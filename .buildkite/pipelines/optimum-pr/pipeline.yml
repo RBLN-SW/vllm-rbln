@@ -1,0 +1,147 @@
+# vllm-rbln optimum PR test suites, uploaded by .buildkite/pr.yml.
+
+notify:
+- github_commit_status:
+    context: "[OB] vllm-rbln optimum tests"
+
+env:
+  UV_CACHE_DIR: "/mnt/uv_cache"
+  UV_LINK_MODE: "symlink"
+  UV_INDEX_STRATEGY: "unsafe-best-match"
+  NUM_INPUT_PROMPT: "1"
+  VLLM_LOGGING_LEVEL: "DEBUG"
+
+_secrets: &secrets
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
+  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
+  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+  HF_TOKEN: HF_TOKEN
+  HF_HOME: HF_HOME
+
+_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime && echo '+++ :pytest: pytest'"
+
+steps:
+  # ===========================================================================
+  # CPU suites
+  # ===========================================================================
+  - label: ":pytest: tests/optimum/v1/core"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources: &cpu-only-resources
+      cpu:
+        requests: "4"
+        limits: "4"
+      memory:
+        requests: "32Gi"
+        limits: "32Gi"
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/v1/core --durations 0"
+
+  - label: ":pytest: tests/optimum/v1/worker"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources: *cpu-only-resources
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker/test_rebel_optimum_model_runner.py --durations 0"
+
+  - label: ":pytest: tests/optimum/optimum_compile/converter"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources: *cpu-only-resources
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/converter --durations 0"
+
+  # ===========================================================================
+  # NPU suites
+  # ===========================================================================
+  - label: ":pytest: tests/optimum/entrypoints/openai"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources:
+      npu:
+        count: 1
+        product: ["RBLN-CA22", "RBLN-CA25"]
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/openai --durations 0 --timeout=600"
+
+  - label: ":pytest: tests/optimum/entrypoints/llm"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources:
+      npu:
+        count: 1
+        product: ["RBLN-CA22", "RBLN-CA25"]
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/llm --durations 0"
+
+  - label: ":pytest: tests/optimum/v1/models"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources:
+      npu:
+        count: 1
+        product: ["RBLN-CA22", "RBLN-CA25"]
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/v1/models --durations 0"
+
+  - label: ":pytest: tests/optimum/v1/worker/test_sampler.py"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources:
+      npu:
+        count: 8
+        product: ["RBLN-CA22", "RBLN-CA25"]
+    secrets: *secrets
+    command:
+      - *sync
+      - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py --durations 0'
+      - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py --durations 0'
+      - 'uv run --no-sync pytest -x -vvs -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py --durations 0'
+
+  # ===========================================================================
+  # Optimum smoke suites -> NPU using RSD
+  # ===========================================================================
+  - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-1"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    env:
+      # TODO single-threaded OpenMP works around a libgomp fork-safety deadlock in the
+      # rsd-1 smoke suite -> a pooling test's parent-side matmul warms libgomp, then the next
+      # forked EngineCore inherits a phantom-worker pool and hangs in GOMP_parallel while
+      # loading the compiled model.
+      OMP_NUM_THREADS: "1"
+    resources:
+      npu:
+        count: 1
+        product: ["RBLN-CA22", "RBLN-CA25"]
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd1.py --durations 0"
+
+  - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-4"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources:
+      npu:
+        count: 4
+        product: ["RBLN-CA22", "RBLN-CA25"]
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd4.py --durations 0"
+
+  - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-8"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources:
+      npu:
+        count: 8
+        product: ["RBLN-CA22", "RBLN-CA25"]
+    secrets: *secrets
+    command:
+      - *sync
+      - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd8.py --durations 0"

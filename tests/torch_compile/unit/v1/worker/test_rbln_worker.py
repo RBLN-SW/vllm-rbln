@@ -57,11 +57,13 @@ def _make_parallel_config(
     tensor_parallel_size=1,
     pipeline_parallel_size=1,
     world_size_across_dp=1,
+    assigned_physical_gpu_ids=None,
 ):
     return SimpleNamespace(
         world_size=world_size,
         data_parallel_size=data_parallel_size,
         data_parallel_rank=data_parallel_rank,
+        assigned_physical_gpu_ids=assigned_physical_gpu_ids,
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=pipeline_parallel_size,
         disable_custom_all_reduce=False,
@@ -108,6 +110,7 @@ def _make_vllm_config(
     data_parallel_rank=0,
     world_size=1,
     world_size_across_dp=1,
+    assigned_physical_gpu_ids=None,
 ):
     return SimpleNamespace(
         profiler_config=_make_profiler_config(profiler_trace_dir),
@@ -116,6 +119,7 @@ def _make_vllm_config(
             data_parallel_size=data_parallel_size,
             data_parallel_rank=data_parallel_rank,
             world_size_across_dp=world_size_across_dp,
+            assigned_physical_gpu_ids=assigned_physical_gpu_ids,
         ),
         model_config=_make_model_config(
             trust_remote_code=trust_remote_code,
@@ -529,6 +533,52 @@ class TestInitDeviceEnv:
         cfg = _make_vllm_config(world_size=2, data_parallel_rank=1)
         _create_worker(vllm_config=cfg, local_rank=0, rank=0, num_devices=2)
         assert os.environ["RBLN_DEVICES"] == "4,5"
+
+    def test_assigned_physical_ids_win_over_the_env_var(self):
+        # Under DP the env var holds the whole deployment; vLLM 0.24 puts this
+        # rank's share on the config instead.
+        os.environ["RBLN_DEVICES"] = "4,5,6,7"
+        cfg = _make_vllm_config(
+            world_size=1,
+            data_parallel_size=4,
+            data_parallel_rank=2,
+            assigned_physical_gpu_ids=[6],
+        )
+        _create_worker(vllm_config=cfg, local_rank=0, rank=0, num_devices=1)
+        assert os.environ["RBLN_DEVICES"] == "6"
+
+    def test_assigned_physical_ids_expand_by_num_devices(self):
+        os.environ["RBLN_DEVICES"] = "0,1,2,3"
+        cfg = _make_vllm_config(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            assigned_physical_gpu_ids=[2, 3],
+        )
+        _create_worker(vllm_config=cfg, local_rank=1, rank=1, num_devices=2)
+        assert os.environ["RBLN_DEVICES"] == "6,7"
+
+    def test_no_assignment_falls_back_to_the_env_var(self):
+        os.environ["RBLN_DEVICES"] = "0,1"
+        cfg = _make_vllm_config(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            assigned_physical_gpu_ids=None,
+        )
+        _create_worker(vllm_config=cfg, local_rank=0, rank=0, num_devices=1)
+        assert os.environ["RBLN_DEVICES"] == "0"
+
+    def test_assigned_physical_ids_wrong_count_still_asserts(self):
+        os.environ["RBLN_DEVICES"] = "4,5,6,7"
+        cfg = _make_vllm_config(
+            world_size=1,
+            data_parallel_size=4,
+            data_parallel_rank=0,
+            assigned_physical_gpu_ids=[4, 5],
+        )
+        with pytest.raises(AssertionError, match="should have device count"):
+            _create_worker(vllm_config=cfg, local_rank=0, rank=0, num_devices=1)
 
 
 # ===========================================================================

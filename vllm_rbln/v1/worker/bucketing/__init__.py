@@ -64,5 +64,5 @@ def get_bucketing_manager(
     else:
         raise ValueError(
             f"Invalid bucketing strategy: {strategy}. "
-            "Valid strategies are [exponential, exp, linear, manual].",
+            "Valid strategies are [exponential, linear, manual].",
         )
