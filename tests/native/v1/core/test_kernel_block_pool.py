@@ -14,11 +14,11 @@
 
 """The pool itself enforces what a second allocator used to try to.
 
-Contiguity (I3) and one-writer-per-block (I4) become properties of allocation,
-and `get_num_free_blocks` -- which `KVCacheManager` consults before admitting
-work -- counts what is actually backable. That last point is the bug this
-class exists to remove: upstream admitted against free pages while kernel
-blocks were exhausted, and `bind` then raised into the engine core.
+Contiguity and one-writer-per-block (R1) become properties of allocation, and
+`get_num_free_blocks` -- which `KVCacheManager` consults before admitting work --
+counts what is actually backable. That last point is the bug this class exists to
+remove: upstream admitted against free pages while kernel blocks were exhausted,
+and binding then raised into the engine core.
 """
 
 import pytest
@@ -77,7 +77,7 @@ class TestAllocation:
         assert p.slot_of(second[0]) == 2
 
     def test_a_second_request_never_shares_an_open_kernel_block(self):
-        # I4: one writer per open kernel block.
+        # R1: one writer per Open kernel block.
         p = pool()
         with p.allocating_for("r1"):
             mine = ids(p.get_new_blocks(1))
@@ -133,10 +133,10 @@ class TestRelease:
         with p.allocating_for("r1"):
             blocks = p.get_new_blocks(2)
         held = p.kernel_block_of(blocks[0].block_id)
-        assert p._owner[held] == "r1"
+        assert p.owner_of(held) == "r1"
 
         p.free_blocks(blocks)
-        assert held not in p._owner
+        assert p.owner_of(held) is None
         with p.allocating_for("r2"):
             reused = ids(p.get_new_blocks(1))
         assert p.kernel_block_of(reused[0]) == held
@@ -147,7 +147,7 @@ class TestRelease:
             blocks = p.get_new_blocks(2)
         held = p.kernel_block_of(blocks[0].block_id)
         p.free_blocks(blocks[:1])
-        assert p._owner[held] == "r1"
+        assert p.owner_of(held) == "r1"
         with p.allocating_for("r2"):
             other = ids(p.get_new_blocks(1))
         assert p.kernel_block_of(other[0]) != held

@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING
 import vllm.v1.core.kv_cache_coordinator as kv_cache_coordinator
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.kernel_block_pool import KernelBlockPool
@@ -51,7 +52,7 @@ from vllm_rbln.v1.core.page_layout import KernelBlockCopyOp, PageLayoutConfig
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
-    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+    from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -125,6 +126,16 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         **kwargs,
     ) -> None:
         assert self.can_use_page_layout(kv_cache_config, page_layout_config)
+        # R2 replaces upstream's matcher, so anything that changes what a match
+        # means has to be refused rather than silently ignored: EAGLE drops the
+        # last matched block, and context parallelism scales the block size.
+        for name in ("use_eagle", "dcp_world_size", "pcp_world_size"):
+            value = kwargs.get(name)
+            if value not in (None, False, 0, 1):
+                raise ValueError(
+                    f"page layout does not support {name}={value}; its group "
+                    f"lookup does not reproduce that matching rule"
+                )
         self.page_layout_config = page_layout_config
         self.geometry = page_layout_config.geometry
         ppe = self.geometry.pages_per_kernel_block
@@ -144,8 +155,6 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         self.num_resumes = 0
         self.num_copies = 0
         self.num_refusals = 0
-        self.num_truncated = 0
-        self.num_pages_truncated = 0
 
         logger.info(
             "Page/kernel block KV cache: page=%d, kernel block=%d (%d pages), "
@@ -159,75 +168,69 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
     # -- prefix match -------------------------------------------------------
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
-        """Drop any tail of the match whose pages are not laid out as a run.
+        """R2: match a group at a time, over kernel blocks rather than pages.
 
-        A hash can name several blocks (upstream does not de-duplicate), so a
-        lookup can stitch one group out of two producers' pages. The group is a
-        single block table entry, so such a match cannot be addressed at all.
+        Upstream matches page by page and asks the hash table for *a* block
+        carrying each hash. That is the wrong question here. A copy publishes a
+        second page under an existing hash, upstream deliberately keeps both and
+        returns an arbitrary one, so a page-at-a-time walk routinely stitches one
+        group out of two producers' blocks -- and a group is one block table
+        entry, so the result names no address that exists.
+
+        Asking instead "which kernel block holds the longest prefix of this
+        group's hashes, at the right slots?" answers attach, partial match and
+        duplicate resolution in one pass, and cannot return an unaddressable
+        match by construction.
         """
-        blocks, num_computed_tokens = super().get_computed_blocks(request)
-        if num_computed_tokens == 0:
-            return blocks, num_computed_tokens
+        if not self.enable_caching or request.skip_reading_prefix_cache:
+            return self.empty_kv_cache_blocks, 0
 
-        pages = blocks.blocks[0]
-        if self._laid_out_prefix(pages) == len(pages):
-            return blocks, num_computed_tokens
-
-        realigned = self._realign(pages)
-        if len(realigned) < len(pages):
-            self.num_truncated += 1
-            self.num_pages_truncated += len(pages) - len(realigned)
+        # The last token must be recomputed to produce logits.
+        max_pages = (request.num_tokens - 1) // self.geometry.page_size
+        pages = self._match(request.block_hashes, max_pages)
+        if self.log_stats and self.prefix_cache_stats is not None:
+            self.prefix_cache_stats.record(
+                num_tokens=request.num_tokens,
+                num_hits=len(pages) * self.geometry.page_size,
+                preempted=request.num_preemptions > 0,
+            )
+        if not pages:
+            return self.empty_kv_cache_blocks, 0
         return (
-            self.create_kv_cache_blocks((realigned,)),
-            min(num_computed_tokens, len(realigned) * self.geometry.page_size),
+            self.create_kv_cache_blocks((pages,)),
+            len(pages) * self.geometry.page_size,
         )
 
-    def _realign(self, pages: Sequence[KVCacheBlock]) -> list[KVCacheBlock]:
-        """Re-pick the match so each group sits in one kernel block.
-
-        A copy publishes a second page under a hash the original already holds,
-        and upstream deliberately keeps both and returns an arbitrary one. So a
-        long match routinely arrives as one conversation's page 0 followed by
-        another's page 1 -- addressable nowhere, since a group is one block table
-        entry. The duplicate that *does* continue the run usually exists; find it
-        by asking, for each kernel block, whether it holds this group's hashes at
-        the right slots.
-        """
+    def _match(
+        self, block_hashes: Sequence[BlockHash], max_pages: int
+    ) -> list[KVCacheBlock]:
+        """The longest addressable prefix: whole groups, then one partial tail."""
         ppe = self.geometry.pages_per_kernel_block
         cache = self.pool.cached_block_hash_to_block
-        out: list[KVCacheBlock] = []
-        for start in range(0, len(pages), ppe):
-            group = pages[start : start + ppe]
-            hashes = [page.block_hash for page in group]
-            if any(block_hash is None for block_hash in hashes):
-                break
-            best: list[int] = []
+        matched: list[KVCacheBlock] = []
+        for start in range(0, min(max_pages, len(block_hashes)), ppe):
+            group = [
+                make_block_hash_with_group_id(block_hash, 0)
+                for block_hash in block_hashes[start : min(start + ppe, max_pages)]
+            ]
+            best: range | None = None
             for kernel_block in range(self.pool.num_kernel_blocks):
                 base = kernel_block * ppe
-                run: list[int] = []
-                for slot, block_hash in enumerate(hashes):
-                    if not cache.contain(block_hash, base + slot):
+                length = 0
+                while length < len(group) and cache.contain(
+                    group[length], base + length
+                ):
+                    length += 1
+                if best is None or length > len(best):
+                    best = range(base, base + length)
+                    if length == len(group):
                         break
-                    run.append(base + slot)
-                if len(run) > len(best):
-                    best = run
-                    if len(best) == len(group):
-                        break
-            out.extend(self.pool.blocks[page_id] for page_id in best)
-            if len(best) < len(group):
+            if best is None or not best:
                 break
-        return out
-
-    def _laid_out_prefix(self, pages: Sequence[KVCacheBlock]) -> int:
-        """Length of the leading run of pages that satisfy the identity map."""
-        ppe = self.geometry.pages_per_kernel_block
-        for index, block in enumerate(pages):
-            slot = index % ppe
-            if block.block_id % ppe != slot:
-                return index
-            if slot and block.block_id != pages[index - 1].block_id + 1:
-                return index
-        return len(pages)
+            matched.extend(self.pool.blocks[page_id] for page_id in best)
+            if len(best) < len(group):
+                break  # a partial group ends the match
+        return matched
 
     # -- allocation ---------------------------------------------------------
 
@@ -295,7 +298,7 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         """Why the copies happen, in one line. Called per scheduler stats tick."""
         logger.info(
             "Page layout: whole-group=%d resume=%d copy=%d refused=%d | "
-            "pages copied=%d written=%d CA=%.4f | match truncated=%d (%d pages)",
+            "pages copied=%d written=%d CA=%.4f",
             self.num_whole_groups,
             self.num_resumes,
             self.num_copies,
@@ -303,8 +306,6 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
             self.num_pages_copied,
             self.num_pages_written,
             self.copy_amplification,
-            self.num_truncated,
-            self.num_pages_truncated,
         )
 
     def _redirect(self, request: Request, plan: _PrivateCopy) -> None:

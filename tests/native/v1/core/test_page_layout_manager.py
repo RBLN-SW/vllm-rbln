@@ -22,6 +22,7 @@ produced it.
 """
 
 import pytest
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 
 from vllm_rbln.v1.core.page_layout import PageLayout, PageLayoutConfig, resolve_config
 from vllm_rbln.v1.core.rbln_page_layout_kv_cache_manager import (
@@ -167,69 +168,57 @@ class TestReuse:
         assert all(manager.pool.blocks[page].ref_cnt == 0 for page in source)
 
 
-def cache_as(manager, page_ids, hashes):
+def publish(manager, page_ids, hashes):
     """Publish `hashes[i]` on page `page_ids[i]`, as `cache_full_blocks` would."""
     for page_id, block_hash in zip(page_ids, hashes):
+        key = make_block_hash_with_group_id(block_hash, 0)
         block = manager.pool.blocks[page_id]
         if block.block_hash is None:
-            block.set_block_hash(block_hash)
-        manager.pool.cached_block_hash_to_block.insert(block_hash, block)
+            block.set_block_hash(key)
+        manager.pool.cached_block_hash_to_block.insert(key, block)
 
 
-class TestMatchGuard:
-    def test_a_stitched_match_is_realigned_onto_one_kernel_block(self, monkeypatch):
-        """A copy publishes a duplicate, so a lookup can straddle two blocks.
+def hashes(n, salt=b""):
+    return [BlockHash(bytes([i]) + salt) for i in range(n)]
 
-        Upstream returns an arbitrary one of them; the duplicate that continues
-        the run has to be found instead of dropping the match.
-        """
+
+class TestLookup:
+    """R2: the longest addressable prefix, group at a time."""
+
+    def test_a_whole_group_in_one_block_matches(self):
         manager = make_manager()
-        request = make_request("r1", list(range(4 * PAGE)), PAGE)
-        hashes = [f"h{i}" for i in range(4)]
-        cache_as(manager, [4, 5, 6, 7], hashes)  # the run, in kernel block 1
-        cache_as(manager, [12], hashes[:1])  # a duplicate of its first page
+        keys = hashes(PPE)
+        publish(manager, [4, 5, 6, 7], keys)
+        assert [b.block_id for b in manager._match(keys, PPE)] == [4, 5, 6, 7]
 
-        stitched = [manager.pool.blocks[i] for i in (12, 5, 6, 7)]
-        monkeypatch.setattr(
-            RBLNPageLayoutKVCacheManager.__bases__[0],
-            "get_computed_blocks",
-            lambda self, req: (self.create_kv_cache_blocks((stitched,)), 4 * PAGE),
-        )
-        blocks, num_computed = manager.get_computed_blocks(request)
-        assert [b.block_id for b in blocks.blocks[0]] == [4, 5, 6, 7]
-        assert num_computed == 4 * PAGE
-
-    def test_the_match_stops_where_no_aligned_run_exists(self, monkeypatch):
+    def test_it_prefers_the_block_that_continues_the_run(self):
+        # A copy publishes a duplicate of one page; upstream would return either.
         manager = make_manager()
-        request = make_request("r1", list(range(4 * PAGE)), PAGE)
-        hashes = [f"g{i}" for i in range(4)]
-        # Only the first two pages of any kernel block carry these hashes.
-        cache_as(manager, [4, 5], hashes[:2])
+        keys = hashes(PPE)
+        publish(manager, [4, 5, 6, 7], keys)
+        publish(manager, [12], keys[:1])
+        assert [b.block_id for b in manager._match(keys, PPE)] == [4, 5, 6, 7]
 
-        stitched = [manager.pool.blocks[i] for i in (4, 5, 10, 11)]
-        cache_as(manager, [10, 11], hashes[2:])
-        monkeypatch.setattr(
-            RBLNPageLayoutKVCacheManager.__bases__[0],
-            "get_computed_blocks",
-            lambda self, req: (self.create_kv_cache_blocks((stitched,)), 4 * PAGE),
-        )
-        blocks, num_computed = manager.get_computed_blocks(request)
-        assert [b.block_id for b in blocks.blocks[0]] == [4, 5]
-        assert num_computed == 2 * PAGE
-
-    def test_a_laid_out_match_is_left_alone(self, monkeypatch):
+    def test_a_partial_group_ends_the_match(self):
         manager = make_manager()
-        request = make_request("r1", list(range(4 * PAGE)), PAGE)
+        keys = hashes(2 * PPE)
+        publish(manager, [4, 5], keys[:2])
+        publish(manager, [10, 11], keys[2:4])  # right hashes, wrong slots
+        assert [b.block_id for b in manager._match(keys, 2 * PPE)] == [4, 5]
 
-        run = [manager.pool.blocks[i] for i in (4, 5, 6, 7)]
-        monkeypatch.setattr(
-            RBLNPageLayoutKVCacheManager.__bases__[0],
-            "get_computed_blocks",
-            lambda self, req: (self.create_kv_cache_blocks((run,)), 4 * PAGE),
-        )
-        blocks, num_computed = manager.get_computed_blocks(request)
-        assert num_computed == 4 * PAGE
-        assert [b.block_id for b in blocks.blocks[0]] == [4, 5, 6, 7]
+    def test_pages_at_the_wrong_slot_do_not_match(self):
+        manager = make_manager()
+        keys = hashes(PPE)
+        publish(manager, [5, 6, 7], keys[:3])  # group starts at slot 1
+        assert manager._match(keys, PPE) == []
+
+    def test_the_match_never_covers_the_last_token(self):
+        # Upstream needs the last token recomputed to produce logits.
+        manager = make_manager()
+        request = make_request("r1", list(range(PPE * PAGE)), PAGE)
+        publish(manager, [4, 5, 6, 7], request.block_hashes)
+        _, num_computed = manager.get_computed_blocks(request)
+        assert num_computed == (PPE - 1) * PAGE
 
 
 class TestAdmission:
