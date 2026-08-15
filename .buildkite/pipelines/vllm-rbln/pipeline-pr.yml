@@ -7,6 +7,23 @@ env:
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
 
+_if_changed: &if_changed
+  include:
+    - ".buildkite/**"
+    - "tests/native/**"
+    - "vllm_rbln/**"
+    - "pyproject.toml"
+    - "uv.lock"
+  exclude:
+    - ".buildkite/pipelines/optimum-pr/**"
+    - "tests/optimum/**"
+    - "vllm_rbln/distributed/ec_transfer/**"
+    - "vllm_rbln/model_executor/models/**"
+    - "vllm_rbln/utils/optimum/**"
+    - "vllm_rbln/v1/**/optimum_*"
+    - "vllm_rbln/v1/core/prefix_cache_manager/**"
+    - "vllm_rbln/v1/worker/ec_disagg_helpers.py"
+
 _secrets: &secrets
   UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
   UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
@@ -20,6 +37,7 @@ _sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --e
 steps:
   - label: ":pytest: [CA25] pytest"
     key: "vllm-rbln-pytest-ca25"
+    if_changed: *if_changed
     agents:
       queue: r18s
       resource_class: "RBLN-CA25-32"
@@ -33,6 +51,7 @@ steps:
 
   - label: ":pytest: [CR03] pytest"
     key: "vllm-rbln-pytest-cr03"
+    if_changed: *if_changed
     agents:
       queue: udc
       resource_class: "REBEL-8"

@@ -48,4 +48,7 @@ steps:
           sparse:
             paths:
               - .buildkite
-        command: "buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pr.yml"
+        command: |
+          TARGET_BRANCH=$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-dev}
+          git fetch origin $$TARGET_BRANCH
+          buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pr.yml --git-diff-base origin/$$TARGET_BRANCH
