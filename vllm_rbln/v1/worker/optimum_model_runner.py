@@ -395,7 +395,7 @@ class RBLNOptimumModelRunner(
                         )
                 else:
                     with capture_ctx as model_reports:
-                        model_input = self._build_forward_inputs(model_input)
+                        model_input = self._maybe_build_mm_forward_inputs(model_input)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
@@ -462,9 +462,13 @@ class RBLNOptimumModelRunner(
             return False
         return True
 
-    def _build_forward_inputs(
+    def _maybe_build_mm_forward_inputs(
         self, model_input: ModelInputForRBLN
     ) -> ModelInputForRBLN:
+        """Build multimodal forward inputs (embeddings, MRoPE positions).
+
+        Pass-through for models without multimodal support.
+        """
         model = self.model
         if not isinstance(model, RBLNOptimumMultimodalMixin):
             return model_input
