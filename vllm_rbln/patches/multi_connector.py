@@ -33,6 +33,13 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
+# Fails loudly on the upgrade that makes this backport redundant.
+assert VLLM_VERSION < (0, 26), (
+    f"vLLM {VLLM_VERSION} already ships vllm#46865; delete this module, its "
+    "entry in vllm_rbln/patches/__init__.py and "
+    "tests/native/patches/test_multi_connector.py."
+)
+
 
 @register_patch(
     target=(
@@ -43,7 +50,6 @@ if TYPE_CHECKING:
         "Backport vllm#46865 (2285cfc): empty blocks for non-chosen sub-connectors "
         "starve an offload connector's store path. TODO(vllm>=0.26.0): delete."
     ),
-    condition=lambda: VLLM_VERSION < (0, 26),
 )
 def patched_update_state_after_alloc(
     self: MultiConnector,
