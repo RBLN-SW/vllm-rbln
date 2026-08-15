@@ -383,7 +383,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         output_token_ids = torch.full(
             (batch_size, max_spec_len + 1),
             PLACEHOLDER_TOKEN_ID,
-            dtype=torch.int64,  # Consistent with SamplerOutput.sampled_token_ids.
+            dtype=torch.int32,
             device=device,
         )
 
@@ -424,7 +424,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         draft_per_batch = torch.full(
             (batch_size, max_spec_len),
             PLACEHOLDER_TOKEN_ID,
-            dtype=torch.int64,
+            dtype=output_token_ids.dtype,
             device=device,
         )
         src_offset = 0
@@ -440,9 +440,9 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
         # Returns:
-        #   recovered_token_ids : (B, K) int — per-batch padded recovered tokens.
-        #   num_accepted       : (B,)   int — per-batch number of accepted draft
-        #                                     tokens (in [0, num_draft_tokens[i]]).
+        #   recovered_token_ids : (B, K) int32 — per-batch padded recovered tokens.
+        #   num_accepted       : (B,)   int32 — per-batch number of accepted draft
+        #                                       tokens (in [0, num_draft_tokens[i]]).
         # ------------------------------------------------------------------
         recovered_token_ids, num_accepted = self._compiled_rejection_sample(
             reshaped_draft_token_ids,
@@ -513,7 +513,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         # 4b) Inactive rows (no drafts): only the bonus token at col 0.
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
 
-        return output_token_ids.to(torch.int32)
+        return output_token_ids
 
     def apply_sampling_constraints(
         self,

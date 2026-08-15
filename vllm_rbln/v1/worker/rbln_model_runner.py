@@ -126,6 +126,7 @@ from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
+from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.metrics_v2 import (
@@ -1830,6 +1831,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                # Logits are consumed by sampling within the same step, so the
+                # output buffer can be reused across steps even under async scheduling.
+                use_static_output=True,
             )
             # NOTE(RBLN): We compile compute_logits separately to cover cases when
             # `self.use_wrapped_compute_logits` is `False`
@@ -1843,6 +1847,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                use_static_output=True,
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
@@ -2943,6 +2948,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
+        sig = mega_cache.config_signature(self.vllm_config)
+        mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             # 1. prefill
             self._dummy_run(1, self.max_num_tokens, True)
@@ -3002,6 +3009,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if self.speculative_config and self.speculative_config.method == "medusa":
                 assert isinstance(self.drafter, RBLNMedusaProposer)
                 self.drafter.dummy_run()
+
+        mega_cache.save(self.model_config.model, sig)
 
     def _process_kv_cache_copy_ops(
         self,
