@@ -78,6 +78,7 @@ from vllm_rbln.model_executor.models.optimum import (
     PartialPrefixInfo,
 )
 from vllm_rbln.model_executor.models.optimum.model_base import (
+    KVCacheCopyError,
     RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
 )
@@ -379,6 +380,14 @@ class RBLNOptimumModelRunner(
 
                 new_reqs = scheduler_output.scheduled_new_reqs
                 prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
+                # Copy prefix-cached KV before building the forward inputs.
+                # On failure (e.g. device OOM) rebuild the inputs without the
+                # cached-prefix trim and run a full prefill; the copy is only
+                # an optimization, so the engine must not die here.
+                if not self.try_copy_prefix_cached_kv(model_input, scheduler_output):
+                    model_input, _ = self._prepare_inputs(
+                        scheduler_output, trim_cached_prefix=False
+                    )
                 if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
                     with capture_ctx as model_reports:
                         hidden_states = self._run_prefill_with_cached_encoder(
@@ -387,7 +396,6 @@ class RBLNOptimumModelRunner(
                 else:
                     with capture_ctx as model_reports:
                         model_input = self._build_forward_inputs(model_input)
-                        self.reuse_prefix_cached_kv(model_input, scheduler_output)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
@@ -423,20 +431,36 @@ class RBLNOptimumModelRunner(
         )
         return None
 
-    def reuse_prefix_cached_kv(
+    def try_copy_prefix_cached_kv(
         self,
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
-    ) -> None:
+    ) -> bool:
+        """Copy prefix-cached KV blocks into the request's own blocks.
+
+        Returns False when the copy fails (e.g. device OOM). The caller must
+        then rebuild the prefill inputs with ``trim_cached_prefix=False`` so
+        the cached prefix is recomputed by a full prefill; that overwrites any
+        partially copied destination blocks, so no cleanup is needed here.
+        """
         if not (
             model_input.is_prompt and isinstance(self.model, RBLNOptimumDecoderMixin)
         ):
-            return
-        self.model.copy_cached_kv_blocks(
-            scheduler_output.cached_block_table,
-            scheduler_output.cached_length,
-            model_input.block_tables,
-        )
+            return True
+        try:
+            self.model.copy_cached_kv_blocks(
+                scheduler_output.cached_block_table,
+                scheduler_output.cached_length,
+                model_input.block_tables,
+            )
+        except KVCacheCopyError:
+            logger.exception(
+                "Copying prefix-cached KV failed for request(s) %s. "
+                "Falling back to a full prefill without prefix-cache reuse.",
+                model_input.running_requests_ids,
+            )
+            return False
+        return True
 
     def _build_forward_inputs(
         self, model_input: ModelInputForRBLN
@@ -492,8 +516,12 @@ class RBLNOptimumModelRunner(
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
+        trim_cached_prefix: bool = True,
     ) -> tuple[ModelInputForRBLN, np.ndarray]:
         """
+        :param trim_cached_prefix: When False, build the prefill inputs as if
+            there were no prefix-cache hit (full prompt, positions from 0).
+            Used to fall back when copying the cached KV blocks failed.
         :return: ModelInputForRBLN[
             input_tokens: Token IDs,
             input_positions: Position IDs,
@@ -540,7 +568,7 @@ class RBLNOptimumModelRunner(
                 multi_modal_kwargs,
                 running_request_ids,
                 partial_prefix,
-            ) = self._prepare_prefill(scheduler_output)
+            ) = self._prepare_prefill(scheduler_output, trim_cached_prefix)
         else:
             input_ids, positions, block_tables, running_request_ids = (
                 self._prepare_decode(scheduler_output)
@@ -599,6 +627,7 @@ class RBLNOptimumModelRunner(
     def _prepare_prefill(
         self,
         scheduler_output: "RBLNSchedulerOutput",
+        trim_cached_prefix: bool = True,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -652,8 +681,9 @@ class RBLNOptimumModelRunner(
                 block_ids,
             )
             block_table = scheduler_output.block_table_dict[req_id]
-            cached_length = scheduler_output.cached_length
-            total_cached_length = sum(cached_length)
+            if trim_cached_prefix:
+                cached_length = scheduler_output.cached_length
+                total_cached_length = sum(cached_length)
             if total_cached_length > 0:
                 prompt_tokens = prompt_tokens[total_cached_length:]
                 input_positions = input_positions[total_cached_length:]

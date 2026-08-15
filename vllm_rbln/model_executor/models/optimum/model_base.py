@@ -44,6 +44,15 @@ from .compilation import RBLNCompileSpec
 logger = init_logger(__name__)
 
 
+class KVCacheCopyError(RuntimeError):
+    """Raised when copying prefix-cached KV blocks fails (e.g. device OOM).
+
+    The copy is a pure optimization: the caller can always recover by
+    running a full prefill without the cached-prefix trim, so this error
+    must be caught at the copy call site instead of killing the engine.
+    """
+
+
 class KVCacheBlockAdapter:
     """
      KV cache block allocation behavior (v1 vs v0).
@@ -427,6 +436,11 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             cached_block_tables: Source block IDs to copy from.
             cached_lengths: Cached length for each source block.
             block_tables: Tensor whose first row holds the destination block IDs.
+
+        Raises:
+            KVCacheCopyError: A block copy failed (e.g. device OOM). The
+                destination blocks may be partially written; the caller must
+                fall back to a full prefill, which overwrites them all.
         """
         if not cached_block_tables:
             return
@@ -455,12 +469,10 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
                     dst_block,
                 )
             except Exception as e:
-                error_msg = (
+                raise KVCacheCopyError(
                     f"Failed to copy KV cache from block {src_block} to block "
                     f"{dst_block} at index {block_idx}: {e}"
-                )
-                logger.error(error_msg)
-                raise RuntimeError(error_msg) from e
+                ) from e
 
     # It is required for decoder models in openai api server
     def compute_logits(
