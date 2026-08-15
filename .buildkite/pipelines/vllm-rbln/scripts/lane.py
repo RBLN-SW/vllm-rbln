@@ -21,6 +21,7 @@ from __future__ import annotations
 import glob
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -159,3 +160,76 @@ def run_logged(cmd: list[str], log: Path, env: dict[str, str]) -> int:
         assert tee.stdin is not None
         tee.stdin.close()
         tee.wait()
+
+
+def _agent_bin() -> str | None:
+    """A containerized step gets the agent bind-mounted into the build root
+    rather than installed, so `which` alone finds nothing."""
+    if found := shutil.which("buildkite-agent"):
+        return found
+    roots = [
+        os.environ.get("BUILDKITE_BIN_PATH"),
+        os.environ.get("BUILDKITE_BUILD_PATH"),
+        "/workspace",
+    ]
+    for root in roots:
+        if not root:
+            continue
+        candidate = Path(root) / "buildkite-agent"
+        if os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def publish_summary(
+    lane: str, target_dir: Path, body: str, *, degraded: bool = False
+) -> None:
+    """Report a target's results to the log, a file, and the build page.
+
+    A summary reports on a run and is never part of its result, so nothing here
+    is allowed to raise: a lane that measured for two hours must not fail because
+    its numbers could not be written down."""
+    try:
+        _publish_summary(lane, target_dir, body, degraded=degraded)
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
+        print(f"  summary: not published ({type(exc).__name__}: {exc})", flush=True)
+
+
+def _publish_summary(lane: str, target_dir: Path, body: str, *, degraded: bool) -> None:
+    """Cheapest channel first, so a failure in one still leaves the rest.
+
+    One context per (lane, target): a driver that runs once per target would
+    otherwise leave only the last one, and each carries its own style."""
+    # `+++` expands the group, putting the table at the top of the step's log.
+    on_ci = bool(os.environ.get("BUILDKITE"))
+    heading = f"+++ {lane} summary" if on_ci else f"=== {lane} summary"
+    print(f"{heading} -- {target_dir.name}")
+    print(body, flush=True)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / "summary.md").write_text(body, encoding="utf-8")
+
+    if not on_ci:
+        return
+    agent = _agent_bin()
+    if agent is None:
+        print("  summary: no buildkite-agent found; annotation skipped", flush=True)
+        return
+    # Say why on failure, or a missing annotation looks like one never built.
+    done = subprocess.run(
+        [
+            agent,
+            "annotate",
+            "--context",
+            f"{lane}-{target_dir.name}",
+            "--style",
+            "warning" if degraded else "info",
+        ],
+        input=body,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if done.returncode:
+        detail = done.stderr.strip() or done.stdout.strip()
+        print(f"  summary: annotate failed ({done.returncode}): {detail}", flush=True)

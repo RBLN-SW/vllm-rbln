@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import datetime
 from importlib import metadata
 from pathlib import Path
@@ -46,11 +47,116 @@ from lane import (  # noqa: E402
     devices_needed,
     host_chip,
     output_dir,
+    publish_summary,
     target_env,
     write_repro,
 )
 
 _HERE = Path(__file__).resolve().parent
+
+
+@dataclass
+class _Summary:
+    """One target's launches. They evaluate the same model and differ only in how
+    it is parallelized, so their scores belong in one table, not one each."""
+
+    chip: str | None = None
+    facts: list[dict[str, str]] = field(default_factory=list)
+    rows: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    degraded: bool = False
+
+
+# The launch directory's parent is the target, per the layout run_target builds.
+_SUMMARIES: dict[Path, _Summary] = {}
+
+
+def _summary_for(out: Path, chip: str | None) -> _Summary:
+    summary = _SUMMARIES.setdefault(out.parent, _Summary(chip=chip))
+    return summary
+
+
+def _note(out: Path, chip: str | None, note: str) -> None:
+    """Why a launch has no numbers, so it is not simply absent from the table."""
+    summary = _summary_for(out, chip)
+    summary.notes.append(f"- {out.name}: {note}")
+    summary.degraded = True
+
+
+def _facts(payload: dict[str, Any], tasks: list[str]) -> dict[str, str]:
+    """What has to match for two launches' scores to be comparable: a run capped
+    at 200 of gsm8k's 1319 is not comparable with an uncapped one."""
+    counts = payload.get("n-samples") or {}
+    shots = payload.get("n-shot") or {}
+    # Values carry their own label, since only the shared ones get printed.
+    facts = {"model": payload.get("model_name") or "?"}
+    for task in tasks:
+        if (shot := shots.get(task)) is not None:
+            facts[f"{task} shots"] = f"{task} {shot}-shot"
+        if sampled := counts.get(task):
+            effective = sampled.get("effective", "?")
+            original = sampled.get("original", "?")
+            facts[f"{task} samples"] = f"{effective} / {original} samples"
+    return facts
+
+
+def _record(
+    out: Path, chip: str | None, payload: dict[str, Any], tasks: list[str]
+) -> None:
+    """One row per (task, metric, filter). lm-eval keys them as ``metric,filter``
+    and puts the error bar under ``metric_stderr,filter``; without that bar a
+    reader treats a move inside it as a regression."""
+    summary = _summary_for(out, chip)
+    summary.facts.append(_facts(payload, tasks))
+    elapsed = "--"
+    with contextlib.suppress(TypeError, ValueError, KeyError):
+        elapsed = f"{float(payload['total_evaluation_time_seconds']):.0f}s"
+
+    for task in tasks:
+        scores = payload["results"].get(task) or {}
+        for key, value in sorted(scores.items()):
+            if "," not in key or "stderr" in key or not isinstance(value, float):
+                continue
+            metric, _, filter_name = key.partition(",")
+            stderr = scores.get(f"{metric}_stderr,{filter_name}")
+            error = f"±{stderr:.4f}" if isinstance(stderr, float) else "--"
+            summary.rows.append(
+                f"| {out.name} | {task} | {metric} | {filter_name} "
+                f"| {value:.4f} | {error} | {elapsed} |"
+            )
+
+
+def flush_summaries() -> None:
+    """Publish each target's launches as one table. A fact shared by every launch
+    moves to the header, leaving the table to what differs."""
+    for target_dir, summary in _SUMMARIES.items():
+        try:
+            _flush(target_dir, summary)
+        except Exception as exc:  # noqa: BLE001 -- reporting never fails a lane
+            print(f"  summary: not built ({type(exc).__name__}: {exc})")
+
+
+def _flush(target_dir: Path, summary: _Summary) -> None:
+    shared = {
+        key: value
+        for key, value in (summary.facts[0] if summary.facts else {}).items()
+        if all(facts.get(key) == value for facts in summary.facts[1:])
+    }
+    chip = f" -- {summary.chip}" if summary.chip else ""
+    body = [f"#### {target_dir.name}{chip}", ""]
+    if shared:
+        body += [" · ".join(shared.values()), ""]
+    if summary.rows:
+        body += [
+            "| launch | task | metric | filter | value | stderr | time |",
+            "|:--|:--|:--|:--|--:|--:|--:|",
+            *summary.rows,
+        ]
+    else:
+        body.append("no lm-eval results.")
+    if summary.notes:
+        body += ["", *summary.notes]
+    publish_summary("lm-eval", target_dir, "\n".join(body), degraded=summary.degraded)
 
 
 @contextlib.contextmanager
@@ -125,10 +231,13 @@ def report(out: Path, target: dict[str, Any], chip: str | None) -> int:
     results = sorted(out.glob("results_*.json"))
     if not results:
         print(f"  no lm-eval results under {out}", file=sys.stderr)
+        _note(out, chip, "no lm-eval results")
         return 1
 
     spec = target["eval"]
-    measured = json.loads(results[-1].read_text())["results"]
+    # The whole payload: the counts the summary needs sit outside "results".
+    payload = json.loads(results[-1].read_text())
+    measured = payload["results"]
     expected = (spec.get("expected") or {}).get(chip)
     key = spec.get("filter", "exact_match,strict-match")
     status = 0
@@ -147,6 +256,8 @@ def report(out: Path, target: dict[str, Any], chip: str | None) -> int:
         )
         if (value := scores.get(key)) is None:
             print(f"  {task}: no filter {key!r} in the results", file=sys.stderr)
+            _record(out, chip, payload, spec["tasks"])
+            _note(out, chip, f"`{key}` is not among the {task} filters")
             return 1
         line = f"  {task}: {key}={value:.4f}"
         if expected is None:
@@ -156,6 +267,7 @@ def report(out: Path, target: dict[str, Any], chip: str | None) -> int:
         ok = abs(value - expected) <= rtol
         print(f"{line}  expected {expected:.4f} +-{rtol}  {'ok' if ok else 'FAILED'}")
         status = max(status, 0 if ok else 1)
+    _record(out, chip, payload, spec["tasks"])
     return status
 
 
@@ -246,7 +358,10 @@ def main() -> int:
         parser.error(f"no targets under {args.targets_dir}")
 
     out_dir = output_dir("LM_EVAL_OUTPUT_DIR", "lm-eval-results")
-    return max(run_target(p, out_dir, args.run_id) for p in paths)
+    # Materialized, or the summaries would be flushed while targets still run.
+    statuses = [run_target(p, out_dir, args.run_id) for p in paths]
+    flush_summaries()
+    return max(statuses)
 
 
 if __name__ == "__main__":
