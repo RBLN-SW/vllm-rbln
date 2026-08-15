@@ -54,7 +54,10 @@ steps:
     if_changed: *if_changed
     agents:
       queue: udc
-      resource_class: "REBEL-8"
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
     timeout_in_minutes: 60

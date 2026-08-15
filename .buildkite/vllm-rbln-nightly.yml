@@ -46,7 +46,10 @@ steps:
     key: "nightly-t0-cr03"
     agents:
       queue: udc
-      resource_class: "REBEL-8"
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
     timeout_in_minutes: 60
@@ -58,7 +61,10 @@ steps:
     key: "nightly-t2-cr03"
     agents:
       queue: udc
-      resource_class: "REBEL-8"
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
     env:
@@ -77,7 +83,10 @@ steps:
     soft_fail: true
     agents:
       queue: udc
-      resource_class: "REBEL-8"
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
     timeout_in_minutes: 120
@@ -92,7 +101,10 @@ steps:
     soft_fail: true
     agents:
       queue: udc
-      resource_class: "REBEL-8"
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
     timeout_in_minutes: 120
