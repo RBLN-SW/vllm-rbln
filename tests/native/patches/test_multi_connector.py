@@ -14,10 +14,7 @@
 
 from types import SimpleNamespace
 
-from vllm_rbln.patches.multi_connector import (
-    _upstream_still_blanks_blocks,
-    patched_update_state_after_alloc,
-)
+from vllm_rbln.patches.multi_connector import patched_update_state_after_alloc
 
 
 class _RecordingConnector:
@@ -31,9 +28,6 @@ class _RecordingConnector:
 class _Blocks:
     def __init__(self, tag: str) -> None:
         self.tag = tag
-
-    def new_empty(self) -> "_Blocks":
-        return _Blocks("empty")
 
 
 def _multi(*connectors: _RecordingConnector, chosen: dict[str, int] | None = None):
@@ -69,7 +63,3 @@ def test_all_connectors_get_real_blocks_when_nobody_is_chosen():
 
     for connector in (first, second):
         assert connector.calls == [(blocks, 0)]
-
-
-def test_condition_is_a_real_check():
-    assert isinstance(_upstream_still_blanks_blocks(), bool)

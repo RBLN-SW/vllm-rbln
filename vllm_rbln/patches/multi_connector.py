@@ -22,32 +22,24 @@ TODO(vllm>=0.26.0): delete this module, its entry in ``patches/__init__.py`` and
 ``tests/native/patches/test_multi_connector.py``.
 """
 
-import inspect
 from typing import TYPE_CHECKING
 
+from packaging.version import Version
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+from vllm.version import __version__ as VLLM_VERSION
 
-from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
-logger = init_logger(__name__)
-
-
-def _upstream_still_blanks_blocks() -> bool:
-    # Source check, not a version compare: vllm-rbln pins vLLM by lock, so a
-    # build can report < 0.26.0 while already carrying the fix.
-    try:
-        source = inspect.getsource(MultiConnector.update_state_after_alloc)
-    except (OSError, TypeError):
-        logger.warning(
-            "Cannot read MultiConnector source; applying vllm#46865 backport."
-        )
-        return True
-    return "empty_blocks" in source
+# Fails loudly on the upgrade that makes this backport redundant.
+assert Version(VLLM_VERSION).release < (0, 26), (
+    f"vLLM {VLLM_VERSION} already ships vllm#46865; delete this module, its "
+    "entry in vllm_rbln/patches/__init__.py and "
+    "tests/native/patches/test_multi_connector.py."
+)
 
 
 @register_patch(
@@ -59,7 +51,6 @@ def _upstream_still_blanks_blocks() -> bool:
         "Backport vllm#46865 (2285cfc): empty blocks for non-chosen sub-connectors "
         "starve an offload connector's store path. TODO(vllm>=0.26.0): delete."
     ),
-    condition=_upstream_still_blanks_blocks,
 )
 def patched_update_state_after_alloc(
     self: MultiConnector,
