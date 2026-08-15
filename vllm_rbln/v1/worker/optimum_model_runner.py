@@ -436,13 +436,6 @@ class RBLNOptimumModelRunner(
         model_input: ModelInputForRBLN,
         scheduler_output: "SchedulerOutput",
     ) -> bool:
-        """Copy prefix-cached KV blocks into the request's own blocks.
-
-        Returns False when the copy fails (e.g. device OOM). The caller must
-        then rebuild the prefill inputs with ``trim_cached_prefix=False`` so
-        the cached prefix is recomputed by a full prefill; that overwrites any
-        partially copied destination blocks, so no cleanup is needed here.
-        """
         if not (
             model_input.is_prompt and isinstance(self.model, RBLNOptimumDecoderMixin)
         ):
@@ -518,22 +511,6 @@ class RBLNOptimumModelRunner(
         scheduler_output: "SchedulerOutput",
         trim_cached_prefix: bool = True,
     ) -> tuple[ModelInputForRBLN, np.ndarray]:
-        """
-        :param trim_cached_prefix: When False, build the prefill inputs as if
-            there were no prefix-cache hit (full prompt, positions from 0).
-            Used to fall back when copying the cached KV blocks failed.
-        :return: ModelInputForRBLN[
-            input_tokens: Token IDs,
-            input_positions: Position IDs,
-            sampling_metadata, pooling_metadata: It is `None` in V1,
-            multi_modal_kwargs: Batched multi-modal data,
-            block_tables: [num_reqs, num_blocks_per_req] shaped tensor,
-            running_requests_ids: RUNNING request IDs,
-            finished_requests_ids: FINISHED request IDs in between
-                the previous and the current steps,
-            is_prompt: It is used only in V1
-        ]
-        """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs

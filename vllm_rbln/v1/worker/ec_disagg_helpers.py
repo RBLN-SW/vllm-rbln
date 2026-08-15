@@ -164,8 +164,6 @@ class ECDisaggHelpersMixin:
             model_input=model_input,
         )
 
-        # The prefix-cached KV copy already ran in execute_model (with OOM
-        # fallback) before this consumer path was entered.
         language_model = self.model.get_language_model()
         logits = language_model.prefill_decoder(
             **prefill_params,
