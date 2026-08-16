@@ -32,6 +32,7 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     "Qwen2ForCausalLM": ("qwen2", "RBLNQwen2ForCausalLM"),
     "OPTForCausalLM": ("opt", "RBLNOPTForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "RBLNQwen3ForCausalLM"),
+    "Qwen3MoeForCausalLM": ("qwen3_moe", "RBLNQwen3MoeForCausalLM"),
     "GptOssForCausalLM": ("gpt-oss", "RBLNGptOssForCausalLM"),
 }
 
