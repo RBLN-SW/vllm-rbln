@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig
-from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.models import utils as model_executor_utils
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
@@ -648,7 +648,9 @@ def get_kv_cache_names(
     """
     index2name: dict[int, list[str]] = defaultdict(list)
     for layer_name in kv_caches:
-        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+        index2name[
+            model_executor_utils.extract_layer_index(layer_name, num_attn_module)
+        ].append(layer_name)
 
     kv_cache_names: list[str] = []
     for layer_index in sorted(index2name.keys()):
