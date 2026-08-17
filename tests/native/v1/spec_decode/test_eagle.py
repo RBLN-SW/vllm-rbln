@@ -274,59 +274,69 @@ class TestDetermineDraftBatchPadding:
         assert proposer._determine_draft_batch_padding(3, 10, True) == (3, None, None)
         assert proposer._determine_draft_batch_padding(3, 3, False) == (8, None, None)
 
+    @staticmethod
+    def _dp_proposer(monkeypatch, dp_status):
+        # The drafter reads the DP counts the runner already collected, so there
+        # is no second collective to fake -- only runner.dp_status to set.
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.parallel_config, "data_parallel_size", 2
+        )
+        proposer.dp_rank = 0
+        proposer.runner = SimpleNamespace(
+            specialized_moe_decode=True,
+            bucketing_manager=SimpleNamespace(
+                # Rounds up like the real one, so the group-agreed bucket stays
+                # distinguishable from the largest one.
+                find_decode_batch_bucket=lambda n: next(
+                    b for b in (1, 2, 4, 8) if b >= n
+                ),
+                decode_batch_buckets=[1, 2, 4, 8],
+            ),
+            dp_status=dp_status,
+        )
+        return proposer
+
     def test_dp_greater_than_one_specialized_moe(self, monkeypatch):
         # The per-DP counts drive the padding: batch bucket from max reqs across
         # DP, token pad from bucket * max tokens-per-req.
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.parallel_config, "data_parallel_size", 2
-        )
-        proposer.dp_rank = 0
-        proposer.runner = SimpleNamespace(
-            specialized_moe_decode=True,
-            bucketing_manager=SimpleNamespace(
-                find_decode_batch_bucket=lambda n: 8,
-                decode_batch_buckets=[1, 2, 4, 8],
-            ),
-        )
-        monkeypatch.setattr(
-            eagle_module.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(lambda *a: (torch.tensor([16, 16]), torch.tensor([4, 2]))),
+        proposer = self._dp_proposer(
+            monkeypatch, (torch.tensor([16, 16]), torch.tensor([4, 2]), False)
         )
         num_reqs_padded, num_tokens_padded, across = (
-            proposer._determine_draft_batch_padding(3, 6, False)
+            proposer._determine_draft_batch_padding(4, 16, False)
         )
-        # bucket(max(4, 2)) = 8; max(16//4, 16//2) = 8; tokens = 8 * 8 = 64.
-        assert num_reqs_padded == 8
-        assert num_tokens_padded == 64
+        # bucket(max(4, 2)) = 4; max(16//4, 16//2) = 8; tokens = 4 * 8 = 32.
+        assert num_reqs_padded == 4
+        assert num_tokens_padded == 32
         assert across.cpu().tolist() == [16, 16]
 
-    def test_dp_greater_than_one_without_per_rank_counts(self, monkeypatch):
-        # When the per-rank req counts are absent, padding falls back to the
-        # largest decode bucket and the full token budget.
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.parallel_config, "data_parallel_size", 2
-        )
-        proposer.dp_rank = 0
-        proposer.runner = SimpleNamespace(
-            specialized_moe_decode=True,
-            bucketing_manager=SimpleNamespace(
-                find_decode_batch_bucket=lambda n: 8,
-                decode_batch_buckets=[1, 2, 4, 8],
-            ),
-        )
-        monkeypatch.setattr(
-            eagle_module.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(lambda *a: (torch.tensor([16, 16]), None)),
+    def test_dp_any_prefill_falls_back_to_max_bucket(self, monkeypatch):
+        # A peer in prefill -- one request, a whole chunk of tokens -- makes the
+        # per-rank req counts unusable, so padding falls back to the largest
+        # decode bucket and the full token budget.
+        proposer = self._dp_proposer(
+            monkeypatch, (torch.tensor([16, 512]), torch.tensor([4, 1]), True)
         )
         num_reqs_padded, num_tokens_padded, _ = proposer._determine_draft_batch_padding(
-            3, 6, False
+            4, 16, False
         )
         assert num_reqs_padded == 8  # decode_batch_buckets[-1]
         assert num_tokens_padded == proposer.max_num_tokens
+
+    def test_later_draft_step_derives_tokens_from_reqs(self, monkeypatch):
+        # Past the first pass every request contributes one token, so the saved
+        # req counts double as the token counts and the prefill flag no longer
+        # applies -- the target's prefill is already done.
+        proposer = self._dp_proposer(
+            monkeypatch, (torch.tensor([16, 512]), torch.tensor([4, 1]), True)
+        )
+        num_reqs_padded, num_tokens_padded, across = (
+            proposer._determine_draft_batch_padding(4, 4, False, first_pass=False)
+        )
+        assert num_reqs_padded == 4  # bucket(max(4, 1)), not the largest bucket
+        assert num_tokens_padded == 4  # 4 * max(4//4, 1//1)
+        assert across.cpu().tolist() == [4, 1]
 
 
 class TestInitGuards:

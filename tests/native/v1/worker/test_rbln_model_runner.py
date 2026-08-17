@@ -356,8 +356,7 @@ class TestDummyRunPadding:
 
         def fake_across_dp(num_tokens, num_reqs, dp_size, dp_rank, is_prefill):
             reqs = torch.tensor(reqs_across_dp, dtype=torch.int32)
-            # The real one returns no per-rank counts while any rank prefills.
-            return reqs.clone(), None if is_prefill else reqs
+            return reqs.clone(), reqs, is_prefill
 
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)

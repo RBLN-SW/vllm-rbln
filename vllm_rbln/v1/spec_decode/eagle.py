@@ -29,7 +29,7 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
 )
-from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.utils import pad
@@ -188,7 +188,9 @@ class RBLNEagleProposer(EagleProposer):
             common_attn_metadata.seq_lens -= num_rejected_tokens
 
         num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_reqs, False)
+            self._determine_draft_batch_padding(
+                num_reqs, num_reqs, False, first_pass=False
+            )
         )
         for token_index in range(self.num_speculative_tokens - 1):
             self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
@@ -548,7 +550,9 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.seq_lens += 1
 
         num_reqs_padded, dp_padded, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_reqs, False)
+            self._determine_draft_batch_padding(
+                num_reqs, num_reqs, False, first_pass=False
+            )
         )
         num_padded_tokens = override_padded or dp_padded
         per_layer_attn_metadata.clear()
@@ -632,6 +636,8 @@ class RBLNEagleProposer(EagleProposer):
         num_reqs: int,
         num_tokens: int,
         is_prefill: bool,
+        *,
+        first_pass: bool = True,
     ) -> tuple[int, int | None, torch.Tensor | None]:
         num_reqs_padded = (
             self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
@@ -642,14 +648,13 @@ class RBLNEagleProposer(EagleProposer):
         if dp_size == 1:
             return num_reqs_padded, None, None
 
-        num_tokens_across_dp, num_reqs_across_dp = (
-            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens, num_reqs, dp_size, self.dp_rank, is_prefill
-            )
+        num_tokens_across_dp, num_reqs_across_dp, any_prefill = self._reuse_dp_status(
+            num_reqs, num_tokens, first_pass
         )
+
         num_tokens_padded = self.max_num_tokens
         if self.runner.specialized_moe_decode and not is_prefill:
-            if num_reqs_across_dp is None:
+            if any_prefill:
                 num_reqs_padded = self.runner.bucketing_manager.decode_batch_buckets[-1]
             else:
                 num_reqs_padded = (
@@ -662,3 +667,25 @@ class RBLNEagleProposer(EagleProposer):
                 )
                 num_tokens_padded = num_reqs_padded * max_tokens_per_req
         return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
+
+    def _reuse_dp_status(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        first_pass: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        dp_status = self.runner.dp_status
+        assert dp_status is not None, (
+            "dp_status is not saved from _determine_batch_padding"
+        )
+        num_tokens_across_dp, num_reqs_across_dp, any_prefill = dp_status
+        local_reqs = int(num_reqs_across_dp[self.dp_rank])
+        assert local_reqs == num_reqs
+
+        if first_pass:
+            local_tokens = int(num_tokens_across_dp[self.dp_rank])
+            assert local_tokens == num_tokens
+            return num_tokens_across_dp, num_reqs_across_dp, any_prefill
+
+        assert num_tokens == num_reqs
+        return num_reqs_across_dp.clone(), num_reqs_across_dp, False

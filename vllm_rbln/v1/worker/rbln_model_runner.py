@@ -447,6 +447,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             self.offload_context = torch.rbln.offload
 
+        # NOTE(RBLN): DP status for the current step.
+        # Since num_tokens_and_reqs_across_dp contains a collective op,
+        # we save it for possible reuse in a drafter.
+        self.dp_status: tuple[torch.Tensor, torch.Tensor, bool] | None = None
+
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
         return self.positions[:num_tokens]
@@ -2872,18 +2877,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if self.parallel_config.data_parallel_size == 1:
             return num_reqs_padded, None, None
 
-        num_tokens_across_dp, num_reqs_across_dp = (
-            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens_unpadded,
-                num_reqs_unpadded,
-                self.parallel_config.data_parallel_size,
-                self.parallel_config.data_parallel_rank,
-                is_prefill,
-            )
+        self.dp_status = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+            num_tokens_unpadded,
+            num_reqs_unpadded,
+            self.parallel_config.data_parallel_size,
+            self.parallel_config.data_parallel_rank,
+            is_prefill,
         )
+        num_tokens_across_dp, num_reqs_across_dp, any_prefill = self.dp_status
         num_tokens_padded = self.max_num_tokens
         if self.specialized_moe_decode:
-            if num_reqs_across_dp is None:
+            if any_prefill:
                 # any_prefill (PD disaggregation): route padded-decode to the max
                 # bucket so only ONE padded-decode graph is ever needed.
                 num_reqs_padded = self.bucketing_manager.decode_batch_buckets[-1]
