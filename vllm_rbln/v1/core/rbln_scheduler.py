@@ -44,13 +44,6 @@ logger = init_logger(__name__)
 
 
 def multi_block_store_enabled() -> bool:
-    """Mirror the compiler's gate (rebel ``_pt_triton_attn.multi_block_store_enabled``).
-
-    The multi-block STEP1 store -- which lets a single prefill chunk span
-    several KV blocks -- is compiled into the in-memory flash-causal kernel only
-    when both flags are set. Read straight from ``os.environ`` (not vllm_rbln
-    envs) so it reflects exactly what the compiler saw at build time.
-    """
     return os.environ.get("RBLN_USE_MULTI_BLOCK_ATTN", "0").lower() in (
         "1",
         "true",
@@ -80,20 +73,10 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
-        #
-        # By default the sub-block size is pinned to the prefill chunk size
-        # (max_num_batched_tokens) so that each prefill stays within one KV
-        # block. When the multi-block attention store is compiled in, a chunk
-        # may span several blocks, so the sub-block size can be set smaller and
-        # independently via VLLM_RBLN_SUB_BLOCK_SIZE. That decouples the
-        # prefix-caching granularity (smaller -> higher hit rate) from the
-        # prefill chunk size (larger -> higher throughput).
         if sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
             chunk_size = self.scheduler_config.max_num_batched_tokens
             configured = envs.VLLM_RBLN_SUB_BLOCK_SIZE
             if configured > 0 and multi_block_store_enabled():
-                # Decoupled: a chunk of chunk_size tokens may now cross block
-                # boundaries; the multi-block kernel store scatters it.
                 sub_block_size = configured
             else:
                 if configured > 0:
@@ -157,10 +140,6 @@ class RBLNScheduler(Scheduler):
                     sub_block_size,
                 )
         elif envs.VLLM_RBLN_SUB_BLOCK_SIZE > 0 and multi_block_store_enabled():
-            # The user asked to decouple the sub-block size but sub-block prefix
-            # caching did not activate (prefix caching disabled, or block_size is
-            # not a multiple of the requested sub-block size), so the setting had
-            # no effect. Surface it rather than silently ignoring it.
             logger.warning(
                 "VLLM_RBLN_SUB_BLOCK_SIZE=%d had no effect: sub-block prefix "
                 "caching is not active (needs enable_prefix_caching and "
