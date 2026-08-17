@@ -213,6 +213,9 @@ class RBLNFlashAttentionMetadataBuilder(
         if is_prefill:
             # NOTE(RBLN): block_tables_tensor for prefill must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
+            # NOTE(RBLN): entries beyond num_blocks_per_row must stay 0 -- the
+            # padded prefill's multi-block store can address block start_blk+1.
+            # See docs/sub_block_prefix_caching.md.
             if not self.is_causal:
                 prefill_chunk_size = self.chunked_prefill_size
                 chunked_attention_mask = torch.zeros(
