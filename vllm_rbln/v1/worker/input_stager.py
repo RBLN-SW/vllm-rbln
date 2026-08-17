@@ -26,6 +26,8 @@ class InputLayout:
     query_len_padded: int
     input_pad_value: int = 0
     position_pad_value: int = 0
+    hidden_state_pad_value: float = 0.0
+    token_index_pad_value: int = 0
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -45,6 +47,8 @@ class StagedModelInputs:
     intermediate_tensors: torch.Tensor | None
     inputs_embeds: torch.Tensor | None
     token_indices: torch.Tensor | None
+    # For Eagle3 drafter
+    hidden_states: torch.Tensor | None = None
 
     def as_kwargs(self) -> dict[str, Any]:
         return {
@@ -60,6 +64,7 @@ class InputStager:
     def __init__(self, device: torch.device):
         self.device = device
         self._buffers: dict[tuple, InputBuffer] = {}
+        self._hidden_state_buffers: dict[tuple, torch.Tensor] = {}
         self._token_indices_buffers: dict[tuple[torch.dtype, int], torch.Tensor] = {}
 
     def stage(
@@ -70,6 +75,7 @@ class InputStager:
         intermediate_tensors: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         token_indices: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
         layout: InputLayout,
     ) -> StagedModelInputs:
         buf = self._get_or_create_buffer(layout, input_ids, positions)
@@ -92,7 +98,8 @@ class InputStager:
             positions=buf.positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
-            token_indices=self._stage_token_indices(token_indices),
+            token_indices=self._stage_token_indices(token_indices, layout),
+            hidden_states=self._stage_hidden_states(hidden_states, layout),
         )
 
     def _get_or_create_buffer(
@@ -124,21 +131,50 @@ class InputStager:
         self._buffers[key] = buf
         return buf
 
+    def _stage_hidden_states(
+        self,
+        hidden_states: torch.Tensor | None,
+        layout: InputLayout,
+    ) -> torch.Tensor | None:
+        if hidden_states is None:
+            return None
+
+        key = (layout.shape, hidden_states.dtype, hidden_states.shape[-1])
+        if (buf := self._hidden_state_buffers.get(key)) is None:
+            buf = torch.empty(
+                (*layout.shape, hidden_states.shape[-1]),
+                dtype=hidden_states.dtype,
+                device=self.device,
+            )
+            self._hidden_state_buffers[key] = buf
+
+        buf.fill_(layout.hidden_state_pad_value)
+        buf[: layout.num_reqs, : layout.query_len].copy_(
+            hidden_states,
+            non_blocking=True,
+        )
+        return buf
+
     def _stage_token_indices(
         self,
         token_indices: torch.Tensor | None,
+        layout: InputLayout,
     ) -> torch.Tensor | None:
         if token_indices is None:
             return None
 
-        key = (token_indices.dtype, token_indices.numel())
+        num_indices = token_indices.shape[0]
+        assert num_indices <= layout.num_reqs_padded
+
+        key = (token_indices.dtype, layout.num_reqs_padded)
         if (buf := self._token_indices_buffers.get(key)) is None:
             buf = torch.empty(
-                token_indices.shape,
+                layout.num_reqs_padded,
                 dtype=token_indices.dtype,
                 device=self.device,
             )
             self._token_indices_buffers[key] = buf
 
-        buf.copy_(token_indices, non_blocking=True)
+        buf.fill_(layout.token_index_pad_value)
+        buf[:num_indices].copy_(token_indices, non_blocking=True)
         return buf

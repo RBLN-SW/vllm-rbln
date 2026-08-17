@@ -102,27 +102,31 @@ def _call_propose(proposer, target_hidden_states=None):
     )
 
 
-class TestSetInputsFirstPass:
-    def test_default_eagle_shifts_tokens_and_inserts_next(self):
+class TestPreprocess:
+    # _preprocess also builds the first-pass draft input ids (formerly
+    # set_inputs_first_pass) whenever target_token_ids is passed.
+    @staticmethod
+    def _first_pass(proposer, token_indices_to_sample):
+        return proposer._preprocess(
+            3,
+            3,
+            9,
+            torch.arange(9, dtype=torch.int64),
+            torch.zeros(9, proposer.hidden_size),
+            is_prefill=False,
+            token_indices_to_sample=token_indices_to_sample,
+            target_token_ids=torch.arange(11, 20, dtype=torch.int32),
+            next_token_ids=torch.tensor([100, 200, 300], dtype=torch.int32),
+            cad=make_cad([0, 3, 5, 9], [3, 5, 4]),
+        )
+
+    def test_first_pass_shifts_tokens_and_inserts_next(self):
         # Three requests, query_lens [3, 2, 4]. The target ids shift left by one
         # (drop the first) and each request's next token lands at its last slot.
         proposer = make_eagle_proposer()
-        cad = make_cad([0, 3, 5, 9], [3, 5, 4])
-        target_token_ids = torch.arange(11, 20, dtype=torch.int32)  # 9 tokens
-        next_token_ids = torch.tensor([100, 200, 300], dtype=torch.int32)
-        positions = torch.arange(9, dtype=torch.int64)
-        hidden = torch.zeros(9, proposer.hidden_size)
-
-        num_tokens, token_indices = proposer.set_inputs_first_pass(
-            target_token_ids=target_token_ids,
-            next_token_ids=next_token_ids,
-            target_positions=positions,
-            target_hidden_states=hidden,
-            token_indices_to_sample=None,  # defaults to query_start_loc[1:] - 1
-            cad=cad,
-        )
-        assert num_tokens == 9
-        assert token_indices.cpu().tolist() == [2, 4, 8]
+        # None token indices default to query_start_loc[1:] - 1.
+        _, _, _, tip = self._first_pass(proposer, None)
+        assert tip.cpu().tolist() == [2, 4, 8]
         # shifted target [12..19] with next tokens overwritten at [2, 4, 8].
         assert proposer.input_ids[:9].cpu().tolist() == [
             12,
@@ -135,22 +139,15 @@ class TestSetInputsFirstPass:
             19,
             300,
         ]
-        assert proposer.positions[:9].cpu().tolist() == list(range(9))
 
-    def test_uses_explicit_token_indices_verbatim(self):
-        # A given token_indices_to_sample is used as-is (not recomputed from
+    def test_first_pass_uses_explicit_token_indices_verbatim(self):
+        # Given token indices are used as-is (not recomputed from
         # query_start_loc); the next tokens land at exactly those slots.
         proposer = make_eagle_proposer()
-        num_tokens, token_indices = proposer.set_inputs_first_pass(
-            target_token_ids=torch.arange(11, 20, dtype=torch.int32),
-            next_token_ids=torch.tensor([100, 200, 300], dtype=torch.int32),
-            target_positions=torch.arange(9, dtype=torch.int64),
-            target_hidden_states=torch.zeros(9, proposer.hidden_size),
-            token_indices_to_sample=torch.tensor([0, 3, 8], dtype=torch.int64),
-            cad=make_cad([0, 3, 5, 9], [3, 5, 4]),
+        _, _, _, tip = self._first_pass(
+            proposer, torch.tensor([0, 3, 8], dtype=torch.int64)
         )
-        assert num_tokens == 9
-        assert token_indices.cpu().tolist() == [0, 3, 8]
+        assert tip.cpu().tolist() == [0, 3, 8]
         assert proposer.input_ids[:9].cpu().tolist() == [
             100,
             13,
@@ -163,51 +160,56 @@ class TestSetInputsFirstPass:
             300,
         ]
 
-    def test_rejects_extra_input_slots(self):
-        # Draft-model / parallel-drafting / dflash paths (needs_extra_input_slots)
-        # are unsupported; this guard trips when one is later enabled.
-        proposer = make_eagle_proposer()
-        proposer.needs_extra_input_slots = True
-        with pytest.raises(NotImplementedError):
-            proposer.set_inputs_first_pass(
-                target_token_ids=torch.arange(4, dtype=torch.int32),
-                next_token_ids=torch.tensor([1], dtype=torch.int32),
-                target_positions=torch.arange(4, dtype=torch.int64),
-                target_hidden_states=torch.zeros(4, proposer.hidden_size),
-                token_indices_to_sample=None,
-                cad=make_cad([0, 4], [4]),
-            )
-
-
-class TestPreprocess:
-    def test_prefill_views_full_buffers(self):
-        # Prefill reshapes the whole (max_num_tokens,) buffer to [num_reqs, -1];
-        # token indices pass through unpadded (num_reqs already the padded width).
+    def test_prefill_pads_query_dim_to_max_tokens(self):
+        # Prefill stages the request into the full (1, max_num_tokens) graph
+        # shape, zeroing everything past the scheduled tokens.
         proposer = make_eagle_proposer()
         n = proposer.max_num_tokens
-        proposer.input_ids[:] = torch.arange(n, dtype=torch.int32)
-        token_indices = torch.tensor([0, 32, 64, 96], dtype=torch.int32)
+        proposer.input_ids[:] = -1
+        proposer.input_ids[:4] = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
 
         input_ids, positions, hidden, tip = proposer._preprocess(
-            4, 4, n, token_indices, True
+            1,
+            1,
+            4,
+            proposer.positions[:4],
+            proposer.hidden_states[:4],
+            is_prefill=True,
+            token_indices_to_sample=torch.tensor([3], dtype=torch.int32),
         )
-        assert input_ids.shape == (4, n // 4)
-        assert positions.shape == (4, n // 4)
-        assert hidden.shape == (4, n // 4, proposer.hidden_size)
-        assert tip.cpu().tolist() == [0, 32, 64, 96]
+        assert input_ids.shape == (1, n)
+        assert positions.shape == (1, n)
+        assert hidden.shape == (1, n, proposer.hidden_size)
+        assert input_ids[0, :4].cpu().tolist() == [10, 11, 12, 13]
+        assert not input_ids[0, 4:].cpu().any()
+        assert tip.cpu().tolist() == [3]
 
     def test_decode_slices_and_pads_to_bucket(self):
         # Decode slices the used tokens, reshapes to [num_reqs, -1], then pads
         # rows and token indices up to the padded batch (here 2 -> 4) with zeros.
+        # positions and hidden states come from the caller (the target's), never
+        # from the drafter's own buffers, so they carry distinct values here.
         proposer = make_eagle_proposer()
         proposer.input_ids[:] = -1
         proposer.input_ids[:4] = torch.tensor([10, 11, 20, 21], dtype=torch.int32)
+        target_hidden = torch.full(
+            (4, proposer.hidden_size), 3.0, dtype=proposer.hidden_states.dtype
+        )
 
-        input_ids, _, hidden, tip = proposer._preprocess(
-            2, 4, 4, torch.tensor([1, 3], dtype=torch.int32), False
+        input_ids, positions, hidden, tip = proposer._preprocess(
+            2,
+            4,
+            4,
+            torch.tensor([7, 8, 9, 10], dtype=torch.int64),
+            target_hidden,
+            is_prefill=False,
+            token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
         )
         assert input_ids.cpu().tolist() == [[10, 11], [20, 21], [0, 0], [0, 0]]
+        assert positions.cpu().tolist() == [[7, 8], [9, 10], [0, 0], [0, 0]]
         assert hidden.shape == (4, 2, proposer.hidden_size)
+        assert hidden[:2].cpu().eq(3.0).all()
+        assert not hidden[2:].cpu().any()
         assert tip.cpu().tolist() == [1, 3, 0, 0]
 
 
@@ -350,6 +352,22 @@ class TestInitGuards:
         with pytest.raises(NotImplementedError):
             make_eagle_proposer()
 
+    def test_rejects_extra_input_slots(self, monkeypatch):
+        # Parallel drafting / draft-model spec decode needs input slots the
+        # staged drafter inputs have no room for; construction, not the first
+        # propose, must be where that trips.
+        from vllm.v1.spec_decode.eagle import EagleProposer
+
+        base_init = EagleProposer.__init__
+
+        def init_with_extra_slots(self, *args, **kwargs):
+            base_init(self, *args, **kwargs)
+            self.needs_extra_input_slots = True
+
+        monkeypatch.setattr(EagleProposer, "__init__", init_with_extra_slots)
+        with pytest.raises(NotImplementedError, match="extra input slots"):
+            make_eagle_proposer()
+
 
 class TestPropose:
     def test_single_step_early_exit_argmaxes_once(self, monkeypatch):
@@ -452,7 +470,9 @@ class TestLoadModel:
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", False
         )
-        proposer.runner = SimpleNamespace(compile_context=object())
+        proposer.runner = SimpleNamespace(
+            compile_context=object(), runtime_holder=[None]
+        )
 
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
