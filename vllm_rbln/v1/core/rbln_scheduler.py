@@ -139,14 +139,6 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
-        elif envs.VLLM_RBLN_SUB_BLOCK_SIZE > 0 and multi_block_store_enabled():
-            logger.warning(
-                "VLLM_RBLN_SUB_BLOCK_SIZE=%d had no effect: sub-block prefix "
-                "caching is not active (needs enable_prefix_caching and "
-                "block_size %% sub_block_size == 0 with block_size > "
-                "sub_block_size).",
-                envs.VLLM_RBLN_SUB_BLOCK_SIZE,
-            )
 
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was
