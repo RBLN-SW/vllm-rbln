@@ -60,31 +60,32 @@ def _wire_runner(proposer, *, num_reqs):
     ]
 
 
-def _fake_model_exec(argmax_tokens, hidden_size):
-    # The load_model wrapper contract: (hidden [n, H], logits) with a
-    # controllable per-row argmax, reshaped so the multi-step loop can feed it back.
+def _fake_model_exec(draft_tokens, hidden_size):
+    # The load_model wrapper contract: (hidden [n, H], in-graph argmax ids),
+    # reshaped so the multi-step loop can feed the hidden states back.
     def executable(
         *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
     ):
-        logits = torch.full((8, 128), -10.0)
-        for i, tok in enumerate(argmax_tokens):
-            logits[i, tok] = 10.0
-        return hidden_states.reshape(-1, hidden_size), logits
+        ids = torch.zeros(8, dtype=torch.int64)
+        ids[: len(draft_tokens)] = torch.tensor(draft_tokens, dtype=torch.int64)
+        return hidden_states.reshape(-1, hidden_size), ids
 
     return executable
 
 
 def _echo_model_exec(hidden_size):
-    # argmax = first input id + 1, so consecutive columns are the observable
-    # signature that the loop feeds each step's output forward.
+    # Draft id = first input id + 1, so consecutive columns are the observable
+    # signature that the loop feeds each step's output forward. The ids tensor is
+    # reused across calls like the compiled graph's static output, so a draft kept
+    # by reference would collapse every column into the last step's.
+    draft_ids = torch.zeros(8, dtype=torch.int64)
+
     def executable(
         *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
     ):
-        rows = input_ids.reshape(input_ids.shape[0], -1)[:, 0].tolist()
-        logits = torch.full((8, 128), -10.0)
-        for i, val in enumerate(rows):
-            logits[i, (int(val) + 1) % 128] = 10.0
-        return hidden_states.reshape(-1, hidden_size), logits
+        rows = input_ids.reshape(input_ids.shape[0], -1)[:, 0]
+        draft_ids[: rows.shape[0]] = (rows.long() + 1) % 128
+        return hidden_states.reshape(-1, hidden_size), draft_ids
 
     return executable
 
@@ -368,11 +369,19 @@ class TestInitGuards:
         with pytest.raises(NotImplementedError, match="extra input slots"):
             make_eagle_proposer()
 
+    def test_rejects_non_greedy_draft_sampling(self, monkeypatch):
+        # The greedy pick happens inside the draft graph, which returns ids and
+        # not logits, so a probabilistic sampler would be silently ignored.
+        spec_config = make_eagle_proposer().vllm_config.speculative_config
+        monkeypatch.setattr(spec_config, "draft_sample_method", "probabilistic")
+        with pytest.raises(NotImplementedError, match="draft_sample_method"):
+            make_eagle_proposer()
+
 
 class TestPropose:
-    def test_single_step_early_exit_argmaxes_once(self, monkeypatch):
+    def test_single_step_early_exit_takes_ids_once(self, monkeypatch):
         # num_speculative_tokens == 1 takes the early-exit branch: one model pass,
-        # per-request argmax, shaped [num_reqs, 1].
+        # the graph's ids sliced per request, shaped [num_reqs, 1].
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=1)
         _wire_runner(proposer, num_reqs=2)
@@ -481,7 +490,7 @@ class TestLoadModel:
 
     def test_eager_wrapper_composes_model_forward(self, monkeypatch):
         # The eager wrapper runs the draft model, reshapes the hidden states,
-        # keeps the sampled positions, and returns (hidden, compute_logits).
+        # keeps the sampled positions, and returns (hidden, in-graph argmax).
         from vllm.v1.spec_decode.eagle import EagleProposer
 
         class _FakeModel:
@@ -489,7 +498,7 @@ class TestLoadModel:
                 return hidden_states  # a single tensor -> model_returns_tuple False
 
             def compute_logits(self, sample_hidden_states):
-                return sample_hidden_states + 1
+                return sample_hidden_states
 
         monkeypatch.setattr(
             EagleProposer,
@@ -504,17 +513,18 @@ class TestLoadModel:
         proposer.load_model(target_model=object())
 
         h = proposer.hidden_size
-        hidden = torch.arange(4, dtype=torch.float32).reshape(4, 1).repeat(1, h)
-        out_hidden, out_logits = proposer.model_executable(
+        # Row i peaks at column i + 1, so the ids identify the rows kept.
+        hidden = torch.zeros(4, h)
+        hidden[torch.arange(4), torch.arange(4) + 1] = 1.0
+        out_hidden, draft_ids = proposer.model_executable(
             input_ids=torch.zeros(4, dtype=torch.int32),
             positions=torch.zeros(4, dtype=torch.int64),
             hidden_states=hidden,
             token_indices_to_sample=torch.tensor([0, 2], dtype=torch.int64),
         )
-        # rows 0 and 2 survive the index_select; compute_logits adds one.
+        # rows 0 and 2 survive the index_select; the argmax is taken in-graph.
         assert out_hidden.shape == (2, h)
-        assert out_hidden[:, 0].cpu().tolist() == [0.0, 2.0]
-        assert out_logits[:, 0].cpu().tolist() == [1.0, 3.0]
+        assert draft_ids.cpu().tolist() == [1, 3]
 
 
 class TestDummyRun:
@@ -556,7 +566,7 @@ class TestDummyRun:
             calls.append(1)
             return kwargs["hidden_states"].reshape(
                 -1, proposer.hidden_size
-            ), torch.zeros((8, 128))
+            ), torch.zeros(8, dtype=torch.int64)
 
         proposer.model_executable = executable
 
@@ -604,7 +614,7 @@ class TestDummyRun:
             calls.append(1)
             return kwargs["hidden_states"].reshape(
                 -1, proposer.hidden_size
-            ), torch.zeros((8, 128))
+            ), torch.zeros(8, dtype=torch.int64)
 
         proposer.model_executable = executable
         proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)

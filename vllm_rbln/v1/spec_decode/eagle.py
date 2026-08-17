@@ -64,6 +64,11 @@ class RBLNEagleProposer(EagleProposer):
                 "vllm-rbln does not support EAGLE extra input slots required for "
                 "parallel drafting or draft-model speculative decoding yet."
             )
+        draft_sample_method = self.speculative_config.draft_sample_method
+        if draft_sample_method != "greedy":
+            raise NotImplementedError(
+                f"draft_sample_method={draft_sample_method!r} is not implemented yet."
+            )
 
         self.runner = runner
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
@@ -138,7 +143,7 @@ class RBLNEagleProposer(EagleProposer):
             num_padded_tokens=num_padded_tokens,
             **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
         ):
-            hidden_states, logits = self.model_executable(
+            hidden_states, draft_ids = self.model_executable(
                 input_ids=input_ids,
                 positions=positions,
                 hidden_states=hidden_states,
@@ -148,9 +153,7 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = self._to_target_token_ids(
-                logits[:num_reqs].argmax(dim=-1)
-            )
+            draft_tokens_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
 
         assert token_indices_to_sample_padded is not None
@@ -162,7 +165,7 @@ class RBLNEagleProposer(EagleProposer):
         # that gather inside `model_wrapper`. Doing it again would index an
         # already (num_reqs_padded, hidden_size) tensor with token-space
         # indices and raise on the first decode.
-        draft_token_ids = self._to_target_token_ids(logits[:num_reqs].argmax(dim=-1))
+        draft_token_ids = self._to_target_token_ids(draft_ids[:num_reqs])
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -241,7 +244,7 @@ class RBLNEagleProposer(EagleProposer):
                 num_padded_tokens=num_padded_tokens,
                 **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
             ):
-                hidden_states, logits = self.model_executable(
+                hidden_states, draft_ids = self.model_executable(
                     input_ids=staged_input_ids,
                     positions=staged_positions,
                     hidden_states=staged_hidden_states,
@@ -250,9 +253,7 @@ class RBLNEagleProposer(EagleProposer):
                 )
             # Mapped before the feed-back above: the draft head's input
             # embedding is in target space even when its output head is not.
-            draft_token_ids = self._to_target_token_ids(
-                logits[:num_reqs].argmax(dim=-1)
-            )
+            draft_token_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
@@ -271,7 +272,7 @@ class RBLNEagleProposer(EagleProposer):
         """
         d2t = self.draft_id_to_target_id
         if d2t is None:
-            return draft_token_ids
+            return draft_token_ids.long().clone()
         return draft_token_ids + d2t[draft_token_ids]
 
     def prepare_next_token_ids_padded(
@@ -399,7 +400,10 @@ class RBLNEagleProposer(EagleProposer):
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
 
-            return hidden_states, logits
+            # NOTE(RBLN): the greedy pick belongs in the graph.
+            # To support probabilistic sampling, we need to return
+            # the logits too.
+            return hidden_states, torch.ops.rbln.argmax(logits)
 
         if (
             self.vllm_config.speculative_config.enforce_eager
