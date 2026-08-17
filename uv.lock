@@ -2932,7 +2932,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils" },
-    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "~=0.11.1.dev0" },
+    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "~=0.11.2.dev256" },
     { name = "setuptools", specifier = ">=64" },
     { name = "setuptools-scm", specifier = ">=8" },
     { name = "setuptools-scm", marker = "extra == 'build'" },

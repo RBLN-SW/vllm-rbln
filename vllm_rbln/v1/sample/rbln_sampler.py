@@ -275,8 +275,8 @@ class RBLNSampler(VLLMSampler):
             raw_logprobs = processed_logprobs
         # Convert sampled token ids to int64 (long) type to ensure compatibility
         # with subsequent operations that may use these values as indices.
-        # This conversion is necessary because FlashInfer sampling operations
-        # return int32 (while PyTorch argmax and topk return int64).
+        # NOTE(RBLN): `rbln::top_k_top_p` and `rbln::argmax` return int32, which is
+        # the same reason upstream needs this on its FlashInfer backend.
         sampled = sampled.long()
 
         if num_logprobs is None:
