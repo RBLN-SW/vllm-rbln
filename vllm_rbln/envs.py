@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
+    VLLM_RBLN_SUB_BLOCK_SIZE: int = 0
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -335,6 +336,12 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
+    # Explicit sub-block size in tokens (0 = auto = max_num_batched_tokens).
+    # A positive value smaller than max_num_batched_tokens needs the multi-block
+    # attention store; see the field comment above.
+    "VLLM_RBLN_SUB_BLOCK_SIZE": lambda: int(
+        os.environ.get("VLLM_RBLN_SUB_BLOCK_SIZE", 0)
+    ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (
@@ -439,6 +446,7 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_AUTO_PORT",
         "VLLM_RBLN_SORT_BATCH",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
+        "VLLM_RBLN_SUB_BLOCK_SIZE",
         "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
     }
 )
