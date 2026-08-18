@@ -40,6 +40,7 @@ from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
+from vllm_rbln.v1.worker.dp_utils import determine_draft_batch_execution_and_padding
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager
 
 if TYPE_CHECKING:
@@ -99,9 +100,16 @@ class RBLNEagleProposer(EagleProposer):
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
+            cfg=self.runner.shape_config,
+            status=self.runner.dp_status,
+            dp_rank=self.dp_rank,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            is_prefill=is_prefill,
         )
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -194,11 +202,17 @@ class RBLNEagleProposer(EagleProposer):
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
 
-        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(
-                num_reqs, num_reqs, False, first_pass=False
-            )
+        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
+            cfg=self.runner.shape_config,
+            status=self.runner.dp_status,
+            dp_rank=self.dp_rank,
+            num_reqs=num_reqs,
+            num_tokens=num_reqs,
+            is_prefill=False,
+            first_pass=False,
         )
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         for token_index in range(self.num_speculative_tokens - 1):
             self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
             positions = positions.view(-1) + 1
@@ -471,10 +485,17 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata = self._build_dummy_attn_metadata(
             num_reqs, num_tokens_per_req
         )
-        num_reqs_padded, dp_padded, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
+            cfg=self.runner.shape_config,
+            status=self.runner.dp_status,
+            dp_rank=self.dp_rank,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            is_prefill=is_prefill,
+            pinned_num_tokens_padded=override_padded,
         )
-        num_padded_tokens = override_padded or dp_padded
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
 
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -535,12 +556,18 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
         common_attn_metadata.seq_lens += 1
 
-        num_reqs_padded, dp_padded, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(
-                num_reqs, num_reqs, False, first_pass=False
-            )
+        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
+            cfg=self.runner.shape_config,
+            status=self.runner.dp_status,
+            dp_rank=self.dp_rank,
+            num_reqs=num_reqs,
+            num_tokens=num_reqs,
+            is_prefill=False,
+            first_pass=False,
+            pinned_num_tokens_padded=override_padded,
         )
-        num_padded_tokens = override_padded or dp_padded
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         per_layer_attn_metadata.clear()
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -637,62 +664,3 @@ class RBLNEagleProposer(EagleProposer):
             staged.hidden_states,
             staged.token_indices,
         )
-
-    def _determine_draft_batch_padding(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        is_prefill: bool,
-        *,
-        first_pass: bool = True,
-    ) -> tuple[int, int | None, torch.Tensor | None]:
-        num_reqs_padded = (
-            self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
-            if not is_prefill
-            else num_reqs
-        )
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-        if dp_size == 1:
-            return num_reqs_padded, None, None
-
-        num_tokens_across_dp, num_reqs_across_dp, any_prefill = self._reuse_dp_status(
-            num_reqs, num_tokens, first_pass
-        )
-
-        num_tokens_padded = self.max_num_tokens
-        if self.runner.specialized_moe_decode and not is_prefill:
-            if any_prefill:
-                num_reqs_padded = self.runner.bucketing_manager.decode_batch_buckets[-1]
-            else:
-                num_reqs_padded = (
-                    self.runner.bucketing_manager.find_decode_batch_bucket(
-                        int(num_reqs_across_dp.max())
-                    )
-                )
-                max_tokens_per_req = int(
-                    (num_tokens_across_dp // num_reqs_across_dp).max()
-                )
-                num_tokens_padded = num_reqs_padded * max_tokens_per_req
-        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
-
-    def _reuse_dp_status(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        first_pass: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
-        dp_status = self.runner.dp_status
-        assert dp_status is not None, (
-            "dp_status is not saved from _determine_batch_padding"
-        )
-        num_tokens_across_dp, num_reqs_across_dp, any_prefill = dp_status
-        local_reqs = int(num_reqs_across_dp[self.dp_rank])
-        assert local_reqs == num_reqs
-
-        if first_pass:
-            local_tokens = int(num_tokens_across_dp[self.dp_rank])
-            assert local_tokens == num_tokens
-            return num_tokens_across_dp, num_reqs_across_dp, any_prefill
-
-        assert num_tokens == num_reqs
-        return num_reqs_across_dp.clone(), num_reqs_across_dp, False
