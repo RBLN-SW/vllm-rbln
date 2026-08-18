@@ -2067,17 +2067,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dtype=torch.int32,
             )
 
+        layout_num_reqs = num_reqs if self.is_prefill else num_reqs_padded
+
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
             intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                batch_size=num_tokens_unpadded,
+                batch_size=layout_num_reqs * num_tokens_per_req,
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
             intermediate_tensors = IntermediateTensors(
                 {
-                    k: v.view(num_reqs_padded, num_tokens_per_req, -1)
+                    k: v.view(layout_num_reqs, num_tokens_per_req, -1)
                     for k, v in intermediate_tensors.items()
                 }
             )
@@ -2091,7 +2093,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             token_indices=token_indices,
             layout=InputLayout(
                 num_reqs=num_reqs,
-                num_reqs_padded=num_reqs if self.is_prefill else num_reqs_padded,
+                num_reqs_padded=layout_num_reqs,
                 query_len=num_tokens_per_req,
                 query_len_padded=num_tokens_per_req,
             ),

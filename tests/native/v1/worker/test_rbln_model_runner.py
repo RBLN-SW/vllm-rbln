@@ -355,7 +355,7 @@ class TestDummyRunPadding:
     # not this rank's own count. #894 was the layout keeping num_reqs while the
     # attention metadata already used num_reqs_padded.
     @staticmethod
-    def _runner(monkeypatch, *, reqs_across_dp, specialized=True):
+    def _runner(monkeypatch, *, reqs_across_dp, specialized=True, first_rank=True):
         captured: dict = {}
 
         def fake_across_dp(num_tokens, num_reqs, dp_size, dp_rank, is_prefill):
@@ -364,7 +364,7 @@ class TestDummyRunPadding:
             return reqs.clone(), None if is_prefill else reqs
 
         monkeypatch.setattr(
-            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first_rank)
         )
         monkeypatch.setattr(
             mr, "set_forward_context", lambda *a, **kw: contextlib.nullcontext()
@@ -380,9 +380,19 @@ class TestDummyRunPadding:
 
         def stage(**kwargs):
             captured["layout"] = kwargs["layout"]
+            captured["intermediate"] = kwargs.get("intermediate_tensors")
             return SimpleNamespace(as_kwargs=lambda: {})
 
+        def make_empty(*, batch_size, dtype, device):
+            return {
+                k: torch.zeros(batch_size, 8, dtype=dtype)
+                for k in ("hidden_states", "residual")
+            }
+
         runner = _make_runner_stub(
+            model=SimpleNamespace(make_empty_intermediate_tensors=make_empty),
+            model_config=SimpleNamespace(dtype=torch.float32),
+            device=torch.device("cpu"),
             # Two buckets, so a padded count can differ from a raw one at all.
             bucketing_manager=ExponentialBucketingManager(
                 max_batch_size=2, min_batch_size=1, limit=2, step=2
@@ -437,6 +447,19 @@ class TestDummyRunPadding:
 
         # Each rank keeps its own bucket, so a peer at bucket 2 disagrees.
         assert captured["layout"].num_reqs_padded == 1
+
+    def test_pp_nonfirst_intermediate_preserves_hidden(self, monkeypatch):
+        runner, captured = self._runner(
+            monkeypatch, reqs_across_dp=[2, 1, 1, 1], first_rank=False
+        )
+        runner._dummy_run(1, 4, is_prefill=True)
+
+        it = captured["intermediate"]
+        assert it is not None
+        for key in ("hidden_states", "residual"):
+            hs = it[key]
+            assert hs.ndim == 3
+            assert hs.shape[:2] == (captured["layout"].num_reqs_padded, 4)
 
 
 class TestProcessKvCacheCopyOps:
