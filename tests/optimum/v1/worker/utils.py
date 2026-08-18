@@ -72,16 +72,28 @@ DEVICE = current_platform.device_type
 
 class MockModelWrapper(nn.Module):
     class MockModel:
-        def __init__(self, dtype: torch.dtype):
-            self.rbln_config = SimpleNamespace(use_multiple_decoder=False, dtype=dtype)
+        def __init__(
+            self, dtype: torch.dtype, decoder_batch_sizes: tuple[int, ...] | None
+        ):
+            self.rbln_config = SimpleNamespace(
+                use_multiple_decoder=decoder_batch_sizes is not None, dtype=dtype
+            )
             self.kv_block_adapter = SimpleNamespace(
                 get_available_num_blocks=lambda: NUM_BLOCKS
             )
 
-    def __init__(self, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        dtype: torch.dtype = torch.float32,
+        decoder_batch_sizes: tuple[int, ...] | None = None,
+    ):
         super().__init__()
-        self.model = self.MockModel(dtype)
+        self.model = self.MockModel(dtype, decoder_batch_sizes)
         self.dtype = self.model.rbln_config.dtype
+        if decoder_batch_sizes is not None:
+            # Ascending, like RBLNOptimumDecoderMixin.setup_decoder_mixin
+            # stores the compiled decoder batch sizes.
+            self.decoder_batch_sizes = decoder_batch_sizes
 
     def compute_logits(
         self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata
@@ -89,7 +101,10 @@ class MockModelWrapper(nn.Module):
         return hidden_states
 
 
-def fake_load_model(runner: RBLNOptimumModelRunner):
+def fake_load_model(
+    runner: RBLNOptimumModelRunner,
+    decoder_batch_sizes: tuple[int, ...] | None = None,
+):
     model_dtype = runner.model_config.dtype
 
     def fake_forward(model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
@@ -102,7 +117,9 @@ def fake_load_model(runner: RBLNOptimumModelRunner):
             device=runner.device,
         )
 
-    runner.model = MockModelWrapper(dtype=model_dtype)
+    runner.model = MockModelWrapper(
+        dtype=model_dtype, decoder_batch_sizes=decoder_batch_sizes
+    )
     runner.use_optimum_lora = False
     # Assign the fake forward function to the model
     runner.model.forward = fake_forward
@@ -389,7 +406,9 @@ def _schedule_cached_reqs(
 
 
 def create_model_runner(
-    max_num_seqs: int = MAX_NUM_SEQ, dtype: torch.dtype = torch.float
+    max_num_seqs: int = MAX_NUM_SEQ,
+    dtype: torch.dtype = torch.float,
+    decoder_batch_sizes: tuple[int, ...] | None = None,
 ):
     vllm_config = get_vllm_config(max_num_seqs=max_num_seqs, dtype=dtype)
     with set_current_vllm_config(vllm_config, check_compile=False):
@@ -406,7 +425,7 @@ def create_model_runner(
             1,
         )
     runner = RBLNOptimumModelRunner(vllm_config, DEVICE)
-    fake_load_model(runner)
+    fake_load_model(runner, decoder_batch_sizes)
     return runner
 
 
