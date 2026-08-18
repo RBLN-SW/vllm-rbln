@@ -3,7 +3,10 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-require_env HF_TOKEN
+# HF_HOME matters more under HF_HUB_OFFLINE: an unset one silently becomes a
+# cold ~/.cache/huggingface, which offline mode turns into a confusing
+# LocalEntryNotFoundError deep inside a test instead of a slow first download.
+require_env HF_TOKEN HF_HOME
 
 args=(
   tests/native

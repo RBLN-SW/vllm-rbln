@@ -6,6 +6,16 @@ env:
   UV_CACHE_DIR: "/root/.cache/uv"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
+  # vLLM lists a model's repo files at every engine init, and that call goes to
+  # the Hub API even when HF_HOME already holds the model. The budget is 2500
+  # calls per 5 minutes per account, charged to the one account these lanes
+  # authenticate as, so five concurrent builds drained it and killed a run with
+  # a 429. Offline mode serves the cache and makes the call count zero.
+  #
+  # The nightly lanes stay online, so they are what warms the cache for a newly
+  # added model. Re-run a build with HF_HUB_OFFLINE=0 when a PR needs a model
+  # the cache has not seen yet.
+  HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-1}"
 
 _if_changed: &if_changed
   include:
