@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import itertools
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,13 +42,6 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
 logger = init_logger(__name__)
 
 
-def multi_block_store_enabled() -> bool:
-    return os.environ.get("RBLN_USE_MULTI_BLOCK_ATTN", "0").lower() in (
-        "1",
-        "true",
-    ) and os.environ.get("RBLN_EXP_USE_GCE", "0").lower() in ("1", "true")
-
-
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
     """SchedulerOutput extended with KV cache copy operations for sub-block
@@ -76,20 +68,7 @@ class RBLNScheduler(Scheduler):
         if sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
             chunk_size = self.scheduler_config.max_num_batched_tokens
             configured = envs.VLLM_RBLN_SUB_BLOCK_SIZE
-            if configured > 0 and multi_block_store_enabled():
-                sub_block_size = configured
-            else:
-                if configured > 0:
-                    logger.warning(
-                        "VLLM_RBLN_SUB_BLOCK_SIZE=%d ignored: decoupling the "
-                        "sub-block size from the prefill chunk size requires "
-                        "the multi-block attention store "
-                        "(RBLN_USE_MULTI_BLOCK_ATTN=1 and RBLN_EXP_USE_GCE=1). "
-                        "Falling back to max_num_batched_tokens=%d.",
-                        configured,
-                        chunk_size,
-                    )
-                sub_block_size = chunk_size
+            sub_block_size = configured if configured > 0 else chunk_size
         if (
             self.cache_config.enable_prefix_caching
             and sub_block_size
@@ -551,7 +530,13 @@ class RBLNScheduler(Scheduler):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
+                            # Sub-block hits are local prefix cache hits too, so
+                            # they belong in num_cached_tokens. Leaving them out
+                            # under-reports the hit length by the sub-block
+                            # extension.
+                            num_local_cached_tokens=(
+                                num_new_local_computed_tokens + num_sub_block_tokens
+                            ),
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
                 else:
