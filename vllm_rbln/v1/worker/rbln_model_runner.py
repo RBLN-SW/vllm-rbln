@@ -1544,6 +1544,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+            if not input_fits_in_drafter:
+                # Zero out draft tokens so the scheduler does not schedule
+                # stale drafts from the previous step. Matches upstream's
+                # `gpu_model_runner`, which is why `take_draft_token_ids`
+                # needs no `None` case.
+                self._draft_token_ids = torch.zeros(
+                    1, device=self.device, dtype=torch.int32
+                ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -3016,6 +3025,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             # 5. specdec (medusa)
             if self.speculative_config and self.speculative_config.method == "medusa":
+                assert isinstance(self.drafter, RBLNMedusaProposer)
                 self.drafter.dummy_run()
 
         mega_cache.save(self.model_config.model, sig)
