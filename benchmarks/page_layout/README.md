@@ -21,6 +21,7 @@ entire effect under test is absent.
 |---|---|
 | `serve.sh` | launches one of the two modes; everything else held equal |
 | `run_suite.sh` | the paired suite: warmup, seeds, interleaved workloads |
+| `repeat.sh` | N replays of one fixed workload against a reset cache -- the protocol below |
 | `analyze.py` | pairs the two modes by (workload, seed), reports deltas and a Welch t |
 | `probe_greedy.py` | fixed prompts at temperature 0, for a correctness diff |
 | `diff_probe.py` | byte-diffs two probe outputs |
@@ -28,13 +29,22 @@ entire effect under test is absent.
 
 ## Prerequisites
 
-The multi-turn driver lives in the vLLM **source tree** (it is not in the wheel),
-so point at a checkout:
+The multi-turn driver lives in the vLLM **source tree**, not in the wheel, so it
+has to be cloned. Pin it to the tag matching the installed wheel (`vllm==0.24.0`,
+see `pyproject.toml`) -- the driver is an HTTP client and mostly tolerates skew,
+but a pinned checkout is the difference between a rerun that reproduces and one
+that merely resembles:
 
 ```bash
-export VLLM_REPO=$HOME/workspace/vllm     # must contain benchmarks/multi_turn/
-pip install -r "$VLLM_REPO/benchmarks/multi_turn/requirements.txt"
+git clone --depth 1 --branch v0.24.0 \
+    https://github.com/vllm-project/vllm.git "$HOME/workspace/vllm"
+export VLLM_REPO=$HOME/workspace/vllm
+uv pip install --python "$(git rev-parse --show-toplevel)/.venv/bin/python" \
+    -r "$VLLM_REPO/benchmarks/multi_turn/requirements.txt"
 ```
+
+If the checkout already exists, check what it is on before trusting a
+measurement: `git -C "$VLLM_REPO" describe --tags`.
 
 The generators draw their filler text from a Project Gutenberg book, resolved
 relative to the results directory:
@@ -90,10 +100,28 @@ every run precisely so this is visible after the fact. Compare *within* a paired
 suite, and treat the prefix cache hit rate — which is internal to the engine — as
 the robust metric.
 
-**3. One run per mode can report the wrong sign.** The first version of this
-comparison did: it ran the two modes against differently composed workloads and
-concluded page layout was 8.8% faster. The paired protocol reversed that. Use at
-least three seeds and read the 95% CI that `analyze.py` prints.
+**3. One run per mode can report the wrong sign, and the suite is the wrong
+instrument for a small difference.** Two versions of this comparison reported
+opposite signs from single runs. Aggregating a suite is what makes that possible:
+it mixes short with long across seeds, and hit rate swings 15.6 points between
+seeds alone. Use `repeat.sh` instead, which fixes the workload and clears the
+cache between repetitions:
+
+```bash
+VLLM_REPO=$VLLM_REPO ./repeat.sh <tag> 5 long 1
+```
+
+It needs `POST /reset_prefix_cache`, which `serve.sh` enables through
+`VLLM_SERVER_DEV_MODE=1`, and refuses to start without it -- a silently failed
+reset would let every repetition inherit the previous one's cache. It also
+discards the first three runs: a fresh serve is still warming up something
+outside the prefix cache, and hit rate tracks runtime at `r = -0.892` until it
+settles. Measuring inside that transient is what produced both wrong signs, since
+the two modes warm up in opposite directions.
+
+After warm-up the instrument resolves about 1 point (sd 1.02, n=7), so five
+repetitions per arm separate a 2-point difference. Decide the threshold before
+the run, not after.
 
 **4. The greedy probe cannot validate correctness on a DP serve.** Wrong KV
 addressing here is silent *and reads faster* — output length is fixed, so every
