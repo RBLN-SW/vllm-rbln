@@ -1119,6 +1119,29 @@ class RBLNScheduler(Scheduler):
                 cached.new_block_ids[i] = (list(delta),) if delta else None
             self._sent_kernel_block_counts[req_id] = len(kernel_blocks)
 
+    def _inflight_prefill_reserved_blocks(self) -> int:
+        """What in-flight prefills have spoken for, rounded per request to groups.
+
+        Upstream sums the pages each one still needs, which under page layout
+        under-reserves exactly where it matters: four prefills a page short each
+        have to open a whole kernel block, and their sum -- four pages -- reads
+        as one. It also over-reserves the pages they can still take from their
+        own Open group. Both are per-request facts, so the rounding has to happen
+        before the sum, not after. Reported in pages, as whole groups, so it
+        passes through `allocate_slots`'s conversion untouched.
+        """
+        manager = self.kv_cache_manager
+        if not isinstance(manager, RBLNPageLayoutKVCacheManager):
+            return super()._inflight_prefill_reserved_blocks()
+
+        ppe = manager.geometry.pages_per_kernel_block
+        return ppe * sum(
+            manager.pool.kernel_blocks_needed(
+                self._request_remaining_blocks(request), owner=request.request_id
+            )
+            for request in self._inflight_prefills
+        )
+
     def _preempt_request(
         self, request: Request, timestamp: float
     ) -> dict[str, Any] | None:

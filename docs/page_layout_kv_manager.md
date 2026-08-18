@@ -224,6 +224,13 @@ group has free slots R1 forbids it from touching. Since this is the number
 `KVCacheManager` gates on, one count drives both admission and allocation, and
 running out becomes a scheduling outcome rather than an exception.
 
+The watermark is rounded up to whole groups for the same reason. It reserves
+headroom for the next waiting or preempted request, and such a request holds no
+Open group -- so the only capacity it can be served from is idle groups, and a
+reserve of fewer than `pages_per_kernel_block` pages reserves nothing it can use.
+Rounded up, the page-unit comparison means "keep N kernel blocks idle" exactly,
+without adding a second gate.
+
 ## Capacity and cost model
 
 Three quantities, all measurable:

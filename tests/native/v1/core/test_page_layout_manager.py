@@ -24,10 +24,13 @@ produced it.
 import pytest
 from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 
+from vllm_rbln.v1.core.kernel_block_pool import RBLNKVCacheBlock
 from vllm_rbln.v1.core.page_layout import PageLayout, PageLayoutConfig, resolve_config
 from vllm_rbln.v1.core.rbln_page_layout_kv_cache_manager import (
+    RBLNKVCacheBlocks,
     RBLNPageLayoutKVCacheManager,
 )
+from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
 
 from .utils import full_attention_spec, make_kv_cache_config, make_request
 
@@ -88,6 +91,16 @@ class TestLayout:
         assert manager.block_table("r1") == [
             page // PPE for page in page_ids(manager, "r1")[::PPE]
         ]
+
+    def test_allocate_slots_returns_rbln_pages(self):
+        manager = make_manager()
+        _, _, result = admit(manager, "r1", list(range(40)))
+        assert isinstance(result, RBLNKVCacheBlocks)
+        assert result.pages
+        assert all(isinstance(page, RBLNKVCacheBlock) for page in result.pages)
+        assert all(
+            page.kernel_block.index == page.block_id // PPE for page in result.pages
+        )
 
     def test_growth_stays_in_the_same_kernel_block(self):
         manager = make_manager()
@@ -237,6 +250,47 @@ class TestAdmission:
         manager.free(request)
         _, _, second = admit(manager, "r2", list(range(100, 100 + KERNEL_BLOCK)))
         assert second is not None
+
+
+class TestInflightReservation:
+    """`RBLNScheduler._inflight_prefill_reserved_blocks` over a real pool.
+
+    Only three attributes of the scheduler are in play, so the override is
+    exercised directly rather than through a whole engine.
+    """
+
+    class _Prefill:
+        def __init__(self, request_id: str) -> None:
+            self.request_id = request_id
+
+    def _reserved(self, manager, remaining: dict[str, int]) -> int:
+        prefills = [self._Prefill(request_id) for request_id in remaining]
+
+        class _Sched:
+            kv_cache_manager = manager
+            _inflight_prefills = prefills
+
+            def _request_remaining_blocks(self, prefill):
+                return remaining[prefill.request_id]
+
+        return RBLNScheduler._inflight_prefill_reserved_blocks(_Sched())
+
+    def test_a_page_short_each_reserves_a_whole_group_each(self):
+        manager = make_manager()
+        admit(manager, "r1", list(range(KERNEL_BLOCK)))
+        admit(manager, "r2", list(range(100, 100 + KERNEL_BLOCK)))
+        # Both filled their group exactly, so one more page apiece opens a new
+        # one. Upstream's page sum would be 2 -- under page layout that is 2
+        # whole groups.
+        reserved = self._reserved(manager, {"r1": 1, "r2": 1})
+        assert reserved == 2 * PPE
+        assert manager.pool.kernel_blocks_needed(reserved) == 2
+
+    def test_what_fits_in_a_prefills_own_group_reserves_nothing(self):
+        manager = make_manager()
+        admit(manager, "r1", list(range(PAGE)))  # one page of a fresh group
+        assert self._reserved(manager, {"r1": PPE - 1}) == 0
+        assert self._reserved(manager, {"r1": PPE}) == PPE
 
 
 class TestConfig:

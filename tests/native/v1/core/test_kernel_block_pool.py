@@ -23,7 +23,7 @@ and binding then raised into the engine core.
 
 import pytest
 
-from vllm_rbln.v1.core.kernel_block_pool import KernelBlockPool
+from vllm_rbln.v1.core.kernel_block_pool import KernelBlockPool, RBLNKVCacheBlock
 
 PPE = 4  # pages per kernel block
 
@@ -47,6 +47,15 @@ class TestGeometry:
         assert p.kernel_block_of(0) == 0 and p.slot_of(0) == 0
         assert p.kernel_block_of(5) == 1 and p.slot_of(5) == 1
         assert list(p.page_ids_of(2)) == [8, 9, 10, 11]
+
+    def test_a_kernel_block_holds_its_pages(self):
+        p = pool()
+        group = p.kernel_blocks[1]
+        assert [page.block_id for page in group.pages] == [4, 5, 6, 7]
+        assert all(isinstance(page, RBLNKVCacheBlock) for page in group.pages)
+        assert all(page.kernel_block is group for page in group.pages)
+        assert p.page(5).kernel_block is group
+        assert group.pages[p.slot_of(5)] is p.blocks[5]
 
     def test_trailing_partial_run_is_dropped(self):
         # 14 pages is 3 whole kernel blocks plus 2 that could never be used
@@ -119,12 +128,35 @@ class TestAdmissionAccounting:
                 p.get_new_blocks(1)
         assert p.get_num_free_blocks() == 3 * (PPE - 1)
         # ...and a fourth request cannot be backed by a fresh block.
-        assert p.idle_kernel_blocks() == []
+        assert p.num_idle_kernel_blocks() == 0
+        with p.allocating_for("r4"):
+            assert p.kernel_blocks_needed(1) > p.num_idle_kernel_blocks()
 
     def test_refuses_more_than_it_reports(self):
         p = pool()
         with pytest.raises(ValueError, match="Cannot get"), p.allocating_for("r1"):
             p.get_new_blocks(p.get_num_free_blocks() + 1)
+
+    def test_need_is_asked_per_owner_because_a_page_sum_cannot_say_it(self):
+        p = pool()
+        for r in ("r1", "r2"):
+            with p.allocating_for(r):
+                p.get_new_blocks(PPE)  # each fills a whole group
+        # A page short each, so a whole group apiece. Their page total says 1,
+        # which is why in-flight reservations round per request, not after.
+        assert p.kernel_blocks_needed(1, owner="r1") == 1
+        assert p.kernel_blocks_needed(1, owner="r2") == 1
+        assert p.kernel_blocks_needed(2) == 1
+
+    def test_need_is_counted_in_groups_after_the_open_run_is_used_up(self):
+        p = pool()
+        with p.allocating_for("r1"):
+            p.get_new_blocks(1)
+            # The open block's remaining slots cost nothing new; only what
+            # spills past them opens another group.
+            assert p.kernel_blocks_needed(PPE - 1) == 0
+            assert p.kernel_blocks_needed(PPE) == 1
+            assert p.kernel_blocks_needed(PPE - 1 + PPE + 1) == 2
 
 
 class TestRelease:
@@ -132,22 +164,22 @@ class TestRelease:
         p = pool()
         with p.allocating_for("r1"):
             blocks = p.get_new_blocks(2)
-        held = p.kernel_block_of(blocks[0].block_id)
-        assert p.owner_of(held) == "r1"
+        group = blocks[0].kernel_block
+        assert group.owner == "r1"
 
         p.free_blocks(blocks)
-        assert p.owner_of(held) is None
+        assert group.owner is None
         with p.allocating_for("r2"):
-            reused = ids(p.get_new_blocks(1))
-        assert p.kernel_block_of(reused[0]) == held
+            reused = p.get_new_blocks(1)
+        assert reused[0].kernel_block is group
 
     def test_a_partly_freed_block_stays_with_its_owner(self):
         p = pool()
         with p.allocating_for("r1"):
             blocks = p.get_new_blocks(2)
-        held = p.kernel_block_of(blocks[0].block_id)
+        group = blocks[0].kernel_block
         p.free_blocks(blocks[:1])
-        assert p.owner_of(held) == "r1"
+        assert group.owner == "r1"
         with p.allocating_for("r2"):
-            other = ids(p.get_new_blocks(1))
-        assert p.kernel_block_of(other[0]) != held
+            other = p.get_new_blocks(1)
+        assert other[0].kernel_block is not group

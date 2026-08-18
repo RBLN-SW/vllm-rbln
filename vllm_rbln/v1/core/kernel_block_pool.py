@@ -30,33 +30,57 @@ surfaced as an exception with nowhere to go. Putting them *in* the pool makes
 upstream's own accounting correct: `get_num_free_blocks` is what `KVCacheManager`
 consults before allocating.
 
-`KernelBlock` carries the group's ownership; its state is derived from the pages
-rather than stored, so it cannot drift from upstream's refcounts.
+`KernelBlock` is that group: it holds the ``ppe`` pages, and each page is an
+``RBLNKVCacheBlock`` that points back at it. The pointer is the object form of
+``page_id // ppe``, not a second map.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 
+import vllm.v1.core.block_pool as block_pool_mod
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from vllm.v1.core.kv_cache_utils import KVCacheBlock
-
 logger = init_logger(__name__)
 
 
-class KernelBlock:
-    """One kernel block: ``ppe`` consecutive pages, addressed by slot.
+@dataclass(slots=True)
+class RBLNKVCacheBlock(KVCacheBlock):
+    """A page that knows which kernel block it lives in.
 
-    The spec's group. Its state is not stored -- it is read off the pages, which
-    is what keeps it from drifting out of sync with upstream's refcounts:
+    Upstream ``KVCacheBlock`` is slotted, so the back-reference cannot be added
+    there. The pool constructs these instead; ``kernel_block`` is filled in as
+    soon as the ``KernelBlock`` exists.
+    """
+
+    kernel_block: KernelBlock = field(init=False)
+
+
+def as_page(block: KVCacheBlock) -> RBLNKVCacheBlock:
+    """Narrow a pool page to ``RBLNKVCacheBlock``."""
+    if not isinstance(block, RBLNKVCacheBlock):
+        raise TypeError(f"expected RBLNKVCacheBlock, got {type(block).__name__}")
+    return block
+
+
+class KernelBlock:
+    """One kernel block: the ``ppe`` consecutive pages that share a DMA unit.
+
+    ``pages`` is the group. Slot ``i`` is ``pages[i]``, and because page ids are
+    partitioned statically that page's id is ``index * ppe + i``. State is not
+    stored -- it is read off those pages, which is what keeps it from drifting
+    out of sync with upstream's refcounts:
 
         Open      an owner is writing it
         Sealed    no owner, every page cached; shareable, matchable
@@ -67,12 +91,14 @@ class KernelBlock:
 
     __slots__ = ("index", "owner", "pages")
 
-    def __init__(self, index: int, pages: list[KVCacheBlock]) -> None:
+    def __init__(self, index: int, pages: list[RBLNKVCacheBlock]) -> None:
         self.index = index
         self.pages = pages
         self.owner: str | None = None
+        for page in pages:
+            page.kernel_block = self
 
-    def free_pages(self) -> list[KVCacheBlock]:
+    def free_pages(self) -> list[RBLNKVCacheBlock]:
         """Pages nobody holds. Cached ones count -- allocation evicts them."""
         return [page for page in self.pages if page.ref_cnt == 0 and not page.is_null]
 
@@ -96,6 +122,35 @@ class KernelBlock:
             page.ref_cnt == 0 and not page.is_null and page.block_hash is None
             for page in self.pages[from_slot:]
         )
+
+    def can_resume(self, from_slot: int) -> bool:
+        """May a request that already holds slots ``[0, from_slot)`` append here?
+
+        Nobody owns the block, nothing live sits in the tail, and -- the part that
+        is easy to get wrong -- the tail carries no cache. A cached tail means the
+        block belongs to some *other* continuation of the same prefix, and
+        appending would overwrite pages that continuation still matches.
+
+        Dropping this condition looked like a win (it took copies to nearly zero)
+        and was in fact catastrophic: with a short shared prefix, `from_slot` is
+        1, the block holding it belongs to another conversation, and every turn
+        resumed a stranger's block and destroyed its cache. Measured on
+        MiniMax-M2.5 multi-turn: every eviction in the run came from that path,
+        88% of published hashes were lost, and matches collapsed to one page.
+        """
+        return self.owner is None and self.tail_is_uncached(from_slot)
+
+    def open(self, request_id: str) -> None:
+        """Claim this block so ``request_id``'s next pages continue in it.
+
+        The tail keeps whatever cache it holds; `get_new_blocks` evicts a page as
+        it hands it out, which is late enough to be correct and leaves cache that
+        the request never reaches intact.
+        """
+        self.owner = request_id
+
+    def release(self) -> None:
+        self.owner = None
 
 
 class KernelBlockPool(BlockPool):
@@ -125,18 +180,30 @@ class KernelBlockPool(BlockPool):
                 f"{num_gpu_blocks} pages is less than one kernel block of "
                 f"{pages_per_kernel_block} pages"
             )
-        super().__init__(usable, enable_caching, hash_block_size, **kwargs)
+        # BlockPool constructs KVCacheBlock(idx) from its own import. Swap in
+        # the subclass so every page can hold the kernel-block back-reference.
+        original = block_pool_mod.KVCacheBlock
+        block_pool_mod.KVCacheBlock = RBLNKVCacheBlock
+        try:
+            super().__init__(usable, enable_caching, hash_block_size, **kwargs)
+        finally:
+            block_pool_mod.KVCacheBlock = original
 
         self.pages_per_kernel_block = pages_per_kernel_block
         self.num_kernel_blocks = usable // pages_per_kernel_block
+        pages = cast(list[RBLNKVCacheBlock], self.blocks)
         self.kernel_blocks = [
-            KernelBlock(index, self.blocks[base : base + pages_per_kernel_block])
+            KernelBlock(index, pages[base : base + pages_per_kernel_block])
             for index, base in enumerate(range(0, usable, pages_per_kernel_block))
         ]
         self._allocating_for: str | None = None
+        # Mirror of `KernelBlock.owner`, so the questions asked per allocation --
+        # which group is this request writing into, how many slots does it still
+        # have -- cost the size of one request's run instead of the whole pool.
+        # `open_group`/`release_group` are the only two mutators of either side.
+        self._groups_by_owner: dict[str, set[KernelBlock]] = {}
         self.num_hash_inserts = 0
         self.num_evictions = 0
-        self.evictions_by: dict[str, int] = {}
         if usable != num_gpu_blocks:
             logger.info(
                 "Kernel block pool: dropped %d trailing pages that cannot form "
@@ -168,6 +235,12 @@ class KernelBlockPool(BlockPool):
         base = kernel_block * self.pages_per_kernel_block
         return range(base, base + self.pages_per_kernel_block)
 
+    def page(self, page_id: int) -> RBLNKVCacheBlock:
+        """The page at ``page_id``, already bound to its kernel block."""
+        block = self.blocks[page_id]
+        assert isinstance(block, RBLNKVCacheBlock)
+        return block
+
     # -- allocation ---------------------------------------------------------
 
     @contextmanager
@@ -185,107 +258,139 @@ class KernelBlockPool(BlockPool):
         finally:
             self._allocating_for = previous
 
-    # -- adoption -----------------------------------------------------------
-
-    def owner_of(self, kernel_block: int) -> str | None:
-        return self.kernel_blocks[kernel_block].owner
-
-    def can_resume(self, kernel_block: int, from_slot: int) -> bool:
-        """May a request that already holds slots ``[0, from_slot)`` append here?
-
-        Nobody owns the block, nothing live sits in the tail, and -- the part that
-        is easy to get wrong -- the tail carries no cache. A cached tail means the
-        block belongs to some *other* continuation of the same prefix, and
-        appending would overwrite pages that continuation still matches.
-
-        Dropping this condition looked like a win (it took copies to nearly zero)
-        and was in fact catastrophic: with a short shared prefix, `from_slot` is
-        1, the block holding it belongs to another conversation, and every turn
-        resumed a stranger's block and destroyed its cache. Measured on
-        MiniMax-M2.5 multi-turn: every eviction in the run came from that path,
-        88% of published hashes were lost, and matches collapsed to one page.
-        """
-        group = self.kernel_blocks[kernel_block]
-        return group.owner is None and group.tail_is_uncached(from_slot)
-
-    def open_run(self, request_id: str, kernel_block: int, from_slot: int = 0) -> None:
-        """Claim ``kernel_block`` so this request's next pages continue in it.
-
-        The tail keeps whatever cache it holds; `get_new_blocks` evicts a page as
-        it hands it out, which is late enough to be correct and leaves cache that
-        the request never reaches intact. Evicting the whole tail up front was
-        measurably worse: it threw away the previous turn's pages before knowing
-        whether this turn would overwrite them.
-        """
-        del from_slot
-        self.kernel_blocks[kernel_block].owner = request_id
-
     def _open_run_for(
         self, request_id: str | None, taken: set[int] | None = None
-    ) -> int | None:
+    ) -> KernelBlock | None:
         """The kernel block this request is already writing into, if any."""
         if request_id is None:
             return None
         taken = taken or set()
-        for group in self.kernel_blocks:
-            if group.owner != request_id:
-                continue
+        for group in self._groups_by_owner.get(request_id, ()):
             if any(page.block_id not in taken for page in group.free_pages()):
-                return group.index
+                return group
         return None
 
-    def idle_kernel_blocks(self) -> list[int]:
-        """Every Retired kernel block, for capacity accounting."""
-        return [group.index for group in self.kernel_blocks if group.is_retired]
+    def num_idle_kernel_blocks(self) -> int:
+        """Retired kernel blocks -- the capacity a new run can be opened in.
+
+        Counting them all costs the pool, and `is_retired` reads every page in a
+        group, so prefer `has_idle_kernel_blocks` wherever a comparison is what
+        the caller actually wants. This exact count is for stats and for
+        `get_usage`, which run once per tick rather than per allocation.
+        """
+        return sum(group.is_retired for group in self.kernel_blocks)
+
+    def has_idle_kernel_blocks(self, at_least: int) -> bool:
+        """Are there ``at_least`` retired groups? Stops as soon as it knows.
+
+        Every admission check is a comparison, not a census, and `at_least` is
+        almost always 0 or 1 -- so this returns after the first idle group
+        instead of reading all `pool x ppe` pages. Only a pool with nothing to
+        give walks the whole way, which is the path that refuses anyway.
+        """
+        if at_least <= 0:
+            return True
+        found = 0
+        for group in self.kernel_blocks:
+            if group.is_retired:
+                found += 1
+                if found >= at_least:
+                    return True
+        return False
+
+    def num_free_pages_in_open(self, owner: str | None = None) -> int:
+        """Free slots in Open groups ``owner`` is allowed to write into.
+
+        Defaults to whoever `allocating_for` names, and that is only *its*
+        groups: another request's Open group has free slots R1 forbids this one
+        from touching, and counting them would admit work `get_new_blocks` then
+        cannot serve. Outside an allocation, with no owner named, every Open
+        group counts -- that is the whole-pool view `get_usage` reads.
+        """
+        owner = owner if owner is not None else self._allocating_for
+        return sum(len(group.free_pages()) for group in self._owned_groups(owner))
+
+    def kernel_blocks_needed(self, num_pages: int, owner: str | None = None) -> int:
+        """Idle groups that serving ``owner`` ``num_pages`` more would open.
+
+        The owner's own Open groups are used up first, so this is not
+        `num_pages / ppe`: a request with three free slots left needs one new
+        group for five pages, not two. It has to be asked per request -- one
+        request a page short needs a whole group, and four of them need four,
+        which no sum of their page counts can express.
+        """
+        outside = max(0, num_pages - self.num_free_pages_in_open(owner))
+        return math.ceil(outside / self.pages_per_kernel_block)
 
     def num_owned(self) -> int:
-        return sum(group.owner is not None for group in self.kernel_blocks)
+        return sum(len(groups) for groups in self._groups_by_owner.values())
 
-    def _next_idle_kernel_block(self, taken: set[int]) -> int | None:
+    def open_group(self, group: KernelBlock, request_id: str) -> None:
+        """Claim ``group`` for ``request_id``, keeping the owner index in step."""
+        if group.owner is not None:
+            self._groups_by_owner[group.owner].discard(group)
+        group.open(request_id)
+        self._groups_by_owner.setdefault(request_id, set()).add(group)
+
+    def release_group(self, group: KernelBlock) -> None:
+        if group.owner is not None:
+            owned = self._groups_by_owner.get(group.owner)
+            if owned is not None:
+                owned.discard(group)
+                if not owned:
+                    del self._groups_by_owner[group.owner]
+        group.release()
+
+    def _owned_groups(self, owner: str | None):
+        """Open groups ``owner`` may write into; every Open group when unnamed."""
+        if owner is not None:
+            return self._groups_by_owner.get(owner, ())
+        return [g for groups in self._groups_by_owner.values() for g in groups]
+
+    def _next_idle_kernel_block(self, taken: set[int]) -> KernelBlock | None:
         """The idle kernel block it costs least to take.
 
         Taking a block destroys every cached page in it, so a block holding no
         cache is free and one holding cache is not. Prefer the former outright;
-        only when none is left fall back to the least-cached block, which is the
-        closest thing to upstream's LRU at this granularity.
+        among the rest take the least-cached, lowest index first.
+
+        Breaking the tie by recency instead was tried and measured -- upstream's
+        free list already orders cached pages LRU, so it cost nothing to consult.
+        Over 12 vs 5 repetitions of a fixed workload it moved the hit rate by
+        +0.16 points, 95% CI [-3.60, +3.92]: no effect this instrument can see.
+        The lowest-index rule stays because it is the simpler of two equals.
 
         Ordering by anything else was catastrophic for hit rate: the pool sat 25
         of 27 blocks idle while holding barely 20 cached pages, because each new
         request kept claiming a block that still held cache.
         """
-        fallback: tuple[int, int] | None = None
+        fallback: tuple[int, KernelBlock] | None = None
         for group in self.kernel_blocks:
             if not group.is_retired:
                 continue
             if all(page.block_id in taken for page in group.pages):
                 continue
             if group.num_cached == 0:
-                return group.index
+                return group
             if fallback is None or group.num_cached < fallback[0]:
-                fallback = (group.num_cached, group.index)
+                fallback = (group.num_cached, group)
         return fallback[1] if fallback else None
 
     def get_num_free_blocks(self) -> int:
         """Pages that can actually be handed out, in kernel block terms.
 
-        Upstream's `KVCacheManager` gates admission on this, so reporting the
-        raw free-page count is what let it admit work the kernel block pool
-        could not back. Inside `allocating_for` the answer is narrowed to what
-        *that* request can take: another request's Open group has free slots R1
-        forbids it from touching, and counting them would admit work that
-        `get_new_blocks` then cannot serve.
+        Upstream states capacity in pages -- `get_usage` and `get_new_blocks`
+        both read it that way -- so this keeps that unit and only makes the
+        number honest: reporting the raw free-page count is what let
+        `KVCacheManager` admit work the kernel block pool could not back.
+        Admission itself is decided in groups, by `kernel_blocks_needed`.
         """
-        free_in_open = sum(
-            len(group.free_pages())
-            for group in self.kernel_blocks
-            if group.owner is not None
-            and (self._allocating_for is None or group.owner == self._allocating_for)
-        )
-        return free_in_open + len(self.idle_kernel_blocks()) * (
-            self.pages_per_kernel_block
+        return (
+            self.num_free_pages_in_open()
+            + self.num_idle_kernel_blocks() * self.pages_per_kernel_block
         )
 
-    def _claim(self, kernel_block: int) -> None:
+    def _claim(self, group: KernelBlock) -> None:
         """Drop the cache still held in a block a request is about to write into.
 
         Leaving it would let another request match a page *ahead* of the owner's
@@ -297,33 +402,32 @@ class KernelBlockPool(BlockPool):
         """
         if not self.enable_caching:
             return
-        for page_id in self.page_ids_of(kernel_block):
-            block = self.blocks[page_id]
-            if block.block_hash is not None:
-                self._maybe_evict_cached_block(block)
+        for page in group.pages:
+            if page.block_hash is not None:
+                self._maybe_evict_cached_block(page)
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(self, num_blocks: int) -> list[RBLNKVCacheBlock]:
         """Serve pages from this request's open kernel block, then fresh ones."""
-        if num_blocks > self.get_num_free_blocks():
+        if not self.has_idle_kernel_blocks(self.kernel_blocks_needed(num_blocks)):
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
         request_id = self._allocating_for
         chosen: list[int] = []
         taken: set[int] = set()  # ref_cnt is only bumped below, so track here
         while len(chosen) < num_blocks:
-            kernel_block = self._open_run_for(request_id, taken)
-            if kernel_block is None:
-                kernel_block = self._next_idle_kernel_block(taken)
-                if kernel_block is None:
+            group = self._open_run_for(request_id, taken)
+            if group is None:
+                group = self._next_idle_kernel_block(taken)
+                if group is None:
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool"
                     )
-                self._claim(kernel_block)
+                self._claim(group)
                 if request_id is not None:
-                    self.kernel_blocks[kernel_block].owner = request_id
+                    self.open_group(group, request_id)
             available = [
                 page.block_id
-                for page in self.kernel_blocks[kernel_block].free_pages()
+                for page in group.free_pages()
                 if page.block_id not in taken
             ]
             if not available:
@@ -333,14 +437,14 @@ class KernelBlockPool(BlockPool):
             # gap would silently point attention at the wrong page.
             if available != list(range(available[0], available[0] + len(available))):
                 raise ValueError(
-                    f"kernel block {kernel_block} has a hole in its free run: "
+                    f"kernel block {group.index} has a hole in its free run: "
                     f"{available}"
                 )
             picked = available[: num_blocks - len(chosen)]
             chosen.extend(picked)
             taken.update(picked)
 
-        blocks = [self.blocks[page_id] for page_id in chosen]
+        blocks = [self.page(page_id) for page_id in chosen]
         for block in blocks:
             self.free_block_queue.remove(block)
             if self.enable_caching:
@@ -355,12 +459,13 @@ class KernelBlockPool(BlockPool):
         """Release pages, and the kernel block once none of them are live."""
         blocks = list(ordered_blocks)
         super().free_blocks(blocks)
-        for kernel_block in {self.kernel_block_of(b.block_id) for b in blocks}:
-            group = self.kernel_blocks[kernel_block]
+        for group in {as_page(block).kernel_block for block in blocks}:
             if all(page.ref_cnt == 0 for page in group.pages):
-                group.owner = None
+                self.release_group(group)
 
-    def publish_copy(self, source: KVCacheBlock, destination: KVCacheBlock) -> None:
+    def publish_copy(
+        self, source: RBLNKVCacheBlock, destination: RBLNKVCacheBlock
+    ) -> None:
         """Give a copied page the identity of the page it was copied from.
 
         Without this the copy is unmatchable: upstream counts the range as
@@ -385,11 +490,11 @@ class KernelBlockPool(BlockPool):
         page to go free would pin ownership for as long as the prefix stays
         cached and make the block unadoptable.
         """
-        for group in self.kernel_blocks:
-            if group.owner == request_id:
-                group.owner = None
+        for group in list(self._groups_by_owner.get(request_id, ())):
+            self.release_group(group)
 
     def reset_ownership(self) -> None:
         for group in self.kernel_blocks:
-            group.owner = None
+            group.release()
+        self._groups_by_owner.clear()
         self._allocating_for = None

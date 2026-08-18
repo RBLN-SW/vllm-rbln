@@ -36,6 +36,7 @@ ids naming the new block, which is what keeps the identity intact.
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -44,9 +45,15 @@ import vllm.v1.core.kv_cache_coordinator as kv_cache_coordinator
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+from vllm.v1.request import RequestStatus
 
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.core.kernel_block_pool import KernelBlockPool
+from vllm_rbln.v1.core.kernel_block_pool import (
+    KernelBlock,
+    KernelBlockPool,
+    RBLNKVCacheBlock,
+    as_page,
+)
 from vllm_rbln.v1.core.page_layout import KernelBlockCopyOp, PageLayoutConfig
 
 if TYPE_CHECKING:
@@ -58,7 +65,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-__all__ = ["RBLNPageLayoutKVCacheManager"]
+__all__ = ["RBLNKVCacheBlocks", "RBLNPageLayoutKVCacheManager"]
 
 
 @contextmanager
@@ -81,16 +88,13 @@ def _kernel_block_pool(pages_per_kernel_block: int) -> Iterator[None]:
         kv_cache_coordinator.BlockPool = original
 
 
-@dataclass
-class _Adoption:
-    """The request continues writing into the block its match ended in."""
+class RBLNKVCacheBlocks(KVCacheBlocks):
+    """``KVCacheBlocks`` whose pages are ``RBLNKVCacheBlock``."""
 
-    kernel_block: int
-
-
-@dataclass
-class _Refused:
-    """No private block for the copy, so the request waits."""
+    @property
+    def pages(self) -> list[RBLNKVCacheBlock]:
+        """Pages of the single full-attention group."""
+        return [as_page(page) for page in self.blocks[0]]
 
 
 @dataclass
@@ -98,8 +102,8 @@ class _PrivateCopy:
     """The matched head of a group, re-issued in a private block."""
 
     first_page_index: int
-    source: list[KVCacheBlock]
-    destination: list[KVCacheBlock]
+    source: list[RBLNKVCacheBlock]
+    destination: list[RBLNKVCacheBlock]
 
 
 class RBLNPageLayoutKVCacheManager(KVCacheManager):
@@ -143,12 +147,25 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
             super().__init__(kv_cache_config=kv_cache_config, **kwargs)
         assert isinstance(self.block_pool, KernelBlockPool)
         self.pool: KernelBlockPool = self.block_pool
+        # Upstream sizes the watermark in pages, but it is headroom for admitting
+        # the *next* request, and a waiting or preempted one can only be served
+        # out of an idle kernel block -- pages free inside another request's Open
+        # group are exactly the ones R1 forbids it from taking. A reserve smaller
+        # than one group therefore reserves nothing, so round it up to whole
+        # groups. It stays expressed in pages, so `get_num_free_blocks` remains
+        # the single admission gate; and since the watermark only applies to
+        # requests that hold no Open group, that count is `idle * ppe` exactly,
+        # which makes the page comparison mean "keep N kernel blocks idle".
+        self.watermark_blocks = math.ceil(self.watermark_blocks / ppe) * ppe
+        self.empty_kv_cache_blocks = RBLNKVCacheBlocks(
+            tuple(() for _ in range(self.num_kv_cache_groups))
+        )
 
         # Copies the worker must perform before the next forward pass, and the
         # source pages each keeps alive until it has run.
         self.pending_copy_ops: list[KernelBlockCopyOp] = []
-        self._pending_sources: list[KVCacheBlock] = []
-        self._in_flight_sources: list[list[KVCacheBlock]] = []
+        self._pending_sources: list[RBLNKVCacheBlock] = []
+        self._in_flight_sources: list[list[RBLNKVCacheBlock]] = []
         self.num_pages_copied = 0
         self.num_pages_written = 0
         self.num_whole_groups = 0
@@ -165,9 +182,19 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
             self.pool.num_kernel_blocks,
         )
 
+    def create_kv_cache_blocks(
+        self, blocks: tuple[list[KVCacheBlock], ...]
+    ) -> RBLNKVCacheBlocks:
+        typed = tuple([as_page(page) for page in group] for group in blocks)
+        if not any(typed):
+            empty = self.empty_kv_cache_blocks
+            assert isinstance(empty, RBLNKVCacheBlocks)
+            return empty
+        return RBLNKVCacheBlocks(typed)
+
     # -- prefix match -------------------------------------------------------
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(self, request: Request) -> tuple[RBLNKVCacheBlocks, int]:
         """R2: match a group at a time, over kernel blocks rather than pages.
 
         Upstream matches page by page and asks the hash table for *a* block
@@ -203,11 +230,11 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
 
     def _match(
         self, block_hashes: Sequence[BlockHash], max_pages: int
-    ) -> list[KVCacheBlock]:
+    ) -> list[RBLNKVCacheBlock]:
         """The longest addressable prefix: whole groups, then one partial tail."""
         ppe = self.geometry.pages_per_kernel_block
         cache = self.pool.cached_block_hash_to_block
-        matched: list[KVCacheBlock] = []
+        matched: list[RBLNKVCacheBlock] = []
         for start in range(0, min(max_pages, len(block_hashes)), ppe):
             group = [
                 make_block_hash_with_group_id(block_hash, 0)
@@ -227,7 +254,7 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
                         break
             if best is None or not best:
                 break
-            matched.extend(self.pool.blocks[page_id] for page_id in best)
+            matched.extend(self.pool.page(page_id) for page_id in best)
             if len(best) < len(group):
                 break  # a partial group ends the match
         return matched
@@ -240,59 +267,167 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         num_new_tokens: int,
         num_new_computed_tokens: int = 0,
         new_computed_blocks: KVCacheBlocks | None = None,
-        *args,
-        **kwargs,
-    ) -> KVCacheBlocks | None:
-        plan = self._plan_partial_group(request, new_computed_blocks)
-        if isinstance(plan, _Refused):
-            return None
-        with self.pool.allocating_for(request.request_id):
-            result = super().allocate_slots(
-                request,
-                num_new_tokens,
-                num_new_computed_tokens,
-                new_computed_blocks,
-                *args,
-                **kwargs,
+        num_lookahead_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+        delay_cache_blocks: bool = False,
+        num_encoder_tokens: int = 0,
+        full_sequence_must_fit: bool = False,
+        reserved_blocks: int = 0,
+        has_scheduled_reqs: bool = True,
+    ) -> RBLNKVCacheBlocks | None:
+        """Allocate pages for ``request``, laid out as kernel-block runs.
+
+        Upstream's ``allocate_slots`` plus the partial-group plan: a match that
+        ends mid-group is resumed in place or copied to a private block before
+        the rest of the tokens are allocated, so the tail lands at the right
+        slot. Returns ``None`` when the request cannot be admitted.
+        """
+        if num_new_tokens == 0 and num_external_computed_tokens == 0:
+            raise ValueError(
+                "num_new_tokens must be greater than 0 when there are no "
+                "external computed tokens"
             )
-        if result is None:
-            self._abandon(request, plan)
-            return None
-        if isinstance(plan, _PrivateCopy):
-            self._redirect(request, plan)
+
+        matched: list[RBLNKVCacheBlock] = []
+        if new_computed_blocks is not None:
+            matched = [as_page(page) for page in new_computed_blocks.blocks[0]]
+        computed = (
+            new_computed_blocks.blocks
+            if new_computed_blocks is not None
+            else self.empty_kv_cache_blocks.blocks
+        )
+
+        # How a match that ends mid-group is continued. Decided here, before the
+        # allocation, because the pool has to know which block the request's next
+        # pages belong in -- upstream would allocate the group's unmatched tail
+        # without knowing it must land at a particular slot of a particular block.
+        adopted: KernelBlock | None = None
+        copy: _PrivateCopy | None = None
+        head = len(matched) % self.geometry.pages_per_kernel_block
+        if matched and head == 0:
+            self.num_whole_groups += 1
+        elif matched:
+            producer = matched[-head].kernel_block
+            if producer.can_resume(head):
+                self.pool.open_group(producer, request.request_id)
+                self.num_resumes += 1
+                adopted = producer
+            else:
+                # One idle group, no more and no less: `head` is a partial group
+                # so it never spans two, and `_redirect` copies it to slot 0, so
+                # it cannot come from a group already part-written. Nothing else
+                # is available to a request that reached here anyway -- it lost
+                # the adoption branch, and a waiting one holds no Open group.
+                if not self.pool.has_idle_kernel_blocks(1):
+                    # No private block for the copy, so the request waits.
+                    self.num_refusals += 1
+                    return None
+                with self.pool.allocating_for(request.request_id):
+                    destination = self.pool.get_new_blocks(head)
+                assert self.pool.slot_of(destination[0].block_id) == 0
+                copy = _PrivateCopy(
+                    len(matched) - head, list(matched[-head:]), destination
+                )
+
+        num_local_computed_tokens = (
+            request.num_computed_tokens + num_new_computed_tokens
+        )
+        total_computed_tokens = min(
+            num_local_computed_tokens + num_external_computed_tokens,
+            self.max_model_len,
+        )
+        watermark_blocks = 0
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = self.watermark_blocks
+
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_need_slot = min(
+            num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+        )
+
+        with self.pool.allocating_for(request.request_id):
+            if full_sequence_must_fit:
+                full_num_tokens = min(request.num_tokens, self.max_model_len)
+                required_page = (
+                    self.coordinator.get_num_blocks_to_allocate(
+                        request_id=request.request_id,
+                        num_tokens=full_num_tokens,
+                        new_computed_blocks=computed,
+                        num_encoder_tokens=num_encoder_tokens,
+                        total_computed_tokens=total_computed_tokens,
+                        num_tokens_main_model=full_num_tokens,
+                        apply_admission_cap=True,
+                    )
+                    + watermark_blocks
+                )
+                required_kernel_block = self.pool.kernel_blocks_needed(required_page)
+                if not self.pool.has_idle_kernel_blocks(required_kernel_block):
+                    self._abandon(request, adopted, copy)
+                    return None
+
+            self.coordinator.remove_skipped_blocks(
+                request.request_id, total_computed_tokens
+            )
+            # Everything this step must find room for, in pages: the tokens
+            # themselves, the watermark held back for the next admission, and
+            # the pages in-flight prefills have already spoken for.
+            #
+            # Both reserves arrive already rounded to whole groups -- the
+            # watermark in `__init__`, `reserved_blocks` in the scheduler's
+            # `_inflight_prefill_reserved_blocks` -- and a multiple of ppe passes
+            # through the ceil untouched. That is what keeps them from sharing
+            # this request's last partial group, which is the whole point of
+            # reserving. Rounding them here instead would not work: they are sums
+            # over other requests, and four prefills a page short each need four
+            # groups, which their page total cannot say.
+            required_page = (
+                self.coordinator.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=num_tokens_need_slot,
+                    new_computed_blocks=computed,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=(
+                        num_local_computed_tokens + num_external_computed_tokens
+                    ),
+                    num_tokens_main_model=num_tokens_main_model,
+                )
+                + watermark_blocks
+                + reserved_blocks
+            )
+            required_kernel_block = self.pool.kernel_blocks_needed(required_page)
+            if not self.pool.has_idle_kernel_blocks(required_kernel_block):
+                self._abandon(request, adopted, copy)
+                return None
+
+            if computed is not self.empty_kv_cache_blocks.blocks or (
+                num_external_computed_tokens > 0
+            ):
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=computed,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                )
+            if copy is not None:
+                self._redirect(request, copy)
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
+
+        if self.enable_caching and not delay_cache_blocks:
+            self.coordinator.cache_blocks(
+                request,
+                min(total_computed_tokens + num_new_tokens, request.num_tokens),
+            )
+        result = self.create_kv_cache_blocks(new_blocks)
         self.num_pages_written += sum(len(group) for group in result.blocks)
         return result
-
-    def _plan_partial_group(
-        self, request: Request, new_computed_blocks: KVCacheBlocks | None
-    ) -> _Adoption | _PrivateCopy | _Refused | None:
-        """Decide how a match that ends mid-group is continued.
-
-        Runs before the allocation so the pool knows which block the request's
-        next pages belong in: upstream allocates the group's unmatched tail
-        without knowing it must land at a particular slot of a particular block.
-        """
-        if new_computed_blocks is None:
-            return None
-        matched = new_computed_blocks.blocks[0]
-        ppe = self.geometry.pages_per_kernel_block
-        head = len(matched) % ppe
-        if not matched or head == 0:
-            self.num_whole_groups += bool(matched)
-            return None
-
-        producer = self.pool.kernel_block_of(matched[-head].block_id)
-        if self.pool.can_resume(producer, head):
-            self.pool.open_run(request.request_id, producer, head)
-            self.num_resumes += 1
-            return _Adoption(producer)
-
-        with self.pool.allocating_for(request.request_id):
-            if self.pool.get_num_free_blocks() < head:
-                self.num_refusals += 1
-                return _Refused()
-            destination = self.pool.get_new_blocks(head)
-        return _PrivateCopy(len(matched) - head, list(matched[-head:]), destination)
 
     def log_binding_stats(self) -> None:
         """Why the copies happen, in one line. Called per scheduler stats tick."""
@@ -324,10 +459,8 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         page = self.geometry.page_size
         self.pending_copy_ops.append(
             KernelBlockCopyOp(
-                src_kernel_block_id=self.pool.kernel_block_of(plan.source[0].block_id),
-                dst_kernel_block_id=self.pool.kernel_block_of(
-                    plan.destination[0].block_id
-                ),
+                src_kernel_block_id=plan.source[0].kernel_block.index,
+                dst_kernel_block_id=plan.destination[0].kernel_block.index,
                 src_start=0,
                 dst_start=0,
                 num_tokens=len(plan.source) * page,
@@ -339,12 +472,17 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         self.num_pages_copied += len(plan.source)
         self.num_copies += 1
 
-    def _abandon(self, request: Request, plan: _Adoption | _PrivateCopy | None) -> None:
-        """Undo a plan whose allocation the scheduler then refused."""
-        if isinstance(plan, _Adoption):
+    def _abandon(
+        self,
+        request: Request,
+        adopted: KernelBlock | None,
+        copy: _PrivateCopy | None,
+    ) -> None:
+        """Undo the partial-group plan whose allocation was then refused."""
+        if adopted is not None:
             self.pool.release_owner(request.request_id)
-        elif isinstance(plan, _PrivateCopy):
-            self.pool.free_blocks(plan.destination)
+        elif copy is not None:
+            self.pool.free_blocks(copy.destination)
 
     # -- copy op plumbing ---------------------------------------------------
 
@@ -369,8 +507,7 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         ppe = self.geometry.pages_per_kernel_block
         pages = self.coordinator.get_blocks(request_id)[0]
         return [
-            self.pool.kernel_block_of(pages[i].block_id)
-            for i in range(0, len(pages), ppe)
+            as_page(pages[i]).kernel_block.index for i in range(0, len(pages), ppe)
         ]
 
     # -- lifetime -----------------------------------------------------------
