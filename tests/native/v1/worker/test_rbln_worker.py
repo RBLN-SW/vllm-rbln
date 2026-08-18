@@ -328,7 +328,7 @@ class TestDetermineAvailableMemory:
         device_name="RBLN-CA25",
         hf_config=None,
         params=None,
-        specialized_moe_decode=0,
+        specialized_moe_decode=False,
         decode_buckets=3,
         drafter=None,
         speculative_config=None,
@@ -358,9 +358,11 @@ class TestDetermineAvailableMemory:
 
     def test_num_runtimes_from_buckets_and_moe(self, make_worker, monkeypatch):
         cap = self._capture(
-            make_worker, monkeypatch, specialized_moe_decode=2, decode_buckets=3
+            make_worker, monkeypatch, specialized_moe_decode=True, decode_buckets=3
         )
-        assert cap["num_runtimes"] == 6  # 1 + buckets(3) + moe(2)
+        # Non-spec: num_decode_query_lens == 1, so 1 + buckets(3)*1 = 4, plus
+        # the specialized-MoE-decode fallback (+1 query length) = 5.
+        assert cap["num_runtimes"] == 5
 
     def test_no_quant_counts_int_at_16bit(self, make_worker, monkeypatch):
         assert self._capture(make_worker, monkeypatch)["n_model_bytes"] == 300
@@ -433,7 +435,35 @@ class TestDetermineAvailableMemory:
         )
         assert "kernel_size" in cap
         assert "n_model_bytes" not in cap
-        assert cap["num_runtimes"] == 8  # (1+3+0) + (1+3)
+        # Spec on: target = 1 + buckets(3)*num_decode_query_lens(2) = 7 (no MoE);
+        # draft = 1 + buckets(3) = 4. Total 11.
+        assert cap["num_runtimes"] == 11
+
+    def test_draft_runtime_adds_specialized_moe_fallback(
+        self, make_worker, monkeypatch
+    ):
+        # The specialized-MoE-decode fallback re-runs the top bucket at a different
+        # num_padded_tokens, so it adds one draft graph.
+        # Target = 1 + buckets(3)*2 + (2 + 1) = 10; draft = 1 + buckets(3) + 1 = 5;
+        # total 15.
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
+            ),
+        )
+        spec = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization=None),
+            draft_parallel_config=None,
+            method="eagle",
+        )
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            specialized_moe_decode=True,
+        )
+        assert cap["num_runtimes"] == 15
 
     def test_draft_quantization_rejected(self, make_worker, monkeypatch):
         drafter = SimpleNamespace(

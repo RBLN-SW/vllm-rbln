@@ -14,12 +14,17 @@
 
 # RBLNModelRunner's small pure helpers, on a bare object.__new__ stub with only
 # what each method reads. Methods that need the real runner's buffers live in
-# test_rbln_model_runner_states / _inputs / _kv_cache.
+# test_rbln_model_runner_states / _inputs / _kv_cache. The one exception is
+# TestShapeConfigWiring: what it checks is produced by __init__, so a stub could
+# only repeat itself -- it builds a real runner and carries its own device marker.
 
 import contextlib
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -30,10 +35,18 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
 )
 
+import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
     ExponentialBucketingManager,
+)
+from vllm_rbln.v1.worker.dp_utils import (
+    BatchDescriptor,
+    BatchRoute,
+    DPStatus,
+    ShapeConfig,
 )
 from vllm_rbln.v1.worker.rbln_model_runner import (
     ExecuteModelState,
@@ -42,6 +55,22 @@ from vllm_rbln.v1.worker.rbln_model_runner import (
     _pad_rows,
     _pad_sampling_metadata,
 )
+
+
+def _resolved_batch(
+    *, num_reqs_padded, query_len, num_tokens_padded, route=BatchRoute.AGREED
+):
+    """What _determine_batch_execution_and_padding returns, for tests that drive
+    _dummy_run without a DP group."""
+    return (
+        BatchDescriptor(
+            num_reqs_padded=num_reqs_padded,
+            query_len=query_len,
+            num_tokens_padded=num_tokens_padded,
+        ),
+        route,
+        torch.tensor([0, 0], dtype=torch.int32),
+    )
 
 
 def _make_runner_stub(**attrs):
@@ -313,7 +342,7 @@ class TestGetSupportedTasks:
         assert self._runner("draft").get_supported_tasks() == ()
 
 
-class TestDetermineBatchPadding:
+class TestResolveBatchDescriptor:
     # data_parallel_size == 1 is the covered path (multi-DP needs RBLNDPMetadata
     # collectives). The phase is driven via _is_prefill_step (is_prefill), not
     # the runner's input_batch.
@@ -322,11 +351,13 @@ class TestDetermineBatchPadding:
         computed = 0 if is_prefill else 9
         return _make_runner_stub(
             _is_prefill_step=is_prefill,
-            bucketing_manager=SimpleNamespace(
-                find_decode_batch_bucket=lambda n: bucket
+            shape_config=ShapeConfig(
+                decode_batch_buckets=(1, 2, 4, 8),
+                find_bucket=lambda n: bucket,
+                max_num_tokens=512,
+                specialized_moe_decode=False,
             ),
-            parallel_config=SimpleNamespace(data_parallel_size=1),
-            specialized_moe_decode=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
             input_batch=SimpleNamespace(
                 num_computed_tokens_cpu=np.array([computed]),
                 num_tokens_no_spec=np.array([10]),
@@ -334,18 +365,52 @@ class TestDetermineBatchPadding:
         )
 
     def test_decode_pads_to_bucket(self):
-        r = self._runner(is_prefill=False, bucket=8)
-        padded, tok, across = r._determine_batch_padding(3, 30)
-        assert padded == 8
-        assert tok is None and across is None
+        runner = self._runner(is_prefill=False, bucket=8)
+        batch_desc, route, _across = runner._determine_batch_execution_and_padding(
+            3, 30
+        )
+        assert route is BatchRoute.LOCAL
+        assert batch_desc.num_reqs_padded == 8
+        assert batch_desc.query_len == 10  # 30 tokens over 3 requests
 
     def test_prefill_uses_unpadded(self):
-        padded, _, _ = self._runner(is_prefill=True)._determine_batch_padding(3, 30)
-        assert padded == 3
+        batch_desc, _route, _across = self._runner(
+            is_prefill=True
+        )._determine_batch_execution_and_padding(3, 30)
+        assert batch_desc.num_reqs_padded == 3
 
     def test_single_dp_returns_no_token_padding(self):
-        _, tok, across = self._runner(is_prefill=False)._determine_batch_padding(3, 30)
-        assert tok is None and across is None
+        # Nothing to agree with, so the caller pads neither tokens nor the context.
+        batch_desc, _route, across = self._runner(
+            is_prefill=False
+        )._determine_batch_execution_and_padding(3, 30)
+        assert batch_desc.num_tokens_padded is None
+        assert across is None
+
+
+class TestShapeConfigWiring:
+    # ShapeConfig is built once in __init__ and every route reads it. The tests
+    # around here hand-build one, which leaves the construction unpinned: a field
+    # wired to the wrong source would keep every one of them green.
+
+    @pytest.mark.maybe_use_device
+    def test_fields_come_from_their_sources(self, make_model_runner):
+        runner = make_model_runner()
+        cfg = runner.shape_config
+        manager = runner.bucketing_manager
+
+        assert cfg.decode_batch_buckets is manager.decode_batch_buckets
+        # The manager's rule, not an identity: 3 sits between two buckets, so a
+        # pass-through would return 3 where the rule rounds up.
+        assert [cfg.find_bucket(n) for n in (1, 3)] == [
+            manager.find_decode_batch_bucket(1),
+            manager.find_decode_batch_bucket(3),
+        ]
+        # The token budget, not the request count -- the routes pad tokens with it.
+        assert cfg.max_num_tokens == runner.max_num_tokens
+        # Single DP: no cross-rank padding to specialize for, so the flag is off
+        # even though its env default is on.
+        assert cfg.specialized_moe_decode is False
 
 
 class TestDummyRunPadding:
@@ -353,39 +418,63 @@ class TestDummyRunPadding:
     # not this rank's own count. #894 was the layout keeping num_reqs while the
     # attention metadata already used num_reqs_padded.
     @staticmethod
-    def _runner(monkeypatch, *, reqs_across_dp, specialized=True):
+    def _runner(
+        monkeypatch,
+        *,
+        reqs_across_dp,
+        tokens_across_dp=None,
+        specialized=True,
+        peers_idle=False,
+    ):
         captured: dict = {}
+        # One token per request unless a case needs the peers on a longer query.
+        tokens = list(tokens_across_dp or reqs_across_dp)
 
-        def fake_across_dp(num_tokens, num_reqs, dp_size, dp_rank, is_prefill):
-            reqs = torch.tensor(reqs_across_dp, dtype=torch.int32)
-            return reqs.clone(), reqs, is_prefill
+        def fake_gather(
+            num_tokens, num_reqs, dp_size, dp_rank, is_prefill, is_idle=False
+        ):
+            # This rank's flags are the ones it passed in -- a fake that hardcodes
+            # them cannot tell whether the caller forwarded the phase or the idle
+            # bit at all.
+            return DPStatus(
+                num_tokens=tuple(tokens),
+                num_reqs=tuple(reqs_across_dp),
+                is_prefill=(is_prefill,) + (False,) * (len(reqs_across_dp) - 1),
+                is_idle=(is_idle,) + (peers_idle,) * (len(reqs_across_dp) - 1),
+                num_tokens_across_dp=torch.tensor(tokens, dtype=torch.int32),
+            )
 
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
         )
-        monkeypatch.setattr(
-            mr, "set_forward_context", lambda *a, **kw: contextlib.nullcontext()
-        )
+
+        def forward_context(*a, **kw):
+            captured["forward"] = kw
+            return contextlib.nullcontext()
+
+        monkeypatch.setattr(mr, "set_forward_context", forward_context)
         monkeypatch.setattr(
             mr, "build_kv_cache_forward_context_kwargs", lambda *a, **kw: {}
         )
-        monkeypatch.setattr(
-            mr.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(fake_across_dp),
-        )
+        monkeypatch.setattr(dp_utils, "_synchronize_dp_ranks", fake_gather)
 
         def stage(**kwargs):
             captured["layout"] = kwargs["layout"]
             return SimpleNamespace(as_kwargs=lambda: {})
 
+        # Two buckets, so a padded count can differ from a raw one at all.
+        bucketing = ExponentialBucketingManager(
+            max_batch_size=2, min_batch_size=1, limit=2, step=2
+        )
         runner = _make_runner_stub(
-            # Two buckets, so a padded count can differ from a raw one at all.
-            bucketing_manager=ExponentialBucketingManager(
-                max_batch_size=2, min_batch_size=1, limit=2, step=2
+            bucketing_manager=bucketing,
+            shape_config=ShapeConfig(
+                decode_batch_buckets=bucketing.decode_batch_buckets,
+                find_bucket=bucketing.find_decode_batch_bucket,
+                max_num_tokens=128,
+                specialized_moe_decode=specialized,
             ),
             parallel_config=SimpleNamespace(data_parallel_size=4, data_parallel_rank=0),
-            specialized_moe_decode=specialized,
             input_batch=SimpleNamespace(
                 num_tokens_no_spec=np.zeros(8, dtype=np.int32),
                 num_computed_tokens_cpu=np.zeros(8, dtype=np.int32),
@@ -400,8 +489,8 @@ class TestDummyRunPadding:
             # use_wrapped_compute_logits is a property over this.
             is_pooling_model=True,
             speculative_config=None,
-            # Read by _determine_batch_padding to floor the MoE dispatch pad
-            # at the spec width; __init__ always sets it.
+            # Read by the batch decision to floor the MoE dispatch pad at the
+            # spec width; __init__ always sets it.
             use_aux_hidden_state_outputs=False,
             # Gates the drafter's dummy run; __init__ always sets it.
             drafter=None,
@@ -430,6 +519,43 @@ class TestDummyRunPadding:
         runner._dummy_run(1, 4, is_prefill=True)
 
         assert captured["layout"].num_reqs_padded == 1
+
+    def test_warmup_pin_is_the_token_dimension(self, monkeypatch):
+        # Warm-up dictates the dimension it wants compiled -- the group agreement
+        # would give a smaller one -- and nothing downstream recomputes it, so the
+        # forward context (the only reader of the token dimension) gets the pin.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[2, 1, 1, 1])
+        runner._dummy_run(1, 1, is_prefill=False, num_tokens_padded_override=64)
+
+        assert captured["forward"]["num_padded_tokens"] == 64
+        # The pin only dictates the token dimension; the batch stays this rank's.
+        assert captured["layout"].num_reqs_padded == 1
+
+    def test_serving_idle_step_is_excluded_from_the_agreement(self, monkeypatch):
+        # warmup=False is the serving DP-idle step. This rank reports a minimal
+        # (1 req, 1 token) so the peers do not block, but it must be marked idle:
+        # counted as busy it disagrees with their query length, and the group falls
+        # to the asymmetric graph where this rank stages its own length instead of
+        # theirs. Every other case here is warm-up, where nothing is idle.
+        runner, captured = self._runner(
+            monkeypatch, reqs_across_dp=[1, 2, 2, 2], tokens_across_dp=[1, 8, 8, 8]
+        )
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        # The busy ranks' shape: bucket for 2 requests, their query length 8/2.
+        assert captured["layout"].num_reqs_padded == 2
+        assert captured["layout"].query_len == 4
+
+    def test_a_fully_drained_group_runs_nothing(self, monkeypatch):
+        # Every rank reported idle, so every rank reaches the same answer and stops:
+        # no peer is waiting on this rank inside a forward, and the output of a step
+        # nobody asked for is discarded anyway. Nothing may be staged or run.
+        runner, captured = self._runner(
+            monkeypatch, reqs_across_dp=[1, 1, 1, 1], peers_idle=True
+        )
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert captured == {}
 
     def test_without_specialised_decode_no_group_agreement(self, monkeypatch):
         runner, captured = self._runner(
@@ -745,3 +871,173 @@ class TestMixinConformance:
             "load_model",
         ):
             assert callable(getattr(RBLNModelRunner, name, None)), name
+
+
+class TestDummyRunDraftParticipation:
+    # On a serving DP-idle step (warmup=False) the rank still runs the draft dummy,
+    # so a draft whose forward joins a DP all-gather keeps this rank in it. The
+    # length it runs is warm-up's, which is not always the one the step decided for
+    # the model leg.
+    NUM_SPEC = 2
+
+    @classmethod
+    def _runner(cls, monkeypatch, *, has_drafter):
+        # has_drafter=False simulates a non-last PP rank: the drafter is None
+        # there, and the draft leg has to skip cleanly.
+        attrs = dict(
+            max_num_tokens=64,
+            max_num_reqs=8,
+            speculative_config=SimpleNamespace(),
+            num_spec_tokens=cls.NUM_SPEC,
+            query_start_loc_np=np.zeros(16, dtype=np.int32),
+            input_ids=torch.zeros(64, dtype=torch.int32),
+            positions=torch.zeros(64, dtype=torch.int64),
+            input_batch=SimpleNamespace(num_tokens_no_spec=np.zeros(8, dtype=np.int32)),
+            model_config=SimpleNamespace(dtype=torch.float16),
+            device=torch.device("cpu"),
+            vllm_config=SimpleNamespace(),
+            kv_cache_bases=None,
+            input_stager=SimpleNamespace(
+                stage=lambda **k: SimpleNamespace(as_kwargs=lambda: {})
+            ),
+            model_executable=lambda **k: None,
+        )
+        drafter = MagicMock(spec=RBLNEagleProposer) if has_drafter else None
+        attrs["drafter"] = drafter
+        runner = _make_runner_stub(**attrs)
+        # use_wrapped_compute_logits is a property (no setter); override on the
+        # class. is_prefill=False here so it only needs to not raise.
+        monkeypatch.setattr(RBLNModelRunner, "use_wrapped_compute_logits", False)
+        # Stub the model body so _dummy_run reaches the drafter leg with no NPU.
+        # The decided shape: bucket 2 at this step's own query length (nothing here
+        # is idle-adopted), so 8 padded tokens.
+        monkeypatch.setattr(
+            runner,
+            "_stage_dummy_seq_lens",
+            lambda nr, ql, ip: (np.full(nr, ql, dtype=np.int32), ql * nr),
+        )
+        # The idle case decides query length 1 -- what a rank beside a prefilling
+        # peer gets, its own -- so a draft handed the decided length rather than
+        # the warmed one is visible here.
+        monkeypatch.setattr(
+            runner,
+            "_determine_batch_execution_and_padding",
+            lambda nr, nt, idle, pinned_num_tokens_padded=None: _resolved_batch(
+                num_reqs_padded=2, query_len=nt // nr, num_tokens_padded=8
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_get_cumsum_and_arange",
+            lambda x: (np.cumsum(x, dtype=np.int32), None),
+        )
+        monkeypatch.setattr(
+            runner, "_build_attention_metadata", lambda **k: (object(), None)
+        )
+        monkeypatch.setattr(mr, "set_forward_context", lambda *a, **k: nullcontext())
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        monkeypatch.setattr(mr, "build_kv_cache_forward_context_kwargs", lambda b: {})
+        return runner, drafter
+
+    def test_idle_draft_runs_the_warmed_decode_length(self, monkeypatch):
+        # The step decided query length 1 for this rank and the model leg stages
+        # that, but warm-up compiles the draft at 1 + num_spec, so the draft has to
+        # get the warmed length or it lands on a graph nobody compiled.
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+        drafter.dummy_run.assert_called_once_with(1, 1 + self.NUM_SPEC, False)
+
+    def test_warmup_compiles_draft_at_spec_qlen(self, monkeypatch):
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        runner._dummy_run(2, 1 + self.NUM_SPEC, is_prefill=False, warmup=True)
+        # warmup path keeps the num_padded_tokens kwarg (draft's own pad target).
+        drafter.dummy_run.assert_called_once_with(
+            2, 1 + self.NUM_SPEC, False, num_padded_tokens=None
+        )
+
+    def test_no_drafter_skips_cleanly(self, monkeypatch):
+        # A non-last PP rank reaches here with self.drafter None, and the draft leg
+        # has to skip rather than treat it as a proposer.
+        runner, drafter = self._runner(monkeypatch, has_drafter=False)
+        assert drafter is None
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)  # must not raise
+
+
+class TestDummyRunPPIntermediateTensors:
+    # A non-first PP rank builds empty intermediate tensors for the dummy step at
+    # the group-bucket batch (num_reqs_padded), since the stager passes them
+    # through unpadded -- num_reqs would undersize them when a peer forced the
+    # bucket up.
+    HIDDEN = 4
+
+    def _runner(self, monkeypatch, *, num_reqs_padded, query_len):
+        captured: dict = {}
+
+        def make_empty(batch_size, dtype, device):
+            return {"h": torch.zeros(batch_size, self.HIDDEN, dtype=dtype)}
+
+        def stage(**kwargs):
+            captured["intermediate_tensors"] = kwargs["intermediate_tensors"]
+            captured["layout"] = kwargs["layout"]
+            return SimpleNamespace(as_kwargs=lambda: {})
+
+        runner = _make_runner_stub(
+            model=SimpleNamespace(make_empty_intermediate_tensors=make_empty),
+            model_config=SimpleNamespace(dtype=torch.float16),
+            device=torch.device("cpu"),
+            max_num_tokens=64,
+            max_num_reqs=8,
+            speculative_config=None,
+            # Gates the drafter leg; __init__ always sets it.
+            drafter=None,
+            query_start_loc_np=np.zeros(16, dtype=np.int32),
+            input_ids=torch.zeros(64, dtype=torch.int32),
+            positions=torch.zeros(64, dtype=torch.int64),
+            input_batch=SimpleNamespace(num_tokens_no_spec=np.zeros(8, dtype=np.int32)),
+            kv_cache_bases=None,
+            vllm_config=SimpleNamespace(),
+            input_stager=SimpleNamespace(stage=stage),
+            model_executable=lambda **k: None,
+        )
+        monkeypatch.setattr(RBLNModelRunner, "use_wrapped_compute_logits", False)
+        monkeypatch.setattr(
+            runner,
+            "_stage_dummy_seq_lens",
+            lambda nr, ql, ip: (np.full(nr, ql, dtype=np.int32), ql * nr),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_determine_batch_execution_and_padding",
+            lambda nr, nt, idle, pinned_num_tokens_padded=None: _resolved_batch(
+                num_reqs_padded=num_reqs_padded,
+                query_len=query_len,
+                num_tokens_padded=num_reqs_padded * query_len,
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_get_cumsum_and_arange",
+            lambda x: (np.cumsum(x, dtype=np.int32), None),
+        )
+        monkeypatch.setattr(
+            runner, "_build_attention_metadata", lambda **k: (object(), None)
+        )
+        monkeypatch.setattr(mr, "set_forward_context", lambda *a, **k: nullcontext())
+        # Non-first PP rank -> the else branch builds intermediate tensors.
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False)
+        )
+        monkeypatch.setattr(mr, "build_kv_cache_forward_context_kwargs", lambda b: {})
+        return runner, captured
+
+    def test_idle_intermediate_tensors_use_group_bucket(self, monkeypatch):
+        # DP-idle (warmup=False): this rank stages num_reqs=1 but a peer forced
+        # bucket 8, so the empty intermediate tensors must be (8, qlen, hidden) --
+        # num_reqs_padded, not num_reqs=1 -- to match the compiled PP graph.
+        runner, captured = self._runner(monkeypatch, num_reqs_padded=8, query_len=1)
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+        assert captured["intermediate_tensors"]["h"].shape == (8, 1, self.HIDDEN)
+        assert captured["layout"].num_reqs == 1
+        assert captured["layout"].num_reqs_padded == 8

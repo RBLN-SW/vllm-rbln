@@ -33,8 +33,20 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from tests.native.v1.spec_decode.utils import make_cad, make_eagle_proposer
+from vllm_rbln.v1.worker.dp_utils import ShapeConfig
 
 pytestmark = pytest.mark.maybe_use_device
+
+
+def _shape_config(*, specialized=False, max_num_tokens=64):
+    """Identity bucketing, so a padded count that differs from num_reqs is the
+    rule's doing and not the fixture's."""
+    return ShapeConfig(
+        decode_batch_buckets=[1, 2, 4, 8],
+        find_bucket=lambda n: n,
+        max_num_tokens=max_num_tokens,
+        specialized_moe_decode=specialized,
+    )
 
 
 def _neutralize(monkeypatch):
@@ -57,7 +69,8 @@ def _wire_runner(proposer, *, num_reqs):
         kv_caches=[],
         kv_cache_bases=[],
         kv_cache_view_infos=[],
-        bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
+        shape_config=_shape_config(),
+        dp_status=None,
     )
     proposer.draft_attn_groups = [
         SimpleNamespace(
@@ -273,83 +286,6 @@ class TestPrepareNextTokenIdsPadded:
         )
         assert next_ids.cpu().tolist() == [5, 101, 102]
         assert valid_count.cpu().tolist() == [1, 0, 0]
-
-
-class TestDetermineDraftBatchPadding:
-    def test_dp1_prefill_keeps_num_reqs_decode_buckets(self):
-        # With data_parallel_size == 1 the dp fields stay None; prefill keeps the
-        # request count, decode rounds up to the runner's decode bucket.
-        proposer = make_eagle_proposer()
-        proposer.runner = SimpleNamespace(
-            bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: 8),
-            specialized_moe_decode=False,
-        )
-        assert proposer._determine_draft_batch_padding(3, 10, True) == (3, None, None)
-        assert proposer._determine_draft_batch_padding(3, 3, False) == (8, None, None)
-
-    @staticmethod
-    def _dp_proposer(monkeypatch, dp_status):
-        # The drafter reads the DP counts the runner already collected, so there
-        # is no second collective to fake -- only runner.dp_status to set.
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.parallel_config, "data_parallel_size", 2
-        )
-        proposer.dp_rank = 0
-        proposer.runner = SimpleNamespace(
-            specialized_moe_decode=True,
-            bucketing_manager=SimpleNamespace(
-                # Rounds up like the real one, so the group-agreed bucket stays
-                # distinguishable from the largest one.
-                find_decode_batch_bucket=lambda n: next(
-                    b for b in (1, 2, 4, 8) if b >= n
-                ),
-                decode_batch_buckets=[1, 2, 4, 8],
-            ),
-            dp_status=dp_status,
-        )
-        return proposer
-
-    def test_dp_greater_than_one_specialized_moe(self, monkeypatch):
-        # The per-DP counts drive the padding: batch bucket from max reqs across
-        # DP, token pad from bucket * max tokens-per-req.
-        proposer = self._dp_proposer(
-            monkeypatch, (torch.tensor([16, 16]), torch.tensor([4, 2]), False)
-        )
-        num_reqs_padded, num_tokens_padded, across = (
-            proposer._determine_draft_batch_padding(4, 16, False)
-        )
-        # bucket(max(4, 2)) = 4; max(16//4, 16//2) = 8; tokens = 4 * 8 = 32.
-        assert num_reqs_padded == 4
-        assert num_tokens_padded == 32
-        assert across.cpu().tolist() == [16, 16]
-
-    def test_dp_any_prefill_falls_back_to_max_bucket(self, monkeypatch):
-        # A peer in prefill -- one request, a whole chunk of tokens -- makes the
-        # per-rank req counts unusable, so padding falls back to the largest
-        # decode bucket and the full token budget.
-        proposer = self._dp_proposer(
-            monkeypatch, (torch.tensor([16, 512]), torch.tensor([4, 1]), True)
-        )
-        num_reqs_padded, num_tokens_padded, _ = proposer._determine_draft_batch_padding(
-            4, 16, False
-        )
-        assert num_reqs_padded == 8  # decode_batch_buckets[-1]
-        assert num_tokens_padded == proposer.max_num_tokens
-
-    def test_later_draft_step_derives_tokens_from_reqs(self, monkeypatch):
-        # Past the first pass every request contributes one token, so the saved
-        # req counts double as the token counts and the prefill flag no longer
-        # applies -- the target's prefill is already done.
-        proposer = self._dp_proposer(
-            monkeypatch, (torch.tensor([16, 512]), torch.tensor([4, 1]), True)
-        )
-        num_reqs_padded, num_tokens_padded, across = (
-            proposer._determine_draft_batch_padding(4, 4, False, first_pass=False)
-        )
-        assert num_reqs_padded == 4  # bucket(max(4, 1)), not the largest bucket
-        assert num_tokens_padded == 4  # 4 * max(4//4, 1//1)
-        assert across.cpu().tolist() == [4, 1]
 
 
 class TestInitGuards:
@@ -730,7 +666,8 @@ class TestDummyRun:
             kv_caches=[],
             kv_cache_bases=[],
             kv_cache_view_infos=[],
-            bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
+            shape_config=_shape_config(),
+            dp_status=None,
             _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
                 np.cumsum(nt, dtype=cumsum_dtype),
                 None,
@@ -778,7 +715,8 @@ class TestDummyRun:
             kv_caches=[],
             kv_cache_bases=[],
             kv_cache_view_infos=[],
-            bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
+            shape_config=_shape_config(),
+            dp_status=None,
             _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
                 np.cumsum(nt, dtype=cumsum_dtype),
                 None,
