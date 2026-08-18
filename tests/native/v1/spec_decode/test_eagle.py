@@ -32,6 +32,7 @@ import torch
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 import vllm_rbln.v1.spec_decode.eagle as eagle_module
+import vllm_rbln.v1.worker.dp_utils as dp_utils
 from tests.native.v1.spec_decode.utils import make_cad, make_eagle_proposer
 
 pytestmark = pytest.mark.maybe_use_device
@@ -65,6 +66,46 @@ def _wire_runner(proposer, *, num_reqs):
             layer_names=["draft.layer"],
         )
     ]
+
+
+def _wire_dummy_runner(proposer):
+    """Wire the runner/attention plumbing dummy_run touches and return the list
+    the fake model appends to, so a test can count forward passes."""
+    proposer.runner = SimpleNamespace(
+        is_prefill=False,
+        input_batch=SimpleNamespace(
+            num_reqs=2,
+            block_table=[
+                SimpleNamespace(
+                    get_cpu_tensor=lambda: torch.zeros((8, 4), dtype=torch.int32)
+                )
+            ],
+        ),
+        kv_caches=[],
+        kv_cache_bases=[],
+        kv_cache_view_infos=[],
+        bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
+        _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
+            np.cumsum(nt, dtype=cumsum_dtype),
+            None,
+        ),
+    )
+    proposer.draft_attn_groups = [
+        SimpleNamespace(
+            get_metadata_builder=lambda: SimpleNamespace(build=lambda **k: object()),
+            layer_names=["draft.layer"],
+        )
+    ]
+    calls = []
+
+    def executable(**kwargs):
+        calls.append(1)
+        return kwargs["hidden_states"].reshape(-1, proposer.hidden_size), torch.zeros(
+            (8, 128)
+        )
+
+    proposer.model_executable = executable
+    return calls
 
 
 def _fake_model_exec(argmax_tokens, hidden_size):
@@ -269,6 +310,17 @@ class TestPrepareNextTokenIdsPadded:
         assert valid_count.cpu().tolist() == [1, 0, 0]
 
 
+def _dp_aggregates(*, num_tokens, num_reqs, is_prefill=None):
+    """What synchronize_draft_dp_ranks returns: the cross-rank aggregates the
+    draft's own shape rule reads."""
+    return (
+        torch.tensor(num_tokens, dtype=torch.int32),
+        any(is_prefill) if is_prefill is not None else False,
+        max(num_reqs),
+        max(t // r for t, r in zip(num_tokens, num_reqs)),
+    )
+
+
 class TestDetermineDraftBatchPadding:
     def test_dp1_prefill_keeps_num_reqs_decode_buckets(self):
         # With data_parallel_size == 1 the dp fields stay None; prefill keeps the
@@ -297,9 +349,9 @@ class TestDetermineDraftBatchPadding:
             ),
         )
         monkeypatch.setattr(
-            eagle_module.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(lambda *a: (torch.tensor([16, 16]), torch.tensor([4, 2]))),
+            dp_utils,
+            "synchronize_draft_dp_ranks",
+            lambda *a: _dp_aggregates(num_tokens=(16, 16), num_reqs=(4, 2)),
         )
         num_reqs_padded, num_tokens_padded, across = (
             proposer._determine_draft_batch_padding(3, 6, False)
@@ -309,9 +361,9 @@ class TestDetermineDraftBatchPadding:
         assert num_tokens_padded == 64
         assert across.cpu().tolist() == [16, 16]
 
-    def test_dp_greater_than_one_without_per_rank_counts(self, monkeypatch):
-        # When the per-rank req counts are absent, padding falls back to the
-        # largest decode bucket and the full token budget.
+    def test_dp_greater_than_one_with_a_prefilling_rank(self, monkeypatch):
+        # A rank in prefill sends the draft to the largest decode bucket and the
+        # full token budget.
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         monkeypatch.setattr(
             proposer.vllm_config.parallel_config, "data_parallel_size", 2
@@ -325,9 +377,11 @@ class TestDetermineDraftBatchPadding:
             ),
         )
         monkeypatch.setattr(
-            eagle_module.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(lambda *a: (torch.tensor([16, 16]), None)),
+            dp_utils,
+            "synchronize_draft_dp_ranks",
+            lambda *a: _dp_aggregates(
+                num_tokens=(16, 16), num_reqs=(4, 2), is_prefill=(False, True)
+            ),
         )
         num_reqs_padded, num_tokens_padded, _ = proposer._determine_draft_batch_padding(
             3, 6, False
@@ -609,6 +663,9 @@ class TestLoadModel:
             def compute_logits(self, sample_hidden_states):
                 return sample_hidden_states + 1
 
+            def modules(self):
+                return []  # dense draft: no fused-MoE layers
+
         monkeypatch.setattr(
             EagleProposer,
             "load_model",
@@ -680,42 +737,7 @@ class TestDummyRun:
         # nothing, invoking the model at least once.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=1)
-        proposer.runner = SimpleNamespace(
-            is_prefill=False,
-            input_batch=SimpleNamespace(
-                num_reqs=2,
-                block_table=[
-                    SimpleNamespace(
-                        get_cpu_tensor=lambda: torch.zeros((8, 4), dtype=torch.int32)
-                    )
-                ],
-            ),
-            kv_caches=[],
-            kv_cache_bases=[],
-            kv_cache_view_infos=[],
-            bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
-            _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
-                np.cumsum(nt, dtype=cumsum_dtype),
-                None,
-            ),
-        )
-        proposer.draft_attn_groups = [
-            SimpleNamespace(
-                get_metadata_builder=lambda: SimpleNamespace(
-                    build=lambda **k: object()
-                ),
-                layer_names=["draft.layer"],
-            )
-        ]
-        calls = []
-
-        def executable(**kwargs):
-            calls.append(1)
-            return kwargs["hidden_states"].reshape(
-                -1, proposer.hidden_size
-            ), torch.zeros((8, 128))
-
-        proposer.model_executable = executable
+        calls = _wire_dummy_runner(proposer)
 
         assert (
             proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
@@ -728,45 +750,43 @@ class TestDummyRun:
         # model runs once for the first pass plus once per extra step.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=2)
-        proposer.runner = SimpleNamespace(
-            is_prefill=False,
-            input_batch=SimpleNamespace(
-                num_reqs=2,
-                block_table=[
-                    SimpleNamespace(
-                        get_cpu_tensor=lambda: torch.zeros((8, 4), dtype=torch.int32)
-                    )
-                ],
-            ),
-            kv_caches=[],
-            kv_cache_bases=[],
-            kv_cache_view_infos=[],
-            bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
-            _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
-                np.cumsum(nt, dtype=cumsum_dtype),
-                None,
-            ),
-        )
-        proposer.draft_attn_groups = [
-            SimpleNamespace(
-                get_metadata_builder=lambda: SimpleNamespace(
-                    build=lambda **k: object()
-                ),
-                layer_names=["draft.layer"],
-            )
-        ]
-        calls = []
-
-        def executable(**kwargs):
-            calls.append(1)
-            return kwargs["hidden_states"].reshape(
-                -1, proposer.hidden_size
-            ), torch.zeros((8, 128))
-
-        proposer.model_executable = executable
+        calls = _wire_dummy_runner(proposer)
         proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
         # first pass (1) + one extra draft step (num_speculative_tokens - 1 = 1).
         assert len(calls) == 2
+
+    @staticmethod
+    def _padded_tokens_per_pass(monkeypatch, proposer, **kwargs):
+        seen: list[int | None] = []
+
+        def record(*a, num_padded_tokens=None, **k):
+            seen.append(num_padded_tokens)
+            return nullcontext()
+
+        monkeypatch.setattr(eagle_module, "set_forward_context", record)
+        monkeypatch.setattr(
+            eagle_module, "attach_kv_cache_bindings", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            eagle_module, "build_kv_cache_forward_context_kwargs", lambda *a, **k: {}
+        )
+        _wire_dummy_runner(proposer)
+        proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True, **kwargs)
+        return seen
+
+    def test_warmup_override_pins_every_pass(self, monkeypatch):
+        # Warm-up compiles for a caller-pinned token dimension, so the override
+        # has to reach the extra draft step too -- not just the first pass.
+        proposer = make_eagle_proposer(num_speculative_tokens=2)
+        assert self._padded_tokens_per_pass(
+            monkeypatch, proposer, num_padded_tokens=64
+        ) == [64, 64]
+
+    def test_without_override_falls_back_to_the_decided_padding(self, monkeypatch):
+        # Single-DP decides no token padding, and no override must not turn that
+        # None into a dimension of its own.
+        proposer = make_eagle_proposer(num_speculative_tokens=2)
+        assert self._padded_tokens_per_pass(monkeypatch, proposer) == [None, None]
 
 
 class TestBuildDummyAttnMetadata:
