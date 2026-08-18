@@ -43,14 +43,15 @@ def make_runner(request):
     compiled decoder_batch_sizes (use_multiple_decoder=True).
     """
 
-    def _make(max_num_seqs):
+    def _make(max_num_seqs, dtype=torch.float32):
         if request.param == "multiple_decoder":
             decoder_batch_sizes = tuple(b for b in (1, 4, 8) if b <= max_num_seqs)
             return create_model_runner(
                 max_num_seqs=max_num_seqs,
+                dtype=dtype,
                 decoder_batch_sizes=decoder_batch_sizes,
             )
-        return create_model_runner(max_num_seqs=max_num_seqs)
+        return create_model_runner(max_num_seqs=max_num_seqs, dtype=dtype)
 
     return _make
 
@@ -75,7 +76,9 @@ def _rig_forward(runner, token_logits: dict[int, float], base: float = 0.0):
     def rigged_forward(model_input, **kwargs):
         num_rows = 1 if model_input.is_prompt else runner.input_batch.num_reqs
         vocab_size = runner.model_config.get_vocab_size()
-        logits = torch.full((num_rows, 1, vocab_size), base, dtype=torch.float32)
+        logits = torch.full(
+            (num_rows, 1, vocab_size), base, dtype=runner.model.dtype
+        )
         for token_id, value in token_logits.items():
             logits[..., token_id] = value
         return logits
@@ -154,14 +157,17 @@ def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: lis
     assert len(runner.pooled_tensors) == len(expected_bucket_sizes)
 
 
-def test_min_p_with_padded_bucket(make_runner):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_min_p_with_padded_bucket(make_runner, dtype):
     """min_p's dense tensor must match the padded (bucket_size) logits,
     not num_reqs. With max_num_seqs=4 and 3 live requests the pooled
     logits have 4 rows; a num_reqs-sized min_p ([3, 1]) fails to
     broadcast in max_probabilities.mul_(self.min_p). Regression test for
-    refresh_metadata_rbln passing num_reqs to get_and_reset.
+    refresh_metadata_rbln passing num_reqs to get_and_reset. The bf16
+    case additionally pins the dtype sync of the bucket-sized min_p
+    against model-dtype pooled logits.
     """
-    runner = make_runner(4)
+    runner = make_runner(4, dtype=dtype)
 
     # The top token holds only ~5% probability; min_p=0.5 masks all other
     # tokens, so random sampling becomes deterministic only when min_p is
@@ -185,8 +191,10 @@ def test_min_p_with_padded_bucket(make_runner):
     output = _decode(runner, reqs)
 
     _assert_padded_bucket(runner, num_live=3)
+    assert runner.pooled_tensors[runner.bucket_size].dtype == dtype
     min_p_proc = _get_min_p_proc(runner)
     assert min_p_proc.min_p.shape[0] == runner.bucket_size
+    assert min_p_proc.min_p.dtype == dtype
     for token_id in _sampled_by_req(output).values():
         assert token_id == TOP_TOKEN_ID
 
@@ -359,11 +367,14 @@ def test_min_p_tracks_bucket_transitions(make_runner):
     assert assert_decode(reqs, finished_req_ids=["req_3", "req_4"]) == small_bucket
 
 
-def test_mixed_sampling_params_with_padded_bucket(make_runner):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_mixed_sampling_params_with_padded_bucket(make_runner, dtype):
     """Rows with different sampling params (greedy, min_p, logit_bias)
-    must each get only their own params in one padded batch.
+    must each get only their own params in one padded batch. The bf16
+    case runs every dtype-synced logitsproc together on model-dtype
+    padded logits.
     """
-    runner = make_runner(4)
+    runner = make_runner(4, dtype=dtype)
 
     # top ~5% under temperature=1.0 so row 1 is deterministic only via
     # min_p; runner-up + 20 beats top only on the biased row.
