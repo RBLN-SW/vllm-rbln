@@ -79,7 +79,7 @@ def impl(monkeypatch) -> RBLNRejectionSamplerImpl:
 
 
 ########################### build_op_top_k_top_p ###########################
-def test_all_greedy_batch_is_encoded_as_argmax():
+def test_all_greedy():
     metadata = make_sampling_metadata(
         temperature=None,
         all_greedy=True,
@@ -93,7 +93,7 @@ def test_all_greedy_batch_is_encoded_as_argmax():
     assert top_p is None
 
 
-def test_all_random_batch_without_top_k_top_p_disables_both():
+def test_all_random_pure_multinomial():
     metadata = make_sampling_metadata(
         temperature=torch.tensor([1.0, 2.0]),
         all_greedy=False,
@@ -102,13 +102,12 @@ def test_all_random_batch_without_top_k_top_p_disables_both():
 
     top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
 
-    # (`None`, `None`) is not allowed, so `top_k` carries the neutral
-    # `vocab_size` tensor and only top-p is elided.
-    assert torch.equal(top_k, torch.tensor([VOCAB_SIZE] * 2, dtype=torch.int32))
+    # Pure multinomial: the compiler fills both with scalar neutrals.
+    assert top_k is None
     assert top_p is None
 
 
-def test_all_random_top_k_only_batch_elides_top_p():
+def test_all_random_top_k_only():
     metadata = make_sampling_metadata(
         temperature=torch.tensor([1.0, 2.0]),
         all_greedy=False,
@@ -122,7 +121,7 @@ def test_all_random_top_k_only_batch_elides_top_p():
     assert top_p is None
 
 
-def test_all_random_top_p_only_batch_elides_top_k():
+def test_all_random_top_p_only():
     metadata = make_sampling_metadata(
         temperature=torch.tensor([1.0, 2.0]),
         all_greedy=False,
@@ -136,7 +135,51 @@ def test_all_random_top_p_only_batch_elides_top_k():
     assert top_p is metadata.top_p
 
 
-def test_mixed_batch_top_p_only_still_builds_top_k():
+def test_all_random_top_k_and_top_p():
+    metadata = make_sampling_metadata(
+        temperature=torch.tensor([1.0, 2.0]),
+        all_greedy=False,
+        all_random=True,
+        top_k=torch.tensor([3, VOCAB_SIZE], dtype=torch.int32),
+        top_p=torch.tensor([0.9, 1.0], dtype=torch.float32),
+    )
+
+    top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
+
+    assert top_k is metadata.top_k
+    assert top_p is metadata.top_p
+
+
+def test_mixed_pure_multinomial():
+    metadata = make_sampling_metadata(
+        temperature=torch.tensor([2.0, 0.0]),
+        all_greedy=False,
+        all_random=False,
+    )
+
+    top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
+
+    assert torch.equal(
+        top_k, torch.tensor([VOCAB_SIZE, GREEDY_TOP_K], dtype=torch.int32)
+    )
+    assert top_p is None
+
+
+def test_mixed_top_k_only():
+    metadata = make_sampling_metadata(
+        temperature=torch.tensor([0.0, 1.0]),
+        all_greedy=False,
+        all_random=False,
+        top_k=torch.tensor([VOCAB_SIZE, 3], dtype=torch.int32),
+    )
+
+    top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
+
+    assert torch.equal(top_k, torch.tensor([GREEDY_TOP_K, 3], dtype=torch.int32))
+    assert top_p is None
+
+
+def test_mixed_top_p_only():
     """A greedy row is encoded as `top_k == 1`, so `top_k` cannot be elided
     from a mixed batch even when no request uses top-k."""
     metadata = make_sampling_metadata(
@@ -156,7 +199,7 @@ def test_mixed_batch_top_p_only_still_builds_top_k():
     )
 
 
-def test_mixed_batch_overrides_only_greedy_rows():
+def test_mixed_top_k_and_top_p():
     # Row 0 is greedy, and vLLM rewrites its params to the same values a random
     # request without top-k/top-p carries -- which is why the op cannot tell the
     # two apart from `sampling_metadata` alone.
@@ -274,21 +317,6 @@ def test_every_row_kind_gets_its_own_top_k_top_p():
         row = input_batch.req_id_to_index[name]
         assert top_k[row].item() == expected_k, name
         assert top_p[row].item() == pytest.approx(expected_p), name
-
-
-def test_mixed_batch_without_request_top_k_top_p():
-    metadata = make_sampling_metadata(
-        temperature=torch.tensor([2.0, 0.0]),
-        all_greedy=False,
-        all_random=False,
-    )
-
-    top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
-
-    assert torch.equal(
-        top_k, torch.tensor([VOCAB_SIZE, GREEDY_TOP_K], dtype=torch.int32)
-    )
-    assert top_p is None
 
 
 ########################### apply_sampling_constraints ###########################
