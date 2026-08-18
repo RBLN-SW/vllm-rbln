@@ -50,6 +50,10 @@ export VLLM_RBLN_USE_DEVICE_TENSOR=1
 export VLLM_DISABLE_COMPILE_CACHE=${VLLM_DISABLE_COMPILE_CACHE:-0}
 # Block hashes must be reproducible across the two serves being compared.
 export PYTHONHASHSEED=0
+# Exposes POST /reset_prefix_cache, which turns a repeat from a 20-minute serve
+# restart into a 3-minute run: the same seed can be replayed against a cold cache
+# instead of buying freshness with a fresh seed. Dev endpoints, benchmark only.
+export VLLM_SERVER_DEV_MODE=${VLLM_SERVER_DEV_MODE:-1}
 export RBLN_DEVICES=${RBLN_DEVICES:-4,5,6,7}
 
 case "$MODE" in
