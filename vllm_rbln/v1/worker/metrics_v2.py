@@ -19,6 +19,7 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TypeVar
 
 import numpy as np
@@ -28,6 +29,14 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 T = TypeVar("T", int, float)
+
+
+class _Phase(Enum):
+    """Report phases, in report order; the value is the section label."""
+
+    PREFILL = "PREFILL"
+    DECODE = "DECODE"
+    PADDED_DECODE = "PADDED DECODE"
 
 
 @dataclass
@@ -98,7 +107,7 @@ class _Sample:
     device: int | None = None
     ccl: int | None = None
     prepare: int | None = None
-    phase: bool | None = None  # True=prefill, False=decode (set by the model span)
+    phase: _Phase | None = None  # None on a sampler span
 
     def merged(self, other: "_Sample") -> "_Sample":
         def _add(a: int | None, b: int | None) -> int | None:
@@ -126,7 +135,7 @@ class _TimingSpan:
     __slots__ = ("_ctx", "_phase", "_is_sampler", "_reports", "_start", "_capture_ctx")
 
     def __init__(
-        self, ctx: "_PerformanceContext", phase: bool | None, is_sampler: bool
+        self, ctx: "_PerformanceContext", phase: _Phase | None, is_sampler: bool
     ) -> None:
         self._ctx = ctx
         self._phase = phase
@@ -172,35 +181,39 @@ class _PerformanceContext:
     def __init__(self, name: str | None = None, runtimes: list | None = None) -> None:
         self.name = name
         self.rank_tag = _rank_tag()
-        self._metrics: dict[bool, Metrics] = defaultdict(Metrics)
+        self._metrics: dict[_Phase, Metrics] = defaultdict(Metrics)
         self._pending: _Sample | None = None
         self._e2e_start: float | None = None
-        self._e2e_is_prefill: bool | None = None
-        self._e2e: dict[bool, Metrics] = defaultdict(Metrics)
+        self._e2e_phase: _Phase | None = None
+        self._e2e: dict[_Phase, Metrics] = defaultdict(Metrics)
         self._runtimes = runtimes if runtimes is not None else []
         self._backlog_drained = False
 
     def start_e2e(self) -> None:
         self._e2e_start = time.perf_counter()
-        self._e2e_is_prefill = None
+        self._e2e_phase = None
 
     def end_e2e(self) -> None:
         end = time.perf_counter()
         start, self._e2e_start = self._e2e_start, None
         if start is None:
             return
-        if self._e2e_is_prefill is None:
+        if self._e2e_phase is None:
             return  # no forward pass ran: nothing to attribute
-        self._e2e[self._e2e_is_prefill].record(end - start)
+        self._e2e[self._e2e_phase].record(end - start)
 
-    def profile_model(self, is_prefill: bool) -> _TimingSpan:
+    def profile_model(self, is_prefill: bool, padded_decode: bool) -> _TimingSpan:
         self._drain_report_backlog()
         # A prior model step with no sampler (intermediate chunked prefill,
         # non-last PP rank) leaves a pending report; record it model-only here.
         self._flush_pending()
+        if is_prefill:
+            phase = _Phase.PREFILL
+        else:
+            phase = _Phase.PADDED_DECODE if padded_decode else _Phase.DECODE
         if self._e2e_start is not None:
-            self._e2e_is_prefill = is_prefill
-        return _TimingSpan(self, phase=is_prefill, is_sampler=False)
+            self._e2e_phase = phase
+        return _TimingSpan(self, phase=phase, is_sampler=False)
 
     def profile_sampler(self) -> _TimingSpan:
         return _TimingSpan(self, phase=None, is_sampler=True)
@@ -220,9 +233,8 @@ class _PerformanceContext:
             self._pending = None
 
     def _record(self, s: _Sample) -> None:
-        self._metrics[bool(s.phase)].record(
-            s.latency, s.host, s.device, s.ccl, s.prepare
-        )
+        assert s.phase is not None, "sampler-only sample reached _record"
+        self._metrics[s.phase].record(s.latency, s.host, s.device, s.ccl, s.prepare)
 
     def _drain_report_backlog(self) -> None:
         """Discard warmup reports left in the runtime FIFO before measuring."""
@@ -237,10 +249,10 @@ class _PerformanceContext:
     def print_stats(self) -> None:
         self._flush_pending()  # record the final step if it had no sampler
         sections: dict[str, Metrics] = {}
-        for phase, m in sorted(self._metrics.items(), key=lambda x: not x[0]):
-            sections["PREFILL + SAMPLE" if phase else "DECODE + SAMPLE"] = m
-        for phase, m in sorted(self._e2e.items(), key=lambda x: not x[0]):
-            sections["PREFILL E2E" if phase else "DECODE E2E"] = m
+        for suffix, table in (("+ SAMPLE", self._metrics), ("E2E", self._e2e)):
+            for phase in _Phase:
+                if phase in table:
+                    sections[f"{phase.value} {suffix}"] = table[phase]
         name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
         _report_metrics(name, sections)
         _write_metrics_json(self.name, self.rank_tag, sections)

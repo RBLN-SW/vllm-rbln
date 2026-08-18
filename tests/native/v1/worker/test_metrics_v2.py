@@ -73,11 +73,11 @@ class TestMetrics:
 
 class TestSampleMerged:
     def test_latency_sums_and_model_phase_is_kept(self):
-        model = mm._Sample(latency=1.0, phase=True)
+        model = mm._Sample(latency=1.0, phase=mm._Phase.PREFILL)
         sampler = mm._Sample(latency=0.5, phase=None)
         merged = model.merged(sampler)
         assert merged.latency == 1.5
-        assert merged.phase is True  # keeps the model span's phase, not other's
+        assert merged.phase == mm._Phase.PREFILL  # keeps the model span's phase
 
     def test_add_is_none_only_when_both_none_else_treats_none_as_zero(self):
         a = mm._Sample(latency=1.0, host=0, device=None, ccl=5, prepare=None)
@@ -184,10 +184,10 @@ def _fake_clock(monkeypatch):
     return clock
 
 
-def _run_pass(ctx, is_prefill, with_sampler=True):
+def _run_pass(ctx, is_prefill, with_sampler=True, padded_decode=False):
     """Drive one execute_model pass the way the runner decorators do."""
     ctx.start_e2e()
-    with ctx.profile_model(is_prefill=is_prefill):
+    with ctx.profile_model(is_prefill=is_prefill, padded_decode=padded_decode):
         pass
     if with_sampler:
         with ctx.profile_sampler():
@@ -199,18 +199,20 @@ class TestPerformanceContextStateMachine:
     def test_model_then_sampler_merges_and_records(self, monkeypatch):
         ctx = _ctx(monkeypatch)
         ctx._submit(
-            mm._Sample(1.0, host=10, device=20, ccl=30, prepare=5, phase=True),
+            mm._Sample(
+                1.0, host=10, device=20, ccl=30, prepare=5, phase=mm._Phase.PREFILL
+            ),
             is_sampler=False,
         )
         # Model span alone stays pending -- nothing recorded yet.
-        assert ctx._metrics[True].call_count == 0
+        assert ctx._metrics[mm._Phase.PREFILL].call_count == 0
         assert ctx._pending is not None
 
         ctx._submit(
             mm._Sample(0.5, host=1, device=2, ccl=3, prepare=4, phase=None),
             is_sampler=True,
         )
-        m = ctx._metrics[True]
+        m = ctx._metrics[mm._Phase.PREFILL]
         assert m.latencies == [1.5]
         assert (m.host_times, m.device_times) == ([11], [22])
         assert (m.ccl_times, m.prepare_times) == ([33], [9])
@@ -219,34 +221,52 @@ class TestPerformanceContextStateMachine:
     def test_sampler_without_pending_is_ignored(self, monkeypatch):
         ctx = _ctx(monkeypatch)
         ctx._submit(mm._Sample(0.5, phase=None), is_sampler=True)
-        assert ctx._metrics[True].call_count == 0
-        assert ctx._metrics[False].call_count == 0
+        assert ctx._metrics[mm._Phase.PREFILL].call_count == 0
+        assert ctx._metrics[mm._Phase.DECODE].call_count == 0
 
     def test_flush_pending_records_model_only(self, monkeypatch):
         # A model step with no following sampler is recorded model-only on flush.
         ctx = _ctx(monkeypatch)
-        ctx._submit(mm._Sample(2.0, host=7, phase=False), is_sampler=False)
+        ctx._submit(mm._Sample(2.0, host=7, phase=mm._Phase.DECODE), is_sampler=False)
         ctx._flush_pending()
-        assert ctx._metrics[False].latencies == [2.0]
-        assert ctx._metrics[False].host_times == [7]
+        assert ctx._metrics[mm._Phase.DECODE].latencies == [2.0]
+        assert ctx._metrics[mm._Phase.DECODE].host_times == [7]
         assert ctx._pending is None
 
     def test_prefill_and_decode_go_to_separate_buckets(self, monkeypatch):
         ctx = _ctx(monkeypatch)
-        ctx._submit(mm._Sample(1.0, phase=True), is_sampler=False)
+        ctx._submit(mm._Sample(1.0, phase=mm._Phase.PREFILL), is_sampler=False)
         ctx._submit(mm._Sample(0.5, phase=None), is_sampler=True)
-        ctx._submit(mm._Sample(0.2, phase=False), is_sampler=False)
+        ctx._submit(mm._Sample(0.2, phase=mm._Phase.DECODE), is_sampler=False)
         ctx._submit(mm._Sample(0.1, phase=None), is_sampler=True)
-        assert ctx._metrics[True].latencies == [1.5]
-        assert ctx._metrics[False].latencies == pytest.approx([0.3])
+        assert ctx._metrics[mm._Phase.PREFILL].latencies == [1.5]
+        assert ctx._metrics[mm._Phase.DECODE].latencies == pytest.approx([0.3])
+
+    def test_padded_decode_gets_its_own_bucket(self, monkeypatch):
+        ctx = _ctx(monkeypatch)
+        _run_pass(ctx, is_prefill=False)
+        _run_pass(ctx, is_prefill=False, padded_decode=True)
+        assert ctx._metrics[mm._Phase.DECODE].call_count == 1
+        assert ctx._metrics[mm._Phase.PADDED_DECODE].call_count == 1
+        assert ctx._e2e[mm._Phase.DECODE].call_count == 1
+        assert ctx._e2e[mm._Phase.PADDED_DECODE].call_count == 1
+
+    def test_prefill_ignores_the_padded_flag(self, monkeypatch):
+        # num_tokens_padded is prefill-sized on a prefill step too; only decode
+        # steps split on it.
+        ctx = _ctx(monkeypatch)
+        _run_pass(ctx, is_prefill=True, padded_decode=True)
+        assert ctx._metrics[mm._Phase.PREFILL].call_count == 1
+        assert mm._Phase.PADDED_DECODE not in ctx._metrics
 
     def test_profile_model_flushes_prior_pending(self, monkeypatch):
         # Back-to-back model steps: the earlier pending one is flushed (recorded
         # model-only) when the next profile_model starts.
         ctx = _ctx(monkeypatch)
-        ctx._submit(mm._Sample(1.0, phase=True), is_sampler=False)
-        ctx.profile_model(is_prefill=False)  # span not entered; only flushes
-        assert ctx._metrics[True].call_count == 1
+        ctx._submit(mm._Sample(1.0, phase=mm._Phase.PREFILL), is_sampler=False)
+        # Span not entered; only flushes.
+        ctx.profile_model(is_prefill=False, padded_decode=False)
+        assert ctx._metrics[mm._Phase.PREFILL].call_count == 1
         assert ctx._pending is None
 
     def test_drain_backlog_flushes_runtimes_once(self, monkeypatch):
@@ -267,15 +287,15 @@ class TestE2EWindow:
         ctx = _ctx(monkeypatch)
         ctx.start_e2e()
         clock.now += 1.0  # input preparation, before the model span opens
-        with ctx.profile_model(is_prefill=True):
+        with ctx.profile_model(is_prefill=True, padded_decode=False):
             clock.now += 4.0
         clock.now += 1.0
         with ctx.profile_sampler():
             clock.now += 2.0
         clock.now += 1.0  # output copy, after the sampler span closed
         ctx.end_e2e()
-        assert ctx._metrics[True].latencies == [6.0]  # the two spans only
-        assert ctx._e2e[True].latencies == [9.0]  # the whole pass
+        assert ctx._metrics[mm._Phase.PREFILL].latencies == [6.0]  # the two spans only
+        assert ctx._e2e[mm._Phase.PREFILL].latencies == [9.0]  # the whole pass
         assert ctx._e2e_start is None
 
     def test_time_between_passes_is_excluded(self, monkeypatch):
@@ -283,21 +303,21 @@ class TestE2EWindow:
         ctx = _ctx(monkeypatch)
         for _ in range(2):
             ctx.start_e2e()
-            with ctx.profile_model(is_prefill=False):
+            with ctx.profile_model(is_prefill=False, padded_decode=False):
                 clock.now += 1.0
             ctx.end_e2e()
             clock.now += 10.0  # engine and idle time between passes
-        assert ctx._e2e[False].latencies == [1.0, 1.0]
+        assert ctx._e2e[mm._Phase.DECODE].latencies == [1.0, 1.0]
 
     def test_sampler_less_pass_is_still_timed(self, monkeypatch):
         # Intermediate chunked prefill / non-last PP rank.
         clock = _fake_clock(monkeypatch)
         ctx = _ctx(monkeypatch)
         ctx.start_e2e()
-        with ctx.profile_model(is_prefill=True):
+        with ctx.profile_model(is_prefill=True, padded_decode=False):
             clock.now += 3.0
         ctx.end_e2e()
-        assert ctx._e2e[True].latencies == [3.0]
+        assert ctx._e2e[mm._Phase.PREFILL].latencies == [3.0]
 
     def test_pass_without_a_model_span_is_dropped(self, monkeypatch):
         clock = _fake_clock(monkeypatch)
@@ -319,40 +339,40 @@ class TestE2EWindow:
         clock = _fake_clock(monkeypatch)
         ctx = _ctx(monkeypatch)
         ctx.start_e2e()
-        with ctx.profile_model(is_prefill=False):
+        with ctx.profile_model(is_prefill=False, padded_decode=False):
             clock.now += 1.0
         ctx.end_e2e()
         clock.now += 5.0
         ctx.end_e2e()
-        assert ctx._e2e[False].latencies == [1.0]
+        assert ctx._e2e[mm._Phase.DECODE].latencies == [1.0]
 
     def test_phase_does_not_carry_over_to_the_next_window(self, monkeypatch):
         clock = _fake_clock(monkeypatch)
         ctx = _ctx(monkeypatch)
         ctx.start_e2e()
-        with ctx.profile_model(is_prefill=False):
+        with ctx.profile_model(is_prefill=False, padded_decode=False):
             clock.now += 1.0
         ctx.end_e2e()
         ctx.start_e2e()
         clock.now += 5.0
         ctx.end_e2e()  # no model span: must not land in the decode bucket again
-        assert ctx._e2e[False].latencies == [1.0]
+        assert ctx._e2e[mm._Phase.DECODE].latencies == [1.0]
 
     def test_model_span_outside_a_window_is_not_attributed(self, monkeypatch):
         _fake_clock(monkeypatch)
         ctx = _ctx(monkeypatch)
-        ctx.profile_model(is_prefill=True)
-        assert ctx._e2e_is_prefill is None
+        ctx.profile_model(is_prefill=True, padded_decode=False)
+        assert ctx._e2e_phase is None
 
 
 class TestTimingSpanWiring:
     def test_model_and_sampler_spans_record_one_merged_step(self, monkeypatch):
         ctx = _ctx(monkeypatch)
         _run_pass(ctx, is_prefill=True)
-        m = ctx._metrics[True]
+        m = ctx._metrics[mm._Phase.PREFILL]
         assert m.call_count == 1
         assert m.host_times == []  # no reports captured -> no timing series
-        assert ctx._e2e[True].call_count == 1
+        assert ctx._e2e[mm._Phase.PREFILL].call_count == 1
         assert ctx._pending is None
 
 
@@ -372,6 +392,25 @@ class TestReporting:
             "DECODE E2E",
         ]
 
+    def test_padded_decode_is_a_separate_section(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        ctx = _ctx(monkeypatch)
+        # Out of report order on purpose: sections follow the fixed phase order.
+        _run_pass(ctx, is_prefill=False, padded_decode=True)
+        _run_pass(ctx, is_prefill=False)
+        _run_pass(ctx, is_prefill=True)
+        ctx.print_stats()
+
+        data = json.loads((tmp_path / "metrics.json").read_text())
+        assert list(data["sections"]) == [
+            "PREFILL + SAMPLE",
+            "DECODE + SAMPLE",
+            "PADDED DECODE + SAMPLE",
+            "PREFILL E2E",
+            "DECODE E2E",
+            "PADDED DECODE E2E",
+        ]
+
     def test_unseen_phase_is_omitted(self, monkeypatch, tmp_path):
         monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
         ctx = _ctx(monkeypatch)
@@ -385,10 +424,10 @@ class TestReporting:
         monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
         ctx = _ctx(monkeypatch)
         _run_pass(ctx, is_prefill=True, with_sampler=False)
-        assert ctx._metrics[True].call_count == 0  # waiting for a sampler
+        assert ctx._metrics[mm._Phase.PREFILL].call_count == 0  # waiting for a sampler
 
         ctx.print_stats()
-        assert ctx._metrics[True].call_count == 1
+        assert ctx._metrics[mm._Phase.PREFILL].call_count == 1
 
 
 class TestE2EDecorators:

@@ -1428,7 +1428,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
-            self.performance_ctx.profile_model(self.is_prefill),
+            self.performance_ctx.profile_model(
+                self.is_prefill,
+                # num_tokens_padded is the MoE pad shape, so matching the prefill
+                # dim means this decode ran the prefill-sized graph.
+                padded_decode=num_tokens_padded == self.max_num_tokens,
+            ),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
