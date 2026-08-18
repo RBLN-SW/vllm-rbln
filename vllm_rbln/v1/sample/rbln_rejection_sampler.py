@@ -29,7 +29,6 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TEMPERATURE,
-    GREEDY_TOP_K,
     build_op_top_k_top_p,
 )
 
@@ -325,26 +324,16 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             else None
         )
 
-        def compile_op(op):
-            return compile(
-                op,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=compile_context,
-                num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_global_ctx=True
-                if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR
-                else None,
-                global_device_id=0
-                if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR
-                else None,
-            )
-
-        self._compiled_rejection_sample = compile_op(rbln_rejection_sample)
-        self._compiled_rejection_sample_greedy = compile_op(
-            rbln_rejection_sample_greedy
+        self._compiled_rejection_sample = compile(
+            rbln_rejection_sample,
+            dynamic=False,
+            fullgraph=True,
+            compile_context=compile_context,
+            num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            model_trace_method="export" if USE_DEVICE_TENSOR else "",
+            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+            use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+            global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
         )
 
     def rejection_sample(
@@ -448,35 +437,27 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
+        top_k, top_p = build_op_top_k_top_p(
+            sampling_metadata,
+            batch_size,
+            vocab_size,
+            device,
+        )
+
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
-        # An all-greedy batch takes its own graph, which carries top_k == 1 as
-        # a baked-in constant.
         # Returns:
         #   recovered_token_ids : (B, K) int — per-batch padded recovered tokens.
         #   num_accepted       : (B,)   int — per-batch number of accepted draft
         #                                     tokens (in [0, num_draft_tokens[i]]).
         # ------------------------------------------------------------------
-        if sampling_metadata.all_greedy:
-            recovered_token_ids, num_accepted = self._compiled_rejection_sample_greedy(
-                reshaped_draft_token_ids,
-                reshaped_target_probs,
-                cu_num_draft_tokens.to(device),
-            )
-        else:
-            top_k, top_p = build_op_top_k_top_p(
-                sampling_metadata,
-                batch_size,
-                vocab_size,
-                device,
-            )
-            recovered_token_ids, num_accepted = self._compiled_rejection_sample(
-                reshaped_draft_token_ids,
-                reshaped_target_probs,
-                cu_num_draft_tokens.to(device),
-                top_k,
-                top_p,
-            )
+        recovered_token_ids, num_accepted = self._compiled_rejection_sample(
+            reshaped_draft_token_ids,
+            reshaped_target_probs,
+            cu_num_draft_tokens.to(device),
+            top_k,
+            top_p,
+        )
 
         # ------------------------------------------------------------------
         # 3) Compose per-position output for the first K columns:
@@ -600,26 +581,6 @@ def rbln_rejection_sample(
         cu_num_draft_tokens,
         top_k,
         top_p,
-    )
-
-
-def rbln_rejection_sample_greedy(
-    draft_token_ids: torch.Tensor,
-    target_probs: torch.Tensor,
-    cu_num_draft_tokens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # `top_k` is created inside the compiled function so that it lands in the
-    # traced graph as a 0-d *constant* the primitive can specialize on; an
-    # argument tensor would only arrive as runtime data.
-    top_k = torch.full(
-        (), GREEDY_TOP_K, dtype=torch.int32, device=draft_token_ids.device
-    )
-    return torch.ops.rbln.rejection_sample(
-        draft_token_ids,
-        target_probs,
-        cu_num_draft_tokens,
-        top_k,
-        None,
     )
 
 
