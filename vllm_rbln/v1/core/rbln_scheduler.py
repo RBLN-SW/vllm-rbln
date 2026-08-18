@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -62,6 +63,14 @@ class RBLNScheduler(Scheduler):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+
+        # Cold-start determinism gate. Only RBLNAsyncScheduler drives it (via
+        # _det_quiesced / the schedule() override); for sync scheduling _det_hold
+        # stays False and this is inert. See RBLNAsyncScheduler for the rationale.
+        self._det_warm = False
+        self._det_last_n = -1
+        self._det_stable = 0
+        self._det_hold = False
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
@@ -169,8 +178,9 @@ class RBLNScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
-        if self._pause_state == PauseState.PAUSED_ALL:
-            # Do not schedule any requests when paused.
+        if self._pause_state == PauseState.PAUSED_ALL or self._det_hold:
+            # Do not schedule any requests when paused, or while the async
+            # determinism gate is holding the first step (see _det_hold).
             token_budget = 0
 
         # Encoder-related.
@@ -1026,3 +1036,67 @@ class RBLNScheduler(Scheduler):
         if match is not None:
             self.kv_cache_manager.release_sub_block_match(match)
         return None, 0
+
+
+class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
+    """RBLNScheduler with async-scheduling (optimistic) semantics.
+
+    Plain RBLNScheduler can't fill the engine's batch_queue: schedule(N+1)
+    sizes a running decode request as
+    num_tokens_with_spec + num_output_placeholders - num_computed_tokens,
+    which is <= 0 until update_from_output(N) appends N's real token. So the
+    next step (and its DP gloo all_reduce) only runs after step N's output --
+    serial, no overlap with forward(N)'s NPU work.
+
+    AsyncScheduler fixes this by bumping num_output_placeholders at schedule
+    time. Composed via MRO: RBLNAsyncScheduler -> RBLNScheduler ->
+    AsyncScheduler -> Scheduler. RBLNScheduler defines neither
+    _update_after_schedule nor _update_request_with_output, so both resolve to
+    AsyncScheduler.
+
+    Cold start: stepping can begin before every in-flight client request has
+    been ingested from the EngineCore input queue, so how many requests are
+    admitted before the first prefill varies with IPC timing - and with it the
+    per-step DP batch composition. schedule() holds the first step until
+    ingestion quiesces; see _det_quiesced.
+    """
+
+    def _det_quiesced(self) -> bool:
+        """True once the initially-queued request set has stopped growing.
+
+        Until then the caller schedules nothing and this sleeps briefly, letting
+        the EngineCore loop drain more requests from its input queue. Re-arms
+        when the engine goes idle; returns True immediately once warm.
+        """
+        if not self.waiting and not self.running:
+            # Engine idle: nothing to hold for; re-arm for the next cold start.
+            self._det_warm = False
+            self._det_last_n = -1
+            self._det_stable = 0
+            return True
+        if self._det_warm or self.running:
+            # Already warmed, or a batch is already stepping -- don't stall it.
+            self._det_warm = True
+            return True
+        # Cold start with pending prefills only: wait for ingestion to settle.
+        n = len(self.waiting)
+        if n != self._det_last_n:
+            self._det_last_n = n
+            self._det_stable = 0
+        else:
+            self._det_stable += 1
+        if self._det_stable >= 3:
+            self._det_warm = True
+            return True
+        time.sleep(0.01)
+        return False
+
+    def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
+        # The signature must track RBLNScheduler.schedule: step_with_batch_queue
+        # calls schedule(self._should_throttle_prefills()), and that is the
+        # async-only path, so a stale signature here breaks every async run.
+        #
+        # Hold the first step until request ingestion quiesces so the DP batch
+        # composition is deterministic (see class docstring).
+        self._det_hold = not self._det_quiesced()
+        return super().schedule(throttle_prefills)

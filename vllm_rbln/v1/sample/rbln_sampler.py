@@ -151,9 +151,31 @@ class RBLNSampler(VLLMSampler):
         self._compiled_greedy_sample = compile_sampler(
             rbln_greedy_sample, compile_context
         )
+        # Staging buffers for the sampled tokens; see greedy_sample.
+        self._tok_stage: list[torch.Tensor] = []
+        self._tok_slot = 0
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        return self._compiled_greedy_sample(logits)
+        # Copy the dense (B,) out so the graph output dies at once and keeps its
+        # address; a changed one re-patches the command stream every step.
+        # non_blocking, or the copy waits on argmax.
+        #
+        # Two buffers alternating: async scheduling hands the returned view to the
+        # output thread and keeps stepping, so one buffer would be overwritten
+        # before those tokens were read.
+        out = self._compiled_greedy_sample(logits)
+        ring = self._tok_stage
+        if not ring or ring[0].shape != out.shape or ring[0].device != out.device:
+            ring = [
+                torch.empty(out.shape, dtype=out.dtype, device=out.device)
+                for _ in range(2)
+            ]
+            self._tok_stage = ring
+            self._tok_slot = 0
+        buf = ring[self._tok_slot]
+        self._tok_slot ^= 1
+        buf.copy_(out, non_blocking=True)
+        return buf
 
     def sample(
         self,
@@ -245,11 +267,10 @@ class RBLNSampler(VLLMSampler):
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
-        # Convert sampled token ids to int64 (long) type to ensure compatibility
-        # with subsequent operations that may use these values as indices.
-        # NOTE(RBLN): `rbln::top_k_top_p` and `rbln::argmax` return int32, which is
-        # the same reason upstream needs this on its FlashInfer backend.
-        sampled = sampled.long()
+        # The int64 round-trip is dropped: integer eager ops have no device kernel,
+        # so it pulled the tokens off the device. `rbln::top_k_top_p` and
+        # `rbln::argmax` already return int32, which is what SamplerOutput wants;
+        # gather_logprobs casts its own copy.
 
         if num_logprobs is None:
             logprobs_tensors = None
@@ -261,11 +282,8 @@ class RBLNSampler(VLLMSampler):
         else:
             # Gather the logprobs and ranks of the topk and sampled token.
             logprobs_tensors = self.gather_logprobs(
-                raw_logprobs, num_logprobs, token_ids=sampled
+                raw_logprobs, num_logprobs, token_ids=sampled.long()
             )
-
-        # Use int32 to reduce the tensor size.
-        sampled = sampled.to(torch.int32)
 
         # These are GPU tensors.
         sampler_output = SamplerOutput(

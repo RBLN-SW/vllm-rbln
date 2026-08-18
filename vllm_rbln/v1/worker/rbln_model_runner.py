@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import dataclasses
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -67,6 +68,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
     DraftTokenIds,
     KVConnectorOutput,
     LogprobsLists,
@@ -189,6 +191,93 @@ def _copy_pooler_output(
     return pooler_output
 
 
+# Wrapper for ModelRunnerOutput to support overlapped execution.
+class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
+    def __init__(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        sampled_token_ids: torch.Tensor,
+        invalid_req_indices: list[int],
+        device_index: int,
+        pending_token_writeback: Any = None,
+        req_ids: list[str] | None = None,
+        placeholder_pos: dict[str, int] | None = None,
+        logprobs_tensors: Any = None,
+    ):
+        self._model_runner_output = model_runner_output
+        self._invalid_req_indices = invalid_req_indices
+        self._device_index = device_index
+        # For the token_ids_cpu write-back, applied by the main thread.
+        self._pending = pending_token_writeback
+        self._req_ids = req_ids
+        self._placeholder_pos = placeholder_pos
+
+        # Keep a reference to the device tensor to avoid it being
+        # deallocated until we finish copying it to the host.
+        self._sampled_token_ids = sampled_token_ids
+        self._sampled_token_ids_cpu = torch.empty(
+            sampled_token_ids.shape,
+            dtype=sampled_token_ids.dtype,
+            device="cpu",
+        )
+        # Logprobs ride the same deferral, dense form only: the topk form
+        # indexes by the sampled ids, which pulls the tokens to the host
+        # mid-step. sample_tokens rejects it under async rather than let it
+        # silently serialise the step.
+        self._logprobs_tensors = logprobs_tensors
+
+        # The D2H is neither dispatched nor awaited here - both happen in
+        # get_output().
+
+    def get_output(self) -> ModelRunnerOutput:
+        """Copy the device tensors to the host and return a ModelRunnerOutput.
+
+        This function blocks until the copy is finished.
+
+        With MultiprocExecutor + async scheduling it is called on the worker's
+        async output thread (WorkerProc.async_output_busy_loop ->
+        enqueue_output); with UniProcExecutor it is called inline from
+        AsyncOutputFuture.result().
+
+        Dispatching the copy from a non-main thread is only safe because rebel's
+        Stream state is mutex-guarded: VMemoryManager::DispatchFlatAsyncCopy
+        reads the dependency, submits and Records under
+        Stream::LockForDispatch(), so it cannot interleave with the main
+        thread's RuntimeInstance::Run.
+
+        inference_mode is re-entered for the copy: _sampled_token_ids_cpu was
+        allocated in __init__ under sample_tokens' inference_mode, so it is an
+        inference tensor, and InferenceMode is thread-local - it is off on this
+        thread. Updating an inference tensor in place with it off is a hard error.
+        """
+        # Blocking copy, not non_blocking + synchronize: rbln_device_synchronize
+        # waits on every pending handle, so once forward(N+1) is dispatched this
+        # thread would wait out a whole forward. DoCopy waits on the sampler only.
+        with torch.inference_mode():
+            self._sampled_token_ids_cpu.copy_(self._sampled_token_ids)
+
+        valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
+        for i in self._invalid_req_indices:
+            valid_sampled_token_ids[i].clear()
+
+        # The -1 placeholders the async path left in token_ids_cpu still have to be
+        # replaced by the real tokens, but not from this thread: the main thread
+        # reads token_ids_cpu in _preprocess. Queue the tokens instead and let the
+        # main thread apply them at the top of its next step.
+        if self._pending is not None and self._req_ids is not None:
+            self._pending.append(
+                (self._req_ids, valid_sampled_token_ids, self._placeholder_pos)
+            )
+
+        output = self._model_runner_output
+        output.sampled_token_ids = valid_sampled_token_ids
+        if self._logprobs_tensors is not None:
+            # tolists() is where the logprobs D2H actually happens - on this
+            # thread, off the step's critical path.
+            output.logprobs = self._logprobs_tensors.tolists()
+        return output
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -267,6 +356,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             self.sampler = Sampler(self.model_config.logprobs_mode)
 
+        # Host hop for the token feedback; see the identity branch in
+        # execute_model.
+        self._tokfb_host = None
+        # Logprobs handed to the deferred output; see the async branch of
+        # _bookkeeping_sync.
+        self._async_logprobs_tensors = None
+        # Sampled tokens handed back by the output thread, applied to
+        # token_ids_cpu by the main thread; see _apply_pending_token_writeback.
+        self._pending_token_writeback: collections.deque = collections.deque()
+        self._placeholder_pos: dict[str, int] = {}
+
         # Lazy initialization
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
@@ -324,6 +424,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
+
+        # bool(), not the field: vLLM resolves an unset value before this runs,
+        # but a directly-built config (a unit test) can still carry None.
+        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1215,6 +1319,53 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
 
+    def _apply_pending_token_writeback(self) -> None:
+        """Put the real sampled tokens where every reader of them can see them.
+
+        Async scheduling stages -1 placeholders and repairs them with an
+        on-device copy, but only for requests that were also in the previous
+        step (upstream does the same - gpu_model_runner._prepare_input_ids skips
+        anything with prev_index < 0). Everyone else reads the host copy, so the
+        host copy has to be truthful.
+
+        Two places, not one. token_ids_cpu is what _prepare_inputs reads, but it
+        is rebuilt from CachedRequestState.output_token_ids whenever a request
+        is (re-)added to the persistent batch, so a placeholder left in the
+        request state comes back. That matters here and not upstream because
+        this runner evicts unscheduled requests every step, and with the prefill
+        batch pinned to 1 a whole wave of requests sits outside the batch while
+        their tokens arrive.
+
+        Nothing is dropped for a request that is currently out of the batch:
+        self.requests outlives eviction (only finished ids are popped), so
+        repairing the request state is enough to make the rebuild correct.
+        deque.popleft is atomic, so no lock is needed against the output
+        thread's append.
+        """
+        ib = self.input_batch
+        while True:
+            try:
+                req_ids, tokens, pos = self._pending_token_writeback.popleft()
+            except IndexError:
+                return
+            if not pos:
+                continue
+            for i, req_id in enumerate(req_ids):
+                if i >= len(tokens) or not tokens[i]:
+                    continue
+                start = pos.get(req_id)
+                if start is None:
+                    continue
+                toks = tokens[i]
+                req_state = self.requests.get(req_id)
+                if req_state is not None:
+                    off = start - req_state.num_prompt_tokens
+                    if 0 <= off <= len(req_state.output_token_ids) - len(toks):
+                        req_state.output_token_ids[off : off + len(toks)] = toks
+                idx = ib.req_id_to_index.get(req_id)
+                if idx is not None:
+                    ib.token_ids_cpu[idx, start : start + len(toks)] = toks
+
     def _bookkeeping_sync(
         self,
         scheduler_output: RBLNSchedulerOutput,
@@ -1229,11 +1380,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         dict[str, LogprobsTensors | None],
         list[str],
         dict[str, int],
+        list[int],
     ]:
         """
         :return: tuple[num_nans_in_logits, logprobs_lists, valid_sampled_token_ids,
                     prompt_logprobs_dict, req_ids_output_copy,
-                    req_id_to_index_output_copy]
+                    req_id_to_index_output_copy, invalid_req_indices]
         """
         num_nans_in_logits: dict[str, int] = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1252,30 +1404,79 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
-        num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
-        sampled_token_ids = sampler_output.sampled_token_ids
-        logprobs_tensors = sampler_output.logprobs_tensors
-        logprobs_lists = None
-
-        # Get the valid generated tokens.
-        max_gen_len = sampled_token_ids.shape[-1]
-        if max_gen_len == 1:
-            # No spec decode tokens.
-            valid_sampled_token_ids: list[list[int]] = sampled_token_ids.tolist()
-            # Mask out the sampled tokens that should not be sampled.
-            for i in discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[int(i)].clear()
-
-            if logprobs_tensors is not None:
-                logprobs_lists = logprobs_tensors.tolists()
+        if sampler_output is None:
+            # No caller passes None today (sample_tokens always supplies
+            # _sample()'s result); kept only so bookkeeping can record
+            # placeholders and per-req counters without a sampler output.
+            num_sampled_tokens = num_reqs
+            sampled_token_ids = None
+            logprobs_tensors = None
         else:
-            # Includes spec decode tokens.
-            valid_sampled_token_ids, logprobs_lists = RBLNRejectionSampler.parse_output(
-                sampled_token_ids,
-                self.input_batch.vocab_size,
-                discard_sampled_tokens_req_indices,
-                logprobs_tensors=logprobs_tensors,
-            )
+            num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
+            sampled_token_ids = sampler_output.sampled_token_ids
+            logprobs_tensors = sampler_output.logprobs_tensors
+        logprobs_lists = None
+        invalid_req_indices: list[int] = []
+        invalid_req_indices_set: set[int] = set()
+
+        if not self.use_async_scheduling:
+            # Get the valid generated tokens.
+            max_gen_len = sampled_token_ids.shape[-1]
+            if max_gen_len == 1:
+                # No spec decode tokens.
+                valid_sampled_token_ids: list[list[int]] = sampled_token_ids.tolist()
+                # Mask out the sampled tokens that should not be sampled.
+                for i in discard_sampled_tokens_req_indices:
+                    valid_sampled_token_ids[int(i)].clear()
+
+                if logprobs_tensors is not None:
+                    logprobs_lists = logprobs_tensors.tolists()
+            else:
+                # Includes spec decode tokens.
+                valid_sampled_token_ids, logprobs_lists = (
+                    RBLNRejectionSampler.parse_output(
+                        sampled_token_ids,
+                        self.input_batch.vocab_size,
+                        discard_sampled_tokens_req_indices,
+                        logprobs_tensors=logprobs_tensors,
+                    )
+                )
+        else:
+            # Async scheduling: defer the sampled-token D2H to get_output(). Cache
+            # the tokens on-device (prev_sampled_token_ids) for next-step feedback;
+            # valid_sampled_token_ids is filled later by AsyncRBLNModelRunnerOutput.
+            #
+            # Logprobs ride along, deferred to get_output() like the tokens.
+            # Carried because the executor's native golden gate rides on the
+            # teacher-forced validation pass, which produces nothing without
+            # them. Building them is expensive, but both scheduling modes pay
+            # that equally (see the warning below); only the D2H is deferred.
+            if logprobs_tensors is not None:
+                logger.warning_once(
+                    "logprobs cost about 22 ms of host CPU per step here - "
+                    "gather_logprobs indexes full vocab by the sampled ids and "
+                    "integer eager ops have no device kernel, so it runs on the "
+                    "host. Both scheduling modes pay it (async 38.3 vs sync 39.8 "
+                    "ms/step, against 17.1 and 18.9 without), so this is not a "
+                    "reason to turn async off - only a reason not to read decode "
+                    "timings off a run that asks for logprobs."
+                )
+            self._async_logprobs_tensors = logprobs_tensors
+            valid_sampled_token_ids = []
+            invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+            invalid_req_indices_set = set(invalid_req_indices)
+            self._placeholder_pos = {}
+            if (
+                sampler_output is not None
+                and self.input_batch.prev_sampled_token_ids is None
+            ):
+                assert sampled_token_ids.shape[-1] == 1
+                self.input_batch.prev_sampled_token_ids = sampled_token_ids
+            self.input_batch.prev_req_id_to_index = {
+                req_id: i
+                for i, req_id in enumerate(self.input_batch.req_ids)
+                if i not in invalid_req_indices_set
+            }
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -1284,7 +1485,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
-            sampled_ids = valid_sampled_token_ids[req_idx]
+            if self.use_async_scheduling:
+                sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
+            else:
+                sampled_ids = valid_sampled_token_ids[req_idx]
             num_sampled_ids: int = len(sampled_ids) if sampled_ids else 0
 
             if not sampled_ids:
@@ -1299,6 +1503,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
             self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
+            if self.use_async_scheduling:
+                # Remember where the placeholder landed. num_tokens_no_spec moves on
+                # every step, so the position cannot be re-derived later.
+                self._placeholder_pos[req_ids[req_idx]] = start_idx
             self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
@@ -1319,6 +1527,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             prompt_logprobs_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
+            invalid_req_indices,
         )
 
     @e2e_starts
@@ -1333,6 +1542,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+
+        # Before anything reads token_ids_cpu this step.
+        if self.use_async_scheduling:
+            self._apply_pending_token_writeback()
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -1409,6 +1622,55 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 intermediate_tensors,
             )
 
+            # Device-tensor async token feedback (decode fast path). staged input_ids
+            # holds the scheduler's placeholders; scatter the real previous token from
+            # prev_sampled_token_ids, remapped via prev_req_id_to_index. No D2H.
+            prev_sampled = self.input_batch.prev_sampled_token_ids
+            prev_map = self.input_batch.prev_req_id_to_index
+            if (
+                envs.VLLM_RBLN_USE_DEVICE_TENSOR
+                and self.use_async_scheduling
+                and not self.is_prefill
+                and prev_sampled is not None
+                and prev_map is not None
+            ):
+                # Per request, not all-or-nothing: a request absent from
+                # prev_map falls back to token_ids_cpu, which
+                # _apply_pending_token_writeback keeps truthful. Skipping the
+                # whole batch instead left -1 placeholders in every row.
+                #
+                # prev_sampled is referenced, not copied - it is a view of the
+                # sampler's 2-deep ring, read before this step's sample() writes
+                # the other slot. Copying it here waits on the sampler graph
+                # (13.5 ms/step).
+                #
+                # Identity - every request present, same order - is the steady
+                # state; the slice copy there avoids building two index tensors
+                # from Python lists every step (2.2 ms of a 20.5 ms step).
+                rows, dsts, identity = [], [], True
+                for j, r in enumerate(req_ids):
+                    idx = prev_map.get(r)
+                    if idx is None:
+                        identity = False
+                        continue
+                    if idx != j:
+                        identity = False
+                    rows.append(idx)
+                    dsts.append(j)
+                if identity:
+                    n_fb = len(rows)
+                    # staged input_ids is a host tensor, so this is a D2H
+                    # either way; the intermediate buffer keeps it contiguous.
+                    if self._tokfb_host is None or self._tokfb_host.shape[0] < n_fb:
+                        self._tokfb_host = torch.empty(
+                            prev_sampled.shape[0], dtype=prev_sampled.dtype
+                        )
+                    host = self._tokfb_host[:n_fb]
+                    host.copy_(prev_sampled[:n_fb, 0])
+                    staged_model_inputs.input_ids[:n_fb, 0].copy_(host)
+                elif rows:
+                    staged_model_inputs.input_ids[dsts, 0] = prev_sampled[rows, 0]
+
         # Run the model.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after the draft model runs
@@ -1476,7 +1738,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         if self.execute_model_state is None:
             # No sampling to do (empty batch already handled, or a PP
             # intermediate stage). Surface any KV-connector output stashed by
@@ -1500,7 +1762,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ) = self.execute_model_state
         self.execute_model_state = None  # Clear ephemeral state
 
-        # TODO(RBLN): structured output bitmasks if present.
+        # NOTE: no explicit drain here. rebel's RuntimeInstance::Run dispatches
+        # and returns, and the sampler's device ops chain on the context's
+        # default stream, so ordering against the forward is the stream's job.
+
+        # Structured output: mask the logits before sampling. The grammar itself is
+        # advanced by the scheduler from the real sampled tokens in
+        # update_from_output, and under async scheduling EngineCore defers this
+        # call until that has happened for the previous step
+        # (pending_structured_output_tokens), so the bitmask is never built from a
+        # placeholder.
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
@@ -1553,6 +1824,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     1, device=self.device, dtype=torch.int32
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
 
+        # Async scheduling caches this step's sampled tokens in prev_sampled_token_ids
+        # via the `is None` guard in _bookkeeping_sync. Reset here so the guard stores
+        # THIS step's tokens; otherwise it freezes at the first decode token.
+        if self.use_async_scheduling:
+            self.input_batch.prev_sampled_token_ids = None
+
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -1561,6 +1838,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 prompt_logprobs_dict,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
+                invalid_req_indices,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -1593,7 +1871,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 kv_connector_output=kv_connector_output,
             )
 
-        return output
+        if not self.use_async_scheduling:
+            return output
+
+        device_index = self.device.index if self.device.index is not None else 0
+        async_output = AsyncRBLNModelRunnerOutput(
+            model_runner_output=output,
+            sampled_token_ids=sampler_output.sampled_token_ids,
+            invalid_req_indices=invalid_req_indices,
+            device_index=device_index,
+            pending_token_writeback=self._pending_token_writeback,
+            req_ids=list(self.input_batch.req_ids),
+            placeholder_pos=dict(self._placeholder_pos),
+            logprobs_tensors=self._async_logprobs_tensors,
+        )
+        return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         req_ids = self.input_batch.req_ids.copy()
