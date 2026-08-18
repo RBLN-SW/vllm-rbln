@@ -46,6 +46,7 @@ steps:
     timeout_in_minutes: 60
     command:
       - *sync
+      - "echo '--- :pytest: pytest (sampler)' && uv run --no-sync pytest tests/torch_compile/unit/v1/sample -v"
       - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
       - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t1-compile.sh"
 
