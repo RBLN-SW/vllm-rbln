@@ -31,7 +31,6 @@ def build_op_top_k_top_p(
 
     batch      | filters (random rows)    | top_k             | top_p
     -----------+--------------------------+-------------------+----------------
-    all greedy | -                        | tensor of 1s      | None
     all random | none (pure multinomial)  | None              | None
                | top-k only               | metadata tensor   | None
                | top-p only               | None              | metadata tensor
@@ -44,14 +43,13 @@ def build_op_top_k_top_p(
     In the mixed rows, `a / b` reads: `a` at greedy rows, `b` at random rows.
     `top_k` is never `None` there, because a greedy row is encoded as
     `top_k == 1`.
+
+    An all-greedy batch never reaches this function:
+    - rejection sampler: `rbln_rejection_sample_greedy` bakes in
+      `top_k` = scalar 1 and `top_p` = None.
+    - normal sampler: `rbln::argmax` carries the same encoding internally.
     """
-    # Reached only from the rejection sampler: spec decode has no separate
-    # greedy op, while the normal sampler answers all_greedy with rbln::argmax.
-    if sampling_metadata.all_greedy:
-        return (
-            torch.full((batch_size,), GREEDY_TOP_K, dtype=torch.int32, device=device),
-            None,
-        )
+    assert not sampling_metadata.all_greedy
 
     top_k = sampling_metadata.top_k
     top_p = sampling_metadata.top_p

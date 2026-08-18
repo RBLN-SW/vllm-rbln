@@ -79,18 +79,17 @@ def impl(monkeypatch) -> RBLNRejectionSamplerImpl:
 
 
 ########################### build_op_top_k_top_p ###########################
-def test_all_greedy():
+def test_all_greedy_never_reaches_build_op():
+    """An all-greedy batch takes the dedicated greedy graph instead, which
+    carries `top_k == 1` as a baked-in constant."""
     metadata = make_sampling_metadata(
         temperature=None,
         all_greedy=True,
         all_random=False,
     )
 
-    top_k, top_p = build_op_top_k_top_p(metadata, 3, VOCAB_SIZE, DEVICE)
-
-    assert torch.equal(top_k, torch.tensor([GREEDY_TOP_K] * 3, dtype=torch.int32))
-    # Greedy is keyed on `top_k == 1` alone; the unused top-p is elided.
-    assert top_p is None
+    with pytest.raises(AssertionError):
+        build_op_top_k_top_p(metadata, 3, VOCAB_SIZE, DEVICE)
 
 
 def test_all_random_pure_multinomial():
@@ -194,9 +193,7 @@ def test_mixed_top_p_only():
     assert torch.equal(
         top_k, torch.tensor([GREEDY_TOP_K, VOCAB_SIZE], dtype=torch.int32)
     )
-    assert torch.equal(
-        top_p, torch.tensor([GREEDY_TOP_P, 0.9], dtype=torch.float32)
-    )
+    assert torch.equal(top_p, torch.tensor([GREEDY_TOP_P, 0.9], dtype=torch.float32))
 
 
 def test_mixed_top_k_and_top_p():
