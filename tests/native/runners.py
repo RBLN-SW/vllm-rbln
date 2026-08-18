@@ -18,12 +18,15 @@ import lazily from a fixture (after pytest_configure sets the env)."""
 from __future__ import annotations
 
 import asyncio
+import functools
 import gc
+import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -41,11 +44,64 @@ _RBLN_RUNNER_DEFAULTS = dict(
 )
 
 
+@functools.cache
+def kv_blocks_per_request(model: str, max_model_len: int, block_size: int) -> int:
+    """Blocks one request needs across every KV cache group.
+
+    vLLM sizes the shared pool in units of ``group_size * page_size``, so the
+    requirement is the sum over groups: a full-attention group holds the whole
+    context, an RBLN sliding-window group exactly one page. Plain
+    ``cdiv(max_model_len, block_size) + 1`` is the special case of at most one
+    sliding group -- true for a 1:1 pattern (gpt-oss), false for gemma3's 5:1.
+
+    Does not model PP stages, Mamba/linear attention, KV sharing, or mixed
+    window sizes; pin num_gpu_blocks_override on the spec for those.
+    """
+    from vllm_rbln import envs
+
+    full_blocks = math.ceil(max_model_len / block_size)
+    try:
+        config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    except OSError:
+        # Only a hybrid model needs the config; a name that cannot be resolved
+        # here fails at model load anyway, so assume the single-group answer.
+        return full_blocks
+    config = config.get_text_config()
+    num_layers = config.num_hidden_layers
+    if envs.VLLM_RBLN_NUM_HIDDEN_LAYERS > 0:
+        num_layers = min(num_layers, envs.VLLM_RBLN_NUM_HIDDEN_LAYERS)
+    layer_types = (
+        getattr(config, "layer_types", None) or ["full_attention"] * num_layers
+    )
+    counts = Counter(layer_types[:num_layers])
+
+    if len(counts) == 1:
+        group_size = num_layers
+    else:
+        fewest, most = min(counts.values()), max(counts.values())
+        # vLLM's heuristic: the "1" of an n:1 pattern, unless padding to the
+        # larger count wastes less.
+        group_size = most if most < fewest * 1.5 else fewest
+    return sum(
+        math.ceil(count / group_size) * (full_blocks if kind == "full_attention" else 1)
+        for kind, count in counts.items()
+    )
+
+
+def rbln_engine_args(model: str, **kwargs) -> dict:
+    merged = {**_RBLN_RUNNER_DEFAULTS, **kwargs}
+    merged.setdefault(
+        "num_gpu_blocks_override",
+        kv_blocks_per_request(model, merged["max_model_len"], merged["block_size"]) + 1,
+    )
+    return merged
+
+
 class VllmRunner:
     """System under test: ``vllm.LLM`` with the native RBLN config; kwargs override."""
 
     def __init__(self, model: str, **kwargs) -> None:
-        self.llm = LLM(model=model, **{**_RBLN_RUNNER_DEFAULTS, **kwargs})
+        self.llm = LLM(model=model, **rbln_engine_args(model, **kwargs))
 
     def generate_greedy(
         self, prompts: list[str], max_tokens: int
@@ -127,7 +183,7 @@ class AsyncVllmRunner:
         self, model: str, *, request_timeout_s: float = 600.0, **kwargs
     ) -> None:
         self.request_timeout_s = request_timeout_s
-        args = AsyncEngineArgs(model=model, **{**_RBLN_RUNNER_DEFAULTS, **kwargs})
+        args = AsyncEngineArgs(model=model, **rbln_engine_args(model, **kwargs))
         # One loop for the runner's lifetime; a fresh asyncio.run() per call would
         # orphan the engine's output handler on a closed loop.
         self._loop = asyncio.new_event_loop()
@@ -146,19 +202,34 @@ class AsyncVllmRunner:
         them has -- or pointedly does not have -- work."""
         return self._loop.run_until_complete(self._generate_all(requests))
 
-    async def _generate_all(self, requests: list[DPRequest]) -> list[Any]:
+    def generate_greedy_logprobs(
+        self, requests: list[DPRequest], num_logprobs: int
+    ) -> list[tuple[list[int], str, list[dict[int, float]]]]:
+        """generate_greedy plus per-step top-k logprobs, for the tolerant
+        comparison: greedy flips on near-tied logits, so two runs that agree
+        mathematically can still pick different tokens."""
+        return self._loop.run_until_complete(self._generate_all(requests, num_logprobs))
+
+    async def _generate_all(
+        self, requests: list[DPRequest], num_logprobs: int | None = None
+    ) -> list[Any]:
         # gather() must be built inside the loop, or its futures attach to
         # whatever loop asyncio considers current.
         return list(
             await asyncio.gather(
-                *(self._generate_one(i, req) for i, req in enumerate(requests))
+                *(
+                    self._generate_one(i, req, num_logprobs)
+                    for i, req in enumerate(requests)
+                )
             )
         )
 
     async def _generate_one(
-        self, index: int, request: DPRequest
-    ) -> tuple[list[int], str]:
-        params = SamplingParams(temperature=0.0, max_tokens=request.max_tokens)
+        self, index: int, request: DPRequest, num_logprobs: int | None = None
+    ) -> tuple[list[int], str] | tuple[list[int], str, list[dict[int, float]]]:
+        params = SamplingParams(
+            temperature=0.0, max_tokens=request.max_tokens, logprobs=num_logprobs
+        )
         stream = self.engine.generate(
             request.prompt,
             params,
@@ -187,7 +258,13 @@ class AsyncVllmRunner:
             f"stream without producing any output"
         )
         completion = final.outputs[0]
-        return list(completion.token_ids), completion.text
+        if num_logprobs is None:
+            return list(completion.token_ids), completion.text
+        logprobs = [
+            {tid: lp.logprob for tid, lp in step.items()}
+            for step in (completion.logprobs or [])
+        ]
+        return list(completion.token_ids), completion.text, logprobs
 
     def __enter__(self) -> AsyncVllmRunner:
         return self
@@ -211,8 +288,17 @@ class HfRunner:
     """Reference oracle: the same model via HuggingFace transformers on CPU."""
 
     def __init__(self, model: str, dtype: str = "auto") -> None:
+        from vllm_rbln import envs
+
+        config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+        # Mirror the engine's truncation, or the oracle is a different model.
+        if envs.VLLM_RBLN_NUM_HIDDEN_LAYERS > 0:
+            text_config = config.get_text_config()
+            text_config.num_hidden_layers = min(
+                text_config.num_hidden_layers, envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
+            )
         self.model: Any = AutoModelForCausalLM.from_pretrained(
-            model, torch_dtype=dtype, trust_remote_code=True
+            model, config=config, torch_dtype=dtype, trust_remote_code=True
         )
         self.model.eval()
         self.tokenizer: Any = AutoTokenizer.from_pretrained(

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import functools
 import json
 import os
 import warnings
@@ -22,11 +23,14 @@ import pytest
 from tests.native.utils import (
     _SPAWN_CHILD_ENV,
     _SPAWN_RESULTS_ENV,
+    LAYERS_PINNABLE_ENV,
     NATIVE_ENV,
     ModuleSpawn,
     read_log_tail,
     scrub_env,
 )
+
+_DEFAULT_NUM_HIDDEN_LAYERS = 3
 
 _scrubbed: dict[str, str] = {}
 
@@ -124,12 +128,83 @@ def pytest_addoption(parser):
             "default is what gets exercised."
         ),
     )
+    parser.addoption(
+        "--num-hidden-layers",
+        type=int,
+        default=None,
+        help=(
+            "VLLM_RBLN_NUM_HIDDEN_LAYERS for the whole session: build only the "
+            "first N decoder layers, cutting compile time in the "
+            "--model-compile lane. hf_runner truncates to the same N, so "
+            "correctness comparisons stay like-for-like. 0 runs the whole "
+            "model. An exported value is scrubbed like every other "
+            f"VLLM_RBLN_* knob; this option is the way in. Defaults to "
+            f"{_DEFAULT_NUM_HIDDEN_LAYERS}, and only then does a spec's own "
+            "num_hidden_layers apply."
+        ),
+    )
+
+
+@functools.cache
+def _host_chip() -> str | None:
+    """The chip this host reports, or None when it cannot be resolved (an
+    NPU-less host) -- filter nothing then, rather than skip everything.
+
+    Safe to call in the parent, unlike opening a device: a name query leaves no
+    /dev/rbln* fd behind, and a child still resolves it afterwards. Resolving it
+    here is what keeps a wrong-chip spec from ever spawning."""
+    from vllm_rbln.platform import RblnPlatform
+
+    try:
+        return RblnPlatform.get_device_name().strip().upper()
+    except Exception:
+        return None
+
+
+def _item_spec(item):
+    """The CompileModelSpec this item is parametrized with, under whatever name
+    (test_dp_e2e parametrizes a fixture, not the test), or None."""
+    from tests.native.model_specs import CompileModelSpec
+
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return None
+    for value in callspec.params.values():
+        if isinstance(value, CompileModelSpec):
+            return value
+    return None
+
+
+def _skip_other_chips(items) -> None:
+    """Skip specs this host's chip is not in. Only whole-model items: a spec also
+    feeds unit tests (test_dp_specs) that assert on it without touching an NPU."""
+    chip = _host_chip()
+    if chip is None:
+        return
+    for item in items:
+        if "model_compile" not in item.keywords:
+            continue
+        spec = _item_spec(item)
+        if spec is not None and chip not in spec.chips:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason=f"needs {'/'.join(sorted(spec.chips))}, host is {chip}"
+                )
+            )
+
+
+def _session_layers(config) -> int:
+    """The option's value, or the default when it was left off. Not `or`: an
+    explicit 0 is the whole model, not a missing value."""
+    layers = config.getoption("--num-hidden-layers")
+    return _DEFAULT_NUM_HIDDEN_LAYERS if layers is None else layers
 
 
 def pytest_collection_modifyitems(config, items):
     """Keep whole-model compiles out of the default lane (opt-in via
     --model-compile; forgetting the flag costs nothing)."""
     if config.getoption("--model-compile"):
+        _skip_other_chips(items)
         return
     skip = pytest.mark.skip(reason="needs --model-compile")
     for item in items:
@@ -223,6 +298,7 @@ def _spawn_for(item) -> ModuleSpawn:
         nodeid_prefix=item.nodeid.split("::", 1)[0],
         device_tensor=config.getoption("--device-tensor"),
         model_compile=config.getoption("--model-compile"),
+        num_hidden_layers=_session_layers(config),
         tb_style=config.getoption("tbstyle", None),
         maxfail=config.getoption("maxfail", 0),
         stream_output=config.getoption("capture") == "no",
@@ -327,6 +403,18 @@ def pytest_configure(config):
     if device_tensor is not None:
         os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
 
+    # Also before the import below: the get_pp_indices patch conditions on this.
+    os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(_session_layers(config))
+
+    # Parent only -- the child is handed the resolved value, so its own view of
+    # the option is always "given". Cleared rather than merely left unset, or an
+    # exported one would pin behind an explicit option's back.
+    if os.environ.get(_SPAWN_CHILD_ENV) != "1":
+        if config.getoption("--num-hidden-layers") is None:
+            os.environ[LAYERS_PINNABLE_ENV] = "1"
+        else:
+            os.environ.pop(LAYERS_PINNABLE_ENV, None)
+
     # Platform plugins activate on their own when current_platform is first
     # touched, but the patches live in the general_plugins group and nothing
     # loads those implicitly. Without this the suite runs half-applied:
@@ -362,6 +450,16 @@ def pytest_report_header(config):
         f"native: env {', '.join(f'{k}={v}' for k, v in NATIVE_ENV.items())}",
         f"native: device_type={RblnPlatform.device_type} ({origin})",
     ]
+    num_hidden_layers = _session_layers(config)
+    pinnable = (
+        " (a spec may pin its own)" if os.environ.get(LAYERS_PINNABLE_ENV) else ""
+    )
+    header.append(
+        f"native: num_hidden_layers={num_hidden_layers or 'whole model'}{pinnable}",
+    )
+    # Which chip a job landed on decides which specs run, and a step may request
+    # several -- so the run has to say which one it got.
+    header.append(f"native: chip={_host_chip() or 'unknown'}")
     if _scrubbed:
         header.append(f"native: scrubbed {', '.join(sorted(_scrubbed))}")
     return header
@@ -392,6 +490,14 @@ def hf_runner():
     return HfRunner
 
 
+@pytest.fixture(scope="session")
+def whole_model(pytestconfig) -> bool:
+    """Whether every decoder layer is built (--num-hidden-layers 0). A truncated
+    model still compiles and runs, but its logits are meaningless -- an assertion
+    that depends on output quality has to gate on this."""
+    return pytestconfig.getoption("--num-hidden-layers") == 0
+
+
 @pytest.fixture(autouse=True)
 def _drop_envs_shadows():
     """Remove any ``vllm_rbln.envs`` attribute a test left behind.
@@ -408,6 +514,19 @@ def _drop_envs_shadows():
     yield
     for name in set(vars(envs)) - before:
         delattr(envs, name)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rbln_ctx_standalone():
+    """Clear the one env var the code under test writes to the process env.
+
+    RblnPlatform.validate_and_setup_prerequisite sets RBLN_CTX_STANDALONE=1 for
+    any TP/DP/PP/EP config and never clears it. The rebel runtime reads it on
+    every context creation, so one test building such a config leaves every later
+    test -- and every spawned child, which inherits the env -- unable to register
+    a device at all. Mirrors tests/torch_compile/conftest.py."""
+    os.environ.pop("RBLN_CTX_STANDALONE", None)
+    yield
 
 
 @pytest.fixture(autouse=True)

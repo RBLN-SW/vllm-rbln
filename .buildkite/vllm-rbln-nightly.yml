@@ -1,0 +1,145 @@
+env:
+  UV_CACHE_DIR: "/root/.cache/uv"
+  UV_LINK_MODE: "symlink"
+  UV_INDEX_STRATEGY: "unsafe-best-match"
+
+_secrets: &secrets
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
+  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
+  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+  HF_TOKEN: FSW_HF_TOKEN
+  HF_HOME: FSW_HF_HOME
+
+
+_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
+
+steps:
+  - label: ":pytest: [CA25] pytest (T0)"
+    key: "nightly-t0-ca25"
+    agents:
+      queue: r18s
+      resource_class: "RBLN-CA25-4"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+
+  - label: ":pytest: [CA25] pytest (T2)"
+    key: "nightly-t2-ca25"
+    agents:
+      queue: r18s
+      resource_class: "RBLN-CA25-32"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    env:
+      VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
+      VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
+    timeout_in_minutes: 120
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
+
+  - label: ":pytest: [CR03] pytest (T0)"
+    key: "nightly-t0-cr03"
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+
+  - label: ":pytest: [CR03] pytest (T2)"
+    key: "nightly-t2-cr03"
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    env:
+      VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
+      VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
+    timeout_in_minutes: 120
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
+
+  # Measured, not gated: soft_fail keeps the build green and neither lane appears
+  # in the deploy step's depends_on. Every target under both targets/ directories
+  # names CR03/CR13 only, so there is no ATOM counterpart to run.
+  - label: ":chart_with_upwards_trend: [CR03] perf"
+    key: "nightly-perf-cr03"
+    soft_fail: true
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "perf-results/**/*"
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/perf/run-perf.sh"
+
+  - label: ":dart: [CR03] lm-eval"
+    key: "nightly-lm-eval-cr03"
+    soft_fail: true
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "lm-eval-results/**/*"
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run-lm-eval.sh"
+
+  # A skipped step satisfies depends_on, so this runs on ATOM alone until the
+  # CR03 steps above lose their skip.
+  # - label: ":package: nightly deploy"
+  #   key: "nightly-deploy"
+  #   depends_on:
+  #     - "nightly-t0-ca25"
+  #     - "nightly-t2-ca25"
+  #     - "nightly-t0-cr03"
+  #     - "nightly-t2-cr03"
+  #   agents:
+  #     queue: r18s
+  #   image: "${DEVTOOLS_DOCKER_IMAGE}"
+  #   secrets:
+  #     # PLACEHOLDER vault names -- confirm both before this step is enabled.
+  #     # TWINE_PASSWORD is PKG_ORG_GATE in GitHub Actions.
+  #     TWINE_PASSWORD: PKG_ORG_GATE
+  #     TWINE_REPOSITORY_URL: PKG_INTERNAL_PYPI_URL
+  #   timeout_in_minutes: 30
+  #   command:
+  #     - |
+  #       set -euo pipefail
+  #       # Without an explicit repository URL twine would target public PyPI, and
+  #       # the pod has no ~/.pypirc to fall back on. Fail instead of publishing
+  #       # anywhere unintended.
+  #       : "${TWINE_REPOSITORY_URL:?not set -- fix the vault name in pipeline.yml}"
+  #       : "${TWINE_PASSWORD:?not set -- fix the vault name in pipeline.yml}"
+  #       uv build --wheel
+  #       TWINE_USERNAME=__token__ TWINE_NON_INTERACTIVE=1 \
+  #         uv tool run twine upload --skip-existing dist/vllm_rbln*.whl
