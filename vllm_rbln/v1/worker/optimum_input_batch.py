@@ -83,6 +83,12 @@ class RBLNInputBatch(InputBatch):
         # For non-pooling models - generate and apply logitsprocs update;
         # reset batch update tracking.
         # Update sampling metadata if batch state is changed.
+        #
+        # Logits processors size their per-request state from
+        # BatchUpdate.batch_size, and the RBLN sampler applies them to
+        # pooled logits with bucket_size rows - so report bucket_size,
+        # not num_reqs. Padding slots hold default params and stay
+        # no-ops.
         batch_update = self.batch_update_builder.get_and_reset(bucket_size)
         if self.thinking_budget_state_holder is not None and batch_update:
             self.thinking_budget_state_holder.sync_batch(batch_update)
