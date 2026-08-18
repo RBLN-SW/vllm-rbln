@@ -65,6 +65,17 @@ def rbln_extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     return base * num_attn_module + sub
 
 
+rbln_extract_layer_index = register_patch(
+    target="vllm.v1.worker.utils.extract_layer_index",
+    reason=(
+        "vllm.v1.worker.utils snapshots extract_layer_index at import time, so "
+        "bind_kv_cache misses the patch on the defining module."
+    ),
+    key="vllm_rbln.patches.models_utils.rbln_extract_layer_index.v1_worker_utils",
+    apply_immediately=True,
+)(rbln_extract_layer_index)
+
+
 def _dsa_indexer_cache_is_fp8() -> bool:
     from vllm.config import get_current_vllm_config
 
