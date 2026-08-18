@@ -421,6 +421,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             type(self.bucketing_manager).__name__,
             self.bucketing_manager.decode_batch_buckets,
         )
+        # Per batch bucket, rbln_top_k_top_p_sample compiles one entry per
+        # (top_k, top_p) None/tensor combination (4) and rbln_greedy_sample
+        # one. Raise the per-code-object and global limits to fit; never lower.
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit,
+            4 * self.bucketing_manager.batch_buckets_count,
+        )
+        torch._dynamo.config.accumulated_recompile_limit = max(
+            torch._dynamo.config.accumulated_recompile_limit,
+            5 * self.bucketing_manager.batch_buckets_count,
+        )
 
         self.specialized_moe_decode = (
             parallel_config.data_parallel_size > 1

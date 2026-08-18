@@ -28,6 +28,57 @@ from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 
 MAX_NUM_PROMPT_TOKENS = 64
 
+# Penalty configs are no longer part of WARM_UP_CONFIGS: penalties run eagerly
+# on the CPU, so they compile nothing and would only lengthen server warm-up.
+# As benchmark scenarios they still matter — they measure that eager cost.
+BENCHMARK_CONFIGS: list[dict] = [
+    *WARM_UP_CONFIGS,
+    {
+        "name": "penalty_greedy",
+        "no_penalties": False,
+        "frequency_penalties": 0.1,
+        "presence_penalties": 0.1,
+        "repetition_penalties": 1.0,
+        "all_greedy": True,
+        "all_random": False,
+        "temperature": 0.0,
+    },
+    {
+        "name": "penalty_topp",
+        "no_penalties": False,
+        "frequency_penalties": 0.1,
+        "presence_penalties": 0.1,
+        "repetition_penalties": 1.0,
+        "all_greedy": False,
+        "all_random": True,
+        "top_p": 0.9,
+        "temperature": 0.5,
+    },
+    {
+        "name": "penalty_topk",
+        "no_penalties": False,
+        "frequency_penalties": 0.1,
+        "presence_penalties": 0.1,
+        "repetition_penalties": 1.0,
+        "all_greedy": False,
+        "all_random": True,
+        "top_k": 1.0,
+        "temperature": 0.5,
+    },
+    {
+        "name": "penalty_topp_topk",
+        "no_penalties": False,
+        "frequency_penalties": 0.1,
+        "presence_penalties": 0.1,
+        "repetition_penalties": 1.0,
+        "all_greedy": False,
+        "all_random": True,
+        "top_p": 0.9,
+        "top_k": 1.0,
+        "temperature": 0.5,
+    },
+]
+
 
 def _create_penalty_tensor(
     batch_size: int, penalty_value: float, device: torch.device
@@ -128,7 +179,9 @@ def run_benchmark(
     warmup_iters: int,
     benchmark_iters: int,
 ):
-    torch._dynamo.config.recompile_limit = len(WARM_UP_CONFIGS)
+    # At a fixed batch size the compiled ops need at most four dynamo entries
+    # each (the (top_k, top_p) None/tensor combinations), which every default
+    # recompile_limit already covers.
     sampler = RBLNSampler()
     sampler_performance_tracker = PerformanceTracker("SAMPLER")
 
@@ -210,17 +263,17 @@ def main():
     parser.add_argument(
         "--benchmark-config",
         type=str,
-        choices=[c["name"] for c in WARM_UP_CONFIGS],
+        choices=[c["name"] for c in BENCHMARK_CONFIGS],
         default="no_penalty_greedy",
         help=f"Benchmark config name (default: no_penalty_greedy). "
-        f"Choices: {[c['name'] for c in WARM_UP_CONFIGS]}",
+        f"Choices: {[c['name'] for c in BENCHMARK_CONFIGS]}",
     )
 
     args = parser.parse_args()
 
     # Find the benchmark config by name
     benchmark_config = None
-    for config in WARM_UP_CONFIGS:
+    for config in BENCHMARK_CONFIGS:
         if config["name"] == args.benchmark_config:
             benchmark_config = config
             break

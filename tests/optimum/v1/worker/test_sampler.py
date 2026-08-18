@@ -17,15 +17,43 @@ import torch
 from vllm.platforms import current_platform
 
 from .utils import (
-    _schedule_cached_reqs,
     _schedule_new_request_from_request,
     create_model_runner,
     fake_load_model,
     forward_steps,
     make_request,
+    prefill_requests,
+    run_decode_steps,
+    sampled_token,
 )
 
 DEVICE = current_platform.device_type
+
+
+@pytest.fixture
+def rbln_sampler_env(monkeypatch):
+    """RBLN sampler on, strict compile, no warm-up — the setup every test
+    here shares unless it parametrizes one of these itself."""
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+
+def set_fixed_logits(runner, favored: dict[int, float]):
+    """Make every forward return the same logits: `favored` token values on a
+    zero background, for every request row. Greedy sampling then picks the
+    highest favored token, letting tests assert exact penalty effects."""
+    vocab_size = runner.model_config.get_vocab_size()
+
+    def fixed_forward(model_input, **kwargs):
+        logits = torch.zeros(
+            (runner.input_batch.num_reqs, 1, vocab_size), dtype=torch.float32
+        )
+        for token_id, value in favored.items():
+            logits[:, :, token_id] = value
+        return logits
+
+    runner.model.forward = fixed_forward
 
 
 @pytest.mark.parametrize(
@@ -36,119 +64,16 @@ DEVICE = current_platform.device_type
         pytest.param(16, [1, 2, 4, 8, 16], id="16_seq"),
         pytest.param(17, [1, 2, 4, 8, 16, 17], id="17_seq"),
         pytest.param(61, [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 61], id="61_seq"),
+        # Powers of two to 16, then step 8 to 256, then step 16 to 512, and
+        # a non-bucket max_num_seqs is appended as its own final bucket.
         pytest.param(
             512,
-            [
-                1,
-                2,
-                4,
-                8,
-                16,
-                24,
-                32,
-                40,
-                48,
-                56,
-                64,
-                72,
-                80,
-                88,
-                96,
-                104,
-                112,
-                120,
-                128,
-                136,
-                144,
-                152,
-                160,
-                168,
-                176,
-                184,
-                192,
-                200,
-                208,
-                216,
-                224,
-                232,
-                240,
-                248,
-                256,
-                272,
-                288,
-                304,
-                320,
-                336,
-                352,
-                368,
-                384,
-                400,
-                416,
-                432,
-                448,
-                464,
-                480,
-                496,
-                512,
-            ],
+            [1, 2, 4, 8, *range(16, 257, 8), *range(272, 513, 16)],
             id="512_seq",
         ),
         pytest.param(
             515,
-            [
-                1,
-                2,
-                4,
-                8,
-                16,
-                24,
-                32,
-                40,
-                48,
-                56,
-                64,
-                72,
-                80,
-                88,
-                96,
-                104,
-                112,
-                120,
-                128,
-                136,
-                144,
-                152,
-                160,
-                168,
-                176,
-                184,
-                192,
-                200,
-                208,
-                216,
-                224,
-                232,
-                240,
-                248,
-                256,
-                272,
-                288,
-                304,
-                320,
-                336,
-                352,
-                368,
-                384,
-                400,
-                416,
-                432,
-                448,
-                464,
-                480,
-                496,
-                512,
-                515,
-            ],
+            [1, 2, 4, 8, *range(16, 257, 8), *range(272, 513, 16), 515],
             id="515_seq",
         ),
     ],
@@ -162,7 +87,7 @@ def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: lis
     assert len(runner.pooled_tensors) == len(expected_bucket_sizes)
 
 
-@pytest.mark.parametrize("use_rbln_sampler", [False])
+@pytest.mark.parametrize("use_rbln_sampler", [True, False])
 @pytest.mark.parametrize("use_structured_output", [True, False])
 def test_forward_sampler_mode_and_structured_output(
     monkeypatch, use_rbln_sampler, use_structured_output
@@ -187,9 +112,13 @@ def test_forward_sampler_mode_and_structured_output(
 @pytest.mark.parametrize("top_k", [0, 3])
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 @pytest.mark.parametrize("logprobs", [0, 3])
-@pytest.mark.parametrize("presence_penalty", [0.0, 2.0])
-@pytest.mark.parametrize("frequency_penalty", [0.0, 2.0])
-@pytest.mark.parametrize("repetition_penalty", [1.0, 2.0])
+# The three penalties travel one code path (no_penalties on/off), so one
+# all-on case suffices here; exact penalty effects have dedicated tests.
+@pytest.mark.parametrize(
+    "presence_penalty, frequency_penalty, repetition_penalty",
+    [(0.0, 0.0, 1.0), (2.0, 2.0, 2.0)],
+    ids=["no_penalty", "all_penalty"],
+)
 @pytest.mark.parametrize(
     "warm_up", [True, False], ids=["warm_up_true", "warm_up_false"]
 )
@@ -236,7 +165,7 @@ def test_forward_sampling_parameters(
     ids=["no_penalty", "all_penalty"],
 )
 def test_no_nan_logits_with_padded_bucket(
-    monkeypatch,
+    rbln_sampler_env,
     top_p,
     top_k,
     temperature,
@@ -255,10 +184,6 @@ def test_no_nan_logits_with_padded_bucket(
     patched during runner construction so every uninitialized float tensor
     starts as NaN. Any missing init guard in RBLNInputBatch will then surface.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
     # max_num_seqs=4 with 3 reqs -> decode uses bucket_size=4, one padded row.
     # Force torch.empty to return NaN-filled float tensors during init so the
     # test does not rely on lucky zero-page allocations.
@@ -308,24 +233,18 @@ def test_no_nan_logits_with_padded_bucket(
                 )
 
     # Prefill is single-req per step (no padding); just run it.
-    for i, req in enumerate(reqs):
-        scheduler_output = _schedule_new_request_from_request(
-            req, block_ids=([i],), outer_block_ids=[i]
-        )
-        runner.execute_model(scheduler_output)
-        runner.sample_tokens(grammar_output=None)
-
-    for req in reqs:
-        req.num_computed_tokens = 3
+    prefill_requests(runner, reqs)
 
     # Decode all together: num_reqs=3, bucket_size=4 -> row 3 is padding.
-    scheduler_output = _schedule_cached_reqs(reqs, new_block_ids=[None, None, None])
-    runner.execute_model(scheduler_output)
-    output = runner.sample_tokens(grammar_output=None)
-    assert_no_nan_in_pooled(output)
+    # Several steps, so the reused pad rows of the pooled buffer and the
+    # growing output_token_ids are exercised, not just the first step.
+    for output in run_decode_steps(runner, reqs, num_steps=3):
+        assert_no_nan_in_pooled(output)
 
 
-def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
+def test_sampler_logits_reshape_keeps_shape_and_stride_stable(
+    rbln_sampler_env, monkeypatch
+):
     """
     Test to ensure that the sampler always receives the same shape and stride
     even when `compute_logits` returns logits with different strides.
@@ -335,11 +254,6 @@ def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
     test forces `compute_logits` to alternate strides while keeping
     batch_size=1, and asserts the reshape in `sample_tokens` absorbs it.
     """
-
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
-
     # Keep max_num_seqs=1 so we always take the non-padding path.
     runner = create_model_runner(max_num_seqs=1)
 
@@ -389,3 +303,284 @@ def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
     assert seen[0] == seen[1], (
         f"sampler input changed across stride change: {seen[0]} -> {seen[1]}"
     )
+
+
+def test_penalty_decode_steps_do_not_recompile(rbln_sampler_env, monkeypatch):
+    """Penalties feed SamplingMetadata.output_token_ids into the sampler — a
+    list[list[int]] that grows by one token every decode step. The penalty
+    path runs eagerly, fully outside torch.compile, so no dynamo frame may
+    specialize on that list: the sampler ops compile once at prefill and
+    every decode step after that must hit the cache. A frame that guards on
+    the list would recompile per token and eventually kill the engine with
+    FailOnRecompileLimitHit.
+    """
+    # One bucket only, so a changed shape can't excuse a recompile.
+    runner = create_model_runner(max_num_seqs=1)
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        presence_penalty=2.0,
+        frequency_penalty=2.0,
+        repetition_penalty=2.0,
+    )
+    # Prefill runs the sampler once: the only legitimate compile.
+    prefill_requests(runner, [req])
+
+    # Each decode step grows output_token_ids; any recompile on any step
+    # means something specialized on it.
+    monkeypatch.setattr(torch._dynamo.config, "error_on_recompile", True)
+    run_decode_steps(runner, [req], num_steps=4)
+
+
+@pytest.mark.parametrize("use_penalty", [True, False], ids=["penalty", "no_penalty"])
+def test_presence_frequency_penalty_changes_greedy_pick(rbln_sampler_env, use_penalty):
+    """Presence/frequency penalties must actually reach the logits: with
+    greedy sampling and fixed logits, the top token wins until it has been
+    generated once, after which the penalties push it below the runner-up.
+    Without penalties the top token wins every step.
+    """
+    runner = create_model_runner(max_num_seqs=1)
+    # Gaps below 4.0, so presence 2.0 + frequency 2.0 demotes a generated
+    # token below the next one.
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0, 23: 0.5})
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        presence_penalty=2.0 if use_penalty else 0.0,
+        frequency_penalty=2.0 if use_penalty else 0.0,
+    )
+
+    # Prefill has no output tokens yet, so both cases pick the top token.
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == 7
+
+    step1, step2 = run_decode_steps(runner, [req], num_steps=2)
+    if use_penalty:
+        # 7 was generated at prefill: 3.0 - 4.0 < 1.0, so 11 wins, then 23.
+        assert sampled_token(step1, "req_0") == 11
+        assert sampled_token(step2, "req_0") == 23
+    else:
+        assert sampled_token(step1, "req_0") == 7
+        assert sampled_token(step2, "req_0") == 7
+
+
+@pytest.mark.parametrize(
+    "repetition_penalty", [2.0, 1.0], ids=["penalty", "no_penalty"]
+)
+def test_repetition_penalty_applies_to_prompt_tokens(
+    rbln_sampler_env, repetition_penalty
+):
+    """Repetition penalty covers prompt tokens, not just generated ones: a
+    prompt token holding the top logit must lose to the runner-up already at
+    the prefill sample when the penalty halves its positive logit.
+    """
+    runner = create_model_runner(max_num_seqs=1)
+    # Token 3 is in the prompt: 2.0 / 2.0 = 1.0 < 1.5, so 11 wins.
+    set_fixed_logits(runner, {3: 2.0, 11: 1.5})
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        repetition_penalty=repetition_penalty,
+    )
+
+    (prefill_output,) = prefill_requests(runner, [req])
+    expected = 11 if repetition_penalty == 2.0 else 3
+    assert sampled_token(prefill_output, "req_0") == expected
+
+
+def test_mixed_penalty_batch_isolates_requests(rbln_sampler_env):
+    """One penalized request in a batch must not disturb the others: the
+    batch-level no_penalties flag turns the penalty path on for every row,
+    and the unpenalized rows rely on their 0.0/1.0 defaults being no-ops.
+    """
+    # 3 reqs pad to bucket_size=4, covering the padded-metadata path too.
+    runner = create_model_runner(max_num_seqs=4)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0, 23: 0.5})
+
+    penalized = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        presence_penalty=2.0,
+        frequency_penalty=2.0,
+    )
+    plain = [
+        make_request(request_id=f"req_{i}", prompt_token_ids=[1, 2, 3], temperature=0.0)
+        for i in (1, 2)
+    ]
+    reqs = [penalized, *plain]
+
+    prefill_requests(runner, reqs)
+
+    step1, step2 = run_decode_steps(runner, reqs, num_steps=2)
+    for output in (step1, step2):
+        for req in plain:
+            assert sampled_token(output, req.request_id) == 7
+    assert sampled_token(step1, "req_0") == 11
+    assert sampled_token(step2, "req_0") == 23
+
+
+@pytest.mark.parametrize("restricted", [True, False], ids=["allowed", "unrestricted"])
+def test_allowed_token_ids_masks_greedy_pick(rbln_sampler_env, restricted):
+    """allowed_token_ids must mask every other token to -inf: the top token
+    loses to an allowed runner-up, at prefill and on decode steps alike.
+    """
+    runner = create_model_runner(max_num_seqs=1)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        allowed_token_ids=[11, 23] if restricted else None,
+    )
+
+    expected = 11 if restricted else 7
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == expected
+    (step1,) = run_decode_steps(runner, [req], num_steps=1)
+    assert sampled_token(step1, "req_0") == expected
+
+
+def test_allowed_token_ids_in_padded_batch(rbln_sampler_env):
+    """A restricted request in a padded batch keeps its mask to itself: the
+    other rows and the pad row of the bucket-sized mask stay unrestricted.
+    """
+    runner = create_model_runner(max_num_seqs=4)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+
+    restricted = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        allowed_token_ids=[11],
+    )
+    plain = [
+        make_request(request_id=f"req_{i}", prompt_token_ids=[1, 2, 3], temperature=0.0)
+        for i in (1, 2)
+    ]
+    reqs = [restricted, *plain]
+
+    prefill_requests(runner, reqs)
+    for output in run_decode_steps(runner, reqs, num_steps=2):
+        assert sampled_token(output, "req_0") == 11
+        for req in plain:
+            assert sampled_token(output, req.request_id) == 7
+
+
+@pytest.mark.parametrize("banned", [True, False], ids=["bad_word", "no_bad_word"])
+def test_bad_words_single_token_masked_from_prefill(rbln_sampler_env, banned):
+    """A single-token bad word is masked unconditionally, so the top token
+    already loses at the prefill sample."""
+    runner = create_model_runner(max_num_seqs=1)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        bad_words_token_ids=[[7]] if banned else None,
+    )
+
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == (11 if banned else 7)
+
+
+def test_bad_words_multi_token_masks_continuation(rbln_sampler_env):
+    """A multi-token bad word only masks its last token when the output
+    history ends with the preceding tokens, so the pick alternates: the top
+    token, then the runner-up while [7] is banned from continuing to [7, 7],
+    then the top token again once the history no longer matches.
+    """
+    runner = create_model_runner(max_num_seqs=1)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        bad_words_token_ids=[[7, 7]],
+    )
+
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == 7
+
+    step1, step2 = run_decode_steps(runner, [req], num_steps=2)
+    assert sampled_token(step1, "req_0") == 11
+    assert sampled_token(step2, "req_0") == 7
+
+
+def test_mixed_greedy_random_batch(rbln_sampler_env):
+    """vLLM RBLN does not split a mixed batch: greedy requests ride the
+    random-sampling path with a tiny temperature. With fixed logits the
+    greedy row must still get the argmax token, next to a random row
+    constrained to top_k=1.
+    """
+    runner = create_model_runner(max_num_seqs=4)
+    set_fixed_logits(runner, {7: 3.0, 11: 1.0})
+
+    greedy = make_request(
+        request_id="req_0", prompt_token_ids=[1, 2, 3], temperature=0.0
+    )
+    random_req = make_request(
+        request_id="req_1", prompt_token_ids=[1, 2, 3], temperature=1.0, top_k=1
+    )
+    reqs = [greedy, random_req]
+
+    prefill_requests(runner, reqs)
+    for output in run_decode_steps(runner, reqs, num_steps=2):
+        assert sampled_token(output, "req_0") == 7
+        assert sampled_token(output, "req_1") == 7
+
+
+def test_logprobs_match_log_softmax_reference(rbln_sampler_env):
+    """gather_logprobs must return the sampled token first, then the top-k
+    tokens, with raw log-softmax values (before penalties/temperature) and a
+    1-based rank."""
+    runner = create_model_runner(max_num_seqs=1)
+    favored = {7: 3.0, 11: 1.0, 23: 0.5}
+    set_fixed_logits(runner, favored)
+    req = make_request(
+        request_id="req_0", prompt_token_ids=[1, 2, 3], temperature=0.0, logprobs=3
+    )
+
+    (output,) = prefill_requests(runner, [req])
+    lp = output.logprobs
+
+    assert list(lp.logprob_token_ids[0]) == [7, 7, 11, 23]
+    assert lp.sampled_token_ranks[0] == 1
+
+    row = torch.zeros(runner.model_config.get_vocab_size())
+    for token_id, value in favored.items():
+        row[token_id] = value
+    reference = torch.log_softmax(row, dim=-1)
+    expected = reference[torch.tensor(lp.logprob_token_ids[0])]
+    assert torch.allclose(torch.tensor(lp.logprobs[0]), expected, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "sampling_kwargs, favored",
+    [
+        # top_k=1 leaves only the argmax in the candidate set.
+        pytest.param({"top_k": 1}, {7: 3.0, 11: 1.0}, id="top_k_1"),
+        # The top token holds ~all probability mass, so a 0.5 nucleus is
+        # exactly {top token}.
+        pytest.param({"top_p": 0.5}, {7: 20.0, 11: 10.0}, id="top_p_singleton"),
+    ],
+)
+def test_top_k_top_p_deterministic_cases(rbln_sampler_env, sampling_kwargs, favored):
+    """Deterministic corners of the RBLN top-k/top-p op: when the candidate
+    set collapses to a single token, random sampling must return it on every
+    step."""
+    runner = create_model_runner(max_num_seqs=1)
+    set_fixed_logits(runner, favored)
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=1.0,
+        **sampling_kwargs,
+    )
+
+    (prefill_output,) = prefill_requests(runner, [req])
+    assert sampled_token(prefill_output, "req_0") == 7
+    for output in run_decode_steps(runner, [req], num_steps=3):
+        assert sampled_token(output, "req_0") == 7
