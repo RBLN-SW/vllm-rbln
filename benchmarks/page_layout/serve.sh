@@ -11,8 +11,7 @@
 # No KV connector: this compares vLLM-local mechanisms only.
 #
 # Usage: serve.sh <subblock|pagelayout>
-# Env:   RBLN_DEVICES (default 4,5,6,7), PORT (8102), DP (4), HF_HOME,
-#        MAX_MODEL_LEN (16384), MAX_NUM_SEQS (8), MODEL
+# Env:   RBLN_DEVICES (required, see README), MAX_NUM_SEQS (8), HF_HOME
 set -uo pipefail
 MODE=${1:?usage: serve.sh <subblock|pagelayout>}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -20,10 +19,6 @@ cd "$REPO"
 source "$REPO/.venv/bin/activate"
 unset PYTHONPATH
 
-MODEL=${MODEL:-MiniMaxAI/MiniMax-M2.5}
-PORT=${PORT:-8102}
-DP=${DP:-4}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 KERNEL_BLOCK=${KERNEL_BLOCK:-8192}
 PAGE=${PAGE:-512}
@@ -54,7 +49,9 @@ export PYTHONHASHSEED=0
 # restart into a 3-minute run: the same seed can be replayed against a cold cache
 # instead of buying freshness with a fresh seed. Dev endpoints, benchmark only.
 export VLLM_SERVER_DEV_MODE=${VLLM_SERVER_DEV_MODE:-1}
-export RBLN_DEVICES=${RBLN_DEVICES:-4,5,6,7}
+# No default. A launch that silently picks its own devices is how one run ends up
+# on hardware another job owns, or on hardware the previous serve has not released.
+: "${RBLN_DEVICES:?set RBLN_DEVICES before launching, e.g. export RBLN_DEVICES=4,5,6,7 (see README)}"
 
 case "$MODE" in
   subblock)
@@ -69,12 +66,12 @@ case "$MODE" in
   *) echo "unknown mode $MODE (expected subblock or pagelayout)"; exit 2 ;;
 esac
 
-echo "[launch] $(date '+%F %T') mode=$MODE devices=$RBLN_DEVICES dp=$DP" \
+echo "[launch] $(date '+%F %T') mode=$MODE devices=$RBLN_DEVICES" \
      "kernel_block=$KERNEL_BLOCK args=${BLOCK_ARGS[*]}"
-exec vllm serve "$MODEL" \
-    --port "$PORT" --served-model-name MiniMax \
-    --data-parallel-size "$DP" --enable-expert-parallel \
-    --max-model-len "$MAX_MODEL_LEN" "${BLOCK_ARGS[@]}" \
+exec vllm serve MiniMaxAI/MiniMax-M2.5 \
+    --port 8102 --served-model-name MiniMax \
+    --data-parallel-size 4 --enable-expert-parallel \
+    --max-model-len 16384 "${BLOCK_ARGS[@]}" \
     --enable-chunked-prefill --max-num-batched-tokens "$CHUNK" \
     --max-num-seqs "$MAX_NUM_SEQS" \
     --gpu-memory-utilization 0.8 --trust-remote-code

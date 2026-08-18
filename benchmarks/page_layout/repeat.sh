@@ -20,7 +20,7 @@
 # and discarded, not reported.
 #
 # Usage: repeat.sh <tag> [n] [workload] [seed]
-# Env:   PORT (8102), OUT_DIR, WARMUP (3)
+# Env:   PORT (8102), OUT_DIR, WARMUP (3), VLLM_REPO (defaults to ./vllm)
 set -uo pipefail
 TAG=${1:?usage: repeat.sh <tag> [n] [workload] [seed]}
 N=${2:-10}
@@ -30,7 +30,7 @@ WARMUP=${WARMUP:-3}
 PORT=${PORT:-8102}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT_DIR=${OUT_DIR:-$HERE/results_repeat}
-DRIVER=${VLLM_REPO:-$HOME/workspace/vllm}/benchmarks/multi_turn/benchmark_serving_multi_turn.py
+DRIVER=${VLLM_REPO:-$HERE/vllm}/benchmarks/multi_turn/benchmark_serving_multi_turn.py
 MODEL=${MODEL:-MiniMaxAI/MiniMax-M2.5}
 
 [ -f "$DRIVER" ] || { echo "missing $DRIVER"; exit 2; }

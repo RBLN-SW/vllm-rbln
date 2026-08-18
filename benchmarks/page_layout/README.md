@@ -20,7 +20,6 @@ entire effect under test is absent.
 | file | what it is |
 |---|---|
 | `serve.sh` | launches one of the two modes; everything else held equal |
-| `run_suite.sh` | the paired suite: warmup, seeds, interleaved workloads |
 | `repeat.sh` | N replays of one fixed workload against a reset cache -- the protocol below |
 | `analyze.py` | pairs the two modes by (workload, seed), reports deltas and a Welch t |
 | `probe_greedy.py` | fixed prompts at temperature 0, for a correctness diff |
@@ -36,15 +35,15 @@ but a pinned checkout is the difference between a rerun that reproduces and one
 that merely resembles:
 
 ```bash
-git clone --depth 1 --branch v0.24.0 \
-    https://github.com/vllm-project/vllm.git "$HOME/workspace/vllm"
-export VLLM_REPO=$HOME/workspace/vllm
-uv pip install --python "$(git rev-parse --show-toplevel)/.venv/bin/python" \
-    -r "$VLLM_REPO/benchmarks/multi_turn/requirements.txt"
+cd benchmarks/page_layout
+git clone --depth 1 --branch v0.24.0 https://github.com/vllm-project/vllm.git
+uv pip install --python ../../.venv/bin/python \
+    -r vllm/benchmarks/multi_turn/requirements.txt
 ```
 
-If the checkout already exists, check what it is on before trusting a
-measurement: `git -C "$VLLM_REPO" describe --tags`.
+The scripts look for `./vllm` next to themselves, so nothing has to be exported.
+Set `VLLM_REPO` only to point somewhere else. If the checkout already exists,
+check what it is on before trusting a measurement: `git -C vllm describe --tags`.
 
 The generators draw their filler text from a Project Gutenberg book, resolved
 relative to the results directory:
@@ -55,26 +54,87 @@ mkdir -p "$OUT_DIR" && curl -sL https://www.gutenberg.org/files/1184/1184-0.txt 
     -o "$OUT_DIR/pg1184.txt"
 ```
 
-## Running
-
-One mode at a time, because the two need the same devices.
+Pick the NPUs. `serve.sh` has no default and refuses to launch without this,
+because a launch that silently picks its own devices is how a run ends up on
+hardware another job owns, or on hardware the previous serve has not yet
+released:
 
 ```bash
-# terminal 1
-RBLN_DEVICES=4,5,6,7 ./serve.sh pagelayout | tee "$OUT_DIR/serve_pagelayout.log"
-
-# terminal 2, once "Application startup complete" appears on every DP rank
-VLLM_REPO=$VLLM_REPO OUT_DIR=$OUT_DIR ./run_suite.sh pagelayout
-
-# then stop the serve, launch `./serve.sh subblock`, and repeat:
-VLLM_REPO=$VLLM_REPO OUT_DIR=$OUT_DIR ./run_suite.sh subblock
-
-python analyze.py "$OUT_DIR"
+export RBLN_DEVICES=4,5,6,7
 ```
 
-Wait for the devices to report zero used memory between the two serves; launching
-while the previous one is still releasing has produced worker startup failures
-that look unrelated to the change under test.
+Everything else the serve needs is fixed in `serve.sh`: MiniMax-M2.5, port 8102,
+`--data-parallel-size 4`, kernel block 8192, page 512, prefill chunk 512. The
+comparison only means something when both modes see the same geometry, so those
+are not knobs.
+
+## Running
+
+Both modes need the same devices, so they run one after the other. Do page layout
+first, then sub-block, then compare.
+
+### Page layout
+
+```bash
+export MODE=pagelayout
+./serve.sh $MODE | tee "$OUT_DIR/serve_$MODE.log"     # terminal 1
+
+# terminal 2, once the log shows "Page/kernel block KV cache" and the port answers
+./repeat.sh $MODE 5 long 1
+```
+
+`repeat.sh` prints one line per repetition and appends them to
+`$OUT_DIR/summary_$MODE.txt`. The first three are warm-up and are marked as such;
+the rest are the measurement.
+
+### Sub-block
+
+Stop the first serve and wait for the devices to report **zero** used memory and
+the port to be free before launching the second — see the pitfalls below, this is
+not optional.
+
+```bash
+export MODE=subblock
+./serve.sh $MODE | tee "$OUT_DIR/serve_$MODE.log"     # terminal 1
+./repeat.sh $MODE 5 long 1                            # terminal 2
+```
+
+The banner to wait for in this mode is `Sub-block prefix caching enabled`.
+
+### Comparing
+
+Take the mean of the kept lines in each `summary_*.txt`. A difference counts only
+if it exceeds the instrument's resolution — about 1 point, so roughly 2 points at
+five repetitions — and its confidence interval excludes zero. Decide that
+threshold before running, not after seeing the numbers.
+
+### Sweeping several workloads and seeds
+
+The comparison above fixes one workload because that is what resolves a small
+difference. To sweep instead — a coarser picture across `short` and `long` at
+several seeds, paired by `analyze.py` — loop the driver directly:
+
+```bash
+cd "$OUT_DIR"
+for seed in 900 1 2 3; do                  # 900 is a discarded warm-up
+  for wl in short long; do
+    python vllm/benchmarks/multi_turn/benchmark_serving_multi_turn.py \
+        --model MiniMaxAI/MiniMax-M2.5 --served-model-name MiniMax \
+        --url http://localhost:8102 \
+        --input-file ../workloads/multi_turn_$wl.json \
+        --num-clients 4 --max-active-conversations 8 \
+        --seed $seed --request-timeout-sec 1800 \
+        --stats-json-output "st_${MODE}_${wl}_${seed}.json" \
+        > "run_${MODE}_${wl}_${seed}.log" 2>&1
+    echo "$MODE $wl seed=$seed $(grep -oE 'benchmark runtime: [0-9.]+ sec' \
+        "run_${MODE}_${wl}_${seed}.log" | tail -1)"
+  done
+done
+```
+
+Run it once per mode, then `python analyze.py "$OUT_DIR"`. Note that a sweep
+buys cache freshness with a fresh seed per run rather than by resetting, so its
+numbers carry the between-seed spread — read it for shape, not for a few points.
 
 ## Reading the results, and four ways to be fooled
 
@@ -95,10 +155,10 @@ reaches ~74%; a page-layout number far below that means cache is being destroyed
 not that the workload changed.
 
 **2. Wall clock is not comparable across sessions.** A neighbour job on the other
-NPUs shifts runtime by tens of percent. `run_suite.sh` stamps `rbln-stat` before
-every run precisely so this is visible after the fact. Compare *within* a paired
-suite, and treat the prefix cache hit rate — which is internal to the engine — as
-the robust metric.
+NPUs shifts runtime by tens of percent, and nothing in these scripts can see it.
+Stamp `rbln-stat` yourself before a session if the machine is shared, compare
+only runs taken close together, and treat the prefix cache hit rate — which is
+internal to the engine — as the robust metric.
 
 **3. One run per mode can report the wrong sign, and the suite is the wrong
 instrument for a small difference.** Two versions of this comparison reported
@@ -108,7 +168,7 @@ seeds alone. Use `repeat.sh` instead, which fixes the workload and clears the
 cache between repetitions:
 
 ```bash
-VLLM_REPO=$VLLM_REPO ./repeat.sh <tag> 5 long 1
+./repeat.sh <tag> 5 long 1
 ```
 
 It needs `POST /reset_prefix_cache`, which `serve.sh` enables through
