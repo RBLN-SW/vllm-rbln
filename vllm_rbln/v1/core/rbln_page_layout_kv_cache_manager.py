@@ -16,8 +16,8 @@
 
 Design: https://github.com/RBLN-SW/vllm-rbln/issues/928
 
-Once ``--block-size`` is the page, upstream does all the matching natively, so what is left is making a page id name its own
-physical home:
+Once ``--block-size`` is the page, upstream does all the matching natively, so
+what is left is making a page id name its own physical home:
 
     kernel block = page_id // pages_per_kernel_block
     slot         = page_id %  pages_per_kernel_block
