@@ -76,15 +76,15 @@ first, then sub-block, then compare.
 ### Page layout
 
 ```bash
-export MODE=pagelayout
-./serve.sh $MODE | tee "$OUT_DIR/serve_$MODE.log"     # terminal 1
+./serve.sh pagelayout | tee "$OUT_DIR/serve_pagelayout.log"   # terminal 1
 
 # terminal 2, once the log shows "Page/kernel block KV cache" and the port answers
-./repeat.sh $MODE 5 long 1
+./repeat.sh pagelayout 5 long 1
 ```
 
 `repeat.sh` prints one line per repetition and appends them to
-`$OUT_DIR/summary_$MODE.txt`. The first three are warm-up and are marked as such;
+`$OUT_DIR/summary_pagelayout.txt`. The first three are warm-up and are marked as
+such;
 the rest are the measurement.
 
 ### Sub-block
@@ -94,9 +94,8 @@ the port to be free before launching the second — see the pitfalls below, this
 not optional.
 
 ```bash
-export MODE=subblock
-./serve.sh $MODE | tee "$OUT_DIR/serve_$MODE.log"     # terminal 1
-./repeat.sh $MODE 5 long 1                            # terminal 2
+./serve.sh subblock | tee "$OUT_DIR/serve_subblock.log"       # terminal 1
+./repeat.sh subblock 5 long 1                                 # terminal 2
 ```
 
 The banner to wait for in this mode is `Sub-block prefix caching enabled`.
@@ -115,6 +114,7 @@ difference. To sweep instead — a coarser picture across `short` and `long` at
 several seeds, paired by `analyze.py` — loop the driver directly:
 
 ```bash
+MODE=pagelayout            # or subblock; must match the serve that is running
 cd "$OUT_DIR"
 for seed in 900 1 2 3; do                  # 900 is a discarded warm-up
   for wl in short long; do
