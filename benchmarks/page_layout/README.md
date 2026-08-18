@@ -20,8 +20,6 @@ entire effect under test is absent.
 | file | what it is |
 |---|---|
 | `serve.sh` | launches one of the two modes; everything else held equal |
-| `repeat.sh` | N replays of one fixed workload against a reset cache -- the protocol below |
-| `analyze.py` | pairs the two modes by (workload, seed), reports deltas and a Welch t |
 | `probe_greedy.py` | fixed prompts at temperature 0, for a correctness diff |
 | `diff_probe.py` | byte-diffs two probe outputs |
 | `workloads/*.json` | conversation generators for the multi-turn driver |
@@ -73,19 +71,58 @@ are not knobs.
 Both modes need the same devices, so they run one after the other. Do page layout
 first, then sub-block, then compare.
 
+### The measurement
+
+Five replays of one fixed workload against a cache cleared before each. Paste it
+once per mode, changing `MODE` and the serve. Run it from this directory, with
+`$OUT_DIR` already set.
+
+```bash
+MODE=pagelayout                 # or subblock
+HERE=$PWD
+
+# The cache reset is what makes a repeat honest. Cumulative counters are not
+# cleared by it, so each run is measured as a difference around itself.
+curl -fsS -X POST localhost:8102/reset_prefix_cache > /dev/null \
+  || { echo "no /reset_prefix_cache: is the serve up with VLLM_SERVER_DEV_MODE=1?"; }
+
+hits() {
+  curl -s localhost:8102/metrics | awk '
+    /^vllm:prefix_cache_hits_total\{/    {h += $2}
+    /^vllm:prefix_cache_queries_total\{/ {q += $2}
+    END {print h, q}'
+}
+
+cd "$OUT_DIR"
+for i in $(seq 1 8); do         # 1-3 warm up and are discarded, see below
+  curl -s -X POST localhost:8102/reset_prefix_cache > /dev/null
+  read -r h0 q0 <<< "$(hits)"
+  "$HERE/../../.venv/bin/python" \
+      "$HERE/vllm/benchmarks/multi_turn/benchmark_serving_multi_turn.py" \
+      --model MiniMaxAI/MiniMax-M2.5 --served-model-name MiniMax \
+      --url http://localhost:8102 \
+      --input-file "$HERE/workloads/multi_turn_long.json" \
+      --num-clients 4 --max-active-conversations 8 \
+      --seed 1 --request-timeout-sec 1800 \
+      --stats-json-output "st_${MODE}_${i}.json" \
+      > "run_${MODE}_${i}.log" 2>&1
+  read -r h1 q1 <<< "$(hits)"
+  awk -v i="$i" -v a="$h0" -v b="$q0" -v c="$h1" -v d="$q1" -v m="$MODE" \
+      'BEGIN {if (d == b) {printf "%s #%d no queries -- check run_%s_%d.log\n", m, i, m, i}
+              else {printf "%s #%d hit_rate=%.4f %s\n", m, i, (c-a)/(d-b),
+                    (i <= 3 ? "warm-up" : "keep")}}' | tee -a "summary_${MODE}.txt"
+done
+cd "$HERE"
+```
+
 ### Page layout
 
 ```bash
-./serve.sh pagelayout | tee "$OUT_DIR/serve_pagelayout.log"   # terminal 1
-
-# terminal 2, once the log shows "Page/kernel block KV cache" and the port answers
-./repeat.sh pagelayout 5 long 1
+./serve.sh pagelayout | tee "$OUT_DIR/serve_pagelayout.log"
 ```
 
-`repeat.sh` prints one line per repetition and appends them to
-`$OUT_DIR/summary_pagelayout.txt`. The first three are warm-up and are marked as
-such;
-the rest are the measurement.
+Wait for `Page/kernel block KV cache` in that log and for the port to answer,
+then run the measurement above with `MODE=pagelayout`.
 
 ### Sub-block
 
@@ -94,47 +131,21 @@ the port to be free before launching the second — see the pitfalls below, this
 not optional.
 
 ```bash
-./serve.sh subblock | tee "$OUT_DIR/serve_subblock.log"       # terminal 1
-./repeat.sh subblock 5 long 1                                 # terminal 2
+./serve.sh subblock | tee "$OUT_DIR/serve_subblock.log"
 ```
 
 The banner to wait for in this mode is `Sub-block prefix caching enabled`.
 
 ### Comparing
 
-Take the mean of the kept lines in each `summary_*.txt`. A difference counts only
-if it exceeds the instrument's resolution — about 1 point, so roughly 2 points at
-five repetitions — and its confidence interval excludes zero. Decide that
-threshold before running, not after seeing the numbers.
+Take the mean of the `keep` lines in each `summary_*.txt`. A difference counts
+only if it exceeds the instrument's resolution — about 1 point, so roughly 2
+points at five repetitions — and its confidence interval excludes zero. Decide
+that threshold before running, not after seeing the numbers.
 
-### Sweeping several workloads and seeds
-
-The comparison above fixes one workload because that is what resolves a small
-difference. To sweep instead — a coarser picture across `short` and `long` at
-several seeds, paired by `analyze.py` — loop the driver directly:
-
-```bash
-MODE=pagelayout            # or subblock; must match the serve that is running
-cd "$OUT_DIR"
-for seed in 900 1 2 3; do                  # 900 is a discarded warm-up
-  for wl in short long; do
-    python vllm/benchmarks/multi_turn/benchmark_serving_multi_turn.py \
-        --model MiniMaxAI/MiniMax-M2.5 --served-model-name MiniMax \
-        --url http://localhost:8102 \
-        --input-file ../workloads/multi_turn_$wl.json \
-        --num-clients 4 --max-active-conversations 8 \
-        --seed $seed --request-timeout-sec 1800 \
-        --stats-json-output "st_${MODE}_${wl}_${seed}.json" \
-        > "run_${MODE}_${wl}_${seed}.log" 2>&1
-    echo "$MODE $wl seed=$seed $(grep -oE 'benchmark runtime: [0-9.]+ sec' \
-        "run_${MODE}_${wl}_${seed}.log" | tail -1)"
-  done
-done
-```
-
-Run it once per mode, then `python analyze.py "$OUT_DIR"`. Note that a sweep
-buys cache freshness with a fresh seed per run rather than by resetting, so its
-numbers carry the between-seed spread — read it for shape, not for a few points.
+To cover the other workload, run the same pair again with `multi_turn_short.json`.
+There is deliberately no seed sweep: varying the seed varies the workload, and
+the spread that introduces is larger than any difference worth arguing about.
 
 ## Reading the results, and four ways to be fooled
 
