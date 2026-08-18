@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
+    VLLM_RBLN_DP_ALL_REDUCE_ASYNC: bool = True
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
@@ -285,6 +286,15 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Run the per-step DP num_tokens/num_reqs all_reduce with async_op=True (issue
+    # in _prepare_inputs, wait in _determine_batch_padding) or async_op=False (one
+    # blocking call at the use site). Applies in both scheduling modes.
+    "VLLM_RBLN_DP_ALL_REDUCE_ASYNC": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DP_ALL_REDUCE_ASYNC", "True").lower()
+            in ("true", "1")
+        )
+    ),
     # Disable RBLN file offloading during model load / warm-up even when
     # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;
     # weight host backings stay resident instead of being paged to disk.
@@ -427,6 +437,9 @@ RBLN_NON_COMPILE_ENV = frozenset(
     {
         # sampler graphs compile with use_cache=False, never enter the bundle
         "VLLM_RBLN_SAMPLER",
+        # picks async_op on the per-step DP all_reduce; host-side collective
+        # scheduling only, the compiled graphs are identical either way
+        "VLLM_RBLN_DP_ALL_REDUCE_ASYNC",
         "VLLM_RBLN_COMPILE_STRICT_MODE",
         "VLLM_RBLN_NUM_RAY_NODES",
         "VLLM_RBLN_ENABLE_WARM_UP",

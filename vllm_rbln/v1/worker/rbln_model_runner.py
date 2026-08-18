@@ -108,7 +108,11 @@ from vllm_rbln.compilation import (
     create_compile_context,
     set_compile_stage,
 )
-from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
+from vllm_rbln.forward_context import (
+    DPTokensReduceHandle,
+    RBLNDPMetadata,
+    set_forward_context,
+)
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
@@ -742,7 +746,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         scheduler_output: RBLNSchedulerOutput,
         num_scheduled_tokens: np.ndarray,
-    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, np.ndarray, int]:
+    ) -> tuple[
+        torch.Tensor,
+        SpecDecodeMetadata | None,
+        np.ndarray,
+        int,
+        int,
+        int | None,
+        torch.Tensor | None,
+    ]:
         assert scheduler_output.total_num_scheduled_tokens > 0
         assert (num_reqs := self.input_batch.num_reqs) > 0
         logical_num_tokens = num_scheduled_tokens
@@ -766,6 +778,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             backfill = np.zeros_like(logical_num_tokens)
 
         total_query_tokens = int(query_lengths.sum())
+
+        # Issue the per-step DP num_tokens all_reduce as soon as its inputs are known
+        # and consume it in _determine_batch_padding below. Host gloo collective on
+        # CPU tensors; touches no device memory.
+        dp_reduce = self._start_dp_token_reduce(num_reqs, total_query_tokens)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -807,6 +824,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.query_start_loc_np[0] = 0
         self.query_start_loc_np[1 : num_reqs + 1] = cu_num_tokens
         self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+
+        num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
+            self._determine_batch_padding(num_reqs, total_query_tokens, dp_reduce)
+        )
 
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + logical_num_tokens
@@ -860,6 +881,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             spec_decode_metadata,
             query_lengths,
             total_query_tokens,
+            num_reqs_padded,
+            num_tokens_padded,
+            num_tokens_across_dp,
         )
 
     def _build_attention_metadata(
@@ -1370,18 +1394,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
 
+            # _prepare_inputs issues the DP all_reduce and returns the padding it
+            # computed.
             (
                 logits_indices,
                 spec_decode_metadata,
                 query_lengths,
                 num_query_tokens,
+                num_reqs_padded,
+                num_tokens_padded,
+                num_tokens_across_dp,
             ) = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
-            )
-
-            num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
-                self._determine_batch_padding(num_reqs, num_query_tokens)
             )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
@@ -2787,10 +2812,36 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.kv_cache_view_infos,
             )
 
+    def _start_dp_token_reduce(
+        self,
+        num_reqs_unpadded: int,
+        num_tokens_unpadded: int,
+    ) -> DPTokensReduceHandle | None:
+        """Issue the DP num_tokens/num_reqs all_reduce ahead of its use site.
+
+        Returns None when there is nothing to overlap (DP==1), in which case
+        _determine_batch_padding runs it blocking.
+        """
+        if self.parallel_config.data_parallel_size == 1:
+            return None
+        if not envs.VLLM_RBLN_DP_ALL_REDUCE_ASYNC:
+            # Returning None makes _determine_batch_padding run the collective
+            # blocking at its use site, i.e. async_op=False.
+            return None
+        return RBLNDPMetadata.start_num_tokens_and_reqs_across_dp(
+            num_tokens_unpadded,
+            num_reqs_unpadded,
+            self.parallel_config.data_parallel_size,
+            self.parallel_config.data_parallel_rank,
+            self.is_prefill,
+            async_op=True,
+        )
+
     def _determine_batch_padding(
         self,
         num_reqs_unpadded: int,
         num_tokens_unpadded: int,
+        dp_reduce: DPTokensReduceHandle | None = None,
     ) -> tuple[int, int | None, torch.Tensor | None]:
         num_reqs_padded = (
             self.bucketing_manager.find_decode_batch_bucket(num_reqs_unpadded)
@@ -2800,15 +2851,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if self.parallel_config.data_parallel_size == 1:
             return num_reqs_padded, None, None
 
-        num_tokens_across_dp, num_reqs_across_dp = (
-            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens_unpadded,
-                num_reqs_unpadded,
-                self.parallel_config.data_parallel_size,
-                self.parallel_config.data_parallel_rank,
-                self.is_prefill,
+        if dp_reduce is not None:
+            num_tokens_across_dp, num_reqs_across_dp = dp_reduce.wait()
+        else:
+            num_tokens_across_dp, num_reqs_across_dp = (
+                RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+                    num_tokens_unpadded,
+                    num_reqs_unpadded,
+                    self.parallel_config.data_parallel_size,
+                    self.parallel_config.data_parallel_rank,
+                    self.is_prefill,
+                )
             )
-        )
         num_tokens_padded = self.max_num_tokens
         if self.specialized_moe_decode:
             if num_reqs_across_dp is None:

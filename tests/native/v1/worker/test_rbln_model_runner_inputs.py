@@ -51,7 +51,10 @@ class TestPrepareInputsSpecDecode:
         runner = make_model_runner()
         _decode_ready(runner, monkeypatch, num_spec_tokens=2)
 
-        logits_indices, spec_md, query_lengths, total = runner._prepare_inputs(
+        # _prepare_inputs also returns the DP padding trio (num_reqs_padded,
+        # num_tokens_padded, num_tokens_across_dp); none of it bears on the
+        # spec-decode query shaping under test here.
+        logits_indices, spec_md, query_lengths, total, *_ = runner._prepare_inputs(
             make_scheduler_output(
                 num_scheduled_tokens={"a": 2}, spec_decode_tokens={"a": [11]}
             ),
@@ -78,7 +81,10 @@ class TestPrepareInputsSpecDecode:
         runner = make_model_runner()
         _decode_ready(runner, monkeypatch, num_spec_tokens=2)
 
-        logits_indices, spec_md, query_lengths, total = runner._prepare_inputs(
+        # _prepare_inputs also returns the DP padding trio (num_reqs_padded,
+        # num_tokens_padded, num_tokens_across_dp); none of it bears on the
+        # spec-decode query shaping under test here.
+        logits_indices, spec_md, query_lengths, total, *_ = runner._prepare_inputs(
             make_scheduler_output(num_scheduled_tokens={"a": 1}),
             np.array([1], dtype=np.int32),
         )
