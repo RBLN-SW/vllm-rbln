@@ -45,8 +45,13 @@ def _register_is_deepseek_mla_patch() -> None:
     )
     def is_deepseek_mla(self) -> bool:
         hf_text_config = self.hf_text_config
-        if getattr(hf_text_config, "model_type", None) == MODEL_TYPE:
+        model_type = getattr(hf_text_config, "model_type", None)
+        if model_type == MODEL_TYPE:
             return getattr(hf_text_config, "kv_lora_rank", None) is not None
+        if model_type == "eagle":
+            inner = getattr(hf_text_config, "model", None)
+            if getattr(inner, "model_type", None) == MODEL_TYPE:
+                return getattr(hf_text_config, "kv_lora_rank", None) is not None
         return original(self)
 
 
