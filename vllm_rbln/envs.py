@@ -325,7 +325,7 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
-    # Back pages with contiguous kernel blocks (docs/page_layout_kv_manager.md).
+    # Back pages with contiguous kernel blocks. Design: https://github.com/RBLN-SW/vllm-rbln/issues/928
     # --block-size becomes the page; the kernel block comes from the compiled model.
     # Supersedes VLLM_RBLN_SUB_BLOCK_CACHE, which it disables when on.
     # VLLM_RBLN_PAGE_EXTENT is the pre-rename name, kept as an alias.

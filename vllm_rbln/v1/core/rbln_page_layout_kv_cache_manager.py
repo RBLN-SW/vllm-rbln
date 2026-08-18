@@ -14,8 +14,9 @@
 
 """Page-native KV cache manager with kernel block backing.
 
-See docs/page_layout_kv_manager.md. Once ``--block-size`` is the page, upstream
-does all the matching natively, so what is left is making a page id name its own
+Design: https://github.com/RBLN-SW/vllm-rbln/issues/928
+
+Once ``--block-size`` is the page, upstream does all the matching natively, so what is left is making a page id name its own
 physical home:
 
     kernel block = page_id // pages_per_kernel_block

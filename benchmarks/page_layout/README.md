@@ -1,7 +1,7 @@
 # Page layout vs sub-block prefix caching
 
 Scripts for the one comparison that decides whether
-[page layout](../../docs/page_layout_kv_manager.md) is worth keeping: does it beat
+[page layout](https://github.com/RBLN-SW/vllm-rbln/issues/928) is worth keeping: does it beat
 [sub-block prefix caching](../../docs/sub_block_prefix_caching.md) on multi-turn
 traffic, at the same kernel block and the same prefill chunk?
 

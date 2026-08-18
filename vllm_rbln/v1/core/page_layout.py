@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Page/kernel block KV sizes. See docs/page_layout_kv_manager.md.
+"""Page/kernel block KV sizes. Design: https://github.com/RBLN-SW/vllm-rbln/issues/928
 
 Sizes and the checks on them, nothing else. A page id names its own physical
 home, but the arithmetic that says so belongs to `KernelBlockPool`, which is the
