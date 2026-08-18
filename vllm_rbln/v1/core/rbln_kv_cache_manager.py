@@ -592,9 +592,12 @@ class RBLNKVCacheManager(KVCacheManager):
             self._index_partial_block(request, False)
         self._pending_indexing.clear()
 
-    def free(self, request: Request) -> None:
-        """Index any not-yet-indexed sub-blocks, free blocks, and clean up
-        sub-block state for the request."""
+    def _finalize_sub_block_state(self, request: Request) -> None:
+        """Index what this request still owes, then drop its per-request state.
+
+        Runs before the blocks leave this manager, since indexing reads them
+        through the coordinator.
+        """
         # Consume this request's pending indexing entry and index all blocks
         # (full + partial) before releasing them.
         pending = self._pending_indexing.pop(request.request_id, None)
@@ -605,7 +608,22 @@ class RBLNKVCacheManager(KVCacheManager):
 
         # Clean up request states
         del self._req_sub_hashes[request.request_id]
+
+    def free(self, request: Request) -> None:
+        """Index any not-yet-indexed sub-blocks, free blocks, and clean up
+        sub-block state for the request."""
+        self._finalize_sub_block_state(request)
         super().free(request)
+
+    def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
+        """Same finalization as ``free()`` on the deferred path.
+
+        The scheduler takes this one when an in-flight step may still write the
+        blocks, so it holds them and returns them to the pool later. The request
+        is gone either way, so its sub-block state has to be settled here too.
+        """
+        self._finalize_sub_block_state(request)
+        return super().pop_blocks_for_free(request)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache including all per-group sub-block indices."""

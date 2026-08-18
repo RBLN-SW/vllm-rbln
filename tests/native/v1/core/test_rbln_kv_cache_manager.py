@@ -633,6 +633,23 @@ class TestSubBlockIndexingFlow:
         manager.free(req)
         assert "0" not in manager._req_sub_hashes
 
+    def test_pop_blocks_for_free_settles_state_like_free(self):
+        # The scheduler's other way out: it takes this one when an in-flight step
+        # may still write the blocks, so it keeps them and returns them to the pool
+        # later. The request is gone all the same, so the sub-block state has to be
+        # settled here as free() settles it.
+        manager = make_manager(8, 4, 10)
+        req = make_request("0", list(range(8 + 4)), 8)
+        prefill_request(manager, req)
+        partial_id = manager.coordinator.get_blocks(req.request_id)[0][1].block_id
+
+        blocks = manager.pop_blocks_for_free(req)
+
+        assert blocks, "the caller frees these later"
+        assert "0" not in manager._req_sub_hashes
+        assert "0" not in manager._pending_indexing
+        assert partial_id in sub_block_index(manager)._block_hashes
+
     def test_partial_block_fewer_than_sub_block_skipped(self):
         # A partial block with fewer than sub_block_size tokens is not indexed
         # and not cached.

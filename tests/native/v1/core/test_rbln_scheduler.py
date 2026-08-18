@@ -1210,8 +1210,9 @@ class TestDeferredBlockFree:
         assert block_pool.get_num_free_blocks() > free_before
 
     def test_no_deferred_free_without_multiple_inflight_batches(self):
-        # Single batch in flight (no PP): freeing stays immediate even with a
-        # KV connector present.
+        # A guard rather than a test of the fence itself: with a single batch in
+        # flight (no PP) the whole mechanism has to stay inert even though a KV
+        # connector is present, so freeing is immediate and neither counter moves.
         sched = create_rbln_scheduler(use_kv_connector=MockKVConfig())
         assert not sched.defer_block_free
 
@@ -1225,4 +1226,53 @@ class TestDeferredBlockFree:
         sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         assert not sched.deferred_frees
         assert block_pool.get_num_free_blocks() > free_before
+
+        # Processing the step leaves the fence untouched: nothing to drain, and
+        # the release counter stays with the scheduling one at 0.
         sched.update_from_output(output, make_model_runner_output(output, 0))
+        assert sched.processed_step_seq == 0
+        assert not sched.deferred_frees
+
+    def test_empty_step_does_not_advance_the_fence(self):
+        # The other half of the condition. update_from_output only advances
+        # processed_step_seq for a step that has tokens, so a scheduling counter
+        # that moved on an empty step would run ahead for good -- the fence would
+        # stop clearing and deferred blocks would never return to the pool. Empty
+        # steps are normal here: a KV consumer parks requests that wait on a
+        # remote KV load.
+        sched = create_rbln_scheduler(
+            pipeline_parallel_size=2, use_kv_connector=MockKVConfig()
+        )
+        assert sched.defer_block_free
+
+        output = sched.schedule()  # nothing queued
+
+        assert output.total_num_scheduled_tokens == 0
+        assert sched.sched_step_seq == 0
+
+    def test_deferred_free_settles_sub_block_state(self):
+        # The fenced path releases blocks through pop_blocks_for_free(), so the
+        # sub-block bookkeeping has to be settled there as free() settles it.
+        # Otherwise the request's hashes outlive it, and its partial block never
+        # gets the synthetic hash that keeps it in the LRU.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            sub_block_size=8,
+            pipeline_parallel_size=2,
+            use_kv_connector=MockKVConfig(),
+        )
+        manager = sched.kv_cache_manager
+        # 32 tokens over a 16-token block with 8-token sub-blocks: the second
+        # block is partial once the step advances, which is what gets indexed.
+        request = create_requests(1, num_tokens=32)[0]
+        sched.add_request(request)
+        sched.schedule()
+        partial_block = manager.coordinator.get_blocks(request.request_id)[0][-1]
+
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+        assert sched.deferred_frees, "blocks must be fenced, not freed"
+        assert request.request_id not in manager._req_sub_hashes
+        assert request.request_id not in manager._pending_indexing
+        assert partial_block.block_hash is not None
