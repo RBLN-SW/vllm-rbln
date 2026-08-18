@@ -1,0 +1,387 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Which padded batch a step runs, agreed across the data-parallel ranks.
+
+RBLN compiles fixed decode shapes, so every step must land on a compiled
+``(num_reqs_padded, query_len)`` pair -- and under data parallelism every rank
+must land on the *same* one, or the ranks enter different graphs and the
+collective hangs. The layers, mirroring upstream's ``vllm/v1/worker/dp_utils.py``:
+
+- ``_run_ar``: one int per rank, sum-reduced into a tensor.
+- ``synchronize_dp_ranks``: bit-packs this rank's counts, all-reduces them and
+  unpacks a ``DPBatchSnapshot`` -- transport only, it decides nothing.
+- ``decide_batch``: the rule, a pure function of this rank's counts plus the
+  snapshot (None on a single rank), so every route is testable without a runner.
+- ``coordinate_batch_across_dp``: the two together, for callers under DP.
+
+``(num_reqs, query_len)`` are the free variables; tokens are their product. The
+result therefore always states ``query_len`` outright: callers stage from it and
+never divide ``num_tokens_padded`` to recover it.
+"""
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from enum import Enum
+
+import torch
+import torch.distributed as dist
+
+
+class BatchRoute(str, Enum):
+    """Which rule decided this step's shape.
+
+    Not derivable from the numbers: two rules can land on the same
+    ``(num_reqs_padded, query_len, num_tokens_padded)`` -- an unspecialized DP
+    decode and a decode alongside a prefilling peer both give ``(8, 1,
+    max_num_tokens)`` -- so a log line or a test that only checked the values
+    could not tell a right-numbers-wrong-rule step from a correct one. Nothing
+    branches on it: callers run on the numbers and log the route.
+    """
+
+    PINNED = "PINNED"
+    """Warm-up dictated the token dimension: it compiles the shapes only DP
+    asymmetry produces, which a symmetric warm-up group cannot reach on its own."""
+    LOCAL = "LOCAL"
+    """Single-DP: nothing to agree with, so the local bucket wins."""
+    UNSPECIALIZED = "UNSPECIALIZED"
+    """DP with specialize-moe-decode off: local bucket, tokens padded to the target."""
+    ANY_PREFILL = "ANY_PREFILL"
+    """Some rank is prefilling, so decoding ranks run the padded-decode graph."""
+    ALL_IDLE = "ALL_IDLE"
+    """Every rank drained; run the cheapest identical graph and discard it."""
+    QLEN_ASYM = "QLEN_ASYM"
+    """Busy ranks disagree on query_len; only the top bucket's padding is warmed."""
+    AGREED = "AGREED"
+    """The normal path: the busy ranks share a query_len and a bucket."""
+
+
+@dataclass(frozen=True)
+class DPBatchSnapshot:
+    """Per-rank counts and flags from one all-reduce, index-aligned by DP rank.
+
+    Everything is data: this layer reports what the ranks said and leaves the
+    policy to ``decide_batch``.
+    """
+
+    num_tokens: tuple[int, ...]
+    num_reqs: tuple[int, ...]
+    is_prefill: tuple[bool, ...]
+    is_idle: tuple[bool, ...]
+    """A DP-idle dummy step, which must not drive the shape."""
+    num_tokens_across_dp: torch.Tensor
+    """``num_tokens`` as the tensor ``set_forward_context`` consumes."""
+
+
+@dataclass(frozen=True)
+class ShapeConfig:
+    """The compiled-shape snapshot of this worker."""
+
+    decode_batch_buckets: Sequence[int]
+    """Ascending compiled decode batch sizes."""
+    find_bucket: Callable[[int], int]
+    """``BucketingManager.find_decode_batch_bucket``, injected so the
+    smallest-bucket-that-fits rule has one implementation."""
+    max_num_tokens: int
+    """Prefill-sized token dimension, used as the padding target."""
+    specialized_moe_decode: bool
+
+
+@dataclass(frozen=True)
+class BatchDescriptor:
+    """Describes the padded batch this rank runs, i.e. which compiled graph the
+    step dispatches to. Same role as upstream's ``BatchDescriptor``, with the
+    dimensions RBLN compiles for."""
+
+    num_reqs_padded: int
+    """Compiled batch dimension. On a prefill step this is ``num_reqs``: RBLN
+    prefills one request at a time and the decode padding does not apply."""
+    query_len: int
+    """Tokens per request to stage. Equals this rank's own ``num_tokens //
+    num_reqs`` except on ``AGREED``, where an idle rank adopts the busy ranks'
+    length so it runs their graph."""
+    num_tokens_padded: int | None
+    """Token dimension of the graph the step runs, or None when the caller does
+    not pad tokens (single-DP). Always at least ``num_reqs * query_len`` -- what
+    this rank stages fits, and pads up to the dimension when it is smaller. The
+    exact value follows from which warmed graph the route picked."""
+
+
+def decide_batch(
+    *,
+    cfg: ShapeConfig,
+    num_reqs: int,
+    num_tokens: int,
+    is_prefill: bool,
+    snapshot: DPBatchSnapshot | None,
+    pinned_num_tokens_padded: int | None = None,
+) -> tuple[BatchDescriptor, BatchRoute]:
+    """Decide this step's padded batch.
+
+    ``snapshot`` is None for single-DP. ``num_tokens`` must be ``num_reqs *
+    query_len``: RBLN runs one query length per step, so a non-uniform batch is a
+    caller bug rather than a shape to be chosen.
+
+    ``pinned_num_tokens_padded`` is warm-up asking for a specific token dimension
+    instead of a decided one; the returned descriptor is still the one value the
+    callers read.
+    """
+    assert num_reqs >= 1, f"num_reqs must be >= 1, got {num_reqs}"
+    assert num_tokens % num_reqs == 0, (
+        f"num_tokens={num_tokens} is not a multiple of num_reqs={num_reqs}: "
+        "a step's query length must be uniform"
+    )
+    query_len = num_tokens // num_reqs
+
+    # A prefill step is not padded to a decode bucket; keep num_reqs so no caller
+    # has to override the value afterwards.
+    local_num_reqs_padded = num_reqs if is_prefill else cfg.find_bucket(num_reqs)
+
+    if pinned_num_tokens_padded is not None:
+        return (
+            BatchDescriptor(
+                num_reqs_padded=local_num_reqs_padded,
+                query_len=query_len,
+                num_tokens_padded=pinned_num_tokens_padded,
+            ),
+            BatchRoute.PINNED,
+        )
+
+    if snapshot is None:
+        return (
+            BatchDescriptor(
+                num_reqs_padded=local_num_reqs_padded,
+                query_len=query_len,
+                num_tokens_padded=None,
+            ),
+            BatchRoute.LOCAL,
+        )
+
+    if not cfg.specialized_moe_decode:
+        return (
+            BatchDescriptor(
+                num_reqs_padded=local_num_reqs_padded,
+                query_len=query_len,
+                num_tokens_padded=cfg.max_num_tokens,
+            ),
+            BatchRoute.UNSPECIALIZED,
+        )
+
+    if any(snapshot.is_prefill):
+        # A rank that prefills forces the token dimension to the prefill target,
+        # which the small decode buckets cannot satisfy -- the decoding ranks run
+        # the top bucket's padded-decode graph instead.
+        return (
+            BatchDescriptor(
+                num_reqs_padded=(
+                    num_reqs if is_prefill else cfg.decode_batch_buckets[-1]
+                ),
+                query_len=query_len,
+                num_tokens_padded=cfg.max_num_tokens,
+            ),
+            BatchRoute.ANY_PREFILL,
+        )
+
+    busy = [i for i, idle in enumerate(snapshot.is_idle) if not idle]
+    if not busy:
+        # Output is discarded, so take the cheapest graph -- identical on every
+        # rank because every rank sees the same snapshot.
+        cheapest = cfg.decode_batch_buckets[0]
+        return (
+            BatchDescriptor(
+                num_reqs_padded=cheapest,
+                query_len=1,
+                num_tokens_padded=cheapest,
+            ),
+            BatchRoute.ALL_IDLE,
+        )
+
+    assert all(snapshot.num_tokens[i] % snapshot.num_reqs[i] == 0 for i in busy), (
+        "a busy rank reported a non-uniform query length: "
+        f"num_tokens={snapshot.num_tokens} num_reqs={snapshot.num_reqs}"
+    )
+    busy_query_lens = [snapshot.num_tokens[i] // snapshot.num_reqs[i] for i in busy]
+    max_query_len = max(busy_query_lens)
+
+    if min(busy_query_lens) != max_query_len:
+        # Spec-decode asymmetry (one rank drafted, another did not). Only the top
+        # bucket is warmed for it, and each rank pads its own tokens up to the
+        # graph's dimension, so query_len stays this rank's own.
+        top = cfg.decode_batch_buckets[-1]
+        return (
+            BatchDescriptor(
+                num_reqs_padded=top,
+                query_len=query_len,
+                num_tokens_padded=top * max_query_len,
+            ),
+            BatchRoute.QLEN_ASYM,
+        )
+
+    # The busy ranks agree, so decide from them and let an idle rank adopt the
+    # result -- its own (1 request, 1 token) must not shrink the graph.
+    num_reqs_padded = cfg.find_bucket(max(snapshot.num_reqs[i] for i in busy))
+    return (
+        BatchDescriptor(
+            num_reqs_padded=num_reqs_padded,
+            query_len=max_query_len,
+            num_tokens_padded=num_reqs_padded * max_query_len,
+        ),
+        BatchRoute.AGREED,
+    )
+
+
+def _run_ar(value: int, dp_size: int, dp_rank: int) -> torch.Tensor:
+    """Sum-reduce one int per rank into a CPU tensor of size dp_size.
+
+    Every rank contributes into its own slot and zero elsewhere, so the sum is a
+    gather. Runs on the CPU group: the values are tiny and the caller is on the
+    host path.
+    """
+    slots = [0] * dp_size
+    slots[dp_rank] = value
+    tensor = torch.tensor(slots, device="cpu", dtype=torch.int32)
+
+    from vllm.distributed.parallel_state import get_dp_group
+
+    dist.all_reduce(tensor, group=get_dp_group().cpu_group)
+    return tensor
+
+
+def _synchronize_dp_ranks(
+    num_tokens: int,
+    num_reqs: int,
+    dp_size: int,
+    dp_rank: int,
+    is_prefill: bool,
+    is_idle: bool = False,
+) -> DPBatchSnapshot:
+    """All-reduce per-rank (num_tokens, num_reqs, is_prefill, is_idle)
+    across DP via a single bit-packed int32 and split the result back out.
+
+    Transport only: it reports what every rank said and leaves the shape
+    decision to ``decide_batch``.
+
+    Bit layout (int32, low to high; bit 31 is left unused to keep the packed
+    value non-negative for the sum-based all-gather):
+        bits  0..15  num_tokens  (max 65535)
+        bits 16..28  num_reqs    (max 8191; >> any real max_num_seqs)
+        bit  29      is_prefill flag
+        bit  30      is_idle flag (DP-idle dummy step)
+    """
+    token_bits = 16
+    req_bits = 13
+    token_mask = (1 << token_bits) - 1
+    req_mask_raw = (1 << req_bits) - 1
+    req_mask_shifted = req_mask_raw << token_bits
+    prefill_flag = 1 << (token_bits + req_bits)
+    idle_flag = 1 << (token_bits + req_bits + 1)
+
+    assert num_tokens <= token_mask, (
+        f"num_tokens={num_tokens} exceeds bit-packed limit {token_mask}"
+    )
+    assert num_reqs <= req_mask_raw, (
+        f"num_reqs={num_reqs} exceeds bit-packed limit {req_mask_raw}"
+    )
+
+    encoded = num_tokens | (num_reqs << token_bits)
+    if is_prefill:
+        encoded |= prefill_flag
+    if is_idle:
+        encoded |= idle_flag
+
+    encoded_across_dp = _run_ar(encoded, dp_size, dp_rank)
+
+    token_mask_t = torch.tensor([token_mask] * dp_size, device="cpu", dtype=torch.int32)
+    num_tokens_across_dp_cpu = encoded_across_dp & token_mask_t
+
+    # Unpack once into ints: the decision reads these several times, and one
+    # all-reduce carries only dp_size numbers.
+    packed_per_rank = encoded_across_dp.tolist()
+    return DPBatchSnapshot(
+        num_tokens=tuple(value & token_mask for value in packed_per_rank),
+        num_reqs=tuple(
+            (value & req_mask_shifted) >> token_bits for value in packed_per_rank
+        ),
+        is_prefill=tuple(bool(value & prefill_flag) for value in packed_per_rank),
+        is_idle=tuple(bool(value & idle_flag) for value in packed_per_rank),
+        num_tokens_across_dp=num_tokens_across_dp_cpu,
+    )
+
+
+def synchronize_draft_dp_ranks(
+    num_tokens: int,
+    num_reqs: int,
+    dp_size: int,
+    dp_rank: int,
+    is_prefill: bool,
+) -> tuple[torch.Tensor, bool, int, int]:
+    """Join the DP collective for a draft step and return the aggregates its own
+    shape rule reads: ``(num_tokens_across_dp, any_prefill, max_num_reqs,
+    max_query_len)``.
+
+    The draft decides its shape in v1/spec_decode/eagle.py rather than through
+    ``decide_batch`` (see the TODO there), but it needs no more of the per-rank
+    picture than these four values -- so the snapshot type stays inside this
+    module. Unlike ``decide_batch`` the aggregates cover every rank: an idle
+    draft step reports itself as busy at the warmed query length.
+    """
+    snapshot = _synchronize_dp_ranks(num_tokens, num_reqs, dp_size, dp_rank, is_prefill)
+    assert all(
+        tokens % reqs == 0
+        for tokens, reqs in zip(snapshot.num_tokens, snapshot.num_reqs)
+    ), (
+        "a rank reported a non-uniform query length: "
+        f"num_tokens={snapshot.num_tokens} num_reqs={snapshot.num_reqs}"
+    )
+    max_query_len = max(
+        tokens // reqs for tokens, reqs in zip(snapshot.num_tokens, snapshot.num_reqs)
+    )
+    return (
+        snapshot.num_tokens_across_dp,
+        any(snapshot.is_prefill),
+        max(snapshot.num_reqs),
+        max_query_len,
+    )
+
+
+def coordinate_batch_across_dp(
+    *,
+    cfg: ShapeConfig,
+    dp_size: int,
+    dp_rank: int,
+    num_reqs: int,
+    num_tokens: int,
+    is_prefill: bool,
+    is_idle: bool = False,
+    pinned_num_tokens_padded: int | None = None,
+) -> tuple[BatchDescriptor, BatchRoute, torch.Tensor]:
+    """Agree on this step's padded batch with the other DP ranks.
+
+    Only for ``dp_size > 1``: it joins the collective, so every rank of the group
+    must call it on the same step or they deadlock. A single-DP caller decides
+    directly with ``decide_batch``. The tensor is the per-rank token counts, which
+    the caller publishes through ``set_forward_context``.
+    """
+    snapshot = _synchronize_dp_ranks(
+        num_tokens, num_reqs, dp_size, dp_rank, is_prefill, is_idle
+    )
+    batch_desc, route = decide_batch(
+        cfg=cfg,
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        is_prefill=is_prefill,
+        snapshot=snapshot,
+        pinned_num_tokens_padded=pinned_num_tokens_padded,
+    )
+    return batch_desc, route, snapshot.num_tokens_across_dp

@@ -108,7 +108,7 @@ from vllm_rbln.compilation import (
     create_compile_context,
     set_compile_stage,
 )
-from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
@@ -135,6 +135,13 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+from vllm_rbln.v1.worker.dp_utils import (
+    BatchDescriptor,
+    BatchRoute,
+    ShapeConfig,
+    coordinate_batch_across_dp,
+    decide_batch,
+)
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
@@ -440,6 +447,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.specialized_moe_decode = (
             parallel_config.data_parallel_size > 1
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
+        )
+
+        # Static, so the per-step decision only has to supply this step's counts.
+        self._shape_config = ShapeConfig(
+            decode_batch_buckets=self.bucketing_manager.decode_batch_buckets,
+            find_bucket=self.bucketing_manager.find_decode_batch_bucket,
+            max_num_tokens=self.max_num_tokens,
+            specialized_moe_decode=self.specialized_moe_decode,
         )
 
         self.offload_context = nullcontext
@@ -905,19 +920,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_tokens: int,
         num_reqs: int,
         max_query_len: int,
-        num_tokens_padded: int | None = None,
-        num_reqs_padded: int | None = None,
+        num_reqs_padded: int,
         logits_indices: torch.Tensor | None = None,
-        use_spec_decode: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+
+        Unlike the base runner this takes no padded token count: the metadata
+        handed to the drafter is built from the unpadded counts here, where the
+        base builds it padded and unpads it again on the way out. The padded
+        request count is still needed -- the decode branch of the builder pads
+        the batch to it.
         """
         if len(kv_cache_groups := self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None
-
-        num_tokens_padded = num_tokens_padded or num_tokens
-        num_reqs_padded = num_reqs_padded or num_reqs
 
         attn_metadata: PerLayerAttnMetadata = {}
 
@@ -1195,7 +1211,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         is_prefill = self.is_prefill
         layout = InputLayout(
             num_reqs=num_reqs,
-            num_reqs_padded=num_reqs if is_prefill else num_reqs_padded,
+            num_reqs_padded=num_reqs_padded,
             query_len=input_ids.shape[1],
             query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
         )
@@ -1421,21 +1437,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_scheduled_tokens_np,
             )
 
-            num_reqs_padded, num_tokens_padded, num_tokens_across_dp = (
-                self._determine_batch_padding(num_reqs, num_query_tokens)
+            batch_desc, _route, num_tokens_across_dp = self._resolve_batch_descriptor(
+                num_reqs, num_query_tokens
             )
-
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
 
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_query_tokens,
-                    num_tokens_padded=num_tokens_padded,
                     max_query_len=int(query_lengths.max()),
                     num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded,
+                    num_reqs_padded=batch_desc.num_reqs_padded,
                     logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
                 )
             )
 
@@ -1444,7 +1456,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 model_kwargs,
             ) = self._preprocess(
                 num_reqs,
-                num_reqs_padded,
+                batch_desc.num_reqs_padded,
                 num_query_tokens,
                 logits_indices,
                 intermediate_tensors,
@@ -1465,7 +1477,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.vllm_config,
                 num_tokens=num_query_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
-                num_padded_tokens=num_tokens_padded,
+                num_padded_tokens=batch_desc.num_tokens_padded,
                 **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
             ),
             record_function_or_nullcontext("rbln_model_runner: forward"),
@@ -2046,6 +2058,26 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         except IndexError:
             return {}
 
+    def _stage_dummy_seq_lens(
+        self, num_reqs: int, num_tokens_per_req: int, is_prefill: bool
+    ) -> tuple[np.ndarray, int]:
+        """Set seq_lens / num_tokens_no_spec for a dummy batch of this shape and
+        return (num_scheduled_tokens, num_tokens_unpadded). Shared by the initial
+        prep and the DP-idle adopt path so both size the dummy identically.
+
+        num_tokens_no_spec is the per-request no-spec logical length consumed
+        downstream (query backfill, spec metadata); for decode it stays 1 so a
+        multi-token speculative-decode query is still sized as decode.
+        """
+        num_scheduled_tokens = np.array([num_tokens_per_req] * num_reqs, dtype=np.int32)
+        self.seq_lens_np[:num_reqs] = num_scheduled_tokens
+        self.seq_lens_np[num_reqs:] = 0
+        if is_prefill:
+            self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
+        else:
+            self.input_batch.num_tokens_no_spec[:num_reqs] = 1
+        return num_scheduled_tokens, int(num_scheduled_tokens.sum())
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -2053,10 +2085,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_tokens_per_req: int,
         is_prefill: bool,
         *,
-        num_tokens_padded: int | None = None,
+        num_tokens_padded_override: int | None = None,
+        warmup: bool = True,
     ) -> None:
-        """
-        Run a dummy forward pass to warm up for the model.
+        """Run a dummy forward pass, in one of two modes.
+
+        warmup=True (default, compile-time): trigger compilation of the graph
+        for this (num_reqs, num_tokens_per_req) shape ahead of serving.
+
+        warmup=False (serving-time DP-idle step, execute_dummy_batch): this rank
+        has no real work. It must still join the cross-DP all-reduce so busy
+        peers don't hang, but must NOT drive the shape decision -- it contributes
+        a minimal num_reqs=1 entry (excluded from the shape decision via
+        is_idle), then adopts the busy-decided shape and runs the same compiled
+        graph the busy ranks run.
         """
         num_tokens = num_tokens_per_req * num_reqs
         assert num_tokens <= self.max_num_tokens
@@ -2066,27 +2108,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # this stops a prior real step's value leaking into a read.
         self.is_prefill = is_prefill
 
-        draft_num_tokens_padded = num_tokens_padded
+        is_idle = not warmup
 
-        num_scheduled_tokens_list = [num_tokens_per_req] * num_reqs
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
-        num_tokens_unpadded = int(num_scheduled_tokens.sum())
-
-        self.seq_lens_np[:num_reqs] = num_scheduled_tokens
-        self.seq_lens_np[num_reqs:] = 0
-
-        # NOTE(RBLN): num_tokens_no_spec is the per-request no-spec length used
-        # downstream (query backfill, spec metadata); keep it 1 for decode so a
-        # multi-token speculative query is still sized as decode.
-        if is_prefill:
-            self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
-        else:
-            self.input_batch.num_tokens_no_spec[:num_reqs] = 1
-
-        num_reqs_padded, _num_tokens_padded, num_tokens_across_dp = (
-            self._determine_batch_padding(num_reqs, num_tokens_unpadded)
+        # Decide before staging, then run on the descriptor alone: on the idle path
+        # the decided query length is the busy ranks' rather than this rank's own,
+        # so this rank runs their graph.
+        batch_desc, _route, num_tokens_across_dp = self._resolve_batch_descriptor(
+            num_reqs,
+            num_tokens,
+            is_idle,
+            pinned_num_tokens_padded=num_tokens_padded_override,
         )
-        num_tokens_padded = num_tokens_padded or _num_tokens_padded
+        query_len = batch_desc.query_len
+
+        num_scheduled_tokens, num_tokens = self._stage_dummy_seq_lens(
+            num_reqs, query_len, is_prefill
+        )
 
         cu_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
         self.query_start_loc_np[0] = 0
@@ -2094,57 +2131,56 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.query_start_loc_np[num_reqs + 1 :].fill(cu_num_tokens[-1])
 
         attn_metadata, _ = self._build_attention_metadata(
-            num_tokens=num_tokens_unpadded,
-            num_tokens_padded=num_tokens_padded,
-            max_query_len=num_tokens_per_req,
+            num_tokens=num_tokens,
+            max_query_len=query_len,
             num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            use_spec_decode=self.speculative_config is not None,
+            num_reqs_padded=batch_desc.num_reqs_padded,
         )
 
-        input_ids = self.input_ids[:num_tokens_unpadded]
+        input_ids = self.input_ids[:num_tokens]
         inputs_embeds = None
-        positions = self.positions[:num_tokens_unpadded]
+        positions = self.positions[:num_tokens]
         token_indices: torch.Tensor | None = None
         if self.use_wrapped_compute_logits and is_prefill:
             token_indices = torch.arange(
-                num_tokens_per_req - 1,
-                num_reqs * num_tokens_per_req,
-                num_tokens_per_req,
+                query_len - 1,
+                num_reqs * query_len,
+                query_len,
                 device=input_ids.device,
                 dtype=torch.int32,
             )
 
+        # The stager pads input_ids / positions but passes intermediate tensors
+        # through unpadded, so build PP intermediate tensors at the padded batch
+        # directly -- num_reqs alone undersizes them when a DP peer forces the
+        # bucket above this rank's count.
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
             intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                batch_size=num_tokens_unpadded,
+                batch_size=batch_desc.num_reqs_padded * query_len,
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
-            # Reshape by num_reqs, not num_reqs_padded: the tensor holds
-            # num_reqs * num_tokens_per_req rows (matching input_ids / InputLayout);
-            # the padded count would over-count leading dims and split the hidden.
             intermediate_tensors = IntermediateTensors(
                 {
-                    k: v.view(num_reqs, num_tokens_per_req, -1)
+                    k: v.view(batch_desc.num_reqs_padded, query_len, -1)
                     for k, v in intermediate_tensors.items()
                 }
             )
 
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
-            input_ids=input_ids.view(num_reqs, num_tokens_per_req),
-            positions=positions.view(num_reqs, num_tokens_per_req),
+            input_ids=input_ids.view(num_reqs, query_len),
+            positions=positions.view(num_reqs, query_len),
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=token_indices,
             layout=InputLayout(
                 num_reqs=num_reqs,
-                num_reqs_padded=(num_reqs if self.is_prefill else num_reqs_padded),
-                query_len=num_tokens_per_req,
-                query_len_padded=num_tokens_per_req,
+                num_reqs_padded=batch_desc.num_reqs_padded,
+                query_len=query_len,
+                query_len_padded=query_len,
             ),
         )
 
@@ -2153,20 +2189,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.vllm_config,
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
-            num_padded_tokens=num_tokens_padded,
+            num_padded_tokens=batch_desc.num_tokens_padded,
             **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
 
-        if isinstance(self.drafter, RBLNEagleProposer) and (
-            is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens
-        ):
-            self.drafter.dummy_run(
-                num_reqs,
-                num_tokens_per_req,
-                is_prefill,
-                num_padded_tokens=draft_num_tokens_padded,
-            )
+        if isinstance(self.drafter, RBLNEagleProposer):
+            if warmup:
+                # Compile the draft graph for this (bucket, query length).
+                if is_prefill or query_len == 1 + self.num_spec_tokens:
+                    self.drafter.dummy_run(
+                        num_reqs,
+                        query_len,
+                        is_prefill,
+                        num_padded_tokens=num_tokens_padded_override,
+                    )
+            else:
+                # DP-idle step: the draft agrees on its own shape across ranks and
+                # that collective counts every rank, so this one joins it (busy ranks
+                # wait inside propose()). Use the warmed decode length, not the
+                # adopted qlen, or the draft's first pass recompiles.
+                self.drafter.dummy_run(num_reqs, 1 + self.num_spec_tokens, False)
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
@@ -2869,46 +2912,56 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.kv_cache_view_infos,
             )
 
-    def _determine_batch_padding(
+    def _resolve_batch_descriptor(
         self,
-        num_reqs_unpadded: int,
-        num_tokens_unpadded: int,
-    ) -> tuple[int, int | None, torch.Tensor | None]:
-        is_prefill = self.is_prefill
-        num_reqs_padded = (
-            self.bucketing_manager.find_decode_batch_bucket(num_reqs_unpadded)
-            if not is_prefill
-            else num_reqs_unpadded
-        )
-        if self.parallel_config.data_parallel_size == 1:
-            return num_reqs_padded, None, None
+        num_reqs: int,
+        num_tokens: int,
+        is_idle: bool = False,
+        pinned_num_tokens_padded: int | None = None,
+    ) -> tuple[BatchDescriptor, BatchRoute, torch.Tensor | None]:
+        """This step's padded batch (see v1/worker/dp_utils.py).
 
-        num_tokens_across_dp, num_reqs_across_dp = (
-            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens_unpadded,
-                num_reqs_unpadded,
-                self.parallel_config.data_parallel_size,
-                self.parallel_config.data_parallel_rank,
-                is_prefill,
+        Under DP the ranks have to land on one batch, so the decision goes through
+        the collective; on a single rank there is nothing to agree with and no
+        per-rank token counts to publish.
+        """
+        dp_size = self.parallel_config.data_parallel_size
+        num_tokens_across_dp: torch.Tensor | None = None
+        if dp_size == 1:
+            batch_desc, route = decide_batch(
+                cfg=self._shape_config,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                is_prefill=self.is_prefill,
+                snapshot=None,
+                pinned_num_tokens_padded=pinned_num_tokens_padded,
             )
+        else:
+            batch_desc, route, num_tokens_across_dp = coordinate_batch_across_dp(
+                cfg=self._shape_config,
+                dp_size=dp_size,
+                dp_rank=self.parallel_config.data_parallel_rank,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                is_prefill=self.is_prefill,
+                is_idle=is_idle,
+                pinned_num_tokens_padded=pinned_num_tokens_padded,
+            )
+        logger.debug_once(
+            "RBLN batch: dp_rank=%d route=%s prefill=%d idle=%d "
+            "in=(num_reqs=%d query_len=%d) -> "
+            "(num_reqs_padded=%d query_len=%d num_tokens_padded=%s)",
+            self.parallel_config.data_parallel_rank,
+            route.value,
+            int(self.is_prefill),
+            int(is_idle),
+            num_reqs,
+            num_tokens // num_reqs,
+            batch_desc.num_reqs_padded,
+            batch_desc.query_len,
+            batch_desc.num_tokens_padded,
         )
-        num_tokens_padded = self.max_num_tokens
-        if self.specialized_moe_decode:
-            if num_reqs_across_dp is None:
-                # any_prefill (PD disaggregation): route padded-decode to the max
-                # bucket so only ONE padded-decode graph is ever needed.
-                num_reqs_padded = self.bucketing_manager.decode_batch_buckets[-1]
-            else:
-                num_reqs_padded = self.bucketing_manager.find_decode_batch_bucket(
-                    int(torch.max(num_reqs_across_dp).item())
-                )
-                assert num_reqs_padded is not None
-                assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
-                tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
-                max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
-                num_tokens_padded = num_reqs_padded * max_tokens_per_req
-
-        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
+        return batch_desc, route, num_tokens_across_dp
 
     def _update_kv_cache_base_bindings(
         self,
@@ -3046,19 +3099,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     self._dummy_run(num_req, query_len, False)
 
             if self.specialized_moe_decode:
-                # NOTE(RBLN): Compile decode graph with prefill-sized padding to cover
-                # the DP-asymmetric case (this rank decoding while another rank
-                # prefills). The bit-encoded all_reduce in get_dp_padding forces
-                # num_padded_tokens to max_num_tokens whenever any rank prefills,
-                # which the small-bucket decode graphs from 2. decode above cannot
-                # satisfy.
+                # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
+                # cover the DP-asymmetric case (this rank decoding while another
+                # rank prefills). Warm-up is symmetric, so it cannot reach those
+                # shapes on its own: it pins the token dimension the ANY_PREFILL
+                # and QLEN_ASYM routes would ask for, which the small-bucket decode
+                # graphs from 2. decode above cannot satisfy.
                 num_req = self.bucketing_manager.decode_batch_buckets[-1]
                 for query_len in query_lens:
                     self._dummy_run(
                         num_req,
                         query_len,
                         False,
-                        num_tokens_padded=self.max_num_tokens,
+                        num_tokens_padded_override=self.max_num_tokens,
                     )
                 if self.speculative_config:
                     # Cover DP-asymmetric decode where a peer runs spec decode.
@@ -3067,7 +3120,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         num_req,
                         1,
                         False,
-                        num_tokens_padded=num_req * spec_query_len,
+                        num_tokens_padded_override=num_req * spec_query_len,
                     )
 
             # 3. compute_logits
