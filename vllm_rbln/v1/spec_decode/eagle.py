@@ -62,6 +62,9 @@ class RBLNEagleProposer(EagleProposer):
 
         self.runner = runner
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
+        # Populated from the draft model in `load_model`. None means the draft
+        # head shares the target vocabulary, so `propose()` maps no ids.
+        self.draft_id_to_target_id: torch.Tensor | None = None
 
     def propose(
         self,
@@ -78,6 +81,8 @@ class RBLNEagleProposer(EagleProposer):
             assert isinstance(
                 self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
             )
+            # Eager. Only cheap with TORCH_RBLN_DEPLOY=ON, which turns off the
+            # per-op NaN/Inf scan that would walk this weight on every call.
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )
@@ -146,7 +151,9 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_tokens_ids = self._to_target_token_ids(
+                logits[:num_reqs].argmax(dim=-1)
+            )
             return draft_tokens_ids.view(-1, 1)
 
         assert token_indices_to_sample_padded is not None
@@ -154,7 +161,11 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample_padded.to(target_positions.device)
         ]
 
-        draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+        # `hidden_states` is deliberately not gathered here -- #821 moved
+        # that gather inside `model_wrapper`. Doing it again would index an
+        # already (num_reqs_padded, hidden_size) tensor with token-space
+        # indices and raise on the first decode.
+        draft_token_ids = self._to_target_token_ids(logits[:num_reqs].argmax(dim=-1))
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -187,9 +198,6 @@ class RBLNEagleProposer(EagleProposer):
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
         )
         for token_index in range(self.num_speculative_tokens - 1):
-            # Update the inputs
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax returns int64 by default.
             self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
             positions = positions.view(-1) + 1
             self.positions[:num_reqs] = positions[:num_reqs]
@@ -199,7 +207,6 @@ class RBLNEagleProposer(EagleProposer):
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            # Rebuild attention metadata
             per_layer_attn_metadata.clear()
             for attn_group in self.draft_attn_groups:
                 attn_metadata = attn_group.get_metadata_builder().build(
@@ -237,12 +244,31 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     token_indices_to_sample=None,
                 )
-            draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+            # Mapped before the feed-back above: the draft head's input
+            # embedding is in target space even when its output head is not.
+            draft_token_ids = self._to_target_token_ids(
+                logits[:num_reqs].argmax(dim=-1)
+            )
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
+
+    def _to_target_token_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+        """Map draft-vocabulary ids to target-vocabulary ids.
+
+        `d2t` holds offsets, not absolute ids -- upstream scatters at
+        `arange(draft_vocab_size) + d2t` -- hence `id + d2t[id]`. None means the
+        draft head already predicts the target vocabulary, so ids pass through.
+
+        Equivalent to upstream's scatter-then-argmax for a monotonic mapping:
+        both pick the same winner, and on an exact tie both pick the lowest id.
+        """
+        d2t = self.draft_id_to_target_id
+        if d2t is None:
+            return draft_token_ids
+        return draft_token_ids + d2t[draft_token_ids]
 
     def set_inputs_first_pass(
         self,
@@ -354,6 +380,8 @@ class RBLNEagleProposer(EagleProposer):
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
 
+        self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
+
         def model_wrapper(
             input_ids: torch.Tensor,
             positions: torch.Tensor,
@@ -380,7 +408,23 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states = hidden_states[token_indices_to_sample]
                 sample_hidden_states = sample_hidden_states[token_indices_to_sample]
 
-            logits = self.model.compute_logits(sample_hidden_states)
+            if self.draft_id_to_target_id is not None:
+                # NOTE(RBLN): upstream's `compute_logits` widens draft-vocab
+                # logits to the target vocabulary by scattering into an `-inf`
+                # row. Its index is input-independent, so the subgraph folds
+                # into an anonymous constant that weight-free apply cannot
+                # resolve by name; it then executes on placeholder indices and
+                # that out-of-bounds write is the SIGSEGV in KV warmup. Stay in
+                # draft-vocab space and map after the argmax instead
+                # (`_to_target_token_ids`) -- no per-model patch needed.
+                assert isinstance(
+                    self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
+                )
+                logits = self.model.logits_processor(
+                    self.model.lm_head, sample_hidden_states
+                )
+            else:
+                logits = self.model.compute_logits(sample_hidden_states)
 
             return hidden_states, logits
 
