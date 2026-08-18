@@ -269,9 +269,13 @@ class RBLNSampler(VLLMSampler):
             raw_logprobs = processed_logprobs
         # The int64 round-trip is dropped. The cost was the cast itself, not the
         # width: integer eager ops have no device kernel, so casting the sampled
-        # ids pulled them off the device every step. SamplerOutput takes whatever
-        # the sampling op returned - int32 from `rbln::top_k_top_p`, int64 from
-        # `rbln::argmax` - and gather_logprobs casts its own copy.
+        # ids pulled them off the device every step. SamplerOutput takes the
+        # sampling op's own dtype instead, and gather_logprobs casts its own copy.
+        #
+        # Both sampling ops return int32: `rbln::top_k_top_p` on rebel_compiler
+        # dev, `rbln::argmax` once rebel_compiler#12905 lands - until then an
+        # all-greedy batch (the path that reaches argmax) arrives as int64, which
+        # this code handles but does not depend on.
 
         if num_logprobs is None:
             logprobs_tensors = None
