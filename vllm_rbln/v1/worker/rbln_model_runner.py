@@ -220,10 +220,10 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             dtype=sampled_token_ids.dtype,
             device="cpu",
         )
-        # Logprobs ride the same deferral, dense form only: the topk form
-        # indexes by the sampled ids, which pulls the tokens to the host
-        # mid-step. sample_tokens rejects it under async rather than let it
-        # silently serialise the step.
+        # Logprobs ride the same deferral. Only the dense form is free of the
+        # tokens: the topk form indexes by the sampled ids, so building it pulls
+        # them to the host mid-step and serialises what async just decoupled.
+        # Nothing refuses that today - it costs speed, not correctness.
         self._logprobs_tensors = logprobs_tensors
 
         # The D2H is neither dispatched nor awaited here - both happen in
@@ -239,11 +239,12 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         enqueue_output); with UniProcExecutor it is called inline from
         AsyncOutputFuture.result().
 
-        Dispatching the copy from a non-main thread is only safe because rebel's
-        Stream state is mutex-guarded: VMemoryManager::DispatchFlatAsyncCopy
-        reads the dependency, submits and Records under
-        Stream::LockForDispatch(), so it cannot interleave with the main
-        thread's RuntimeInstance::Run.
+        The copy is therefore dispatched from a thread other than the one running
+        the model. Nothing in the rebel API documents that as supported, so read it
+        as an assumption this code rests on: that rebel serialises its own dispatch
+        well enough for VMemoryManager::DispatchFlatAsyncCopy to interleave with the
+        main thread's RuntimeInstance::Run. It has run clean, but a race need not
+        show up as a failure - start here if async-only token corruption reappears.
 
         inference_mode is re-entered for the copy: _sampled_token_ids_cpu was
         allocated in __init__ under sample_tokens' inference_mode, so it is an
@@ -1447,19 +1448,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # valid_sampled_token_ids is filled later by AsyncRBLNModelRunnerOutput.
             #
             # Logprobs ride along, deferred to get_output() like the tokens.
-            # Carried because the executor's native golden gate rides on the
-            # teacher-forced validation pass, which produces nothing without
-            # them. Building them is expensive, but both scheduling modes pay
-            # that equally (see the warning below); only the D2H is deferred.
+            # Carried rather than dropped: a request that asks for logprobs must
+            # get them under async too, or async silently answers a different
+            # question than sync. Building them is expensive, but both scheduling
+            # modes pay that equally (see the warning below); only the D2H moves.
             if logprobs_tensors is not None:
                 logger.warning_once(
-                    "logprobs cost about 22 ms of host CPU per step here - "
-                    "gather_logprobs indexes full vocab by the sampled ids and "
-                    "integer eager ops have no device kernel, so it runs on the "
-                    "host. Both scheduling modes pay it (async 38.3 vs sync 39.8 "
-                    "ms/step, against 17.1 and 18.9 without), so this is not a "
-                    "reason to turn async off - only a reason not to read decode "
-                    "timings off a run that asks for logprobs."
+                    "Requesting logprobs adds host CPU to every decode step: "
+                    "gather_logprobs indexes the full vocab by the sampled ids, "
+                    "and integer eager ops have no device kernel, so it runs on "
+                    "the host. Both scheduling modes pay it, so this is not a "
+                    "reason to turn async scheduling off - only a reason not to "
+                    "read decode timings off a run that asks for logprobs."
                 )
             self._async_logprobs_tensors = logprobs_tensors
             valid_sampled_token_ids = []
@@ -1641,12 +1641,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 #
                 # prev_sampled is referenced, not copied - it is a view of the
                 # sampler's 2-deep ring, read before this step's sample() writes
-                # the other slot. Copying it here waits on the sampler graph
-                # (13.5 ms/step).
+                # the other slot. Copying it here would wait on the sampler graph,
+                # which costs most of a decode step.
                 #
                 # Identity - every request present, same order - is the steady
                 # state; the slice copy there avoids building two index tensors
-                # from Python lists every step (2.2 ms of a 20.5 ms step).
+                # from Python lists every step, which measured about a tenth of a
+                # decode step on gpt-oss-120b at DP4/b8.
                 rows, dsts, identity = [], [], True
                 for j, r in enumerate(req_ids):
                     idx = prev_map.get(r)

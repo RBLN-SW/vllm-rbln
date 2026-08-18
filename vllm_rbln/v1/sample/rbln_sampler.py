@@ -267,10 +267,11 @@ class RBLNSampler(VLLMSampler):
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
-        # The int64 round-trip is dropped: integer eager ops have no device kernel,
-        # so it pulled the tokens off the device. `rbln::top_k_top_p` and
-        # `rbln::argmax` already return int32, which is what SamplerOutput wants;
-        # gather_logprobs casts its own copy.
+        # The int64 round-trip is dropped. The cost was the cast itself, not the
+        # width: integer eager ops have no device kernel, so casting the sampled
+        # ids pulled them off the device every step. SamplerOutput takes whatever
+        # the sampling op returned - int32 from `rbln::top_k_top_p`, int64 from
+        # `rbln::argmax` - and gather_logprobs casts its own copy.
 
         if num_logprobs is None:
             logprobs_tensors = None
