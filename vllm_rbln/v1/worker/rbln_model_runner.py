@@ -3016,24 +3016,32 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        use_runtime_kv_copy = (
+        if (
             not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
-        )
-        for op in copy_ops:
-            if use_runtime_kv_copy:
+        ):
+            # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
+            # in this path (VLLM_RBLN_USE_VLLM_MODEL).
+            for op in copy_ops:
                 runtime = self.runtime_holder[0]
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
-            else:
-                for kv_cache in self.kv_caches:
-                    src = op.src_block_id
-                    dst = op.dst_block_id
-                    nt = op.num_tokens
-                    if self.model_config.use_mla:
-                        kv_cache[dst, :nt, :] = kv_cache[src, :nt, :]
-                    else:
-                        kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+            return
+
+        dsts: list[torch.Tensor] = []
+        srcs: list[torch.Tensor] = []
+        for op in copy_ops:
+            src = op.src_block_id
+            dst = op.dst_block_id
+            nt = op.num_tokens
+            for kv_cache in self.kv_caches:
+                if self.model_config.use_mla:
+                    dsts.append(kv_cache[dst, :nt, :])
+                    srcs.append(kv_cache[src, :nt, :])
+                else:
+                    dsts.append(kv_cache[:, dst, :, :, :nt, :])
+                    srcs.append(kv_cache[:, src, :, :, :nt, :])
+        torch._foreach_copy_(dsts, srcs)
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
