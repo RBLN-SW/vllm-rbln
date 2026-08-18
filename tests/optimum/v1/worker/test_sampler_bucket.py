@@ -21,6 +21,7 @@ from .utils import (
     _schedule_cached_reqs,
     _schedule_new_request_from_request,
     create_model_runner,
+    fake_load_model,
     make_request,
 )
 
@@ -120,6 +121,37 @@ def _get_min_p_proc(runner) -> MinPLogitsProcessor:
         for p in runner.input_batch.logitsprocs.all
         if isinstance(p, MinPLogitsProcessor)
     )
+
+
+@pytest.mark.parametrize(
+    "num_seqs, expected_bucket_sizes",
+    [
+        pytest.param(1, [1], id="1_seq"),
+        pytest.param(2, [1, 2], id="2_seq"),
+        pytest.param(16, [1, 2, 4, 8, 16], id="16_seq"),
+        pytest.param(17, [1, 2, 4, 8, 16, 17], id="17_seq"),
+        pytest.param(61, [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 61], id="61_seq"),
+        # Powers of two to 16, then step 8 to 256, then step 16 to 512, and
+        # a non-bucket max_num_seqs is appended as its own final bucket.
+        pytest.param(
+            512,
+            [1, 2, 4, 8, *range(16, 257, 8), *range(272, 513, 16)],
+            id="512_seq",
+        ),
+        pytest.param(
+            515,
+            [1, 2, 4, 8, *range(16, 257, 8), *range(272, 513, 16), 515],
+            id="515_seq",
+        ),
+    ],
+)
+def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: list[int]):
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    runner = create_model_runner(max_num_seqs=num_seqs)
+    fake_load_model(runner)
+    bucket_sizes = runner.get_bucket_sizes(num_seqs)
+    assert bucket_sizes == expected_bucket_sizes
+    assert len(runner.pooled_tensors) == len(expected_bucket_sizes)
 
 
 def test_min_p_with_padded_bucket(make_runner):
