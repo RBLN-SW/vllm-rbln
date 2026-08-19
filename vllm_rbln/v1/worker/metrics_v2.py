@@ -76,6 +76,10 @@ class Metrics:
             "call_count": self.call_count,
             "mean_latency_ms": self.mean_latency_ms(),
             "latency_percentiles_ms": self.latency_percentiles_ms(),
+            # Raw per-step samples in recording order, so the JSON can answer
+            # distribution questions (first-step spikes, variance) that the
+            # summary stats above hide.
+            "latencies_ms": [lat * 1000.0 for lat in self.latencies],
         }
         timings = (
             ("mean_host_time_us", self.host_times),
@@ -86,6 +90,15 @@ class Metrics:
         for key, values in timings:
             if values:
                 stats[key] = _mean(values)
+        raw_timings = (
+            ("host_times_us", self.host_times),
+            ("device_times_us", self.device_times),
+            ("ccl_times_us", self.ccl_times),
+            ("prepare_times_us", self.prepare_times),
+        )
+        for key, values in raw_timings:
+            if values:
+                stats[key] = list(values)
         return stats
 
 
