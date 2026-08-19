@@ -1045,11 +1045,13 @@ class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
     _update_after_schedule nor _update_request_with_output, so both resolve to
     AsyncScheduler.
 
-    Nothing here holds the first step. Async can begin stepping before every
-    in-flight client request has been ingested from the EngineCore input queue,
-    so how many requests are admitted before the first prefill varies with IPC
-    timing, and with it whether a rank drops into decode while a peer is still
-    prefilling. A wall-clock hold used to paper that over; it guarded only the
-    cold start of an already-balanced request set, and the damage is done in the
-    runner's DP padding decision, not here. See docs/dp_phase_alignment.md.
+    Nothing here overrides anything: the class exists only to compose those two,
+    and the one method it used to add was a wall-clock hold on the first step.
+    That hold was meant to keep the DP ranks' prefill waves aligned, so that a
+    decode batch never shared a collective with a peer's prefill - the RBLN MoE
+    op does not return the same values for a row when the collective's padded
+    token count changes. It reached only one way of losing that alignment, and
+    unequal per-rank prompt counts, differing prefill chunk counts and
+    mid-generation arrivals all went past it. Removed; see the commit that did
+    it for the measurements.
     """
