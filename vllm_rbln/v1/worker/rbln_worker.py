@@ -61,7 +61,6 @@ from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
@@ -1214,21 +1213,12 @@ class RBLNWorker(WorkerBase):
         # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
         get_pp_group().send_tensor_dict(output.tensors)
 
-        # For PP with a KV connector, surface the connector output the
-        # model runner attached to the intermediate tensors so finished
-        # send/recv notifications still propagate from non-last ranks.
-        kv_connector_output = output.kv_connector_output
-        if not kv_connector_output:
-            return None
-        if (
-            not kv_connector_output.finished_sending
-            and not kv_connector_output.finished_recving
-        ):
-            return EMPTY_MODEL_RUNNER_OUTPUT
-
-        empty_output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
-        empty_output.kv_connector_output = kv_connector_output
-        return empty_output
+        # Non-last PP rank: the model runner already surfaces this rank's
+        # KV-connector output through the two-phase sample_tokens() path
+        # (mirroring the upstream model runner). The engine consumes this
+        # execute_model result only for error propagation, so return None
+        # rather than emitting the same finished send/recv notifications here.
+        return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
@@ -1312,7 +1302,6 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         self._release_offload_temp_storage()
-        self.model_runner.performance_ctx.print_stats()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

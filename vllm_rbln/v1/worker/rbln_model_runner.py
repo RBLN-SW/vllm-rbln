@@ -136,11 +136,6 @@ from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.metrics_v2 import (
-    PerformanceContext,
-    e2e_ends,
-    e2e_starts,
-)
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
     prepare_kernel_block_sizes,
@@ -446,8 +441,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             parallel_config.data_parallel_size > 1
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
-
-        self.performance_ctx = PerformanceContext("runner", self.runtime_holder)
 
         self.offload_context = nullcontext
         if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
@@ -1244,23 +1237,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        with self.performance_ctx.profile_sampler():
-            if spec_decode_metadata is None:
-                bucket = logits.shape[0]
-                num_reqs = self.input_batch.num_reqs
-                padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
-                out = self.sampler(
-                    logits=logits,
-                    sampling_metadata=padded_md,
-                )
-                return _depad_sampler_output(out, num_reqs)
-
-            return self.rejection_sampler(
-                spec_decode_metadata,
-                None,  # draft_probs
-                logits,
-                sampling_metadata,
+        if spec_decode_metadata is None:
+            bucket = logits.shape[0]
+            num_reqs = self.input_batch.num_reqs
+            padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
+            out = self.sampler(
+                logits=logits,
+                sampling_metadata=padded_md,
             )
+            return _depad_sampler_output(out, num_reqs)
+
+        return self.rejection_sampler(
+            spec_decode_metadata,
+            None,  # draft_probs
+            logits,
+            sampling_metadata,
+        )
 
     def _bookkeeping_sync(
         self,
@@ -1368,7 +1360,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_id_to_index_output_copy,
         )
 
-    @e2e_starts
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1482,7 +1473,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
-            self.performance_ctx.profile_model(self.is_prefill),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1526,7 +1516,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_connector_output = kv_connector_output
         return None
 
-    @e2e_ends
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
