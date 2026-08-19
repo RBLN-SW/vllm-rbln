@@ -619,8 +619,10 @@ class RBLNKVCacheManager(KVCacheManager):
         """Same finalization as ``free()`` on the deferred path.
 
         The scheduler takes this one when an in-flight step may still write the
-        blocks, so it holds them and returns them to the pool later. The request
-        is gone either way, so its sub-block state has to be settled here too.
+        blocks, so it holds them and returns them to the pool later. What settles
+        here is tied to the blocks leaving, not to the request ending: a preempted
+        request comes through too and goes back on the waiting queue, where the
+        state it needs is rebuilt from its tokens on resume.
         """
         self._finalize_sub_block_state(request)
         return super().pop_blocks_for_free(request)

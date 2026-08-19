@@ -636,7 +636,7 @@ class TestSubBlockIndexingFlow:
     def test_pop_blocks_for_free_settles_state_like_free(self):
         # The scheduler's other way out: it takes this one when an in-flight step
         # may still write the blocks, so it keeps them and returns them to the pool
-        # later. The request is gone all the same, so the sub-block state has to be
+        # later. The blocks leave either way, so the sub-block state has to be
         # settled here as free() settles it.
         manager = make_manager(8, 4, 10)
         req = make_request("0", list(range(8 + 4)), 8)
