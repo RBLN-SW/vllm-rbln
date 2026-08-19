@@ -183,6 +183,19 @@ def test_rejects_unknown_label_token():
         resolve_label_token_ids(_bare_config(["no", "nope"]))
 
 
+def test_rejects_seq_cls_arch_without_reranker_flags():
+    model_config = _model_config(is_original_qwen3_reranker=False)
+    with pytest.raises(ValueError, match="classifier_from_token"):
+        is_qwen3_reranker(model_config)
+
+
+def test_predicate_ignores_configs_without_the_arch():
+    # Without the arch override the checkpoint keeps Qwen3ForCausalLM and is
+    # served like any decoder model: no match, but no error either.
+    generate_route = ModelConfig(model=MODEL_ID, dtype=torch.float32, seed=42)
+    assert not is_qwen3_reranker(generate_route)
+
+
 def test_vllm_also_rejects_bad_classifier_from_token():
     """Belt and braces: with the arch override, vLLM catches it at config time."""
     with pytest.raises(Exception, match="Try loading the original Qwen3 Reranker"):

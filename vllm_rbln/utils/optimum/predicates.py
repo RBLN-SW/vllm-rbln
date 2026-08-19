@@ -45,27 +45,32 @@ def is_qwen3_embedding(model_config: "ModelConfig") -> bool:
 
 
 def is_qwen3_reranker(model_config: "ModelConfig") -> bool:
-    """Return True for the original Qwen3-Reranker loaded for ``score()``.
-
-    Keyed on ``classifier_from_token`` rather than the architecture name, so the
-    predicate still holds after the model runner has remapped the HF arch to
-    ``Qwen3Model`` for optimum-rbln. A checkpoint already converted offline to
-    sequence classification carries a real ``score`` layer and no
-    ``classifier_from_token``, so it does not match here.
+    """
+    Return True for the original Qwen3-Reranker loaded for ``score()``.
     """
     if model_config.runner_type != "pooling":
         return False
 
     hf_config = model_config.hf_config
     text_config = hf_config.get_text_config()
-    if not getattr(hf_config, "is_original_qwen3_reranker", False):
-        return False
-
     tokens: Sized | None = getattr(
         hf_config,
         "classifier_from_token",
         getattr(text_config, "classifier_from_token", None),
     )
-    if tokens is None:
-        return False
-    return len(tokens) == 2
+    has_reranker_flags = (
+        getattr(hf_config, "is_original_qwen3_reranker", False)
+        and tokens is not None
+        and len(tokens) == 2
+    )
+
+    architectures = getattr(hf_config, "architectures", None) or []
+    if "Qwen3ForSequenceClassification" in architectures and not has_reranker_flags:
+        raise ValueError(
+            "Serving Qwen3-Reranker through score() requires "
+            "classifier_from_token=['no', 'yes'] and "
+            "is_original_qwen3_reranker=True in hf_overrides, next to the "
+            "Qwen3ForSequenceClassification architecture. See "
+            "examples/optimum/pooling_models/qwen3_reranker_score_offline.py."
+        )
+    return has_reranker_flags
