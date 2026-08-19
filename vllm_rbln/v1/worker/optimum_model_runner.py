@@ -1206,20 +1206,47 @@ class RBLNOptimumModelRunner(
 
                 clear_reqs(input_batch)
 
-        for config in WARM_UP_CONFIGS:
-            logger.info("Running dummy sampler config: %s", config["name"])
+        # A budget that exactly covers what this loop compiles, so a recompile
+        # beyond it means the warm-up set has drifted from what the sampler
+        # specialises on — a bug worth failing on, while we are still warming up
+        # and not yet serving anyone.
+        warm_up_variants = len(self.bucket_sizes) * len(WARM_UP_CONFIGS)
+        saved_limit = torch._dynamo.config.recompile_limit
+        torch._dynamo.config.recompile_limit = warm_up_variants
+        torch._dynamo.config.fail_on_recompile_limit_hit = True
+        try:
+            for config in WARM_UP_CONFIGS:
+                logger.info("Running dummy sampler config: %s", config["name"])
 
-            set_sampling_tensors(
-                self.input_batch,
-                temperature=config["temperature"],
-                top_p=config.get("top_p"),
-                top_k=config.get("top_k"),
-                frequency_penalties=config.get("frequency_penalties"),
-                repetition_penalties=config.get("repetition_penalties"),
-                presence_penalties=config.get("presence_penalties"),
+                set_sampling_tensors(
+                    self.input_batch,
+                    temperature=config["temperature"],
+                    top_p=config.get("top_p"),
+                    top_k=config.get("top_k"),
+                    frequency_penalties=config.get("frequency_penalties"),
+                    repetition_penalties=config.get("repetition_penalties"),
+                    presence_penalties=config.get("presence_penalties"),
+                )
+
+                dummy_run_batches(config)
+        finally:
+            # Serving is a different question. A sampling combination the warm-up
+            # set does not cover must cost a compile, not the engine: restore the
+            # budget and let an overflow fall back to eager — slower, still
+            # correct, still serving.
+            torch._dynamo.config.recompile_limit = max(
+                saved_limit, 2 * warm_up_variants
             )
-
-            dummy_run_batches(config)
+            # Not restored to its previous value on purpose: torch defaults it to
+            # True, and that default is what turns an unanticipated sampling
+            # combination into a dead engine.
+            torch._dynamo.config.fail_on_recompile_limit_hit = False
+            logger.info(
+                "Sampler warm-up done: %d variants compiled, recompile_limit "
+                "restored to %d, overflow falls back to eager.",
+                warm_up_variants,
+                torch._dynamo.config.recompile_limit,
+            )
 
     def set_active_loras(self, input_batch: RBLNInputBatch, is_prefill: bool) -> None:
         num_reqs = self.input_batch.num_reqs
@@ -1477,9 +1504,6 @@ class RBLNOptimumModelRunner(
                     (bucket_size, self.model_config.get_vocab_size()),
                     dtype=self.model.dtype,
                 )
-        torch._dynamo.config.recompile_limit = len(self.bucket_sizes) * len(
-            WARM_UP_CONFIGS
-        )
         self.sampler = torch.compile(self.sampler, dynamic=False, fullgraph=False)
 
     @torch.inference_mode

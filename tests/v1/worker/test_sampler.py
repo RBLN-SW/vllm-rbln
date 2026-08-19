@@ -17,6 +17,8 @@ import torch
 from torch._dynamo.testing import CompileCounter
 from vllm.platforms import current_platform
 
+from vllm_rbln.v1.sample import WARM_UP_CONFIGS
+
 from .utils import (
     _schedule_cached_reqs,
     _schedule_new_request_from_request,
@@ -390,3 +392,36 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
         f"sampler recompiled across stride change: "
         f"{baseline_frames} -> {compile_counter.frame_count}"
     )
+
+
+@pytest.mark.parametrize("warm_up", [False, True], ids=["no_warm_up", "warm_up"])
+def test_recompile_budget_leaves_room_for_serving(monkeypatch, warm_up: bool):
+    """A sampling combination warm-up did not cover must cost a compile, not the engine.
+
+    `prepare_rbln_sampler` used to lower the process-global
+    `torch._dynamo.config.recompile_limit` to exactly the number of variants
+    warm-up compiles. Warm-up is opt-in, so in the default configuration the
+    budget was lowered and never restored, and with torch's
+    `fail_on_recompile_limit_hit` default of True the first unanticipated
+    combination raised `FailOnRecompileLimitHit` and took EngineCore with it —
+    observed on four served models whose request bodies were identical to
+    passing ones.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "1" if warm_up else "False")
+
+    before = torch._dynamo.config.recompile_limit
+    runner = create_model_runner(max_num_seqs=1)
+
+    warm_up_variants = len(runner.bucket_sizes) * len(WARM_UP_CONFIGS)
+    assert torch._dynamo.config.recompile_limit >= 2 * warm_up_variants, (
+        "serving must keep headroom over the warm-up variant count"
+    )
+    assert torch._dynamo.config.recompile_limit >= before, (
+        "the limit is process-global — lowering it caps every other compiled "
+        "function in the process too"
+    )
+    if warm_up:
+        assert not torch._dynamo.config.fail_on_recompile_limit_hit, (
+            "an overflow while serving must fall back to eager, not raise"
+        )
