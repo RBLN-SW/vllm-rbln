@@ -164,52 +164,55 @@ def _handshake(worker, sock, *, remote_tp_size=1, engine_id="eng"):
 
 
 class TestPpHandshakeFanout:
-    def test_single_stage_matches_base_shape(self):
-        # pp_size == 1: one shard queried, keyed by tp_rank (global_rank).
+    @pytest.mark.parametrize("pp_size", [1, 2, 3])
+    def test_every_stage_is_queried_once_and_keyed_by_global_rank(self, pp_size):
+        # The fan-out itself, from the degenerate single stage up. pp_size comes
+        # from the pp_rank-0 shard, which is why that one must not be queried
+        # again for its own registration -- and at pp_size 1 the whole thing has
+        # to reduce to the base's single-shard shape, keyed by tp_rank.
         w = _make_worker()
-        sock = _FakeSock(pp_size=1)
-        result = _handshake(w, sock)
-        assert result == {0: "agent-0"}
-        assert sock.queried == [0]  # bootstrap only
-        assert w.add_remote_agent.call_count == 1
-        assert dict(w._remote_shard_layer_names["eng"]) == {0: ("layer.0",)}
+        sock = _FakeSock(pp_size=pp_size)
 
-    def test_pp_fans_out_over_stages(self):
-        # pp_size == 2: both stages queried and registered by global_rank.
-        w = _make_worker()
-        sock = _FakeSock(pp_size=2)
         result = _handshake(w, sock)
-        assert result == {0: "agent-0", 1: "agent-1"}
-        # rank 0 bootstrap (reused), rank 1 queried once.
-        assert sock.queried == [0, 1]
-        ranks = sorted(c.args[1] for c in w.add_remote_agent.call_args_list)
-        assert ranks == [0, 1]
+
+        assert result == {r: f"agent-{r}" for r in range(pp_size)}
+        assert sock.queried == list(range(pp_size))
+        assert sock.queried.count(0) == 1  # bootstrap reused, not re-queried
+        assert w.add_remote_agent.call_count == pp_size
         assert dict(w._remote_shard_layer_names["eng"]) == {
-            0: ("layer.0",),
-            1: ("layer.1",),
+            r: (f"layer.{r}",) for r in range(pp_size)
         }
-        assert w._remote_pp_size["eng"] == 2
+        assert w._remote_pp_size["eng"] == pp_size
 
-    def test_bootstrap_reuses_first_query(self):
-        # The pp_rank-0 shard is queried exactly once (bootstrap reused).
+    @pytest.mark.parametrize(
+        ("local_band", "stage_layers"),
+        [
+            # Even split: this decode rank owns the second stage's single layer.
+            (["layer.1"], None),
+            # Uneven split (5 layers / 2 -> [3, 2]): this rank is the smaller last
+            # stage, so the peer stage is the LARGER one. Regression for the
+            # symmetric-uneven handshake crash: add_remote_agent indexes the local
+            # block_len_per_layer by the remote region position, so a larger
+            # non-overlapping peer must be skipped before it runs, not after.
+            (
+                ["layer.3", "layer.4"],
+                [["layer.0", "layer.1", "layer.2"], ["layer.3", "layer.4"]],
+            ),
+        ],
+        ids=["even", "uneven_larger_peer"],
+    )
+    def test_handshake_registers_only_overlapping_stages(
+        self, local_band, stage_layers
+    ):
+        # Of the two producer stages only the one this rank's band overlaps is
+        # handshaked and registered for reading. The other is skipped BEFORE
+        # add_remote_agent; its layer names are still recorded during enumeration.
         w = _make_worker()
-        sock = _FakeSock(pp_size=3)
-        _handshake(w, sock)
-        assert sock.queried == [0, 1, 2]
-        assert sock.queried.count(0) == 1
+        w.local_seen_layer_names = local_band
+        sock = _FakeSock(pp_size=2, stage_layers=stage_layers)
 
-    def test_handshake_registers_only_overlapping_stages(self):
-        # Decode-PP: this rank owns only layer.1, so of the two producer stages
-        # only stage 1 overlaps -> only it is handshaked (add_remote_agent) and
-        # registered for reading. The non-overlapping stage 0 is skipped BEFORE
-        # add_remote_agent so its base FA-remote build never runs (it would index
-        # the local block_len_per_layer out of range under an uneven split);
-        # its layer names are still recorded during enumeration.
-        w = _make_worker()
-        w.local_seen_layer_names = ["layer.1"]  # this decode rank's band
-        sock = _FakeSock(pp_size=2)
         result = _handshake(w, sock)
-        # Only the overlapping stage (1) is handshaked and read.
+
         assert result == {1: "agent-1"}
         assert [c.args[1] for c in w.add_remote_agent.call_args_list] == [1]
         assert set(w._remote_shard_layer_names["eng"]) == {0, 1}  # both enumerated
@@ -227,27 +230,6 @@ class TestPpHandshakeFanout:
         assert sorted(c.args[1] for c in w.add_remote_agent.call_args_list) == [0, 1]
         assert w._overlapping_ranks["eng"] == [0, 1]  # only owned stages read
         assert w._register_shard_read_state.call_count == 2
-
-    def test_symmetric_uneven_skips_larger_nonoverlapping_peer(self):
-        # Symmetric PP with an uneven layer split (e.g. 5 layers / 2 = [3, 2]):
-        # this decode rank is the *smaller* last stage and owns only its own
-        # layers. The peer producer stage is *larger* and does not overlap, so it
-        # must be skipped entirely -- add_remote_agent (and hence the base
-        # FA-remote build, which indexes the local block_len_per_layer by the
-        # remote region position) never runs on it. Regression for the
-        # symmetric-uneven PP4-PP4 handshake out-of-range crash.
-        w = _make_worker()
-        # stage 0 = 3 layers (larger), stage 1 = 2 layers (this rank, smaller).
-        stage_layers = [["layer.0", "layer.1", "layer.2"], ["layer.3", "layer.4"]]
-        w.local_seen_layer_names = ["layer.3", "layer.4"]  # this rank's own stage
-        sock = _FakeSock(pp_size=2, stage_layers=stage_layers)
-        result = _handshake(w, sock)
-        # Only this rank's own (overlapping) stage is handshaked/registered; the
-        # larger non-overlapping peer (stage 0) is skipped, not crashed.
-        assert result == {1: "agent-1"}
-        assert [c.args[1] for c in w.add_remote_agent.call_args_list] == [1]
-        assert w._overlapping_ranks["eng"] == [1]
-        assert w._register_shard_read_state.call_count == 1
 
     def test_partial_overlap_raises(self):
         # Prefill pipeline size not an integer multiple of the decode pipeline
@@ -352,15 +334,19 @@ class TestShardLocalRegions:
         with pytest.raises(AssertionError, match="not divisible"):
             w._regions_per_layer()
 
-    def test_shard_local_region_ids_kv_split(self):
-        # rpl=2: layer L -> regions [2L, 2L+1] (layer-major).
-        w = self._worker(["l0", "l1", "l2", "l3"], num_regions=8)
-        assert w._shard_local_region_ids(("l2", "l3")) == [4, 5, 6, 7]
-        assert w._shard_local_region_ids(("l0",)) == [0, 1]
-
-    def test_shard_local_region_ids_no_split(self):
-        w = self._worker(["l0", "l1", "l2", "l3"], num_regions=4)
-        assert w._shard_local_region_ids(("l1", "l2")) == [1, 2]
+    @pytest.mark.parametrize(
+        ("num_regions", "names", "expected"),
+        [
+            # rpl=2 (K/V split): layer L -> regions [2L, 2L+1], layer-major.
+            (8, ("l2", "l3"), [4, 5, 6, 7]),
+            (8, ("l0",), [0, 1]),
+            # rpl=1: the region index is the layer index.
+            (4, ("l1", "l2"), [1, 2]),
+        ],
+    )
+    def test_shard_local_region_ids(self, num_regions, names, expected):
+        w = self._worker(["l0", "l1", "l2", "l3"], num_regions=num_regions)
+        assert w._shard_local_region_ids(names) == expected
 
     @classmethod
     def _wired_worker(cls):
