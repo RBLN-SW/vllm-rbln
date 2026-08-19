@@ -1162,25 +1162,13 @@ class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
     """RBLNScheduler with async-scheduling (optimistic) semantics.
 
     Plain RBLNScheduler can't fill the engine's batch_queue: schedule(N+1)
-    sizes a running decode request as
-    num_tokens_with_spec + num_output_placeholders - num_computed_tokens,
-    which is <= 0 until update_from_output(N) appends N's real token. So the
-    next step (and its DP gloo all_reduce) only runs after step N's output --
-    serial, no overlap with forward(N)'s NPU work.
+    sizes a running decode request as num_tokens_with_spec +
+    num_output_placeholders - num_computed_tokens, which is <= 0 until
+    update_from_output(N) appends N's real token, so step N+1 and its DP gloo
+    all_reduce only run after step N's output. AsyncScheduler fixes this by
+    bumping num_output_placeholders at schedule time.
 
-    AsyncScheduler fixes this by bumping num_output_placeholders at schedule
-    time. Composed via MRO: RBLNAsyncScheduler -> RBLNScheduler ->
-    AsyncScheduler -> Scheduler. RBLNScheduler defines neither
-    _update_after_schedule nor _update_request_with_output, so both resolve to
-    AsyncScheduler.
-
-    Nothing here overrides anything: the class exists only to compose those two,
-    and the one method it used to add was a wall-clock hold on the first step.
-    That hold was meant to keep the DP ranks' prefill waves aligned, so that a
-    decode batch never shared a collective with a peer's prefill - the RBLN MoE
-    op does not return the same values for a row when the collective's padded
-    token count changes. It reached only one way of losing that alignment, and
-    unequal per-rank prompt counts, differing prefill chunk counts and
-    mid-generation arrivals all went past it. Removed; see the commit that did
-    it for the measurements.
+    Empty by design: RBLNScheduler defines neither _update_after_schedule nor
+    _update_request_with_output, so both resolve to AsyncScheduler via the MRO
+    RBLNAsyncScheduler -> RBLNScheduler -> AsyncScheduler -> Scheduler.
     """

@@ -37,6 +37,30 @@ _SAMPLING_EPS = 1e-3
 logger = init_logger(__name__)
 
 
+def _ring_copy(owner: nn.Module, out: torch.Tensor) -> torch.Tensor:
+    """Hand back a copy of `out`, alternating two buffers owned by `owner`.
+
+    Async scheduling holds the returned tensor past the step boundary, via
+    prev_sampled_token_ids and AsyncRBLNModelRunnerOutput. Holding the sampling
+    graph's own output there makes that graph's next launch block on the device --
+    measured 0.8ms -> 11.1ms inside the sampler call, host CPU unchanged, on
+    gpt-oss-120b at DP4/b8. Two slots, because the output thread reads one while
+    the next step writes the other.
+    """
+    ring = owner._tok_stage
+    if not ring or ring[0].shape != out.shape or ring[0].device != out.device:
+        ring = [
+            torch.empty(out.shape, dtype=out.dtype, device=out.device) for _ in range(2)
+        ]
+        owner._tok_stage = ring
+        owner._tok_slot = 0
+    buf = ring[owner._tok_slot]
+    owner._tok_slot ^= 1
+    # non_blocking, or the copy waits on the sampling graph.
+    buf.copy_(out, non_blocking=True)
+    return buf
+
+
 def rbln_top_k_top_p_sample(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -114,6 +138,9 @@ class RBLNTopKTopPSampler(nn.Module):
         self._compiled_rbln_topk_topp_sampler = compile_sampler(
             rbln_top_k_top_p_sample, compile_context
         )
+        # Staging buffers for the sampled tokens; see _ring_copy.
+        self._tok_stage: list[torch.Tensor] = []
+        self._tok_slot = 0
 
     def forward(
         self,
@@ -133,7 +160,8 @@ class RBLNTopKTopPSampler(nn.Module):
                 "per-request generators. Ignoring generators."
             )
 
-        return self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p), None
+        out = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
+        return _ring_copy(self, out), None
 
 
 class RBLNSampler(VLLMSampler):
@@ -166,31 +194,12 @@ class RBLNSampler(VLLMSampler):
         self._compiled_greedy_sample = compile_sampler(
             rbln_greedy_sample, compile_context
         )
-        # Staging buffers for the sampled tokens; see greedy_sample.
+        # Staging buffers for the sampled tokens; see _ring_copy.
         self._tok_stage: list[torch.Tensor] = []
         self._tok_slot = 0
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        # Copy the dense (B,) out so the graph output dies at once and keeps its
-        # address; a changed one re-patches the command stream every step.
-        # non_blocking, or the copy waits on argmax.
-        #
-        # Two buffers alternating: async scheduling hands the returned view to the
-        # output thread and keeps stepping, so one buffer would be overwritten
-        # before those tokens were read.
-        out = self._compiled_greedy_sample(logits)
-        ring = self._tok_stage
-        if not ring or ring[0].shape != out.shape or ring[0].device != out.device:
-            ring = [
-                torch.empty(out.shape, dtype=out.dtype, device=out.device)
-                for _ in range(2)
-            ]
-            self._tok_stage = ring
-            self._tok_slot = 0
-        buf = ring[self._tok_slot]
-        self._tok_slot ^= 1
-        buf.copy_(out, non_blocking=True)
-        return buf
+        return _ring_copy(self, self._compiled_greedy_sample(logits))
 
     def sample(
         self,
