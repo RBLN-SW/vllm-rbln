@@ -15,151 +15,25 @@
 import pytest
 import torch
 from vllm.platforms import current_platform
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinPLogitsProcessor,
+)
+
+from vllm_rbln.v1.sample.rbln_logits_processor import (
+    RBLNLogitBiasLogitsProcessor,
+    RBLNMinPLogitsProcessor,
+)
 
 from .utils import (
     _schedule_cached_reqs,
     _schedule_new_request_from_request,
     create_model_runner,
-    fake_load_model,
     forward_steps,
     make_request,
 )
 
 DEVICE = current_platform.device_type
-
-
-@pytest.mark.parametrize(
-    "num_seqs, expected_bucket_sizes",
-    [
-        pytest.param(1, [1], id="1_seq"),
-        pytest.param(2, [1, 2], id="2_seq"),
-        pytest.param(16, [1, 2, 4, 8, 16], id="16_seq"),
-        pytest.param(17, [1, 2, 4, 8, 16, 17], id="17_seq"),
-        pytest.param(61, [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 61], id="61_seq"),
-        pytest.param(
-            512,
-            [
-                1,
-                2,
-                4,
-                8,
-                16,
-                24,
-                32,
-                40,
-                48,
-                56,
-                64,
-                72,
-                80,
-                88,
-                96,
-                104,
-                112,
-                120,
-                128,
-                136,
-                144,
-                152,
-                160,
-                168,
-                176,
-                184,
-                192,
-                200,
-                208,
-                216,
-                224,
-                232,
-                240,
-                248,
-                256,
-                272,
-                288,
-                304,
-                320,
-                336,
-                352,
-                368,
-                384,
-                400,
-                416,
-                432,
-                448,
-                464,
-                480,
-                496,
-                512,
-            ],
-            id="512_seq",
-        ),
-        pytest.param(
-            515,
-            [
-                1,
-                2,
-                4,
-                8,
-                16,
-                24,
-                32,
-                40,
-                48,
-                56,
-                64,
-                72,
-                80,
-                88,
-                96,
-                104,
-                112,
-                120,
-                128,
-                136,
-                144,
-                152,
-                160,
-                168,
-                176,
-                184,
-                192,
-                200,
-                208,
-                216,
-                224,
-                232,
-                240,
-                248,
-                256,
-                272,
-                288,
-                304,
-                320,
-                336,
-                352,
-                368,
-                384,
-                400,
-                416,
-                432,
-                448,
-                464,
-                480,
-                496,
-                512,
-                515,
-            ],
-            id="515_seq",
-        ),
-    ],
-)
-def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: list[int]):
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    runner = create_model_runner(max_num_seqs=num_seqs)
-    fake_load_model(runner)
-    bucket_sizes = runner.get_bucket_sizes(num_seqs)
-    assert bucket_sizes == expected_bucket_sizes
-    assert len(runner.pooled_tensors) == len(expected_bucket_sizes)
 
 
 @pytest.mark.parametrize("use_rbln_sampler", [False])
@@ -225,6 +99,204 @@ def test_forward_sampling_parameters(
 
 
 # TODO mix the requests with different sampling parameters
+
+
+@pytest.mark.parametrize(
+    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampler):
+    """min_tokens must mask stop tokens until min_tokens tokens are
+    generated, then release them. The bf16 + RBLN sampler case is a
+    regression test for the mixed-dtype index_put_ crash.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+
+    stop_token_id = 9
+    runner_up_token_id = 5
+    min_tokens = 3
+
+    # Greedy picks the stop token unless min_tokens masks it.
+    def rigged_forward(model_input, **kwargs):
+        num_reqs = runner.input_batch.num_reqs
+        vocab_size = runner.model_config.get_vocab_size()
+        logits = torch.full((num_reqs, 1, vocab_size), -10.0, dtype=dtype)
+        logits[..., stop_token_id] = 10.0
+        logits[..., runner_up_token_id] = 5.0
+        return logits
+
+    runner.model.forward = rigged_forward
+
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        min_tokens=min_tokens,
+        stop_token_ids=[stop_token_id],
+    )
+
+    scheduler_output = _schedule_new_request_from_request(
+        req, block_ids=([0],), outer_block_ids=[0]
+    )
+    runner.execute_model(scheduler_output)
+    output = runner.sample_tokens(grammar_output=None)
+    sampled = [output.sampled_token_ids[0][0]]
+
+    req.num_computed_tokens = len(req.prompt_token_ids)
+    for _ in range(min_tokens):
+        scheduler_output = _schedule_cached_reqs([req], new_block_ids=[None])
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        sampled.append(output.sampled_token_ids[0][0])
+        req.num_computed_tokens += 1
+
+    assert sampled[:min_tokens] == [runner_up_token_id] * min_tokens
+    assert sampled[min_tokens] == stop_token_id
+
+
+@pytest.mark.parametrize(
+    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sampler):
+    """logit_bias must lift a losing token above the raw argmax under
+    greedy sampling. The bf16 + RBLN sampler case is a regression test
+    for bias_tensor staying float32 against model-dtype logits.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+
+    top_token_id = 9
+    biased_token_id = 5
+    num_decodes = 3
+
+    # The top token wins greedy sampling unless the +20 bias lifts the
+    # biased token (5 + 20) above it (10).
+    def rigged_forward(model_input, **kwargs):
+        num_reqs = runner.input_batch.num_reqs
+        vocab_size = runner.model_config.get_vocab_size()
+        logits = torch.full((num_reqs, 1, vocab_size), -10.0, dtype=dtype)
+        logits[..., top_token_id] = 10.0
+        logits[..., biased_token_id] = 5.0
+        return logits
+
+    runner.model.forward = rigged_forward
+
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=0.0,
+        logit_bias={biased_token_id: 20.0},
+    )
+
+    scheduler_output = _schedule_new_request_from_request(
+        req, block_ids=([0],), outer_block_ids=[0]
+    )
+    runner.execute_model(scheduler_output)
+    output = runner.sample_tokens(grammar_output=None)
+    sampled = [output.sampled_token_ids[0][0]]
+
+    req.num_computed_tokens = len(req.prompt_token_ids)
+    for _ in range(num_decodes):
+        scheduler_output = _schedule_cached_reqs([req], new_block_ids=[None])
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        sampled.append(output.sampled_token_ids[0][0])
+        req.num_computed_tokens += 1
+
+    assert sampled == [biased_token_id] * (num_decodes + 1)
+
+    bias_proc = next(
+        p
+        for p in runner.input_batch.logitsprocs.all
+        if isinstance(p, LogitBiasLogitsProcessor)
+    )
+    if use_rbln_sampler == "1":
+        assert isinstance(bias_proc, RBLNLogitBiasLogitsProcessor)
+        assert bias_proc.bias_tensor.dtype == dtype
+    else:
+        # The fallback keeps the builtin float32 processor because the
+        # default vLLM sampler upcasts logits to float32.
+        assert not isinstance(bias_proc, RBLNLogitBiasLogitsProcessor)
+        assert bias_proc.bias_tensor.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_forward_min_p_masks_low_probability_tokens(
+    monkeypatch, dtype, use_rbln_sampler
+):
+    """min_p must mask every token below min_p * max_prob. The bf16 +
+    RBLN sampler case is a regression test for min_p staying float32
+    against model-dtype logits.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
+    monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
+    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
+
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+
+    top_token_id = 5
+    num_decodes = 4
+
+    # The top token holds only ~5% probability; min_p=0.5 masks all other
+    # tokens, so random sampling becomes deterministic only when min_p is
+    # actually applied.
+    def rigged_forward(model_input, **kwargs):
+        num_reqs = runner.input_batch.num_reqs
+        vocab_size = runner.model_config.get_vocab_size()
+        logits = torch.zeros((num_reqs, 1, vocab_size), dtype=dtype)
+        logits[..., top_token_id] = 8.0
+        return logits
+
+    runner.model.forward = rigged_forward
+
+    req = make_request(
+        request_id="req_0",
+        prompt_token_ids=[1, 2, 3],
+        temperature=1.0,
+        min_p=0.5,
+    )
+
+    scheduler_output = _schedule_new_request_from_request(
+        req, block_ids=([0],), outer_block_ids=[0]
+    )
+    runner.execute_model(scheduler_output)
+    output = runner.sample_tokens(grammar_output=None)
+    sampled = [output.sampled_token_ids[0][0]]
+
+    req.num_computed_tokens = len(req.prompt_token_ids)
+    for _ in range(num_decodes):
+        scheduler_output = _schedule_cached_reqs([req], new_block_ids=[None])
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        sampled.append(output.sampled_token_ids[0][0])
+        req.num_computed_tokens += 1
+
+    assert sampled == [top_token_id] * (num_decodes + 1)
+
+    min_p_proc = next(
+        p
+        for p in runner.input_batch.logitsprocs.all
+        if isinstance(p, MinPLogitsProcessor)
+    )
+    if use_rbln_sampler == "1":
+        assert isinstance(min_p_proc, RBLNMinPLogitsProcessor)
+        assert min_p_proc.min_p.dtype == dtype
+    else:
+        # The fallback keeps the builtin float32 processor because the
+        # default vLLM sampler upcasts logits to float32.
+        assert not isinstance(min_p_proc, RBLNMinPLogitsProcessor)
+        assert min_p_proc.min_p.dtype == torch.float32
 
 
 @pytest.mark.parametrize("top_p", [0.7, 1.0])

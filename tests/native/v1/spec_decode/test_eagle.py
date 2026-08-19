@@ -43,10 +43,11 @@ def _neutralize(monkeypatch):
     )
 
 
-def _wire_runner(proposer, *, num_reqs, is_prefill):
+def _wire_runner(proposer, *, num_reqs):
     proposer.runner = SimpleNamespace(
+        # propose runs in the decode phase, which is the step phase it reads.
+        is_prefill=False,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
-        is_prefill=is_prefill,
         kv_caches=[],
         kv_cache_bases=[],
         kv_cache_view_infos=[],
@@ -345,7 +346,7 @@ class TestPropose:
         # per-request argmax, shaped [num_reqs, 1].
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=1)
-        _wire_runner(proposer, num_reqs=2, is_prefill=True)
+        _wire_runner(proposer, num_reqs=2)
         proposer.model_executable = _fake_model_exec([42, 60], proposer.hidden_size)
 
         out = _call_propose(proposer)
@@ -357,7 +358,7 @@ class TestPropose:
         # columns prove the loop feeds outputs forward (a broken one repeats).
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)
-        _wire_runner(proposer, num_reqs=2, is_prefill=True)
+        _wire_runner(proposer, num_reqs=2)
         proposer.model_executable = _echo_model_exec(proposer.hidden_size)
 
         out = proposer.propose(
@@ -378,7 +379,7 @@ class TestPropose:
         # still running and feeding drafts forward is observable here.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=2)
-        _wire_runner(proposer, num_reqs=1, is_prefill=False)
+        _wire_runner(proposer, num_reqs=1)
         proposer.max_model_len = 3  # positions hit the cap on the second step
         proposer.model_executable = _echo_model_exec(proposer.hidden_size)
 
@@ -399,7 +400,7 @@ class TestPropose:
         # a mismatch fails before any draft pass.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle3", num_speculative_tokens=1)
-        _wire_runner(proposer, num_reqs=2, is_prefill=True)
+        _wire_runner(proposer, num_reqs=2)
 
         class _FakeEagle3(Eagle3LlamaForCausalLM):
             def __init__(self, combined):
@@ -501,6 +502,7 @@ class TestDummyRun:
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         proposer.runner = SimpleNamespace(
+            is_prefill=False,
             input_batch=SimpleNamespace(
                 num_reqs=2,
                 block_table=[
@@ -548,6 +550,7 @@ class TestDummyRun:
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=2)
         proposer.runner = SimpleNamespace(
+            is_prefill=False,
             input_batch=SimpleNamespace(
                 num_reqs=2,
                 block_table=[
@@ -591,6 +594,7 @@ class TestBuildDummyAttnMetadata:
     def test_computes_cumsum_and_shapes(self):
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         proposer.runner = SimpleNamespace(
+            is_prefill=False,
             input_batch=SimpleNamespace(
                 block_table=[
                     SimpleNamespace(

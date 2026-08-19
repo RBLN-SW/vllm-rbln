@@ -43,6 +43,9 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
@@ -373,8 +376,13 @@ class RBLNWorker(WorkerBase):
 
         return available_memory_estimate
 
-    def get_kv_connector_handshake_metadata(self) -> dict | None:
-        """Get KV connector metadata from this worker if available."""
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
+        """Get KV connector metadata from this worker if available.
+
+        Returned dict is keyed by ``(pp_rank, tp_rank)``.
+        """
 
         if not has_kv_transfer_group():
             return None
@@ -385,8 +393,9 @@ class RBLNWorker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
 
+        pp_rank = get_pp_group().rank_in_group
         tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
@@ -607,6 +616,7 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
+        self._release_offload_temp_storage()
         self.model_runner.performance_ctx.print_stats()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
@@ -614,6 +624,19 @@ class RBLNWorker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
+
+    def _release_offload_temp_storage(self) -> None:
+        # The runtime drops the offload dir on teardown, but that runs last and vLLM
+        # SIGKILLs a worker seconds after asking it to stop, so reclaim up front.
+        if not has_torch_rbln:
+            return
+        try:
+            num_removed = torch.rbln.release_offload_temp_storage()
+        except Exception:
+            logger.exception("Failed to release RBLN offload temp storage")
+            return
+        if num_removed:
+            logger.info("Released %d RBLN offload temp file(s)", num_removed)
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
