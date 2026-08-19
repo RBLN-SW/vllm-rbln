@@ -26,10 +26,6 @@ from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm_rbln.v1.sample.rbln_logits_processor import (
-    RBLNMinTokensLogitsProcessor,
-    build_rbln_logitsprocs,
-)
 
 from vllm_rbln.v1.sample.rbln_logits_processor import (
     RBLNMinTokensLogitsProcessor,

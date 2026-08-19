@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -672,6 +673,47 @@ class RBLNEagleProposer(EagleProposer):
 
         if self.num_speculative_tokens == 1:
             return
+
+        # Warm the chained region here rather than letting it compile on the
+        # first decode. A graph that reaches the compile cache after warmup
+        # does not survive a reload: its const buffer indices were handed out
+        # against a different allocation than the one the cache records, and
+        # the next server start raises INIT_INTERNAL.
+        chain_metas: list[object] = [per_layer_attn_metadata]
+        chain_cad = copy.copy(common_attn_metadata)
+        for _ in range(1, self.num_speculative_tokens):
+            chain_cad.seq_lens = chain_cad.seq_lens + 1
+            md: dict[str, object] = {}
+            for attn_group in self.draft_attn_groups:
+                am = attn_group.get_metadata_builder().build(
+                    common_attn_metadata=chain_cad,
+                    positions=self.positions[:num_tokens],
+                    is_prefill=False,
+                    batch_pad=num_reqs_padded,
+                )
+                attach_kv_cache_bindings(
+                    am,
+                    self.runner.kv_caches,
+                    self.runner.kv_cache_bases,
+                    self.runner.kv_cache_view_infos,
+                )
+                for layer_name in attn_group.layer_names:
+                    md[layer_name] = am
+            chain_metas.append(md)
+        with set_forward_context(
+            chain_metas,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            num_padded_tokens=num_padded_tokens,
+            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+        ):
+            _ = self.chain_executable(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+                token_indices_to_sample=token_indices_to_sample_padded,
+            )
 
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
