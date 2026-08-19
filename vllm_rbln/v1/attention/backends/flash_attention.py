@@ -384,45 +384,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             self.sinks is None
         )
 
-    def _kv_quantize_scales(
-        self, layer: torch.nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the static fp8 KV-cache scales for this layer.
-
-        vLLM's ``Attention.__init__`` unconditionally registers the
-        ``_k_scale``/``_v_scale`` buffers (via ``set_default_quant_scales``) and
-        fills them during ``process_weights_after_loading``. Their shape encodes
-        the quantization granularity:
-
-        * scalar ``()`` or ``[1]`` -> per-tensor: a single scale for the whole
-          KV tensor (the 1.0 default, or a compressed-tensors per-tensor scheme).
-        * ``[num_kv_heads]`` -> per-head: compressed-tensors ``attn_head``
-          strategy stores one scale per (TP-local) KV head
-          (``_k_scale = layer.k_scale`` of shape ``torch.ones(num_kv_heads)``).
-
-        We flatten to the ``[1]`` (per-tensor) / ``[num_kv_heads]`` (per-head)
-        layout the compiled RBLN custom op expects; the op routes on the KV
-        cache dtype and the scale length. Weights are fully loaded by the time
-        ``forward`` runs, so the values are final here. The per-head head order
-        matches q/k/v (both are the TP-local ``n_kv_heads`` axis).
-        """
-        return (
-            self._normalize_kv_scale(layer._k_scale),
-            self._normalize_kv_scale(layer._v_scale),
-        )
-
-    def _normalize_kv_scale(self, scale: torch.Tensor) -> torch.Tensor:
-        """Flatten a KV scale buffer to [1] (per-tensor) or [num_kv_heads]."""
-        scale = scale.reshape(-1).to(device=self.device, dtype=torch.float32)
-        numel = scale.numel()
-        if numel not in (1, self.num_kv_heads):
-            raise ValueError(
-                "RBLNFlashAttention expects a per-tensor (len 1) or per-head "
-                f"(len num_kv_heads={self.num_kv_heads}) fp8 KV scale, "
-                f"got length {numel}."
-            )
-        return scale
-
     def forward(
         self,
         layer: torch.nn.Module,
@@ -575,7 +536,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 #   original sequence index
                 # * otherwise         - seq_lens[B, P] == seq_lens_tensor,
                 #   dynamic size for each partition
-                k_quantize_scale, v_quantize_scale = self._kv_quantize_scales(layer)
+                # Raw per-layer fp8 KV scales; the compiled op's converter
+                # normalizes their shape and rejects unsupported (per-head)
+                # layouts (rebel_compiler#12946).
+                k_quantize_scale = layer._k_scale
+                v_quantize_scale = layer._v_scale
                 cache_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
                 if attn_metadata.is_prefill:
                     attn_output = flash_causal_attention_naive_prefill(
