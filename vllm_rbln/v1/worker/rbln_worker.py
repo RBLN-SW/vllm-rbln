@@ -617,7 +617,6 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         self._release_offload_temp_storage()
-        self.model_runner.performance_ctx.print_stats()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

@@ -32,6 +32,7 @@ from . import (
     fp8_moe_method,
     gpt_oss,
     gpt_oss_mxfp4_config,
+    metrics,
     minimax_m2,
     mla,
     models_utils,
