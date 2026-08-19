@@ -130,6 +130,18 @@ _WHY = (
 
 _CACHE_PARTITION_SIZE = 1024
 _DFLASH_CONTEXT_KV_MAX_RUN_LEN = 506
+_DFLASH_CONTEXT_KV_DECODE_BUCKET = 8
+
+
+def _context_kv_bucket_size(run_len: int) -> int:
+    if not 1 <= run_len <= _DFLASH_CONTEXT_KV_MAX_RUN_LEN:
+        raise ValueError(
+            "DFlash projection run length must be in "
+            f"[1, {_DFLASH_CONTEXT_KV_MAX_RUN_LEN}], got {run_len}"
+        )
+    if run_len <= _DFLASH_CONTEXT_KV_DECODE_BUCKET:
+        return _DFLASH_CONTEXT_KV_DECODE_BUCKET
+    return _DFLASH_CONTEXT_KV_MAX_RUN_LEN
 
 
 # The third parameter of `precompute_and_store_context_kv` is upstream's
@@ -572,7 +584,7 @@ def _apply_rope(k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 class _ContextKVPrecompute:
-    """Owns exact-length projection graphs and native cache copies."""
+    """Owns bounded projection graphs and native cache copies."""
 
     def __init__(self, model) -> None:
         self._model = model
@@ -718,9 +730,10 @@ class _ContextKVPrecompute:
         # Keep each projection graph layer-local. Multi-layer stateful stores
         # violate Machine dependency constraints, while these cache-free graphs
         # can coexist safely and never change a KV physical view.
-        key = (layer_idx, run_len, self._model._fused_kv_bias is not None)
+        profile_len = _context_kv_bucket_size(run_len)
+        key = (layer_idx, profile_len, self._model._fused_kv_bias is not None)
         if key not in self._graphs:
-            fn = self._graph_fn(layer_idx, run_len)
+            fn = self._graph_fn(layer_idx, profile_len)
             if not envs.VLLM_RBLN_COMPILE_MODEL:
                 self._graphs[key] = fn
             else:
@@ -748,25 +761,26 @@ class _ContextKVPrecompute:
     def _get_run_inputs(
         self, run_len: int, dtype: torch.dtype, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Stable device addresses for exact-length context and RoPE slices."""
-        key = (run_len, dtype, device)
+        """Stable device addresses for the verified decode/prefill buckets."""
+        profile_len = _context_kv_bucket_size(run_len)
+        key = (profile_len, dtype, device)
         cached = self._run_inputs.get(key)
         if cached is None:
             cached = (
-                torch.empty(
-                    run_len,
+                torch.zeros(
+                    profile_len,
                     self._model._fused_kv_weight.shape[-1],
                     dtype=dtype,
                     device=device,
                 ),
-                torch.empty(
-                    run_len,
+                torch.zeros(
+                    profile_len,
                     self._model._head_dim,
                     dtype=dtype,
                     device=device,
                 ),
-                torch.empty(
-                    run_len,
+                torch.zeros(
+                    profile_len,
                     self._model._head_dim,
                     dtype=dtype,
                     device=device,
@@ -839,6 +853,8 @@ class _ContextKVPrecompute:
         layers_by_group: dict[int, list[int]] = {}
         for layer_idx, group_id in self._layer_group.items():
             layers_by_group.setdefault(group_id, []).append(layer_idx)
+        for layer_indices in layers_by_group.values():
+            layer_indices.sort()
 
         for group_id, runs in self._group_runs.items():
             layer_indices = layers_by_group.get(group_id, [])
@@ -854,9 +870,16 @@ class _ContextKVPrecompute:
                 state_input, cos_input, sin_input = self._get_run_inputs(
                     run.token_count, context_states.dtype, context_states.device
                 )
-                state_input.copy_(context_states[token_slice])
-                cos_input.copy_(cos[token_slice])
-                sin_input.copy_(sin[token_slice])
+                profile_len = state_input.shape[0]
+                input_slice = slice(0, run.token_count)
+                state_input[input_slice].copy_(context_states[token_slice])
+                cos_input[input_slice].copy_(cos[token_slice])
+                sin_input[input_slice].copy_(sin[token_slice])
+                expected_output_shape = (
+                    m._num_kv_heads,
+                    profile_len,
+                    m._head_dim,
+                )
                 projected: list[tuple[torch.Tensor, torch.Tensor]] = []
                 for layer_idx in layer_indices:
                     cache = m._attn_layers[layer_idx].kv_cache
@@ -867,11 +890,30 @@ class _ContextKVPrecompute:
                         )
                     graph = self._get_graph(layer_idx, run.token_count)
                     output = graph(state_input, cos_input, sin_input)
-                    if not isinstance(output, (tuple, list)) or len(output) != 2:
+                    if (
+                        not isinstance(output, (tuple, list))
+                        or len(output) != 2
+                        or not all(
+                            isinstance(tensor, torch.Tensor) for tensor in output
+                        )
+                    ):
                         raise RuntimeError(
                             "DFlash context projection graph must return K and V"
                         )
-                    projected.append((output[0], output[1]))
+                    if any(
+                        tuple(tensor.shape) != expected_output_shape
+                        for tensor in output
+                    ):
+                        raise RuntimeError(
+                            "DFlash context projection output shape does not match "
+                            "its profile"
+                        )
+                    projected.append(
+                        (
+                            output[0][:, input_slice, :],
+                            output[1][:, input_slice, :],
+                        )
+                    )
                 self._store_projected_kv(layer_indices, run, projected)
 
 

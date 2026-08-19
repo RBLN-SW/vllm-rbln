@@ -21,11 +21,68 @@ from vllm_rbln.v1.attention.ops.triton_flash_attention_naive import (
 )
 from vllm_rbln.v1.spec_decode.dflash import (
     RBLNDFlashProposer,
+    _BoundedHiddenStateCombiner,
     _dflash_page_crossing_mask,
     _DFlashSplitForwardGraph,
     _empty_drafts_for_page_crossing,
     _get_dflash_forward_split,
 )
+
+
+def test_hidden_state_combiner_reuses_two_stable_input_profiles() -> None:
+    calls: list[tuple[torch.Size, int]] = []
+
+    def combine(inputs: torch.Tensor) -> torch.Tensor:
+        calls.append((inputs.shape, inputs.data_ptr()))
+        return inputs[:, :3] * 2
+
+    helper = _BoundedHiddenStateCombiner(combine)
+    outputs = [
+        helper(torch.full((run_len, 6), float(run_len)))
+        for run_len in (3, 8, 111, 506, 3, 111)
+    ]
+
+    assert [shape for shape, _ in calls] == [
+        torch.Size([8, 6]),
+        torch.Size([8, 6]),
+        torch.Size([512, 6]),
+        torch.Size([512, 6]),
+        torch.Size([8, 6]),
+        torch.Size([512, 6]),
+    ]
+    assert len({pointer for _, pointer in calls[:2] + calls[4:5]}) == 1
+    assert len({pointer for _, pointer in calls[2:4] + calls[5:]}) == 1
+    assert calls[0][1] != calls[2][1]
+    for run_len, output in zip((3, 8, 111, 506, 3, 111), outputs):
+        assert output.shape == (run_len, 3)
+        torch.testing.assert_close(
+            output, torch.full((run_len, 3), float(run_len * 2))
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_len", "bucket_len"), [(1, 8), (8, 8), (9, 512), (512, 512)]
+)
+def test_hidden_state_combiner_bucket_boundaries(
+    run_len: int, bucket_len: int
+) -> None:
+    observed_shapes: list[torch.Size] = []
+
+    def combine(inputs: torch.Tensor) -> torch.Tensor:
+        observed_shapes.append(inputs.shape)
+        return inputs
+
+    _BoundedHiddenStateCombiner(combine)(torch.empty(run_len, 4))
+
+    assert observed_shapes == [torch.Size([bucket_len, 4])]
+
+
+@pytest.mark.parametrize("run_len", [0, 513])
+def test_hidden_state_combiner_rejects_unverified_lengths(run_len: int) -> None:
+    helper = _BoundedHiddenStateCombiner(lambda inputs: inputs)
+
+    with pytest.raises(ValueError, match="combine run length"):
+        helper(torch.empty(run_len, 4))
 
 
 def test_apply_rope_broadcasts_over_kv_heads() -> None:
@@ -39,23 +96,62 @@ def test_apply_rope_broadcasts_over_kv_heads() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_projection_runtime_buffers_are_exact_length_and_stable() -> None:
+def test_projection_runtime_buffers_use_two_stable_buckets() -> None:
     model = SimpleNamespace(
         _fused_kv_weight=torch.empty(16, 32),
         _head_dim=4,
     )
     helper = _ContextKVPrecompute(model)
 
-    first_inputs = helper._get_run_inputs(8, torch.bfloat16, torch.device("cpu"))
-    repeated_inputs = helper._get_run_inputs(8, torch.bfloat16, torch.device("cpu"))
-    tail_inputs = helper._get_run_inputs(506, torch.bfloat16, torch.device("cpu"))
-
-    assert tuple(t.data_ptr() for t in first_inputs) == tuple(
-        t.data_ptr() for t in repeated_inputs
+    decode_inputs = helper._get_run_inputs(3, torch.bfloat16, torch.device("cpu"))
+    decode_max_inputs = helper._get_run_inputs(
+        8, torch.bfloat16, torch.device("cpu")
     )
-    assert first_inputs[0].shape[0] == 8
+    tail_inputs = helper._get_run_inputs(111, torch.bfloat16, torch.device("cpu"))
+    prefill_max_inputs = helper._get_run_inputs(
+        506, torch.bfloat16, torch.device("cpu")
+    )
+
+    assert tuple(t.data_ptr() for t in decode_inputs) == tuple(
+        t.data_ptr() for t in decode_max_inputs
+    )
+    assert tuple(t.data_ptr() for t in tail_inputs) == tuple(
+        t.data_ptr() for t in prefill_max_inputs
+    )
+    assert decode_inputs[0].shape[0] == 8
     assert tail_inputs[0].shape[0] == 506
-    assert first_inputs[0].data_ptr() != tail_inputs[0].data_ptr()
+    assert decode_inputs[0].data_ptr() != tail_inputs[0].data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("run_len", "bucket_len"), [(1, 8), (8, 8), (9, 506), (506, 506)]
+)
+def test_projection_runtime_bucket_boundaries(
+    run_len: int, bucket_len: int
+) -> None:
+    model = SimpleNamespace(
+        _fused_kv_weight=torch.empty(16, 32),
+        _head_dim=4,
+    )
+    helper = _ContextKVPrecompute(model)
+
+    inputs = helper._get_run_inputs(run_len, torch.bfloat16, torch.device("cpu"))
+
+    assert inputs[0].shape[0] == bucket_len
+
+
+@pytest.mark.parametrize("run_len", [0, 507])
+def test_projection_runtime_rejects_lengths_outside_verified_buckets(
+    run_len: int,
+) -> None:
+    model = SimpleNamespace(
+        _fused_kv_weight=torch.empty(16, 32),
+        _head_dim=4,
+    )
+    helper = _ContextKVPrecompute(model)
+
+    with pytest.raises(ValueError, match="projection run length"):
+        helper._get_run_inputs(run_len, torch.bfloat16, torch.device("cpu"))
 
 
 def test_context_kv_compiles_projection_only_runtime_per_layer_without_disk_cache(
@@ -83,11 +179,15 @@ def test_context_kv_compiles_projection_only_runtime_per_layer_without_disk_cach
 
     layer0_decode = helper._get_graph(0, 1)
     layer0_decode_again = helper._get_graph(0, 1)
+    layer0_decode_max = helper._get_graph(0, 8)
+    layer0_tail = helper._get_graph(0, 111)
     layer0_prefill = helper._get_graph(0, 506)
     layer1_decode = helper._get_graph(1, 1)
     layer1_prefill = helper._get_graph(1, 506)
 
     assert layer0_decode is layer0_decode_again
+    assert layer0_decode is layer0_decode_max
+    assert layer0_tail is layer0_prefill
     assert layer0_decode is not layer0_prefill
     assert layer0_decode is not layer1_decode
     assert layer0_prefill is not layer1_prefill
@@ -97,7 +197,7 @@ def test_context_kv_compiles_projection_only_runtime_per_layer_without_disk_cach
     assert all(call["use_cache"] is False for call in compile_calls)
 
 
-def test_context_kv_gives_exact_profiles_unique_dynamo_frames(
+def test_context_kv_gives_bounded_profiles_unique_dynamo_frames(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     num_layers = 5
@@ -121,12 +221,13 @@ def test_context_kv_gives_exact_profiles_unique_dynamo_frames(
     monkeypatch.setattr(qwen3_dflash_patch.envs, "VLLM_RBLN_COMPILE_MODEL", True)
     monkeypatch.setattr(qwen3_dflash_patch, "rbln_compile", fake_compile)
 
-    for run_len in (1, 8, 111, 506):
-        for layer_idx in range(num_layers):
+    for layer_idx in range(num_layers):
+        for run_len in (1, 8, 111, 506):
             helper._get_graph(layer_idx, run_len)
 
-    assert len(code_objects) == 20
-    assert len({id(code) for code in code_objects}) == 20
+    assert len(code_objects) == 2 * num_layers
+    assert len({id(code) for code in code_objects}) == 2 * num_layers
+    assert helper._graphs.keys() == helper._runtime_holders.keys()
 
 
 def test_dflash_scheduler_disables_only_eagle_cache_drop(
@@ -516,7 +617,7 @@ def test_context_kv_store_uses_one_batched_copy_and_preserves_sentinels(
         assert torch.count_nonzero(cache[:, 2, :, 0, 12:, :] != 7.5) == 0
 
 
-def test_context_kv_run_uses_exact_shape_and_preserves_sentinels(
+def test_context_kv_run_uses_bucket_shape_and_stores_only_real_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     num_heads, head_dim, hidden_size, run_len = 2, 4, 8, 3
@@ -540,8 +641,11 @@ def test_context_kv_run_uses_exact_shape_and_preserves_sentinels(
 
     def projection_graph(*inputs: torch.Tensor):
         graph_input_shapes.append(tuple(tensor.shape for tensor in inputs))
-        output = torch.arange(num_heads * run_len * head_dim, dtype=torch.float32).view(
-            num_heads, run_len, head_dim
+        bucket_len = inputs[0].shape[0]
+        output = torch.arange(
+            num_heads * bucket_len * head_dim, dtype=torch.float32
+        ).view(
+            num_heads, bucket_len, head_dim
         )
         return output, output + 1
 
@@ -555,14 +659,14 @@ def test_context_kv_run_uses_exact_shape_and_preserves_sentinels(
 
     assert graph_input_shapes == [
         (
-            torch.Size([run_len, hidden_size]),
-            torch.Size([run_len, head_dim]),
-            torch.Size([run_len, head_dim]),
+            torch.Size([8, hidden_size]),
+            torch.Size([8, head_dim]),
+            torch.Size([8, head_dim]),
         )
     ]
-    expected = torch.arange(num_heads * run_len * head_dim, dtype=torch.float32).view(
-        num_heads, run_len, head_dim
-    )
+    expected = torch.arange(num_heads * 8 * head_dim, dtype=torch.float32).view(
+        num_heads, 8, head_dim
+    )[:, :run_len]
     torch.testing.assert_close(cache[0, 1, :, 0, 5:8, :], expected)
     torch.testing.assert_close(cache[1, 1, :, 0, 5:8, :], expected + 1)
     assert torch.count_nonzero(cache[:, 1, :, 0, :5, :] != 7.5) == 0
@@ -913,6 +1017,9 @@ def test_scheduler_batch_resolves_request_and_physical_block_runs() -> None:
     proposer = SimpleNamespace(
         runner=SimpleNamespace(cache_config=SimpleNamespace(block_size=1024)),
         _dflash_num_context=21,
+        _context_positions_cpu_buffer=torch.cat(
+            (torch.arange(1020, 1028), torch.arange(31, 44))
+        ),
     )
     cad = SimpleNamespace(
         num_reqs=2,
@@ -938,6 +1045,34 @@ def test_scheduler_batch_resolves_request_and_physical_block_runs() -> None:
         _ContextKVRun(8, 13, 8, 31, 0),
     )
     assert layer_group == {layer_idx: 0 for layer_idx in range(5)}
+
+
+def test_rejected_draft_padding_keeps_actual_context_publication_positions() -> None:
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(cache_config=SimpleNamespace(block_size=1024)),
+        _dflash_num_context=8,
+        _context_positions_cpu_buffer=torch.tensor(
+            [78, 79, 80, 81, 82, 83, 84, 85], dtype=torch.int64
+        ),
+    )
+    cad = SimpleNamespace(
+        num_reqs=1,
+        query_start_loc_cpu=torch.tensor([0, 8], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([80], dtype=torch.int32),
+        block_table_tensor=torch.tensor([[1, 2, 3]], dtype=torch.int32),
+    )
+    group = SimpleNamespace(layer_names=[f"layer.{i}" for i in range(5)])
+    metadata = SimpleNamespace(local_block_tables=None, cache_seq_lens=None)
+
+    group_slots, layer_group, request_ids = RBLNDFlashProposer._resolve_group_slots(
+        proposer, [(group, metadata)], cad
+    )
+    helper = _ContextKVPrecompute(
+        SimpleNamespace(_fused_kv_weight=torch.empty(16, 32), _head_dim=4)
+    )
+    helper.set_group_slots(group_slots, layer_group, request_ids)
+
+    assert helper._group_runs[0] == (_ContextKVRun(0, 8, 1, 78, 0),)
 
 
 @pytest.mark.parametrize(
@@ -970,6 +1105,7 @@ def test_scheduler_repeated_prefill_chunks_keep_absolute_cache_offsets(
     proposer = SimpleNamespace(
         runner=SimpleNamespace(cache_config=SimpleNamespace(block_size=1024)),
         _dflash_num_context=chunk_len,
+        _context_positions_cpu_buffer=torch.arange(seq_len - chunk_len, seq_len),
     )
     cad = SimpleNamespace(
         num_reqs=1,

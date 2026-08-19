@@ -82,6 +82,19 @@ logger = init_logger(__name__)
 # with `mask_dims.at(i) == input_dims.at(i) not satisfied`. EAGLE's own unrolled
 # path pins the same constant for the same reason.
 _DRAFT_IS_PREFILL = False
+_DFLASH_COMBINE_DECODE_BUCKET = 8
+_DFLASH_COMBINE_PREFILL_BUCKET = 512
+
+
+def _combine_hidden_states_bucket_size(run_len: int) -> int:
+    if not 1 <= run_len <= _DFLASH_COMBINE_PREFILL_BUCKET:
+        raise ValueError(
+            "DFlash combine run length must be in "
+            f"[1, {_DFLASH_COMBINE_PREFILL_BUCKET}], got {run_len}"
+        )
+    if run_len <= _DFLASH_COMBINE_DECODE_BUCKET:
+        return _DFLASH_COMBINE_DECODE_BUCKET
+    return _DFLASH_COMBINE_PREFILL_BUCKET
 
 
 def _get_dflash_forward_split(layer_types: list[str]) -> int | None:
@@ -147,6 +160,56 @@ def _empty_drafts_for_page_crossing(
     return [[] for _ in crossing_list]
 
 
+class _BoundedHiddenStateCombiner:
+    """Run the auxiliary-state FC through two stable input profiles.
+
+    MiniMax supplies six target hidden states concatenated on the feature axis.
+    ``combine_hidden_states`` projects those rows back to the drafter width, but
+    its eager RBLN dispatch otherwise creates a runtime profile for every exact
+    context length. Reuse one 8-row decode profile and the scheduler's 512-row
+    prefill profile, then expose only the logical prefix to its consumer. The
+    following context-KV planner independently splits that prefix at 506 rows.
+
+    The FC is row-wise, so stale padded rows cannot affect the returned prefix.
+    Keeping the staging tensors alive also makes their device addresses stable
+    across requests without changing the compiled graph or FC implementation.
+    """
+
+    def __init__(self, combine) -> None:
+        self._combine = combine
+        self._inputs: dict[
+            tuple[int, int, torch.dtype, torch.device], torch.Tensor
+        ] = {}
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.ndim != 2:
+            raise ValueError("DFlash auxiliary hidden states must be two-dimensional")
+        run_len, width = hidden_states.shape
+        bucket_len = _combine_hidden_states_bucket_size(run_len)
+        key = (bucket_len, width, hidden_states.dtype, hidden_states.device)
+        inputs = self._inputs.get(key)
+        if inputs is None:
+            inputs = torch.zeros(
+                bucket_len,
+                width,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            self._inputs[key] = inputs
+        inputs[:run_len].copy_(hidden_states)
+        output = self._combine(inputs)
+        if not isinstance(output, torch.Tensor) or output.ndim != 2:
+            raise RuntimeError(
+                "DFlash hidden-state combiner must return a two-dimensional tensor"
+            )
+        if output.shape[0] != bucket_len:
+            raise RuntimeError(
+                "DFlash hidden-state combiner returned an unexpected row count: "
+                f"expected {bucket_len}, got {output.shape[0]}"
+            )
+        return output[:run_len]
+
+
 class _DFlashSplitForwardGraph:
     """Join independently compiled SWA and full-attention graph regions."""
 
@@ -184,13 +247,16 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         # buffers stay tiny compared with EAGLE3's.
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
 
-        # Filled by set_inputs_first_pass. Upstream's fused Triton kernel also
-        # emits a context slot mapping; here the equivalent coordinates are
-        # recomputed in `_resolve_group_slots` from the block table, because
-        # `cad.slot_mapping` is a 0-dim dummy on this stack and carries nothing
-        # (DFLASH-PORT-DESIGN.md section 17).
+        # Filled by set_inputs_first_pass. Upstream's fused Triton kernel uses
+        # the original target positions both for RoPE and for the context slot
+        # mapping. Keep a host copy for `_resolve_group_slots`: after rejection,
+        # `cad.seq_lens` is intentionally rewound for the next draft query and
+        # can no longer reconstruct the scheduled target rows' positions.
         self._context_positions_buffer = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
+        )
+        self._context_positions_cpu_buffer = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device="cpu"
         )
 
         # MUST stay None. The base class allocates this in
@@ -207,6 +273,7 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         # build_model_inputs_first_pass.
         self._dflash_num_context = 0
         self._dflash_hidden_states: torch.Tensor | None = None
+        self._hidden_state_combiner: _BoundedHiddenStateCombiner | None = None
 
     # ------------------------------------------------------------------
     # Draft model configuration
@@ -565,6 +632,9 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         """
         super(RBLNEagleProposer, self).load_model(target_model)
         self._probe_dp_rendezvous_need()
+        self._hidden_state_combiner = _BoundedHiddenStateCombiner(
+            self.model.combine_hidden_states,
+        )
 
         def sample_hidden_states(
             hidden_states: torch.Tensor,
@@ -817,8 +887,10 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         # would rotate every context key to position 0 -- no crash, just a
         # drafter that proposes noise.
         num_context = self._dflash_num_context
+        context_positions = target_positions[:num_context]
+        self._context_positions_cpu_buffer[:num_context].copy_(context_positions)
         self._context_positions_buffer[:num_context].copy_(
-            target_positions[:num_context]
+            self._context_positions_cpu_buffer[:num_context]
         )
 
         # Query ids: [bonus, mask, mask, ...] per request.
@@ -912,14 +984,14 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         num_context = self._dflash_num_context
         num_reqs = cad.num_reqs
 
-        # Per-context-token request id, and the token's absolute position.
+        # Per-context-token request id, and the token's original absolute
+        # position. This mirrors upstream copy_and_expand_dflash_inputs_kernel,
+        # which uses target_positions for both RoPE and context slot mapping.
         qsl = cad.query_start_loc_cpu[: num_reqs + 1].to(torch.int64)
         counts = qsl[1:] - qsl[:-1]
         req_of = torch.repeat_interleave(torch.arange(num_reqs), counts)
         within = torch.arange(num_context) - qsl[:-1][req_of]
-        seq_lens = cad._seq_lens_cpu[:num_reqs].to(torch.int64)
-        # The scheduled tokens are the tail of each request's sequence.
-        positions = seq_lens[req_of] - counts[req_of] + within
+        positions = self._context_positions_cpu_buffer[:num_context].to(torch.int64)
 
         block_table = cad.block_table_tensor
         max_blocks = block_table.shape[-1]
@@ -1057,8 +1129,9 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         # six target layers concatenated to 18432 features, while the drafter's
         # RMSNorm and KV projections consume 3072. Upstream keeps this FC out of
         # ``precompute_and_store_context_kv``; retain that contract here.
+        assert self._hidden_state_combiner is not None
         self.model.precompute_and_store_context_kv(
-            self.model.combine_hidden_states(self._dflash_hidden_states),
+            self._hidden_state_combiner(self._dflash_hidden_states),
             self._context_positions_buffer[: self._dflash_num_context],
             WRITE_CONTEXT_KV,
         )
