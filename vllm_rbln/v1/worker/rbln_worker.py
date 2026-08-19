@@ -74,7 +74,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.worker.kv_profile import (
     MERGED_PROFILE_LOG_KEY,
     assert_budget_covers_profile,
@@ -100,12 +99,9 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
-# Blocks the KV cache is shrunk to for the compile: a trace hint for the
-# mark_dynamic'd dim, not a capacity. Smaller is strictly better -- it narrows the
-# window where the estimate is not above it and the run is refused, and TP>=2 is
-# charged the retained compile-time cache per block. But 2-block artifacts abort
-# on device during the warm-up prefill (SYS_TASK_ABORTED) once
-# max_num_batched_tokens grows; 4 is the smallest value measured safe.
+# Trace hint for the mark_dynamic'd KV dim, not a capacity, so it cannot be
+# derived from max_model_len/block_size. 2-block artifacts abort on device
+# (SYS_TASK_ABORTED) at larger max_num_batched_tokens; 4 is the measured floor.
 COMPILE_KV_CACHE_NUM_BLOCKS = 4
 # Held back from every chiplet's budget for device memory no profile region
 # describes. Measured at 41,968,576 B, rounded up; costs no blocks in practice.
@@ -177,8 +173,6 @@ class RBLNWorker(WorkerBase):
         self._rbln_host_threads_before_compile_ready = False
         self._rbln_cpu_affinity_applied = False
 
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            self._assert_dynamic_kv_model_supported()
         # num_blocks vLLM sized the cache with, stashed while it is shrunk for
         # the compile. None when no shrink is pending.
         self._kv_blocks_before_shrink: int | None = None
@@ -508,9 +502,6 @@ class RBLNWorker(WorkerBase):
 
         dynamic_kv = envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
         if dynamic_kv:
-            self._assert_dynamic_kv_compiler_support()
-            self._assert_dynamic_kv_scheduler_handoff_installed()
-            self._assert_dynamic_kv_transfer_absent()
             self._assert_dynamic_kv_attention_layout()
 
         self.model_runner.initialize_kv_cache(
@@ -538,7 +529,6 @@ class RBLNWorker(WorkerBase):
         The cache allocated here is what `warmup_model()` traces, so its
         `num_blocks` becomes the hint of the `mark_dynamic`'d dim.
         """
-        compile_num_blocks = COMPILE_KV_CACHE_NUM_BLOCKS
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             return kv_cache_config
         skip_reason = self._compile_and_warmup_skip_reason()
@@ -562,6 +552,7 @@ class RBLNWorker(WorkerBase):
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
+        compile_num_blocks = COMPILE_KV_CACHE_NUM_BLOCKS
         if compile_num_blocks >= kv_cache_config.num_blocks:
             # Cancelling the shrink cancels the resize too, so serving on would
             # leave the run on the pre-compile estimate -- #42 reproducing
@@ -583,99 +574,13 @@ class RBLNWorker(WorkerBase):
         )
         return shrunk
 
-    def _assert_dynamic_kv_scheduler_handoff_installed(self) -> None:
-        """Guard: nothing may shrink the KV cache unless something will resize it.
-
-        Both rpcs are only ever driven by the `EngineCore._initialize_kv_caches`
-        patch.
-        """
-        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
-                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
-            )
-
-        from vllm.v1.engine.core import EngineCore
-
-        from vllm_rbln.patches.dynamic_kv import patched_initialize_kv_caches
-
-        if EngineCore._initialize_kv_caches is not patched_initialize_kv_caches:
-            raise RuntimeError(
-                "the EngineCore._initialize_kv_caches patch is not installed, so "
-                "nothing would resize the KV cache or re-announce the count."
-            )
-
-    def _assert_dynamic_kv_compiler_support(self) -> None:
-        """Guard: the installed rebel-compiler must carry the #10678 API.
-
-        Both symbols are reached only after the compile and warm-up, so probing
-        them up front saves an older compiler a full compile before it dies.
-        """
-        try:
-            from rebel.kv_cache import max_num_blocks  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs rebel.kv_cache.max_num_blocks "
-                f"(rebel_compiler #10678): {exc}"
-            ) from exc
-
-        try:
-            from rebel.sync_runtime import DynamoRuntime
-        except ImportError:
-            # The class moved or is not importable here; the per-runtime type
-            # check in _assert_dynamo_runtimes still covers the real objects.
-            return
-        # Defined on BaseRuntime, which DynamoRuntime inherits from.
-        if not hasattr(DynamoRuntime, "reset_adaptive_buffers"):
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs "
-                "DynamoRuntime.reset_adaptive_buffers (rebel_compiler #10678)."
-            )
-
-    def _assert_dynamic_kv_transfer_absent(self) -> None:
-        """Guard: a KV connector and dynamic KV cannot be combined."""
-        # NOTE(RBLN): `finalize_kv_cache_registrations` hands the connector the
-        # KV cache's physical views during warm-up; the resize frees them.
-        if has_kv_transfer_group():
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
-                "transfer connector; the resize invalidates its registrations."
-            )
-
-    def _assert_dynamic_kv_model_supported(self) -> None:
-        """Guard: reject the shapes the dynamic path cannot size.
-
-        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
-        Configurations".
-        """
-        # NOTE(RBLN): must run in `__init__`, not beside the other dynamic-KV
-        # guards -- vLLM loads the model first, and for spec decode that load
-        # already compiles the drafter (`RBLNEagleProposer.load_model`).
-        if self.model_config.use_mla:
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
-                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
-            )
-
-        if self.vllm_config.speculative_config is not None:
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
-                "decoding; the merged profiles cannot be attributed per artifact."
-            )
-
-        if not USE_DEVICE_TENSOR:
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
-                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
-                "no dynamic KV dimension."
-            )
-
     def _assert_dynamic_kv_attention_layout(self) -> None:
         """Guard: every attention layer must dispatch to the paged-causal kernel.
 
         i.e. `sliding_window is None`, `is_causal` True and `is_normal` False;
-        `is_normal` becomes True when `block_size == max_model_len`. Reads only
-        `vllm_config`, so it can run before the shrink.
+        `is_normal` becomes True when `block_size == max_model_len`. Lives in
+        the worker, not platform config validation: `get_layers_from_vllm_config`
+        reads `static_forward_context`, which only the model build fills.
         """
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         offenders: list[str] = []
@@ -896,8 +801,6 @@ class RBLNWorker(WorkerBase):
         across ranks and hands it back through `apply_dynamic_kv_num_blocks`.
         None means the path is not in play.
         """
-        if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            return None
         if self.cache_config.num_gpu_blocks_override is not None:
             logger.info(
                 "[Dynamic KV] --num-gpu-blocks-override=%d is set; leaving the "
@@ -1041,9 +944,6 @@ class RBLNWorker(WorkerBase):
         `n` is None when no usable count was computed; the pre-shrink number is
         put back then, or the server would serve from the tiny compile cache.
         """
-        if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            return None
-
         before_shrink = self._kv_blocks_before_shrink
         target = before_shrink if n is None else n
         if target is None:
