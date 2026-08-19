@@ -76,9 +76,7 @@ def _rig_forward(runner, token_logits: dict[int, float], base: float = 0.0):
     def rigged_forward(model_input, **kwargs):
         num_rows = 1 if model_input.is_prompt else runner.input_batch.num_reqs
         vocab_size = runner.model_config.get_vocab_size()
-        logits = torch.full(
-            (num_rows, 1, vocab_size), base, dtype=runner.model.dtype
-        )
+        logits = torch.full((num_rows, 1, vocab_size), base, dtype=runner.model.dtype)
         for token_id, value in token_logits.items():
             logits[..., token_id] = value
         return logits
@@ -207,9 +205,7 @@ def test_min_tokens_with_padded_bucket(make_runner):
 
     min_tokens = 3
     # Greedy picks the stop token unless min_tokens masks it.
-    _rig_forward(
-        runner, {TOP_TOKEN_ID: 10.0, RUNNER_UP_TOKEN_ID: 5.0}, base=-10.0
-    )
+    _rig_forward(runner, {TOP_TOKEN_ID: 10.0, RUNNER_UP_TOKEN_ID: 5.0}, base=-10.0)
 
     reqs = [
         make_request(
@@ -421,9 +417,7 @@ def test_logprobs_with_padded_bucket(make_runner):
     """
     runner = make_runner(4)
 
-    _rig_forward(
-        runner, {TOP_TOKEN_ID: 10.0, RUNNER_UP_TOKEN_ID: 5.0}, base=-10.0
-    )
+    _rig_forward(runner, {TOP_TOKEN_ID: 10.0, RUNNER_UP_TOKEN_ID: 5.0}, base=-10.0)
 
     reqs = [
         make_request(
