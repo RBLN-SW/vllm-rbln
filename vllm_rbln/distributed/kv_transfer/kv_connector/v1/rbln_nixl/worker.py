@@ -1116,6 +1116,11 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             " (full prefix hit, notif only)" if prefix_hit else "",
         )
 
+        # Publish once and fail as one request: a handle visible while a later
+        # stage is still being prepped settles the request early, and the stages
+        # landing after that are a second completion with its metadata gone.
+        # A failed stage means recompute, so in-flight handles are released.
+        handles: list[int] = []
         for global_rank in self._overlapping_ranks[engine_id]:
             if prefix_hit:
                 agent_name = self._remote_agents[engine_id][global_rank]
@@ -1162,7 +1167,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                     notif_msg=notif_id,
                 )
                 self.nixl_wrapper.transfer(handle)
-                self._recving_transfers[req_id].append(handle)
+                handles.append(handle)
             except Exception as e:
                 self._log_failure(
                     failure_type="transfer_setup_failed",
@@ -1172,4 +1177,10 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                     dst_engine_id=engine_id,
                     remote_pp_rank=global_rank,
                 )
+                for submitted in handles:
+                    self.nixl_wrapper.release_xfer_handle(submitted)
                 self._handle_failed_transfer(req_id, handle)
+                return
+
+        if handles:
+            self._recving_transfers[req_id].extend(handles)

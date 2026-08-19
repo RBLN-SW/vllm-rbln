@@ -17,6 +17,7 @@
 # Exercises RblnNixlConnectorWorker._nixl_handshake with the ZMQ side-channel and
 # add_remote_agent mocked, so it needs neither a live NIXL peer nor nixl-rbln.
 
+import queue
 from collections import defaultdict
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
@@ -262,6 +263,9 @@ class TestPpHandshakeFanout:
             _handshake(w, sock)
 
     def test_swa_plus_pp_raises(self):
+        # The consumer's own guard, hit when it discovers a PP producer while it
+        # runs the SWA view-opt. TestPpConstraints covers the producer-side check
+        # in _check_pp_constraints; deleting either leaves its guard uncovered.
         w = _make_worker(sw_ratio=0.5)
         sock = _FakeSock(pp_size=2)
         with pytest.raises(RuntimeError, match="sliding-window"):
@@ -471,6 +475,14 @@ class TestShardReadPath:
         w.dst_num_blocks = {"eng": 8}
         w._recving_transfers = defaultdict(list)
         w._engine_last_active = {}
+        # What the base failure path reads: it logs with the engine id, looks the
+        # request's metadata up, queues the failure and the invalidated blocks.
+        w.engine_id = "local"
+        w._recving_metadata = {}
+        w._invalid_block_ids = queue.Queue()
+        w._failed_recv_reqs = queue.Queue()
+        w._is_hma_required = False
+        w.xfer_stats = MagicMock()
         # single group, 2 regions per shard
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
@@ -511,6 +523,26 @@ class TestShardReadPath:
         assert calls[1].args[1] == 101 and calls[1].args[3] == 201
         # completion: one handle per stage -> req done only when both finish.
         assert len(w._recving_transfers["r0"]) == 2
+
+    def test_a_failed_stage_leaves_no_handles_behind(self):
+        # A stage that fails takes the request with it, so nothing may stay in
+        # flight for it: get_finished() reports a failed request and drops its
+        # metadata, and a leftover handle completing later would report the same
+        # request a second time -- against metadata that is already gone.
+        w = self._read_worker(pp_size=3)
+        first = object()
+        w.nixl_wrapper.make_prepped_xfer.side_effect = [first, RuntimeError("boom")]
+
+        w._read_blocks_for_req("r0", self._meta([[1, 2]], [[3, 4]]))
+
+        assert w._recving_transfers["r0"] == []
+        # The stage that already submitted is released, and the third is never
+        # submitted -- the request is failed, not partially read.
+        w.nixl_wrapper.release_xfer_handle.assert_called_once_with(first)
+        assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
+        # Reported failed exactly once, which is what the engine counts.
+        assert w._failed_recv_reqs.qsize() == 1
+        assert w._failed_recv_reqs.get_nowait() == "r0"
 
     def test_prefix_hit_notifies_each_stage_no_read(self):
         # Full prefix hit (empty local list): no read, one notif per stage.
