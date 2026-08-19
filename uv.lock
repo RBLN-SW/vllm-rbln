@@ -1527,7 +1527,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.2a1"
+version = "0.11.2a2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1540,9 +1540,9 @@ dependencies = [
     { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/22/4f0ace819ba138d2aa6f70f92c097b3bc0796d561ab9daea7e54b306336d/optimum_rbln-0.11.2a1.tar.gz", hash = "sha256:10d10abd186e7e3b59b1b622c45326b83df465036018ce15de65679b6cbf07a9", size = 602350, upload-time = "2026-08-13T11:12:37.693Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b9/e7/3ba8e22839d54f8588cf32f4b086cb3d452a1e804bdc163f2eb9d832c0a9/optimum_rbln-0.11.2a2.tar.gz", hash = "sha256:3a2bad28bbb843427a58a5c97128c82e1c56c27eac9273cd71709f0c8f8e43f5", size = 605497, upload-time = "2026-08-19T07:20:29.536Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b6/b5/f7b9565052823ed3ec5b86178a65faa96ac00eee6859c5a9bce8646d6d5e/optimum_rbln-0.11.2a1-py3-none-any.whl", hash = "sha256:418c976cf884576c5bb286eef0ea302c27ae10ebbbb88f08c1dc29d1bfd0451e", size = 656637, upload-time = "2026-08-13T11:12:35.854Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/c2/2737e59b20524db597b09ce425a930648f71f29cfae9eb3bf6bbef0bf2ae/optimum_rbln-0.11.2a2-py3-none-any.whl", hash = "sha256:cae6a967cea3b4802ae126bb366d0a512c4be3efe92ab2e644ebd44046f9c138", size = 658799, upload-time = "2026-08-19T07:20:27.504Z" },
 ]
 
 [[package]]
@@ -2581,7 +2581,7 @@ wheels = [
 [[package]]
 name = "torch-rbln"
 version = "0.4.0rc0"
-source = { registry = "https://pypi.org/simple" }
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "libcst" },
     { name = "pyyaml" },
@@ -2591,10 +2591,10 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d3/30/a30524970d1208bc2bf6d26720faf6c463b58dfe015bdbe2bf4394518c03/torch_rbln-0.4.0rc0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:7687f86a22bc75ee5c86182facbbdbb8a7a34914a0bd4a2e48d6eb873fdae785", size = 1257550, upload-time = "2026-08-13T02:15:59.62Z" },
-    { url = "https://files.pythonhosted.org/packages/56/a3/75c73b473afcb74f02bd4e11b11b01514945ab96648bc19751818c25e193/torch_rbln-0.4.0rc0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:60fc4a9f9b744414c010b8f5e5184c35194e0c722f811fb74f0ac117b6995a6e", size = 1259238, upload-time = "2026-08-13T02:16:01.587Z" },
-    { url = "https://files.pythonhosted.org/packages/de/c3/851f7c6886fb6dca5f737c15eff06942ef496f5ac695a9fc4f3d57194959/torch_rbln-0.4.0rc0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:e1f0ce90935b314f7cccc20964ad0c79516620d40f0c7c8a09a2e17a7c926637", size = 1264731, upload-time = "2026-08-13T02:16:03.062Z" },
-    { url = "https://files.pythonhosted.org/packages/50/3c/7f110587a35833b2d5e0a1f5b9c44353b8944a14d48c28ed4f19e97c7ab1/torch_rbln-0.4.0rc0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:1bd2aa1e263b59a8b0b214bb79ededd7efa4a64b479da5fb89cf37a2a7ed5a39", size = 1266411, upload-time = "2026-08-13T02:16:05.153Z" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.4.0rc0/torch_rbln-0.4.0rc0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:7687f86a22bc75ee5c86182facbbdbb8a7a34914a0bd4a2e48d6eb873fdae785" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.4.0rc0/torch_rbln-0.4.0rc0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:60fc4a9f9b744414c010b8f5e5184c35194e0c722f811fb74f0ac117b6995a6e" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.4.0rc0/torch_rbln-0.4.0rc0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:e1f0ce90935b314f7cccc20964ad0c79516620d40f0c7c8a09a2e17a7c926637" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.4.0rc0/torch_rbln-0.4.0rc0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:1bd2aa1e263b59a8b0b214bb79ededd7efa4a64b479da5fb89cf37a2a7ed5a39" },
 ]
 
 [[package]]
@@ -2922,7 +2922,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
-    { name = "optimum-rbln", specifier = ">=0.11.2a1" },
+    { name = "optimum-rbln", specifier = ">=0.11.2a2" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
