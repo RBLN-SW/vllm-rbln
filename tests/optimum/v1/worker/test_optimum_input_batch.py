@@ -24,7 +24,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
-from vllm_rbln.v1.sample.ops.top_k_top_p import (
+from vllm_rbln.v1.sample.ops import (
     GREEDY_TOP_K,
     build_op_top_k_top_p,
 )
