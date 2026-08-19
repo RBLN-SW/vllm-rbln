@@ -2170,9 +2170,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
 
-        if isinstance(self.drafter, RBLNEagleProposer) and (
-            is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens
-        ):
+        if isinstance(self.drafter, RBLNEagleProposer):
             self.drafter.dummy_run(
                 num_reqs,
                 num_tokens_per_req,
@@ -2877,14 +2875,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if self.parallel_config.data_parallel_size == 1:
             return num_reqs_padded, None, None
 
-        self.dp_status = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+        dp_status = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
             num_tokens_unpadded,
             num_reqs_unpadded,
             self.parallel_config.data_parallel_size,
             self.parallel_config.data_parallel_rank,
             is_prefill,
         )
-        num_tokens_across_dp, num_reqs_across_dp, any_prefill = self.dp_status
+        self.dp_status = dp_status
+        num_tokens_across_dp, num_reqs_across_dp, any_prefill = dp_status
         num_tokens_padded = self.max_num_tokens
         if self.specialized_moe_decode:
             if any_prefill:
@@ -2899,6 +2898,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
                 tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
                 max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
+                if self.use_aux_hidden_state_outputs:
+                    # NOTE(RBLN): This can rarely cause some redundant padding in MoE.
+                    # However, there's a compiler failure with eagle3 on a case where
+                    # qlen=1 on every rank. So we pad to num_spec_tokens + 1 if every
+                    # rank has qlen=1 for now.
+                    max_tokens_per_req = max(
+                        max_tokens_per_req, self.num_spec_tokens + 1
+                    )
                 num_tokens_padded = num_reqs_padded * max_tokens_per_req
 
         return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
@@ -3033,11 +3040,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # 2. decode
             query_lens = [1]
             if self.speculative_config:
-                spec_width = self.speculative_config.num_speculative_tokens + 1
-                if self.speculative_config.use_eagle():
-                    query_lens = [spec_width]
-                else:
-                    query_lens.append(spec_width)
+                query_lens.append(self.speculative_config.num_speculative_tokens + 1)
             for num_req in self.bucketing_manager.decode_batch_buckets:
                 for query_len in query_lens:
                     self._dummy_run(num_req, query_len, False)

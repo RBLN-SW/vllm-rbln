@@ -398,6 +398,9 @@ class TestDummyRunPadding:
             # use_wrapped_compute_logits is a property over this.
             is_pooling_model=True,
             speculative_config=None,
+            # Read by _determine_batch_padding to floor the MoE dispatch pad
+            # at the spec width; __init__ always sets it.
+            use_aux_hidden_state_outputs=False,
             # Gates the drafter's dummy run; __init__ always sets it.
             drafter=None,
             kv_cache_bases=None,
