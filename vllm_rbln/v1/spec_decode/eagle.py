@@ -29,7 +29,7 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
 )
-from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.utils import pad
@@ -41,6 +41,7 @@ from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
+from vllm_rbln.v1.worker import dp_utils
 
 if TYPE_CHECKING:
     from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
@@ -495,7 +496,9 @@ class RBLNEagleProposer(EagleProposer):
         num_reqs_padded, dp_padded, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
         )
-        num_padded_tokens = override_padded or dp_padded
+        num_padded_tokens = (
+            override_padded if override_padded is not None else dp_padded
+        )
 
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -557,7 +560,9 @@ class RBLNEagleProposer(EagleProposer):
         num_reqs_padded, dp_padded, num_tokens_across_dp = (
             self._determine_draft_batch_padding(num_reqs, num_reqs, False)
         )
-        num_padded_tokens = override_padded or dp_padded
+        num_padded_tokens = (
+            override_padded if override_padded is not None else dp_padded
+        )
         per_layer_attn_metadata.clear()
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -649,23 +654,23 @@ class RBLNEagleProposer(EagleProposer):
         if dp_size == 1:
             return num_reqs_padded, None, None
 
-        num_tokens_across_dp, num_reqs_across_dp = (
-            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+        # TODO(RBLN): the draft's rules differ from the model's, so it cannot take
+        # coordinate_batch_across_dp as is: an idle draft step keeps the warmed
+        # 1+num_spec query length instead of adopting the group's, and this rule has
+        # neither the DP-idle exclusion nor the query-length-asymmetric case. Worth
+        # unifying once those differences fit the shared path.
+        num_tokens_across_dp, any_prefill, max_num_reqs, max_query_len = (
+            dp_utils.synchronize_draft_dp_ranks(
                 num_tokens, num_reqs, dp_size, self.dp_rank, is_prefill
             )
         )
         num_tokens_padded = self.max_num_tokens
         if self.runner.specialized_moe_decode and not is_prefill:
-            if num_reqs_across_dp is None:
+            if any_prefill:
                 num_reqs_padded = self.runner.bucketing_manager.decode_batch_buckets[-1]
             else:
                 num_reqs_padded = (
-                    self.runner.bucketing_manager.find_decode_batch_bucket(
-                        int(num_reqs_across_dp.max())
-                    )
+                    self.runner.bucketing_manager.find_decode_batch_bucket(max_num_reqs)
                 )
-                max_tokens_per_req = int(
-                    (num_tokens_across_dp // num_reqs_across_dp).max()
-                )
-                num_tokens_padded = num_reqs_padded * max_tokens_per_req
+                num_tokens_padded = num_reqs_padded * max_query_len
         return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
