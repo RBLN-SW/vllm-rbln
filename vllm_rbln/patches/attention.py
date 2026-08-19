@@ -31,6 +31,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.spec_decode import pass_state
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -128,9 +129,18 @@ def patched_get_attention_context(
     if isinstance(attn_metadata_raw, dict):
         attn_metadata = attn_metadata_raw[layer_name]
     elif isinstance(attn_metadata_raw, list):
-        # list[dict[str, AttentionMetadata]]: used in speculative decoding
-        # where [0] is the base-model (non-speculative) metadata dict.
-        attn_metadata = attn_metadata_raw[0][layer_name]
+        # list[dict[str, AttentionMetadata]]: speculative decoding, where entry
+        # 0 is the base-model dict and later entries belong to the drafter's
+        # chained passes (seq_lens grows by one per pass).
+        #
+        # Selection happens here rather than by opening `set_forward_context`
+        # per pass inside the trace, which graph-breaks under the drafter's
+        # fullgraph=True. The loop is unrolled at trace time, so each pass bakes
+        # a constant index and lifts that entry's tensors as its own inputs.
+        idx = pass_state.PASS_IDX
+        if len(attn_metadata_raw) <= idx:
+            idx = 0
+        attn_metadata = attn_metadata_raw[idx][layer_name]
     else:
         attn_metadata = attn_metadata_raw
     attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]

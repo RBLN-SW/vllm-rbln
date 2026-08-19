@@ -36,6 +36,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
 )
+from vllm_rbln.v1.spec_decode import pass_state
 from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
@@ -135,13 +136,57 @@ class RBLNEagleProposer(EagleProposer):
         )
         inputs_embeds = None
 
+        _kv_kwargs = build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases)
+        if self.num_speculative_tokens > 1:
+            # Every pass in one region, so the per-pass work below must not run.
+            # Metadata goes in as a list, one entry per pass, and the wrapper's
+            # PASS_IDX picks which -- entry 0 is the first pass's own, which is
+            # why the list starts from `per_layer_attn_metadata` rather than
+            # skipping it.
+            full_metas: list[object] = [per_layer_attn_metadata]
+            for _ in range(1, self.num_speculative_tokens):
+                common_attn_metadata.seq_lens += 1
+                md: dict[str, object] = {}
+                for attn_group in self.draft_attn_groups:
+                    am = attn_group.get_metadata_builder().build(
+                        common_attn_metadata=common_attn_metadata,
+                        positions=target_positions,
+                        is_prefill=False,
+                        batch_pad=num_reqs_padded,
+                    )
+                    attach_kv_cache_bindings(
+                        am,
+                        self.runner.kv_caches,
+                        self.runner.kv_cache_bases,
+                        self.runner.kv_cache_view_infos,
+                    )
+                    for layer_name in attn_group.layer_names:
+                        md[layer_name] = am
+                full_metas.append(md)
+            with set_forward_context(
+                full_metas,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                num_padded_tokens=num_padded_tokens,
+                **_kv_kwargs,
+            ):
+                all_ids = self.chain_executable(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    token_indices_to_sample=token_indices_to_sample_padded,
+                )
+            # The region already mapped draft ids to target ids.
+            return all_ids[:num_reqs].view(num_reqs, -1)
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
-            **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
+            **_kv_kwargs,
         ):
             hidden_states, draft_ids = self.model_executable(
                 input_ids=input_ids,
@@ -405,12 +450,111 @@ class RBLNEagleProposer(EagleProposer):
             # the logits too.
             return hidden_states, torch.ops.rbln.argmax(logits)
 
+        def chain_wrapper(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            token_indices_to_sample: torch.Tensor | None = None,
+        ):
+            """Every drafter pass as one compiled region.
+
+            Each pass feeds the next: its ids become the next `input_ids`, its
+            hidden states the next `hidden_states`, and positions advance by
+            one. Calling `model_executable` per pass leaves that feedback on the
+            host -- buffer writes, a masked_fill and a metadata rebuild between
+            every pass -- and pays a separate region's fixed cost each time.
+            Inside one region it is tensor plumbing the graph already has.
+
+            Metadata arrives from the forward context as a list, one entry per
+            pass, and `pass_state.PASS_IDX` picks which. The loop unrolls at
+            trace time, so each pass bakes a constant index and lifts that
+            entry's tensors as its own graph inputs. Reopening
+            `set_forward_context` per pass is the obvious alternative and
+            graph-breaks, which is an error under fullgraph=True.
+            """
+            outs = []
+            cur_ids, cur_pos, cur_h = input_ids, positions, hidden_states
+            for pass_idx in range(self.num_speculative_tokens):
+                pass_state.PASS_IDX = pass_idx
+                ret = self.model(
+                    input_ids=cur_ids,
+                    positions=cur_pos,
+                    hidden_states=cur_h,
+                    inputs_embeds=None,
+                )
+                if not self.model_returns_tuple():
+                    last_hidden_states = ret
+                    next_hidden = ret
+                else:
+                    last_hidden_states, next_hidden = ret
+                sample_hidden_states = last_hidden_states.view(-1, self.hidden_size)
+                next_flat = next_hidden.view(-1, self.hidden_size)
+                if pass_idx == 0 and token_indices_to_sample is not None:
+                    # The narrowing the later passes need: one state per request
+                    # instead of one per verified token. It is the same indexing
+                    # the separate first pass did, so folding that pass in costs
+                    # a wider body rather than a new shape.
+                    sample_hidden_states = sample_hidden_states[token_indices_to_sample]
+                    next_flat = next_flat[token_indices_to_sample]
+                if self.draft_id_to_target_id is not None:
+                    assert isinstance(
+                        self.model,
+                        (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM),
+                    )
+                    logits = self.model.logits_processor(
+                        self.model.lm_head, sample_hidden_states
+                    )
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
+                ids = torch.ops.rbln.argmax(logits)
+                if self.draft_id_to_target_id is not None:
+                    # Map here rather than in `_to_target_token_ids` on the
+                    # host. `d2t` must be reached through the module so it stays
+                    # a named tensor in the traced graph: weight-free apply
+                    # cannot fill an anonymous constant, and the out-of-bounds
+                    # write that follows segfaults KV warmup.
+                    d2t = self.model.draft_id_to_target_id
+                    flat = ids.reshape(-1)
+                    ids = (flat + d2t.index_select(0, flat)).view_as(ids)
+                outs.append(ids.to(torch.int32))
+                # Feed back at the shapes the model takes, not the shapes the
+                # reductions leave behind. `hidden_states` enters 3-D; handing
+                # back the 2-D view the sampling path uses dies in the fake
+                # tensor pass with "Expected 3-D tensors, but got 2-D".
+                if pass_idx == 0:
+                    cur_ids = outs[-1].view(1, -1)
+                    cur_pos = (positions.view(-1)[token_indices_to_sample] + 1).view(
+                        1, -1
+                    )
+                    cur_h = next_flat.view(1, -1, self.hidden_size)
+                else:
+                    cur_ids = outs[-1].view(cur_ids.shape)
+                    cur_pos = (cur_pos.view(-1) + 1).view(cur_pos.shape)
+                    cur_h = next_flat.view(cur_h.shape)
+            pass_state.PASS_IDX = 0
+            return torch.stack(outs, dim=-1)
+
         if (
             self.vllm_config.speculative_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
         ):
             self.model_executable = model_wrapper
+            self.chain_executable = chain_wrapper
         else:
+            if self.num_speculative_tokens > 1:
+                self.chain_executable = compile(
+                    chain_wrapper,
+                    dynamic=False,
+                    fullgraph=True,
+                    compile_context=self.runner.compile_context,
+                    num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                    model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                    process_group_dict=build_process_group_dict(),
+                    guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                    runtime_holder=self.runner.runtime_holder,
+                    mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                    use_static_output=True,
+                )
             self.model_executable = compile(
                 model_wrapper,
                 dynamic=False,
