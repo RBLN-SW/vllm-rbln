@@ -18,7 +18,10 @@ import lazily from a fixture (after pytest_configure sets the env)."""
 from __future__ import annotations
 
 import asyncio
+import functools
 import gc
+import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,11 +44,64 @@ _RBLN_RUNNER_DEFAULTS = dict(
 )
 
 
+@functools.cache
+def kv_blocks_per_request(model: str, max_model_len: int, block_size: int) -> int:
+    """Blocks one request needs across every KV cache group.
+
+    vLLM sizes the shared pool in units of ``group_size * page_size``, so the
+    requirement is the sum over groups: a full-attention group holds the whole
+    context, an RBLN sliding-window group exactly one page. Plain
+    ``cdiv(max_model_len, block_size) + 1`` is the special case of at most one
+    sliding group -- true for a 1:1 pattern (gpt-oss), false for gemma3's 5:1.
+
+    Does not model PP stages, Mamba/linear attention, KV sharing, or mixed
+    window sizes; pin num_gpu_blocks_override on the spec for those.
+    """
+    from vllm_rbln import envs
+
+    full_blocks = math.ceil(max_model_len / block_size)
+    try:
+        config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    except OSError:
+        # Only a hybrid model needs the config; a name that cannot be resolved
+        # here fails at model load anyway, so assume the single-group answer.
+        return full_blocks
+    config = config.get_text_config()
+    num_layers = config.num_hidden_layers
+    if envs.VLLM_RBLN_NUM_HIDDEN_LAYERS > 0:
+        num_layers = min(num_layers, envs.VLLM_RBLN_NUM_HIDDEN_LAYERS)
+    layer_types = (
+        getattr(config, "layer_types", None) or ["full_attention"] * num_layers
+    )
+    counts = Counter(layer_types[:num_layers])
+
+    if len(counts) == 1:
+        group_size = num_layers
+    else:
+        fewest, most = min(counts.values()), max(counts.values())
+        # vLLM's heuristic: the "1" of an n:1 pattern, unless padding to the
+        # larger count wastes less.
+        group_size = most if most < fewest * 1.5 else fewest
+    return sum(
+        math.ceil(count / group_size) * (full_blocks if kind == "full_attention" else 1)
+        for kind, count in counts.items()
+    )
+
+
+def rbln_engine_args(model: str, **kwargs) -> dict:
+    merged = {**_RBLN_RUNNER_DEFAULTS, **kwargs}
+    merged.setdefault(
+        "num_gpu_blocks_override",
+        kv_blocks_per_request(model, merged["max_model_len"], merged["block_size"]) + 1,
+    )
+    return merged
+
+
 class VllmRunner:
     """System under test: ``vllm.LLM`` with the native RBLN config; kwargs override."""
 
     def __init__(self, model: str, **kwargs) -> None:
-        self.llm = LLM(model=model, **{**_RBLN_RUNNER_DEFAULTS, **kwargs})
+        self.llm = LLM(model=model, **rbln_engine_args(model, **kwargs))
 
     def generate_greedy(
         self, prompts: list[str], max_tokens: int
@@ -127,7 +183,7 @@ class AsyncVllmRunner:
         self, model: str, *, request_timeout_s: float = 600.0, **kwargs
     ) -> None:
         self.request_timeout_s = request_timeout_s
-        args = AsyncEngineArgs(model=model, **{**_RBLN_RUNNER_DEFAULTS, **kwargs})
+        args = AsyncEngineArgs(model=model, **rbln_engine_args(model, **kwargs))
         # One loop for the runner's lifetime; a fresh asyncio.run() per call would
         # orphan the engine's output handler on a closed loop.
         self._loop = asyncio.new_event_loop()
