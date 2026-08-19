@@ -197,9 +197,6 @@ class RBLNSampler(VLLMSampler):
 
         temperature = sampling_metadata.temperature
         if not sampling_metadata.all_random:
-            # A greedy row is answered by its top_k=1 filter (see
-            # build_op_top_k_top_p), so its temperature only needs to avoid the
-            # division by zero -- 1.0 leaves the row's logits untouched.
             temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
 
         argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
