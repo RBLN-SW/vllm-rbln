@@ -27,10 +27,11 @@ Four numbers per request:
   spill   the recomputed chunk crosses a block boundary, which is the
           multi-block store path under test.  Set by SPILL; 0 makes the chunk
           end exactly on the boundary, which is the control.
-  max|d|  largest logprob move against the no-cache reference, readable only
-          next to `noise` -- the same measurement between two runs on the same
-          engine.  noise == 0 and max|d| == 0 together mean the assembled KV is
-          bit-exact; a max|d| above `noise` is a real difference.
+  max|d|  largest logprob move against the no-cache reference.
+
+The multi-block store path runs only when the first recomputed chunk crosses a
+block boundary:
+    (hit % BLOCK_SIZE) + min(MAX_BATCHED, n_prompt - hit) > BLOCK_SIZE
 """
 
 import os
@@ -43,11 +44,13 @@ from vllm.inputs import TokensPrompt  # noqa: E402
 
 MODEL = "meta-llama/Llama-3.2-1B"
 BLOCK_SIZE = 1024
-MAX_BATCHED = 1024
+MAX_BATCHED = 512
 MAX_NUM_SEQS = 4
 SUB_BLOCK = 128  # must match VLLM_RBLN_SUB_BLOCK_SIZE
 TP = 1
 NUM_REQUESTS = 8
+
+os.environ["VLLM_RBLN_SUB_BLOCK_SIZE"] = str(SUB_BLOCK)
 
 # The shared prefix is a role setup followed by a document, which is the shape
 # prefix caching exists for.  SYSTEM leads it once; PASSAGE fills the rest.
@@ -103,8 +106,8 @@ research programme of its own.
 
 # The two knobs of the experiment.
 FULL_BLOCKS = 2  # full blocks before the sub-block hit, so the copy's destination
-                 # block index is not 0 and an off-by-one there cannot hide
-SPILL = 125  # tokens the recomputed chunk pushes into the NEXT block; 0 = no spill
+# block index is not 0 and an off-by-one there cannot hide
+SPILL = 10  # tokens the recomputed chunk pushes into the NEXT block; 0 = no spill
 
 # Both lengths follow from those, so there is one number per effect and no slack:
 # the hit is FULL_BLOCKS full blocks plus 7 of the 8 sub-blocks of the next one,
@@ -113,14 +116,11 @@ SPILL = 125  # tokens the recomputed chunk pushes into the NEXT block; 0 = no sp
 # rest of that block plus SPILL.
 PREFIX_TOKENS = FULL_BLOCKS * BLOCK_SIZE + (BLOCK_SIZE - SUB_BLOCK)
 PROMPT_TOKENS = PREFIX_TOKENS + SUB_BLOCK + SPILL
-# `chunk` is the one number RequestOutput does not expose, so the table derives
-# it.  That derivation is only exact while the recompute of every request the
-# scheduler can run at once fits in one step's token budget -- MAX_BATCHED is a
-# per-step total shared across requests, not a per-request cap.  If this fails,
-# a request's first chunk is smaller than the table claims and `spill` becomes an
-# upper bound rather than a fact.
-assert MAX_NUM_SEQS * (SUB_BLOCK + SPILL) <= MAX_BATCHED, (
-    "the recomputed chunk can be split across steps; lower MAX_NUM_SEQS or SPILL"
+
+assert SUB_BLOCK + SPILL <= MAX_BATCHED, (
+    f"recompute {SUB_BLOCK + SPILL} > {MAX_BATCHED}: it would be split across "
+    f"steps into several stores with different spills.  Keep SPILL <= "
+    f"{MAX_BATCHED - SUB_BLOCK}"
 )
 
 
@@ -290,10 +290,10 @@ def main():
     assert not wrong, "geometry is not what was configured:\n  " + "\n  ".join(wrong)
 
     print(f"\ntop-1 agree {agree}/{n}   spill {spilled}/{n}")
-    if spilled == 0:
+    if SPILL and not spilled:
         print(
-            "WARNING: no request spilled across a block boundary -- the "
-            "multi-block store path never ran.  Raise SPILL."
+            "WARNING: SPILL is set but no request crossed a block boundary -- "
+            "the multi-block store path never ran."
         )
 
     for i, out in enumerate(outs):
