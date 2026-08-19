@@ -150,11 +150,13 @@ class TestPadDepad:
         assert torch.equal(out[2], t[1])
         assert torch.equal(out[3], t[1])
 
-    def test_pad_rows_clone_when_at_bucket(self):
+    def test_pad_rows_reuses_storage_when_at_bucket(self):
+        # A batch already at the bucket is handed through untouched -- reuse is
+        # what keeps the sampler graph's input address fixed across steps.
         t = torch.arange(6).reshape(2, 3)
         out = _pad_rows(t, 2)
         assert torch.equal(out, t)
-        assert out is not t
+        assert out is t
 
     def test_pad_rows_none_passthrough(self):
         assert _pad_rows(None, 4) is None

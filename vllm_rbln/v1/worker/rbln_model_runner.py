@@ -129,17 +129,13 @@ from vllm_rbln.v1.core.utils import (
     resolve_propagated_token_write,
     step_is_prefill,
 )
+from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.metrics_v2 import (
-    PerformanceContext,
-    e2e_ends,
-    e2e_starts,
-)
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
     prepare_kernel_block_sizes,
@@ -349,6 +345,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        logitsprocs_builder = (
+            build_rbln_logitsprocs if envs.VLLM_RBLN_SAMPLER else build_logitsprocs
+        )
+
+        logitsprocs = logitsprocs_builder(
+            self.vllm_config,
+            self.device,
+            PIN_MEMORY,
+            self.is_pooling_model,
+            custom_logitsprocs,
+        )
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -358,13 +365,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
             num_spec_tokens=self.num_spec_tokens,
-            logitsprocs=build_logitsprocs(
-                self.vllm_config,
-                self.device,
-                PIN_MEMORY,
-                self.is_pooling_model,
-                custom_logitsprocs,
-            ),
+            logitsprocs=logitsprocs,
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,
@@ -440,8 +441,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             parallel_config.data_parallel_size > 1
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
-
-        self.performance_ctx = PerformanceContext("runner", self.runtime_holder)
 
         self.offload_context = nullcontext
         if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
@@ -1242,23 +1241,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        with self.performance_ctx.profile_sampler():
-            if spec_decode_metadata is None:
-                bucket = logits.shape[0]
-                num_reqs = self.input_batch.num_reqs
-                padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
-                out = self.sampler(
-                    logits=logits,
-                    sampling_metadata=padded_md,
-                )
-                return _depad_sampler_output(out, num_reqs)
-
-            return self.rejection_sampler(
-                spec_decode_metadata,
-                None,  # draft_probs
-                logits,
-                sampling_metadata,
+        if spec_decode_metadata is None:
+            bucket = logits.shape[0]
+            num_reqs = self.input_batch.num_reqs
+            padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
+            out = self.sampler(
+                logits=logits,
+                sampling_metadata=padded_md,
             )
+            return _depad_sampler_output(out, num_reqs)
+
+        return self.rejection_sampler(
+            spec_decode_metadata,
+            None,  # draft_probs
+            logits,
+            sampling_metadata,
+        )
 
     def _bookkeeping_sync(
         self,
@@ -1366,7 +1364,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_id_to_index_output_copy,
         )
 
-    @e2e_starts
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1477,7 +1474,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
-            self.performance_ctx.profile_model(self.is_prefill),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1521,7 +1517,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_connector_output = kv_connector_output
         return None
 
-    @e2e_ends
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -2190,29 +2185,30 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dtype=self.dtype,
         )
 
-        def dummy_float_tensor(buffer: torch.Tensor, value: float | None):
-            if value is None:
-                return None
-            return torch.full(
-                (num_reqs,), float(value), dtype=buffer.dtype, device=self.device
-            )
+        def dummy_tensor_view(
+            buffer: torch.Tensor, value: int | float | None
+        ) -> torch.Tensor | None:
+            """Warm-up stand-in for what a real step feeds: a view of the buffer.
 
-        def dummy_int_tensor(buffer: torch.Tensor, value: int | float | None):
+            Dynamo guards distinguish a view from a fresh allocation, so this follows
+            how the runtime builds its sampling metadata tensors -- `_pad_rows` hands
+            through a slice of the persistent buffer.
+            """
             if value is None:
                 return None
-            return torch.full(
-                (num_reqs,), int(value), dtype=buffer.dtype, device=self.device
-            )
+            view = buffer[:num_reqs]
+            view.fill_(value)
+            return view
 
         for config in WARM_UP_CONFIGS:
             dummy_metadata = SamplingMetadata(
-                temperature=dummy_float_tensor(
+                temperature=dummy_tensor_view(
                     self.input_batch.temperature, config.get("temperature")
                 ),
                 all_greedy=config.get("all_greedy", True),
                 all_random=config.get("all_random", False),
-                top_p=dummy_float_tensor(self.input_batch.top_p, config.get("top_p")),
-                top_k=dummy_int_tensor(self.input_batch.top_k, config.get("top_k")),
+                top_p=dummy_tensor_view(self.input_batch.top_p, config.get("top_p")),
+                top_k=dummy_tensor_view(self.input_batch.top_k, config.get("top_k")),
                 generators={},
                 max_num_logprobs=None,
                 no_penalties=config.get("no_penalties", True),
@@ -2221,15 +2217,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
                 if not config.get("no_penalties", True)
                 else None,
-                frequency_penalties=dummy_float_tensor(
+                frequency_penalties=dummy_tensor_view(
                     self.input_batch.frequency_penalties,
                     config.get("frequency_penalties", 0.1),
                 ),
-                presence_penalties=dummy_float_tensor(
+                presence_penalties=dummy_tensor_view(
                     self.input_batch.presence_penalties,
                     config.get("presence_penalties", 0.1),
                 ),
-                repetition_penalties=dummy_float_tensor(
+                repetition_penalties=dummy_tensor_view(
                     self.input_batch.repetition_penalties,
                     config.get("repetition_penalties", 0.1),
                 ),
@@ -2244,6 +2240,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits=logits,
                 sampling_metadata=dummy_metadata,
             )
+
+            if num_reqs > 1:
+                # A batch smaller than the bucket takes `_pad_rows`'s `torch.cat`
+                # branch, whose result is not a view. Warm that kind too.
+                def shorter(t: torch.Tensor | None) -> torch.Tensor | None:
+                    return None if t is None else t[: num_reqs - 1]
+
+                short_metadata = dataclasses.replace(
+                    dummy_metadata,
+                    temperature=shorter(dummy_metadata.temperature),
+                    top_p=shorter(dummy_metadata.top_p),
+                    top_k=shorter(dummy_metadata.top_k),
+                )
+                _ = self.sampler(
+                    logits=logits,
+                    sampling_metadata=_pad_sampling_metadata(short_metadata, num_reqs),
+                )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -3130,10 +3143,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
+    """Size `t` to `bucket` rows, reusing its storage when it already has them.
+
+    Reuse keeps the sampler graph's input address fixed across steps. The result
+    aliases `t`: read it, do not write to it.
+    """
     if t is None:
         return None
-    if (n := t.shape[0]) >= bucket:
-        return t.clone()
+    n = t.shape[0]
+    if n == bucket:
+        return t
+    if n > bucket:
+        return t[:bucket]
     pad = t[-1:].expand(bucket - n, *t.shape[1:])
     return torch.cat([t, pad], dim=0)
 

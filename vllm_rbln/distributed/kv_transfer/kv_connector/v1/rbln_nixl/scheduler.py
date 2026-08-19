@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
@@ -20,12 +19,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     yield_req_data,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorMetadata,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnectorMetadata,
-    NixlConnectorScheduler,
+    NixlPullConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
@@ -41,7 +37,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class RblnNixlConnectorScheduler(NixlConnectorScheduler):
+class RblnNixlConnectorScheduler(NixlPullConnectorScheduler):
     """Implementation of Scheduler side methods"""
 
     def __init__(
@@ -49,152 +45,85 @@ class RblnNixlConnectorScheduler(NixlConnectorScheduler):
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
+        # NOTE(RBLN): the platform reports device_type "cpu" when device tensors
+        # are off, which the base reads as "no host staging" -- the very setup
+        # that needs it. Decide from the requested buffer device instead.
         self.use_host_buffer = vllm_config.kv_transfer_config.kv_buffer_device == "cpu"
 
+        # Blocks collected so far for a prefill that is still being chunked.
         self._block_ids_need_save: dict[ReqId, BlockIds] = {}
 
-    def build_connector_meta(
+    def _build_save_meta(
         self,
+        meta: NixlConnectorMetadata,
         scheduler_output: SchedulerOutput,
-    ) -> KVConnectorMetadata:
-        meta = NixlConnectorMetadata()
+    ) -> None:
+        """Stage a prefill's blocks in one save, once every chunk has landed.
 
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
+        NOTE(RBLN): the base saves each step's new blocks as they arrive. The
+        RBLN host copy moves whole blocks and transfers once, so blocks are
+        accumulated here and handed over when the prefill completes.
+        """
+        for req_id, new_block_id_groups, resumed in yield_req_data(scheduler_output):
+            req = self._reqs_need_save.get(req_id)
+            if req is None:
+                continue
+
             assert req.kv_transfer_params is not None
-            meta.add_new_req_to_recv(
-                request_id=req_id,
-                local_block_ids=block_ids,
-                kv_transfer_params=req.kv_transfer_params,
+            assert scheduler_output.num_scheduled_tokens is not None
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+
+            has_block_ids_to_save = req_id in self._block_ids_need_save
+            has_new_block_ids = new_block_id_groups is not None
+            # Blocks follow the chunks, so the closing one often adds none.
+            # Neither side holding any would stage a prefill without its KV.
+            assert has_block_ids_to_save or has_new_block_ids, (
+                "RBLN host-bounce save path reached with no blocks: "
+                f"req_id={req_id} resumed={resumed} "
+                f"num_computed={req.num_computed_tokens} "
+                f"num_prompt={req.num_prompt_tokens} "
+                f"num_scheduled={num_scheduled_tokens}"
             )
 
-        if self._reqs_need_save:
-            # NOTE: For the prefill side, there might be a chance that an early added
-            # request is a chunked prefill, so we need to check if new blocks are added
-            for req_id, new_block_id_groups, _ in yield_req_data(scheduler_output):
-                req_to_save = self._reqs_need_save.get(req_id)
-                if req_to_save is None:
-                    continue
-
-                # NOTE(RBLN): RBLN allocates the whole prefill blocks at once
-                # and does not resume prefill requests in P/D disaggregation scenario.
-                # save_to_host path will be deprecated in the future.
-                has_block_ids_to_save = req_id in self._block_ids_need_save
-                has_new_block_ids = new_block_id_groups is not None
-                assert has_block_ids_to_save ^ has_new_block_ids
-
-                if has_new_block_ids:
-                    self._block_ids_need_save[req_id] = new_block_id_groups
-
-                req = req_to_save
-
-                assert req.kv_transfer_params is not None
-                assert scheduler_output.num_scheduled_tokens is not None
-                num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                is_partial = (
-                    req.num_computed_tokens + num_scheduled_tokens
-                ) < req.num_prompt_tokens
-
-                if not is_partial:
-                    new_block_id_groups = self._block_ids_need_save.pop(req_id)
-                    clipped_block_id_groups = self.get_sw_clipped_blocks(
-                        new_block_id_groups
+            if has_new_block_ids:
+                if resumed or not has_block_ids_to_save:
+                    # A resumed request re-sends its full block list, not a
+                    # delta, so appending would double-count.
+                    self._block_ids_need_save[req_id] = tuple(
+                        list(group) for group in new_block_id_groups
                     )
-                    meta.add_new_req_to_save(
-                        request_id=req_id,
-                        local_block_ids=clipped_block_id_groups,
-                        kv_transfer_params=req.kv_transfer_params,
-                    )
-                    # For non-partial prefills, once new req_meta is scheduled, it
-                    # can be removed from _reqs_need_save.
-                    # For partial prefill case, we will retain the request in
-                    # _reqs_need_save until all blocks are scheduled with req_meta.
-                    # Therefore, only pop if `not is_partial`.
-                    self._reqs_need_save.pop(req_id)
+                else:
+                    for stored_group, new_group in zip(
+                        self._block_ids_need_save[req_id], new_block_id_groups
+                    ):
+                        stored_group.extend(new_group)
 
-        meta.reqs_to_send = self._reqs_need_send  # type: ignore[var-annotated, has-type]
-        meta.reqs_in_batch = self._reqs_in_batch  # type: ignore[var-annotated, has-type]
-        meta.reqs_not_processed = self._reqs_not_processed  # type: ignore[var-annotated, has-type]
+            is_partial = (
+                req.num_computed_tokens + num_scheduled_tokens
+            ) < req.num_prompt_tokens
 
-        # Clear the list once workers start the transfers
-        self._reqs_need_recv.clear()
-        self._reqs_in_batch = set()  # type: ignore[var-annotated]
-        self._reqs_not_processed = set()  # type: ignore[var-annotated]
-        self._reqs_need_send = {}  # type: ignore[var-annotated]
-
-        return meta
+            if not is_partial:
+                clipped_block_id_groups = self.get_sw_clipped_blocks(
+                    self._block_ids_need_save.pop(req_id)
+                )
+                meta.add_new_req_to_save(
+                    request_id=req_id,
+                    local_block_ids=clipped_block_id_groups,
+                    kv_transfer_params=req.kv_transfer_params,
+                )
+                # For non-partial prefills, once new req_meta is scheduled, it
+                # can be removed from _reqs_need_save.
+                # For partial prefill case, we will retain the request in
+                # _reqs_need_save until all blocks are scheduled with req_meta.
+                # Therefore, only pop if `not is_partial`.
+                self._reqs_need_save.pop(req_id)
 
     def request_finished(
         self,
         request: "Request",
         block_ids: BlockIds,
     ) -> tuple[bool, dict[str, Any] | None]:
-        """
-        Once a request is finished, determine whether request blocks
-        should be freed now or will be sent asynchronously and freed later.
-        """
-        from vllm.v1.request import RequestStatus
-
-        params = request.kv_transfer_params
-        logger.debug(
-            "NIXLConnector request_finished(%s), request_status=%s, "
-            "kv_transfer_params=%s",
-            request.request_id,
-            request.status,
-            params,
-        )
-        if not params:
-            return False, None
-
-        if params.get("do_remote_prefill"):
-            # If do_remote_prefill is still True when the request is finished,
-            # update_state_after_alloc must not have been called (the request
-            # must have been aborted before it was scheduled).
-            # To avoid stranding the prefill blocks in the prefill instance,
-            # we must add empty block_ids to _reqs_need_recv so that our
-            # worker side will notify and free blocks in the prefill instance.
-            self._reqs_need_recv[request.request_id] = (request, [])
-            params["do_remote_prefill"] = False
-            return False, None
-
-        if not params.get("do_remote_decode"):
-            return False, None
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
-            # Also include the case of a P/D Prefill request with immediate
-            # block free (eg abort). Stop tracking this request.
-            self._reqs_not_processed.add(request.request_id)
-            # Clear _reqs_need_save if a request is aborted as partial prefill.
-            self._reqs_need_save.pop(request.request_id, None)
-            self._block_ids_need_save.pop(request.request_id, None)
-            return False, None
-
-        # TODO: check whether block_ids actually ever be 0. If not we could
-        # remove the conditional below
-        delay_free_blocks = any(len(group) > 0 for group in block_ids)
-
-        if delay_free_blocks:
-            # Prefill request on remote. It will be read from D upon completion
-            logger.debug(
-                "NIXLConnector request_finished(%s) waiting for %d seconds "
-                "for remote decode to fetch blocks",
-                request.request_id,
-                self._kv_lease_duration,
-            )
-            self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + self._kv_lease_duration
-            )
-            # NOTE HMA will "mark" empty/null blocks in groups with 0s (eg SWA ones),
-            # trimming down after allocating for the whole sequence length. Empty
-            # blocks are always at the start of the list.
-            # Here we "unpad" blocks to send the actual remote blocks to be read.
-            block_ids = self.get_sw_clipped_blocks(block_ids)
-
-        return delay_free_blocks, dict(
-            do_remote_prefill=True,
-            do_remote_decode=False,
-            remote_block_ids=block_ids,
-            remote_engine_id=self.engine_id,
-            remote_request_id=request.request_id,
-            remote_host=self.side_channel_host,
-            remote_port=self.side_channel_port,
-            tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-        )
+        # NOTE(RBLN): an entry surviving here belongs to a prefill that ended
+        # before its closing chunk, so the blocks accumulated for it are stale.
+        self._block_ids_need_save.pop(request.request_id, None)
+        return super().request_finished(request, block_ids)
