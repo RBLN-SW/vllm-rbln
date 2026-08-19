@@ -64,14 +64,6 @@ class RBLNScheduler(Scheduler):
     ) -> None:
         super().__init__(*args, **kwargs)
 
-        # Cold-start determinism gate. Only RBLNAsyncScheduler drives it (via
-        # _det_quiesced / the schedule() override); for sync scheduling _det_hold
-        # stays False and this is inert. See RBLNAsyncScheduler for the rationale.
-        self._det_warm = False
-        self._det_last_n = -1
-        self._det_stable = 0
-        self._det_hold = False
-
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
         # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
@@ -178,9 +170,8 @@ class RBLNScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
-        if self._pause_state == PauseState.PAUSED_ALL or self._det_hold:
-            # Do not schedule any requests when paused, or while the async
-            # determinism gate is holding the first step (see _det_hold).
+        if self._pause_state == PauseState.PAUSED_ALL:
+            # Do not schedule any requests when paused.
             token_budget = 0
 
         # Encoder-related.
@@ -1054,49 +1045,11 @@ class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
     _update_after_schedule nor _update_request_with_output, so both resolve to
     AsyncScheduler.
 
-    Cold start: stepping can begin before every in-flight client request has
-    been ingested from the EngineCore input queue, so how many requests are
-    admitted before the first prefill varies with IPC timing - and with it the
-    per-step DP batch composition. schedule() holds the first step until
-    ingestion quiesces; see _det_quiesced.
+    Nothing here holds the first step. Async can begin stepping before every
+    in-flight client request has been ingested from the EngineCore input queue,
+    so how many requests are admitted before the first prefill varies with IPC
+    timing, and with it whether a rank drops into decode while a peer is still
+    prefilling. A wall-clock hold used to paper that over; it guarded only the
+    cold start of an already-balanced request set, and the damage is done in the
+    runner's DP padding decision, not here. See docs/dp_phase_alignment.md.
     """
-
-    def _det_quiesced(self) -> bool:
-        """True once the initially-queued request set has stopped growing.
-
-        Until then the caller schedules nothing and this sleeps briefly, letting
-        the EngineCore loop drain more requests from its input queue. Re-arms
-        when the engine goes idle; returns True immediately once warm.
-        """
-        if not self.waiting and not self.running:
-            # Engine idle: nothing to hold for; re-arm for the next cold start.
-            self._det_warm = False
-            self._det_last_n = -1
-            self._det_stable = 0
-            return True
-        if self._det_warm or self.running:
-            # Already warmed, or a batch is already stepping -- don't stall it.
-            self._det_warm = True
-            return True
-        # Cold start with pending prefills only: wait for ingestion to settle.
-        n = len(self.waiting)
-        if n != self._det_last_n:
-            self._det_last_n = n
-            self._det_stable = 0
-        else:
-            self._det_stable += 1
-        if self._det_stable >= 3:
-            self._det_warm = True
-            return True
-        time.sleep(0.01)
-        return False
-
-    def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
-        # The signature must track RBLNScheduler.schedule: step_with_batch_queue
-        # calls schedule(self._should_throttle_prefills()), and that is the
-        # async-only path, so a stale signature here breaks every async run.
-        #
-        # Hold the first step until request ingestion quiesces so the DP batch
-        # composition is deterministic (see class docstring).
-        self._det_hold = not self._det_quiesced()
-        return super().schedule(throttle_prefills)
