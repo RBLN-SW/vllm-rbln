@@ -277,7 +277,7 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
                 return None
             num_layers = len(present[0][key])
             return [
-                torch.cat([c[key][layer].to(self.dtype) for c in present], dim=0)
+                torch.cat([c[key][layer] for c in present], dim=0)
                 for layer in range(num_layers)
             ]
 
