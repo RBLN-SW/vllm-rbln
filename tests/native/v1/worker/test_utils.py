@@ -1254,5 +1254,3 @@ class TestRblnSysfsReaders:
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):
             assert read_rbln_card_dram_total_bytes() == expected
-
-
