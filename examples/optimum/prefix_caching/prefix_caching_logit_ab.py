@@ -38,6 +38,7 @@ import os
 from itertools import cycle, islice
 
 os.environ.setdefault("VLLM_RBLN_USE_VLLM_MODEL", "1")
+os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "60")
 
 from vllm import LLM, SamplingParams  # noqa: E402
 from vllm.inputs import TokensPrompt  # noqa: E402
