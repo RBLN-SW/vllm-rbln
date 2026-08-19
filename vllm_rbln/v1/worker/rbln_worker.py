@@ -1311,6 +1311,7 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
+        self._release_offload_temp_storage()
         self.model_runner.performance_ctx.print_stats()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
@@ -1318,6 +1319,19 @@ class RBLNWorker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
+
+    def _release_offload_temp_storage(self) -> None:
+        # The runtime drops the offload dir on teardown, but that runs last and vLLM
+        # SIGKILLs a worker seconds after asking it to stop, so reclaim up front.
+        if not has_torch_rbln:
+            return
+        try:
+            num_removed = torch.rbln.release_offload_temp_storage()
+        except Exception:
+            logger.exception("Failed to release RBLN offload temp storage")
+            return
+        if num_removed:
+            logger.info("Released %d RBLN offload temp file(s)", num_removed)
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without

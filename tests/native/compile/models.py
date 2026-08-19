@@ -38,7 +38,7 @@ _MINIMAX_BASE = CompileModelSpec(
     "MiniMaxAI/MiniMax-M2.7",
     {
         "max_num_seqs": 1,
-        "max_model_len": 204800,
+        "max_model_len": 51200,
         "block_size": 1024,
         "max_num_batched_tokens": 512,
         "enable_expert_parallel": True,
@@ -101,5 +101,5 @@ MODELS: list[CompileModelSpec] = [
     ),
     _MINIMAX_BASE.variant(data_parallel_size=4),
     _MINIMAX_BASE.variant(tensor_parallel_size=4),
-    _MINIMAX_BASE.variant(pipeline_parallel_size=4),
+    _MINIMAX_BASE.variant(max_num_seqs=4, pipeline_parallel_size=4),
 ]
