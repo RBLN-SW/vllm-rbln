@@ -28,7 +28,7 @@ import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
-from vllm_rbln.v1.sample.ops import build_op_top_k_top_p
+from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
 

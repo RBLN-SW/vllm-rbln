@@ -22,7 +22,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_rbln.v1.sample import rbln_rejection_sampler as module
-from vllm_rbln.v1.sample.ops import (
+from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TOP_K,
     GREEDY_TOP_P,
     build_op_top_k_top_p,
