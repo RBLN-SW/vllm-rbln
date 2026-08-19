@@ -559,7 +559,10 @@ class RblnPlatform(Platform):
 
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+        from vllm_rbln.utils.optimum.predicates import (
+            is_qwen3_embedding,
+            is_qwen3_reranker,
+        )
         from vllm_rbln.utils.optimum.registry import (
             is_enc_dec_arch,
             is_pooling_arch,
@@ -584,7 +587,8 @@ class RblnPlatform(Platform):
 
         else:
             # Prefix caching is supported only for decoder-only models for now.
-            if is_qwen3_pooling(vllm_config.model_config):
+            model_config = vllm_config.model_config
+            if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
                 # Qwen3 pooling model does not support prefix caching for now.
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):
