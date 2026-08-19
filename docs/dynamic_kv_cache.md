@@ -70,9 +70,6 @@ would serve from the pre-compile estimate this feature exists to replace.
   nothing to shrink, and cancelling the shrink cancels the reallocation too.
   Raise the estimate with a smaller `--block-size`, a higher
   `--gpu-memory-utilization`, or more devices.
-- **The compiler does not carry the dynamic KV API.** `rebel.kv_cache.max_num_blocks`
-  and `DynamoRuntime.reset_adaptive_buffers` are both checked before anything is
-  compiled. Upgrade `rebel-compiler`.
 - **No artifact reported a memory profile.** Usually a `VLLM_CACHE_ROOT` replaying
   a static build. Use a fresh directory.
 - **The per-chiplet budget cannot hold the base usage.** Raise

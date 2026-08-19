@@ -49,13 +49,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
-# NOTE(RBLN): sysfs lists every card on the host, /dev only the ones this process
-# was given. `RBLN_DEVICES` indexes the latter, so reading sysfs by the raw entry
-# charges a neighbouring container's workload to this worker.
+# sysfs lists every card on the host, /dev only ours; reading sysfs by the raw
+# RBLN_DEVICES entry would charge a neighbouring container's workload to us.
 RBLN_DEV_DIR = "/dev"
 
-# 144 GiB of quad-chiplet DRAM minus the 4 GiB system region; the ceiling
-# `read_rbln_card_dram_total_bytes` clamps to.
+# 144 GiB of quad-chiplet DRAM minus the 4 GiB system region
 REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
 
 
@@ -347,12 +345,8 @@ def estimate_available_memory(
         rsd_size = REBEL_CHIPLET_SIZE
         available_dram_bytes = REBEL_DRAM_NBYTES
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            # NOTE(RBLN): only under the flag. The driver's figure and the
-            # built-in constant agree on every card measured so far, so reading
-            # sysfs here would change nothing today -- but it would make the
-            # default path's KV size depend on a driver release, which is not
-            # this feature's to decide. The reader clamps to REBEL_DRAM_NBYTES,
-            # so it can only ever report less.
+            # Flag-gated: reading the driver would tie the default path's KV
+            # size to a driver release, which is not this feature's to decide.
             try:
                 sysfs_dram_total = read_rbln_card_dram_total_bytes()
             except RuntimeError as exc:

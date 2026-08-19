@@ -55,10 +55,9 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
 @register_patch(
     target="vllm.v1.engine.core.EngineCore._initialize_kv_caches",
     reason=(
-        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE resizes the KV cache after warm-up, "
-        "once the compiled artifact can report how many blocks fit the device. "
-        "Re-announce that number to the scheduler's block pool, which was "
-        "otherwise sized from the pre-compile estimate."
+        "upstream offers no extension point between warm-up and Scheduler "
+        "construction, and the true block count exists only after warm-up, "
+        "when the compiled artifact reports its memory profile."
     ),
     condition=lambda: envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE,
 )
@@ -143,30 +142,20 @@ def _log_gpu_kv_cache_size(
     Upstream emits its line before warm-up and `info_once` will not repeat it,
     so these keep upstream's wording for whatever parses the first one.
     """
-    try:
-        from vllm.v1.core.kv_cache_utils import (
-            get_max_concurrency_for_kv_cache_config,
-        )
+    from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
-        max_model_len = vllm_config.model_config.max_model_len
-        max_concurrency = get_max_concurrency_for_kv_cache_config(
-            vllm_config, kv_cache_config
-        )
-        logger.info(
-            "GPU KV cache size: %s tokens (num_blocks=%d, after the dynamic KV resize)",
-            f"{int(max_concurrency * max_model_len):,}",
-            kv_cache_config.num_blocks,
-        )
-        logger.info(
-            "Maximum concurrency for %s tokens per request: %.2fx (after the "
-            "dynamic KV resize)",
-            f"{max_model_len:,}",
-            max_concurrency,
-        )
-    except Exception as exc:
-        # Reporting must never break start-up.
-        logger.warning(
-            "could not recompute the GPU KV cache size at num_blocks=%d: %s",
-            kv_cache_config.num_blocks,
-            exc,
-        )
+    max_model_len = vllm_config.model_config.max_model_len
+    max_concurrency = get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    )
+    logger.info(
+        "GPU KV cache size: %s tokens (num_blocks=%d, after the dynamic KV resize)",
+        f"{int(max_concurrency * max_model_len):,}",
+        kv_cache_config.num_blocks,
+    )
+    logger.info(
+        "Maximum concurrency for %s tokens per request: %.2fx (after the "
+        "dynamic KV resize)",
+        f"{max_model_len:,}",
+        max_concurrency,
+    )

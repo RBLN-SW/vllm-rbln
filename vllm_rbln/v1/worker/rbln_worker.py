@@ -99,12 +99,12 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
-# Trace hint for the mark_dynamic'd KV dim, not a capacity, so it cannot be
-# derived from max_model_len/block_size. 2-block artifacts abort on device
-# (SYS_TASK_ABORTED) at larger max_num_batched_tokens; 4 is the measured floor.
+# Trace hint for the mark_dynamic'd KV dim, not a capacity: dynamo specializes
+# a smaller dim away, and below this artifacts abort on device at larger
+# max_num_batched_tokens.
 COMPILE_KV_CACHE_NUM_BLOCKS = 4
 # Held back from every chiplet's budget for device memory no profile region
-# describes. Measured at 41,968,576 B, rounded up; costs no blocks in practice.
+# describes.
 DYNAMIC_KV_UNPROFILED_RESERVE_BYTES = 48 * 1024 * 1024
 
 
@@ -176,10 +176,6 @@ class RBLNWorker(WorkerBase):
         # num_blocks vLLM sized the cache with, stashed while it is shrunk for
         # the compile. None when no shrink is pending.
         self._kv_blocks_before_shrink: int | None = None
-        # Runtimes whose profile fed the block-count answer. Each must have its
-        # adaptive-size latch cleared after the reallocation or its next forward
-        # raises inside the rbln runtime.
-        self._dynamic_kv_profiled_runtime_ids: set[int] = set()
         # Other tenants' device DRAM, sampled before this worker allocates
         # anything. Card-scope; only `_dynamic_kv_chiplet_budget` reads it.
         self._foreign_dram_used_bytes = 0
@@ -648,22 +644,6 @@ class RBLNWorker(WorkerBase):
             runtimes.append(runtime)
         return runtimes
 
-    def _assert_dynamo_runtimes(self, runtimes: list[Any]) -> None:
-        """Guard: adaptive buffer sizes are a `DynamoRuntime`-only feature.
-
-        The other classes ignore the resize silently.
-        """
-        offenders = [
-            type(runtime).__name__
-            for runtime in runtimes
-            if type(runtime).__name__ != "DynamoRuntime"
-        ]
-        if offenders:
-            raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs every KV-holding runtime to "
-                f"be a rebel DynamoRuntime; found {sorted(set(offenders))}."
-            )
-
     def _dynamic_kv_device_topology(self, runtimes: list[Any]) -> tuple[int, int]:
         """`(num_nodes, num_chiplets)` from a runtime's allocation report.
 
@@ -704,7 +684,7 @@ class RBLNWorker(WorkerBase):
         """
         resident_blocks = self.model_runner.kv_cache_config.num_blocks
         tp_size = self.parallel_config.tensor_parallel_size
-        if resident_blocks <= 0 or tp_size <= 1:
+        if tp_size <= 1:
             return budget
 
         # Difference of two aligned usages, not num_blocks * bytes_per_block:
@@ -753,9 +733,8 @@ class RBLNWorker(WorkerBase):
         `floor(dram_total / num_chiplets * gmu)` minus the unprofiled reserve
         minus other tenants' usage.
         """
-        # NOTE(RBLN): capacity-derived on purpose. `max_num_blocks` subtracts the
-        # profile's own `base_bytes`, which is already resident, so feeding it a
-        # measured *free* figure charges the base twice.
+        # Capacity-derived on purpose: `max_num_blocks` subtracts the profile's
+        # own `base_bytes`, so a free-memory figure would charge it twice.
         dram_total = read_rbln_card_dram_total_bytes()
         if dram_total is None:
             raise RuntimeError(
@@ -818,15 +797,7 @@ class RBLNWorker(WorkerBase):
             return None
 
         runtimes = self._collect_dynamic_kv_runtimes()
-        if not runtimes:
-            raise RuntimeError(
-                "[Dynamic KV] no rbln runtime was registered during warm-up, so "
-                "the compiled memory profile cannot be queried."
-            )
-        self._assert_dynamo_runtimes(runtimes)
-
         profiles = []
-        profiled_ids: set[int] = set()
         for runtime in runtimes:
             executor = getattr(runtime, "_executor", None)
             if executor is None:
@@ -854,7 +825,6 @@ class RBLNWorker(WorkerBase):
                 )
                 continue
             profiles.append(profile)
-            profiled_ids.add(id(runtime))
             # The only record of base_bytes / bytes_per_block / alignment; see
             # kv_profile.SOURCE_PROFILE_LOG_KEY.
             logger.info(
@@ -935,7 +905,6 @@ class RBLNWorker(WorkerBase):
                 runtime.get_alloc_per_chiplet(1),
             )
 
-        self._dynamic_kv_profiled_runtime_ids = profiled_ids
         return num_blocks
 
     def apply_dynamic_kv_num_blocks(self, n: int | None) -> int | None:
@@ -957,7 +926,6 @@ class RBLNWorker(WorkerBase):
                 "[Dynamic KV] KV cache already holds %d blocks; nothing to reallocate.",
                 target,
             )
-            self._dynamic_kv_profiled_runtime_ids = set()
             return target
 
         if n is None:
@@ -974,11 +942,8 @@ class RBLNWorker(WorkerBase):
     def _materialize_kv_cache(self) -> None:
         """One decode step so the resized pool is paid for at boot, not by a user.
 
-        The reallocation leaves physical allocation to the next forward.
-        Measured on Qwen2.5-3B TP1: without this, the first request
-        materializes the whole pool (8 -> 111 GiB) and its TTFT is 19.8 s vs
-        0.03 s; on a shared device that window can also lose the memory the
-        scheduler was already promised.
+        The reallocation leaves physical allocation to the next forward, which
+        would otherwise land on the first request.
         """
         # The smallest decode bucket warmup already compiled: no new graph.
         num_reqs = min(self.model_runner.bucketing_manager.decode_batch_buckets)
@@ -989,9 +954,8 @@ class RBLNWorker(WorkerBase):
         """Drop every reference to the outgoing KV cache and free its device DRAM.
 
         Called *before* the replacement is allocated. Otherwise the old tensors
-        outlive the free, the allocator keeps their blocks reserved (measured at
-        4.5 GiB per card), and the peak is base + old + new rather than
-        base + max(old, new).
+        outlive the free, the allocator keeps their blocks reserved, and the
+        peak is base + old + new rather than base + max(old, new).
         """
         mr = self.model_runner
 
@@ -1089,23 +1053,12 @@ class RBLNWorker(WorkerBase):
         # changed after adaptive buffers were fixed'. No getattr: a missing
         # symbol must fail here, not on the first request.
         runtimes = self._collect_dynamic_kv_runtimes()
-        reset_ids: set[int] = set()
         for runtime in runtimes:
             runtime.reset_adaptive_buffers()
-            reset_ids.add(id(runtime))
-        missing = self._dynamic_kv_profiled_runtime_ids - reset_ids
-        if missing:
-            raise RuntimeError(
-                f"{len(missing)} runtime(s) contributed a KV memory profile but "
-                "were not reset after the reallocation."
-            )
         logger.info(
-            "[Dynamic KV] reset_adaptive_buffers() on %d runtime(s) "
-            "(%d contributed a profile).",
-            len(reset_ids),
-            len(self._dynamic_kv_profiled_runtime_ids),
+            "[Dynamic KV] reset_adaptive_buffers() on %d runtime(s).",
+            len(runtimes),
         )
-        self._dynamic_kv_profiled_runtime_ids = set()
 
     @instrument(span_name="Warmup (NPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:

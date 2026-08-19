@@ -64,12 +64,6 @@ Building from source? See **[DEVELOPMENT.md](./DEVELOPMENT.md)** for the `uv` de
 - [Overview & Supported Models](https://docs.rbln.ai/software/model_serving/vllm_support/vllm-rbln.html)
 - [API Tutorial](https://docs.rbln.ai/software/model_serving/vllm_support/tutorial/vllm_llama3-8b.html)
 
-In-tree notes on RBLN-specific behaviour:
-
-- [Bucketing](./docs/bucketing.md)
-- [Sub-block prefix caching](./docs/sub_block_prefix_caching.md)
-- [Dynamic KV cache sizing](./docs/dynamic_kv_cache.md)
-
 
 ## 🤝 Contributing
 

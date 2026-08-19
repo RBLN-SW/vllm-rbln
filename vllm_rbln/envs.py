@@ -310,10 +310,7 @@ environment_variables = {
         os.environ.get("VLLM_RBLN_NUM_RAY_NODES", 1)
     ),
     # --- DYNAMIC KV CACHE ---
-    # Size the KV cache from each compiled artifact's kv_cache_memory_profile()
-    # instead of from the pre-compile estimate. Requires the torch.compile path
-    # (VLLM_RBLN_USE_VLLM_MODEL=1): only DynamoRuntime applies adaptive buffer
-    # sizes, the others ignore them silently.
+    # Size the KV cache from the compiled artifact instead of the estimate
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()

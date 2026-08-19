@@ -997,11 +997,10 @@ class TestDynamicKvFailuresRaise:
                 kv_cache_config=SimpleNamespace(num_blocks=211)
             ),
             _collect_dynamic_kv_runtimes=lambda: list(runtimes),
-            _assert_dynamo_runtimes=lambda rs: None,
         )
 
     def test_no_runtime_after_the_shrink_raises(self):
-        with pytest.raises(RuntimeError, match="no rbln runtime was registered"):
+        with pytest.raises(RuntimeError, match="not one of the 0"):
             RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(runtimes=()))
 
     def test_no_profile_after_the_shrink_raises(self):
@@ -1043,7 +1042,6 @@ class TestApplyResizesThenMaterializes:
         calls: list = []
         worker = SimpleNamespace(
             _kv_blocks_before_shrink=before_shrink,
-            _dynamic_kv_profiled_runtime_ids={1},
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(num_blocks=current)
             ),
@@ -1067,7 +1065,6 @@ class TestApplyResizesThenMaterializes:
         worker, calls = self._worker(before_shrink=4, current=4)
         assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, 4) == 4
         assert calls == []
-        assert worker._dynamic_kv_profiled_runtime_ids == set()
 
     def test_nothing_pending_returns_none(self):
         worker, calls = self._worker(before_shrink=None)

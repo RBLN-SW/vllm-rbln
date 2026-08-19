@@ -473,27 +473,6 @@ class RblnPlatform(Platform):
                 "transfer connector; the resize invalidates its registrations."
             )
 
-        try:
-            from rebel.kv_cache import max_num_blocks  # noqa: F401
-        except ImportError as exc:
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs rebel.kv_cache.max_num_blocks "
-                f"(rebel_compiler #10678): {exc}"
-            ) from exc
-
-        try:
-            from rebel.sync_runtime import DynamoRuntime
-        except ImportError:
-            # The class moved or is not importable here; the per-runtime type
-            # check in _assert_dynamo_runtimes still covers the real objects.
-            return
-        # Defined on BaseRuntime, which DynamoRuntime inherits from.
-        if not hasattr(DynamoRuntime, "reset_adaptive_buffers"):
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs "
-                "DynamoRuntime.reset_adaptive_buffers (rebel_compiler #10678)."
-            )
-
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry

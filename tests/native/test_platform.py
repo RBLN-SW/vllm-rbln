@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import copy
 import os
-import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -566,57 +565,6 @@ class TestDynamicKvConfig:
             patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
             pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR=1"),
         ):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg())
-
-    # -- compiler capability probe: both symbols arrived in rebel_compiler
-    # #10678 and are only reached after warm-up, so an older compiler would
-    # otherwise pay the whole compile and then die on a bare ImportError.
-
-    class _RuntimeWithReset:
-        def reset_adaptive_buffers(self) -> None:
-            pass
-
-    class _RuntimeWithoutReset:
-        pass
-
-    @classmethod
-    def _modules(cls, *, kv_cache: bool, reset_adaptive: bool) -> dict:
-        mods: dict = {"rebel": SimpleNamespace()}
-        if kv_cache:
-            mods["rebel.kv_cache"] = SimpleNamespace(max_num_blocks=lambda *a, **k: 0)
-        mods["rebel.sync_runtime"] = SimpleNamespace(
-            DynamoRuntime=(
-                cls._RuntimeWithReset if reset_adaptive else cls._RuntimeWithoutReset
-            )
-        )
-        return mods
-
-    def test_passes_when_both_compiler_symbols_exist(self):
-        with patch.dict(sys.modules, self._modules(kv_cache=True, reset_adaptive=True)):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg())
-
-    def test_rejects_a_compiler_without_max_num_blocks(self):
-        mods = self._modules(kv_cache=False, reset_adaptive=True)
-        # Block the real module too, so an installed compiler cannot mask this.
-        mods["rebel.kv_cache"] = None
-        with (
-            patch.dict(sys.modules, mods),
-            pytest.raises(ValueError, match="max_num_blocks"),
-        ):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg())
-
-    def test_rejects_a_runtime_without_reset_adaptive_buffers(self):
-        with (
-            patch.dict(sys.modules, self._modules(kv_cache=True, reset_adaptive=False)),
-            pytest.raises(ValueError, match="reset_adaptive_buffers"),
-        ):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg())
-
-    def test_a_missing_runtime_module_is_not_fatal(self):
-        """`_assert_dynamo_runtimes` still checks the real objects later."""
-        mods = self._modules(kv_cache=True, reset_adaptive=True)
-        mods["rebel.sync_runtime"] = None
-        with patch.dict(sys.modules, mods):
             RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
     def test_the_hook_validates_only_under_the_flag(self, monkeypatch, reconfigure):
