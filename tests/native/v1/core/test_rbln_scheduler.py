@@ -1263,9 +1263,12 @@ class TestDeferredBlockFree:
             use_kv_connector=MockKVConfig(),
         )
         manager = sched.kv_cache_manager
-        # 32 tokens over a 16-token block with 8-token sub-blocks: the second
-        # block is partial once the step advances, which is what gets indexed.
-        request = create_requests(1, num_tokens=32)[0]
+        # 24 tokens over a 16-token block with 8-token sub-blocks: one full block
+        # plus an 8-token partial. Ordinary caching hashes the full block only, so
+        # the partial one's hash can come from nothing but this path -- a multiple
+        # of the block size would leave no partial block at all and the assert
+        # below would hold either way.
+        request = create_requests(1, num_tokens=24)[0]
         sched.add_request(request)
         sched.schedule()
         partial_block = manager.coordinator.get_blocks(request.request_id)[0][-1]
