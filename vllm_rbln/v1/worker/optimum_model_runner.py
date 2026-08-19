@@ -83,11 +83,8 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
-from vllm_rbln.utils.optimum.registry import (
-    get_rbln_model_info,
-    validate_arch_supported,
-)
+from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
+from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
@@ -122,14 +119,22 @@ class RBLNOptimumModelRunner(
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Validate against upstream vLLM's registry BEFORE the Qwen3 arch remap
-        # below — the remapped name (Qwen3Model) is not in upstream vLLM, but the
-        # original HF arch (Qwen3ForCausalLM) is.
-        validate_arch_supported(vllm_config.model_config)
-        _, model_cls_name = get_rbln_model_info(vllm_config.model_config)
+        # Raises if the architecture has no optimum-rbln counterpart. Must run
+        # before the remap below, which rewrites it to an optimum-rbln-internal
+        # name. vLLM has already rejected anything it cannot resolve itself, so
+        # this only has to cover the RBLN side.
+        get_rbln_model_info(vllm_config.model_config)
 
-        if is_qwen3_pooling(vllm_config.model_config):
-            # NOTE The architecture of Qwen3-Embedding model in huggingface
+        if is_qwen3_reranker(vllm_config.model_config):
+            # Callers pass `Qwen3ForSequenceClassification`, which is how vLLM
+            # selects convert=classify; optimum-rbln has no such class. Map it
+            # back to `Qwen3ForCausalLM`: the score comes from two vocabulary
+            # logits, so the graph needs lm_head, which `Qwen3Model` would drop.
+            vllm_config.model_config.hf_config.__dict__["architectures"] = [
+                "Qwen3ForCausalLM"
+            ]
+        elif is_qwen3_embedding(vllm_config.model_config):
+            # The architecture of Qwen3-Embedding model in huggingface
             # is `Qwen3ForCausalLM`. But it have to be mapped to `Qwen3Model`
             # for optimum-rbln.
             vllm_config.model_config.hf_config.__dict__["architectures"] = [

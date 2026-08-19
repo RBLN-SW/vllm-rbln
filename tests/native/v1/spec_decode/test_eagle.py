@@ -14,7 +14,13 @@
 
 """Tests for RBLNEagleProposer methods (spec_decode/eagle.py), built through its
 real constructor from upstream's eagle model pair with the compiled model left
-unset; scenarios mirror upstream's tests/v1/spec_decode/test_eagle.py."""
+unset; scenarios mirror upstream's tests/v1/spec_decode/test_eagle.py.
+
+The draft->target id mapping (`_to_target_token_ids`, and the `logits_processor`
+branch in the load_model wrapper) has no upstream counterpart -- upstream widens
+the draft logits inside compute_logits, which this platform cannot compile.
+Those tests pin the RBLN detour, so do not resolve a divergence from upstream by
+deleting them."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -70,7 +76,9 @@ def _fake_model_exec(argmax_tokens, hidden_size):
         logits = torch.full((8, 128), -10.0)
         for i, tok in enumerate(argmax_tokens):
             logits[i, tok] = 10.0
-        return hidden_states.reshape(-1, hidden_size), logits
+        # Filled on the host but returned on the device the real executable
+        # returns, so the argmax and any d2t gather run where production runs them.
+        return hidden_states.reshape(-1, hidden_size), logits.to(hidden_states.device)
 
     return executable
 
@@ -340,6 +348,55 @@ class TestInitGuards:
             make_eagle_proposer()
 
 
+class TestToTargetTokenIds:
+    def test_applies_d2t_as_an_offset(self):
+        # d2t holds offsets, not absolute target ids: id -> id + d2t[id]. Both
+        # operands sit on the proposer's device, so this is the gather production
+        # runs -- the reason the mapping moved out of the compiled graph.
+        proposer = make_eagle_proposer()
+        proposer.draft_id_to_target_id = torch.tensor(
+            [0, 2, 3, 5, 8], dtype=torch.long, device=proposer.device
+        )
+        draft_ids = torch.tensor(
+            [0, 1, 4, 2], dtype=torch.int64, device=proposer.device
+        )
+
+        out = proposer._to_target_token_ids(draft_ids)
+
+        assert out.cpu().tolist() == [0, 3, 12, 5]
+
+    def test_matches_full_vocab_scatter_then_argmax(self):
+        # Upstream widens the draft logits into the target vocabulary and
+        # argmaxes there. Dropping that scatter is only safe because
+        # argmax-then-map picks the same id for a monotonic mapping.
+        target_vocab_size = 20
+        d2t = torch.tensor([0, 2, 3, 5, 8, 11], dtype=torch.long)
+        target_ids = torch.arange(d2t.shape[0], dtype=torch.long) + d2t
+        # The two premises of that equivalence; without them the reference below
+        # would agree only by accident.
+        assert bool((target_ids.diff() > 0).all())
+        assert int(target_ids.max()) < target_vocab_size
+        draft_logits = torch.tensor(
+            [
+                [0.0, 9.0, 1.0, 2.0, 3.0, 4.0],
+                [5.0, 1.0, 0.0, 0.0, 7.0, 2.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 8.0],
+            ]
+        )
+        full_logits = torch.full(
+            (draft_logits.shape[0], target_vocab_size), float("-inf")
+        )
+        full_logits[:, target_ids] = draft_logits
+        proposer = make_eagle_proposer()
+        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+
+        out = proposer._to_target_token_ids(
+            draft_logits.argmax(dim=-1).to(proposer.device)
+        )
+
+        assert out.cpu().tolist() == full_logits.argmax(dim=-1).tolist()
+
+
 class TestPropose:
     def test_single_step_early_exit_argmaxes_once(self, monkeypatch):
         # num_speculative_tokens == 1 takes the early-exit branch: one model pass,
@@ -413,18 +470,101 @@ class TestPropose:
         with pytest.raises(AssertionError):
             _call_propose(proposer)
 
+    def test_single_step_maps_draft_ids_into_target_space(self, monkeypatch):
+        # The early-exit branch maps too; an unmapped draft id names a different
+        # token in the target vocabulary.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=1)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.model_executable = _fake_model_exec([42, 60], proposer.hidden_size)
+        d2t = torch.zeros(128, dtype=torch.long)
+        d2t[42], d2t[60] = 5, 7
+        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+
+        out = _call_propose(proposer)
+
+        assert out.cpu().tolist() == [[47], [67]]
+
+    def test_multi_step_feeds_the_mapped_id_forward(self, monkeypatch):
+        # Each draft is mapped before it becomes the next step's input: the draft
+        # head's input embedding is in target space even when its output head is
+        # not.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=2)
+        _wire_runner(proposer, num_reqs=2)
+        d2t = torch.zeros(128, dtype=torch.long)
+        d2t[1], d2t[2], d2t[3], d2t[4] = 2, 3, 5, 8
+        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        argmax_per_call = [[1, 3], [2, 4]]
+        seen: list[torch.Tensor] = []
+
+        def executable(
+            *,
+            input_ids,
+            positions,
+            hidden_states,
+            inputs_embeds,
+            token_indices_to_sample,
+        ):
+            logits = torch.full((8, 128), -10.0)
+            for row, tok in enumerate(argmax_per_call[len(seen)]):
+                logits[row, tok] = 10.0
+            seen.append(input_ids.clone())
+            return (
+                hidden_states.reshape(-1, proposer.hidden_size),
+                logits.to(hidden_states.device),
+            )
+
+        proposer.model_executable = executable
+
+        out = proposer.propose(
+            target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
+            target_positions=torch.tensor([4, 5, 6, 7], dtype=torch.int64),
+            target_hidden_states=torch.zeros(4, proposer.hidden_size),
+            next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
+            token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
+            common_attn_metadata=make_cad([0, 2, 4], [10, 11]),
+        )
+
+        # step 1 argmax [1, 3] -> [3, 8], which is what step 2 must be fed.
+        assert seen[1][:, 0].cpu().tolist() == [3, 8]
+        # step 2 argmax [2, 4] -> [5, 12].
+        assert out.cpu().tolist() == [[3, 5], [8, 12]]
+
 
 class TestLoadModel:
+    class _FakeMappedDraft(Eagle3LlamaForCausalLM):
+        """An EAGLE3 draft head whose output stays in draft-vocab space: it
+        carries a d2t mapping and a logits_processor. compute_logits only counts
+        calls -- reaching its full-vocab scatter is the defect under test."""
+
+        def __init__(self, d2t):
+            self.draft_id_to_target_id = d2t
+            self.lm_head = object()
+            self.logits_processor_calls: list[tuple[object, torch.Tensor]] = []
+            self.compute_logits_calls = 0
+
+        def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds):
+            return hidden_states + 1000, hidden_states + 2000
+
+        def logits_processor(self, lm_head, hidden_states):
+            self.logits_processor_calls.append((lm_head, hidden_states.clone()))
+            return hidden_states + 1
+
+        def compute_logits(self, sample_hidden_states):
+            self.compute_logits_calls += 1
+            return sample_hidden_states + 1
+
     @staticmethod
-    def _stub_super_load_model(monkeypatch):
+    def _stub_super_load_model(monkeypatch, model=None):
         from vllm.v1.spec_decode.eagle import EagleProposer
 
+        if model is None:
+            model = SimpleNamespace(compute_logits=lambda h: h)
         monkeypatch.setattr(
             EagleProposer,
             "load_model",
-            lambda self, target_model: setattr(
-                self, "model", SimpleNamespace(compute_logits=lambda h: h)
-            ),
+            lambda self, target_model: setattr(self, "model", model),
         )
 
     def test_eager_wrapper_when_enforce_eager(self, monkeypatch):
@@ -493,6 +633,45 @@ class TestLoadModel:
         assert out_hidden.shape == (2, h)
         assert out_hidden[:, 0].cpu().tolist() == [0.0, 2.0]
         assert out_logits[:, 0].cpu().tolist() == [1.0, 3.0]
+
+    def test_mapped_wrapper_skips_the_full_vocab_scatter(self, monkeypatch):
+        # A mapped head must reach logits_processor instead: compute_logits
+        # scatters into an -inf target-vocab row, and that index is
+        # input-independent, so it folds into a constant whose out-of-bounds
+        # write is the SIGSEGV in KV warm-up. What is checked here is the branch
+        # selection -- only a real compile on the device reaches the SIGSEGV, so
+        # this guards against someone routing back through compute_logits.
+        d2t = torch.tensor([0, 2, 3], dtype=torch.long)
+        model = self._FakeMappedDraft(d2t)
+        self._stub_super_load_model(monkeypatch, model)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        proposer.load_model(target_model=object())
+
+        # Taking that branch at all depends on load_model lifting d2t off the
+        # draft model, so this covers the capture too.
+        assert proposer.draft_id_to_target_id is d2t
+
+        h = proposer.hidden_size
+        hidden = torch.arange(2 * 3 * h, dtype=torch.float32).view(2, 3, h)
+        _, logits = proposer.model_executable(
+            input_ids=torch.zeros((2, 3), dtype=torch.int32),
+            positions=torch.zeros((2, 3), dtype=torch.int64),
+            hidden_states=hidden,
+            token_indices_to_sample=None,
+        )
+
+        assert model.compute_logits_calls == 0
+        assert len(model.logits_processor_calls) == 1
+        lm_head_arg, hidden_arg = model.logits_processor_calls[0]
+        assert lm_head_arg is model.lm_head
+        # model_returns_tuple() is True for eagle, so the wrapper samples from
+        # the first stream.
+        expected_sample = (hidden + 1000).view(-1, h)
+        assert torch.equal(hidden_arg, expected_sample)
+        assert torch.equal(logits, expected_sample + 1)
 
 
 class TestDummyRun:
