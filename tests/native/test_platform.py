@@ -335,12 +335,12 @@ class TestSchedulerOverrides:
         async with eagle / ngram / draft_model, so without this the combination
         reaches the runner and dies on that assert mid-decode.
         """
-        config = reconfigure(
-            lambda config: (
-                setattr(config.scheduler_config, "async_scheduling", True),
-                setattr(config, "speculative_config", object()),
-            )
-        )
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.async_scheduling = True
+            config.speculative_config = object()
+
+        config = reconfigure(mutate)
         assert config.scheduler_config.async_scheduling is False
         assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
 
