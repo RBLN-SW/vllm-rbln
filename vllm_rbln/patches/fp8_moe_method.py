@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NOTE(RBLN): Importing the RBLN quantization.fp8 module here also registers the
-# `rbln_custom_ops::custom_moe_glu_group_dequantize` custom op as an import side
-# effect, so pulling in this patch module is enough to make the op available.
 from vllm_rbln.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 from vllm_rbln.patches import register_patch
 

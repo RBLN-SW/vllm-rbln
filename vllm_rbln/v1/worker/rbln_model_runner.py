@@ -1544,6 +1544,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+            if not input_fits_in_drafter:
+                # Zero out draft tokens so the scheduler does not schedule
+                # stale drafts from the previous step. Matches upstream's
+                # `gpu_model_runner`, which is why `take_draft_token_ids`
+                # needs no `None` case.
+                self._draft_token_ids = torch.zeros(
+                    1, device=self.device, dtype=torch.int32
+                ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -3019,6 +3028,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             # 5. specdec (medusa)
             if self.speculative_config and self.speculative_config.method == "medusa":
+                assert isinstance(self.drafter, RBLNMedusaProposer)
                 self.drafter.dummy_run()
 
         mega_cache.save(self.model_config.model, sig)
@@ -3027,24 +3037,32 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        use_runtime_kv_copy = (
+        if (
             not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
-        )
-        for op in copy_ops:
-            if use_runtime_kv_copy:
+        ):
+            # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
+            # in this path (VLLM_RBLN_USE_VLLM_MODEL).
+            for op in copy_ops:
                 runtime = self.runtime_holder[0]
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
-            else:
-                for kv_cache in self.kv_caches:
-                    src = op.src_block_id
-                    dst = op.dst_block_id
-                    nt = op.num_tokens
-                    if self.model_config.use_mla:
-                        kv_cache[dst, :nt, :] = kv_cache[src, :nt, :]
-                    else:
-                        kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+            return
+
+        dsts: list[torch.Tensor] = []
+        srcs: list[torch.Tensor] = []
+        for op in copy_ops:
+            src = op.src_block_id
+            dst = op.dst_block_id
+            nt = op.num_tokens
+            for kv_cache in self.kv_caches:
+                if self.model_config.use_mla:
+                    dsts.append(kv_cache[dst, :nt, :])
+                    srcs.append(kv_cache[src, :nt, :])
+                else:
+                    dsts.append(kv_cache[:, dst, :, :, :nt, :])
+                    srcs.append(kv_cache[:, src, :, :, :nt, :])
+        torch._foreach_copy_(dsts, srcs)
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:

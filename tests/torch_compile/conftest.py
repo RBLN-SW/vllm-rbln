@@ -61,21 +61,6 @@ def _isolate_rbln_ctx_standalone():
     yield
 
 
-@pytest.fixture(autouse=True)
-def _keep_rbln_envs_lazy():
-    # `vllm_rbln.envs` serves values from `__getattr__`, so they never live in
-    # `__dict__`. `monkeypatch.setattr(envs, X, v)` undoes itself with `setattr`
-    # and leaves a real attribute shadowing the getter for the rest of the
-    # session; every later test then reads one frozen value and
-    # `monkeypatch.setenv` stops working. Drop whatever landed in `__dict__`.
-    # (`mock.patch` deletes rather than restores, so it never needed this.)
-    import vllm_rbln.envs as rbln_envs
-
-    yield
-    for name in list(rbln_envs.environment_variables):
-        rbln_envs.__dict__.pop(name, None)
-
-
 @pytest.fixture(scope="class")
 def monkeypatch_class():
     monkeypatch = pytest.MonkeyPatch()

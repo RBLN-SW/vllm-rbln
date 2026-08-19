@@ -36,6 +36,7 @@ from . import (
     minimax_m2,
     mla,
     models_utils,
+    multi_connector,
     oot,
     profiler,
     qwen2_moe,
