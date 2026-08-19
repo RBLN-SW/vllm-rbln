@@ -70,6 +70,7 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
+from vllm_rbln.compilation.backends import set_compile_stage
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
@@ -968,7 +969,22 @@ class RBLNWorker(WorkerBase):
                 current,
             )
         self._reallocate_kv_cache(target)
+        self._materialize_kv_cache()
         return target
+
+    def _materialize_kv_cache(self) -> None:
+        """One decode step so the resized pool is paid for at boot, not by a user.
+
+        The reallocation leaves physical allocation to the next forward.
+        Measured on Qwen2.5-3B TP1: without this, the first request
+        materializes the whole pool (8 -> 111 GiB) and its TTFT is 19.8 s vs
+        0.03 s; on a shared device that window can also lose the memory the
+        scheduler was already promised.
+        """
+        # The smallest decode bucket warmup already compiled: no new graph.
+        num_reqs = min(self.model_runner.bucketing_manager.decode_batch_buckets)
+        with set_compile_stage("warmup"), self.model_runner.offload_context():
+            self.model_runner._dummy_run(num_reqs, 1, False)
 
     def _release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
         """Drop every reference to the outgoing KV cache and free its device DRAM.
