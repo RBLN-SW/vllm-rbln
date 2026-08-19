@@ -536,9 +536,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 #   original sequence index
                 # * otherwise         - seq_lens[B, P] == seq_lens_tensor,
                 #   dynamic size for each partition
-                # Raw per-layer fp8 KV scales; the compiled op's converter
-                # normalizes their shape and rejects unsupported (per-head)
-                # layouts (rebel_compiler#12946).
                 k_quantize_scale = layer._k_scale
                 v_quantize_scale = layer._v_scale
                 cache_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
