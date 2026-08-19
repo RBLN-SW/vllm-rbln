@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnNixlConnectorScheduler: chunked-prefill save tracking in
-# build_connector_meta and the finished-request branches in request_finished.
-# Built bare with only the state its methods read.
+# RblnNixlConnectorScheduler: chunked-prefill save tracking and the
+# finished-request branches, exercised through the inherited entry points.
+# Built bare with only the state those paths read.
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -77,7 +77,7 @@ def _sched_output(req_id, block_ids, num_scheduled_tokens, *, is_new=True):
     )
 
 
-def _scheduler():
+def _scheduler(*, use_host_buffer=False):
     sched = object.__new__(RblnNixlConnectorScheduler)
     sched.vllm_config = MagicMock()
     sched.vllm_config.parallel_config.tensor_parallel_size = 1
@@ -86,7 +86,8 @@ def _scheduler():
     sched.kv_cache_config = MagicMock()
     sched.side_channel_host = "localhost"
     sched.side_channel_port = 5000
-    sched.use_host_buffer = False
+    # The save path is gated on this, so save tests must turn it on.
+    sched.use_host_buffer = use_host_buffer
     sched._is_hma_required = False  # get_sw_clipped_blocks (inherited) reads this
     sched.blocks_per_sw = [0]
     sched._kv_lease_duration = 30
@@ -96,6 +97,13 @@ def _scheduler():
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._block_ids_need_save = {}
+    # Base state the inherited entry points read.
+    sched._heartbeat_by_engine = {}
+    sched._heartbeat_req_engine = {}
+    sched._last_heartbeat_time = 0.0
+    sched._heartbeat_interval = 5
+    sched.is_bidirectional_kv_xfer_enabled = False
+    sched.decoder_kv_blocks_ttl = 480
     return sched
 
 
@@ -109,7 +117,7 @@ class TestInit:
     ):
         # host-bounce ("cpu") stages through host DRAM; D2D ("rbln") does not.
         monkeypatch.setattr(
-            sm.NixlConnectorScheduler, "__init__", lambda self, *a, **k: None
+            sm.NixlPullConnectorScheduler, "__init__", lambda self, *a, **k: None
         )
         vllm_config = SimpleNamespace(
             kv_transfer_config=SimpleNamespace(kv_buffer_device=kv_buffer_device)
@@ -124,7 +132,7 @@ class TestBuildConnectorMeta:
     def test_single_step_prefill_saves_immediately(self):
         # A prefill that finishes in one step is added to the save metadata and
         # dropped from both tracking dicts.
-        sched = _scheduler()
+        sched = _scheduler(use_host_buffer=True)
         req = _Request("prefill", num_prompt_tokens=256)
         sched._reqs_need_save["prefill"] = req
 
@@ -138,7 +146,7 @@ class TestBuildConnectorMeta:
     def test_chunked_prefill_defers_save_to_final_chunk(self):
         # Partial chunks accumulate blocks in _block_ids_need_save and are NOT
         # saved; only the final chunk (prompt fully computed) saves and clears.
-        sched = _scheduler()
+        sched = _scheduler(use_host_buffer=True)
         req = _Request("chunked", num_prompt_tokens=512)
         sched._reqs_need_save["chunked"] = req
 
@@ -205,12 +213,12 @@ class TestRequestFinished:
         req.kv_transfer_params = {"foo": 1}
         assert sched.request_finished(req, ([1],)) == (False, None)
 
-    def test_non_length_capped_cleans_up_tracking(self):
-        # A remote-decode producer that did not finish LENGTH_CAPPED (e.g. an
-        # aborted partial prefill) stops being tracked and frees now.
+    def test_aborted_producer_cleans_up_tracking(self):
+        # A remote-decode producer that ended without completing its prefill
+        # stops being tracked and frees now -- there is no KV worth sending.
         sched = _scheduler()
         req = _Request("aborted", num_prompt_tokens=512)
-        req.status = RequestStatus.FINISHED_STOPPED
+        req.status = RequestStatus.FINISHED_ABORTED
         sched._reqs_need_save["aborted"] = req
         sched._block_ids_need_save["aborted"] = ([1, 2],)
 
@@ -219,6 +227,32 @@ class TestRequestFinished:
         assert "aborted" not in sched._reqs_need_save
         assert "aborted" not in sched._block_ids_need_save
         assert "aborted" in sched._reqs_not_processed
+
+    def test_stopped_prefill_is_transferred_like_length_capped(self):
+        # A producer whose single generated token happens to be a stop token
+        # finishes STOPPED rather than LENGTH_CAPPED. Its KV is just as valid,
+        # so it must still be handed to the decode side.
+        sched = _scheduler()
+        req = _Request("stopped", num_prompt_tokens=256)
+        req.status = RequestStatus.FINISHED_STOPPED
+
+        delay, params = sched.request_finished(req, ([1, 2, 3, 4],))
+        assert delay is True
+        assert params is not None
+        assert params["do_remote_prefill"] is True
+        assert "stopped" in sched._reqs_need_send
+        assert "stopped" not in sched._reqs_not_processed
+
+    def test_partial_save_state_is_dropped_when_the_request_ends(self):
+        # _block_ids_need_save only holds blocks for a prefill still being
+        # chunked; whatever survives to request_finished is stale.
+        sched = _scheduler()
+        req = _Request("leftover", num_prompt_tokens=256)
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        sched._block_ids_need_save["leftover"] = ([9],)
+
+        sched.request_finished(req, ([1],))
+        assert "leftover" not in sched._block_ids_need_save
 
     def test_completed_prefill_delays_free_and_returns_remote_params(self):
         # A LENGTH_CAPPED remote-decode producer with real blocks delays the free
