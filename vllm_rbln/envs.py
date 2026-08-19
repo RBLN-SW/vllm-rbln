@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_METRICS_DIR: str = ""
+    VLLM_RBLN_SKIP_GUARD_EVAL: bool = False
     VLLM_RBLN_NUMA: bool = True
 
     # ====================================================================
@@ -227,6 +228,14 @@ environment_variables = {
     "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
     # Directory for per-worker JSON performance reports (empty disables).
     "VLLM_RBLN_METRICS_DIR": lambda: os.environ.get("VLLM_RBLN_METRICS_DIR", ""),
+    # After warmup, evaluate only Dynamo's differentiating guards
+    # (torch.compiler.set_stance(skip_guard_eval_unsafe=True)). Safe only
+    # because bucketing warmup pre-compiles every shape seen at runtime; an
+    # un-warmed shape raises RuntimeError instead of recompiling.
+    "VLLM_RBLN_SKIP_GUARD_EVAL": (
+        lambda: os.environ.get("VLLM_RBLN_SKIP_GUARD_EVAL", "False").lower()
+        in ("true", "1")
+    ),
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")

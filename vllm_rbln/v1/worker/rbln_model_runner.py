@@ -2997,6 +2997,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if self.speculative_config and self.speculative_config.method == "medusa":
                 self.drafter.dummy_run()
 
+        if envs.VLLM_RBLN_SKIP_GUARD_EVAL:
+            # Every runtime shape was pre-compiled above, so full guard
+            # evaluation only re-checks invariants Dynamo already burned in.
+            # Diff guards (the ones that pick between cache entries) still run.
+            torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+            logger.info(
+                "Dynamo guard evaluation reduced to diff guards "
+                "(VLLM_RBLN_SKIP_GUARD_EVAL=1)."
+            )
+
     def _process_kv_cache_copy_ops(
         self,
         copy_ops: list[KVCacheCopyOp],

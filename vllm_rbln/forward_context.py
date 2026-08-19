@@ -15,7 +15,7 @@
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -39,6 +39,22 @@ logger = init_logger(__name__)
 @dataclass
 class RBLNDPMetadata(DPMetadata):
     max_pads_across_dp: torch.Tensor | None = None
+
+    # Persistent per-(slot, shape, dtype) buffers for per-step tensors that
+    # feed the compiled graph. Reusing one buffer keeps the graph input
+    # identity-stable across steps (required by the runtime's input-identity
+    # caches and direct dispatch); contents are refreshed via copy_().
+    _stable_bufs: ClassVar[dict] = {}
+
+    @classmethod
+    def _stable_buf(cls, slot: str, t: torch.Tensor) -> torch.Tensor:
+        key = (slot, tuple(t.shape), t.dtype)
+        buf = cls._stable_bufs.get(key)
+        if buf is None:
+            buf = torch.empty_like(t)
+            cls._stable_bufs[key] = buf
+        buf.copy_(t)
+        return buf
 
     @staticmethod
     def num_tokens_across_dp(
@@ -133,7 +149,11 @@ class RBLNDPMetadata(DPMetadata):
             assert num_padded_tokens is not None, (
                 "num_padded_tokens should be applied for DP case"
             )
-            num_tokens_across_dp_cpu = num_tokens_across_dp
+            # A fresh all-reduce output every step would defeat input-identity
+            # caching downstream; hand the graph a persistent buffer instead.
+            num_tokens_across_dp_cpu = RBLNDPMetadata._stable_buf(
+                "num_tokens_across_dp", num_tokens_across_dp
+            )
             max_pad = num_padded_tokens
 
             max_pads_across_dp = torch.empty(max_pad, device="cpu")
