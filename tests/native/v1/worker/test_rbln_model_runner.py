@@ -177,25 +177,19 @@ class TestPadDepad:
 
 
 class TestPredicates:
-    def test_is_prefill_boundary(self):
-        # is_prefill: num_computed < num_tokens_no_spec - 1 (request 0).
-        r = _make_runner_stub(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([3]),
-                num_tokens_no_spec=np.array([10]),
-            )
-        )
+    def test_is_prefill_is_written_only_through_the_setter(self):
+        # The is_prefill setter is the sole write path; the getter -- the
+        # single source of truth -- returns it, so all PP ranks agree.
+        r = _make_runner_stub()
+        r.is_prefill = True
         assert r.is_prefill is True
-        r.input_batch.num_computed_tokens_cpu = np.array([9])
+        r.is_prefill = False
         assert r.is_prefill is False
 
     def test_is_intermediate_chunked_prefill(self):
-        # is_prefill AND discard_request_mask[0].
+        # is_prefill (the step phase) AND discard_request_mask[0].
         r = _make_runner_stub(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([3]),
-                num_tokens_no_spec=np.array([10]),
-            ),
+            _is_prefill_step=True,
             discard_request_mask=np.array([True]),
         )
         assert r.is_intermediate_chunked_prefill is True
@@ -319,11 +313,13 @@ class TestGetSupportedTasks:
 
 class TestDetermineBatchPadding:
     # data_parallel_size == 1 is the covered path (multi-DP needs RBLNDPMetadata
-    # collectives -> e2e). is_prefill is driven via the input_batch stub.
+    # collectives). The phase is driven via _is_prefill_step (is_prefill), not
+    # the runner's input_batch.
     @staticmethod
     def _runner(*, is_prefill, bucket=8):
         computed = 0 if is_prefill else 9
         return _make_runner_stub(
+            _is_prefill_step=is_prefill,
             bucketing_manager=SimpleNamespace(
                 find_decode_batch_bucket=lambda n: bucket
             ),
@@ -403,6 +399,8 @@ class TestDummyRunPadding:
             # use_wrapped_compute_logits is a property over this.
             is_pooling_model=True,
             speculative_config=None,
+            # Gates the drafter's dummy run; __init__ always sets it.
+            drafter=None,
             kv_cache_bases=None,
             vllm_config=None,
             input_stager=SimpleNamespace(stage=stage),

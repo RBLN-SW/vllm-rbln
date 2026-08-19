@@ -325,6 +325,33 @@ class RblnPlatform(Platform):
                     "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
                 )
 
+            # Under PP the compiled per-stage decode batch is max_num_seqs // pp_size
+            # (see decode_batch_size). Fail fast on an impossible config.
+            pp_size = parallel_config.pipeline_parallel_size
+            if pp_size > 1:
+                max_num_seqs = scheduler_config.max_num_seqs
+                if max_num_seqs < pp_size:
+                    raise ValueError(
+                        f"pipeline_parallel_size={pp_size} requires "
+                        f"max_num_seqs >= {pp_size} (got {max_num_seqs}); "
+                        f"per-stage decode batch would floor to 0."
+                    )
+                if max_num_seqs % pp_size != 0:
+                    logger.warning(
+                        "max_num_seqs=%d is not a multiple of "
+                        "pipeline_parallel_size=%d; %d decode slot(s) will be unused.",
+                        max_num_seqs,
+                        pp_size,
+                        max_num_seqs % pp_size,
+                    )
+                logger.info_once(
+                    "pipeline_parallel_size=%d, max_num_seqs=%d -> "
+                    "per-stage decode batch=%d.",
+                    pp_size,
+                    max_num_seqs,
+                    max_num_seqs // pp_size,
+                )
+
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
                 if not USE_DEVICE_TENSOR:

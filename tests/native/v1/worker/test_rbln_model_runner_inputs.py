@@ -30,8 +30,9 @@ pytestmark = pytest.mark.maybe_use_device
 
 
 def _decode_ready(runner, monkeypatch, *, num_spec_tokens: int) -> None:
-    """One request past its prompt, so is_prefill is False and the spec branch
-    is reachable."""
+    """One request past its prompt in the decode phase, so the spec branch is
+    reachable. The phase comes from the scheduler output, so it is set through
+    _is_prefill_step rather than derived from input_batch."""
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     runner._update_states(schedule_new("a"))
     runner.input_batch.num_computed_tokens_cpu[0] = 3
@@ -39,6 +40,7 @@ def _decode_ready(runner, monkeypatch, *, num_spec_tokens: int) -> None:
     # Patched rather than configured: a real speculative_config would pull in a
     # drafter, and none of the arithmetic under test depends on one.
     monkeypatch.setattr(runner, "num_spec_tokens", num_spec_tokens)
+    runner._is_prefill_step = False
     assert runner.is_prefill is False
 
 
