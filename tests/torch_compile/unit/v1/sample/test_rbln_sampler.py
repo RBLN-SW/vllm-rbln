@@ -59,13 +59,13 @@ def sampler(monkeypatch) -> RBLNSampler:
 def op_args(sampler) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Record the (top_k, top_p) tensors the sampling op receives."""
     recorded: list[tuple[torch.Tensor, torch.Tensor]] = []
-    original = sampler.topk_topp_sampler.top_k_top_p_sample
+    original = sampler.topk_topp_sampler._compiled_rbln_topk_topp_sampler
 
-    def spy(logits, k, p):
+    def spy(logits, temperature, k, p):
         recorded.append((k, p))
-        return original(logits, k, p)
+        return original(logits, temperature, k, p)
 
-    sampler.topk_topp_sampler.top_k_top_p_sample = spy
+    sampler.topk_topp_sampler._compiled_rbln_topk_topp_sampler = spy
     return recorded
 
 
