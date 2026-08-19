@@ -25,8 +25,11 @@ from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
 from vllm.v1.metrics.reader import Counter, Metric
 
+from tests.native.utils import TokensTextLogprobs, check_outputs_almost_equal
+
 MODEL = "Qwen/Qwen3-0.6B"
 BLOCK_SIZE = 1024
+NUM_LOGPROBS = 5
 
 # Deterministic 1600-token shared prefix (spans one 1024 block + 576 trailing),
 # each prompt then diverging by 10 distinct tokens.
@@ -84,10 +87,11 @@ def test_sub_block_prefix_cache_matches_baseline(vllm_runner) -> None:
 
 def _run_to_completion(engine, tag, sampling, *, reset_at=None):
     """Drive the engine to completion, optionally resetting the prefix cache at
-    a given step. Returns {request_id: generated_token_ids}."""
+    a given step. Returns one (token_ids, text, logprobs) per prompt, in prompt
+    order -- requests finish in whatever order the scheduler retires them."""
     for i, prompt in enumerate(PROMPTS):
         engine.add_request(f"{tag}_{i}", prompt, sampling)
-    results: dict[str, list[int]] = {}
+    results: dict[str, TokensTextLogprobs] = {}
     step = 0
     while engine.has_unfinished_requests():
         if reset_at is not None and step == reset_at:
@@ -96,9 +100,17 @@ def _run_to_completion(engine, tag, sampling, *, reset_at=None):
             engine.reset_prefix_cache(reset_running_requests=True)
         for out in engine.step():
             if out.finished:
-                results[out.request_id] = list(out.outputs[0].token_ids)
+                completion = out.outputs[0]
+                results[out.request_id] = (
+                    list(completion.token_ids),
+                    completion.text,
+                    [
+                        {tid: lp.logprob for tid, lp in step_logprobs.items()}
+                        for step_logprobs in (completion.logprobs or [])
+                    ],
+                )
         step += 1
-    return results
+    return [results[f"{tag}_{i}"] for i in range(len(PROMPTS))]
 
 
 @pytest.mark.model_compile
@@ -106,11 +118,19 @@ def test_reset_prefix_cache_mid_run_matches_baseline(vllm_runner) -> None:
     # Resetting mid-generation must not change the output: the preempted requests
     # recompute their KV and land on the same greedy tokens. Driven via the V1
     # engine so the reset can be injected between steps.
-    sampling = SamplingParams(temperature=0.0, max_tokens=16)
+    #
+    # The recompute re-runs the prefill arithmetic in a different shape than the
+    # cached continuation it replaces, so the two agree only up to rounding.
+    # Only near-tie flips are tolerated.
+    sampling = SamplingParams(temperature=0.0, max_tokens=16, logprobs=NUM_LOGPROBS)
     with vllm_runner(MODEL, enable_prefix_caching=True, **_ENGINE_OVERRIDES) as runner:
         engine = runner.llm.llm_engine
         baseline = _run_to_completion(engine, "gt", sampling)
         after_reset = _run_to_completion(engine, "rs", sampling, reset_at=10)
 
-    for i in range(len(PROMPTS)):
-        assert after_reset[f"rs_{i}"] == baseline[f"gt_{i}"]
+    check_outputs_almost_equal(
+        outputs_0_lst=baseline,
+        outputs_1_lst=after_reset,
+        name_0="baseline",
+        name_1="after_reset",
+    )

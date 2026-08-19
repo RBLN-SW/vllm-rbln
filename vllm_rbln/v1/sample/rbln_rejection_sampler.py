@@ -386,7 +386,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         output_token_ids = torch.full(
             (batch_size, max_spec_len + 1),
             PLACEHOLDER_TOKEN_ID,
-            dtype=torch.int64,  # Consistent with SamplerOutput.sampled_token_ids.
+            dtype=torch.int32,
             device=device,
         )
 
@@ -427,7 +427,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         draft_per_batch = torch.full(
             (batch_size, max_spec_len),
             PLACEHOLDER_TOKEN_ID,
-            dtype=torch.int64,
+            dtype=output_token_ids.dtype,
             device=device,
         )
         src_offset = 0
@@ -447,9 +447,9 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
         # Returns:
-        #   recovered_token_ids : (B, K) int — per-batch padded recovered tokens.
-        #   num_accepted       : (B,)   int — per-batch number of accepted draft
-        #                                     tokens (in [0, num_draft_tokens[i]]).
+        #   recovered_token_ids : (B, K) int32 — per-batch padded recovered tokens.
+        #   num_accepted       : (B,)   int32 — per-batch number of accepted draft
+        #                                       tokens (in [0, num_draft_tokens[i]]).
         # ------------------------------------------------------------------
         recovered_token_ids, num_accepted = self._compiled_rejection_sample(
             reshaped_draft_token_ids,
@@ -520,7 +520,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         # 4b) Inactive rows (no drafts): only the bonus token at col 0.
         output_token_ids[~active_mask, 0] = bonus[~active_mask]
 
-        return output_token_ids.to(torch.int32)
+        return output_token_ids
 
     def apply_sampling_constraints(
         self,
@@ -657,6 +657,7 @@ def torch_rejection_sample(
             is_greedy,
             batch_size,
             device,
+            target_probs.shape[-1],
             uniform_probs=uniform_probs,
             synthetic_conditional_rates=synthetic_conditional_rates,
             synthetic_mode=synthetic_mode,
@@ -789,6 +790,7 @@ def torch_rejection_greedy_sample_kernel(
     is_greedy: torch.Tensor | None,
     batch_size: int,
     device: torch.device,
+    vocab_size: int,
     uniform_probs: torch.Tensor | None = None,
     synthetic_conditional_rates: torch.Tensor | None = None,
     synthetic_mode: bool = False,
@@ -825,10 +827,14 @@ def torch_rejection_greedy_sample_kernel(
             assert synthetic_conditional_rates is not None
             u = uniform_probs[s:e]
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
-            # NOTE(RBLN): -1 marks padded/invalid draft ids that must be
-            # rejected (vllm PR #46533); without this the synthetic path could
-            # accept the placeholder and emit -1 as a real token.
-            accepted = (u < rate) & (d >= 0)
+            # NOTE(RBLN): reject draft ids that are not real tokens before
+            # the synthetic rate can accept them. This branch emits `d`
+            # verbatim below, so an id outside [0, vocab) would leave the
+            # sampler as an output token -- -1 padding (vllm PR #46533) at the
+            # bottom, and at the top an EAGLE3 id that `d2t` failed to map.
+            # The non-synthetic branch below needs no such check: it only ever
+            # emits `target_argmax`, which is in range by construction.
+            accepted = (u < rate) & (d >= 0) & (d < vocab_size)
             rej = ~accepted
             if rej.any():
                 k = int(rej.to(torch.int64).argmax().item())
@@ -893,17 +899,28 @@ def torch_rejection_random_sample_kernel(
         d_ids = draft_token_ids[s:e].to(torch.int64)
         u = uniform_probs[s:e].to(torch.float64)
 
-        # NOTE(RBLN): -1 marks padded/invalid draft ids that must be rejected
-        # (vllm PR #46533). Clamp them to 0 so the prob gathers below never
-        # index out of bounds, then force-reject those positions via neg_mask.
-        neg_mask = d_ids < 0
+        # NOTE(RBLN): draft ids that must be rejected outright. Two sources:
+        #   -1        padding for absent drafts (vllm PR #46533)
+        #   >= vocab  an EAGLE3 drafter samples over `draft_vocab_size` and maps
+        #             back through `d2t`; a stale or unmapped entry lands at or
+        #             past the target vocab.
+        # Both bounds have to be in the REJECT mask, not just clamped for the
+        # gather: clamping alone lets an out-of-range id ride the clamped
+        # token's probability through acceptance and then get emitted verbatim
+        # below, because the output is written from `draft_token_ids`, not from
+        # the clamped copy.
+        invalid_mask = (d_ids < 0) | (d_ids >= target_probs.shape[-1])
 
         if synthetic_mode:
             assert synthetic_conditional_rates is not None
             rate = synthetic_conditional_rates[:n].to(device=u.device, dtype=u.dtype)
             accept = u < rate
         else:
-            safe_ids = d_ids.clamp_min(0)
+            # Clamp only so the gather stays in bounds -- on this backend an
+            # out-of-range index reads past the row and segfaults in the host
+            # kernel rather than raising (rebellions-sw/fsw-inference#430).
+            # Rejection of those positions is `invalid_mask`'s job, above.
+            safe_ids = d_ids.clamp(0, target_probs.shape[-1] - 1)
             t_prob = (
                 target_probs[s:e]
                 .gather(1, safe_ids.unsqueeze(1))
@@ -922,7 +939,7 @@ def torch_rejection_random_sample_kernel(
                 )
                 accept = (d_prob > 0) & ((t_prob / d_prob) >= u)
 
-        accept = accept & ~neg_mask
+        accept = accept & ~invalid_mask
 
         if (~accept).any():
             k = int((~accept).to(torch.int64).argmax().item())
@@ -998,10 +1015,20 @@ def torch_sample_recovered_tokens_kernel(
             prob = target_probs[s:e].to(torch.float32)
             d_ids = draft_token_ids[s:e].to(torch.int64)
             prob = prob.clone()
-            # NOTE(RBLN): clamp padded/invalid (-1) draft ids so scatter_ does
-            # not index out of bounds (vllm PR #46533). The recovered token is
-            # still sampled from the target distribution for those positions.
-            prob.scatter_(1, d_ids.clamp_min(0).unsqueeze(1), 0.0)
+            # NOTE(RBLN): zero the drafted token's probability so recovery
+            # cannot resample it -- but only where the draft id is a real
+            # token. Clamping an invalid id into range instead would zero some
+            # innocent token (id 0, or the last one) and distort the recovery
+            # distribution; those positions have no drafted token to exclude,
+            # so recovery samples from the target distribution unchanged
+            # (vllm PR #46533).
+            # Stays in-place and touches one element per row: writing the
+            # gathered value back for invalid rows makes them a no-op. Selecting
+            # rows instead (`prob[valid_rows] = ...`) would copy a
+            # (rows, vocab) block -- megabytes per request per step.
+            safe = d_ids.clamp(0, prob.shape[-1] - 1).unsqueeze(1)
+            keep = ((d_ids < 0) | (d_ids >= prob.shape[-1])).unsqueeze(1)
+            prob.scatter_(1, safe, torch.where(keep, prob.gather(1, safe), 0.0))
         else:
             prob = torch.maximum(
                 target_probs[s:e].to(torch.float32)

@@ -110,6 +110,7 @@ def compile(
     set_option("use_static_output", use_static_output)
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
+        set_option("mega_cache_only", True)
 
     return cast(
         CompiledTarget,

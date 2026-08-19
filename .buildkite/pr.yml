@@ -1,0 +1,54 @@
+env:
+  UV_CACHE_DIR: "/mnt/uv_cache"
+  UV_LINK_MODE: "symlink"
+  UV_INDEX_STRATEGY: "unsafe-best-match"
+
+# uv index creds for the pre-commit env (LHS = job env var, RHS = OB vault name).
+_uv_secrets: &uv_secrets
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
+  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
+  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+
+steps:
+  - label: ":closed_lock_with_key: team-member gate"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets:
+      - GIT_PAT
+    command:
+      - "bash .buildkite/scripts/gate-team-member.sh"
+
+  - label: ":mag: pre-commit"
+    notify:
+    - github_commit_status:
+        context: "[OB] pre-commit"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *uv_secrets
+    command:
+      - "uv tool run pre-commit run --all-files --hook-stage manual --show-diff-on-failure"
+
+  # Both gates must pass before the heavy test pipelines are even uploaded.
+  - wait: ~
+
+  - group: ":gear: vllm-rbln optimum tests"
+    key: "optimum"
+    steps:
+      - label: ":sparkles: upload optimum-pr"
+        checkout:
+          sparse:
+            paths:
+              - .buildkite
+        command: "buildkite-agent pipeline upload .buildkite/pipelines/optimum-pr/pipeline.yml"
+
+  - group: ":snake: vllm-rbln tests"
+    key: "vllm-rbln"
+    steps:
+      - label: ":sparkles: upload vllm-rbln-pr"
+        checkout:
+          sparse:
+            paths:
+              - .buildkite
+        command: |
+          TARGET_BRANCH=$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-dev}
+          git fetch origin $$TARGET_BRANCH
+          buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pr.yml --git-diff-base origin/$$TARGET_BRANCH
