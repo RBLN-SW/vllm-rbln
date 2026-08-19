@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import functools
 import json
 import os
 import warnings
@@ -144,6 +145,54 @@ def pytest_addoption(parser):
     )
 
 
+@functools.cache
+def _host_chip() -> str | None:
+    """The chip this host reports, or None when it cannot be resolved (an
+    NPU-less host) -- filter nothing then, rather than skip everything.
+
+    Safe to call in the parent, unlike opening a device: a name query leaves no
+    /dev/rbln* fd behind, and a child still resolves it afterwards. Resolving it
+    here is what keeps a wrong-chip spec from ever spawning."""
+    from vllm_rbln.platform import RblnPlatform
+
+    try:
+        return RblnPlatform.get_device_name().strip().upper()
+    except Exception:
+        return None
+
+
+def _item_spec(item):
+    """The CompileModelSpec this item is parametrized with, under whatever name
+    (test_dp_e2e parametrizes a fixture, not the test), or None."""
+    from tests.native.model_specs import CompileModelSpec
+
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return None
+    for value in callspec.params.values():
+        if isinstance(value, CompileModelSpec):
+            return value
+    return None
+
+
+def _skip_other_chips(items) -> None:
+    """Skip specs this host's chip is not in. Only whole-model items: a spec also
+    feeds unit tests (test_dp_specs) that assert on it without touching an NPU."""
+    chip = _host_chip()
+    if chip is None:
+        return
+    for item in items:
+        if "model_compile" not in item.keywords:
+            continue
+        spec = _item_spec(item)
+        if spec is not None and chip not in spec.chips:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason=f"needs {'/'.join(sorted(spec.chips))}, host is {chip}"
+                )
+            )
+
+
 def _session_layers(config) -> int:
     """The option's value, or the default when it was left off. Not `or`: an
     explicit 0 is the whole model, not a missing value."""
@@ -155,6 +204,7 @@ def pytest_collection_modifyitems(config, items):
     """Keep whole-model compiles out of the default lane (opt-in via
     --model-compile; forgetting the flag costs nothing)."""
     if config.getoption("--model-compile"):
+        _skip_other_chips(items)
         return
     skip = pytest.mark.skip(reason="needs --model-compile")
     for item in items:
@@ -407,6 +457,9 @@ def pytest_report_header(config):
     header.append(
         f"native: num_hidden_layers={num_hidden_layers or 'whole model'}{pinnable}",
     )
+    # Which chip a job landed on decides which specs run, and a step may request
+    # several -- so the run has to say which one it got.
+    header.append(f"native: chip={_host_chip() or 'unknown'}")
     if _scrubbed:
         header.append(f"native: scrubbed {', '.join(sorted(_scrubbed))}")
     return header

@@ -35,11 +35,12 @@ from typing import ParamSpec
 # the knobs whose source default the suite must not take. Nothing that merely
 # repeats a default -- pinning those would hide the day one is flipped.
 NATIVE_ENV = {
-    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-    "VLLM_RBLN_USE_VLLM_MODEL": "1",
-    "VLLM_DISABLE_COMPILE_CACHE": "1",
     "RBLN_ROOT_IP": "127.0.0.1",
     "RBLN_LOCAL_IP": "127.0.0.1",
+    "VLLM_DISABLE_COMPILE_CACHE": "1",
+    "VLLM_LOGGING_LEVEL": "DEBUG",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "VLLM_RBLN_USE_VLLM_MODEL": "1",
 }
 
 SCRUBBED_PREFIXES = ("VLLM_RBLN_",)
