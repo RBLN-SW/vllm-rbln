@@ -230,7 +230,6 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # Logprobs ride the same deferral. Only the dense form is free of the
         # tokens: the topk form indexes by the sampled ids, so building it pulls
         # them to the host mid-step and serialises what async just decoupled.
-        # Nothing refuses that today - it costs speed, not correctness.
         self._logprobs_tensors = logprobs_tensors
 
         # The D2H is neither dispatched nor awaited here - both happen in
@@ -250,8 +249,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         the model. Nothing in the rebel API documents that as supported, so read it
         as an assumption this code rests on: that rebel serialises its own dispatch
         well enough for VMemoryManager::DispatchFlatAsyncCopy to interleave with the
-        main thread's RuntimeInstance::Run. It has run clean, but a race need not
-        show up as a failure - start here if async-only token corruption reappears.
+        main thread's RuntimeInstance::Run.
 
         inference_mode is re-entered for the copy: _sampled_token_ids_cpu was
         allocated in __init__ under sample_tokens' inference_mode, so it is an
@@ -1493,12 +1491,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # Async scheduling: defer the sampled-token D2H to get_output(). Cache
             # the tokens on-device (prev_sampled_token_ids) for next-step feedback;
             # valid_sampled_token_ids is filled later by AsyncRBLNModelRunnerOutput.
-            #
-            # Logprobs ride along, deferred to get_output() like the tokens.
-            # Carried rather than dropped: a request that asks for logprobs must
-            # get them under async too, or async silently answers a different
-            # question than sync. Building them is expensive, but both scheduling
-            # modes pay that equally (see the warning below); only the D2H moves.
+            # Logprobs are deferred the same way.
             if logprobs_tensors is not None:
                 logger.warning_once(
                     "Requesting logprobs adds host CPU to every decode step: "
@@ -1674,7 +1667,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             # Device-tensor async token feedback (decode fast path). staged input_ids
             # holds the scheduler's placeholders; scatter the real previous token from
-            # prev_sampled_token_ids, remapped via prev_req_id_to_index. No D2H.
+            # prev_sampled_token_ids, remapped via prev_req_id_to_index.
             prev_sampled = self.input_batch.prev_sampled_token_ids
             prev_map = self.input_batch.prev_req_id_to_index
             if (
@@ -1686,13 +1679,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             ):
                 # Per request, not all-or-nothing: a request absent from
                 # prev_map falls back to token_ids_cpu, which
-                # _apply_pending_token_writeback keeps truthful. Skipping the
-                # whole batch instead left -1 placeholders in every row.
+                # _apply_pending_token_writeback keeps truthful.
                 #
-                # prev_sampled is referenced, not copied - it is a view of the
-                # sampler's 2-deep ring, read before this step's sample() writes
-                # the other slot. Copying it here would wait on the sampler graph,
-                # which costs most of a decode step.
+                # prev_sampled is a view of the sampler's 2-deep ring, read here
+                # before this step's sample() writes the other slot.
                 #
                 # Identity - every request present, same order - is the steady
                 # state; the slice copy there avoids building two index tensors
