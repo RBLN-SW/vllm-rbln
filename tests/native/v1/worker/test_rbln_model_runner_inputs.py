@@ -104,11 +104,7 @@ class TestBookkeepingSyncSpecDecode:
         )
         runner = make_model_runner()
         # This class covers the synchronous bookkeeping path, and vLLM now
-        # resolves an unset --async-scheduling to enabled, so pin it. The async
-        # branch is not merely a different route to the same result: it defers
-        # the tokens and asserts a single sampled column
-        # (rbln_model_runner._bookkeeping_sync), which a rejection-sampler output
-        # of shape (batch, num_spec + 1) cannot satisfy.
+        # resolves an unset --async-scheduling to enabled, so pin it.
         runner.use_async_scheduling = False
         runner._update_states(schedule_new("req_0", "req_1"))
         batch = runner.input_batch

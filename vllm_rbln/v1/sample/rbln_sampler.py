@@ -42,10 +42,9 @@ def _ring_copy(owner: nn.Module, out: torch.Tensor) -> torch.Tensor:
 
     Async scheduling holds the returned tensor past the step boundary, via
     prev_sampled_token_ids and AsyncRBLNModelRunnerOutput. Holding the sampling
-    graph's own output there makes that graph's next launch block on the device --
-    measured 0.8ms -> 11.1ms inside the sampler call, host CPU unchanged, on
-    gpt-oss-120b at DP4/b8. Two slots, because the output thread reads one while
-    the next step writes the other.
+    graph's own output there makes that graph's next launch block on the device.
+    Two slots, because the output thread reads one while the next step writes
+    the other.
     """
     ring = owner._tok_stage
     if not ring or ring[0].shape != out.shape or ring[0].device != out.device:
@@ -304,9 +303,6 @@ class RBLNSampler(VLLMSampler):
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
-        # `rbln::top_k_top_p` returns int32; `rbln::argmax` returns int64 until
-        # rebel_compiler#12905 lands. SamplerOutput takes whichever it gets --
-        # casting here would pull the ids off the device every step.
 
         if num_logprobs is None:
             logprobs_tensors = None

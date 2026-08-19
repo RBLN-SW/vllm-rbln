@@ -1450,17 +1450,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
-        if sampler_output is None:
-            # No caller passes None today (sample_tokens always supplies
-            # _sample()'s result); kept only so bookkeeping can record
-            # placeholders and per-req counters without a sampler output.
-            num_sampled_tokens = num_reqs
-            sampled_token_ids = None
-            logprobs_tensors = None
-        else:
-            num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
-            sampled_token_ids = sampler_output.sampled_token_ids
-            logprobs_tensors = sampler_output.logprobs_tensors
+        num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
+        sampled_token_ids = sampler_output.sampled_token_ids
+        logprobs_tensors = sampler_output.logprobs_tensors
         logprobs_lists = None
         invalid_req_indices: list[int] = []
         invalid_req_indices_set: set[int] = set()
@@ -1506,10 +1498,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
             self._placeholder_pos = {}
-            if (
-                sampler_output is not None
-                and self.input_batch.prev_sampled_token_ids is None
-            ):
+            if self.input_batch.prev_sampled_token_ids is None:
                 assert sampled_token_ids.shape[-1] == 1
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
             self.input_batch.prev_req_id_to_index = {
@@ -1702,11 +1691,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     n_fb = len(rows)
                     # staged input_ids is a host tensor, so this is a D2H
                     # either way; the intermediate buffer keeps it contiguous.
-                    if self._tokfb_host is None or self._tokfb_host.shape[0] < n_fb:
-                        self._tokfb_host = torch.empty(
+                    tokfb_host = self._tokfb_host
+                    if tokfb_host is None or tokfb_host.shape[0] < n_fb:
+                        tokfb_host = torch.empty(
                             prev_sampled.shape[0], dtype=prev_sampled.dtype
                         )
-                    host = self._tokfb_host[:n_fb]
+                        self._tokfb_host = tokfb_host
+                    host = tokfb_host[:n_fb]
                     host.copy_(prev_sampled[:n_fb, 0])
                     staged_model_inputs.input_ids[:n_fb, 0].copy_(host)
                 elif rows:
