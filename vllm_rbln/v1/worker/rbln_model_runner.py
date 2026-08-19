@@ -1666,17 +1666,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 and prev_sampled is not None
                 and prev_map is not None
             ):
-                # Per request, not all-or-nothing: a request absent from
-                # prev_map falls back to token_ids_cpu, which
-                # _apply_pending_token_writeback keeps truthful.
+                # prev_sampled holds last step's tokens in last step's batch
+                # order, so each request needs its own row: prev_map[req_id] is
+                # where it sat then, j is where it sits now.
                 #
-                # prev_sampled is a view of the sampler's 2-deep ring, read here
-                # before this step's sample() writes the other slot.
+                # A request missing from prev_map (it was not in last step's
+                # batch) keeps the placeholder here and gets its token from
+                # token_ids_cpu instead, which _apply_pending_token_writeback
+                # fills in. Only the rows found here are overwritten.
                 #
-                # Identity - every request present, same order - is the steady
-                # state; the slice copy there avoids building two index tensors
-                # from Python lists every step, which measured about a tenth of a
-                # decode step on gpt-oss-120b at DP4/b8.
+                # Two ways to write them, because the order usually does not
+                # change: when it has not (identity), one contiguous slice copy
+                # does it, and that avoids turning `rows`/`dsts` into index
+                # tensors every step -- about a tenth of a decode step on
+                # gpt-oss-120b at DP4/b8. Otherwise fall back to the scatter.
+                #
+                # prev_sampled aliases the sampler's ring, which has two slots:
+                # this read must happen before this step's sample() comes back
+                # around to the slot it points at.
                 rows, dsts, identity = [], [], True
                 for j, r in enumerate(req_ids):
                     idx = prev_map.get(r)
@@ -1798,16 +1805,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ) = self.execute_model_state
         self.execute_model_state = None  # Clear ephemeral state
 
-        # NOTE: no explicit drain here. rebel's RuntimeInstance::Run dispatches
-        # and returns, and the sampler's device ops chain on the context's
-        # default stream, so ordering against the forward is the stream's job.
+        # Nothing waits for the forward here. Its device work and the sampler's
+        # are queued in order on the same device, so the sampler cannot start on
+        # logits the forward has not written yet.
 
-        # Structured output: mask the logits before sampling. The grammar itself is
-        # advanced by the scheduler from the real sampled tokens in
-        # update_from_output, and under async scheduling EngineCore defers this
-        # call until that has happened for the previous step
-        # (pending_structured_output_tokens), so the bitmask is never built from a
-        # placeholder.
+        # Structured output: mask the logits before sampling. Safe under async
+        # even though this step's own tokens do not exist yet -- the grammar is
+        # advanced from real sampled tokens in update_from_output, and EngineCore
+        # holds this call back until the previous step's tokens have gone through
+        # it, so the mask is never built from a -1 placeholder.
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
