@@ -2191,29 +2191,30 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dtype=self.dtype,
         )
 
-        def dummy_float_tensor(buffer: torch.Tensor, value: float | None):
-            if value is None:
-                return None
-            return torch.full(
-                (num_reqs,), float(value), dtype=buffer.dtype, device=self.device
-            )
+        def dummy_tensor_view(
+            buffer: torch.Tensor, value: int | float | None
+        ) -> torch.Tensor | None:
+            """Warm-up stand-in for what a real step feeds: a view of the buffer.
 
-        def dummy_int_tensor(buffer: torch.Tensor, value: int | float | None):
+            Dynamo guards distinguish a view from a fresh allocation, so this follows
+            how the runtime builds its sampling metadata tensors -- `_pad_rows` hands
+            through a slice of the persistent buffer.
+            """
             if value is None:
                 return None
-            return torch.full(
-                (num_reqs,), int(value), dtype=buffer.dtype, device=self.device
-            )
+            view = buffer[:num_reqs]
+            view.fill_(value)
+            return view
 
         for config in WARM_UP_CONFIGS:
             dummy_metadata = SamplingMetadata(
-                temperature=dummy_float_tensor(
+                temperature=dummy_tensor_view(
                     self.input_batch.temperature, config.get("temperature")
                 ),
                 all_greedy=config.get("all_greedy", True),
                 all_random=config.get("all_random", False),
-                top_p=dummy_float_tensor(self.input_batch.top_p, config.get("top_p")),
-                top_k=dummy_int_tensor(self.input_batch.top_k, config.get("top_k")),
+                top_p=dummy_tensor_view(self.input_batch.top_p, config.get("top_p")),
+                top_k=dummy_tensor_view(self.input_batch.top_k, config.get("top_k")),
                 generators={},
                 max_num_logprobs=None,
                 no_penalties=config.get("no_penalties", True),
@@ -2222,15 +2223,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
                 if not config.get("no_penalties", True)
                 else None,
-                frequency_penalties=dummy_float_tensor(
+                frequency_penalties=dummy_tensor_view(
                     self.input_batch.frequency_penalties,
                     config.get("frequency_penalties", 0.1),
                 ),
-                presence_penalties=dummy_float_tensor(
+                presence_penalties=dummy_tensor_view(
                     self.input_batch.presence_penalties,
                     config.get("presence_penalties", 0.1),
                 ),
-                repetition_penalties=dummy_float_tensor(
+                repetition_penalties=dummy_tensor_view(
                     self.input_batch.repetition_penalties,
                     config.get("repetition_penalties", 0.1),
                 ),
@@ -2245,6 +2246,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits=logits,
                 sampling_metadata=dummy_metadata,
             )
+
+            if num_reqs > 1:
+                # A batch smaller than the bucket takes `_pad_rows`'s `torch.cat`
+                # branch, whose result is not a view. Warm that kind too.
+                def shorter(t: torch.Tensor | None) -> torch.Tensor | None:
+                    return None if t is None else t[: num_reqs - 1]
+
+                short_metadata = dataclasses.replace(
+                    dummy_metadata,
+                    temperature=shorter(dummy_metadata.temperature),
+                    top_p=shorter(dummy_metadata.top_p),
+                    top_k=shorter(dummy_metadata.top_k),
+                )
+                _ = self.sampler(
+                    logits=logits,
+                    sampling_metadata=_pad_sampling_metadata(short_metadata, num_reqs),
+                )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -3144,10 +3162,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
+    """Size `t` to `bucket` rows, reusing its storage when it already has them.
+
+    Reuse keeps the sampler graph's input address fixed across steps. The result
+    aliases `t`: read it, do not write to it.
+    """
     if t is None:
         return None
-    if (n := t.shape[0]) >= bucket:
-        return t.clone()
+    n = t.shape[0]
+    if n == bucket:
+        return t
+    if n > bucket:
+        return t[:bucket]
     pad = t[-1:].expand(bucket - n, *t.shape[1:])
     return torch.cat([t, pad], dim=0)
 

@@ -34,6 +34,11 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     "Qwen3ForCausalLM": ("qwen3", "RBLNQwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "RBLNQwen3MoeForCausalLM"),
     "GptOssForCausalLM": ("gpt-oss", "RBLNGptOssForCausalLM"),
+    # Qwen3-Reranker is served by score() but reads its score off two vocabulary
+    # logits, so it runs the generation graph -- as upstream vLLM does, resolving
+    # it to Qwen3ForCausalLM. Classing it as pooling would compile
+    # prefill_chunk_size == max_model_len, which the decoder graph cannot use.
+    "Qwen3ForSequenceClassification": ("qwen3", "RBLNQwen3ForCausalLM"),
 }
 
 _RBLN_ENCODER_DECODER_MODELS: dict[str, tuple[str, str]] = {
@@ -131,19 +136,6 @@ def is_arch_supported(
     return any(
         arch in _RBLN_SUPPORTED_MODELS and arch in model_set for arch in architectures
     )
-
-
-def validate_arch_supported(config: PretrainedConfig) -> None:
-    """Validate the model's architecture is known to upstream vLLM."""
-    architectures = getattr(config, "architectures", [])
-    import vllm.model_executor.models as me_models
-
-    supported_archs = me_models.ModelRegistry.get_supported_archs()
-    if not any(arch in supported_archs for arch in architectures):
-        raise ValueError(
-            f"Model architectures {architectures} are not supported on upstream "
-            f"vLLM for now. Supported architectures: {supported_archs}"
-        )
 
 
 def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:

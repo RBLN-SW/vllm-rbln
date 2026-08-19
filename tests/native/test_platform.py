@@ -33,10 +33,11 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
+from tests.native.vllm_config import local_model_path
 from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_SEQS, RblnPlatform
 
 # Small, non-gated and already needed by the spec-decode tests; a config build
-# costs ~1s and never touches the device.
+# never touches the device.
 _MODEL = "JackFram/llama-68m"
 _ENGINE_ARGS = dict(
     max_model_len=2048,
@@ -58,7 +59,7 @@ def _build(**engine_kwargs) -> VllmConfig:
     needs unset to observe the RBLN default.
     """
     return EngineArgs(
-        model=_MODEL, **{**_ENGINE_ARGS, **engine_kwargs}
+        model=local_model_path(_MODEL), **{**_ENGINE_ARGS, **engine_kwargs}
     ).create_engine_config()
 
 
