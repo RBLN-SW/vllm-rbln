@@ -148,7 +148,8 @@ class InputStager:
             )
             self._hidden_state_buffers[key] = buf
 
-        buf.fill_(layout.hidden_state_pad_value)
+        buf[layout.num_reqs :].fill_(layout.hidden_state_pad_value)
+        buf[: layout.num_reqs, layout.query_len :].fill_(layout.hidden_state_pad_value)
         buf[: layout.num_reqs, : layout.query_len].copy_(
             hidden_states,
             non_blocking=True,
