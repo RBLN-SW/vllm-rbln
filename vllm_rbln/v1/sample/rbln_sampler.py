@@ -28,6 +28,7 @@ import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
 
@@ -280,10 +281,6 @@ class RBLNSampler(VLLMSampler):
         temperature: torch.Tensor,
         all_random: bool,
     ) -> torch.Tensor:
-        # NOTE:
-        # Greedy requests use a small temperature (1e-3) so softmax collapses
-        # to a near one-hot at argmax. _SAMPLING_EPS (1e-5) is too small here —
-        # it pushes logits past softmax's safe exp range and overflows.
         if not all_random:
             temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
         temperature = temperature.to(logits.dtype)
