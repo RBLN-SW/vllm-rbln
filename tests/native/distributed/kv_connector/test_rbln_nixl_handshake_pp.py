@@ -137,8 +137,8 @@ def _make_worker(*, tp_target_ranks=(0,), sw_ratio=None, compat="HASH"):
     # overlaps (the fan-out default). _FakeSock advertises stage i as "layer.i".
     w.local_seen_layer_names = ["layer.0", "layer.1", "layer.2"]
     w.add_remote_agent = MagicMock(side_effect=lambda meta, rank, tps: f"agent-{rank}")
-    # Per-shard local handle building is exercised in TestShardLocalRegions;
-    # stub it here so the fan-out tests stay focused on stage enumeration.
+    # Stubbed so the fan-out tests stay on stage enumeration; the body runs for
+    # real in TestShardLocalRegions::test_register_shard_read_state_keys_the_stage.
     w._register_shard_read_state = MagicMock()
     return w
 
@@ -358,8 +358,11 @@ class TestShardLocalRegions:
         w = self._worker(["l0", "l1", "l2", "l3"], num_regions=4)
         assert w._shard_local_region_ids(("l1", "l2")) == [1, 2]
 
-    def test_register_shard_local_xfer_handler_covers_subset(self):
-        w = self._worker(["l0", "l1", "l2", "l3"], num_regions=8)  # rpl=2
+    @classmethod
+    def _wired_worker(cls):
+        # Enough of the worker for the handle building to run for real: 4 layers
+        # over 8 regions (rpl=2), base addrs 1000 apart, prep_xfer_dlist -> 42.
+        w = cls._worker(["l0", "l1", "l2", "l3"], num_regions=8)
         w.block_size = 16
         w.num_blocks = 4
         w.device_id = 0
@@ -374,6 +377,10 @@ class TestShardLocalRegions:
         w.get_backend_aware_kv_block_len = MagicMock(return_value=64)
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.prep_xfer_dlist.return_value = 42
+        return w
+
+    def test_register_shard_local_xfer_handler_covers_subset(self):
+        w = self._wired_worker()
 
         handle, blocks = w._register_shard_local_xfer_handler(16, ("l2", "l3"))
 
@@ -386,6 +393,49 @@ class TestShardLocalRegions:
         assert blocks[1] == (4000 + 64, 64, 0)
         # regions used are exactly the shard's (no addr below 4000).
         assert min(a for a, _, _ in blocks) == 4000
+
+    def test_register_local_xfer_handler_routes_to_the_shard_path(self):
+        # The dispatch that puts a PP stage on the shard path: no SWA view opt,
+        # layer names present. Miss it and a stage registers the whole model's
+        # regions, so the descriptor math addresses layers it does not own. The
+        # no-names branch is upstream's and is covered by the non-PP tests.
+        w = self._wired_worker()
+        w._sw_ratio = None
+
+        with patch.object(
+            RblnNixlConnectorWorker, "_register_shard_local_xfer_handler"
+        ) as shard:
+            w.register_local_xfer_handler(16, registered_layer_names=("l2", "l3"))
+
+        shard.assert_called_once_with(16, ("l2", "l3"))
+
+    def test_register_shard_read_state_keys_the_stage(self):
+        # The read and cleanup paths look these two maps up by exactly these
+        # keys, and the fan-out tests reach this function as a stub -- so the
+        # real key shape is pinned here or nowhere: a swapped key order or a
+        # group-id tuple of the wrong length would leave both sides agreeing
+        # with their own fixtures.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+
+        w._register_shard_read_state("eng", 2, 16, ("l2", "l3"))
+
+        assert w.src_xfer_handles_by_remote == {("eng", 2, 16): 42}
+        # One group id per region of the shard: layers l2,l3 x rpl 2 = 4.
+        assert w._shard_region_group_ids == {("eng", 2): (0, 0, 0, 0)}
+
+    def test_register_shard_read_state_rejects_multiple_groups(self):
+        # The single-group assumption is what makes the all-zero tuple above
+        # right; more than one group has to fail rather than mislabel regions.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(kv_cache_groups=[object(), object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+
+        with pytest.raises(AssertionError, match="single KV-cache group"):
+            w._register_shard_read_state("eng", 2, 16, ("l2", "l3"))
 
 
 class TestShardReadPath:
@@ -483,6 +533,25 @@ class TestShardReadPath:
             # 2 regions per shard x 1 (trimmed) block = 2 descriptors.
             assert len(remote_descs) == 2
         assert len(w._recving_transfers["r0"]) == 2
+
+    def test_single_stage_read_delegates_to_base(self):
+        # A producer that advertised pp_size 1 must read through the upstream
+        # path untouched -- the per-stage loop below would key handles the
+        # non-PP registration never wrote. Liveness is still stamped first,
+        # since TTL eviction must not consider this producer idle.
+        w = object.__new__(RblnNixlConnectorWorker)
+        w._engine_last_active = {}
+        w._remote_pp_size = {}  # unknown engine defaults to a single stage
+        w.transfer_topo = MagicMock()
+        meta = MagicMock()
+        meta.remote.engine_id = "eng"
+        base = RblnNixlConnectorWorker.__bases__[0]
+
+        with patch.object(base, "_read_blocks_for_req") as base_read:
+            w._read_blocks_for_req("r0", meta)
+
+        base_read.assert_called_once_with("r0", meta)
+        assert "eng" in w._engine_last_active
 
     def test_reads_only_overlapping_stages(self):
         # Decode-PP (m=4, n=2): this rank owns 2 of the 4 producer stages, so
@@ -685,6 +754,31 @@ class TestPublishPpHandshakeMetadata:
         # ... and PP fields populated.
         assert (decoded.pp_rank, decoded.pp_size) == (1, 2)
         assert decoded.registered_layer_names == ["l7", "l8"]
+
+    def test_register_kv_caches_wires_the_publish(self):
+        # The helper above is only useful if the registration path reaches it.
+        # Host-bounce is the path that does so directly (D2D defers to
+        # finalize_kv_cache_registration), and the ordered layer names it
+        # captures are what the consumer matches regions by.
+        w = object.__new__(RblnNixlConnectorWorker)
+        w.kv_buffer_device = "cpu"
+        w._use_rbln_nixl_backend = False
+        w.xfer_handshake_metadata = MagicMock(
+            agent_metadata_bytes=msgspec.msgpack.encode(self._base_meta())
+        )
+        w._publish_pp_handshake_metadata = MagicMock()
+        base = RblnNixlConnectorWorker.__bases__[0]
+        kv_caches = {"l0": MagicMock(), "l1": MagicMock()}
+
+        with patch.object(base, "register_kv_caches"):
+            w.register_kv_caches(kv_caches)
+
+        assert w.local_seen_layer_names == ["l0", "l1"]
+        w._publish_pp_handshake_metadata.assert_called_once()
+        published_meta, published_names = w._publish_pp_handshake_metadata.call_args[0]
+        # The base metadata is handed over decoded, not as bytes.
+        assert published_meta.engine_id == "eng"
+        assert list(published_names) == ["l0", "l1"]
 
     def test_single_stage_defaults(self):
         # pp_size == 1 still folds compat but advertises no-PP layer fields.
