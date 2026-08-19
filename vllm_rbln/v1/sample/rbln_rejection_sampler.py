@@ -65,12 +65,6 @@ class RBLNRejectionSampler(RejectionSampler):
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
 
-        if envs.VLLM_RBLN_SAMPLER:
-            assert not self.synthetic_mode, (
-                "RBLNRejectionSampler does not support synthetic rejection "
-                "sampling (rejection_sample_method='synthetic'). Use "
-                "`VLLM_RBLN_SAMPLER=0` for this mode."
-            )
         self.impl = (
             RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
             if envs.VLLM_RBLN_SAMPLER
@@ -464,6 +458,33 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             dtype=num_accepted_per_batch.dtype,
             device=device,
         )
+
+        # NOTE(RBLN): Synthetic-acceptance mode (rejection_sample_method=
+        # "synthetic") replaces the real accept/reject decision with one
+        # driven by a per-position rate schedule, independent of
+        # target/draft probabilities. The primitive call above still runs
+        # unconditionally -- its cost is not skipped -- and its
+        # `recovered_token_ids` output is per-position (computed from each
+        # position's own target distribution with that position's own draft
+        # id excluded), so it is reused as-is for whichever position ends up
+        # being the first reject; only `num_accepted_per_batch` itself is
+        # overridden here, and every step below stays untouched. The uniform
+        # draws below are independent of vLLM's own generators: synthetic
+        # mode is a benchmarking tool, not a path with a reproducibility
+        # requirement.
+        if synthetic_mode:
+            assert synthetic_conditional_rates is not None
+            rates = synthetic_conditional_rates[:max_spec_len].to(
+                device=device, dtype=torch.float32
+            )
+            accepted = torch.rand(
+                (batch_size, max_spec_len), device=device, dtype=torch.float32
+            ) < rates.unsqueeze(0)
+            num_accepted_per_batch = torch.minimum(
+                accepted.to(torch.int64).cumprod(dim=1).sum(dim=1),
+                num_draft_tokens_t.to(torch.int64),
+            ).to(num_accepted_per_batch.dtype)
+
         positions = torch.arange(
             max_spec_len,
             device=device,
