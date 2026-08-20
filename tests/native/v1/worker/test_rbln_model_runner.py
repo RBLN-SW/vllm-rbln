@@ -150,11 +150,13 @@ class TestPadDepad:
         assert torch.equal(out[2], t[1])
         assert torch.equal(out[3], t[1])
 
-    def test_pad_rows_clone_when_at_bucket(self):
+    def test_pad_rows_reuses_storage_when_at_bucket(self):
+        # A batch already at the bucket is handed through untouched -- reuse is
+        # what keeps the sampler graph's input address fixed across steps.
         t = torch.arange(6).reshape(2, 3)
         out = _pad_rows(t, 2)
         assert torch.equal(out, t)
-        assert out is not t
+        assert out is t
 
     def test_pad_rows_none_passthrough(self):
         assert _pad_rows(None, 4) is None
@@ -177,25 +179,19 @@ class TestPadDepad:
 
 
 class TestPredicates:
-    def test_is_prefill_boundary(self):
-        # is_prefill: num_computed < num_tokens_no_spec - 1 (request 0).
-        r = _make_runner_stub(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([3]),
-                num_tokens_no_spec=np.array([10]),
-            )
-        )
+    def test_is_prefill_is_written_only_through_the_setter(self):
+        # The is_prefill setter is the sole write path; the getter -- the
+        # single source of truth -- returns it, so all PP ranks agree.
+        r = _make_runner_stub()
+        r.is_prefill = True
         assert r.is_prefill is True
-        r.input_batch.num_computed_tokens_cpu = np.array([9])
+        r.is_prefill = False
         assert r.is_prefill is False
 
     def test_is_intermediate_chunked_prefill(self):
-        # is_prefill AND discard_request_mask[0].
+        # is_prefill (the step phase) AND discard_request_mask[0].
         r = _make_runner_stub(
-            input_batch=SimpleNamespace(
-                num_computed_tokens_cpu=np.array([3]),
-                num_tokens_no_spec=np.array([10]),
-            ),
+            _is_prefill_step=True,
             discard_request_mask=np.array([True]),
         )
         assert r.is_intermediate_chunked_prefill is True
@@ -216,7 +212,7 @@ class TestExecuteModelState:
             "spec_decode_common_attn_metadata",
             "hidden_states",
             "sample_hidden_states",
-            "aux_hidden_states",
+            "combined_hidden_states",
         )
 
     def test_is_named_tuple(self):
@@ -319,11 +315,13 @@ class TestGetSupportedTasks:
 
 class TestDetermineBatchPadding:
     # data_parallel_size == 1 is the covered path (multi-DP needs RBLNDPMetadata
-    # collectives -> e2e). is_prefill is driven via the input_batch stub.
+    # collectives). The phase is driven via _is_prefill_step (is_prefill), not
+    # the runner's input_batch.
     @staticmethod
     def _runner(*, is_prefill, bucket=8):
         computed = 0 if is_prefill else 9
         return _make_runner_stub(
+            _is_prefill_step=is_prefill,
             bucketing_manager=SimpleNamespace(
                 find_decode_batch_bucket=lambda n: bucket
             ),
@@ -360,8 +358,7 @@ class TestDummyRunPadding:
 
         def fake_across_dp(num_tokens, num_reqs, dp_size, dp_rank, is_prefill):
             reqs = torch.tensor(reqs_across_dp, dtype=torch.int32)
-            # The real one returns no per-rank counts while any rank prefills.
-            return reqs.clone(), None if is_prefill else reqs
+            return reqs.clone(), reqs, is_prefill
 
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
@@ -403,6 +400,11 @@ class TestDummyRunPadding:
             # use_wrapped_compute_logits is a property over this.
             is_pooling_model=True,
             speculative_config=None,
+            # Read by _determine_batch_padding to floor the MoE dispatch pad
+            # at the spec width; __init__ always sets it.
+            use_aux_hidden_state_outputs=False,
+            # Gates the drafter's dummy run; __init__ always sets it.
+            drafter=None,
             kv_cache_bases=None,
             vllm_config=None,
             input_stager=SimpleNamespace(stage=stage),

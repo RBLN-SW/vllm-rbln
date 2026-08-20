@@ -48,7 +48,7 @@ from vllm_rbln.model_executor.models.optimum.encoder import (
     RBLNOptimumForEncoderModel,
 )
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding
 
 # (model id, expected seq_pooling_type, expected pooler) per architecture.
 # Encoder-only models are forced to CLS; the *ForSequenceClassification ones use
@@ -72,7 +72,7 @@ def _build_encoder(model_id: str):
     model_config = ModelConfig(model=model_id, dtype=torch.float32, seed=42)
     # Mirror RBLNOptimumModelRunner: Qwen3 pooling models have their HF arch
     # (Qwen3ForCausalLM) remapped to Qwen3Model before the encoder is built.
-    if is_qwen3_pooling(model_config):
+    if is_qwen3_embedding(model_config):
         model_config.hf_config.__dict__["architectures"] = ["Qwen3Model"]
     vllm_config = VllmConfig(
         model_config=model_config,
