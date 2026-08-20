@@ -79,24 +79,23 @@ def _get_dflash_step_token_budget(
     max_num_seqs: int,
     speculative_config: Any | None,
 ) -> int:
-    """Restore only the implicit reservation for a lone DFlash request.
+    """Restore the implicit draft-slot reservation for DFlash.
 
-    The old scheduler reserves target-batch slots for speculative tokens. RBLN
-    DFlash runs its draft graph separately, so a lone target prefill can still
-    use the complete compiled target width. Explicitly smaller budgets and
-    multi-request schedulers retain the original limit.
+    vLLM reserves max_num_new_slots_for_drafting * max_num_seqs target-batch
+    slots because GPU drafters insert mask slots into the target batch. The
+    RBLN port drafts on a separate compiled graph whose query buffers are
+    validated at proposer init (_validate_dflash_geometry), so the
+    reservation only distorts prefill chunk geometry: 512 - 6 * max_num_seqs
+    stops dividing the 1024-token KV block and the block-boundary cap then
+    produces ragged chunks. Restore the full width when the budget matches
+    the implicit reservation exactly; an explicitly configured smaller
+    budget stays untouched.
     """
-    if (
-        speculative_config is None
-        or not speculative_config.use_dflash()
-        or max_num_seqs != 1
-    ):
+    if speculative_config is None or not speculative_config.use_dflash():
         return current_budget
 
-    # Keep the multiplication even though the guard pins max_num_seqs to 1:
-    # VllmConfig._set_max_num_scheduled_tokens reserves
-    # max_num_new_slots_for_drafting * max_num_seqs, and dropping the factor
-    # here would silently break the equality check if the guard is relaxed.
+    # Mirror VllmConfig._set_max_num_scheduled_tokens exactly, or the
+    # equality check silently stops matching.
     reserved_slots = speculative_config.max_num_new_slots_for_drafting * max_num_seqs
     if current_budget != max_num_batched_tokens - reserved_slots:
         return current_budget
@@ -259,9 +258,9 @@ class RBLNScheduler(Scheduler):
         # breaks that read; see the step-phase section in v1/core/utils.py for
         # what it would cost.
         num_scheduled_tokens: dict[str, int] = {}
-        # Only a lone DFlash prefill can consume the restored portion. Decode
-        # queries remain bounded by their fixed speculative width, while the
-        # stored global budget keeps the ordinary scheduler contract intact.
+        # DFlash prefills can consume the restored portion. Decode queries
+        # remain bounded by their fixed speculative width, while the stored
+        # global budget keeps the ordinary scheduler contract intact.
         step_token_budget = self._dflash_step_token_budget
         token_budget = step_token_budget
         if self._pause_state == PauseState.PAUSED_ALL:

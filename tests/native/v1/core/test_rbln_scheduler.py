@@ -297,7 +297,58 @@ class TestDFlashPrefill:
         assert sched._cap_dflash_prefill_to_kv_block is True
         assert sched._dflash_step_token_budget == 512
 
-    def test_restores_only_implicit_lone_request_target_budget(self):
+    def test_scheduler_init_restores_multi_request_budget(self):
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=512,
+            max_num_seqs=2,
+            block_size=1024,
+            max_model_len=49152,
+            speculative_config_override=_DFlashSpecConfig(
+                num_speculative_tokens=7
+            ),
+        )
+
+        assert sched.max_num_scheduled_tokens == 500
+        assert sched._dflash_step_token_budget == 512
+
+    def test_two_request_chunks_do_not_cross_kv_block_boundary(self):
+        block_size = 1024
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=512,
+            max_num_seqs=2,
+            block_size=block_size,
+            max_model_len=49152,
+            speculative_config_override=_DFlashSpecConfig(
+                num_speculative_tokens=7
+            ),
+        )
+        requests = create_requests(
+            num_requests=2,
+            num_tokens=1135,
+            block_size=block_size,
+            max_tokens=64,
+        )
+        for req in requests:
+            sched.add_request(req)
+        by_id = {req.request_id: req for req in requests}
+        scheduled_chunks: dict[str, list[int]] = {req_id: [] for req_id in by_id}
+
+        while any(
+            req.num_computed_tokens < req.num_prompt_tokens for req in requests
+        ):
+            starts = {
+                req_id: req.num_computed_tokens for req_id, req in by_id.items()
+            }
+            out = sched.schedule()
+            for req_id, chunk in out.num_scheduled_tokens.items():
+                assert starts[req_id] % block_size + chunk <= block_size
+                scheduled_chunks[req_id].append(chunk)
+            sched.update_from_output(out, make_model_runner_output(out))
+
+        for req_id, chunks in scheduled_chunks.items():
+            assert sum(chunks) >= by_id[req_id].num_prompt_tokens
+
+    def test_restores_only_implicit_target_budget(self):
         class _SpecConfig:
             def __init__(self, reserve: int, use_dflash: bool):
                 self.max_num_new_slots_for_drafting = reserve
@@ -306,6 +357,15 @@ class TestDFlashPrefill:
             def use_dflash(self) -> bool:
                 return self._use_dflash
 
+        assert (
+            _get_dflash_step_token_budget(
+                current_budget=500,
+                max_num_batched_tokens=512,
+                max_num_seqs=2,
+                speculative_config=_SpecConfig(reserve=6, use_dflash=True),
+            )
+            == 512
+        )
         assert (
             _get_dflash_step_token_budget(
                 current_budget=506,
