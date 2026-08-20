@@ -22,13 +22,13 @@ no page -> (block, slot) table is needed:
     slot         = page_id %  pages_per_kernel_block
 
 Two things upstream's pool cannot provide: a request's pages must land
-contiguously inside one kernel block (R1), and the capacity that gates admission
-must be the group, because that is what runs out first. Keeping those rules in a
-second allocator beside the pool is what let the two disagree -- upstream kept
-admitting against free pages while kernel blocks were exhausted, and the failure
-surfaced as an exception with nowhere to go. Putting them *in* the pool makes
-upstream's own accounting correct: `get_num_free_blocks` is what `KVCacheManager`
-consults before allocating.
+contiguously inside one kernel block with a single writer, and the capacity that
+gates admission must be the group, because that is what runs out first. Keeping
+those rules in a second allocator beside the pool is what let the two disagree --
+upstream kept admitting against free pages while kernel blocks were exhausted,
+and the failure surfaced as an exception with nowhere to go. Putting them *in*
+the pool makes upstream's own accounting correct: `get_num_free_blocks` is what
+`KVCacheManager` consults before allocating.
 
 `KernelBlock` is that group: it holds the ``ppe`` pages, and each page is an
 ``RBLNKVCacheBlock`` that points back at it. The pointer is the object form of
@@ -79,7 +79,7 @@ class KernelBlock:
         Sealed    no owner, every page cached; shareable, matchable
         Retired   no owner, nothing live; reallocatable
 
-    ``owner`` is single-valued because R1 admits one writer per block.
+    ``owner`` is single-valued: an Open kernel block has one writer.
     """
 
     __slots__ = ("index", "owner", "pages")
@@ -109,7 +109,7 @@ class KernelBlock:
         """Is everything from ``from_slot`` on both free and unpublished?
 
         A published tail means the block is some *other* continuation of the same
-        prefix, and R3 must refuse it.
+        prefix, so resume is refused.
         """
         return all(
             page.ref_cnt == 0 and not page.is_null and page.block_hash is None
@@ -295,10 +295,11 @@ class KernelBlockPool(BlockPool):
         """Free slots in Open groups ``owner`` is allowed to write into.
 
         Defaults to whoever `allocating_for` names, and that is only *its*
-        groups: another request's Open group has free slots R1 forbids this one
-        from touching, and counting them would admit work `get_new_blocks` then
-        cannot serve. Outside an allocation, with no owner named, every Open
-        group counts -- that is the whole-pool view `get_usage` reads.
+        groups: another request's Open group already has a writer, so its free
+        slots cannot be touched, and counting them would admit work
+        `get_new_blocks` then cannot serve. Outside an allocation, with no owner
+        named, every Open group counts -- that is the whole-pool view
+        `get_usage` reads.
         """
         owner = owner if owner is not None else self._allocating_for
         return sum(len(group.free_pages()) for group in self._owned_groups(owner))

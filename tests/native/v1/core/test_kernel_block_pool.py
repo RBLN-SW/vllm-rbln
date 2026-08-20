@@ -14,7 +14,7 @@
 
 """The pool itself enforces what a second allocator used to try to.
 
-Contiguity and one-writer-per-block (R1) become properties of allocation, and
+Contiguity and one-writer-per-block become properties of allocation, and
 `get_num_free_blocks` -- which `KVCacheManager` consults before admitting work --
 counts what is actually backable. That last point is the bug this class exists to
 remove: upstream admitted against free pages while kernel blocks were exhausted,
@@ -86,7 +86,6 @@ class TestAllocation:
         assert p.slot_of(second[0]) == 2
 
     def test_a_second_request_never_shares_an_open_kernel_block(self):
-        # R1: one writer per Open kernel block.
         p = pool()
         with p.allocating_for("r1"):
             mine = ids(p.get_new_blocks(1))

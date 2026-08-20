@@ -196,7 +196,7 @@ def hashes(n, salt=b""):
 
 
 class TestLookup:
-    """R2: the longest addressable prefix, group at a time."""
+    """The longest addressable prefix, group at a time."""
 
     def test_a_whole_group_in_one_block_matches(self):
         manager = make_manager()

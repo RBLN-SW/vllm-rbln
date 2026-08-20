@@ -9,7 +9,7 @@ Multi-turn is the deciding workload because it is the only place the two designs
 differ structurally. Both match at page granularity, and both copy a partially
 matched block into a private one — page layout adds exactly one case: when the
 producer's kernel block is unowned and wholly covered by the match, the next turn
-continues writing into it and the copy disappears (rule R3 in the design doc).
+continues writing into it and the copy disappears.
 Everything else is at parity by construction, so a benchmark of independent
 requests cannot separate them. `vllm bench serve` in particular sends
 independent requests, so no turn ever resumes the previous turn's tokens — the

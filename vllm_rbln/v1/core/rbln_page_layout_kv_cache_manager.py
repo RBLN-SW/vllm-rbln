@@ -29,10 +29,11 @@ worker wants then falls out arithmetically -- no page -> location map to keep.
 
 That leaves one case with no legal answer: a group whose match ends part-way
 while the producer's block is still live. Its remaining slots must be written,
-R1 forbids writing them in the producer's block, and the group is one block table
-entry so they cannot go elsewhere. The group is then re-allocated whole as a
-private run and the matched tail copied into it -- the copied pages get *fresh*
-ids naming the new block, which is what keeps the identity intact.
+but an Open kernel block has one writer so they cannot go in the producer's
+block, and the group is one block table entry so they cannot go elsewhere. The
+group is then re-allocated whole as a private run and the matched tail copied
+into it -- the copied pages get *fresh* ids naming the new block, which is what
+keeps the identity intact.
 """
 
 from __future__ import annotations
@@ -131,9 +132,10 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
         **kwargs,
     ) -> None:
         assert self.can_use_page_layout(kv_cache_config, page_layout_config)
-        # R2 replaces upstream's matcher, so anything that changes what a match
-        # means has to be refused rather than silently ignored: EAGLE drops the
-        # last matched block, and context parallelism scales the block size.
+        # Prefix matching walks kernel-block groups, not pages, so anything that
+        # changes what a match means has to be refused rather than silently
+        # ignored: EAGLE drops the last matched block, and context parallelism
+        # scales the block size.
         for name in ("use_eagle", "dcp_world_size", "pcp_world_size"):
             value = kwargs.get(name)
             if value not in (None, False, 0, 1):
@@ -151,7 +153,7 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
         # Upstream sizes the watermark in pages, but it is headroom for admitting
         # the *next* request, and a waiting or preempted one can only be served
         # out of an idle kernel block -- pages free inside another request's Open
-        # group are exactly the ones R1 forbids it from taking. A reserve smaller
+        # group already have a writer and cannot be taken. A reserve smaller
         # than one group therefore reserves nothing, so round it up to whole
         # groups. It stays expressed in pages, so `get_num_free_blocks` remains
         # the single admission gate; and since the watermark only applies to
@@ -186,7 +188,7 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
     # -- prefix match -------------------------------------------------------
 
     def get_computed_blocks(self, request: Request) -> tuple[RBLNKVCacheBlocks, int]:
-        """R2: match a group at a time, over kernel blocks rather than pages.
+        """Match a group at a time, over kernel blocks rather than pages.
 
         Upstream matches page by page and asks the hash table for *a* block
         carrying each hash. That is the wrong question here. A copy publishes a

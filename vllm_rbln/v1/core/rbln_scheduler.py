@@ -84,10 +84,10 @@ class RBLNScheduler(Scheduler):
         # so that each prefill does not span multiple blocks.
 
         # A decode query is written as one contiguous KV window, so the
-        # spec-decode boundary guards below need the *physical* block. Without
+        # spec-decode boundary guards below need the kernel block. Without
         # page layout that is `self.block_size`; page layout makes it coarser
         # and `_maybe_install_page_layout_manager` overwrites this.
-        self.physical_block_size = self.block_size
+        self.kernel_block_size = self.block_size
 
         # Supersedes the overlay: upstream gives the same fine-grained hits
         # directly once the page is --block-size.
@@ -206,22 +206,22 @@ class RBLNScheduler(Scheduler):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
-        self.physical_block_size = page_layout_config.geometry.kernel_block_size
+        self.kernel_block_size = page_layout_config.geometry.kernel_block_size
         return True
 
     def _spec_backfill_is_unsafe(
         self, num_computed_tokens: int, num_new_tokens: int
     ) -> bool:
-        """Would the runner's backfill reach out of the current physical block?
+        """Would the runner's backfill reach out of the current kernel block?
 
         A decode query is written as one contiguous KV window, and the runner
-        pads it to `num_spec_tokens + 1` by reaching backwards. The block here
-        must be the *physical* one: under page layout the pages inside a kernel
-        block are contiguous (I3), so crossing a page boundary is harmless and
-        only a kernel-block boundary is a real discontinuity.
+        pads it to `num_spec_tokens + 1` by reaching backwards. Under page
+        layout the pages inside a kernel block are contiguous, so crossing a
+        page boundary is harmless and only a kernel-block boundary is a real
+        discontinuity.
         """
         required_backfill = max(0, self.num_spec_tokens + 1 - num_new_tokens)
-        return required_backfill > num_computed_tokens % self.physical_block_size
+        return required_backfill > num_computed_tokens % self.kernel_block_size
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -415,9 +415,9 @@ class RBLNScheduler(Scheduler):
             # batch to single-token decode only if this request remains scheduled.
             if self.num_spec_tokens > 0 and not is_prefill(request):
                 tokens_used_in_block = (
-                    request.num_computed_tokens % self.physical_block_size
+                    request.num_computed_tokens % self.kernel_block_size
                 )
-                remaining_in_block = self.physical_block_size - tokens_used_in_block
+                remaining_in_block = self.kernel_block_size - tokens_used_in_block
                 num_new_tokens = min(remaining_in_block, num_new_tokens)
 
                 if num_new_tokens > 0 and self._spec_backfill_is_unsafe(

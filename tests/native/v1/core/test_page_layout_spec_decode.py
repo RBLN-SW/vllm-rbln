@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The spec-decode backfill guard measures against the physical block.
+"""The spec-decode backfill guard measures against the kernel block.
 
 A decode query is one contiguous KV window that the runner pads backwards to
 `num_spec_tokens + 1`. Page layout makes `block_size` the *page*, which is not
-that window: pages inside a kernel block are contiguous (I3), so only a
+that window: pages inside a kernel block are contiguous, so only a
 kernel-block boundary is a real discontinuity. Measuring against the page is
 still safe -- the page divides the kernel block, so it is strictly stricter --
 but it disables spec decode near every page boundary instead of every kernel
@@ -32,10 +32,10 @@ KERNEL_BLOCK = 8192
 NUM_SPEC = 3
 
 
-def guard(physical_block_size, num_computed_tokens, num_new_tokens=1):
+def guard(kernel_block_size, num_computed_tokens, num_new_tokens=1):
     sched = RBLNScheduler.__new__(RBLNScheduler)
     sched.num_spec_tokens = NUM_SPEC
-    sched.physical_block_size = physical_block_size
+    sched.kernel_block_size = kernel_block_size
     return RBLNScheduler._spec_backfill_is_unsafe(
         sched, num_computed_tokens, num_new_tokens
     )
@@ -59,7 +59,7 @@ class TestBoundary:
         assert not guard(KERNEL_BLOCK, KERNEL_BLOCK, num_new_tokens=NUM_SPEC + 1)
 
 
-class TestPhysicalVsPage:
+class TestKernelBlockVsPage:
     def test_page_boundaries_inside_a_kernel_block_are_not_boundaries(self):
         # The regression this guards: measured against the page, every one of
         # the 16 page boundaries in a kernel block would drop to no-spec.
@@ -67,7 +67,7 @@ class TestPhysicalVsPage:
             position = page_index * PAGE
             assert guard(PAGE, position), "page-sized guard fires here"
             assert not guard(KERNEL_BLOCK, position), (
-                "a page boundary is contiguous inside a kernel block (I3)"
+                "a page boundary is contiguous inside a kernel block"
             )
 
     def test_kernel_block_boundary_still_fires(self):
