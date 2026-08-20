@@ -63,7 +63,8 @@ An empty list is a claim. Only write it if it is true.
 ## 5. Write the commit and PR
 
 - `type(scope): summary`, matching the existing history
-- Explain intent, not the diff
+- Summarise what changed in a line or two, then explain what the diff cannot show
 - Say which model path or paths the change affects
-- English, and no measured numbers
+- English
+- A perf change says the direction, not the number
 - Fill in `.github/PULL_REQUEST_TEMPLATE.md`. `gh pr create --body` does not apply it, so read the file and follow its sections rather than writing free-form prose.

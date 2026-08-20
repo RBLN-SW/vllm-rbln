@@ -145,7 +145,7 @@ Explain intent. Summarise what changed in a line or two, then spend the space on
 
 ## Skills
 
-Read and follow the matching skill before you start:
+Read and follow the matching skill at the point it applies:
 
 - Adding or changing tests under `tests/native/`: `.claude/skills/writing-tests/SKILL.md`
 - Investigating a bug, a test failure, or unexpected behavior: `.claude/skills/debugging/SKILL.md`
