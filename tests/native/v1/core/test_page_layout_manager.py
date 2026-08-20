@@ -206,10 +206,11 @@ class TestLookup:
 
     def test_it_prefers_the_block_that_continues_the_run(self):
         # A copy publishes a duplicate of one page; upstream would return either.
+        # Publish the short copy first so a single-entry lookup would pick it.
         manager = make_manager()
         keys = hashes(PPE)
-        publish(manager, [4, 5, 6, 7], keys)
         publish(manager, [12], keys[:1])
+        publish(manager, [4, 5, 6, 7], keys)
         assert [b.block_id for b in manager._match(keys, PPE)] == [4, 5, 6, 7]
 
     def test_a_partial_group_ends_the_match(self):

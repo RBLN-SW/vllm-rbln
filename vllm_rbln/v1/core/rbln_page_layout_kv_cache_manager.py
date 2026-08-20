@@ -234,9 +234,13 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
                 for block_hash in block_hashes[start : min(start + ppe, max_pages)]
             ]
             best: range | None = None
-            for kernel_block in range(self.pool.num_kernel_blocks):
-                base = kernel_block * ppe
-                length = 0
+            # Groups are kernel-block aligned, so the first hash's cached
+            # pages *are* the candidate starts. Copies make a few extras.
+            for page in cache.get_blocks(group[0]):
+                if self.pool.slot_of(page.block_id) != 0:
+                    continue
+                base = page.block_id
+                length = 1
                 while length < len(group) and cache.contain(
                     group[length], base + length
                 ):
@@ -245,7 +249,7 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
                     best = range(base, base + length)
                     if length == len(group):
                         break
-            if best is None or not best:
+            if best is None:
                 break
             matched.extend(self.pool.page(page_id) for page_id in best)
             if len(best) < len(group):

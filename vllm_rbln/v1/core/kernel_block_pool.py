@@ -44,13 +44,15 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 import vllm.v1.core.block_pool as block_pool_mod
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId
 
 logger = init_logger(__name__)
 
@@ -146,12 +148,35 @@ class KernelBlock:
         self.owner = None
 
 
+class KernelBlockHashToBlockMap(BlockHashToBlockMap):
+    """``BlockHashToBlockMap`` that can list every page carrying a hash.
+
+    Upstream's map returns *a* page for a hash. A copy publishes a second page
+    under the same hash, and prefix match has to see both so it can pick the
+    kernel block that actually continues the run.
+    """
+
+    def get_blocks(self, key: BlockHashWithGroupId) -> Iterable[KVCacheBlock]:
+        """Every cached page carrying ``key`` (one, or several after a copy)."""
+        blocks = self._cache.get(key)
+        if blocks is None:
+            return ()
+        if isinstance(blocks, KVCacheBlock):
+            return (blocks,)
+        if isinstance(blocks, dict):
+            return blocks.values()
+        self._unexpected_blocks_type(blocks)
+        return ()
+
+
 class KernelBlockPool(BlockPool):
     """``BlockPool`` whose allocation unit is the kernel block.
 
     Pages are still the unit upstream schedules, hashes and matches on. Only
     *where* a page lives, and *how many* are considered free, change.
     """
+
+    cached_block_hash_to_block: KernelBlockHashToBlockMap
 
     def __init__(
         self,
@@ -181,6 +206,7 @@ class KernelBlockPool(BlockPool):
             super().__init__(usable, enable_caching, hash_block_size, **kwargs)
         finally:
             block_pool_mod.KVCacheBlock = original
+        self.cached_block_hash_to_block = KernelBlockHashToBlockMap()
 
         self.pages_per_kernel_block = pages_per_kernel_block
         self.num_kernel_blocks = usable // pages_per_kernel_block
