@@ -1591,8 +1591,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
+            # DFlash queries 1 + num_spec positions per request (bonus token
+            # plus mask tokens), one wider than EAGLE's sequential drafts, so
+            # its ceiling check needs the extra slot.
+            drafter_query_width = self.num_spec_tokens + (
+                1 if spec_config.use_dflash() else 0
+            )
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
-                spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+                spec_decode_common_attn_metadata.max_seq_len + drafter_query_width
                 <= self.effective_drafter_max_model_len
             )
             # TODO(RBLN): supports mtp and extract hidden states

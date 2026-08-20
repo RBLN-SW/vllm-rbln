@@ -239,18 +239,29 @@ def _dflash_page_crossing_mask(
     return offsets + query_len > partition_size
 
 
-def _empty_drafts_for_page_crossing(
-    crossing: torch.Tensor,
-) -> list[list[int]] | None:
-    """Skip a whole local batch before any unrepresentable KV insert runs."""
-    crossing_list = [bool(value) for value in crossing.tolist()]
-    if not any(crossing_list):
-        return None
-    # Selective execution would require rebuilding the compiled attention
-    # metadata for a smaller batch. Running a crossing row and filtering only
-    # its token IDs afterwards is unsafe because its unsplittable KV insert has
-    # already happened. Sacrifice speculation for this one local batch instead.
-    return [[] for _ in crossing_list]
+def _clamped_draft_seq_lens(
+    seq_lens: torch.Tensor,
+    partition_size: int,
+    query_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Crossing rows rounded UP to their next page start; others unchanged.
+
+    Running a crossing row as-is is unsafe: its unsplittable query-block KV
+    insert executes inside the forward, so it cannot be filtered afterwards,
+    and rebuilding the compiled metadata for a smaller batch would need
+    another graph shape. Redirecting only the WRITE side (block-start
+    position, attention window) of the crossing row keeps the insert
+    representable and lands it in the request's own lookahead block: crossing
+    means the 1 + num_spec lookahead already spilled past the page boundary,
+    so that block is allocated to this request, and its slots are overwritten
+    by real context K/V once the sequence reaches them. The redirected row's
+    draft output is meaningless and MUST be dropped by the caller; every
+    other row drafts normally instead of losing the whole batch.
+    """
+    crossing = _dflash_page_crossing_mask(seq_lens, partition_size, query_len)
+    clamped = seq_lens.clone()
+    clamped[crossing] = (clamped[crossing] // partition_size + 1) * partition_size
+    return clamped, crossing
 
 
 class _BoundedHiddenStateCombiner:
@@ -1251,13 +1262,55 @@ class RBLNDFlashProposer(RBLNEagleProposer):
             self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
         )
 
-        block_start_positions = self._block_start_positions(common_attn_metadata)
+        # Page-crossing neutralization. The naive non-causal kernel writes the
+        # whole query block at ONE dynamic offset per partition, so the seven
+        # offsets before a page boundary are unrepresentable. Redirect only
+        # the WRITE side of each crossing request -- block-start positions and
+        # the attention window below come from `draft_cad` -- to its next page
+        # start (see _clamped_draft_seq_lens for why that slot is safe), and
+        # drop that request's drafts at the end. Model-input positions keep
+        # the TRUE sequence positions (set_inputs_first_pass above already
+        # read the original cad), so RoPE never indexes past the request's
+        # real range. The original cad tensors are never mutated: they alias
+        # the runner's buffers.
+        assert common_attn_metadata._seq_lens_cpu is not None
+        block_size = self.runner.cache_config.block_size
+        clamped_seq_lens, page_crossing = _clamped_draft_seq_lens(
+            common_attn_metadata._seq_lens_cpu[:num_reqs],
+            block_size,
+            1 + self.num_speculative_tokens,
+        )
+        # Neutralization needs somewhere representable to redirect the write.
+        # At the context ceiling the next page is outside the request's block
+        # table (allocate_slots caps the lookahead at max_model_len), so fall
+        # back to the pre-neutralization behavior for the whole step: keep the
+        # metadata unclamped, still write context K/V below, and return only
+        # empty drafts.
+        block_table_width = common_attn_metadata.block_table_tensor.shape[-1]
+        crossing_beyond_table = page_crossing & (
+            clamped_seq_lens // block_size >= block_table_width
+        )
+        neutralize_crossing = bool(page_crossing.any()) and not bool(
+            crossing_beyond_table.any()
+        )
+        draft_cad = common_attn_metadata
+        if neutralize_crossing:
+            draft_seq_lens_cpu = common_attn_metadata._seq_lens_cpu.clone()
+            draft_seq_lens_cpu[:num_reqs] = clamped_seq_lens
+            draft_cad = copy(common_attn_metadata)
+            draft_cad._seq_lens_cpu = draft_seq_lens_cpu
+            draft_cad.seq_lens = draft_seq_lens_cpu.to(
+                common_attn_metadata.seq_lens.device,
+                common_attn_metadata.seq_lens.dtype,
+            )
+
+        block_start_positions = self._block_start_positions(draft_cad)
 
         per_group_metadata = []
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
-                common_attn_metadata=common_attn_metadata,
+                common_attn_metadata=draft_cad,
                 positions=block_start_positions,
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
@@ -1273,11 +1326,26 @@ class RBLNDFlashProposer(RBLNEagleProposer):
                 self._specialize_layer_attn_metadata(
                     attn_group,
                     attn_metadata,
-                    common_attn_metadata,
+                    draft_cad,
                     num_reqs,
                     num_reqs_padded,
                 )
             )
+
+        # The sliding-window branch of _resolve_group_slots derives context
+        # offsets from per-group metadata, which now carries CLAMPED seq_lens
+        # for crossing rows. Dead on this stack (one full-attention KV group),
+        # but a stack that splits the groups would write real context K/V at
+        # redirected offsets -- persistent corruption, not a dropped draft.
+        if neutralize_crossing:
+            for _, attn_metadata in per_group_metadata:
+                if getattr(attn_metadata, "local_block_tables", None) is not None:
+                    raise RuntimeError(
+                        "DFlash page-crossing neutralization does not support "
+                        "split sliding-window KV groups: their context slots "
+                        "would derive from clamped metadata. Resolve slots "
+                        "from unclamped metadata before enabling this stack."
+                    )
 
         # Project the target's hidden states into the drafter's KV cache. This
         # is a compiled graph (patches/qwen3_dflash.py): upstream runs it eager,
@@ -1313,19 +1381,12 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         if intermediate_drafts is not None:
             return intermediate_drafts
 
-        assert common_attn_metadata._seq_lens_cpu is not None
-        page_crossing = _dflash_page_crossing_mask(
-            common_attn_metadata._seq_lens_cpu[:num_reqs],
-            self.runner.cache_config.block_size,
-            1 + self.num_speculative_tokens,
-        )
-        empty_drafts = _empty_drafts_for_page_crossing(page_crossing)
-        if empty_drafts is not None:
-            # Context K/V above is still required: this target-only step is what
-            # advances the request toward the next aligned page. Do not return a
-            # zero-filled tensor; the scheduler would treat those zeros as valid
-            # draft token IDs.
-            return empty_drafts
+        if bool(crossing_beyond_table.any()):
+            # Context K/V above is still required: this target-only step is
+            # what advances the request toward the next aligned page. Do not
+            # return a zero-filled tensor; the scheduler would treat those
+            # zeros as valid draft token IDs.
+            return [[] for _ in range(num_reqs)]
 
         # Same reshape/pad path the warmup used, so the compiled shape matches
         # and the first real step does not trigger a recompile.
@@ -1357,4 +1418,17 @@ class RBLNDFlashProposer(RBLNEagleProposer):
             )
 
         draft_token_ids = self._draft_ids(out, num_reqs * self.num_speculative_tokens)
-        return draft_token_ids.view(num_reqs, self.num_speculative_tokens)
+        draft_token_ids = draft_token_ids.view(num_reqs, self.num_speculative_tokens)
+        if neutralize_crossing:
+            # A crossing request drafted against its redirected window, so its
+            # ids are meaningless. Empty lists -- never zeros, which the
+            # scheduler would treat as real token ids -- drop speculation for
+            # it alone; the context K/V above still landed, and the target-only
+            # step advances it to the aligned page where speculation resumes.
+            # One tolist() for the whole tensor: per-row slices would each be
+            # an eager device op on this stack.
+            rows = draft_token_ids.tolist()
+            return [
+                [] if bool(page_crossing[i]) else rows[i] for i in range(num_reqs)
+            ]
+        return draft_token_ids

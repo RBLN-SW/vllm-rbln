@@ -332,10 +332,13 @@ class TestDFlashPrefill:
             sched.add_request(req)
         by_id = {req.request_id: req for req in requests}
         scheduled_chunks: dict[str, list[int]] = {req_id: [] for req_id in by_id}
+        steps = 0
 
         while any(
             req.num_computed_tokens < req.num_prompt_tokens for req in requests
         ):
+            steps += 1
+            assert steps <= 16, "scheduler stalled before finishing both prefills"
             starts = {
                 req_id: req.num_computed_tokens for req_id, req in by_id.items()
             }

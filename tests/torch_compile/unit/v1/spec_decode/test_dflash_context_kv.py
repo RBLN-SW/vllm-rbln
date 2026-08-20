@@ -30,10 +30,10 @@ from vllm_rbln.v1.spec_decode.dflash import (
     RBLNDFlashProposer,
     _BoundedHiddenStateCombiner,
     _check_draft_rope_style,
+    _clamped_draft_seq_lens,
     _dflash_page_crossing_mask,
     _dflash_target_rope_is_neox_style,
     _DFlashSplitForwardGraph,
-    _empty_drafts_for_page_crossing,
     _get_dflash_forward_split,
     _validate_dflash_geometry,
 )
@@ -381,10 +381,16 @@ def test_dflash_page_crossing_guard_covers_only_unrepresentable_offsets() -> Non
     assert mask.tolist() == [False, *([True] * 7), False, False]
 
 
-def test_dflash_page_crossing_guard_skips_whole_batch_before_kv_insert() -> None:
-    assert _empty_drafts_for_page_crossing(torch.tensor([True, False])) == [[], []]
-    assert _empty_drafts_for_page_crossing(torch.tensor([True, True])) == [[], []]
-    assert _empty_drafts_for_page_crossing(torch.tensor([False, False])) is None
+def test_clamped_draft_seq_lens_redirects_only_crossing_rows() -> None:
+    seq_lens = torch.tensor([100, 1016, 1017, 1023, 2045], dtype=torch.int32)
+
+    clamped, crossing = _clamped_draft_seq_lens(seq_lens, 1024, 8)
+
+    assert crossing.tolist() == [False, False, True, True, True]
+    assert clamped.tolist() == [100, 1016, 1024, 1024, 2048]
+    assert clamped.dtype == torch.int32
+    # The input is never mutated; it aliases the runner's buffers.
+    assert seq_lens.tolist() == [100, 1016, 1017, 1023, 2045]
 
 
 def test_dflash_intermediate_prefill_keeps_only_context_kv_work() -> None:
@@ -1524,6 +1530,119 @@ def test_propose_truncates_padded_draft_output_to_real_batch(
     assert fake_helper.calls == ["compile_context", "group_slots"]
     assert isinstance(result, torch.Tensor)
     assert result.shape == (num_reqs, num_spec)
+
+
+def test_propose_neutralizes_only_page_crossing_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One request at page offset 1020 (crossing) next to one at 100.
+
+    The crossing request's WRITE-side positions are redirected to its next
+    page start (1024) so the batch still runs; only its drafts come back
+    empty. The runner's seq_lens tensors are never mutated.
+    """
+    num_reqs = num_reqs_padded = 2
+    num_spec = 7
+    ctx_per_req = 8
+    proposer = _make_propose_proposer(num_reqs, num_reqs_padded, num_spec)
+    cad = _make_propose_cad(num_reqs, ctx_per_req, seq_len=100)
+    seq_lens = torch.tensor([100, 1020], dtype=torch.int32)
+    cad.seq_lens = seq_lens
+    cad._seq_lens_cpu = seq_lens
+
+    fake_helper = _FakeContextKVHelper()
+    monkeypatch.setattr(dflash_mod, "attach_kv_cache_bindings", lambda *a, **k: None)
+    monkeypatch.setattr(dflash_mod, "get_or_create_context_kv", lambda m: fake_helper)
+    monkeypatch.setattr(
+        dflash_mod, "build_kv_cache_forward_context_kwargs", lambda bases: {}
+    )
+    monkeypatch.setattr(
+        dflash_mod, "set_forward_context", lambda *a, **k: contextlib.nullcontext()
+    )
+
+    forward_ran = {}
+
+    def fake_model_executable(*, input_ids, positions, token_indices_to_sample):
+        forward_ran["sampled_rows"] = int(token_indices_to_sample.shape[0])
+        rows = token_indices_to_sample.shape[0]
+        return None, torch.arange(rows, dtype=torch.int64)
+
+    proposer.model_executable = fake_model_executable
+
+    num_context = num_reqs * ctx_per_req
+    result = proposer.propose(
+        target_token_ids=torch.zeros(num_context, dtype=torch.int32),
+        target_positions=torch.arange(num_context, dtype=torch.int64),
+        target_hidden_states=torch.randn(num_context, 16),
+        next_token_ids=torch.arange(num_reqs, dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=cad,
+    )
+
+    # The batch DID run; only the crossing request's drafts are dropped. The
+    # fake model returns the sample-slot index, so request 0 owns rows 0..6.
+    assert forward_ran["sampled_rows"] == num_reqs_padded * num_spec
+    assert isinstance(result, list)
+    assert result[0] == list(range(num_spec))
+    assert result[1] == []
+    # The metadata builder saw the redirected write position for the crossing
+    # request (next page start), and the true one for the other.
+    builder = proposer.draft_attn_groups[0].get_metadata_builder()
+    probe = builder.build_calls[0][0]
+    assert probe[0].item() == 100
+    assert probe[ctx_per_req].item() == 1024
+    # The runner-aliased tensors stay untouched.
+    assert cad.seq_lens.tolist() == [100, 1020]
+
+
+def test_propose_falls_back_to_batch_drop_at_the_context_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crossing request whose next page is OUTSIDE its block table cannot
+    be redirected (allocate_slots caps the lookahead at max_model_len), so
+    the step keeps the old semantics: context K/V is still written with
+    unclamped metadata, the forward never runs, everyone returns empty."""
+    num_reqs = num_reqs_padded = 2
+    ctx_per_req = 8
+    proposer = _make_propose_proposer(num_reqs, num_reqs_padded, 7)
+    cad = _make_propose_cad(num_reqs, ctx_per_req, seq_len=100)
+    # Table is 4 blocks wide (4096 tokens); 4090 crosses and clamps to 4096,
+    # which is block index 4 -- beyond the table.
+    seq_lens = torch.tensor([100, 4090], dtype=torch.int32)
+    cad.seq_lens = seq_lens
+    cad._seq_lens_cpu = seq_lens
+
+    fake_helper = _FakeContextKVHelper()
+    monkeypatch.setattr(dflash_mod, "attach_kv_cache_bindings", lambda *a, **k: None)
+    monkeypatch.setattr(dflash_mod, "get_or_create_context_kv", lambda m: fake_helper)
+    monkeypatch.setattr(
+        dflash_mod, "build_kv_cache_forward_context_kwargs", lambda bases: {}
+    )
+    monkeypatch.setattr(
+        dflash_mod, "set_forward_context", lambda *a, **k: contextlib.nullcontext()
+    )
+
+    def fail_model_executable(**kwargs):
+        raise AssertionError("the draft forward must not run at the ceiling")
+
+    proposer.model_executable = fail_model_executable
+
+    num_context = num_reqs * ctx_per_req
+    result = proposer.propose(
+        target_token_ids=torch.zeros(num_context, dtype=torch.int32),
+        target_positions=torch.arange(num_context, dtype=torch.int64),
+        target_hidden_states=torch.randn(num_context, 16),
+        next_token_ids=torch.arange(num_reqs, dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=cad,
+    )
+
+    assert result == [[], []]
+    # Context K/V was still delivered, and with UNCLAMPED write positions.
+    assert fake_helper.calls == ["compile_context", "group_slots"]
+    builder = proposer.draft_attn_groups[0].get_metadata_builder()
+    probe = builder.build_calls[0][0]
+    assert probe[ctx_per_req].item() == 4090
 
 
 # ----------------------------------------------------------------------
