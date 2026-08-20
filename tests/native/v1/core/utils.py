@@ -148,6 +148,7 @@ def create_rbln_scheduler(
     sub_block_size: int | None = None,
     policy: str = "fcfs",
     use_kv_connector: MockKVConfig | None = None,
+    speculative_config_override: Any | None = None,
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
@@ -201,6 +202,12 @@ def create_rbln_scheduler(
         kv_cache_groups=[KVCacheGroupSpec(["layer"], full_attention_spec(block_size))],
     )
     cache_config.num_gpu_blocks = num_blocks
+    if speculative_config_override is not None:
+        # Draft-model configs need a real checkpoint during normal validation.
+        # Tests install a duck-typed config afterward, then run the production
+        # implicit draft-slot reservation logic against it.
+        vllm_config.speculative_config = speculative_config_override
+        vllm_config._set_max_num_scheduled_tokens()
     return RBLNScheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,

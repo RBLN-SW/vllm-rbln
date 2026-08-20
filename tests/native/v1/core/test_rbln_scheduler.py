@@ -259,7 +259,44 @@ class TestScheduleBasic:
         assert out.num_scheduled_tokens[req.request_id] == 1
 
 
+class _DFlashSpecConfig:
+    """Attributes consumed by scheduler setup for a DFlash configuration."""
+
+    def __init__(self, num_speculative_tokens: int) -> None:
+        self.num_speculative_tokens = num_speculative_tokens
+        self.parallel_drafting = True
+        self.method = "dflash"
+
+    @property
+    def max_num_new_slots_for_drafting(self) -> int:
+        return self.num_speculative_tokens - 1
+
+    def use_eagle(self) -> bool:
+        return True
+
+    def use_dflash(self) -> bool:
+        return True
+
+    def uses_draft_model(self) -> bool:
+        return False
+
+
 class TestDFlashPrefill:
+    def test_scheduler_init_derives_budget_and_cap(self):
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=512,
+            max_num_seqs=1,
+            block_size=1024,
+            max_model_len=49152,
+            speculative_config_override=_DFlashSpecConfig(
+                num_speculative_tokens=7
+            ),
+        )
+
+        assert sched.max_num_scheduled_tokens == 506
+        assert sched._cap_dflash_prefill_to_kv_block is True
+        assert sched._dflash_step_token_budget == 512
+
     def test_restores_only_implicit_lone_request_target_budget(self):
         class _SpecConfig:
             def __init__(self, reserve: int, use_dflash: bool):

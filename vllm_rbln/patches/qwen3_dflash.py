@@ -132,6 +132,12 @@ _WHY = (
 )
 
 _CACHE_PARTITION_SIZE = 1024
+# 506 is the device-verified projection profile from before the scheduler
+# restored the full 512-token step budget (rbln_scheduler._get_dflash_step_
+# token_budget). A full 512-token prefill run therefore splits 506 + 6 and
+# projects twice per layer per chunk. Raising this to 512 removes the split
+# but changes the compiled profile, so it needs device re-verification and a
+# TTFT measurement first; until then the split is a known cost, not a bug.
 _DFLASH_CONTEXT_KV_MAX_RUN_LEN = 506
 _DFLASH_CONTEXT_KV_DECODE_BUCKET = 8
 

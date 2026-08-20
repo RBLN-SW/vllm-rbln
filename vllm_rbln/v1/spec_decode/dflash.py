@@ -143,6 +143,53 @@ def _check_draft_rope_style(draft_model: nn.Module, expected_is_neox: bool) -> N
             return
 
 
+def _validate_dflash_geometry(
+    max_num_tokens: int,
+    max_batch_size: int,
+    num_speculative_tokens: int,
+) -> None:
+    """Reject configurations the port only appears to support.
+
+    Both bounds are silent failures without this check: an oversized block
+    width overruns the base class's `max_num_tokens`-sized query buffers only
+    at warmup (or later), and speculation past the 8-row decode profile pads
+    every context-KV and combiner decode run to the prefill profile -- a large
+    unexplained step-time regression rather than an error.
+    """
+    num_query_per_req = 1 + num_speculative_tokens
+    if num_query_per_req > _DFLASH_COMBINE_DECODE_BUCKET:
+        # patches/qwen3_dflash.py pins its context-KV decode profile to the
+        # same 8 rows; both would fall off the cliff together.
+        raise ValueError(
+            "DFlash supports num_speculative_tokens <= "
+            f"{_DFLASH_COMBINE_DECODE_BUCKET - 1}, got {num_speculative_tokens}. "
+            "Larger blocks pad every decode-step projection to the prefill "
+            "profile; derive the decode buckets from the configuration before "
+            "lifting this limit."
+        )
+    max_query_tokens = max_batch_size * num_query_per_req
+    if max_num_tokens < max_query_tokens:
+        raise ValueError(
+            "DFlash query buffers reuse the base class's max_num_batched_tokens"
+            f"-sized allocations, so max_num_batched_tokens ({max_num_tokens}) "
+            "must cover max_batch_size * (1 + num_speculative_tokens) "
+            f"({max_batch_size} * {num_query_per_req} = {max_query_tokens}). "
+            "Raise max_num_batched_tokens or lower max_num_seqs."
+        )
+    if max_num_tokens > _DFLASH_COMBINE_PREFILL_BUCKET:
+        # A step packs at most the restored token budget (max_num_batched_
+        # tokens) of context rows into ONE combiner call, and dummy_run never
+        # exercises the combiner, so an oversized budget only surfaces on the
+        # first long prefill chunk in production.
+        raise ValueError(
+            "DFlash's combiner prefill profile is fixed at "
+            f"{_DFLASH_COMBINE_PREFILL_BUCKET} rows, so max_num_batched_tokens "
+            f"({max_num_tokens}) must not exceed it. Lower "
+            "max_num_batched_tokens, or derive the combiner and context-KV "
+            "profile buckets from the configuration before lifting this limit."
+        )
+
+
 def _get_dflash_forward_split(layer_types: list[str]) -> int | None:
     """Return the one SWA-to-full boundary that needs a graph split.
 
@@ -292,6 +339,11 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         # is context that reaches the drafter through its KV cache, so the query
         # buffers stay tiny compared with EAGLE3's.
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
+        _validate_dflash_geometry(
+            max_num_tokens=self.max_num_tokens,
+            max_batch_size=self.max_batch_size,
+            num_speculative_tokens=self.num_speculative_tokens,
+        )
 
         # Filled by set_inputs_first_pass. Upstream's fused Triton kernel uses
         # the original target positions both for RoPE and for the context slot

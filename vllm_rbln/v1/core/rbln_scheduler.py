@@ -93,7 +93,11 @@ def _get_dflash_step_token_budget(
     ):
         return current_budget
 
-    reserved_slots = speculative_config.max_num_new_slots_for_drafting
+    # Keep the multiplication even though the guard pins max_num_seqs to 1:
+    # VllmConfig._set_max_num_scheduled_tokens reserves
+    # max_num_new_slots_for_drafting * max_num_seqs, and dropping the factor
+    # here would silently break the equality check if the guard is relaxed.
+    reserved_slots = speculative_config.max_num_new_slots_for_drafting * max_num_seqs
     if current_budget != max_num_batched_tokens - reserved_slots:
         return current_budget
     return max_num_batched_tokens

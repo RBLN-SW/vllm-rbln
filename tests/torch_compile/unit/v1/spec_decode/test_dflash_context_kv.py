@@ -35,6 +35,7 @@ from vllm_rbln.v1.spec_decode.dflash import (
     _DFlashSplitForwardGraph,
     _empty_drafts_for_page_crossing,
     _get_dflash_forward_split,
+    _validate_dflash_geometry,
 )
 
 
@@ -1410,6 +1411,35 @@ def test_propose_truncates_padded_draft_output_to_real_batch(
 # ----------------------------------------------------------------------
 # Configuration geometry and RoPE style plumbing
 # ----------------------------------------------------------------------
+
+
+def test_dflash_geometry_accepts_supported_configuration() -> None:
+    _validate_dflash_geometry(
+        max_num_tokens=512, max_batch_size=64, num_speculative_tokens=7
+    )
+
+
+def test_dflash_geometry_rejects_query_buffers_beyond_token_budget() -> None:
+    with pytest.raises(ValueError, match="max_num_batched_tokens"):
+        _validate_dflash_geometry(
+            max_num_tokens=511, max_batch_size=64, num_speculative_tokens=7
+        )
+
+
+def test_dflash_geometry_rejects_speculation_past_decode_profile() -> None:
+    with pytest.raises(ValueError, match="num_speculative_tokens"):
+        _validate_dflash_geometry(
+            max_num_tokens=8192, max_batch_size=1, num_speculative_tokens=8
+        )
+
+
+def test_dflash_geometry_rejects_budget_beyond_combiner_prefill_profile() -> None:
+    # A 1024-token budget would feed the first long prefill chunk into the
+    # fixed 512-row combiner profile at serve time; fail at init instead.
+    with pytest.raises(ValueError, match="prefill profile"):
+        _validate_dflash_geometry(
+            max_num_tokens=1024, max_batch_size=1, num_speculative_tokens=7
+        )
 
 
 class _RotaryModule(nn.Module):
