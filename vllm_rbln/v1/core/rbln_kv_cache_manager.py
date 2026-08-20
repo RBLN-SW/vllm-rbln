@@ -48,6 +48,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.page_layout import KVCacheCopyOp
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -65,18 +66,6 @@ _SUB_BLOCK_ELIGIBLE_SPECS: tuple[type[KVCacheSpec], ...] = (
 )
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class KVCacheCopyOp:
-    """Describes a sub-block KV cache copy from a cached block to a new block."""
-
-    group_id: int
-    # NOTE: While pending, it holds a ref count of the source block to prevent eviction.
-    src_block_id: int
-    dst_block_id: int
-    # Number of tokens to copy (= num_matched_sub_blocks * sub_block_size).
-    num_tokens: int
 
 
 class SubBlockHasher:
@@ -489,7 +478,6 @@ class RBLNKVCacheManager(KVCacheManager):
             dst_block = block_list[gm.dst_req_block_index]
             self.pending_copy_ops.append(
                 KVCacheCopyOp(
-                    group_id=i,
                     src_block_id=gm.src_block.block_id,
                     dst_block_id=dst_block.block_id,
                     num_tokens=match.num_tokens,

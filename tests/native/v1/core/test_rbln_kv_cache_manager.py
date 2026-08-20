@@ -480,7 +480,7 @@ class TestGetComputedBlocksSubBlock:
 
 class TestApplyReleaseSubBlockMatch:
     def test_apply_creates_copy_op_per_group(self):
-        # apply -> one KVCacheCopyOp(group_id/src/dst/num_tokens) per group.
+        # apply -> one KVCacheCopyOp(src/dst/num_tokens) per group.
         manager = make_manager(8, 4, 10)
         req0 = make_request("0", list(range(8)), 8)
         prefill_request(manager, req0)
@@ -491,7 +491,6 @@ class TestApplyReleaseSubBlockMatch:
         ops = manager.drain_pending_copy_ops()
         assert len(ops) == 1
         op = ops[0]
-        assert op.group_id == 0
         assert op.num_tokens == 4
         assert op.dst_block_id != op.src_block_id
         manager.release_copy_ops(ops)

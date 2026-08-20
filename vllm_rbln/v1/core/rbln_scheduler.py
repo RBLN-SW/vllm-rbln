@@ -15,7 +15,7 @@
 import itertools
 import time
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -38,13 +38,12 @@ from vllm.v1.utils import record_function_or_nullcontext
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.page_layout import (
-    KernelBlockCopyOp,
+    KVCacheCopyOp,
     kernel_block_size_from_config,
     resolve_config,
     validate_fragmentation,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
-    KVCacheCopyOp,
     RBLNKVCacheManager,
     SubBlockMatch,
 )
@@ -65,14 +64,9 @@ logger = init_logger(__name__)
 class RBLNSchedulerOutput(SchedulerOutput):
     """SchedulerOutput extended with KV cache copies for the worker to perform
     before the forward pass.
-
-    Carries whichever op shape the active manager produces: the overlay's
-    block-prefix copy or the page/kernel block layer's slot-range copy.
     """
 
-    kv_cache_copy_ops: list[KVCacheCopyOp | KernelBlockCopyOp] = field(
-        default_factory=list
-    )
+    kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
 
 
 def _align_prefill_threshold(threshold: int, match_unit: int | None) -> int:
@@ -1307,11 +1301,7 @@ class RBLNScheduler(Scheduler):
         # Sources can be released now the worker has read them; running after
         # super() keeps this safe under async scheduling / PP.
         if scheduler_output.kv_cache_copy_ops:
-            # One manager is installed at a time and each emits only its own op
-            # shape, so the list is homogeneous even though its type is a union.
-            self.kv_cache_manager.release_copy_ops(
-                cast(Any, scheduler_output.kv_cache_copy_ops)
-            )
+            self.kv_cache_manager.release_copy_ops(scheduler_output.kv_cache_copy_ops)
 
         return result
 

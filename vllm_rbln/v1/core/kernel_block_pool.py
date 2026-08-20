@@ -67,13 +67,6 @@ class RBLNKVCacheBlock(KVCacheBlock):
     kernel_block: KernelBlock = field(init=False)
 
 
-def as_page(block: KVCacheBlock) -> RBLNKVCacheBlock:
-    """Narrow a pool page to ``RBLNKVCacheBlock``."""
-    if not isinstance(block, RBLNKVCacheBlock):
-        raise TypeError(f"expected RBLNKVCacheBlock, got {type(block).__name__}")
-    return block
-
-
 class KernelBlock:
     """One kernel block: the ``ppe`` consecutive pages that share a DMA unit.
 
@@ -459,7 +452,7 @@ class KernelBlockPool(BlockPool):
         """Release pages, and the kernel block once none of them are live."""
         blocks = list(ordered_blocks)
         super().free_blocks(blocks)
-        for group in {as_page(block).kernel_block for block in blocks}:
+        for group in {cast(RBLNKVCacheBlock, block).kernel_block for block in blocks}:
             if all(page.ref_cnt == 0 for page in group.pages):
                 self.release_group(group)
 

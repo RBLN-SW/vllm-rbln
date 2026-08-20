@@ -454,7 +454,9 @@ class TestProcessKvCacheCopyOps:
             model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
             runtime_holder=[None],
         )
-        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
+        r._process_kv_cache_copy_ops(
+            [KVCacheCopyOp(src_block_id=1, dst_block_id=2, num_tokens=3)]
+        )
         # First 3 token slots of dst block 2 now match src; the rest stay 0.
         assert torch.equal(kv[:, 2, :, :, :3, :].cpu(), kv[:, 1, :, :, :3, :].cpu())
         assert (kv[:, 2, :, :, :3, :] == 5.0).all()
@@ -469,7 +471,9 @@ class TestProcessKvCacheCopyOps:
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
-        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
+        r._process_kv_cache_copy_ops(
+            [KVCacheCopyOp(src_block_id=1, dst_block_id=2, num_tokens=3)]
+        )
         assert (kv[2, :3, :] == 7.0).all()
         assert (kv[2, 3:, :] == 0.0).all()
 
@@ -485,7 +489,9 @@ class TestProcessKvCacheCopyOps:
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
         )
-        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
+        r._process_kv_cache_copy_ops(
+            [KVCacheCopyOp(src_block_id=5, dst_block_id=6, num_tokens=4)]
+        )
         assert calls == [(5, 6, 4)]
 
 

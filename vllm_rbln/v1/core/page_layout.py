@@ -14,10 +14,10 @@
 
 """Page/kernel block KV sizes. Design: https://github.com/RBLN-SW/vllm-rbln/issues/928
 
-Sizes and the checks on them, nothing else. A page id names its own physical
-home, but the arithmetic that says so belongs to `KernelBlockPool`, which is the
-only thing that can enforce it -- keeping a second copy here is how the two
-drift apart.
+Sizes, the checks on them, and the copy op both KV managers emit. A page id
+names its own physical home, but the arithmetic that says so belongs to
+`KernelBlockPool`, which is the only thing that can enforce it -- keeping a
+second copy here is how the two drift apart.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "ATTN_BLOCK_SIZE_KEY",
-    "KernelBlockCopyOp",
+    "KVCacheCopyOp",
     "PageLayout",
     "PageLayoutConfig",
     "kernel_block_size_from_config",
@@ -164,15 +164,11 @@ def validate_fragmentation(
 
 
 @dataclass(frozen=True)
-class KernelBlockCopyOp:
-    """A token range to copy before the forward pass.
+class KVCacheCopyOp:
+    """A token range to copy between KV blocks before the forward pass."""
 
-    In tokens, not slots: page size is scheduler-side and the worker never
-    needs it.
-    """
-
-    src_kernel_block_id: int
-    dst_kernel_block_id: int
-    src_start: int
-    dst_start: int
+    src_block_id: int
+    dst_block_id: int
     num_tokens: int
+    src_start: int = 0
+    dst_start: int = 0

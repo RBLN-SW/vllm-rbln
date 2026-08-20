@@ -23,7 +23,6 @@ import torch
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.native.v1.worker.utils import make_kv_cache_config, schedule_new
-from vllm_rbln.v1.core.page_layout import KernelBlockCopyOp
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 
 pytestmark = pytest.mark.maybe_use_device
@@ -165,15 +164,13 @@ class TestProcessKVCacheCopyOps:
         mr.RBLNModelRunner._process_kv_cache_copy_ops(
             runner,
             [
+                KVCacheCopyOp(src_block_id=0, dst_block_id=3, num_tokens=16),
                 KVCacheCopyOp(
-                    group_id=0, src_block_id=0, dst_block_id=3, num_tokens=16
-                ),
-                KernelBlockCopyOp(
-                    src_kernel_block_id=1,
-                    dst_kernel_block_id=4,
+                    src_block_id=1,
+                    dst_block_id=4,
+                    num_tokens=8,
                     src_start=4,
                     dst_start=0,
-                    num_tokens=8,
                 ),
             ],
         )

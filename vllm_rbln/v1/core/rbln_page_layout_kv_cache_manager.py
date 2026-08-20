@@ -40,7 +40,7 @@ from __future__ import annotations
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import vllm.v1.core.kv_cache_coordinator as kv_cache_coordinator
 from vllm.v1.core.block_pool import BlockPool
@@ -53,9 +53,8 @@ from vllm_rbln.v1.core.kernel_block_pool import (
     KernelBlock,
     KernelBlockPool,
     RBLNKVCacheBlock,
-    as_page,
 )
-from vllm_rbln.v1.core.page_layout import KernelBlockCopyOp, PageLayoutConfig
+from vllm_rbln.v1.core.page_layout import KVCacheCopyOp, PageLayoutConfig
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -95,7 +94,7 @@ class RBLNKVCacheBlocks(KVCacheBlocks):
     @property
     def pages(self) -> list[RBLNKVCacheBlock]:
         """Pages of the single full-attention group."""
-        return [as_page(page) for page in self.blocks[0]]
+        return [cast(RBLNKVCacheBlock, page) for page in self.blocks[0]]
 
 
 @dataclass
@@ -157,14 +156,14 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         # the single admission gate; and since the watermark only applies to
         # requests that hold no Open group, that count is `idle * ppe` exactly,
         # which makes the page comparison mean "keep N kernel blocks idle".
-        self.watermark_blocks = math.ceil(self.watermark_blocks / ppe) * ppe
+        self.watermark_blocks = math.ceil(self.watermark_blocks / ppe) * ppe  # type: ignore[has-type]
         self.empty_kv_cache_blocks = RBLNKVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
         # Copies the worker must perform before the next forward pass, and the
         # source pages each keeps alive until it has run.
-        self.pending_copy_ops: list[KernelBlockCopyOp] = []
+        self.pending_copy_ops: list[KVCacheCopyOp] = []
         self._pending_sources: list[RBLNKVCacheBlock] = []
         self._in_flight_sources: list[list[RBLNKVCacheBlock]] = []
         self.num_pages_copied = 0
@@ -186,7 +185,9 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
     ) -> RBLNKVCacheBlocks:
-        typed = tuple([as_page(page) for page in group] for group in blocks)
+        typed = tuple(
+            [cast(RBLNKVCacheBlock, page) for page in group] for group in blocks
+        )
         if not any(typed):
             empty = self.empty_kv_cache_blocks
             assert isinstance(empty, RBLNKVCacheBlocks)
@@ -291,7 +292,9 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
 
         matched: list[RBLNKVCacheBlock] = []
         if new_computed_blocks is not None:
-            matched = [as_page(page) for page in new_computed_blocks.blocks[0]]
+            matched = [
+                cast(RBLNKVCacheBlock, page) for page in new_computed_blocks.blocks[0]
+            ]
         computed = (
             new_computed_blocks.blocks
             if new_computed_blocks is not None
@@ -459,11 +462,9 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
 
         page = self.geometry.page_size
         self.pending_copy_ops.append(
-            KernelBlockCopyOp(
-                src_kernel_block_id=plan.source[0].kernel_block.index,
-                dst_kernel_block_id=plan.destination[0].kernel_block.index,
-                src_start=0,
-                dst_start=0,
+            KVCacheCopyOp(
+                src_block_id=plan.source[0].kernel_block.index,
+                dst_block_id=plan.destination[0].kernel_block.index,
                 num_tokens=len(plan.source) * page,
             )
         )
@@ -487,7 +488,7 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
 
     # -- copy op plumbing ---------------------------------------------------
 
-    def drain_pending_copy_ops(self) -> list[KernelBlockCopyOp]:
+    def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
         """Copies for this step; sources stay referenced until released."""
         ops = self.pending_copy_ops
         self.pending_copy_ops = []
@@ -497,7 +498,7 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
             self.log_binding_stats()
         return ops
 
-    def release_copy_ops(self, ops: list[KernelBlockCopyOp]) -> None:
+    def release_copy_ops(self, ops: list[KVCacheCopyOp]) -> None:
         """Drop the source references held by drained copy ops."""
         del ops
         if self._in_flight_sources:
@@ -508,7 +509,8 @@ class RBLNPageLayoutKVCacheManager(KVCacheManager):
         ppe = self.geometry.pages_per_kernel_block
         pages = self.coordinator.get_blocks(request_id)[0]
         return [
-            as_page(pages[i]).kernel_block.index for i in range(0, len(pages), ppe)
+            cast(RBLNKVCacheBlock, pages[i]).kernel_block.index
+            for i in range(0, len(pages), ppe)
         ]
 
     # -- lifetime -----------------------------------------------------------

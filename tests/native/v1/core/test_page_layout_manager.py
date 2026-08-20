@@ -160,8 +160,8 @@ class TestReuse:
         assert_identity(manager, "r2")
 
         (op,) = manager.pending_copy_ops
-        assert op.src_kernel_block_id == producer
-        assert op.dst_kernel_block_id == table[0]
+        assert op.src_block_id == producer
+        assert op.dst_block_id == table[0]
         assert (op.src_start, op.dst_start) == (0, 0)
         assert op.num_tokens == len(prefix)
 

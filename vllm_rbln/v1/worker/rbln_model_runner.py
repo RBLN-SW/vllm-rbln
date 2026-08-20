@@ -122,11 +122,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
 )
-from vllm_rbln.v1.core.page_layout import (
-    KernelBlockCopyOp,
-    kernel_block_size_from_config,
-)
-from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.core.page_layout import KVCacheCopyOp, kernel_block_size_from_config
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
@@ -3187,7 +3183,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def _process_kv_cache_copy_ops(
         self,
-        copy_ops: list[KVCacheCopyOp | KernelBlockCopyOp],
+        copy_ops: list[KVCacheCopyOp],
     ) -> None:
         use_runtime_kv_copy = (
             not USE_DEVICE_TENSOR
@@ -3204,14 +3200,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         for op in copy_ops:
-            # Two op shapes reach here: the overlay copies a block prefix, the
-            # page/kernel block layer an arbitrary token range.
-            if isinstance(op, KernelBlockCopyOp):
-                src, dst = op.src_kernel_block_id, op.dst_kernel_block_id
-                src_start, dst_start, nt = op.src_start, op.dst_start, op.num_tokens
-            else:
-                src, dst = op.src_block_id, op.dst_block_id
-                src_start, dst_start, nt = 0, 0, op.num_tokens
+            src, dst = op.src_block_id, op.dst_block_id
+            src_start, dst_start, nt = op.src_start, op.dst_start, op.num_tokens
             # The runtime helper can only copy a block prefix, which is the
             # common case (a matched prefix starts at the kernel block boundary).
             if use_runtime_kv_copy and src_start == 0 and dst_start == 0:
