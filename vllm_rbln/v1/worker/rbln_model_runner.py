@@ -3186,46 +3186,32 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        use_runtime_kv_copy = (
+        if (
             not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
-        )
-        if not getattr(self, "_logged_kv_copy_mode", False):
-            # Which copy path a measurement actually ran on, stated once per worker.
-            logger.info(
-                "KV copy path: %s",
-                "foreach" if envs.VLLM_RBLN_FOREACH_KV_COPY else "per-layer",
-            )
-            self._logged_kv_copy_mode = True
+        ):
+            # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
+            # in this path (VLLM_RBLN_USE_VLLM_MODEL).
+            for op in copy_ops:
+                runtime = self.runtime_holder[0]
+                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
+            return
+
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         for op in copy_ops:
-            src, dst = op.src_block_id, op.dst_block_id
-            src_start, dst_start, nt = op.src_start, op.dst_start, op.num_tokens
-            # The runtime helper can only copy a block prefix, which is the
-            # common case (a matched prefix starts at the kernel block boundary).
-            if use_runtime_kv_copy and src_start == 0 and dst_start == 0:
-                runtime = self.runtime_holder[0]
-                runtime._copy_kv_cache(src, dst, nt)
-                continue
-            src_end, dst_end = src_start + nt, dst_start + nt
+            src = op.src_block_id
+            dst = op.dst_block_id
+            nt = op.num_tokens
             for kv_cache in self.kv_caches:
                 if self.model_config.use_mla:
-                    d = kv_cache[dst, dst_start:dst_end, :]
-                    s = kv_cache[src, src_start:src_end, :]
+                    dsts.append(kv_cache[dst, :nt, :])
+                    srcs.append(kv_cache[src, :nt, :])
                 else:
-                    d = kv_cache[:, dst, :, :, dst_start:dst_end, :]
-                    s = kv_cache[:, src, :, :, src_start:src_end, :]
-                if envs.VLLM_RBLN_FOREACH_KV_COPY:
-                    dsts.append(d)
-                    srcs.append(s)
-                else:
-                    d.copy_(s)
-        if dsts:
-            # kv-copy-opt (fd996216): one dispatch for every layer of every op,
-            # instead of one slice assignment per layer.
-            torch._foreach_copy_(dsts, srcs)
+                    dsts.append(kv_cache[:, dst, :, :, :nt, :])
+                    srcs.append(kv_cache[:, src, :, :, :nt, :])
+        torch._foreach_copy_(dsts, srcs)
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:

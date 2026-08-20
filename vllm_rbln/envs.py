@@ -69,7 +69,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_PAGE_LAYOUT: bool = False
-    VLLM_RBLN_FOREACH_KV_COPY: bool = False
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -358,11 +357,6 @@ environment_variables = {
         ).lower()
         in ("true", "1")
     ),
-    # Batch the per-layer KV copy slices into one torch._foreach_copy_ instead of
-    # one slice assignment per layer. Port of kv-copy-opt (fd996216); benchmark knob.
-    "VLLM_RBLN_FOREACH_KV_COPY": lambda: (
-        os.environ.get("VLLM_RBLN_FOREACH_KV_COPY", "False").lower() in ("true", "1")
-    ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (
@@ -468,6 +462,7 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_AUTO_PORT",
         "VLLM_RBLN_SORT_BATCH",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
+        "VLLM_RBLN_PAGE_LAYOUT",
         "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
     }
 )
