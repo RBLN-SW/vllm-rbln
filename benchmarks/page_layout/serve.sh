@@ -20,6 +20,11 @@ source "$REPO/.venv/bin/activate"
 unset PYTHONPATH
 
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
+# The greedy probe wants DP=1, so that requests are ordered and the cache is not
+# split across ranks. That needs the weights to fit one device -- MiniMax-M2.5
+# does not (Insufficient DRAM during block calculation), so DP=1 is only usable
+# with a smaller model here.
+DP=${DP:-4}
 KERNEL_BLOCK=${KERNEL_BLOCK:-8192}
 PAGE=${PAGE:-512}
 CHUNK=${CHUNK:-512}
@@ -66,11 +71,11 @@ case "$MODE" in
   *) echo "unknown mode $MODE (expected subblock or pagelayout)"; exit 2 ;;
 esac
 
-echo "[launch] $(date '+%F %T') mode=$MODE devices=$RBLN_DEVICES" \
+echo "[launch] $(date '+%F %T') mode=$MODE devices=$RBLN_DEVICES dp=$DP" \
      "kernel_block=$KERNEL_BLOCK args=${BLOCK_ARGS[*]}"
 exec vllm serve MiniMaxAI/MiniMax-M2.5 \
     --port 8102 --served-model-name MiniMax \
-    --data-parallel-size 4 --enable-expert-parallel \
+    --data-parallel-size "$DP" --enable-expert-parallel \
     --max-model-len 16384 "${BLOCK_ARGS[@]}" \
     --enable-chunked-prefill --max-num-batched-tokens "$CHUNK" \
     --max-num-seqs "$MAX_NUM_SEQS" \
