@@ -62,6 +62,14 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 **`@register_patch` overwrites an upstream symbol and is the last resort.** Use it only when no extension point exists, and make `reason` say what upstream cannot express — not what the replacement does. When you are unsure whether an extension point exists, ask instead of defaulting to a patch.
 
+These are the cases that legitimately reach a patch:
+
+- Upstream's shape cannot express an RBLN constraint, such as a KV cache that has to enter the compiled graph as an input, or a kernel RBLN does not provide.
+- An upstream module needs adapting to an RBLN interface, and replacing one method beats reimplementing the model.
+- An upstream bug, or a fix that is not released yet. Cite the upstream issue and give the version that removes the need, such as `TODO(vllm>=0.26.0): delete`. A temporary patch with no removal condition becomes a permanent one.
+
+The registry rules:
+
 - Never `setattr` an upstream symbol directly. Every replacement goes through the registry, which verifies that it took.
 - A new module under `patches/` must be added to the import list in `patches/__init__.py`. A decorator in a module nobody imports registers nothing.
 - Duplicate keys and duplicate targets raise. Two patches may share a target only when their `condition` predicates are mutually exclusive.
@@ -106,7 +114,6 @@ Code either succeeds or fails with a clear error.
 
 - A test must fail without the change it covers. Verify that; do not assume it.
 - Cover what the change touched. Do not test pre-existing logic, third-party functions, or statically defined values.
-- If the test diff dwarfs the code change, cut scope.
 - Extend an existing file, `conftest.py` fixture, or `utils.py` helper before adding a new file.
 - Do not add a test that is skipped as a placeholder. A test that never runs covers nothing while reading as coverage that exists.
 - `--strict-markers` turns a misspelled mark into a collection error, but a mark you leave off is silent. Forgetting `model_compile` is how a whole-model compile ends up in the lane that runs on every PR.
