@@ -341,11 +341,26 @@ class RBLNKVCacheManager(KVCacheManager):
         num_new_computed_tokens: int,
     ) -> tuple[list[int], list[int]]:
         cached_blocks = new_computed_blocks.get_block_ids()[0]
-        return self.prefix_cache_manager.get_matched_outer_blocks(
-            request.request_id,
-            cached_blocks,
-            num_new_computed_tokens,
+        cached_block_table, cached_length = (
+            self.prefix_cache_manager.get_matched_outer_blocks(
+                request.request_id,
+                cached_blocks,
+                num_new_computed_tokens,
+            )
         )
+        if cached_block_table:
+            # Keep the matched inner blocks' hashes alive as long as their
+            # outer copies. A hit bypasses allocate_slots' touch path
+            # (allocation passes empty computed blocks), so without
+            # repositioning, the hit blocks keep their free-queue position
+            # and get reused -- destroying their hashes -- while the outer
+            # copy is still resident, after which the outer block can never
+            # be matched again.
+            num_matched_blocks = sum(cached_length) // self.block_size
+            self.block_pool.refresh_cached_blocks(
+                new_computed_blocks.blocks[0][:num_matched_blocks]
+            )
+        return cached_block_table, cached_length
 
     def get_block_table(self, request_id: str) -> torch.Tensor:
         return self.prefix_cache_manager.get_blocks(request_id)
