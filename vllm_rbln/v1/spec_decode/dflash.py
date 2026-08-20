@@ -314,7 +314,14 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         `model.target_ids` to map back; DFlash shares the target vocabulary
         (200064 in both configs), so applying that map would gather with ids
         from the wrong space and collapse acceptance.
+
+        The slice is load-bearing, exactly as in the base class: `out` carries
+        one row per PADDED sample slot (`num_reqs_padded * num_spec`, from
+        `token_indices_padded`), while the caller reshapes to the REAL batch.
+        Without the slice, any decode step whose request count is not exactly a
+        configured batch bucket dies in `view` with a shape mismatch.
         """
+        out = out[:num_reqs]
         if out.dim() == 1 or out.dtype in (torch.int32, torch.int64):
             return out
         return out.argmax(dim=-1)

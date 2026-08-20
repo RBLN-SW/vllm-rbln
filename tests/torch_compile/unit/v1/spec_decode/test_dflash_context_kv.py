@@ -1,3 +1,4 @@
+import contextlib
 import inspect
 from types import SimpleNamespace
 
@@ -5,6 +6,7 @@ import pytest
 import torch
 
 import vllm_rbln.patches.qwen3_dflash as qwen3_dflash_patch
+import vllm_rbln.v1.spec_decode.dflash as dflash_mod
 from vllm_rbln.patches.qwen3_dflash import (
     _apply_rope,
     _ContextKVPrecompute,
@@ -1174,3 +1176,175 @@ def test_plan_context_kv_runs_rejects_invalid_coordinates(
 ) -> None:
     with pytest.raises(ValueError):
         _plan_context_kv_runs(blocks, offsets, request_ids, group_id=0)
+
+
+# ----------------------------------------------------------------------
+# Proposer wiring: propose(), set_inputs_first_pass, rejection rewind
+# ----------------------------------------------------------------------
+
+
+def test_draft_ids_truncates_padded_rows_for_ids_and_logits() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+
+    padded_ids = torch.arange(56, dtype=torch.int64)
+    assert proposer._draft_ids(padded_ids, 35).tolist() == list(range(35))
+
+    logits = torch.zeros(56, 16)
+    logits[torch.arange(56), torch.arange(56) % 16] = 1.0
+    ids = proposer._draft_ids(logits, 35)
+    assert ids.shape == (35,)
+    assert ids.tolist() == [row % 16 for row in range(35)]
+
+
+def _make_first_pass_proposer(num_speculative_tokens: int = 7) -> RBLNDFlashProposer:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = num_speculative_tokens
+    proposer.device = torch.device("cpu")
+    proposer.parallel_drafting_token_id = 99
+    proposer.input_ids = torch.zeros(256, dtype=torch.int32)
+    proposer.positions = torch.zeros(256, dtype=torch.int64)
+    proposer._context_positions_buffer = torch.zeros(256, dtype=torch.int64)
+    proposer._context_positions_cpu_buffer = torch.zeros(256, dtype=torch.int64)
+    proposer._dflash_num_context = 0
+    proposer._dflash_hidden_states = None
+    return proposer
+
+
+class _FakeMetadataBuilder:
+    def __init__(self) -> None:
+        self.build_calls: list[tuple] = []
+
+    def build(self, *, common_attn_metadata, positions, is_prefill, batch_pad):
+        self.build_calls.append((positions, is_prefill, batch_pad))
+        return SimpleNamespace(name="fake-metadata")
+
+
+class _FakeContextKVHelper:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def set_compile_context(self, compile_context) -> None:
+        self.calls.append("compile_context")
+
+    def set_group_slots(self, *args, **kwargs) -> None:
+        self.calls.append("group_slots")
+
+
+def _make_propose_proposer(
+    num_reqs: int, num_reqs_padded: int, num_speculative_tokens: int = 7
+):
+    proposer = _make_first_pass_proposer(num_speculative_tokens)
+    proposer.input_ids = torch.zeros(4096, dtype=torch.int32)
+    proposer.positions = torch.zeros(4096, dtype=torch.int64)
+    proposer._context_positions_buffer = torch.zeros(4096, dtype=torch.int64)
+    proposer._context_positions_cpu_buffer = torch.zeros(4096, dtype=torch.int64)
+    proposer._dflash_sliding_layer_names = set()
+    proposer._dflash_sliding_window = None
+    proposer._hidden_state_combiner = lambda hidden: hidden
+    proposer.vllm_config = SimpleNamespace()
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=num_reqs),
+        cache_config=SimpleNamespace(block_size=1024),
+        kv_caches=[],
+        kv_cache_bases=None,
+        kv_cache_view_infos=None,
+        compile_context=None,
+        is_intermediate_chunked_prefill=False,
+    )
+    proposer.model = SimpleNamespace(
+        model=SimpleNamespace(),
+        precompute_and_store_context_kv=lambda *args, **kwargs: None,
+    )
+    builder = _FakeMetadataBuilder()
+    proposer.draft_attn_groups = [
+        SimpleNamespace(
+            layer_names=["model.layers.0.self_attn.attn"],
+            get_metadata_builder=lambda builder=builder: builder,
+        )
+    ]
+    proposer._specialize_layer_attn_metadata = (
+        lambda attn_group, attn_metadata, cad, num_reqs, num_reqs_padded: {}
+    )
+    proposer._resolve_group_slots = lambda per_group_metadata, cad: (
+        {0: (torch.zeros(0, dtype=torch.int64), torch.zeros(0, dtype=torch.int64))},
+        {},
+        torch.zeros(0, dtype=torch.int64),
+    )
+    proposer._determine_draft_batch_padding = (
+        lambda num_reqs_arg, num_tokens, is_prefill: (num_reqs_padded, None, None)
+    )
+    proposer._preprocess = (
+        lambda num_reqs_arg, num_reqs_padded_arg, num_tokens, token_indices, is_prefill: (
+            proposer.input_ids[:num_tokens],
+            proposer.positions[:num_tokens],
+            None,
+            token_indices,
+        )
+    )
+    return proposer
+
+
+def _make_propose_cad(num_reqs: int, ctx_per_req: int, seq_len: int):
+    counts = torch.full((num_reqs,), ctx_per_req, dtype=torch.int32)
+    query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32)
+    query_start_loc[1:] = torch.cumsum(counts, dim=0)
+    seq_lens = torch.full((num_reqs,), seq_len, dtype=torch.int32)
+    return SimpleNamespace(
+        num_reqs=num_reqs,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens=seq_lens,
+        _seq_lens_cpu=seq_lens,
+        block_table_tensor=torch.zeros(num_reqs, 4, dtype=torch.int32),
+    )
+
+
+def test_propose_truncates_padded_draft_output_to_real_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5-request batch padded to the 8-request bucket must return [5, 7].
+
+    The compiled graph samples every PADDED mask slot
+    (num_reqs_padded * num_spec rows); the caller reshapes to the real batch.
+    This is the seam that shipped broken: _draft_ids returned all padded rows
+    and the final view raised for every non-bucket-exact request count.
+    """
+    num_reqs, num_reqs_padded, num_spec = 5, 8, 7
+    ctx_per_req = 8
+    proposer = _make_propose_proposer(num_reqs, num_reqs_padded, num_spec)
+    cad = _make_propose_cad(num_reqs, ctx_per_req, seq_len=100)
+
+    fake_helper = _FakeContextKVHelper()
+    monkeypatch.setattr(dflash_mod, "attach_kv_cache_bindings", lambda *a, **k: None)
+    monkeypatch.setattr(dflash_mod, "get_or_create_context_kv", lambda m: fake_helper)
+    monkeypatch.setattr(
+        dflash_mod, "build_kv_cache_forward_context_kwargs", lambda bases: {}
+    )
+    monkeypatch.setattr(
+        dflash_mod, "set_forward_context", lambda *a, **k: contextlib.nullcontext()
+    )
+
+    seen: dict[str, int] = {}
+
+    def fake_model_executable(*, input_ids, positions, token_indices_to_sample):
+        seen["sampled_rows"] = int(token_indices_to_sample.shape[0])
+        return None, torch.zeros(
+            token_indices_to_sample.shape[0], dtype=torch.int64
+        )
+
+    proposer.model_executable = fake_model_executable
+
+    num_context = num_reqs * ctx_per_req
+    result = proposer.propose(
+        target_token_ids=torch.zeros(num_context, dtype=torch.int32),
+        target_positions=torch.arange(num_context, dtype=torch.int64),
+        target_hidden_states=torch.randn(num_context, 16),
+        next_token_ids=torch.arange(num_reqs, dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=cad,
+    )
+
+    # The padded sampling contract feeds the graph, the real batch comes back.
+    assert seen["sampled_rows"] == num_reqs_padded * num_spec
+    assert fake_helper.calls == ["compile_context", "group_slots"]
+    assert isinstance(result, torch.Tensor)
+    assert result.shape == (num_reqs, num_spec)
