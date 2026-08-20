@@ -114,32 +114,26 @@ steps:
       - *sync
       - "bash .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run-lm-eval.sh"
 
-  # A skipped step satisfies depends_on, so this runs on ATOM alone until the
-  # CR03 steps above lose their skip.
-  # - label: ":package: nightly deploy"
-  #   key: "nightly-deploy"
-  #   depends_on:
-  #     - "nightly-t0-ca25"
-  #     - "nightly-t2-ca25"
-  #     - "nightly-t0-cr03"
-  #     - "nightly-t2-cr03"
-  #   agents:
-  #     queue: r18s
-  #   image: "${DEVTOOLS_DOCKER_IMAGE}"
-  #   secrets:
-  #     # PLACEHOLDER vault names -- confirm both before this step is enabled.
-  #     # TWINE_PASSWORD is PKG_ORG_GATE in GitHub Actions.
-  #     TWINE_PASSWORD: PKG_ORG_GATE
-  #     TWINE_REPOSITORY_URL: PKG_INTERNAL_PYPI_URL
-  #   timeout_in_minutes: 30
-  #   command:
-  #     - |
-  #       set -euo pipefail
-  #       # Without an explicit repository URL twine would target public PyPI, and
-  #       # the pod has no ~/.pypirc to fall back on. Fail instead of publishing
-  #       # anywhere unintended.
-  #       : "${TWINE_REPOSITORY_URL:?not set -- fix the vault name in pipeline.yml}"
-  #       : "${TWINE_PASSWORD:?not set -- fix the vault name in pipeline.yml}"
-  #       uv build --wheel
-  #       TWINE_USERNAME=__token__ TWINE_NON_INTERACTIVE=1 \
-  #         uv tool run twine upload --skip-existing dist/vllm_rbln*.whl
+  # The four gating lanes above; perf and lm-eval are measured, not gated, so
+  # they stay out of depends_on. No NPU needed -- the wheel is a pure CPU build,
+  # so this runs on the default queue.
+  - label: ":package: nightly publish"
+    key: "nightly-publish"
+    depends_on:
+      - "nightly-t0-ca25"
+      - "nightly-t2-ca25"
+      - "nightly-t0-cr03"
+      - "nightly-t2-cr03"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets:
+      # rbln-nexus-nightly is a non-explicit index, so resolving the build
+      # backend already needs its credentials.
+      UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
+      UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
+      UV_PUBLISH_USERNAME: MGMT_NEXUS_USERNAME
+      UV_PUBLISH_PASSWORD: MGMT_NEXUS_PASSWORD
+    env:
+      UV_PUBLISH_URL: "https://nexus.mgmt.rbln.in/repository/pypi-vllm-nightly/"
+    timeout_in_minutes: 30
+    command:
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/publish-nightly-wheel.sh"

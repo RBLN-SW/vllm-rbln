@@ -807,6 +807,11 @@ def load_gptoss_mxfp4_weights(
     tp_rank_start = tp_rank * per_rank_intermediate_size
     tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
+    if use_ep:
+        experts_per_rank = num_experts // tp_size
+        ep_rank_start = tp_rank * experts_per_rank
+        ep_rank_end = (tp_rank + 1) * experts_per_rank
+
     for name, weight in remap_moe_expert_weights(weights, params_dict):
         if name.startswith("layers"):
             layer_idx = int(name.split(".")[1])
