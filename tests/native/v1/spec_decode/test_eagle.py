@@ -67,69 +67,77 @@ def _wire_runner(proposer, *, num_reqs):
     ]
 
 
-def _fake_model_exec(argmax_tokens, hidden_size):
-    # The load_model wrapper contract: (hidden [n, H], logits) with a
-    # controllable per-row argmax, reshaped so the multi-step loop can feed it back.
+def _fake_model_exec(draft_tokens, hidden_size):
+    # The load_model wrapper contract: (hidden [n, H], in-graph argmax ids),
+    # reshaped so the multi-step loop can feed the hidden states back.
     def executable(
         *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
     ):
-        logits = torch.full((8, 128), -10.0)
-        for i, tok in enumerate(argmax_tokens):
-            logits[i, tok] = 10.0
+        ids = torch.zeros(8, dtype=torch.int64)
+        ids[: len(draft_tokens)] = torch.tensor(draft_tokens, dtype=torch.int64)
         # Filled on the host but returned on the device the real executable
-        # returns, so the argmax and any d2t gather run where production runs them.
-        return hidden_states.reshape(-1, hidden_size), logits.to(hidden_states.device)
+        # returns, so the d2t gather runs where production runs it. The argmax
+        # itself is no longer here: it moved inside the compiled wrapper.
+        return hidden_states.reshape(-1, hidden_size), ids.to(hidden_states.device)
 
     return executable
 
 
 def _echo_model_exec(hidden_size):
-    # argmax = first input id + 1, so consecutive columns are the observable
-    # signature that the loop feeds each step's output forward.
+    # Draft id = first input id + 1, so consecutive columns are the observable
+    # signature that the loop feeds each step's output forward. The ids tensor is
+    # reused across calls like the compiled graph's static output, so a draft kept
+    # by reference would collapse every column into the last step's.
+    draft_ids = torch.zeros(8, dtype=torch.int64)
+
     def executable(
         *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
     ):
-        rows = input_ids.reshape(input_ids.shape[0], -1)[:, 0].tolist()
-        logits = torch.full((8, 128), -10.0)
-        for i, val in enumerate(rows):
-            logits[i, (int(val) + 1) % 128] = 10.0
-        return hidden_states.reshape(-1, hidden_size), logits
+        rows = input_ids.reshape(input_ids.shape[0], -1)[:, 0]
+        draft_ids[: rows.shape[0]] = (rows.long() + 1) % 128
+        return hidden_states.reshape(-1, hidden_size), draft_ids
 
     return executable
 
 
-def _call_propose(proposer):
+def _call_propose(proposer, target_hidden_states=None):
     return proposer.propose(
         target_token_ids=torch.arange(4, dtype=torch.int32),
         target_positions=torch.arange(4, dtype=torch.int64),
-        target_hidden_states=torch.zeros(4, proposer.hidden_size),
+        target_hidden_states=torch.zeros(4, proposer.hidden_size)
+        if target_hidden_states is None
+        else target_hidden_states,
         next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
         token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
         common_attn_metadata=make_cad([0, 2, 4], [10, 11]),
     )
 
 
-class TestSetInputsFirstPass:
-    def test_default_eagle_shifts_tokens_and_inserts_next(self):
+class TestPreprocess:
+    # _preprocess also builds the first-pass draft input ids (formerly
+    # set_inputs_first_pass) whenever target_token_ids is passed.
+    @staticmethod
+    def _first_pass(proposer, token_indices_to_sample):
+        return proposer._preprocess(
+            3,
+            3,
+            9,
+            torch.arange(9, dtype=torch.int64),
+            torch.zeros(9, proposer.hidden_size),
+            is_prefill=False,
+            token_indices_to_sample=token_indices_to_sample,
+            target_token_ids=torch.arange(11, 20, dtype=torch.int32),
+            next_token_ids=torch.tensor([100, 200, 300], dtype=torch.int32),
+            cad=make_cad([0, 3, 5, 9], [3, 5, 4]),
+        )
+
+    def test_first_pass_shifts_tokens_and_inserts_next(self):
         # Three requests, query_lens [3, 2, 4]. The target ids shift left by one
         # (drop the first) and each request's next token lands at its last slot.
         proposer = make_eagle_proposer()
-        cad = make_cad([0, 3, 5, 9], [3, 5, 4])
-        target_token_ids = torch.arange(11, 20, dtype=torch.int32)  # 9 tokens
-        next_token_ids = torch.tensor([100, 200, 300], dtype=torch.int32)
-        positions = torch.arange(9, dtype=torch.int64)
-        hidden = torch.zeros(9, proposer.hidden_size)
-
-        num_tokens, token_indices = proposer.set_inputs_first_pass(
-            target_token_ids=target_token_ids,
-            next_token_ids=next_token_ids,
-            target_positions=positions,
-            target_hidden_states=hidden,
-            token_indices_to_sample=None,  # defaults to query_start_loc[1:] - 1
-            cad=cad,
-        )
-        assert num_tokens == 9
-        assert token_indices.cpu().tolist() == [2, 4, 8]
+        # None token indices default to query_start_loc[1:] - 1.
+        _, _, _, tip = self._first_pass(proposer, None)
+        assert tip.cpu().tolist() == [2, 4, 8]
         # shifted target [12..19] with next tokens overwritten at [2, 4, 8].
         assert proposer.input_ids[:9].cpu().tolist() == [
             12,
@@ -142,22 +150,15 @@ class TestSetInputsFirstPass:
             19,
             300,
         ]
-        assert proposer.positions[:9].cpu().tolist() == list(range(9))
 
-    def test_uses_explicit_token_indices_verbatim(self):
-        # A given token_indices_to_sample is used as-is (not recomputed from
+    def test_first_pass_uses_explicit_token_indices_verbatim(self):
+        # Given token indices are used as-is (not recomputed from
         # query_start_loc); the next tokens land at exactly those slots.
         proposer = make_eagle_proposer()
-        num_tokens, token_indices = proposer.set_inputs_first_pass(
-            target_token_ids=torch.arange(11, 20, dtype=torch.int32),
-            next_token_ids=torch.tensor([100, 200, 300], dtype=torch.int32),
-            target_positions=torch.arange(9, dtype=torch.int64),
-            target_hidden_states=torch.zeros(9, proposer.hidden_size),
-            token_indices_to_sample=torch.tensor([0, 3, 8], dtype=torch.int64),
-            cad=make_cad([0, 3, 5, 9], [3, 5, 4]),
+        _, _, _, tip = self._first_pass(
+            proposer, torch.tensor([0, 3, 8], dtype=torch.int64)
         )
-        assert num_tokens == 9
-        assert token_indices.cpu().tolist() == [0, 3, 8]
+        assert tip.cpu().tolist() == [0, 3, 8]
         assert proposer.input_ids[:9].cpu().tolist() == [
             100,
             13,
@@ -170,51 +171,56 @@ class TestSetInputsFirstPass:
             300,
         ]
 
-    def test_rejects_extra_input_slots(self):
-        # Draft-model / parallel-drafting / dflash paths (needs_extra_input_slots)
-        # are unsupported; this guard trips when one is later enabled.
-        proposer = make_eagle_proposer()
-        proposer.needs_extra_input_slots = True
-        with pytest.raises(NotImplementedError):
-            proposer.set_inputs_first_pass(
-                target_token_ids=torch.arange(4, dtype=torch.int32),
-                next_token_ids=torch.tensor([1], dtype=torch.int32),
-                target_positions=torch.arange(4, dtype=torch.int64),
-                target_hidden_states=torch.zeros(4, proposer.hidden_size),
-                token_indices_to_sample=None,
-                cad=make_cad([0, 4], [4]),
-            )
-
-
-class TestPreprocess:
-    def test_prefill_views_full_buffers(self):
-        # Prefill reshapes the whole (max_num_tokens,) buffer to [num_reqs, -1];
-        # token indices pass through unpadded (num_reqs already the padded width).
+    def test_prefill_pads_query_dim_to_max_tokens(self):
+        # Prefill stages the request into the full (1, max_num_tokens) graph
+        # shape, zeroing everything past the scheduled tokens.
         proposer = make_eagle_proposer()
         n = proposer.max_num_tokens
-        proposer.input_ids[:] = torch.arange(n, dtype=torch.int32)
-        token_indices = torch.tensor([0, 32, 64, 96], dtype=torch.int32)
+        proposer.input_ids[:] = -1
+        proposer.input_ids[:4] = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
 
         input_ids, positions, hidden, tip = proposer._preprocess(
-            4, 4, n, token_indices, True
+            1,
+            1,
+            4,
+            proposer.positions[:4],
+            proposer.hidden_states[:4],
+            is_prefill=True,
+            token_indices_to_sample=torch.tensor([3], dtype=torch.int32),
         )
-        assert input_ids.shape == (4, n // 4)
-        assert positions.shape == (4, n // 4)
-        assert hidden.shape == (4, n // 4, proposer.hidden_size)
-        assert tip.cpu().tolist() == [0, 32, 64, 96]
+        assert input_ids.shape == (1, n)
+        assert positions.shape == (1, n)
+        assert hidden.shape == (1, n, proposer.hidden_size)
+        assert input_ids[0, :4].cpu().tolist() == [10, 11, 12, 13]
+        assert not input_ids[0, 4:].cpu().any()
+        assert tip.cpu().tolist() == [3]
 
     def test_decode_slices_and_pads_to_bucket(self):
         # Decode slices the used tokens, reshapes to [num_reqs, -1], then pads
         # rows and token indices up to the padded batch (here 2 -> 4) with zeros.
+        # positions and hidden states come from the caller (the target's), never
+        # from the drafter's own buffers, so they carry distinct values here.
         proposer = make_eagle_proposer()
         proposer.input_ids[:] = -1
         proposer.input_ids[:4] = torch.tensor([10, 11, 20, 21], dtype=torch.int32)
+        target_hidden = torch.full(
+            (4, proposer.hidden_size), 3.0, dtype=proposer.hidden_states.dtype
+        )
 
-        input_ids, _, hidden, tip = proposer._preprocess(
-            2, 4, 4, torch.tensor([1, 3], dtype=torch.int32), False
+        input_ids, positions, hidden, tip = proposer._preprocess(
+            2,
+            4,
+            4,
+            torch.tensor([7, 8, 9, 10], dtype=torch.int64),
+            target_hidden,
+            is_prefill=False,
+            token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
         )
         assert input_ids.cpu().tolist() == [[10, 11], [20, 21], [0, 0], [0, 0]]
+        assert positions.cpu().tolist() == [[7, 8], [9, 10], [0, 0], [0, 0]]
         assert hidden.shape == (4, 2, proposer.hidden_size)
+        assert hidden[:2].cpu().eq(3.0).all()
+        assert not hidden[2:].cpu().any()
         assert tip.cpu().tolist() == [1, 3, 0, 0]
 
 
@@ -281,59 +287,69 @@ class TestDetermineDraftBatchPadding:
         assert proposer._determine_draft_batch_padding(3, 10, True) == (3, None, None)
         assert proposer._determine_draft_batch_padding(3, 3, False) == (8, None, None)
 
+    @staticmethod
+    def _dp_proposer(monkeypatch, dp_status):
+        # The drafter reads the DP counts the runner already collected, so there
+        # is no second collective to fake -- only runner.dp_status to set.
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.parallel_config, "data_parallel_size", 2
+        )
+        proposer.dp_rank = 0
+        proposer.runner = SimpleNamespace(
+            specialized_moe_decode=True,
+            bucketing_manager=SimpleNamespace(
+                # Rounds up like the real one, so the group-agreed bucket stays
+                # distinguishable from the largest one.
+                find_decode_batch_bucket=lambda n: next(
+                    b for b in (1, 2, 4, 8) if b >= n
+                ),
+                decode_batch_buckets=[1, 2, 4, 8],
+            ),
+            dp_status=dp_status,
+        )
+        return proposer
+
     def test_dp_greater_than_one_specialized_moe(self, monkeypatch):
         # The per-DP counts drive the padding: batch bucket from max reqs across
         # DP, token pad from bucket * max tokens-per-req.
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.parallel_config, "data_parallel_size", 2
-        )
-        proposer.dp_rank = 0
-        proposer.runner = SimpleNamespace(
-            specialized_moe_decode=True,
-            bucketing_manager=SimpleNamespace(
-                find_decode_batch_bucket=lambda n: 8,
-                decode_batch_buckets=[1, 2, 4, 8],
-            ),
-        )
-        monkeypatch.setattr(
-            eagle_module.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(lambda *a: (torch.tensor([16, 16]), torch.tensor([4, 2]))),
+        proposer = self._dp_proposer(
+            monkeypatch, (torch.tensor([16, 16]), torch.tensor([4, 2]), False)
         )
         num_reqs_padded, num_tokens_padded, across = (
-            proposer._determine_draft_batch_padding(3, 6, False)
+            proposer._determine_draft_batch_padding(4, 16, False)
         )
-        # bucket(max(4, 2)) = 8; max(16//4, 16//2) = 8; tokens = 8 * 8 = 64.
-        assert num_reqs_padded == 8
-        assert num_tokens_padded == 64
+        # bucket(max(4, 2)) = 4; max(16//4, 16//2) = 8; tokens = 4 * 8 = 32.
+        assert num_reqs_padded == 4
+        assert num_tokens_padded == 32
         assert across.cpu().tolist() == [16, 16]
 
-    def test_dp_greater_than_one_without_per_rank_counts(self, monkeypatch):
-        # When the per-rank req counts are absent, padding falls back to the
-        # largest decode bucket and the full token budget.
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.parallel_config, "data_parallel_size", 2
-        )
-        proposer.dp_rank = 0
-        proposer.runner = SimpleNamespace(
-            specialized_moe_decode=True,
-            bucketing_manager=SimpleNamespace(
-                find_decode_batch_bucket=lambda n: 8,
-                decode_batch_buckets=[1, 2, 4, 8],
-            ),
-        )
-        monkeypatch.setattr(
-            eagle_module.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(lambda *a: (torch.tensor([16, 16]), None)),
+    def test_dp_any_prefill_falls_back_to_max_bucket(self, monkeypatch):
+        # A peer in prefill -- one request, a whole chunk of tokens -- makes the
+        # per-rank req counts unusable, so padding falls back to the largest
+        # decode bucket and the full token budget.
+        proposer = self._dp_proposer(
+            monkeypatch, (torch.tensor([16, 512]), torch.tensor([4, 1]), True)
         )
         num_reqs_padded, num_tokens_padded, _ = proposer._determine_draft_batch_padding(
-            3, 6, False
+            4, 16, False
         )
         assert num_reqs_padded == 8  # decode_batch_buckets[-1]
         assert num_tokens_padded == proposer.max_num_tokens
+
+    def test_later_draft_step_derives_tokens_from_reqs(self, monkeypatch):
+        # Past the first pass every request contributes one token, so the saved
+        # req counts double as the token counts and the prefill flag no longer
+        # applies -- the target's prefill is already done.
+        proposer = self._dp_proposer(
+            monkeypatch, (torch.tensor([16, 512]), torch.tensor([4, 1]), True)
+        )
+        num_reqs_padded, num_tokens_padded, across = (
+            proposer._determine_draft_batch_padding(4, 4, False, first_pass=False)
+        )
+        assert num_reqs_padded == 4  # bucket(max(4, 1)), not the largest bucket
+        assert num_tokens_padded == 4  # 4 * max(4//4, 1//1)
+        assert across.cpu().tolist() == [4, 1]
 
 
 class TestInitGuards:
@@ -345,6 +361,30 @@ class TestInitGuards:
             MULTIMODAL_REGISTRY, "supports_multimodal_inputs", lambda cfg: True
         )
         with pytest.raises(NotImplementedError):
+            make_eagle_proposer()
+
+    def test_rejects_extra_input_slots(self, monkeypatch):
+        # Parallel drafting / draft-model spec decode needs input slots the
+        # staged drafter inputs have no room for; construction, not the first
+        # propose, must be where that trips.
+        from vllm.v1.spec_decode.eagle import EagleProposer
+
+        base_init = EagleProposer.__init__
+
+        def init_with_extra_slots(self, *args, **kwargs):
+            base_init(self, *args, **kwargs)
+            self.needs_extra_input_slots = True
+
+        monkeypatch.setattr(EagleProposer, "__init__", init_with_extra_slots)
+        with pytest.raises(NotImplementedError, match="extra input slots"):
+            make_eagle_proposer()
+
+    def test_rejects_non_greedy_draft_sampling(self, monkeypatch):
+        # The greedy pick happens inside the draft graph, which returns ids and
+        # not logits, so a probabilistic sampler would be silently ignored.
+        spec_config = make_eagle_proposer().vllm_config.speculative_config
+        monkeypatch.setattr(spec_config, "draft_sample_method", "probabilistic")
+        with pytest.raises(NotImplementedError, match="draft_sample_method"):
             make_eagle_proposer()
 
 
@@ -398,9 +438,9 @@ class TestToTargetTokenIds:
 
 
 class TestPropose:
-    def test_single_step_early_exit_argmaxes_once(self, monkeypatch):
+    def test_single_step_early_exit_takes_ids_once(self, monkeypatch):
         # num_speculative_tokens == 1 takes the early-exit branch: one model pass,
-        # per-request argmax, shaped [num_reqs, 1].
+        # the graph's ids sliced per request, shaped [num_reqs, 1].
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=1)
         _wire_runner(proposer, num_reqs=2)
@@ -452,23 +492,14 @@ class TestPropose:
         assert out.shape == (1, 2)
         assert torch.equal(out.cpu()[:, 1:], out.cpu()[:, :-1] + 1)
 
-    def test_eagle3_rejects_wrong_combined_hidden_size(self, monkeypatch):
-        # eagle3 combines the target hidden states first and asserts the width;
-        # a mismatch fails before any draft pass.
+    def test_eagle3_rejects_uncombined_hidden_states(self, monkeypatch):
+        # eagle3's combine_hidden_states now runs in the target graph, so propose
+        # is handed already-combined states; raw aux-width ones must not pass.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle3", num_speculative_tokens=1)
         _wire_runner(proposer, num_reqs=2)
-
-        class _FakeEagle3(Eagle3LlamaForCausalLM):
-            def __init__(self, combined):
-                self.combined = combined
-
-            def combine_hidden_states(self, target_hidden_states):
-                return self.combined
-
-        proposer.model = _FakeEagle3(torch.zeros((4, proposer.hidden_size + 1)))
         with pytest.raises(AssertionError):
-            _call_propose(proposer)
+            _call_propose(proposer, torch.zeros(4, proposer.hidden_size * 3))
 
     def test_single_step_maps_draft_ids_into_target_space(self, monkeypatch):
         # The early-exit branch maps too; an unmapped draft id names a different
@@ -506,13 +537,13 @@ class TestPropose:
             inputs_embeds,
             token_indices_to_sample,
         ):
-            logits = torch.full((8, 128), -10.0)
+            ids = torch.zeros(8, dtype=torch.int64)
             for row, tok in enumerate(argmax_per_call[len(seen)]):
-                logits[row, tok] = 10.0
+                ids[row] = tok
             seen.append(input_ids.clone())
             return (
                 hidden_states.reshape(-1, proposer.hidden_size),
-                logits.to(hidden_states.device),
+                ids.to(hidden_states.device),
             )
 
         proposer.model_executable = executable
@@ -590,7 +621,9 @@ class TestLoadModel:
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", False
         )
-        proposer.runner = SimpleNamespace(compile_context=object())
+        proposer.runner = SimpleNamespace(
+            compile_context=object(), runtime_holder=[None]
+        )
 
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
@@ -599,7 +632,7 @@ class TestLoadModel:
 
     def test_eager_wrapper_composes_model_forward(self, monkeypatch):
         # The eager wrapper runs the draft model, reshapes the hidden states,
-        # keeps the sampled positions, and returns (hidden, compute_logits).
+        # keeps the sampled positions, and returns (hidden, in-graph argmax).
         from vllm.v1.spec_decode.eagle import EagleProposer
 
         class _FakeModel:
@@ -607,7 +640,7 @@ class TestLoadModel:
                 return hidden_states  # a single tensor -> model_returns_tuple False
 
             def compute_logits(self, sample_hidden_states):
-                return sample_hidden_states + 1
+                return sample_hidden_states
 
         monkeypatch.setattr(
             EagleProposer,
@@ -622,17 +655,18 @@ class TestLoadModel:
         proposer.load_model(target_model=object())
 
         h = proposer.hidden_size
-        hidden = torch.arange(4, dtype=torch.float32).reshape(4, 1).repeat(1, h)
-        out_hidden, out_logits = proposer.model_executable(
+        # Row i peaks at column i + 1, so the ids identify the rows kept.
+        hidden = torch.zeros(4, h)
+        hidden[torch.arange(4), torch.arange(4) + 1] = 1.0
+        out_hidden, draft_ids = proposer.model_executable(
             input_ids=torch.zeros(4, dtype=torch.int32),
             positions=torch.zeros(4, dtype=torch.int64),
             hidden_states=hidden,
             token_indices_to_sample=torch.tensor([0, 2], dtype=torch.int64),
         )
-        # rows 0 and 2 survive the index_select; compute_logits adds one.
+        # rows 0 and 2 survive the index_select; the argmax is taken in-graph.
         assert out_hidden.shape == (2, h)
-        assert out_hidden[:, 0].cpu().tolist() == [0.0, 2.0]
-        assert out_logits[:, 0].cpu().tolist() == [1.0, 3.0]
+        assert draft_ids.cpu().tolist() == [1, 3]
 
     def test_mapped_wrapper_skips_the_full_vocab_scatter(self, monkeypatch):
         # A mapped head must reach logits_processor instead: compute_logits
@@ -656,7 +690,7 @@ class TestLoadModel:
 
         h = proposer.hidden_size
         hidden = torch.arange(2 * 3 * h, dtype=torch.float32).view(2, 3, h)
-        _, logits = proposer.model_executable(
+        _, draft_ids = proposer.model_executable(
             input_ids=torch.zeros((2, 3), dtype=torch.int32),
             positions=torch.zeros((2, 3), dtype=torch.int64),
             hidden_states=hidden,
@@ -671,7 +705,10 @@ class TestLoadModel:
         # the first stream.
         expected_sample = (hidden + 1000).view(-1, h)
         assert torch.equal(hidden_arg, expected_sample)
-        assert torch.equal(logits, expected_sample + 1)
+        # The wrapper argmaxes in the graph and returns draft-vocab ids, so the
+        # observable is the pick over logits_processor's output, not the logits.
+        expected_ids = (expected_sample + 1).argmax(dim=-1)
+        assert draft_ids.cpu().tolist() == expected_ids.tolist()
 
 
 class TestDummyRun:
@@ -713,7 +750,7 @@ class TestDummyRun:
             calls.append(1)
             return kwargs["hidden_states"].reshape(
                 -1, proposer.hidden_size
-            ), torch.zeros((8, 128))
+            ), torch.zeros(8, dtype=torch.int64)
 
         proposer.model_executable = executable
 
@@ -761,7 +798,7 @@ class TestDummyRun:
             calls.append(1)
             return kwargs["hidden_states"].reshape(
                 -1, proposer.hidden_size
-            ), torch.zeros((8, 128))
+            ), torch.zeros(8, dtype=torch.int64)
 
         proposer.model_executable = executable
         proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
