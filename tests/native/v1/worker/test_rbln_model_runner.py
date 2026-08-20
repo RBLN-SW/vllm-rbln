@@ -24,6 +24,8 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
@@ -41,6 +43,7 @@ from vllm_rbln.v1.worker.rbln_model_runner import (
     _depad_sampler_output,
     _pad_rows,
     _pad_sampling_metadata,
+    _padded_min_p,
 )
 
 
@@ -141,6 +144,15 @@ class TestGetCumsumAndArange:
         assert cu.dtype == np.int32
 
 
+def _min_p_proc(min_p_count, min_p):
+    # Bare stub: real construction needs a VllmConfig, but _padded_min_p only
+    # reads min_p_count/min_p and calls the (state-independent) is_argmax_invariant.
+    p = object.__new__(MinPLogitsProcessor)
+    p.min_p_count = min_p_count
+    p.min_p = min_p
+    return p
+
+
 class TestPadDepad:
     def test_pad_rows_repeats_last_row(self):
         t = torch.arange(6).reshape(2, 3)
@@ -176,6 +188,44 @@ class TestPadDepad:
             sampled_token_ids=torch.arange(4).reshape(4, 1), logprobs_tensors=None
         )
         assert _depad_sampler_output(out, 2).sampled_token_ids.shape == (2, 1)
+
+    def test_padded_min_p_pads_active_processor_and_restores(self):
+        # Regression test: MinPLogitsProcessor.apply broadcasts min_p against
+        # the full (bucket-sized) logits tensor, unlike MinTokens/LogitBias
+        # which index by request id. A min_p still sized to num_reqs=2 fails
+        # to broadcast against bucket=4 logits with "size of tensor a (4) must
+        # match the size of tensor b (2)".
+        original = torch.tensor([[0.5], [0.3]])
+        proc = _min_p_proc(min_p_count=2, min_p=original)
+        logitsprocs = LogitsProcessors([proc])
+
+        with _padded_min_p(logitsprocs, 4):
+            assert proc.min_p.shape[0] == 4
+            assert torch.equal(proc.min_p[:2], original)
+
+        assert proc.min_p is original
+
+    def test_padded_min_p_skips_inactive_processor(self):
+        # min_p_count == 0 means MinPLogitsProcessor.apply short-circuits
+        # before ever reading min_p, so it must be left untouched here too.
+        original = torch.empty(0, 1)
+        proc = _min_p_proc(min_p_count=0, min_p=original)
+        logitsprocs = LogitsProcessors([proc])
+
+        with _padded_min_p(logitsprocs, 4):
+            assert proc.min_p is original
+
+        assert proc.min_p is original
+
+    def test_padded_min_p_restores_on_exception(self):
+        original = torch.tensor([[0.5], [0.3]])
+        proc = _min_p_proc(min_p_count=2, min_p=original)
+        logitsprocs = LogitsProcessors([proc])
+
+        with contextlib.suppress(RuntimeError), _padded_min_p(logitsprocs, 4):
+            raise RuntimeError("boom")
+
+        assert proc.min_p is original
 
 
 class TestPredicates:

@@ -15,7 +15,7 @@
 import dataclasses
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
@@ -80,6 +80,7 @@ from vllm.v1.sample.logits_processor import (
     MoveDirectionality,
     build_logitsprocs,
 )
+from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -1249,10 +1250,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 bucket = logits.shape[0]
                 num_reqs = self.input_batch.num_reqs
                 padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
-                out = self.sampler(
-                    logits=logits,
-                    sampling_metadata=padded_md,
-                )
+                with _padded_min_p(padded_md.logitsprocs, bucket):
+                    out = self.sampler(
+                        logits=logits,
+                        sampling_metadata=padded_md,
+                    )
                 return _depad_sampler_output(out, num_reqs)
 
             return self.rejection_sampler(
@@ -3155,6 +3157,35 @@ def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
         return t[:bucket]
     pad = t[-1:].expand(bucket - n, *t.shape[1:])
     return torch.cat([t, pad], dim=0)
+
+
+@contextmanager
+def _padded_min_p(logitsprocs: LogitsProcessors, bucket: int) -> Iterator[None]:
+    """Temporarily pad every active `MinPLogitsProcessor.min_p` to `bucket` rows.
+
+    `min_p` lives on the logits processor itself, not on `SamplingMetadata`, so
+    `_pad_sampling_metadata`'s per-field padding cannot reach it. Unlike
+    `MinTokensLogitsProcessor` and `LogitBiasLogitsProcessor`, which index into
+    `logits` by request index, `MinPLogitsProcessor.apply` broadcasts `min_p`
+    against the full logits tensor -- so it fails to broadcast once the batch
+    is smaller than the compiled bucket the padded `logits` is sized to. This
+    swaps in a bucket-sized view for the call and restores the real
+    `num_reqs`-sized tensor afterwards, so the next step's `update_state` still
+    sees the true per-request state.
+    """
+    min_p_procs = [
+        p
+        for p in logitsprocs.argmax_invariant
+        if isinstance(p, MinPLogitsProcessor) and p.min_p_count
+    ]
+    originals = [p.min_p for p in min_p_procs]
+    for p in min_p_procs:
+        p.min_p = _pad_rows(p.min_p, bucket)
+    try:
+        yield
+    finally:
+        for p, original in zip(min_p_procs, originals):
+            p.min_p = original
 
 
 def _pad_sampling_metadata(md: SamplingMetadata, bucket: int) -> SamplingMetadata:
