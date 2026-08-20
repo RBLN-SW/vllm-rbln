@@ -141,7 +141,7 @@ Some of the rules above cost something to follow. When you believe a case is a r
 
 Follow the existing convention: `type(scope): summary`, for example `fix(mega-cache): key the bundle on the warm-up graph set`.
 
-Explain intent. The diff already shows what changed, so a message that narrates it adds nothing.
+Explain intent. Summarise what changed in a line or two, then spend the space on what the diff cannot show — the reason behind an unusual approach, a constraint that forced the shape, a tradeoff that was weighed. Do not walk through the diff file by file; that is the part a reader can already see.
 
 ## Skills
 
