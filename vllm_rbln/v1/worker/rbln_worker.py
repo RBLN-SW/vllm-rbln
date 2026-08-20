@@ -13,7 +13,6 @@
 # limitations under the License.
 """A RBLN worker class."""
 
-import copy
 import os
 import time
 from types import NoneType
@@ -43,6 +42,9 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
@@ -52,7 +54,6 @@ from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
@@ -373,8 +374,13 @@ class RBLNWorker(WorkerBase):
 
         return available_memory_estimate
 
-    def get_kv_connector_handshake_metadata(self) -> dict | None:
-        """Get KV connector metadata from this worker if available."""
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
+        """Get KV connector metadata from this worker if available.
+
+        Returned dict is keyed by ``(pp_rank, tp_rank)``.
+        """
 
         if not has_kv_transfer_group():
             return None
@@ -385,8 +391,9 @@ class RBLNWorker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
 
+        pp_rank = get_pp_group().rank_in_group
         tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
@@ -510,21 +517,12 @@ class RBLNWorker(WorkerBase):
         # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
         get_pp_group().send_tensor_dict(output.tensors)
 
-        # For PP with a KV connector, surface the connector output the
-        # model runner attached to the intermediate tensors so finished
-        # send/recv notifications still propagate from non-last ranks.
-        kv_connector_output = output.kv_connector_output
-        if not kv_connector_output:
-            return None
-        if (
-            not kv_connector_output.finished_sending
-            and not kv_connector_output.finished_recving
-        ):
-            return EMPTY_MODEL_RUNNER_OUTPUT
-
-        empty_output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
-        empty_output.kv_connector_output = kv_connector_output
-        return empty_output
+        # Non-last PP rank: the model runner already surfaces this rank's
+        # KV-connector output through the two-phase sample_tokens() path
+        # (mirroring the upstream model runner). The engine consumes this
+        # execute_model result only for error propagation, so return None
+        # rather than emitting the same finished send/recv notifications here.
+        return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
@@ -607,13 +605,26 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
-        self.model_runner.performance_ctx.print_stats()
+        self._release_offload_temp_storage()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
+
+    def _release_offload_temp_storage(self) -> None:
+        # The runtime drops the offload dir on teardown, but that runs last and vLLM
+        # SIGKILLs a worker seconds after asking it to stop, so reclaim up front.
+        if not has_torch_rbln:
+            return
+        try:
+            num_removed = torch.rbln.release_offload_temp_storage()
+        except Exception:
+            logger.exception("Failed to release RBLN offload temp storage")
+            return
+        if num_removed:
+            logger.info("Released %d RBLN offload temp file(s)", num_removed)
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without
