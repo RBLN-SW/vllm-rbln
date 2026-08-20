@@ -18,6 +18,7 @@ from torch._dynamo.testing import CompileCounter
 from vllm.platforms import current_platform
 
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS
+from vllm_rbln.v1.worker.optimum_model_runner import sampler_recompile_budget
 
 from .utils import (
     _schedule_cached_reqs,
@@ -394,34 +395,22 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("warm_up", [False, True], ids=["no_warm_up", "warm_up"])
-def test_recompile_budget_leaves_room_for_serving(monkeypatch, warm_up: bool):
-    """A sampling combination warm-up did not cover must cost a compile, not the engine.
+@pytest.mark.parametrize(
+    ("num_buckets", "warm_up_pairs"),
+    [pytest.param(1, 9, id="1_bucket"), pytest.param(5, 45, id="5_buckets")],
+)
+def test_sampler_recompile_budget_exceeds_the_warm_up_count(num_buckets, warm_up_pairs):
+    """The budget must leave room past what warm-up compiles.
 
-    `prepare_rbln_sampler` used to lower the process-global
-    `torch._dynamo.config.recompile_limit` to exactly the number of variants
-    warm-up compiles. Warm-up is opt-in, so in the default configuration the
-    budget was lowered and never restored, and with torch's
-    `fail_on_recompile_limit_hit` default of True the first unanticipated
-    combination raised `FailOnRecompileLimitHit` and took EngineCore with it —
-    observed on four served models whose request bodies were identical to
-    passing ones.
+    `prepare_rbln_sampler` used to set the process-global
+    `torch._dynamo.config.recompile_limit` to exactly
+    `len(bucket_sizes) * len(WARM_UP_CONFIGS)` — 9 under `--max-num-seqs 1`,
+    regardless of model size or device count. Warm-up is opt-in, so usually the
+    budget was spent on nothing, and torch defaults
+    `fail_on_recompile_limit_hit` to True: the first (bucket, sampling config)
+    pair the warm-up set did not cover raised `FailOnRecompileLimitHit` and took
+    EngineCore with it. Five served models died that way with request bodies
+    identical to passing ones.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
-    monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "1" if warm_up else "False")
-
-    before = torch._dynamo.config.recompile_limit
-    runner = create_model_runner(max_num_seqs=1)
-
-    warm_up_variants = len(runner.bucket_sizes) * len(WARM_UP_CONFIGS)
-    assert torch._dynamo.config.recompile_limit >= 2 * warm_up_variants, (
-        "serving must keep headroom over the warm-up variant count"
-    )
-    assert torch._dynamo.config.recompile_limit >= before, (
-        "the limit is process-global — lowering it caps every other compiled "
-        "function in the process too"
-    )
-    if warm_up:
-        assert not torch._dynamo.config.fail_on_recompile_limit_hit, (
-            "an overflow while serving must fall back to eager, not raise"
-        )
+    assert num_buckets * len(WARM_UP_CONFIGS) == warm_up_pairs
+    assert sampler_recompile_budget(num_buckets) > warm_up_pairs
