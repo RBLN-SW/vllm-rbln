@@ -20,10 +20,11 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorHandshakeMetadata,
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-    NixlConnector,
+    NixlPullConnector,
 )
 
 import vllm_rbln.envs as envs
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class RblnNixlConnector(NixlConnector, SupportsKVCacheRegistrationFinalize):
+class RblnNixlConnector(NixlPullConnector, SupportsKVCacheRegistrationFinalize):
     """RBLN's NIXL KV connector. A single `RblnNixlConnectorWorker` runs
     both paths and branches internally on
     `kv_transfer_config.kv_buffer_device`:
@@ -89,6 +90,34 @@ class RblnNixlConnector(NixlConnector, SupportsKVCacheRegistrationFinalize):
             self.connector_worker = RblnNixlConnectorWorker(
                 vllm_config, self.engine_id, kv_cache_config
             )
+
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
+    ) -> None:
+        """Serve every producer shard, including pipeline-parallel stages.
+
+        The base implementation rejects `pp_rank > 0` and drops the pipeline
+        rank, keying the side channel by `tp_rank` alone; PP stages would then
+        overwrite each other. This connector's side channel identifies a shard
+        by the flat rank `pp_rank * tp_size + tp_rank` -- what a consumer asks
+        for in `RblnNixlConnectorWorker._nixl_handshake` -- so flatten the pair
+        here. `tp_size` is this (producer) engine's, matching the workers that
+        produced these entries. Reduces to `tp_rank` at `pp_size == 1`, i.e. the
+        base behavior.
+        """
+        tp_size = self._vllm_config.parallel_config.tensor_parallel_size
+        flattened: dict[int, KVConnectorHandshakeMetadata] = {}
+        for (pp_rank, tp_rank), rank_metadata in metadata.items():
+            flat_rank = pp_rank * tp_size + tp_rank
+            if flat_rank in flattened:
+                raise ValueError(
+                    "Duplicate handshake metadata for flat rank "
+                    f"{flat_rank} (pp_rank={pp_rank}, tp_rank={tp_rank}); "
+                    f"tensor_parallel_size={tp_size} disagrees with the ranks "
+                    "reported by the workers."
+                )
+            flattened[flat_rank] = rank_metadata
+        self.set_xfer_handshake_metadata(flattened)
 
     def finalize_kv_cache_registration(self) -> None:
         """Run the worker's deferred NIXL registration after warm-up
