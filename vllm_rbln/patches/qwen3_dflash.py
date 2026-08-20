@@ -191,6 +191,16 @@ class _RuntimeInputBindingCache:
     once so it can install the port's device-allocation configuration.  After
     that, inputs whose *contents* change still go through ``PrepareInputs``;
     immutable inputs only need an address patch when the layer changes.
+
+    LIFETIME INVARIANT: the cache identifies tensors by raw ``data_ptr()``
+    alone, with no generation counter or liveness check. That is safe only
+    because every tracked tensor (``_layer_constants`` clones,
+    ``_get_run_inputs`` staging buffers) lives exactly as long as this helper,
+    so an address is never freed and recycled by an unrelated allocation. Any
+    change that lets a tracked tensor be deallocated -- per-request buffers, a
+    cache-eviction path, a physical-view reconfiguration -- must revisit this
+    class, or a recycled address would silently bind wrong data to a compiled
+    input port instead of raising.
     """
 
     def __init__(self, dynamic_input_indices: tuple[int, ...]) -> None:

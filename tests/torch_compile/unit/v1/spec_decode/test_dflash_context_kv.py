@@ -1268,6 +1268,104 @@ def _make_first_pass_proposer(num_speculative_tokens: int = 7) -> RBLNDFlashProp
     return proposer
 
 
+def test_set_inputs_first_pass_flattens_rank3_prefill_hidden() -> None:
+    proposer = _make_first_pass_proposer()
+    cad = SimpleNamespace(num_reqs=1, seq_lens=torch.tensor([10], dtype=torch.int32))
+    # The runner's first-step (prefill) branch hands over 3-D
+    # [1, tokens, fused_hidden] with more rows than the sliced token ids.
+    hidden = torch.randn(1, 12, 6)
+
+    num_tokens, token_indices = proposer.set_inputs_first_pass(
+        target_token_ids=torch.zeros(10, dtype=torch.int32),
+        next_token_ids=torch.tensor([7], dtype=torch.int32),
+        target_positions=torch.arange(10, dtype=torch.int64),
+        target_hidden_states=hidden,
+        token_indices_to_sample=None,
+        cad=cad,
+    )
+
+    assert num_tokens == 8
+    assert proposer._dflash_num_context == 10
+    assert proposer._dflash_hidden_states.shape == (10, 6)
+    torch.testing.assert_close(
+        proposer._dflash_hidden_states, hidden.reshape(-1, 6)[:10]
+    )
+    assert proposer._context_positions_cpu_buffer[:10].tolist() == list(range(10))
+    assert proposer.input_ids[0].item() == 7
+    assert proposer.input_ids[1:8].tolist() == [99] * 7
+    assert proposer.positions[:8].tolist() == list(range(10, 18))
+    assert token_indices.dtype == torch.int32
+    assert token_indices.tolist() == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_set_inputs_first_pass_slices_unsliced_decode_hidden() -> None:
+    proposer = _make_first_pass_proposer()
+    cad = SimpleNamespace(
+        num_reqs=2, seq_lens=torch.tensor([20, 30], dtype=torch.int32)
+    )
+    # The runner's spec-decode branch flattens but does NOT slice to the total
+    # token count, so the hidden rows exceed the 16 context tokens.
+    hidden = torch.randn(20, 6)
+
+    num_tokens, token_indices = proposer.set_inputs_first_pass(
+        target_token_ids=torch.zeros(16, dtype=torch.int32),
+        next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
+        target_positions=torch.arange(16, dtype=torch.int64),
+        target_hidden_states=hidden,
+        token_indices_to_sample=None,
+        cad=cad,
+    )
+
+    assert num_tokens == 16
+    assert proposer._dflash_hidden_states.shape == (16, 6)
+    torch.testing.assert_close(proposer._dflash_hidden_states, hidden[:16])
+    assert proposer.input_ids[:16].view(2, 8)[:, 0].tolist() == [3, 4]
+    assert proposer.positions[:8].tolist() == list(range(20, 28))
+    assert proposer.positions[8:16].tolist() == list(range(30, 38))
+    assert token_indices.tolist() == list(range(1, 8)) + list(range(9, 16))
+
+
+def test_rewind_rejected_tokens_subtracts_once_for_aliased_views() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 7
+    base = torch.tensor([100, 200], dtype=torch.int32)
+    # rbln_model_runner slices ONE cpu tensor into both fields.
+    cad = SimpleNamespace(seq_lens=base[:2], _seq_lens_cpu=base[:2])
+
+    proposer._rewind_rejected_tokens(cad, torch.tensor([3, 5]))
+
+    assert base.tolist() == [97, 195]
+
+
+def test_rewind_rejected_tokens_corrects_separate_host_shadow() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 7
+    cad = SimpleNamespace(
+        seq_lens=torch.tensor([100, 200], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([100, 200], dtype=torch.int32),
+    )
+
+    proposer._rewind_rejected_tokens(cad, torch.tensor([3, 5]))
+
+    assert cad.seq_lens.tolist() == [97, 195]
+    assert cad._seq_lens_cpu.tolist() == [97, 195]
+
+
+def test_rewind_rejected_tokens_noops_without_rejects_or_speculation() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 7
+    cad = SimpleNamespace(
+        seq_lens=torch.tensor([100], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([100], dtype=torch.int32),
+    )
+    proposer._rewind_rejected_tokens(cad, None)
+    assert cad.seq_lens.tolist() == [100]
+
+    proposer.num_speculative_tokens = 1
+    proposer._rewind_rejected_tokens(cad, torch.tensor([3]))
+    assert cad.seq_lens.tolist() == [100]
+
+
 class _FakeMetadataBuilder:
     def __init__(self) -> None:
         self.build_calls: list[tuple] = []
@@ -1478,3 +1576,150 @@ def test_check_draft_rope_style_raises_only_on_mismatch() -> None:
 
     with pytest.raises(ValueError, match="RoPE style"):
         _check_draft_rope_style(_ModelWithRotary(True), False)
+
+
+# ----------------------------------------------------------------------
+# Residual guard coverage: combiner dtype keys, config validation branches,
+# causal-mismatch guard, SWA local-view bounds guard
+# ----------------------------------------------------------------------
+
+
+def test_hidden_state_combiner_keys_buffers_by_dtype() -> None:
+    seen: list[tuple[torch.dtype, int]] = []
+
+    def combine(inputs: torch.Tensor) -> torch.Tensor:
+        seen.append((inputs.dtype, inputs.data_ptr()))
+        return inputs
+
+    helper = _BoundedHiddenStateCombiner(combine)
+    out_fp32 = helper(torch.ones(3, 4, dtype=torch.float32))
+    out_bf16 = helper(torch.ones(3, 4, dtype=torch.bfloat16))
+    out_fp32_again = helper(torch.ones(3, 4, dtype=torch.float32))
+
+    assert [dtype for dtype, _ in seen] == [
+        torch.float32,
+        torch.bfloat16,
+        torch.float32,
+    ]
+    # Distinct staging buffers per dtype; same-dtype calls reuse one buffer.
+    assert seen[0][1] != seen[1][1]
+    assert seen[0][1] == seen[2][1]
+    assert out_fp32.dtype == torch.float32
+    assert out_bf16.dtype == torch.bfloat16
+    assert out_fp32_again.dtype == torch.float32
+
+
+def _make_configure_proposer(layer_types, sliding_window):
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.draft_attn_groups = [
+        SimpleNamespace(
+            layer_names=[
+                "model.layers.0.self_attn.attn",
+                "model.layers.1.self_attn.attn",
+            ]
+        )
+    ]
+    proposer.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            layer_types=layer_types, sliding_window=sliding_window
+        )
+    )
+    proposer._dflash_sliding_layer_names = set()
+    proposer._dflash_sliding_window = None
+    return proposer
+
+
+def test_configure_dflash_layers_rejects_layer_type_length_mismatch() -> None:
+    proposer = _make_configure_proposer(["full_attention"], sliding_window=None)
+    with pytest.raises(ValueError, match="length"):
+        proposer._configure_dflash_attention_layers()
+
+
+def test_configure_dflash_layers_rejects_unknown_layer_type() -> None:
+    proposer = _make_configure_proposer(
+        ["full_attention", "weird_attention"], sliding_window=None
+    )
+    with pytest.raises(ValueError, match="Invalid DFlash layer type"):
+        proposer._configure_dflash_attention_layers()
+
+
+def test_configure_dflash_layers_requires_window_for_sliding_layers() -> None:
+    proposer = _make_configure_proposer(
+        ["sliding_attention", "full_attention"], sliding_window=None
+    )
+    with pytest.raises(ValueError, match="sliding_window"):
+        proposer._configure_dflash_attention_layers()
+
+
+def test_configure_dflash_layers_handles_absent_layer_types() -> None:
+    proposer = _make_configure_proposer(None, sliding_window=None)
+    proposer._configure_dflash_attention_layers()
+    assert proposer._dflash_sliding_layer_names == set()
+    assert proposer._dflash_sliding_window is None
+
+
+def test_causal_guard_rejects_causal_full_attention_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        dflash_mod.RBLNEagleProposer,
+        "build_per_group_and_layer_attn_metadata",
+        lambda self, cad, draft_index=0: (
+            [],
+            {"layer.full": SimpleNamespace(causal=True)},
+        ),
+    )
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer._dflash_sliding_layer_names = set()
+
+    with pytest.raises(RuntimeError, match="causal=True"):
+        proposer.build_per_group_and_layer_attn_metadata(None)
+
+
+def test_causal_guard_allows_causal_sliding_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    per_layer = {"layer.sw": SimpleNamespace(causal=True)}
+    monkeypatch.setattr(
+        dflash_mod.RBLNEagleProposer,
+        "build_per_group_and_layer_attn_metadata",
+        lambda self, cad, draft_index=0: ([], per_layer),
+    )
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer._dflash_sliding_layer_names = {"layer.sw"}
+
+    _, result = proposer.build_per_group_and_layer_attn_metadata(None)
+
+    assert result is per_layer
+
+
+def test_swa_localization_rejects_undersized_block_table() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 7
+    proposer._dflash_sliding_layer_names = {"layer.sw"}
+    proposer._dflash_sliding_window = 2048
+    # Sequence 3497 with a 2048 window needs partitions 0..3; a 3-wide block
+    # table cannot represent the local view and must fail loudly.
+    metadata = SimpleNamespace(
+        attn_masks=torch.zeros(1, 1, 1, 1, 49152),
+        block_tables=torch.arange(100, 103).view(1, -1),
+        seq_lens=torch.tensor([[3497]], dtype=torch.int32),
+    )
+    cad = SimpleNamespace(
+        _seq_lens_cpu=torch.tensor([3497], dtype=torch.int32),
+        block_table_tensor=metadata.block_tables,
+    )
+    group = SimpleNamespace(
+        layer_names=["layer.sw"],
+        kv_cache_spec=SimpleNamespace(block_size=1024),
+    )
+
+    with pytest.raises(ValueError, match="block table"):
+        RBLNDFlashProposer._specialize_layer_attn_metadata(
+            proposer,
+            group,
+            metadata,
+            cad,
+            num_reqs=1,
+            num_reqs_padded=1,
+        )

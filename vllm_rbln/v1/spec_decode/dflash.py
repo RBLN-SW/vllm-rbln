@@ -1146,6 +1146,37 @@ class RBLNDFlashProposer(RBLNEagleProposer):
     # Drafting
     # ------------------------------------------------------------------
 
+    def _rewind_rejected_tokens(
+        self,
+        cad: CommonAttentionMetadata,
+        num_rejected_tokens: torch.Tensor | None,
+    ) -> None:
+        """Strip just-rejected tokens from `seq_lens`, exactly once.
+
+        The drafter batch arrives padded to the full speculation width, so
+        `seq_lens` still counts the tokens the target just rejected. Everything
+        downstream keys off it -- the block's query positions, its cache write
+        offset, the mask window -- so strip the rejects first. Upstream's
+        kernel does the equivalent by walking back to the last accepted
+        position (`valid_ctx_end = ctx_end - num_rejected`).
+        """
+        if self.num_speculative_tokens <= 1 or num_rejected_tokens is None:
+            return
+        seq_lens = cad.seq_lens
+        seq_lens_cpu = cad._seq_lens_cpu
+        seq_lens -= num_rejected_tokens.to(seq_lens.device, seq_lens.dtype)
+        # The flash-attention builder reads the HOST shadow, so it has to see
+        # the same correction -- but on this stack the two fields are views of
+        # ONE tensor: rbln_model_runner.py:920-921 slices the plain CPU
+        # `self.seq_lens` twice, and prepare_inputs_padded passes both through
+        # unchanged. Subtracting from both, the way eagle.py:511-521 does,
+        # therefore applies the correction TWICE to the same storage. Only
+        # touch the shadow when it is genuinely a separate buffer.
+        if seq_lens_cpu is not None and seq_lens_cpu.data_ptr() != seq_lens.data_ptr():
+            seq_lens_cpu -= num_rejected_tokens.to(
+                seq_lens_cpu.device, seq_lens_cpu.dtype
+            )
+
     def propose(
         self,
         target_token_ids: torch.Tensor,
@@ -1158,30 +1189,7 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         num_rejected_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor | list[list[int]]:
         """One non-causal forward produces every draft token."""
-        # The drafter batch arrives padded to the full speculation width, so
-        # `seq_lens` still counts the tokens the target just rejected. Everything
-        # downstream keys off it -- the block's query positions, its cache write
-        # offset, the mask window -- so strip the rejects first. Upstream's
-        # kernel does the equivalent by walking back to the last accepted
-        # position (`valid_ctx_end = ctx_end - num_rejected`).
-        if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
-            seq_lens = common_attn_metadata.seq_lens
-            seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-            seq_lens -= num_rejected_tokens.to(seq_lens.device, seq_lens.dtype)
-            # The flash-attention builder reads the HOST shadow, so it has to see
-            # the same correction -- but on this stack the two fields are views of
-            # ONE tensor: rbln_model_runner.py:920-921 slices the plain CPU
-            # `self.seq_lens` twice, and prepare_inputs_padded passes both through
-            # unchanged. Subtracting from both, the way eagle.py:511-521 does,
-            # therefore applies the correction TWICE to the same storage. Only
-            # touch the shadow when it is genuinely a separate buffer.
-            if (
-                seq_lens_cpu is not None
-                and seq_lens_cpu.data_ptr() != seq_lens.data_ptr()
-            ):
-                seq_lens_cpu -= num_rejected_tokens.to(
-                    seq_lens_cpu.device, seq_lens_cpu.dtype
-                )
+        self._rewind_rejected_tokens(common_attn_metadata, num_rejected_tokens)
 
         num_tokens, token_indices = self.set_inputs_first_pass(
             target_token_ids=target_token_ids,
