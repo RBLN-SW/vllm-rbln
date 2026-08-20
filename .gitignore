@@ -183,3 +183,7 @@ _version.py
 profile/
 cache_dir/
 rsd_cache_dir/
+
+# vLLM checkout the page-layout benchmark clones for its multi-turn driver
+benchmarks/page_layout/vllm/
+benchmarks/page_layout/results*/
