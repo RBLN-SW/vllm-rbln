@@ -150,11 +150,13 @@ class TestPadDepad:
         assert torch.equal(out[2], t[1])
         assert torch.equal(out[3], t[1])
 
-    def test_pad_rows_clone_when_at_bucket(self):
+    def test_pad_rows_reuses_storage_when_at_bucket(self):
+        # A batch already at the bucket is handed through untouched -- reuse is
+        # what keeps the sampler graph's input address fixed across steps.
         t = torch.arange(6).reshape(2, 3)
         out = _pad_rows(t, 2)
         assert torch.equal(out, t)
-        assert out is not t
+        assert out is t
 
     def test_pad_rows_none_passthrough(self):
         assert _pad_rows(None, 4) is None
@@ -210,7 +212,7 @@ class TestExecuteModelState:
             "spec_decode_common_attn_metadata",
             "hidden_states",
             "sample_hidden_states",
-            "aux_hidden_states",
+            "combined_hidden_states",
         )
 
     def test_is_named_tuple(self):
@@ -356,8 +358,7 @@ class TestDummyRunPadding:
 
         def fake_across_dp(num_tokens, num_reqs, dp_size, dp_rank, is_prefill):
             reqs = torch.tensor(reqs_across_dp, dtype=torch.int32)
-            # The real one returns no per-rank counts while any rank prefills.
-            return reqs.clone(), None if is_prefill else reqs
+            return reqs.clone(), reqs, is_prefill
 
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
@@ -399,6 +400,9 @@ class TestDummyRunPadding:
             # use_wrapped_compute_logits is a property over this.
             is_pooling_model=True,
             speculative_config=None,
+            # Read by _determine_batch_padding to floor the MoE dispatch pad
+            # at the spec width; __init__ always sets it.
+            use_aux_hidden_state_outputs=False,
             # Gates the drafter's dummy run; __init__ always sets it.
             drafter=None,
             kv_cache_bases=None,
