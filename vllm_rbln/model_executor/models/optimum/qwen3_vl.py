@@ -460,7 +460,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             input_block_ids=batch_indices,
         )
         input_ids = kw.pop("input_ids")
-        inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+        inputs_embeds = self.model.embed_tokens(input_ids)
         self.model.decoder = self.model.decoders[self.decoder_batch_size]
         logits = self.model.decoder(
             inputs_embeds=inputs_embeds,
