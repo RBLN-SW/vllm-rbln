@@ -237,7 +237,7 @@ class TestSampleTokensOnDrafterOverflow:
             spec_decode_common_attn_metadata=SimpleNamespace(max_seq_len=10),
             hidden_states=torch.zeros((1, 4)),
             sample_hidden_states=torch.zeros((1, 4)),
-            aux_hidden_states=None,
+            combined_hidden_states=None,
         )
 
         def unexpected_propose(*args, **kwargs):
