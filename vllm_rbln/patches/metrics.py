@@ -13,11 +13,17 @@
 # limitations under the License.
 """Wall-clock metrics for the native runner, installed only under VLLM_RBLN_METRICS.
 
-Three ranges are timed with perf_counter: the pass (execute_model through
-sample_tokens), the model call, and the sampler call. The last two are reported as one
-sum, so MODEL + SAMPLE carries the same call count as E2E and the difference of the two
-means is the host overhead around the graphs. A pass is recorded only once its phase
-and its graph time are both known, which is what keeps those counts equal.
+Four ranges are timed with perf_counter: the pass (execute_model through
+sample_tokens), the model call, the sampler call, and the DP all-reduce. The model and
+sampler calls are reported as one sum, so MODEL + SAMPLE carries the same call count as
+E2E and the difference of the two means is the host overhead around the graphs. A pass
+is recorded only once its phase and its graph time are both known, which is what keeps
+those counts equal.
+
+DP WAIT is reported separately because it is not host overhead: the all-reduce blocks
+until every DP rank reaches the same forward, so a rank that is ready early pays its
+peers' lateness there. Without it that time is indistinguishable from work inside E2E.
+It is absent from the report when there is no DP group to wait on.
 
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
@@ -36,6 +42,7 @@ from enum import Enum
 import numpy as np
 
 from vllm_rbln import envs
+from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
@@ -44,6 +51,11 @@ from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 logger = init_logger(__name__)
 
 _CTX_ATTR = "_metrics_ctx"
+
+# The DP all-reduce is reached from a static helper with no path back to the runner,
+# so the open pass is published here for it. One runner per process makes this
+# unambiguous.
+_ACTIVE_CTX: "_PerformanceContext | None" = None
 
 
 class _Phase(Enum):
@@ -93,31 +105,42 @@ class _PerformanceContext:
         self.name = name
         self.rank_tag = _rank_tag()
         self._graph: dict[_Phase, _Metrics] = defaultdict(_Metrics)
+        self._dp: dict[_Phase, _Metrics] = defaultdict(_Metrics)
         self._e2e: dict[_Phase, _Metrics] = defaultdict(_Metrics)
         self._start: float | None = None
         self._phase: _Phase | None = None
         self._graph_latency: float | None = None
+        self._dp_latency: float | None = None
 
     @property
     def in_pass(self) -> bool:
         return self._start is not None
 
     def start_pass(self) -> None:
+        global _ACTIVE_CTX
+        _ACTIVE_CTX = self
         self._start = time.perf_counter()
         self._phase = None
         self._graph_latency = None
+        self._dp_latency = None
 
     def end_pass(self) -> None:
+        global _ACTIVE_CTX
         end = time.perf_counter()
+        _ACTIVE_CTX = None
         start, self._start = self._start, None
         phase, self._phase = self._phase, None
         graph, self._graph_latency = self._graph_latency, None
+        dp, self._dp_latency = self._dp_latency, None
         if start is None or phase is None or graph is None:
             # No pass was open, or it never reached the forward: an empty batch, KV
             # send/recv with no forward work, or a pass that raised.
             return
         self._e2e[phase].record(end - start)
         self._graph[phase].record(graph)
+        if dp is not None:
+            # None without a DP group: nothing to wait on, so no section.
+            self._dp[phase].record(dp)
 
     def mark_phase(self, phase: _Phase) -> None:
         if self._start is not None:
@@ -127,9 +150,17 @@ class _PerformanceContext:
         if self._start is not None:
             self._graph_latency = (self._graph_latency or 0.0) + latency
 
+    def add_dp_wait(self, latency: float) -> None:
+        if self._start is not None:
+            self._dp_latency = (self._dp_latency or 0.0) + latency
+
     def print_stats(self) -> None:
         sections: dict[str, _Metrics] = {}
-        for label, table in (("MODEL + SAMPLE", self._graph), ("E2E", self._e2e)):
+        for label, table in (
+            ("MODEL + SAMPLE", self._graph),
+            ("DP WAIT", self._dp),
+            ("E2E", self._e2e),
+        ):
             for phase in _Phase:
                 if phase in table:
                     sections[f"{label} ({phase.value})"] = table[phase]
@@ -248,6 +279,19 @@ def _ctx(runner: RBLNModelRunner) -> _PerformanceContext:
     return ctx
 
 
+_num_tokens_across_dp = RBLNDPMetadata.num_tokens_across_dp
+
+
+@functools.wraps(_num_tokens_across_dp)
+def num_tokens_across_dp(num_tokens, dp_size, dp_rank):
+    start = time.perf_counter()
+    out = _num_tokens_across_dp(num_tokens, dp_size, dp_rank)
+    ctx = _ACTIVE_CTX
+    if ctx is not None:
+        ctx.add_dp_wait(time.perf_counter() - start)
+    return out
+
+
 _execute_model = RBLNModelRunner.execute_model
 _sample_tokens = RBLNModelRunner.sample_tokens
 _sample = RBLNModelRunner._sample
@@ -336,6 +380,7 @@ def shutdown(self):
 
 
 _RUNNER = "vllm_rbln.v1.worker.rbln_model_runner.RBLNModelRunner"
+_DP_METADATA = "vllm_rbln.forward_context.RBLNDPMetadata"
 _WORKER = "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
 
 
@@ -370,6 +415,12 @@ def _register_patches() -> None:
             determine_batch_padding,
             "Reads the pass phase where it is decided. num_tokens_padded is a local of "
             "execute_model and is not observable from any wrapped callable.",
+        ),
+        (
+            f"{_DP_METADATA}.num_tokens_across_dp",
+            num_tokens_across_dp,
+            "Times the DP all-reduce. It is a static helper, so wrapping it is the "
+            "only way to separate peer-wait time from the work around it.",
         ),
         (
             f"{_WORKER}.shutdown",

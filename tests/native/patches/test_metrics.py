@@ -62,14 +62,19 @@ def ctx(monkeypatch):
     return pm._PerformanceContext("runner")
 
 
-def run_pass(ctx, clock, *, phase, before=0.0, model=0.0, sample=None, after=0.0):
+def run_pass(
+    ctx, clock, *, phase, before=0.0, model=0.0, sample=None, after=0.0, dp=None
+):
     """Drive one pass the way the patched runner methods do.
 
     ``sample=None`` is a pass whose sampler never ran: an intermediate chunked prefill,
-    or a non-last PP rank.
+    or a non-last PP rank. ``dp=None`` is a pass with no DP group, so no all-reduce.
     """
     ctx.start_pass()
     clock.advance(before)
+    if dp is not None:
+        clock.advance(dp)
+        ctx.add_dp_wait(dp)
     ctx.mark_phase(phase)
     clock.advance(model)
     ctx.add_graph_time(model)
@@ -219,6 +224,27 @@ class TestReporting:
             "E2E (DECODE)",
             "E2E (PADDED DECODE)",
         ]
+
+    def test_dp_wait_sits_between_the_graph_and_the_whole_pass(
+        self, ctx, clock, monkeypatch
+    ):
+        run_pass(ctx, clock, phase=pm._Phase.PREFILL, dp=5 * MS, model=10 * MS)
+        assert self._labels(ctx, monkeypatch) == [
+            "MODEL + SAMPLE (PREFILL)",
+            "DP WAIT (PREFILL)",
+            "E2E (PREFILL)",
+        ]
+
+    def test_dp_wait_is_omitted_without_a_dp_group(self, ctx, clock, monkeypatch):
+        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=8 * MS, sample=1 * MS)
+        assert "DP WAIT (DECODE)" not in self._labels(ctx, monkeypatch)
+
+    def test_dp_wait_is_counted_out_of_the_graph_time(self, ctx, clock):
+        run_pass(ctx, clock, phase=pm._Phase.PREFILL, dp=5 * MS, model=10 * MS)
+        assert ctx._dp[pm._Phase.PREFILL].latencies == pytest.approx([5 * MS])
+        assert ctx._graph[pm._Phase.PREFILL].latencies == pytest.approx([10 * MS])
+        # The wait is inside E2E, which is why it needs reporting separately.
+        assert ctx._e2e[pm._Phase.PREFILL].latencies == pytest.approx([15 * MS])
 
     def test_unseen_phase_is_omitted(self, ctx, clock, monkeypatch):
         run_pass(ctx, clock, phase=pm._Phase.DECODE, model=8 * MS, sample=1 * MS)
@@ -477,6 +503,32 @@ class TestSamplerTiming:
         assert ctx._graph_latency is None
 
 
+class TestDpWaitProbe:
+    def test_the_all_reduce_is_timed_only_inside_a_pass(self, monkeypatch):
+        monkeypatch.setattr(
+            pm, "_num_tokens_across_dp", lambda tokens, size, rank: "across"
+        )
+        ctx = pm._PerformanceContext("runner")
+
+        assert pm.num_tokens_across_dp(4, 2, 0) == "across"  # warm-up, no pass open
+        assert ctx._dp_latency is None
+
+        ctx.start_pass()
+        assert pm.num_tokens_across_dp(4, 2, 0) == "across"
+        assert ctx._dp_latency is not None
+
+    def test_a_closed_pass_stops_collecting(self, monkeypatch):
+        monkeypatch.setattr(
+            pm, "_num_tokens_across_dp", lambda tokens, size, rank: "across"
+        )
+        ctx = pm._PerformanceContext("runner")
+        ctx.start_pass()
+        ctx.end_pass()
+
+        pm.num_tokens_across_dp(4, 2, 0)
+        assert ctx._dp_latency is None
+
+
 class TestModelExecutable:
     def test_the_executable_is_timed_only_inside_a_pass(self, monkeypatch):
         calls: list[dict] = []
@@ -538,7 +590,7 @@ class TestDescriptors:
             for d in registry.get_registered_patch_descriptors()
             if d.owner_module == "vllm_rbln.patches.metrics"
         ]
-        assert len(ours) == 6
+        assert len(ours) == 7
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target
