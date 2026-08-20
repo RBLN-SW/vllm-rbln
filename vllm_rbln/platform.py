@@ -258,6 +258,12 @@ class RblnPlatform(Platform):
             )
             scheduler_config.async_scheduling = False
 
+        # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
+        # that runs only inside the vLLM-native branch below, and the optimum
+        # path is exactly where an unsupported flag would go unnoticed.
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            cls._validate_dynamic_kv_config(vllm_config)
+
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             if vllm_config.lora_config is not None:
                 raise ValueError("LoRA is not supported on RBLN.")
@@ -427,6 +433,44 @@ class RblnPlatform(Platform):
                     "distributed executor backend."
                 ),
                 parallel_config.distributed_executor_backend,
+            )
+
+    @staticmethod
+    def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
+        """Reject configurations the dynamic-KV path cannot size.
+
+        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
+        Configurations".
+        """
+        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
+                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
+            )
+
+        if vllm_config.model_config.use_mla:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
+                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
+            )
+
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
+                "decoding; the merged profiles cannot be attributed per artifact."
+            )
+
+        if not USE_DEVICE_TENSOR:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
+                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
+                "no dynamic KV dimension."
+            )
+
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
+                "transfer connector; the resize invalidates its registrations."
             )
 
     @classmethod
