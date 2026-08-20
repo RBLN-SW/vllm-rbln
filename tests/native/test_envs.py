@@ -387,6 +387,30 @@ def test_rbln_variables_are_registered_with_vllm():
     assert getattr(upstream_envs, "VLLM_RBLN_USE_VLLM_MODEL") is True  # noqa: B009
 
 
+def test_compile_env_partition_covers_every_variable():
+    """The mega-cache bundle key hashes RBLN_COMPILE_ENV and ignores
+    RBLN_NON_COMPILE_ENV, so a variable in neither is a silent stale bundle
+    (graph-relevant) or a silent recompile every launch (not)."""
+    declared = set(envs.environment_variables)
+    classified = envs.RBLN_COMPILE_ENV | envs.RBLN_NON_COMPILE_ENV
+    assert classified == declared, (
+        f"unclassified: {sorted(declared - classified)}, "
+        f"stale: {sorted(classified - declared)}"
+    )
+
+
+def test_compile_env_partition_is_disjoint():
+    overlap = envs.RBLN_COMPILE_ENV & envs.RBLN_NON_COMPILE_ENV
+    assert not overlap, f"classified twice: {sorted(overlap)}"
+
+
 def test_unknown_variable_raises():
     with pytest.raises(AttributeError, match="VLLM_RBLN_NOT_A_REAL_VARIABLE"):
         getattr(envs, "VLLM_RBLN_NOT_A_REAL_VARIABLE")  # noqa: B009
+
+
+def test_dynamic_kv_cache_is_opt_in(monkeypatch):
+    # The flag is read during compile, so a non-False default would change the
+    # compiled artifact for every existing deployment.
+    monkeypatch.delenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", raising=False)
+    assert envs.environment_variables["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"]() is False

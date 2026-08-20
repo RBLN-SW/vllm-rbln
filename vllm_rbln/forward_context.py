@@ -61,7 +61,7 @@ class RBLNDPMetadata(DPMetadata):
     @staticmethod
     def num_tokens_and_reqs_across_dp(
         num_tokens: int, num_reqs: int, dp_size: int, dp_rank: int, is_prefill: bool
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
         """All-reduce per-rank (num_tokens, num_reqs, is_prefill) across DP via
         a single bit-packed int32 and split the result back out.
 
@@ -72,8 +72,8 @@ class RBLNDPMetadata(DPMetadata):
 
         Returns:
             num_tokens_across_dp_cpu: per-rank num_tokens (size dp_size).
-            num_reqs_across_dp_cpu: per-rank num_reqs (size dp_size), or None
-                if any rank is in prefill phase.
+            num_reqs_across_dp_cpu: per-rank num_reqs (size dp_size)
+            any_prefill: whether any rank is in prefill phase.
         """
         token_bits = 16
         req_bits = 14
@@ -107,15 +107,12 @@ class RBLNDPMetadata(DPMetadata):
         )
         num_tokens_across_dp_cpu = encoded_across_dp & token_mask_t
 
-        if any_prefill:
-            num_reqs_across_dp_cpu = None
-        else:
-            req_mask_t = torch.tensor(
-                [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
-            )
-            num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> token_bits
+        req_mask_t = torch.tensor(
+            [req_mask_shifted] * dp_size, device="cpu", dtype=torch.int32
+        )
+        num_reqs_across_dp_cpu = (encoded_across_dp & req_mask_t) >> token_bits
 
-        return num_tokens_across_dp_cpu, num_reqs_across_dp_cpu
+        return num_tokens_across_dp_cpu, num_reqs_across_dp_cpu, any_prefill
 
     @staticmethod
     def make(

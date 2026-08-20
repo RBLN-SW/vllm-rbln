@@ -233,33 +233,38 @@ class TestTokenIndices:
         assert staged.token_indices.device.type == current_platform.device_type
         assert torch.equal(staged.token_indices.cpu(), ti)
 
-    def test_reuses_buffer_for_same_key(self):
+    def test_reuses_buffer_and_pads_to_padded_batch(self):
         stager = _stager()
+        # Same padded batch, four live requests and then two.
         s1 = stager.stage(
-            **self._base_kwargs(),
-            token_indices=torch.tensor([1, 2, 3], dtype=torch.int64),
-        )
-        s2 = stager.stage(
-            **self._base_kwargs(),
-            token_indices=torch.tensor([4, 5, 6], dtype=torch.int64),
-        )
-        # Same (dtype, numel) -> same buffer object, refreshed to the new values.
-        assert s1.token_indices is s2.token_indices
-        assert torch.equal(
-            s2.token_indices.cpu(), torch.tensor([4, 5, 6], dtype=torch.int64)
-        )
-
-    def test_new_buffer_for_different_numel(self):
-        stager = _stager()
-        s1 = stager.stage(
-            **self._base_kwargs(),
-            token_indices=torch.tensor([1, 2, 3], dtype=torch.int64),
-        )
-        s2 = stager.stage(
-            **self._base_kwargs(),
+            input_ids=torch.ones(4, 3, dtype=torch.int64),
+            positions=torch.ones(4, 3, dtype=torch.int64),
+            layout=_layout(num_reqs=4),
             token_indices=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
         )
+        s2 = stager.stage(
+            **self._base_kwargs(),
+            token_indices=torch.tensor([5, 6], dtype=torch.int64),
+        )
+        # Same (dtype, num_reqs_padded) -> same buffer object, refreshed to the
+        # new values; the shrunk tail is pad, never the last call's indices.
+        assert s1.token_indices is s2.token_indices
+        assert torch.equal(
+            s2.token_indices.cpu(), torch.tensor([5, 6, 0, 0], dtype=torch.int64)
+        )
+
+    def test_new_buffer_for_different_padded_batch(self):
+        stager = _stager()
+        s1 = stager.stage(
+            **self._base_kwargs(),
+            token_indices=torch.tensor([1, 2, 3], dtype=torch.int64),
+        )
+        s2 = stager.stage(
+            **{**self._base_kwargs(), "layout": _layout(num_reqs_padded=8)},
+            token_indices=torch.tensor([1, 2, 3], dtype=torch.int64),
+        )
         assert s1.token_indices is not s2.token_indices
+        assert s2.token_indices.shape == (8,)
 
     def test_new_buffer_for_different_dtype(self):
         stager = _stager()
@@ -273,6 +278,39 @@ class TestTokenIndices:
         )
         # dtype is a distinct component of the token-indices buffer key.
         assert s1.token_indices is not s2.token_indices
+
+
+@pytest.mark.maybe_use_device
+class TestHiddenStates:
+    # The eagle3 drafter's third input, staged into the same padded layout.
+    @staticmethod
+    def _base_kwargs():
+        return {
+            "input_ids": torch.ones(2, 3, dtype=torch.int64),
+            "positions": torch.ones(2, 3, dtype=torch.int64),
+            "layout": _layout(),
+        }
+
+    def test_copies_into_top_left_and_reuses_buffer(self):
+        stager = _stager()
+        hidden = torch.full((2, 3, 4), 5.0)
+        s1 = stager.stage(**self._base_kwargs(), hidden_states=hidden)
+        expected = torch.zeros(4, 8, 4)
+        expected[:2, :3] = hidden
+        assert s1.hidden_states.shape == (4, 8, 4)
+        assert torch.equal(s1.hidden_states.cpu(), expected)
+
+        # Reused across steps: the pad region must not keep the stale values.
+        s2 = stager.stage(
+            input_ids=torch.ones(1, 2, dtype=torch.int64),
+            positions=torch.ones(1, 2, dtype=torch.int64),
+            layout=_layout(num_reqs=1, query_len=2),
+            hidden_states=torch.full((1, 2, 4), 9.0),
+        )
+        assert s2.hidden_states is s1.hidden_states
+        expected = torch.zeros(4, 8, 4)
+        expected[:1, :2] = 9.0
+        assert torch.equal(s2.hidden_states.cpu(), expected)
 
 
 @pytest.mark.maybe_use_device
