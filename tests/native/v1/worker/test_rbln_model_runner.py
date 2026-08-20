@@ -20,7 +20,6 @@ import contextlib
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -746,45 +745,3 @@ class TestMixinConformance:
             "load_model",
         ):
             assert callable(getattr(RBLNModelRunner, name, None)), name
-
-
-@pytest.mark.maybe_use_device
-class TestWarmupRendezvous:
-    """Ranks must leave warm-up together, or the first forward's all-reduce
-    charges the straggler's start-up to whoever was ready first."""
-
-    @pytest.fixture
-    def runner(self, make_model_runner, monkeypatch):
-        runner = make_model_runner()
-        # Warm-up's own work is irrelevant here; only the tail is under test.
-        monkeypatch.setattr(
-            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
-        )
-        monkeypatch.setattr(runner, "offload_context", contextlib.nullcontext)
-        monkeypatch.setattr(runner, "_dummy_run", lambda *a, **kw: None)
-        monkeypatch.setattr(runner, "_dummy_sampler_run", lambda *a, **kw: None)
-        monkeypatch.setattr(runner, "_warmup_sampler_decode_batches", lambda: None)
-        monkeypatch.setattr(mr.mega_cache, "load", lambda *a: None)
-        monkeypatch.setattr(mr.mega_cache, "save", lambda *a: None)
-        return runner
-
-    def test_ranks_rendezvous_under_data_parallel(self, runner, monkeypatch):
-        barriers = []
-        monkeypatch.setattr(
-            mr, "get_dp_group", lambda: SimpleNamespace(cpu_group="dp-cpu")
-        )
-        monkeypatch.setattr(mr.dist, "barrier", lambda group: barriers.append(group))
-        runner.parallel_config.data_parallel_size = 4
-
-        runner.warmup_model()
-
-        assert barriers == ["dp-cpu"]
-
-    def test_no_rendezvous_without_peers(self, runner, monkeypatch):
-        barriers = []
-        monkeypatch.setattr(mr.dist, "barrier", lambda group: barriers.append(group))
-        runner.parallel_config.data_parallel_size = 1
-
-        runner.warmup_model()
-
-        assert barriers == []

@@ -30,6 +30,7 @@ try:
 except ImportError:
     has_torch_rbln = False
 
+import torch.distributed as dist
 import torch.nn as nn
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import (
@@ -51,7 +52,7 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
 )
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
@@ -1083,6 +1084,16 @@ class RBLNWorker(WorkerBase):
                 # successful warm-up — not on the skipped or failed path.
                 if has_kv_transfer_group():
                     finalize_kv_cache_registrations(get_kv_transfer_group())
+
+                # NOTE(RBLN): the sampler warm-up and the deferred KV-cache
+                # registration above are per-rank, so ranks reach this point
+                # hundreds of ms apart. Nothing left before the first request is
+                # collective, so that skew would otherwise land in the first
+                # forward's DP all-reduce and be billed to the prefill it runs.
+                if self.parallel_config.data_parallel_size > 1:
+                    logger.info("Warm-up done; waiting for the other DP ranks.")
+                    dist.barrier(group=get_dp_group().cpu_group)
+                    logger.info("All DP ranks left warm-up.")
 
         except BackendCompilerFailed as e:
 
