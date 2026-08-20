@@ -69,27 +69,6 @@ class RBLNSchedulerOutput(SchedulerOutput):
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
 
 
-def _align_prefill_threshold(threshold: int, match_unit: int | None) -> int:
-    """Round the threshold down to a whole match unit.
-
-    Below one unit it is raised, not floored to zero, which would stall.
-    """
-    if threshold <= 0 or not match_unit:
-        return threshold
-    if threshold % match_unit == 0:
-        return threshold
-    aligned = max(match_unit, threshold - threshold % match_unit)
-    logger.warning(
-        "long_prefill_token_threshold=%d is not a multiple of the prefix match "
-        "unit %d; a prefill step would end mid-unit and that unit could never "
-        "be cached. Using %d instead.",
-        threshold,
-        match_unit,
-        aligned,
-    )
-    return aligned
-
-
 class RBLNScheduler(Scheduler):
     def __init__(
         self,
@@ -103,9 +82,6 @@ class RBLNScheduler(Scheduler):
         # when sub-block prefix caching is enabled.
         # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
         # so that each prefill does not span multiple blocks.
-        # Token boundary a prefix-cache hit can land on; None when fine-grained
-        # matching is off.
-        match_unit: int | None = None
 
         # A decode query is written as one contiguous KV window, so the
         # spec-decode boundary guards below need the *physical* block. Without
@@ -117,7 +93,6 @@ class RBLNScheduler(Scheduler):
         # directly once the page is --block-size.
         page_layout_installed = self._maybe_install_page_layout_manager()
         if page_layout_installed:
-            match_unit = self.block_size
             sub_block_size = None
         elif sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
             sub_block_size = self.scheduler_config.max_num_batched_tokens
@@ -147,7 +122,6 @@ class RBLNScheduler(Scheduler):
                 watermark=self.scheduler_config.watermark,
             )
 
-            match_unit = sub_block_size
             logger.info(
                 "Sub-block prefix caching enabled: block_size=%d, sub_block_size=%d",
                 self.block_size,
@@ -160,12 +134,6 @@ class RBLNScheduler(Scheduler):
                     "sub_block_size=%d.",
                     sub_block_size,
                 )
-
-        # Alignment holds inductively (chunk divides the unit, one prefill per
-        # step) except for this clamp, the one knob that cuts at any token.
-        self.long_prefill_token_threshold = _align_prefill_threshold(
-            self.scheduler_config.long_prefill_token_threshold, match_unit
-        )
 
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was
@@ -407,8 +375,8 @@ class RBLNScheduler(Scheduler):
             ):
                 req_index += 1
                 continue
-            if 0 < self.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.long_prefill_token_threshold
+            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -747,7 +715,7 @@ class RBLNScheduler(Scheduler):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.long_prefill_token_threshold
+                    threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
