@@ -28,7 +28,8 @@ from vllm_rbln.v1.core.utils import step_is_prefill
 
 BLOCK_SIZE = 16
 PROMPT_LEN = 2 * BLOCK_SIZE
-MAX_LEN = BLOCK_SIZE * 100
+# 99, not 100: one block of the pool is BlockPool's reserved null block.
+MAX_LEN = BLOCK_SIZE * 99
 
 
 def _scheduler(matched_tokens: int, *, is_async: bool = True, **kwargs):

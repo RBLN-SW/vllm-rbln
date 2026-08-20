@@ -88,7 +88,8 @@ class TestScheduleSubBlockCopyOps:
 class TestSubBlockVersusKVConnector:
     # Whoever covers more wins, sub-block on ties since a local copy beats an
     # RDMA fetch. None of that code runs without a connector, hence the mock.
-    MAX_LEN = BLOCK_SIZE * 100
+    # 99, not 100: one block of the pool is BlockPool's reserved null block.
+    MAX_LEN = BLOCK_SIZE * 99
 
     def _scheduler(self, matched_tokens: int):
         return create_rbln_scheduler(

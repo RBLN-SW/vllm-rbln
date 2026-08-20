@@ -240,8 +240,9 @@ class TestScheduleBasic:
         assert len(sched.waiting) == 2
 
     def test_chunked_prefill_across_steps(self):
-        # A prompt longer than max_num_batched_tokens is chunked across steps.
-        sched = create_rbln_scheduler(max_num_batched_tokens=256)
+        # A prompt longer than max_num_batched_tokens is chunked across steps;
+        # max_model_len only has to clear the prompt itself.
+        sched = create_rbln_scheduler(max_num_batched_tokens=256, max_model_len=1024)
         req = create_requests(1, num_tokens=500)[0]
         sched.add_request(req)
         out = sched.schedule()
@@ -329,14 +330,62 @@ class TestScheduleDecodeBatchLimit:
         assert not sched.requests
 
 
+class TestCapacityInvariant:
+    # One block of the pool is BlockPool's reserved null block, so a
+    # max_model_len above (num_blocks - 1) * block_size admits prompts that can
+    # never be allocated: they retry every step forever and block the queue
+    # behind them. The scheduler rejects such a config at construction.
+    BLOCK_SIZE = 8192
+    NUM_BLOCKS = 13
+    USABLE = (NUM_BLOCKS - 1) * BLOCK_SIZE
+
+    def _scheduler(self, max_model_len: int):
+        return create_rbln_scheduler(
+            block_size=self.BLOCK_SIZE,
+            num_blocks=self.NUM_BLOCKS,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=512,
+        )
+
+    def test_max_model_len_beyond_usable_pool_is_rejected(self):
+        # max_model_len sized to the whole pool, which is one block too many.
+        with pytest.raises(ValueError, match="usable KV cache capacity"):
+            self._scheduler(self.NUM_BLOCKS * self.BLOCK_SIZE)
+
+    def test_max_model_len_at_usable_capacity_is_accepted(self):
+        sched = self._scheduler(self.USABLE)
+        assert sched.max_model_len == self.USABLE
+
+    def test_prompt_at_usable_capacity_still_schedules(self):
+        # The guard must not be off by one the other way: the longest admissible
+        # prompt (max_model_len - 1, since admission rejects the rest) has to
+        # keep running, one max_num_batched_tokens chunk per step.
+        sched = self._scheduler(self.USABLE)
+        req = create_requests(
+            1, num_tokens=self.USABLE - 1, block_size=self.BLOCK_SIZE
+        )[0]
+        sched.add_request(req)
+        out = sched.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 512
+
+
 class TestSchedulePrefillAllocation:
     def test_prefill_not_scheduled_when_full_prompt_cannot_fit(self):
-        # KV is reserved for the whole prompt: 500 tokens need 32 blocks and only
-        # ~19 are usable, so nothing is scheduled even though one chunk would fit.
+        # KV is reserved for the whole prompt, so a prefill waits until all of
+        # it fits: with 8 of the 19 usable blocks held by a running decode, a
+        # 200-token prompt (13 blocks) is not scheduled even though its first
+        # 128-token chunk would fit.
         sched = create_rbln_scheduler(
-            max_num_batched_tokens=128, block_size=16, num_blocks=20
+            max_num_batched_tokens=128,
+            block_size=16,
+            num_blocks=20,
+            max_model_len=19 * 16,  # the usable pool
         )
-        req = create_requests(1, num_tokens=500, block_size=16)[0]
+        running = create_requests(
+            1, num_tokens=128, block_size=16, max_tokens=30, req_ids=["running"]
+        )[0]
+        advance_to_decode(sched, running)
+        req = create_requests(1, num_tokens=200, block_size=16, req_ids=["waiting"])[0]
         sched.add_request(req)
         out = sched.schedule()
         assert req.request_id not in out.num_scheduled_tokens
@@ -344,7 +393,7 @@ class TestSchedulePrefillAllocation:
         sched2 = create_rbln_scheduler(
             max_num_batched_tokens=128, block_size=16, num_blocks=10000
         )
-        req2 = create_requests(1, num_tokens=500, block_size=16)[0]
+        req2 = create_requests(1, num_tokens=200, block_size=16)[0]
         sched2.add_request(req2)
         out2 = sched2.schedule()
         assert out2.num_scheduled_tokens[req2.request_id] == 128
