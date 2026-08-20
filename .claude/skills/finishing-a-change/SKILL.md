@@ -1,6 +1,6 @@
 ---
 name: finishing-a-change
-description: Use before claiming a change is done, fixed, ready, or passing, and before writing a commit or PR — runs the checks, reviews the diff against the repository rules, and reports what was not done.
+description: Use before claiming a change is done, fixed, ready, or passing, and before you commit, open a PR, or run gh pr create — runs the checks, reviews the diff against the repository rules, fills in the PR template, and reports what was not done.
 ---
 
 # Finishing a change
@@ -39,6 +39,7 @@ Look for each of these:
 - **`else` branches for cases that cannot happen** — should be `assert` or `raise`
 - **Dead leftovers** — renamed `_var`, unused re-exports, `# removed` comments
 - **Anything not in English**
+- **Measured numbers** — throughput, latency, memory, or accuracy from an internal run. Take them out; this repository is public.
 
 Repository-specific checks:
 
@@ -64,4 +65,5 @@ An empty list is a claim. Only write it if it is true.
 - `type(scope): summary`, matching the existing history
 - Explain intent, not the diff
 - Say which model path or paths the change affects
-- English
+- English, and no measured numbers
+- Fill in `.github/PULL_REQUEST_TEMPLATE.md`. `gh pr create --body` does not apply it, so read the file and follow its sections rather than writing free-form prose.

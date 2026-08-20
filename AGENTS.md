@@ -82,6 +82,12 @@ Everything in the repository is written in English: code, comments, docstrings, 
 
 Conversation with the user is not a repository artifact. Reply in the language the user writes in.
 
+## What not to publish
+
+This repository is public. Keep measured numbers out of it: throughput, latency, memory footprint, and accuracy from internal runs do not belong in code, comments, tests, docs, commit messages, or PR descriptions. Benchmark scripts live here; their results do not. When a change needs a measurement to justify it, describe the direction and keep the figures to an internal channel.
+
+Upstream vLLM asks for eval results in the PR description. That convention does not apply here.
+
 ## Scope
 
 - Look for an existing utility or mechanism before writing a significant amount of new code.
