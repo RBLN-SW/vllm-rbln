@@ -143,7 +143,7 @@ class RBLNSampler(VLLMSampler):
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
     ):
-        super().__init__()
+        super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
         compile_context = (
             compile_context
