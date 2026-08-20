@@ -21,13 +21,14 @@ from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheConfig
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_dp_group, get_pp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
@@ -3124,6 +3125,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter.dummy_run()
 
         mega_cache.save(self.model_config.model, sig)
+
+        # NOTE(RBLN): the sampler warm-up above is not collective, so ranks leave
+        # warm-up hundreds of ms apart. Without this, the first forward's own
+        # all-reduce absorbs that skew and bills it to the first request's prefill.
+        if self.parallel_config.data_parallel_size > 1:
+            dist.barrier(group=get_dp_group().cpu_group)
 
     def _process_kv_cache_copy_ops(
         self,
