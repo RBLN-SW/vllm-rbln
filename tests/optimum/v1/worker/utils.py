@@ -104,13 +104,8 @@ class MockModelWrapper(nn.Module):
 def fake_load_model(
     runner: RBLNOptimumModelRunner,
     decoder_batch_sizes: tuple[int, ...] | None = None,
-    model_dtype: torch.dtype | None = None,
 ):
-    # FIXME(eunji.lee): model_config.dtype is forced to float32, so the
-    # compiled dtype must be passed in. Drop model_dtype once the PR
-    # removing that forcing lands.
-    if model_dtype is None:
-        model_dtype = runner.model_config.dtype
+    model_dtype = runner.model_config.dtype
 
     def fake_forward(model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         current_num_reqs = runner.input_batch.num_reqs
@@ -430,7 +425,7 @@ def create_model_runner(
             1,
         )
     runner = RBLNOptimumModelRunner(vllm_config, DEVICE)
-    fake_load_model(runner, decoder_batch_sizes, model_dtype=dtype)
+    fake_load_model(runner, decoder_batch_sizes)
     return runner
 
 

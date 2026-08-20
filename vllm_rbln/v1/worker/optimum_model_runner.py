@@ -306,6 +306,12 @@ class RBLNOptimumModelRunner(
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
+        # The converter keeps model_config.dtype in sync with the compiled
+        # artefact, so the runner reads self.dtype everywhere; catch drift here.
+        assert self.model.dtype == self.dtype, (
+            f"model_config.dtype ({self.dtype}) does not match the compiled "
+            f"artefact's dtype ({self.model.dtype})"
+        )
         self.use_optimum_lora = getattr(self.model.model.rbln_config, "use_lora", None)
         if self.lora_config and not self.use_optimum_lora:
             raise RuntimeError(
@@ -1223,7 +1229,7 @@ class RBLNOptimumModelRunner(
                     empty_logits = torch.empty(
                         batch_size,
                         input_batch.vocab_size,
-                        dtype=self.model.dtype,
+                        dtype=self.dtype,
                     )
                     _ = self.sampler(logits=empty_logits, sampling_metadata=metadata)
 
@@ -1498,7 +1504,7 @@ class RBLNOptimumModelRunner(
             for bucket_size in self.bucket_sizes:
                 self.pooled_tensors[bucket_size] = torch.zeros(
                     (bucket_size, self.model_config.get_vocab_size()),
-                    dtype=self.model.dtype,
+                    dtype=self.dtype,
                 )
         torch._dynamo.config.recompile_limit = len(self.bucket_sizes) * len(
             WARM_UP_CONFIGS
