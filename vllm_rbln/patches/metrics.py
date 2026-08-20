@@ -387,4 +387,21 @@ def _register_patches() -> None:
         )(replacement)
 
 
+def _install_executor_compat() -> None:
+    """Re-expose the context under the name vllm-rbln-executor still calls.
+
+    The executor flushes stats through ``model_runner.performance_ctx`` while the
+    engine is alive, because DP teardown races the shutdown-time dump. That
+    attribute went away when the metrics moved into this module, and an
+    AttributeError raised inside a worker is fatal to the executor -- the run then
+    reports no metrics at all, not even the shutdown dump. Kept out of the patch
+    registry deliberately: the registry replaces attributes that already exist,
+    and this one no longer does.
+    """
+    if not _metrics_enabled():
+        return
+    RBLNModelRunner.performance_ctx = property(_ctx)
+
+
 _register_patches()
+_install_executor_compat()

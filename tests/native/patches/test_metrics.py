@@ -531,6 +531,28 @@ class TestShutdown:
         assert order == ["shutdown"]
 
 
+class TestExecutorCompat:
+    @pytest.fixture(autouse=True)
+    def _uninstall(self):
+        # The shim writes to the real class, so it must not leak between tests.
+        yield
+        if "performance_ctx" in vars(pm.RBLNModelRunner):
+            del pm.RBLNModelRunner.performance_ctx
+
+    def test_performance_ctx_is_the_runner_context(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS", True)
+        pm._install_executor_compat()
+
+        runner = pm.RBLNModelRunner.__new__(pm.RBLNModelRunner)
+        assert runner.performance_ctx is pm._ctx(runner)
+
+    def test_shim_is_absent_when_metrics_are_off(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS", False)
+        pm._install_executor_compat()
+
+        assert "performance_ctx" not in vars(pm.RBLNModelRunner)
+
+
 class TestDescriptors:
     def test_every_target_resolves_to_an_existing_attribute(self):
         ours = [
