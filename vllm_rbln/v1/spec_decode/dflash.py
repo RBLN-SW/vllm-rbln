@@ -97,6 +97,52 @@ def _combine_hidden_states_bucket_size(run_len: int) -> int:
     return _DFLASH_COMBINE_PREFILL_BUCKET
 
 
+def _dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
+    """The target's RoPE rotation style, from its first rotary module.
+
+    A DFlash head must rotate Q/K the way the target it was distilled against
+    does, and a mismatch is silent: acceptance collapses but nothing errors.
+    Draft checkpoints do not carry the style, so read it from the target.
+    Returns None when the target uses no RoPE.
+
+    Ported from newer upstream vLLM (`dflash_target_rope_is_neox_style` in
+    qwen3_dflash.py); the release pinned here predates it.
+    """
+    language_model = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    for module in language_model.modules():
+        style = getattr(module, "is_neox_style", None)
+        if isinstance(style, bool):
+            return style
+    return None
+
+
+def _check_draft_rope_style(draft_model: nn.Module, expected_is_neox: bool) -> None:
+    """Fail loudly when the built drafter cannot honor the target's RoPE style.
+
+    The vLLM release pinned here builds `DFlashQwen3Attention` rotary modules
+    without reading `hf_config.is_neox_style`, so plumbing the target's style
+    into the draft config (the upstream fix) is inert on it. Proceeding with a
+    mismatched drafter would silently collapse acceptance; refuse instead.
+    """
+    for module in draft_model.modules():
+        style = getattr(module, "is_neox_style", None)
+        if isinstance(style, bool):
+            if style != expected_is_neox:
+                raise ValueError(
+                    "DFlash drafter RoPE style does not match its target: the "
+                    f"target rotates {'neox' if expected_is_neox else 'gptj'}-"
+                    f"style but the drafter was built {'neox' if style else 'gptj'}-"
+                    "style. This vLLM release ignores hf_config.is_neox_style "
+                    "for DFlash drafters; upgrade vLLM or use a neox-style "
+                    "target."
+                )
+            return
+
+
 def _get_dflash_forward_split(layer_types: list[str]) -> int | None:
     """Return the one SWA-to-full boundary that needs a graph split.
 
@@ -637,7 +683,24 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         base weight-loading and attention-group setup directly, and we compile
         our own wrapper on top with the same options.
         """
+        # The drafter must rotate K the way the target it was distilled
+        # against does; a mismatch silently collapses acceptance. Newer vLLM
+        # reads this from hf_config when building DFlashQwen3Attention, so
+        # record it before the draft model is constructed. The release pinned
+        # here ignores it -- _check_draft_rope_style below turns that into an
+        # explicit error instead of a silent quality collapse.
+        target_rope_is_neox = _dflash_target_rope_is_neox_style(target_model)
+        if target_rope_is_neox is not None:
+            # TODO(vllm-bump): inert on the pinned release (get_rope never
+            # reads it for DFlash); becomes live when vLLM gains
+            # dflash_target_rope_is_neox_style, and the check below can then
+            # be retired.
+            self.draft_model_config.hf_config.is_neox_style = target_rope_is_neox
+
         super(RBLNEagleProposer, self).load_model(target_model)
+
+        if target_rope_is_neox is not None:
+            _check_draft_rope_style(self.model, target_rope_is_neox)
         self._probe_dp_rendezvous_need()
         self._hidden_state_combiner = _BoundedHiddenStateCombiner(
             self.model.combine_hidden_states,

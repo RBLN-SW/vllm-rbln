@@ -56,7 +56,10 @@ from dataclasses import dataclass
 
 import torch
 from vllm.config import SpeculativeConfig
-from vllm.model_executor.layers.rotary_embedding.common import rotate_neox
+from vllm.model_executor.layers.rotary_embedding.common import (
+    rotate_gptj,
+    rotate_neox,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 
 import vllm_rbln.envs as envs
@@ -566,12 +569,21 @@ def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
     return (x.to(orig_dtype) * weight).to(orig_dtype)
 
 
-def _apply_rope(k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Rotate-half RoPE on K only.
+def _apply_rope(
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    is_neox: bool,
+) -> torch.Tensor:
+    """RoPE on K only, in the model's resolved rotation style.
 
-    vllm-rbln already replaces the upstream cos_sin_cache with rotate-half style
-    `cos_cache`/`sin_cache` (patches/rotary_embedding.py) because that layout
-    suits RBLN, so we consume those directly instead of re-deriving them.
+    vllm-rbln already replaces the upstream cos_sin_cache with style-matched
+    `cos_cache`/`sin_cache` (patches/rotary_embedding.py: repeated halves for
+    neox, interleaved for gptj), so we consume those directly and only the
+    rotate function switches here -- the same split the patched forward path
+    makes. A hardcoded rotation would silently collapse acceptance for
+    interleaved-RoPE targets.
     """
     # K is [num_ctx, num_kv_heads, head_dim], while cos/sin are normally
     # [num_ctx, head_dim]. Keep a singleton head axis so rotation remains
@@ -580,7 +592,8 @@ def _apply_rope(k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     if k.dim() == cos.dim() + 1:
         cos = cos.unsqueeze(-2)
         sin = sin.unsqueeze(-2)
-    return k * cos + rotate_neox(k) * sin
+    rotate_fn = rotate_neox if is_neox else rotate_gptj
+    return k * cos + rotate_fn(k) * sin
 
 
 class _ContextKVPrecompute:
@@ -693,6 +706,24 @@ class _ContextKVPrecompute:
         self._layer_constants[layer_idx] = constants
         return constants
 
+    def _resolve_rope_style(self) -> bool:
+        """The model's resolved rotation style, validated at buffer build.
+
+        Upstream `_build_fused_kv_buffers` records `_rope_is_neox` from the
+        first attention layer and asserts every layer agrees, so it is the one
+        authoritative style for the fused context-KV path. Refusing to default
+        keeps a style-less model from silently reintroducing the hardcoded
+        rotation this resolution replaced.
+        """
+        style = getattr(self._model, "_rope_is_neox", None)
+        if not isinstance(style, bool):
+            raise RuntimeError(
+                "DFlash context-KV cannot resolve the model's RoPE rotation "
+                "style: _rope_is_neox is missing. _build_fused_kv_buffers must "
+                "run before projection graphs are built."
+            )
+        return style
+
     def _graph_fn(self, layer_idx: int, run_len: int):
         m = self._model
         nkv, head_dim = m._num_kv_heads, m._head_dim
@@ -701,6 +732,9 @@ class _ContextKVPrecompute:
         )
         hidden_norm = m._hidden_norm_weight
         key_norm = m._k_norm_weights[layer_idx]
+        # Model-constant, so it folds into the traced graph; the graph cache
+        # key needs no style axis.
+        rope_is_neox = self._resolve_rope_style()
 
         def fn(context_states, cos, sin):
             normed = _rms_norm(context_states, hidden_norm, m._rms_norm_eps)
@@ -711,7 +745,7 @@ class _ContextKVPrecompute:
                 run_len, nkv, head_dim
             )
             key = _rms_norm(key, key_norm, m._rms_norm_eps)
-            key = _apply_rope(key, cos, sin)
+            key = _apply_rope(key, cos, sin, is_neox=rope_is_neox)
             return (
                 key.permute(1, 0, 2).contiguous(),
                 value.permute(1, 0, 2).contiguous(),

@@ -4,6 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
+from vllm.model_executor.layers.rotary_embedding.common import (
+    rotate_gptj,
+    rotate_neox,
+)
 
 import vllm_rbln.patches.qwen3_dflash as qwen3_dflash_patch
 import vllm_rbln.v1.spec_decode.dflash as dflash_mod
@@ -24,7 +29,9 @@ from vllm_rbln.v1.attention.ops.triton_flash_attention_naive import (
 from vllm_rbln.v1.spec_decode.dflash import (
     RBLNDFlashProposer,
     _BoundedHiddenStateCombiner,
+    _check_draft_rope_style,
     _dflash_page_crossing_mask,
+    _dflash_target_rope_is_neox_style,
     _DFlashSplitForwardGraph,
     _empty_drafts_for_page_crossing,
     _get_dflash_forward_split,
@@ -87,15 +94,38 @@ def test_hidden_state_combiner_rejects_unverified_lengths(run_len: int) -> None:
         helper(torch.empty(run_len, 4))
 
 
-def test_apply_rope_broadcasts_over_kv_heads() -> None:
+@pytest.mark.parametrize("is_neox", [True, False])
+def test_apply_rope_broadcasts_over_kv_heads(is_neox: bool) -> None:
     key = torch.randn(3, 8, 128)
     cos = torch.randn(3, 128)
     sin = torch.randn(3, 128)
 
-    actual = _apply_rope(key, cos, sin)
-    expected = _apply_rope(key, cos.unsqueeze(1), sin.unsqueeze(1))
+    actual = _apply_rope(key, cos, sin, is_neox=is_neox)
+    expected = _apply_rope(
+        key, cos.unsqueeze(1), sin.unsqueeze(1), is_neox=is_neox
+    )
 
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("is_neox", "rotate_fn"),
+    [(True, rotate_neox), (False, rotate_gptj)],
+)
+def test_apply_rope_selects_rotation_by_style(is_neox: bool, rotate_fn) -> None:
+    torch.manual_seed(3)
+    key = torch.randn(2, 1, 8)
+    cos = torch.randn(2, 8)
+    sin = torch.randn(2, 8)
+
+    actual = _apply_rope(key, cos, sin, is_neox=is_neox)
+    expected = key * cos.unsqueeze(1) + rotate_fn(key) * sin.unsqueeze(1)
+    other = key * cos.unsqueeze(1) + (
+        rotate_gptj(key) if is_neox else rotate_neox(key)
+    ) * sin.unsqueeze(1)
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, other)
 
 
 def test_projection_runtime_buffers_use_two_stable_buckets() -> None:
@@ -168,6 +198,7 @@ def test_context_kv_compiles_projection_only_runtime_per_layer_without_disk_cach
         _fused_kv_bias=None,
         _k_norm_weights=[torch.empty(4), torch.empty(4)],
         _rms_norm_eps=1e-6,
+        _rope_is_neox=True,
     )
     helper = _ContextKVPrecompute(model)
     compile_calls: list[dict] = []
@@ -212,6 +243,7 @@ def test_context_kv_gives_bounded_profiles_unique_dynamo_frames(
         _fused_kv_bias=None,
         _k_norm_weights=[torch.empty(4) for _ in range(num_layers)],
         _rms_norm_eps=1e-6,
+        _rope_is_neox=True,
     )
     helper = _ContextKVPrecompute(model)
     code_objects: list[object] = []
@@ -547,7 +579,13 @@ def test_noncausal_flash_kernel_derives_each_partition_offset(kernel) -> None:
     assert "to_dynamic_index(SP_block_ptr, P)" in source
 
 
-def test_context_kv_projection_graph_does_not_take_cache_input() -> None:
+@pytest.mark.parametrize(
+    ("is_neox", "rotate_fn"),
+    [(True, rotate_neox), (False, rotate_gptj)],
+)
+def test_context_kv_projection_graph_does_not_take_cache_input(
+    is_neox: bool, rotate_fn
+) -> None:
     torch.manual_seed(11)
     model = SimpleNamespace(
         _num_attn_layers=1,
@@ -558,6 +596,7 @@ def test_context_kv_projection_graph_does_not_take_cache_input() -> None:
         _fused_kv_bias=torch.randn(2 * 2 * 4),
         _k_norm_weights=[torch.randn(4)],
         _rms_norm_eps=1e-6,
+        _rope_is_neox=is_neox,
     )
     helper = _ContextKVPrecompute(model)
     states = torch.randn(3, 8)
@@ -569,10 +608,11 @@ def test_context_kv_projection_graph_does_not_take_cache_input() -> None:
     fused = torch.nn.functional.linear(
         normed, model._fused_kv_weight, model._fused_kv_bias
     ).view(3, 2, 2, 4)
-    expected_key = _apply_rope(
-        _rms_norm(fused[:, 0], model._k_norm_weights[0], model._rms_norm_eps),
-        cos,
-        sin,
+    # The rotation reference is built directly from vLLM's rotate functions so
+    # the golden stays independent of _apply_rope's own style dispatch.
+    normed_key = _rms_norm(fused[:, 0], model._k_norm_weights[0], model._rms_norm_eps)
+    expected_key = (
+        normed_key * cos.unsqueeze(1) + rotate_fn(normed_key) * sin.unsqueeze(1)
     ).permute(1, 0, 2)
     expected_value = fused[:, 1].permute(1, 0, 2)
 
@@ -580,6 +620,23 @@ def test_context_kv_projection_graph_does_not_take_cache_input() -> None:
     assert value.shape == (2, 3, 4)
     torch.testing.assert_close(key, expected_key)
     torch.testing.assert_close(value, expected_value)
+
+
+def test_graph_fn_requires_resolved_rope_style() -> None:
+    model = SimpleNamespace(
+        _num_attn_layers=1,
+        _num_kv_heads=2,
+        _head_dim=4,
+        _hidden_norm_weight=torch.empty(8),
+        _fused_kv_weight=torch.empty(2 * 2 * 4, 8),
+        _fused_kv_bias=None,
+        _k_norm_weights=[torch.empty(4)],
+        _rms_norm_eps=1e-6,
+    )
+    helper = _ContextKVPrecompute(model)
+
+    with pytest.raises(RuntimeError, match="RoPE rotation style"):
+        helper._graph_fn(layer_idx=0, run_len=3)
 
 
 def test_context_kv_store_uses_one_batched_copy_and_preserves_sentinels(
@@ -1348,3 +1405,46 @@ def test_propose_truncates_padded_draft_output_to_real_batch(
     assert fake_helper.calls == ["compile_context", "group_slots"]
     assert isinstance(result, torch.Tensor)
     assert result.shape == (num_reqs, num_spec)
+
+
+# ----------------------------------------------------------------------
+# Configuration geometry and RoPE style plumbing
+# ----------------------------------------------------------------------
+
+
+class _RotaryModule(nn.Module):
+    def __init__(self, style: bool) -> None:
+        super().__init__()
+        self.is_neox_style = style
+
+
+class _ModelWithRotary(nn.Module):
+    def __init__(self, style: bool) -> None:
+        super().__init__()
+        self.rotary = _RotaryModule(style)
+
+
+class _WrappedTarget(nn.Module):
+    def __init__(self, style: bool) -> None:
+        super().__init__()
+        self._language_model = _ModelWithRotary(style)
+
+    def get_language_model(self) -> nn.Module:
+        return self._language_model
+
+
+def test_target_rope_style_reads_first_rotary_module() -> None:
+    assert _dflash_target_rope_is_neox_style(_ModelWithRotary(True)) is True
+    assert _dflash_target_rope_is_neox_style(_ModelWithRotary(False)) is False
+    assert _dflash_target_rope_is_neox_style(_WrappedTarget(False)) is False
+    assert _dflash_target_rope_is_neox_style(nn.Linear(2, 2)) is None
+
+
+def test_check_draft_rope_style_raises_only_on_mismatch() -> None:
+    _check_draft_rope_style(_ModelWithRotary(True), True)
+    _check_draft_rope_style(_ModelWithRotary(False), False)
+    # A rope-free drafter has nothing to contradict.
+    _check_draft_rope_style(nn.Linear(2, 2), True)
+
+    with pytest.raises(ValueError, match="RoPE style"):
+        _check_draft_rope_style(_ModelWithRotary(True), False)
