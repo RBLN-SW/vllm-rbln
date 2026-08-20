@@ -35,52 +35,6 @@ logger = init_logger(__name__)
 USER_MAX_NUM_BATCHED_TOKENS_KEY = "user_max_num_batched_tokens"
 
 
-def _apply_prefix_caching_block_size(
-    vllm_config: VllmConfig, kvcache_block_size: int, prefill_chunk_size: int
-) -> None:
-    assert prefill_chunk_size is not None, (
-        "prefill_chunk_size must be specified in rbln_config.json"
-    )
-    # If user set prefix_block_size in additional_config, use it.
-    # Otherwise, set it to prefill_chunk_size.
-    prefix_block_size = vllm_config.additional_config.get("prefix_block_size", None)
-    if prefix_block_size is None:
-        prefix_block_size = prefill_chunk_size
-        logger.debug(
-            "Prefix block size is set to %s based on prefill_chunk_size",
-            prefix_block_size,
-        )
-    else:
-        if prefix_block_size % prefill_chunk_size != 0:
-            raise ValueError(
-                "prefix_block_size ({}) is not divisible "
-                "by prefill_chunk_size ({}). "
-                "Please check the value of prefill_chunk_size "
-                "in rbln_config.json".format(prefix_block_size, prefill_chunk_size)
-            )
-        if prefix_block_size > kvcache_block_size:
-            raise ValueError(
-                "prefix_block_size ({}) is greater than "
-                "kvcache_block_size ({}). "
-                "Please check the value of kvcache_block_size "
-                "in rbln_config.json".format(prefix_block_size, kvcache_block_size)
-            )
-        logger.debug(
-            "Prefix block size is set to %s based on additional_config",
-            prefix_block_size,
-        )
-    if kvcache_block_size % prefix_block_size != 0:
-        raise ValueError(
-            "kvcache_block_size ({}) is not divisible "
-            "by prefix_block_size ({}). "
-            "Please check the value of prefix_block_size in rbln_config.json".format(
-                kvcache_block_size, prefix_block_size
-            )
-        )
-    vllm_config.cache_config.block_size = prefix_block_size
-    vllm_config.additional_config["attn_block_size"] = kvcache_block_size
-
-
 def update_block_size(
     vllm_config: VllmConfig,
     kvcache_block_size: int,
@@ -88,25 +42,39 @@ def update_block_size(
     image_prefill_chunk_size: list[int] | None = None,
 ) -> None:
     """
-    Update the block size in the vllm_config based on the provided kvcache_block_size
-    and prefill_chunk_size. For models with prefix caching enabled, the block size
-    is set to the prefix block size, which is determined based on the prefill_chunk_size
-    and user-provided prefix_block_size.
+    Update the block size in the vllm_config based on the provided
+    kvcache_block_size. The vLLM block is the device block: prefix caching
+    shares device blocks between requests through the upstream KVCacheManager,
+    so there is no separate prefix block size.
     """
     vllm_config.cache_config.user_specified_block_size = True
     if vllm_config.cache_config.enable_prefix_caching:
-        _apply_prefix_caching_block_size(
-            vllm_config, kvcache_block_size, prefill_chunk_size
-        )
-    else:
-        if vllm_config.cache_config.block_size != kvcache_block_size:
-            logger.info(
-                "Updating model_cache_config.block_size from %s to %s "
-                "based on rbln_config.json",
-                vllm_config.cache_config.block_size,
-                kvcache_block_size,
+        if "prefix_block_size" in vllm_config.additional_config:
+            raise ValueError(
+                "prefix_block_size is no longer supported: prefix caching "
+                "shares device blocks at kvcache_block_size granularity."
             )
-            vllm_config.cache_config.block_size = kvcache_block_size
+        assert prefill_chunk_size is not None, (
+            "prefill_chunk_size must be specified in rbln_config.json"
+        )
+        # A prefix-cache hit makes the prefill resume at a block-aligned
+        # offset, and the compiled prefill only resumes at chunk boundaries.
+        if kvcache_block_size % prefill_chunk_size != 0:
+            raise ValueError(
+                "kvcache_block_size ({}) is not divisible by "
+                "prefill_chunk_size ({}), so a prefix-cache hit cannot "
+                "resume at a chunk-aligned offset.".format(
+                    kvcache_block_size, prefill_chunk_size
+                )
+            )
+    if vllm_config.cache_config.block_size != kvcache_block_size:
+        logger.info(
+            "Updating model_cache_config.block_size from %s to %s "
+            "based on rbln_config.json",
+            vllm_config.cache_config.block_size,
+            kvcache_block_size,
+        )
+        vllm_config.cache_config.block_size = kvcache_block_size
 
 
 def is_chunked_prefill_arch(hf_config) -> bool:

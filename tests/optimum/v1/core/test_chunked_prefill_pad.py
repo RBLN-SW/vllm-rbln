@@ -30,12 +30,12 @@ from vllm_rbln.v1.core.optimum_kv_cache_manager import RBLNKVCacheManager
 
 def _make_manager(
     prefill_chunk_size: int,
-    attn_block_size: int,
+    block_size: int,
     image_prefill_chunk_size: list[int] | None = None,
 ) -> RBLNKVCacheManager:
     mgr = object.__new__(RBLNKVCacheManager)
     mgr.prefill_chunk_size = prefill_chunk_size
-    mgr.attn_block_size = attn_block_size
+    mgr.block_size = block_size
     mgr.image_prefill_chunk_size = image_prefill_chunk_size
     return mgr
 
@@ -135,17 +135,17 @@ class TestImageEmbedSegments:
 class TestChunkedPrefillPadTextOnly:
     def test_block_multiple_of_chunk_no_padding(self):
         # 4096 = 16 * 256, so chunks never straddle a block boundary.
-        mgr = _make_manager(prefill_chunk_size=256, attn_block_size=4096)
+        mgr = _make_manager(prefill_chunk_size=256, block_size=4096)
         assert mgr._chunked_prefill_pad(_request(), query_len=1000) == 0
 
     def test_block_multiple_of_chunk_unaligned_prompt_no_padding(self):
-        mgr = _make_manager(prefill_chunk_size=256, attn_block_size=4096)
+        mgr = _make_manager(prefill_chunk_size=256, block_size=4096)
         assert mgr._chunked_prefill_pad(_request(), query_len=4732) == 0
 
     def test_block_not_multiple_of_chunk_straddles(self):
         # block=10, chunk=4: chunks straddle the boundary repeatedly.
         # steps 0,4,8(->pad 2),12,16(->pad 2): total pad = 4.
-        mgr = _make_manager(prefill_chunk_size=4, attn_block_size=10)
+        mgr = _make_manager(prefill_chunk_size=4, block_size=10)
         assert mgr._chunked_prefill_pad(_request(), query_len=20) == 4
 
 
@@ -154,7 +154,7 @@ class TestChunkedPrefillPadWithImages:
         # Single image, all runs land within 4096 (multiple of 256).
         mgr = _make_manager(
             prefill_chunk_size=256,
-            attn_block_size=4096,
+            block_size=4096,
             image_prefill_chunk_size=[256],
         )
         req = _request(_image(100, 256, lead=2, trail=2))
@@ -172,7 +172,7 @@ class TestChunkedPrefillPadWithImages:
         #  17    image  4       3    3+4<=16              -
         mgr = _make_manager(
             prefill_chunk_size=4,
-            attn_block_size=16,
+            block_size=16,
             image_prefill_chunk_size=[4],
         )
         req = _request(
@@ -189,7 +189,7 @@ class TestChunkedPrefillPadWithImages:
         #  2     image  8     2    2+8>8  -> +6    6
         mgr = _make_manager(
             prefill_chunk_size=2,
-            attn_block_size=8,
+            block_size=8,
             image_prefill_chunk_size=[8],
         )
         req = _request(_image(2, 6))
@@ -206,7 +206,7 @@ class TestChunkedPrefillPadWithImages:
         #  7     image  8     7    7+8>12 -> +5     5
         mgr = _make_manager(
             prefill_chunk_size=4,
-            attn_block_size=12,
+            block_size=12,
             image_prefill_chunk_size=[8, 4],  # descending, as optimum stores it
         )
         req = _request(_image(2, 3), _image(7, 6))

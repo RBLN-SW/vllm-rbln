@@ -12,39 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.distributed.kv_events import KVCacheEvent
+from collections.abc import Callable
+
 from vllm.logger import init_logger
-from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import (
-    BlockHashWithGroupId,
-    FreeKVCacheBlockQueue,
-    KVCacheBlock,
-)
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 logger = init_logger(__name__)
-
-
-class RBLNBlockHashToBlockMap(BlockHashToBlockMap):
-    def get_one_block(self, key: BlockHashWithGroupId) -> KVCacheBlock | None:
-        """
-        Gets any block with the given block hash key.
-        """
-        blocks = self._cache.get(key)
-        if blocks is not None:
-            if isinstance(blocks, KVCacheBlock):
-                # Only one block is allocated.
-                # This block is allocated by the current request itself.
-                return None
-            if isinstance(blocks, dict):
-                # Multiple blocks are allocated.
-                # Return the second-to-last block.
-                block_values = blocks.values()
-                iterator = reversed(block_values)
-                _ = next(iterator)
-                return next(iterator)
-            self._unexpected_blocks_type(blocks)
-        return None
 
 
 class RBLNBlockPool(BlockPool):
@@ -57,45 +32,39 @@ class RBLNBlockPool(BlockPool):
         metrics_collector: KVCacheMetricsCollector | None = None,
         is_encoder_decoder: bool = False,
     ):
-        assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
-        self.num_gpu_blocks = num_gpu_blocks
-        self.enable_caching = enable_caching
-        self.hash_block_size = hash_block_size
-        # All kv-cache blocks.
-        self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
-        ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
-
-        # Cache for block lookup
-        self.cached_block_hash_to_block: RBLNBlockHashToBlockMap = (
-            RBLNBlockHashToBlockMap()
+        super().__init__(
+            num_gpu_blocks,
+            enable_caching,
+            hash_block_size,
+            enable_kv_cache_events,
+            metrics_collector,
         )
-        self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
 
-        # To represent a placeholder block with block_id=0.
-        # The ref_cnt of null_block is not maintained, needs special care to
-        # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
-        self.null_block.is_null = True
+        # Called with the block id whenever a cached block is actually
+        # evicted. The KV cache manager registers its sub-block index cleanup
+        # here, since eviction is the only point where a hash-carrying block
+        # leaves the cache.
+        self.evicted_block_hook: Callable[[int], None] | None = None
 
-        # Encoder-decoder models (e.g. Whisper) need a scratch block that the
-        # decoder runtime can write into for padded slots. Reserve the last
-        # block by removing it from the free queue so it is never handed out
-        # to a real request.
+        # The decoder runtime writes into every block-table slot of a padded
+        # decode batch, so padded slots need a scratch block that never holds
+        # a real request's KV. Encoder-decoder models (e.g. Whisper) also pad
+        # the decoder's block table during prefill. With prefix caching, a
+        # free block may hold cached KV that such a write would clobber, so a
+        # dedicated block is reserved instead of borrowing a free one.
+        # Reserve the last block by removing it from the free queue so it is
+        # never handed out to a real request.
         self.dummy_block: KVCacheBlock | None = None
-        if is_encoder_decoder:
+        if is_encoder_decoder or enable_caching:
             assert num_gpu_blocks >= 2, (
-                "Encoder-decoder models require at least 2 blocks "
+                "Reserving a dummy block requires at least 2 blocks "
                 "(1 null block + 1 dummy block)."
             )
             self.dummy_block = self.blocks[num_gpu_blocks - 1]
             self.free_block_queue.remove(self.dummy_block)
 
-        self.enable_kv_cache_events = enable_kv_cache_events
-        self.kv_event_queue: list[KVCacheEvent] = []
-
-        self.metrics_collector = metrics_collector
+    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+        evicted = super()._maybe_evict_cached_block(block)
+        if evicted and self.evicted_block_hook is not None:
+            self.evicted_block_hook(block.block_id)
+        return evicted

@@ -85,9 +85,7 @@ def _rig_forward(runner, token_logits: dict[int, float], base: float = 0.0):
 
 
 def _prefill(runner, req, index):
-    scheduler_output = _schedule_new_request_from_request(
-        req, block_ids=([index],), outer_block_ids=[index]
-    )
+    scheduler_output = _schedule_new_request_from_request(req, block_ids=([index + 1],))
     runner.execute_model(scheduler_output)
     output = runner.sample_tokens(grammar_output=None)
     req.num_computed_tokens = len(req.prompt_token_ids)

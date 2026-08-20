@@ -55,8 +55,8 @@ def create_scheduler(
     block_size: int = 16,
     max_model_len: int | None = None,
     async_scheduling: bool = False,
-    outer_block_size: int = 16,
     enable_prefix_caching: bool = False,
+    prefill_chunk_size: int | None = None,
 ) -> RBLNOptimumScheduler:
     """Create RBLNOptimumscheduler under test.
 
@@ -70,6 +70,8 @@ def create_scheduler(
     """
     if max_model_len is None:
         max_model_len = max_num_batched_tokens
+    if prefill_chunk_size is None:
+        prefill_chunk_size = block_size
 
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
@@ -87,7 +89,7 @@ def create_scheduler(
     )
 
     cache_config = CacheConfig(
-        block_size=outer_block_size,
+        block_size=block_size,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
     )
@@ -100,9 +102,8 @@ def create_scheduler(
         cache_config=cache_config,
         structured_outputs_config=structured_outputs_config,
         additional_config={
-            "prefix_block_size": block_size,
             "rbln_config": {
-                "prefill_chunk_size": block_size,
+                "prefill_chunk_size": prefill_chunk_size,
             },
         },
     )

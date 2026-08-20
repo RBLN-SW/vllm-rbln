@@ -79,7 +79,6 @@ from vllm_rbln.model_executor.models.optimum import (
     PartialPrefixInfo,
 )
 from vllm_rbln.model_executor.models.optimum.model_base import (
-    RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
@@ -89,6 +88,7 @@ from vllm_rbln.utils.optimum.registry import (
     validate_arch_supported,
 )
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.core.sub_block import KVCacheCopyOp
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
@@ -251,7 +251,6 @@ class RBLNOptimumModelRunner(
 
         # FIXME enable async scheduling for optimum model runner
         self.use_async_scheduling = self.scheduler_config.async_scheduling
-        self.enable_prefix_caching = cache_config.enable_prefix_caching
         self.seq_lens = np.zeros(self.max_num_reqs, dtype=np.int32)
 
         # self.uniform_decode_query_len = 1
@@ -370,6 +369,11 @@ class RBLNOptimumModelRunner(
                 scheduler_output
             )
 
+        # Sub-block prefix caching: copy the matched KV into this request's
+        # block before the prefill reads it.
+        if scheduler_output.kv_cache_copy_ops:
+            self._process_kv_cache_copy_ops(scheduler_output.kv_cache_copy_ops)
+
         has_new_prefill = len(scheduler_output.scheduled_new_reqs) > 0
         with self.maybe_get_ec_connector_output(
             scheduler_output,
@@ -397,7 +401,6 @@ class RBLNOptimumModelRunner(
                 else:
                     with capture_ctx as model_reports:
                         model_input = self._build_forward_inputs(model_input)
-                        self.reuse_prefix_cached_kv(model_input, scheduler_output)
                         hidden_states = self.model(model_input)
                 if (
                     envs.VLLM_RBLN_METRICS
@@ -433,20 +436,16 @@ class RBLNOptimumModelRunner(
         )
         return None
 
-    def reuse_prefix_cached_kv(
-        self,
-        model_input: ModelInputForRBLN,
-        scheduler_output: "SchedulerOutput",
-    ) -> None:
-        if not (
-            model_input.is_prompt and isinstance(self.model, RBLNOptimumDecoderMixin)
-        ):
-            return
-        self.model.copy_cached_kv_blocks(
-            scheduler_output.cached_block_table,
-            scheduler_output.cached_length,
-            model_input.block_tables,
-        )
+    def _process_kv_cache_copy_ops(self, copy_ops: list[KVCacheCopyOp]) -> None:
+        runtime = self.model.get_prefill_decoder().runtime
+        for op in copy_ops:
+            # The optimum path has a single KV cache group.
+            assert op.group_id == 0
+            # Scheduler block ids are vLLM-space (0 is the null block); the
+            # runtime expects compiler-space ids.
+            runtime._copy_kv_cache(
+                op.src_block_id - 1, op.dst_block_id - 1, op.num_tokens
+            )
 
     def _build_forward_inputs(
         self, model_input: ModelInputForRBLN
@@ -623,8 +622,6 @@ class RBLNOptimumModelRunner(
             0
         ].num_blocks_per_row
         block_tables_cpu = self.input_batch.block_table.block_tables[0].get_cpu_tensor()
-        cached_length = []
-        total_cached_length = 0
 
         if len(scheduler_output.scheduled_new_reqs) == 1:
             # New request started
@@ -632,7 +629,6 @@ class RBLNOptimumModelRunner(
             req_id = scheduled.req_id
             req_index = self.input_batch.req_id_to_index[req_id]
             prompt_tokens = np.array(scheduled.prompt_token_ids)
-            block_ids = scheduled.block_ids[0]
         elif scheduler_output.scheduled_cached_reqs.num_reqs == 1:
             # Preempted request resumed
             req_id = scheduler_output.scheduled_cached_reqs.req_ids[0]
@@ -640,7 +636,6 @@ class RBLNOptimumModelRunner(
             logger.warning("Request %s is resumed.", req_id)
             num_token = int(self.input_batch.num_tokens_no_spec[req_index])
             prompt_tokens = self.input_batch.token_ids_cpu[req_index][:num_token]
-            block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[0]
         else:
             raise RuntimeError(
                 "Prefill stage request cannot processed with other requests."
@@ -652,34 +647,24 @@ class RBLNOptimumModelRunner(
         # Full prompt tokens before any prefix-cache trim; needed by MRoPE
         # models to recompute positions over the whole prompt on a partial hit.
         full_prompt_tokens = prompt_tokens
-        if self.enable_prefix_caching:
-            logger.debug(
-                "Request %s is now scheduled. Prompt tokens: %s, "
-                "Already generated tokens: %s, Allocated block(s): %s",
-                req_id,
-                len(self.requests[req_id].prompt_token_ids),
-                len(self.requests[req_id].output_token_ids),
-                block_ids,
-            )
-            block_table = scheduler_output.block_table_dict[req_id]
-            cached_length = scheduler_output.cached_length
-            total_cached_length = sum(cached_length)
-            if total_cached_length > 0:
-                prompt_tokens = prompt_tokens[total_cached_length:]
-                input_positions = input_positions[total_cached_length:]
-                assert len(prompt_tokens) > 0, (
-                    "The prompt tokens is empty after removing the cached tokens."
-                )
-        else:
-            block_table = block_tables_cpu[req_index]
-            block_table = self.mask_block_table(block_table, num_blocks)
-            logger.debug(
-                "Request %s is now scheduled. Prompt tokens: %s, "
-                "Already generated tokens: %s, Allocated block(s): %s",
-                req_id,
-                len(self.requests[req_id].prompt_token_ids),
-                len(self.requests[req_id].output_token_ids),
-                block_table.tolist(),
+        block_table = block_tables_cpu[req_index]
+        block_table = self.mask_block_table(block_table, num_blocks)
+        logger.debug(
+            "Request %s is now scheduled. Prompt tokens: %s, "
+            "Already generated tokens: %s, Allocated block(s): %s",
+            req_id,
+            len(self.requests[req_id].prompt_token_ids),
+            len(self.requests[req_id].output_token_ids),
+            block_table.tolist(),
+        )
+        # Prefix-cache hit tokens: their KV is served by shared blocks in the
+        # block table, so the prefill computes only the remainder.
+        total_cached_length = int(self.input_batch.num_computed_tokens_cpu[req_index])
+        if total_cached_length > 0:
+            prompt_tokens = prompt_tokens[total_cached_length:]
+            input_positions = input_positions[total_cached_length:]
+            assert len(prompt_tokens) > 0, (
+                "The prompt tokens is empty after removing the cached tokens."
             )
 
         running_request_ids.append(req_id)
@@ -722,12 +707,9 @@ class RBLNOptimumModelRunner(
             )
             input_positions.append([input_position])
             num_blocks = num_blocks_per_req[req_index]
-            if self.enable_prefix_caching:
-                block_tables_list.append(scheduler_output.block_table_dict[req_id])
-            else:
-                block_table = block_tables_cpu[req_index]
-                block_table = self.mask_block_table(block_table, num_blocks)
-                block_tables_list.append(block_table)
+            block_table = block_tables_cpu[req_index]
+            block_table = self.mask_block_table(block_table, num_blocks)
+            block_tables_list.append(block_table)
             running_request_ids.append(req_id)
 
         input_tokens = torch.tensor(input_tokens)
@@ -854,12 +836,10 @@ class RBLNOptimumModelRunner(
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             if logger.isEnabledFor(logging.DEBUG) and req_id in self.requests:
-                if self.enable_prefix_caching:
-                    block_ids = self.requests[req_id].block_ids[0]
-                else:
-                    block_ids = [
-                        block_id - 1 for block_id in self.requests[req_id].block_ids[0]
-                    ]
+                # Log in compiler-space (block id 0 is the vLLM null block).
+                block_ids = [
+                    block_id - 1 for block_id in self.requests[req_id].block_ids[0]
+                ]
                 logger.debug(
                     "Request %s is finished. Prompt tokens: %s, "
                     "Generated tokens: %s, Freed block(s): %s",

@@ -64,9 +64,10 @@ else:
 
 MAX_NUM_SEQ = 2
 MAX_MODEL_LEN = 64
-OB_SIZE = 16
-IB_SIZE = 4
-NUM_BLOCKS = MAX_MODEL_LEN // OB_SIZE * MAX_NUM_SEQ + 1
+BLOCK_SIZE = 16
+PREFILL_CHUNK_SIZE = 4
+# A full batch of blocks + the null block + the pinned dummy block.
+NUM_BLOCKS = MAX_MODEL_LEN // BLOCK_SIZE * MAX_NUM_SEQ + 2
 DEVICE = current_platform.device_type
 
 
@@ -162,7 +163,7 @@ def make_request(
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
-    block_size: int = IB_SIZE,
+    block_size: int = BLOCK_SIZE,
     hash_fn: Callable = sha256,
     mm_positions: list[PlaceholderRange] | None = None,
     mm_hashes: list[str] | None = None,
@@ -242,14 +243,13 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float
         seed=42,
     )
     cache_config = CacheConfig(
-        block_size=OB_SIZE,
+        block_size=BLOCK_SIZE,
         cache_dtype="auto",
         enable_prefix_caching=True,
     )
     additional_config = {
-        "prefix_block_size": IB_SIZE,
         "rbln_config": {
-            "prefill_chunk_size": IB_SIZE,
+            "prefill_chunk_size": PREFILL_CHUNK_SIZE,
         },
     }
     structured_outputs_config = StructuredOutputsConfig(
@@ -268,7 +268,6 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float
 def _schedule_new_request(
     *req_ids: str,
     block_ids: tuple[list[int], ...],
-    outer_block_ids: list[int],
     new_computed_tokens: int = 0,
     token_ids: list[int] | None = None,
     finished_req_ids: list[str] | None = None,
@@ -280,7 +279,6 @@ def _schedule_new_request(
     total_num_scheduled_tokens = 0
     if token_ids is None:
         token_ids = [1, 2, 3]
-    outer_block_ids = torch.tensor([outer_block_ids])
     for req_id in req_ids:
         new_reqs.append(
             NewRequestData(
@@ -307,9 +305,6 @@ def _schedule_new_request(
         num_common_prefix_blocks=0,
         finished_req_ids=set(finished_req_ids) if finished_req_ids else set(),
         free_encoder_mm_hashes=[],
-        block_table_dict={req_id: outer_block_ids},
-        cached_block_table=[],
-        cached_length=[],
         dummy_block=None,
     )
 
@@ -317,7 +312,6 @@ def _schedule_new_request(
 def _schedule_new_request_from_request(
     req: Request,
     block_ids: tuple[list[int], ...],
-    outer_block_ids: list[int],
     new_computed_tokens: int = 0,
     token_ids: list[int] | None = None,
     finished_req_ids: list[str] | None = None,
@@ -329,7 +323,6 @@ def _schedule_new_request_from_request(
     total_num_scheduled_tokens = 0
     if token_ids is None:
         token_ids = [1, 2, 3]
-    outer_block_ids = torch.tensor([outer_block_ids])
     new_reqs.append(
         NewRequestData(
             req_id=req.request_id,
@@ -354,9 +347,6 @@ def _schedule_new_request_from_request(
         num_common_prefix_blocks=0,
         finished_req_ids=set(finished_req_ids) if finished_req_ids else set(),
         free_encoder_mm_hashes=[],
-        block_table_dict={req.request_id: outer_block_ids},
-        cached_block_table=[],
-        cached_length=[],
         dummy_block=None,
     )
 
@@ -370,12 +360,9 @@ def _schedule_cached_reqs(
     arr_num_computed_tokens = []
     num_scheduled_tokens = {}
     total_num_scheduled_tokens = 0
-    block_table_dict = {}
-    outer_block_id = 0
     num_output_tokens = []
 
-    for outer_block_id, req in enumerate(reqs):
-        block_table_dict[req.request_id] = torch.tensor([[outer_block_id]])
+    for req in reqs:
         num_computed_tokens = req.num_computed_tokens
         req_ids.append(req.request_id)
         arr_num_computed_tokens.append(num_computed_tokens)
@@ -403,9 +390,6 @@ def _schedule_cached_reqs(
         num_common_prefix_blocks=0,
         finished_req_ids=set(finished_req_ids) if finished_req_ids else set(),
         free_encoder_mm_hashes=[],
-        block_table_dict=block_table_dict,
-        cached_block_table=[],
-        cached_length=[],
         dummy_block=None,
     )
 
@@ -476,9 +460,7 @@ def forward_steps(reqs: list[Request]):
         if req.structured_output_request is not None:
             while not req.structured_output_request._check_grammar_completion():
                 continue
-        scheduler_output = _schedule_new_request_from_request(
-            req, block_ids=([i],), outer_block_ids=[i]
-        )
+        scheduler_output = _schedule_new_request_from_request(req, block_ids=([i + 1],))
         runner.execute_model(scheduler_output)
         grammar_output = get_grammar_bitmask(
             structured_output_manager, requests, scheduler_output

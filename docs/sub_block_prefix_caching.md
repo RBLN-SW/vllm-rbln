@@ -68,13 +68,17 @@ set the router's token processing block size to vLLM `--max-num-batched-tokens`
 └─────────────────────────────────────────────────────────┘
 ```
 
-* `vllm_rbln.v1.core.rbln_kv_cache_manager`
+* `vllm_rbln.v1.core.sub_block` — path-neutral building blocks, shared with
+  the optimum path (see [Optimum path](#optimum-path)):
    * `SubBlockHasher`:
      Computes chained hashes at sub-block granularity.
      Uses the same `hash_block_tokens` as upstream.
    * `SubBlockIndex`:
      Maps sub-block hashes to sets of physical block IDs containing the sub-block.
      Supports `update`, `pop`, and `longest_match`.
+   * `KVCacheCopyOp`: Dataclass describing a sub-block KV data copy:
+     `(group_id, src_block_id, dst_block_id, num_tokens)`.
+* `vllm_rbln.v1.core.rbln_kv_cache_manager`
    * `RBLNKVCacheManager`: Extends upstream `KVCacheManager`.
         * Overrides
             * `allocate_slots` queues the request for sub-block indexing work
@@ -95,8 +99,6 @@ set the router's token processing block size to vLLM `--max-num-batched-tokens`
             * `do_pending_indexing()` executes the scheduled indexing work.
               Must be called after `super().update_from_output()`.
             * `can_use_sub_block_caching()` checks eligibility.
-   * `KVCacheCopyOp`: Dataclass describing a sub-block KV data copy:
-     `(group_id, src_block_id, dst_block_id, num_tokens)`.
 * `vllm_rbln.v1.core.rbln_scheduler`
    * `RBLNSchedulerOutput`: Extends `SchedulerOutput` with `kv_cache_copy_ops` field.
    * `RBLNScheduler.__init__`: Creates `RBLNKVCacheManager` when prefix caching is
@@ -107,6 +109,26 @@ set the router's token processing block size to vLLM `--max-num-batched-tokens`
      then `do_pending_indexing` and releases source-block refs from copy ops.
 * `vllm_rbln.v1.worker.rbln_model_runner`
    * `_process_kv_cache_copy_ops`: Copies KV data between blocks before the forward pass.
+
+## Optimum path
+
+The optimum path builds its own sub-block layer on the shared
+`vllm_rbln.v1.core.sub_block` components, with a simpler orchestration:
+
+* Single KV cache group only (the optimum coordinator is Unitary), no KV
+  events, no KV-connector arbitration.
+* `sub_block_size` is the compiled prefill chunk size
+  (`max_num_batched_tokens` after config sync), so a hit always resumes the
+  prefill at a chunk boundary. When the chunk covers a whole block,
+  sub-block caching stays off.
+* `optimum_kv_cache_manager.RBLNKVCacheManager` owns the index, matching,
+  and indexing; eviction cleanup goes through `RBLNBlockPool`'s
+  `evicted_block_hook` instead of a monkey-patch.
+* `optimum_model_runner._process_kv_cache_copy_ops` executes the copies via
+  the runtime KV-copy API (`_copy_kv_cache`), translating vLLM block ids to
+  compiler-space ids.
+
+The same `VLLM_RBLN_SUB_BLOCK_CACHE` variable gates both paths.
 
 ## How it works
 

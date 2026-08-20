@@ -16,9 +16,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-import torch
 from vllm import SamplingParams
-from vllm.platforms import current_platform
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.request import Request, RequestStatus
@@ -27,59 +25,38 @@ from .utils import create_model_runner_output, create_scheduler
 
 MAX_NUM_SEQ = 2
 MAX_MODEL_LEN = 64
-OB_SIZE = 16
-IB_SIZE = 4
-NUM_BLOCKS = MAX_MODEL_LEN // IB_SIZE * MAX_NUM_SEQ + 1  # 9
-DEVICE = current_platform.device_type
+BLOCK_SIZE = 16
+PREFILL_CHUNK_SIZE = 4
+# 8 usable blocks (a full batch) + the null block + the pinned dummy block.
+NUM_BLOCKS = MAX_MODEL_LEN // BLOCK_SIZE * MAX_NUM_SEQ + 2
 HASH_FN = sha256
-
-# checkout output scheduler, runner in prefill, decode tests
-# not preempt + eviction test
-# preempt + eviction test
 
 
 @pytest.fixture
 def scheduler():
-    scheduler = create_scheduler(
+    return create_scheduler(
         max_num_seqs=MAX_NUM_SEQ,
         max_num_batched_tokens=MAX_MODEL_LEN,
         num_blocks=NUM_BLOCKS,
-        block_size=IB_SIZE,
+        block_size=BLOCK_SIZE,
         max_model_len=MAX_MODEL_LEN,
-        outer_block_size=OB_SIZE,
         enable_prefix_caching=True,
+        prefill_chunk_size=PREFILL_CHUNK_SIZE,
     )
-    return scheduler
 
 
 @pytest.fixture
-def limited_4blocks_scheduler(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_NPU_NUM_BLOCKS", "4")
-    scheduler = create_scheduler(
+def limited_4blocks_scheduler():
+    # 4 usable blocks + null + dummy.
+    return create_scheduler(
         max_num_seqs=MAX_NUM_SEQ,
         max_num_batched_tokens=MAX_MODEL_LEN,
-        num_blocks=4 * (OB_SIZE // IB_SIZE) + 1,
-        block_size=IB_SIZE,
+        num_blocks=4 + 2,
+        block_size=BLOCK_SIZE,
         max_model_len=MAX_MODEL_LEN,
-        outer_block_size=OB_SIZE,
         enable_prefix_caching=True,
+        prefill_chunk_size=PREFILL_CHUNK_SIZE,
     )
-    return scheduler
-
-
-@pytest.fixture
-def limited_6blocks_scheduler(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_NPU_NUM_BLOCKS", "6")
-    scheduler = create_scheduler(
-        max_num_seqs=3,
-        max_num_batched_tokens=MAX_MODEL_LEN,
-        num_blocks=6 * (OB_SIZE // IB_SIZE) + 1,
-        block_size=IB_SIZE,
-        max_model_len=MAX_MODEL_LEN,
-        outer_block_size=OB_SIZE,
-        enable_prefix_caching=True,
-    )
-    return scheduler
 
 
 def create_request(
@@ -102,349 +79,240 @@ def create_request(
     return request
 
 
+def run_one_step(scheduler):
+    output = scheduler.schedule()
+    model_runner_output = create_model_runner_output(output)
+    scheduler.update_from_output(output, model_runner_output)
+    return output
+
+
 @pytest.mark.parametrize(
-    "token_length, cached_block_table, cached_length, ",
+    "token_length, expected_num_cached_tokens, expected_copy_op",
     [
-        pytest.param(
-            50,
-            [0, 1, 2],
-            [16, 16, 16],
-            id="50_tokens",
-        ),
-        pytest.param(
-            54,
-            [0, 1, 2, 3],
-            [16, 16, 16, 4],
-            id="54_tokens",
-        ),
+        # 50 tokens: 3 full blocks (48 tokens) are cached; the 2-token
+        # remainder is smaller than a sub-block, so no sub-block match.
+        pytest.param(50, 48, None, id="50_tokens"),
+        # 62 tokens: 3 full blocks (48 tokens) plus a sub-block extension of
+        # 12 tokens (3 sub-blocks of req0's partial block 4, copied into
+        # req1's own block 5). The hit cap at num_tokens - 1 = 61 leaves the
+        # last sub-block out.
+        pytest.param(62, 60, (4, 5, 12), id="62_tokens"),
     ],
 )
-def test_prefix_cache_hit_same_prompt(
+def test_prefix_cache_hit_shares_blocks(
     scheduler,
     token_length: int,
-    cached_block_table: list[int],
-    cached_length: list[int],
+    expected_num_cached_tokens: int,
+    expected_copy_op: tuple[int, int, int] | None,
 ):
+    """A request with a cached prefix reuses the very blocks that hold it:
+    the full-block hit appears in the new request's block table as shared
+    blocks, a sub-block hit becomes a copy op, and only the remainder of the
+    prompt is scheduled for computation."""
     init_none_hash(HASH_FN)
-    """
-    Check the prefix caching works as expected
-    between two requests with the same prompt.
-    Note that if the prompt is fully cached,
-    the last inner block is excluded from cache hit
-    to return the logits.
-    """
-    # 1. Generate req0: 42 tokens -> 11 inner blocks
-    common_token_ids = [i for i in range(token_length)]
-    req0_id = "req0"
-    req0 = create_request(req0_id, common_token_ids, IB_SIZE, HASH_FN)
+    common_token_ids = list(range(token_length))
+    req0 = create_request("req0", common_token_ids, BLOCK_SIZE, HASH_FN)
+    req1 = create_request("req1", common_token_ids, BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req0)
+    scheduler.add_request(req1)
 
-    req1_id = "req1"
-    req1 = create_request(req1_id, common_token_ids, IB_SIZE, HASH_FN)
-
-    requests = [req0, req1]
-    for request in requests:
-        scheduler.add_request(request)
+    output = run_one_step(scheduler)
+    new_req = output.scheduled_new_reqs[0]
+    assert new_req.req_id == "req0"
+    assert new_req.block_ids[0] == [1, 2, 3, 4]
+    assert new_req.num_computed_tokens == 0
+    assert output.num_scheduled_tokens["req0"] == token_length
+    assert output.kv_cache_copy_ops == []
 
     output = scheduler.schedule()
-    answer = torch.tensor([0, 1, 2, 3], dtype=torch.int16)
-    assert torch.allclose(output.block_table_dict[req0_id], answer)
-    assert output.cached_block_table == []
-    assert output.cached_length == []
-
-    # Model output of the first request.
-    model_runner_output = create_model_runner_output(output)
-    scheduler.update_from_output(output, model_runner_output)
-
-    output = scheduler.schedule()
-    answer = torch.tensor([4, 5, 6, 7], dtype=torch.int16)
-    assert torch.allclose(output.block_table_dict[req1_id], answer)
-    assert output.cached_block_table == cached_block_table
-    assert output.cached_length == cached_length
-
-
-@pytest.mark.parametrize(
-    "token_length, decode_steps, allocated_blocks",
-    [
-        pytest.param(
-            31,
-            1,
-            [0, 1, 2, -1],
-            id="decode_1_step_and_eviction",
-        ),
-        pytest.param(
-            25,
-            7,
-            [0, 1, 2, -1],
-            id="decode_7_steps_eviction",
-        ),
-    ],
-)
-def test_eviction(
-    limited_4blocks_scheduler,
-    token_length: int,
-    decode_steps: int,
-    allocated_blocks: list[int],
-):
-    init_none_hash(HASH_FN)
-    """
-    Check the eviction works as expected.
-
-    Scenario:
-    0. There are 4 blocks in total.
-    1. Generate req0 which spends 2 blocks when it is scheduled.
-    2. Generate req1 which spends 2 blocks when it is scheduled.
-    3. req0 requires 1 more block, and req1 is preempted.
-    4. After req0 is done, req1 resumes.
-    We check whether req1 can resume correctly
-    by evicting req0's blocks.
-    5. Finally, we check whether req1's prefix caching works correctly.
-    """
-    # 1. Generate req0: 31 tokens -> 12 inner blocks
-    common_token_ids = [i for i in range(token_length)]
-    req0_id = "req0"
-    req0 = create_request(req0_id, common_token_ids, IB_SIZE, HASH_FN)
-    req1_id = "req1"
-    req1 = create_request(req1_id, common_token_ids, IB_SIZE, HASH_FN)
-
-    requests = [req0, req1]
-    for request in requests:
-        limited_4blocks_scheduler.add_request(request)
-
-    until_to_preemption = len(requests) + decode_steps
-    for _ in range(until_to_preemption):
-        output = limited_4blocks_scheduler.schedule()
-        model_runner_output = create_model_runner_output(output)
-        limited_4blocks_scheduler.update_from_output(output, model_runner_output)
-    assert req1_id in output.block_table_dict
-    # Now, req1 is preempted, and req0 continues.
-    # req0 requires 1 more block.
-    output = limited_4blocks_scheduler.schedule()
-    assert req1_id not in output.block_table_dict
-    answer = torch.tensor(allocated_blocks, dtype=torch.int16)
-    assert torch.allclose(output.block_table_dict[req0_id], answer)
-
-
-def test_cache_hit_child_block(limited_6blocks_scheduler):
-    """
-    This test verifies the difference between
-    our prefix caching implementation and vLLM's approach.
-
-    Unlike vLLM, which directly reuses cache-hit blocks,
-    our implementation creates new blocks and copies the contents
-    of the cache-hit blocks into them.
-
-    In other words:
-    - vLLM returns the original (root) cache-hit blocks.
-    - Our implementation returns newly allocated blocks that contain copies
-    of those cache-hit blocks.
-
-    This test ensures that this behavior works as intended.
-
-    Test scenario:
-    0. There are 6 blocks in total.
-    1. Generate req0 which spends 2 blocks when it is scheduled.
-    => [0, 1]
-    2. Generate req1 which spends 2 blocks when it is scheduled.
-    => [2, 3]
-    3. Generate req2 with a new prompt, which spends 2 blocks when scheduled.
-    => [4, 5]
-    4. Finish req0 and generate req3 with a different prompt,
-       which spends 2 blocks when scheduled.
-    => [0, 1]
-    5. Finish req2 and generate req4 with the same prompt as req1,
-       which spends 2 blocks when scheduled.
-       Here, we check whether req4 correctly reuses req1's cached blocks.
-    => [4, 5] (reuse req1's cached blocks [2, 3])
-    """
-    init_none_hash(HASH_FN)
-    # 1. Generate req0: 32 tokens -> 8 inner blocks
-    common_token_ids = [i for i in range(21)]
-    req0_id = "req0"
-    req0 = create_request(req0_id, common_token_ids, IB_SIZE, HASH_FN)
-
-    req1_id = "req1"
-    req1 = create_request(req1_id, common_token_ids, IB_SIZE, HASH_FN)
-
-    req2_id = "req2"
-    req2 = create_request(
-        req2_id, [i + 100 for i in common_token_ids], IB_SIZE, HASH_FN
+    new_req = output.scheduled_new_reqs[0]
+    assert new_req.req_id == "req1"
+    # The full blocks are shared with req0; only the last block is new.
+    assert new_req.block_ids[0] == [1, 2, 3, 5]
+    assert new_req.num_computed_tokens == expected_num_cached_tokens
+    assert (
+        output.num_scheduled_tokens["req1"] == token_length - expected_num_cached_tokens
     )
-    req3_id = "req3"
-    req3 = create_request(req3_id, [i + 50 for i in common_token_ids], IB_SIZE, HASH_FN)
 
-    req4_id = "req4"
-    req4 = create_request(req4_id, common_token_ids, IB_SIZE, HASH_FN)
+    # The shared blocks are referenced by both requests, not copied.
+    block_pool = scheduler.kv_cache_manager.block_pool
+    for block_id in (1, 2, 3):
+        assert block_pool.blocks[block_id].ref_cnt == 2
 
-    requests = [req0, req1, req2, req3, req4]
-    for request in requests:
-        limited_6blocks_scheduler.add_request(request)
-
-    # Schedule req0 [0, 1]
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-
-    # Schedule req1 [2, 3]
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    assert req2_id not in output.block_table_dict
-
-    # Schedule req2 [4, 5] with new prompt
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    assert req2_id in output.block_table_dict
-
-    # Finish req0 and schedule req3 [0, 1]
-    # To remove the cache, the prompt of req3 is different from req0/req1
-    limited_6blocks_scheduler.finish_requests(req0_id, RequestStatus.FINISHED_ABORTED)
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    assert req3_id in output.block_table_dict
-
-    # Finish req2 and schedule req4 [4, 5]
-    # Reuse the req1's blocks [2, 3] for req4
-    limited_6blocks_scheduler.finish_requests(req2_id, RequestStatus.FINISHED_ABORTED)
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    answer = torch.tensor([4, 5, -1, -1], dtype=torch.int16)
-    assert torch.allclose(output.block_table_dict[req4_id], answer)
-    assert output.cached_block_table == [2, 3]
+    if expected_copy_op is None:
+        assert output.kv_cache_copy_ops == []
+        return
+    src, dst, num_tokens = expected_copy_op
+    (op,) = output.kv_cache_copy_ops
+    assert (op.src_block_id, op.dst_block_id, op.num_tokens) == (src, dst, num_tokens)
+    # The pending copy op holds a ref on the source block (req0's own ref
+    # plus the copy op's) until update_from_output releases it.
+    assert block_pool.blocks[src].ref_cnt == 2
+    scheduler.update_from_output(output, create_model_runner_output(output))
+    assert block_pool.blocks[src].ref_cnt == 1
 
 
-def test_allocated_blocks_excluded_from_cache_hit(limited_6blocks_scheduler):
-    """
-    If the allocated blocks are excluded when calculating
-    the cached blocks for prefix caching.
-    0. There are 4 blocks in total.
-    1. Generate req0 which spends 2 blocks when it is scheduled.
-    2. Generate req1 which spends 2 blocks when it is scheduled.
-    3. Generate req2 which spends 2 blocks when it is scheduled.
-        - It is for getting enough freed inner blocks.
-    4. Finish req0 and req1, and generate req3 with the same prompt
-        - Here, req3's prompt is the same as req0's prompt.
-        - req0 is allocated [0, 1]
-        - So the cached blocks become [2, 3], not [0, 1].
-    """
+def test_sub_block_hit_after_finish(scheduler):
+    """A finished request's partial block keeps serving sub-block hits: the
+    synthetic block hash keeps it in the LRU, and the match is realized as a
+    copy op into the new request's own block."""
     init_none_hash(HASH_FN)
-    # 1. Generate req0: 32 tokens -> 8 inner blocks
-    common_token_ids = [i for i in range(31)]
-    req0_id = "req0"
-    req0 = create_request(req0_id, common_token_ids, IB_SIZE, HASH_FN)
-
-    req1_id = "req1"
-    req1 = create_request(req1_id, common_token_ids, IB_SIZE, HASH_FN)
-
-    req2_id = "req2"
-    req2 = create_request(req2_id, common_token_ids, IB_SIZE, HASH_FN)
-
-    req3_id = "req3"
-    req3 = create_request(req3_id, common_token_ids, IB_SIZE, HASH_FN)
-
-    requests = [req0, req1, req2, req3]
-    for request in requests:
-        limited_6blocks_scheduler.add_request(request)
-
-    # Schedule req0 [0, 1]
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    assert output.cached_block_table == []
-    assert output.block_table_dict[req0_id].tolist() == [0, 1, -1, -1]
-
-    # Schedule req1 [2, 3]
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    assert output.cached_block_table == [0, 1]
-    assert output.block_table_dict[req1_id].tolist() == [2, 3, -1, -1]
-
-    # Schedule req2 [4, 5]
-    limited_6blocks_scheduler.finish_requests(req0_id, RequestStatus.FINISHED_ABORTED)
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    assert output.cached_block_table == [2, 3]
-    assert output.block_table_dict[req2_id].tolist() == [4, 5, -1, -1]
-
-    # Finish Schedule req0, req1 and schedule req3 [0, 1]
-    # 1. To get enough freed inner blocks
-    # this pytest finishes req0 and req1
-    # 2. req3 is allocated [0, 1] again
-    # 3. So the cached blocks become [2, 3]
-    # to exclude the allocated blocks [0, 1].
-    limited_6blocks_scheduler.finish_requests(req0_id, RequestStatus.FINISHED_ABORTED)
-    limited_6blocks_scheduler.finish_requests(req1_id, RequestStatus.FINISHED_ABORTED)
-    output = limited_6blocks_scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    limited_6blocks_scheduler.update_from_output(output, model_runner_output)
-    assert output.cached_block_table == [4, 5]
-    assert output.block_table_dict[req3_id].tolist() == [0, 1, -1, -1]
-
-
-def test_finish_request(scheduler):
-    """
-    Check that finishing a request correctly frees its allocated blocks
-    while retaining the mapping for future reuse.
-    """
-    init_none_hash(HASH_FN)
-    # 1. Generate req0: 10 tokens -> 3 inner blocks
-    common_token_ids = [i for i in range(10)]
-    req0_id = "req0"
-    req0 = create_request(req0_id, common_token_ids, IB_SIZE, HASH_FN)
-
+    # 30 tokens: 1 full block + a partial block with 3 complete sub-blocks.
+    common_token_ids = list(range(30))
+    req0 = create_request("req0", common_token_ids, BLOCK_SIZE, HASH_FN)
     scheduler.add_request(req0)
+    run_one_step(scheduler)
+    scheduler.finish_requests("req0", RequestStatus.FINISHED_ABORTED)
 
+    req1 = create_request("req1", common_token_ids, BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req1)
     output = scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    scheduler.update_from_output(output, model_runner_output)
-
-    # Finish req0
-    scheduler.finish_requests(req0_id, RequestStatus.FINISHED_ABORTED)
-    prefix_cache_manager = scheduler.kv_cache_manager.prefix_cache_manager
-    # The allocated blocks for req0 is not freed yet
-    allocated_blocks = prefix_cache_manager._allocator._allocated_blocks
-    assert len(allocated_blocks) == 1
-
-    # Mark req0 as finished and free its blocks
-    mapping_manager = prefix_cache_manager._mapping_manager
-    mapping = mapping_manager.get_mapping(0)
-    assert not mapping_manager.is_request_registered(req0_id)
-    assert mapping.request_id is None
-    assert mapping.is_active is False
-
-    # Keep the mapping between outer and inner blocks
-    # to reuse them for future requests.
-    assert mapping.outer_block_id == 0
-    assert mapping.inner_block_ids == [1, 2, 3]
-    assert len(mapping_manager._inner_to_outer) == 3
+    new_req = output.scheduled_new_reqs[0]
+    # Full hit on block 1 (16 tokens) + 3 sub-blocks (12 tokens) copied from
+    # req0's freed partial block 2 into req1's own block 3.
+    assert new_req.block_ids[0] == [1, 3]
+    assert new_req.num_computed_tokens == 28
+    assert output.num_scheduled_tokens["req1"] == 2
+    (op,) = output.kv_cache_copy_ops
+    assert (op.src_block_id, op.dst_block_id, op.num_tokens) == (2, 3, 12)
 
 
-def test_free_outer_blocks(scheduler):
-    """
-    Check the evicted blocks are correctly freed
-    from the prefix cache manager.
-    """
+def test_sub_block_disabled_when_chunk_covers_block():
+    """When the prefill chunk size equals the block size, sub-block caching
+    adds nothing and stays off; full-block sharing still works."""
     init_none_hash(HASH_FN)
-    # 1. Generate req0: 10 tokens -> 3 inner blocks
-    common_token_ids = [i for i in range(10)]
-    req0_id = "req0"
-    req0 = create_request(req0_id, common_token_ids, IB_SIZE, HASH_FN)
+    scheduler = create_scheduler(
+        max_num_seqs=MAX_NUM_SEQ,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        num_blocks=NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+        max_model_len=MAX_MODEL_LEN,
+        enable_prefix_caching=True,
+        prefill_chunk_size=BLOCK_SIZE,
+    )
+    assert scheduler.kv_cache_manager.sub_block_size is None
 
+    common_token_ids = list(range(30))
+    req0 = create_request("req0", common_token_ids, BLOCK_SIZE, HASH_FN)
+    req1 = create_request("req1", common_token_ids, BLOCK_SIZE, HASH_FN)
     scheduler.add_request(req0)
-
+    scheduler.add_request(req1)
+    run_one_step(scheduler)
     output = scheduler.schedule()
-    model_runner_output = create_model_runner_output(output)
-    scheduler.update_from_output(output, model_runner_output)
+    new_req = output.scheduled_new_reqs[0]
+    assert new_req.num_computed_tokens == BLOCK_SIZE
+    assert output.kv_cache_copy_ops == []
 
-    # Evict the outer block 0
-    prefix_cache_manager = scheduler.kv_cache_manager.prefix_cache_manager
-    mapping_manager = prefix_cache_manager._mapping_manager
-    prefix_cache_manager.free_request(req0_id, preemption=True)
-    assert not mapping_manager.is_request_registered(req0_id)
-    assert mapping_manager.get_mapping(0) is None
 
-    assert len(mapping_manager._inner_to_outer) == 0
+def test_evicted_block_leaves_sub_block_index(limited_4blocks_scheduler):
+    """Evicting a block removes it from the sub-block index, so a later
+    request cannot match KV that no longer exists."""
+    scheduler = limited_4blocks_scheduler
+    init_none_hash(HASH_FN)
+    req0 = create_request("req0", list(range(30)), BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req0)
+    run_one_step(scheduler)  # blocks [1, 2], both indexed
+    scheduler.finish_requests("req0", RequestStatus.FINISHED_ABORTED)
+
+    # A 62-token request takes all 4 blocks, evicting req0's cached ones.
+    reqx = create_request("reqx", [i + 100 for i in range(62)], BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(reqx)
+    run_one_step(scheduler)
+    scheduler.finish_requests("reqx", RequestStatus.FINISHED_STOPPED)
+
+    # req0's prompt must now miss entirely: a stale sub-block index entry
+    # would emit a copy op reading reqx's KV.
+    req1 = create_request("req1", list(range(30)), BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req1)
+    output = scheduler.schedule()
+    new_req = output.scheduled_new_reqs[0]
+    assert new_req.num_computed_tokens == 0
+    assert output.kv_cache_copy_ops == []
+
+
+def test_finished_request_blocks_are_reused(scheduler):
+    """Blocks of a finished request stay cached and serve later hits."""
+    init_none_hash(HASH_FN)
+    common_token_ids = list(range(50))
+    req0 = create_request("req0", common_token_ids, BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req0)
+    run_one_step(scheduler)
+    scheduler.finish_requests("req0", RequestStatus.FINISHED_ABORTED)
+
+    req1 = create_request("req1", common_token_ids, BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req1)
+    output = scheduler.schedule()
+    new_req = output.scheduled_new_reqs[0]
+    # Blocks 1-3 are req0's cached blocks. The new last block is 4: req0's
+    # freed unhashed block goes back to the head of the free queue.
+    assert new_req.block_ids[0] == [1, 2, 3, 4]
+    assert new_req.num_computed_tokens == 48
+    assert output.num_scheduled_tokens["req1"] == 2
+
+
+def test_cached_blocks_evicted_under_pressure(limited_4blocks_scheduler):
+    """Cached blocks of finished requests are evicted when a new request
+    needs the space."""
+    scheduler = limited_4blocks_scheduler
+    init_none_hash(HASH_FN)
+    req0 = create_request("req0", list(range(40)), BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req0)
+    run_one_step(scheduler)
+    assert scheduler.kv_cache_manager.get_block_ids("req0")[0] == [1, 2, 3]
+    scheduler.finish_requests("req0", RequestStatus.FINISHED_ABORTED)
+
+    # A different prompt cannot hit req0's cache, so its blocks are evicted
+    # to make room.
+    req1 = create_request("req1", [i + 100 for i in range(40)], BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req1)
+    output = scheduler.schedule()
+    new_req = output.scheduled_new_reqs[0]
+    assert new_req.num_computed_tokens == 0
+    assert len(new_req.block_ids[0]) == 3
+
+
+def test_preemption_and_resume_with_cache_hit(limited_4blocks_scheduler):
+    """Preemption frees blocks under pressure; the preempted request later
+    resumes and re-hits its own cached prefix."""
+    scheduler = limited_4blocks_scheduler
+    init_none_hash(HASH_FN)
+    req0 = create_request("req0", list(range(30)), BLOCK_SIZE, HASH_FN)
+    req1 = create_request("req1", [i + 100 for i in range(30)], BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req0)
+    scheduler.add_request(req1)
+
+    run_one_step(scheduler)  # req0 prefill -> [1, 2]
+    run_one_step(scheduler)  # req1 prefill -> [3, 4]
+
+    # Decode until req0 needs a third block (33 tokens). The pool is empty,
+    # so req1 is preempted to free it.
+    for _ in range(4):
+        run_one_step(scheduler)
+        if req1.status == RequestStatus.PREEMPTED:
+            break
+    assert req1.status == RequestStatus.PREEMPTED
+    assert len(scheduler.kv_cache_manager.get_block_ids("req0")[0]) == 3
+
+    # Finish req0; req1 resumes and re-hits its own cached first block.
+    scheduler.finish_requests("req0", RequestStatus.FINISHED_STOPPED)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens.keys() == {"req1"}
+    assert req1.status == RequestStatus.RUNNING
+    assert req1.num_computed_tokens >= BLOCK_SIZE
+
+
+def test_dummy_block_for_decode_padding(scheduler):
+    """A partially filled decode batch reports the pinned dummy block, which
+    is never allocated to a request."""
+    init_none_hash(HASH_FN)
+    req0 = create_request("req0", list(range(20)), BLOCK_SIZE, HASH_FN)
+    scheduler.add_request(req0)
+    output = run_one_step(scheduler)
+    assert output.dummy_block is None  # prefill step
+
+    output = run_one_step(scheduler)  # decode with 1 < MAX_NUM_SEQ requests
+    # The pool pins its last block (vLLM id NUM_BLOCKS - 1) as the dummy;
+    # the scheduler reports it in compiler-space (shifted by -1).
+    assert output.dummy_block == NUM_BLOCKS - 2
+    dummy = scheduler.kv_cache_manager.block_pool.dummy_block
+    assert dummy is not None and dummy.ref_cnt == 0

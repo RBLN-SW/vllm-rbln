@@ -38,10 +38,10 @@ from vllm.v1.utils import record_function_or_nullcontext
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
-    KVCacheCopyOp,
     RBLNKVCacheManager,
     SubBlockMatch,
 )
+from vllm_rbln.v1.core.sub_block import KVCacheCopyOp
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
     is_prefill,

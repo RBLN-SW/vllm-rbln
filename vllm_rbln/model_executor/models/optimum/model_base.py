@@ -34,7 +34,6 @@ from optimum.rbln.transformers.models.decoderonly import (
 )
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 
@@ -91,7 +90,7 @@ class KVCacheBlockAdapter:
     def is_full_block_available(self) -> bool:
         """True if we can allocate a full batch worth of blocks."""
         estimated = self._estimated_num_blocks()
-        block_size = get_attn_block_size(self.vllm_config)
+        block_size = self.vllm_config.cache_config.block_size
 
         max_model_len = self.vllm_config.model_config.max_model_len
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
@@ -101,18 +100,13 @@ class KVCacheBlockAdapter:
         return estimated >= ideal_total
 
     def get_available_num_blocks(self) -> int:
+        # Must agree with update_num_blocks (from_optimum.py).
+        estimated = self._estimated_num_blocks()
         if self.vllm_config.cache_config.enable_prefix_caching:
-            ob_size = self.vllm_config.additional_config["attn_block_size"]
-            ib_size = self.vllm_config.cache_config.block_size
-            blk_ratio = ob_size // ib_size
-        else:
-            blk_ratio = 1
+            return estimated + 1
         if self.is_full_block_available():
-            new_estimated = self._estimated_num_blocks() * blk_ratio
-            return new_estimated + 1
-
-        new_estimated = (self._estimated_num_blocks() - 1) * blk_ratio + 1
-        return new_estimated
+            return estimated + 1
+        return estimated
 
 
 class _ProducerOptimumModelProxy:
@@ -224,7 +218,7 @@ class RBLNOptimumModelBase(nn.Module):
             spec = RBLNCompileSpec.for_architecture(
                 hf_config,
                 batch_size=self.scheduler_config.max_num_seqs,
-                block_size=get_attn_block_size(self.vllm_config),
+                block_size=self.vllm_config.cache_config.block_size,
                 max_model_len=self.model_config.max_model_len,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
                 # Resolved during sync (from_optimum/from_vllm) into
@@ -411,57 +405,6 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder
 
-    def copy_cached_kv_blocks(
-        self,
-        cached_block_tables: list[int],
-        cached_lengths: list[int],
-        block_tables: torch.Tensor,
-    ) -> None:
-        """Copy prefix-cached KV blocks into this request's destination blocks.
-
-        The model runner calls this before the prefill forward so the copy
-        stays an orchestration concern and the model forward remains a pure
-        forward pass.
-
-        Args:
-            cached_block_tables: Source block IDs to copy from.
-            cached_lengths: Cached length for each source block.
-            block_tables: Tensor whose first row holds the destination block IDs.
-        """
-        if not cached_block_tables:
-            return
-
-        if len(cached_block_tables) != len(cached_lengths):
-            raise ValueError(
-                "Mismatch between cached_block_tables length "
-                f"({len(cached_block_tables)}) and cached_lengths length "
-                f"({len(cached_lengths)})"
-            )
-
-        prefill_decoder = self.get_prefill_decoder()
-        # Convert to list once for efficiency
-        dst_blocks = block_tables[0].tolist()
-
-        for block_idx, (src_block, dst_block) in enumerate(
-            zip(cached_block_tables, dst_blocks)
-        ):
-            try:
-                prefill_decoder.runtime._copy_kv_cache(
-                    src_block, dst_block, cached_lengths[block_idx]
-                )
-                logger.debug(
-                    "Successfully copied KV cache from block %d to block %d",
-                    src_block,
-                    dst_block,
-                )
-            except Exception as e:
-                error_msg = (
-                    f"Failed to copy KV cache from block {src_block} to block "
-                    f"{dst_block} at index {block_idx}: {e}"
-                )
-                logger.error(error_msg)
-                raise RuntimeError(error_msg) from e
-
     # It is required for decoder models in openai api server
     def compute_logits(
         self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata
@@ -639,7 +582,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
                 "Partial prefix tail slicing across multiple modalities needs a "
                 "model-specific _build_partial_mm_embeds override."
             )
-        tail_starts = next(iter(tail_starts_by_modality.values()), [])
+        tail_starts: list[int] = next(iter(tail_starts_by_modality.values()), [])
 
         if not isinstance(multimodal_embeddings, (list, tuple)):
             raise NotImplementedError(

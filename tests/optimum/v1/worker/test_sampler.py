@@ -139,9 +139,7 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
         stop_token_ids=[stop_token_id],
     )
 
-    scheduler_output = _schedule_new_request_from_request(
-        req, block_ids=([0],), outer_block_ids=[0]
-    )
+    scheduler_output = _schedule_new_request_from_request(req, block_ids=([1],))
     runner.execute_model(scheduler_output)
     output = runner.sample_tokens(grammar_output=None)
     sampled = [output.sampled_token_ids[0][0]]
@@ -196,9 +194,7 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
         logit_bias={biased_token_id: 20.0},
     )
 
-    scheduler_output = _schedule_new_request_from_request(
-        req, block_ids=([0],), outer_block_ids=[0]
-    )
+    scheduler_output = _schedule_new_request_from_request(req, block_ids=([1],))
     runner.execute_model(scheduler_output)
     output = runner.sample_tokens(grammar_output=None)
     sampled = [output.sampled_token_ids[0][0]]
@@ -267,9 +263,7 @@ def test_forward_min_p_masks_low_probability_tokens(
         min_p=0.5,
     )
 
-    scheduler_output = _schedule_new_request_from_request(
-        req, block_ids=([0],), outer_block_ids=[0]
-    )
+    scheduler_output = _schedule_new_request_from_request(req, block_ids=([1],))
     runner.execute_model(scheduler_output)
     output = runner.sample_tokens(grammar_output=None)
     sampled = [output.sampled_token_ids[0][0]]
@@ -381,9 +375,7 @@ def test_no_nan_logits_with_padded_bucket(
 
     # Prefill is single-req per step (no padding); just run it.
     for i, req in enumerate(reqs):
-        scheduler_output = _schedule_new_request_from_request(
-            req, block_ids=([i],), outer_block_ids=[i]
-        )
+        scheduler_output = _schedule_new_request_from_request(req, block_ids=([i + 1],))
         runner.execute_model(scheduler_output)
         runner.sample_tokens(grammar_output=None)
 
@@ -447,9 +439,7 @@ def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
 
     def run_step(i):
         req = make_request(request_id=f"req_{i}", prompt_token_ids=[1, 2, 3])
-        scheduler_output = _schedule_new_request_from_request(
-            req, block_ids=([0],), outer_block_ids=[0]
-        )
+        scheduler_output = _schedule_new_request_from_request(req, block_ids=([1],))
         runner.execute_model(scheduler_output)
         _ = runner.sample_tokens(grammar_output=None)
 

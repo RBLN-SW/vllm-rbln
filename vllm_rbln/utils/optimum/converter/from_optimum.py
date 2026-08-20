@@ -16,10 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.block_size import (
-    get_block_ratio,
-    is_full_block_available,
-)
+from vllm_rbln.utils.optimum.block_size import is_full_block_available
 
 from .common import (
     apply_user_prefill_chunk_size,
@@ -138,15 +135,20 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
     # num_blocks is determined by rbln_config or overridden by user.
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         num_blocks = vllm_config.cache_config.num_gpu_blocks_override
-        # This is kept for optimum based num blocks
-        # not considering ob-ib logic for prefix caching
         vllm_config.additional_config["num_blocks_override"] = num_blocks
-    blk_ratio = get_block_ratio(vllm_config)
 
-    if is_full_block_available(num_blocks, vllm_config):
-        adjusted_num_blocks = num_blocks * blk_ratio + 1
+    if vllm_config.cache_config.enable_prefix_caching:
+        # Every device block joins the pool (+1 for the null block at id 0);
+        # RBLNBlockPool pins the last one as the decode-padding dummy, since a
+        # free block may hold cached KV that a padded decoder slot would
+        # clobber.
+        adjusted_num_blocks = num_blocks + 1
+    elif is_full_block_available(num_blocks, vllm_config):
+        adjusted_num_blocks = num_blocks + 1
     else:
-        adjusted_num_blocks = (num_blocks - 1) * blk_ratio + 1
+        # Keep one device block out of the pool so decode-batch padding always
+        # has an unallocated block to point at (see pad_decoder_items).
+        adjusted_num_blocks = num_blocks
 
     vllm_config.cache_config.num_gpu_blocks = adjusted_num_blocks
 

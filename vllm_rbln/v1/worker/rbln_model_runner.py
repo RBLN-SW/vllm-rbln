@@ -121,8 +121,8 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
 )
-from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.core.sub_block import KVCacheCopyOp
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
     num_base_tokens,

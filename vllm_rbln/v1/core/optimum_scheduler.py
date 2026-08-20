@@ -17,7 +17,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
@@ -26,6 +25,7 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_events import EventPublisherFactory
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -44,8 +44,10 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.optimum_kv_cache_manager import RBLNKVCacheManager
+from vllm_rbln.v1.core.sub_block import KVCacheCopyOp
 
 logger = init_logger(__name__)
 
@@ -53,22 +55,16 @@ logger = init_logger(__name__)
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
     """
-    block_table_dict: dict[str, torch.Tensor]
-        Mapping from request ID to outer block table tensor
-        for both prefill and decode.
-    cached_block_table: list[int]
-        List of cached outer block table entries for prefill.
-    cached_length: list[int]
-        List of cached lengths for each outer block for prefill.
+    kv_cache_copy_ops: list[KVCacheCopyOp]
+        Sub-block KV copies the model runner must execute before the
+        forward pass.
     dummy_block: int
         The index of dummy block for padding. It is required
         if the number of requests is less than the number of batch_size
         in decode phase.
     """
 
-    block_table_dict: dict[str, torch.Tensor] = field(default_factory=dict)
-    cached_block_table: list[int] = field(default_factory=list)
-    cached_length: list[int] = field(default_factory=list)
+    kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
     dummy_block: int | None = None
 
 
@@ -192,14 +188,6 @@ class RBLNOptimumScheduler(Scheduler):
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
 
-        # Create the KV cache manager.
-        if (
-            self.vllm_config.additional_config is not None
-            and "attn_block_size" in self.vllm_config.additional_config
-        ):
-            attn_block_size = self.vllm_config.additional_config["attn_block_size"]
-        else:
-            attn_block_size = None
         # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
         # slots beyond the prompt (partition-alignment + trailing chunk
         # write-extent), so `allocate_slots` must reserve them. The prefill chunk
@@ -214,6 +202,29 @@ class RBLNOptimumScheduler(Scheduler):
             if vllm_config.additional_config is not None:
                 image_prefill_chunk_size = vllm_config.additional_config.get(
                     "image_prefill_chunk_size"
+                )
+
+        # Sub-block prefix caching: extend full-block hits at prefill-chunk
+        # granularity. max_num_batched_tokens is the compiled prefill chunk
+        # size on the optimum path (models where it is a budget instead —
+        # enc-dec, pooling — never reach here with caching enabled), and a
+        # hit must resume at a chunk boundary, so the sub-block size is the
+        # chunk size. When the chunk covers a whole block, sub-block caching
+        # adds nothing and stays off.
+        sub_block_size = None
+        hash_fn = None
+        if self.cache_config.enable_prefix_caching and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
+            chunk_size = self.scheduler_config.max_num_batched_tokens
+            if self.block_size > chunk_size and self.block_size % chunk_size == 0:
+                sub_block_size = chunk_size
+                hash_fn = get_hash_fn_by_name(
+                    self.cache_config.prefix_caching_hash_algo
+                )
+                logger.info(
+                    "Sub-block prefix caching enabled: block_size=%d, "
+                    "sub_block_size=%d",
+                    self.block_size,
+                    sub_block_size,
                 )
 
         # Create the KV cache manager.
@@ -235,12 +246,12 @@ class RBLNOptimumScheduler(Scheduler):
             pcp_world_size=1,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
-            attn_block_size=attn_block_size,
-            max_num_seqs=self.max_num_running_reqs,
             is_encoder_decoder=self.is_encoder_decoder,
             prefill_chunk_size=prefill_chunk_size,
             image_prefill_chunk_size=image_prefill_chunk_size,
             needs_chunked_prefill_pad=needs_chunked_prefill_pad,
+            sub_block_size=sub_block_size,
+            hash_fn=hash_fn,
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -318,9 +329,6 @@ class RBLNOptimumScheduler(Scheduler):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # For logging.
         scheduled_timestamp = time.monotonic()
-        block_table_dict: dict[str, torch.Tensor] = {}
-        cached_block_table: list[int] = []
-        cached_length: list[int] = []
         dummy_block: int | None = None
 
         # NOTE The scheduling process is changed like below.
@@ -332,8 +340,6 @@ class RBLNOptimumScheduler(Scheduler):
         #   In the vLLM, requests are scheduled RUNNING -> WAITING.
 
         req_index = 0
-        # It is always empty in decode phase.
-        new_computed_blocks = KVCacheBlocks(blocks=([],))
         # Record the LoRAs in scheduled_running_reqs
         # It is for checking the max_loras constraint.
         scheduled_loras: set[int] = set()
@@ -392,11 +398,31 @@ class RBLNOptimumScheduler(Scheduler):
 
                 assert request.num_computed_tokens == 0
 
+                # Get locally-cached tokens. The hit blocks join the
+                # request's block table as shared blocks; only the rest of
+                # the prompt is scheduled for computation.
+                new_computed_blocks, num_new_local_computed_tokens = (
+                    self.kv_cache_manager.get_computed_blocks(request)
+                )
+
+                # Extend the full-block hit at sub-block granularity. The
+                # matched tokens are copied into the request's own block by
+                # the model runner (see kv_cache_copy_ops).
+                sub_block_match = self.kv_cache_manager.get_computed_blocks_sub_block(
+                    request, num_new_local_computed_tokens
+                )
+                num_sub_block_tokens = (
+                    sub_block_match.num_tokens if sub_block_match is not None else 0
+                )
+                num_computed_tokens = (
+                    num_new_local_computed_tokens + num_sub_block_tokens
+                )
+
                 # Number of tokens to be scheduled.
                 # We use `request.num_tokens` instead of
                 # `request.num_prompt_tokens` to consider the resumed
                 # requests, which have output tokens.
-                num_new_tokens = request.num_tokens
+                num_new_tokens = request.num_tokens - num_computed_tokens
 
                 num_new_tokens = min(num_new_tokens, token_budget)
                 assert num_new_tokens > 0
@@ -404,45 +430,26 @@ class RBLNOptimumScheduler(Scheduler):
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
+                    num_computed_tokens,
+                    new_computed_blocks,
                 )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if sub_block_match is not None:
+                        self.kv_cache_manager.release_sub_block_match(sub_block_match)
                     break
 
-                # Get locally-cached tokens.
-                # NOTE(eunji.lee):
-                # Allocation -> Caching
-                # Allocate blocks before cache lookup to prevent
-                # prefix-cache hit blocks from being reused for new requests,
-                # which would otherwise reduce the cache hit rate.
-                # This is special logic
-                # because we do not touch cache-hit blocks.
-                new_computed_blocks, num_new_local_computed_tokens = (
-                    self.kv_cache_manager.get_computed_blocks(request)
-                )
-
-                # Get the cached blocks for prefix caching.
-                # using new_computed_blocks, num_new_local_computed_tokens
-                if self.cache_config.enable_prefix_caching:
-                    (
-                        cached_block_table,
-                        cached_length,
-                    ) = self.kv_cache_manager.get_prefix_cached_blocks(
-                        request,
-                        new_computed_blocks,
-                        num_new_local_computed_tokens,
-                    )
-
-                    # Update the block table to the return output.
-                    self.update_block_table_dict(request, block_table_dict)
+                # Apply the sub-block match now that blocks are allocated
+                # (the destination block exists).
+                if sub_block_match is not None:
+                    self.kv_cache_manager.apply_sub_block_match(sub_block_match)
 
                 if request.prefill_stats is not None:
-                    num_local_cached_tokens = sum(cached_length)
-                    assert num_local_cached_tokens <= request.num_prompt_tokens
+                    assert num_new_local_computed_tokens <= request.num_prompt_tokens
                     request.prefill_stats.set(
                         num_prompt_tokens=request.num_prompt_tokens,
-                        num_local_cached_tokens=num_local_cached_tokens,
+                        num_local_cached_tokens=num_new_local_computed_tokens,
                         num_external_cached_tokens=0,
                     )
 
@@ -471,10 +478,7 @@ class RBLNOptimumScheduler(Scheduler):
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
-                # NOTE Setting num_computed_tokens to the number of tokens hit
-                # by prefix caching may cause incorrect computation
-                # of new_blocks during the decode phase.
-                request.num_computed_tokens = 0
+                request.num_computed_tokens = num_computed_tokens
 
                 # EC Connector: track multimodal features that need remote
                 # loading or local encoding for this request.
@@ -553,8 +557,6 @@ class RBLNOptimumScheduler(Scheduler):
                 if new_blocks is None:
                     # Cannot schedule this request.
                     break
-                if self.cache_config.enable_prefix_caching:
-                    self.update_block_table_dict(request, block_table_dict)
                 # Schedule the request.
                 scheduled_running_reqs.append(request)
                 request_id = request.request_id
@@ -638,9 +640,9 @@ class RBLNOptimumScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self._pending_free_mm_hashes,
             new_block_ids_to_zero=None,  # It is used for Mamba models
-            block_table_dict=block_table_dict,
-            cached_block_table=cached_block_table,
-            cached_length=cached_length,
+            # Source-block refs stay held until update_from_output(), which
+            # runs after the model runner finishes the copies.
+            kv_cache_copy_ops=self.kv_cache_manager.drain_pending_copy_ops(),
             dummy_block=dummy_block,
         )
 
@@ -666,6 +668,18 @@ class RBLNOptimumScheduler(Scheduler):
         self._pending_free_mm_hashes = []
         return scheduler_output
 
+    def update_from_output(self, scheduler_output, model_runner_output):
+        result = super().update_from_output(scheduler_output, model_runner_output)
+        # Now that execute_model has written KV data and
+        # super().update_from_output() has updated num_computed_tokens (and
+        # freed finished requests), index sub-blocks for the remaining
+        # running requests and release copy-op source refs.
+        self.kv_cache_manager.do_pending_indexing()
+        assert isinstance(scheduler_output, RBLNSchedulerOutput)
+        if scheduler_output.kv_cache_copy_ops:
+            self.kv_cache_manager.release_copy_ops(scheduler_output.kv_cache_copy_ops)
+        return result
+
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
@@ -680,13 +694,6 @@ class RBLNOptimumScheduler(Scheduler):
             )
         return super()._free_request(request, delay_free_blocks=delay_free_blocks)
 
-    def update_block_table_dict(
-        self, request: Request, block_table_dict: dict[str, torch.Tensor]
-    ) -> None:
-        request_id = request.request_id
-        block_table = self.kv_cache_manager.get_block_table(request_id)
-        block_table_dict[request_id] = block_table
-
     def _preempt_request(
         self,
         request: Request,
@@ -696,9 +703,9 @@ class RBLNOptimumScheduler(Scheduler):
             "Only running requests can be preempted"
         )
         preempted_blocks = self.kv_cache_manager.get_block_ids(request.request_id)[0]
-        self._free_request_blocks(request, preemption=True)
-        if not self.cache_config.enable_prefix_caching:
-            preempted_blocks = [block_idx - 1 for block_idx in preempted_blocks]
+        self._free_request_blocks(request)
+        # Log in compiler-space (block id 0 is the vLLM null block).
+        preempted_blocks = [block_idx - 1 for block_idx in preempted_blocks]
         logger.warning(
             "Request %s is preempted. Freed block(s): %s Already generated tokens: %d",
             request.request_id,
@@ -713,22 +720,3 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
-
-    def _free_request_blocks(self, request: Request, preemption: bool = False):
-        """Free the request's KV blocks, deferring the return to the block
-        pool when an in-flight GPU step may still write them.
-        """
-        if not self.defer_block_free or (
-            # Last scheduled step already processed: no in-flight write remains
-            # (always the case for a normal finish), so free now.
-            request.last_sched_seq <= self.processed_step_seq
-        ):
-            self.kv_cache_manager.free(request, preemption=preemption)
-            return
-        # Dead branch on the optimum path: defer_block_free is always False
-        # (no async scheduling / PP), so the guard above always frees and
-        # returns. Kept only to stay in sync with the upstream 0.24
-        # implementation. Note preemption is intentionally not threaded here.
-        blocks = self.kv_cache_manager.pop_blocks_for_free(request)
-        if blocks:
-            self.deferred_frees.append((self.sched_step_seq, blocks))
