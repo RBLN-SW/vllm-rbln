@@ -37,10 +37,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.kv_cache_copy import CopyOpMixin, KVCacheCopyOp
+from vllm_rbln.v1.core.page_layout import (
+    kernel_block_size_from_config,
+    resolve_config,
+    validate_fragmentation,
+)
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
-    KVCacheCopyOp,
     RBLNKVCacheManager,
     SubBlockMatch,
+)
+from vllm_rbln.v1.core.rbln_page_layout_kv_cache_manager import (
+    RBLNPageLayoutKVCacheManager,
 )
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
@@ -54,10 +62,32 @@ logger = init_logger(__name__)
 
 @dataclass
 class RBLNSchedulerOutput(SchedulerOutput):
-    """SchedulerOutput extended with KV cache copy operations for sub-block
-    prefix caching."""
+    """SchedulerOutput extended with KV cache copies for the worker to perform
+    before the forward pass.
+    """
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
+
+
+def _align_prefill_threshold(threshold: int, match_unit: int | None) -> int:
+    """Round the threshold down to a whole match unit.
+
+    Below one unit it is raised, not floored to zero, which would stall.
+    """
+    if threshold <= 0 or not match_unit:
+        return threshold
+    if threshold % match_unit == 0:
+        return threshold
+    aligned = max(match_unit, threshold - threshold % match_unit)
+    logger.warning(
+        "long_prefill_token_threshold=%d is not a multiple of the prefix match "
+        "unit %d; a prefill step would end mid-unit and that unit could never "
+        "be cached. Using %d instead.",
+        threshold,
+        match_unit,
+        aligned,
+    )
+    return aligned
 
 
 class RBLNScheduler(Scheduler):
@@ -73,7 +103,23 @@ class RBLNScheduler(Scheduler):
         # when sub-block prefix caching is enabled.
         # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
         # so that each prefill does not span multiple blocks.
-        if sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
+        # Token boundary a prefix-cache hit can land on; None when fine-grained
+        # matching is off.
+        match_unit: int | None = None
+
+        # A decode query is written as one contiguous KV window, so the
+        # spec-decode boundary guards below need the *physical* block. Without
+        # page layout that is `self.block_size`; page layout makes it coarser
+        # and `_maybe_install_page_layout_manager` overwrites this.
+        self.physical_block_size = self.block_size
+
+        # Supersedes the overlay: upstream gives the same fine-grained hits
+        # directly once the page is --block-size.
+        page_layout_installed = self._maybe_install_page_layout_manager()
+        if page_layout_installed:
+            match_unit = self.block_size
+            sub_block_size = None
+        elif sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
             sub_block_size = self.scheduler_config.max_num_batched_tokens
         if (
             self.cache_config.enable_prefix_caching
@@ -101,6 +147,7 @@ class RBLNScheduler(Scheduler):
                 watermark=self.scheduler_config.watermark,
             )
 
+            match_unit = sub_block_size
             logger.info(
                 "Sub-block prefix caching enabled: block_size=%d, sub_block_size=%d",
                 self.block_size,
@@ -114,6 +161,12 @@ class RBLNScheduler(Scheduler):
                     sub_block_size,
                 )
 
+        # Alignment holds inductively (chunk divides the unit, one prefill per
+        # step) except for this clamp, the one knob that cuts at any token.
+        self.long_prefill_token_threshold = _align_prefill_threshold(
+            self.scheduler_config.long_prefill_token_threshold, match_unit
+        )
+
         # NOTE(RBLN): Block deltas already committed in the KV cache manager
         # but not yet delivered to the model runner because the request was
         # evicted from the scheduler output. Running/cached requests need
@@ -122,11 +175,85 @@ class RBLNScheduler(Scheduler):
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
 
+        # KernelBlocks the worker already holds. Not derivable from the page delta:
+        # the list grows once per `pages_per_kernel_block` pages.
+        self._sent_kernel_block_counts: dict[str, int] = {}
+
         # NOTE(RBLN): PP degree for the per-step decode-admission budget
         # (DecodeBatchBudget.for_step): hard cap = max_num_seqs // pp, soft cap =
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+
+    def _maybe_install_page_layout_manager(self) -> bool:
+        """Swap in the page/kernel block manager; everything is derivable."""
+        if not envs.VLLM_RBLN_PAGE_LAYOUT:
+            return False
+        if not self.cache_config.enable_prefix_caching:
+            return False
+
+        kernel_block_size = kernel_block_size_from_config(self.vllm_config)
+        page_layout_config = resolve_config(
+            page_size=self.block_size,
+            kernel_block_size=kernel_block_size,
+            num_pages=self.kv_cache_config.num_blocks,
+        )
+        if not RBLNPageLayoutKVCacheManager.can_use_page_layout(
+            self.kv_cache_config, page_layout_config
+        ):
+            logger.warning(
+                "VLLM_RBLN_PAGE_LAYOUT is set but this configuration cannot "
+                "use it (kernel_block_size=%s, page_size=%d, kv_cache_groups=%d); "
+                "falling back.",
+                kernel_block_size,
+                self.block_size,
+                len(self.kv_cache_config.kv_cache_groups),
+            )
+            return False
+
+        page_layout_config.geometry.validate_chunk(
+            self.scheduler_config.max_num_batched_tokens
+        )
+        validate_fragmentation(
+            page_layout_config.geometry,
+            self.scheduler_config.max_num_seqs,
+            page_layout_config.num_kernel_blocks,
+            self.max_model_len,
+        )
+
+        hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
+        init_none_hash(hash_fn)
+        self.kv_cache_manager = RBLNPageLayoutKVCacheManager(
+            kv_cache_config=self.kv_cache_config,
+            page_layout_config=page_layout_config,
+            max_model_len=self.max_model_len,
+            scheduler_block_size=self.block_size,
+            hash_block_size=self.block_size,
+            enable_caching=True,
+            use_eagle=self.use_eagle,
+            log_stats=self.log_stats,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+            dcp_world_size=self.dcp_world_size,
+            pcp_world_size=self.pcp_world_size,
+            metrics_collector=self.kv_metrics_collector,
+            watermark=self.scheduler_config.watermark,
+        )
+        self.physical_block_size = page_layout_config.geometry.kernel_block_size
+        return True
+
+    def _spec_backfill_is_unsafe(
+        self, num_computed_tokens: int, num_new_tokens: int
+    ) -> bool:
+        """Would the runner's backfill reach out of the current physical block?
+
+        A decode query is written as one contiguous KV window, and the runner
+        pads it to `num_spec_tokens + 1` by reaching backwards. The block here
+        must be the *physical* one: under page layout the pages inside a kernel
+        block are contiguous (I3), so crossing a page boundary is harmless and
+        only a kernel-block boundary is a real discontinuity.
+        """
+        required_backfill = max(0, self.num_spec_tokens + 1 - num_new_tokens)
+        return required_backfill > num_computed_tokens % self.physical_block_size
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -280,8 +407,8 @@ class RBLNScheduler(Scheduler):
             ):
                 req_index += 1
                 continue
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if 0 < self.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = self.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -319,17 +446,17 @@ class RBLNScheduler(Scheduler):
             # the previous block, remember this request and force the finalized decode
             # batch to single-token decode only if this request remains scheduled.
             if self.num_spec_tokens > 0 and not is_prefill(request):
-                tokens_used_in_block = request.num_computed_tokens % self.block_size
-                remaining_in_block = self.block_size - tokens_used_in_block
+                tokens_used_in_block = (
+                    request.num_computed_tokens % self.physical_block_size
+                )
+                remaining_in_block = self.physical_block_size - tokens_used_in_block
                 num_new_tokens = min(remaining_in_block, num_new_tokens)
 
-                if num_new_tokens > 0:
-                    required_backfill = max(
-                        0, self.num_spec_tokens + 1 - num_new_tokens
-                    )
-                    if required_backfill > tokens_used_in_block:
-                        unsafe_backfill_req_ids.add(request.request_id)
-                        num_new_tokens = 1
+                if num_new_tokens > 0 and self._spec_backfill_is_unsafe(
+                    request.num_computed_tokens, num_new_tokens
+                ):
+                    unsafe_backfill_req_ids.add(request.request_id)
+                    num_new_tokens = 1
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -620,7 +747,7 @@ class RBLNScheduler(Scheduler):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    threshold = self.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
@@ -847,13 +974,10 @@ class RBLNScheduler(Scheduler):
                     # num_spec past tokens don't fit the current block the backfill
                     # would cross into the previous one -> mark unsafe so the batch
                     # drops to no-spec.
-                    if self.num_spec_tokens > 0:
-                        tokens_used_in_block = (
-                            request.num_computed_tokens % self.block_size
-                        )
-                        required_backfill = self.num_spec_tokens  # (num_spec+1)-1
-                        if required_backfill > tokens_used_in_block:
-                            unsafe_backfill_req_ids.add(request.request_id)
+                    if self.num_spec_tokens > 0 and self._spec_backfill_is_unsafe(
+                        request.num_computed_tokens, num_new_tokens
+                    ):
+                        unsafe_backfill_req_ids.add(request.request_id)
                     # NOTE(RBLN): this decode-ready request has just joined the
                     # decode batch (any route -- full remote-KV match or full
                     # local prefix-cache match), so count it against the shared
@@ -1022,7 +1146,7 @@ class RBLNScheduler(Scheduler):
         # Source-block refs are kept alive until update_from_output(),
         # which runs after the model runner finishes (safe for async
         # scheduling / pipeline parallelism).
-        if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
+        if isinstance(self.kv_cache_manager, CopyOpMixin):
             scheduler_output.kv_cache_copy_ops = (
                 self.kv_cache_manager.drain_pending_copy_ops()
             )
@@ -1051,7 +1175,59 @@ class RBLNScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._rewrite_block_ids_to_kernel_blocks(scheduler_output)
         return scheduler_output
+
+    def _rewrite_block_ids_to_kernel_blocks(
+        self, scheduler_output: RBLNSchedulerOutput
+    ) -> None:
+        """Swap page ids for the kernel blocks backing them, at the output boundary.
+
+        Keeps the translation out of ``schedule()``'s delta bookkeeping.
+        """
+        manager = self.kv_cache_manager
+        if not isinstance(manager, RBLNPageLayoutKVCacheManager):
+            return
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            kernel_blocks = manager.block_table(new_req.req_id)
+            new_req.block_ids = (list(kernel_blocks),)
+            self._sent_kernel_block_counts[new_req.req_id] = len(kernel_blocks)
+
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached.req_ids):
+            kernel_blocks = manager.block_table(req_id)
+            if req_id in cached.resumed_req_ids:
+                # resumed requests get the whole table, not a delta
+                cached.new_block_ids[i] = (list(kernel_blocks),)
+            else:
+                already_sent = self._sent_kernel_block_counts.get(req_id, 0)
+                delta = kernel_blocks[already_sent:]
+                cached.new_block_ids[i] = (list(delta),) if delta else None
+            self._sent_kernel_block_counts[req_id] = len(kernel_blocks)
+
+    def _inflight_prefill_reserved_blocks(self) -> int:
+        """What in-flight prefills have spoken for, rounded per request to groups.
+
+        Upstream sums the pages each one still needs, which under page layout
+        under-reserves exactly where it matters: four prefills a page short each
+        have to open a whole kernel block, and their sum -- four pages -- reads
+        as one. It also over-reserves the pages they can still take from their
+        own Open group. Both are per-request facts, so the rounding has to happen
+        before the sum, not after. Reported in pages, as whole groups, so it
+        passes through `allocate_slots`'s conversion untouched.
+        """
+        manager = self.kv_cache_manager
+        if not isinstance(manager, RBLNPageLayoutKVCacheManager):
+            return super()._inflight_prefill_reserved_blocks()
+
+        ppe = manager.geometry.pages_per_kernel_block
+        return ppe * sum(
+            manager.pool.kernel_blocks_needed(
+                self._request_remaining_blocks(request), owner=request.request_id
+            )
+            for request in self._inflight_prefills
+        )
 
     def _preempt_request(
         self, request: Request, timestamp: float
@@ -1059,6 +1235,7 @@ class RBLNScheduler(Scheduler):
         # Preempted requests resume with full block tables, so pending deltas
         # from the previous running state are stale.
         self._pending_runner_block_deltas.pop(request.request_id, None)
+        self._sent_kernel_block_counts.pop(request.request_id, None)
         return super()._preempt_request(request, timestamp)
 
     def _make_cached_request_data(
@@ -1105,6 +1282,7 @@ class RBLNScheduler(Scheduler):
         # Drop any pending runner block delta; the request is finishing and will
         # never be scheduled again.
         self._pending_runner_block_deltas.pop(request.request_id, None)
+        self._sent_kernel_block_counts.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(
@@ -1119,12 +1297,13 @@ class RBLNScheduler(Scheduler):
             # Now that execute_model has written KV data and
             # super().update_from_output() has updated num_computed_tokens
             # (and freed finished requests), index sub-blocks for the
-            # remaining running requests and release copy-op source refs.
+            # remaining running requests.
             self.kv_cache_manager.do_pending_indexing()
-            if scheduler_output.kv_cache_copy_ops:
-                self.kv_cache_manager.release_copy_ops(
-                    scheduler_output.kv_cache_copy_ops
-                )
+
+        # Sources can be released now the worker has read them; running after
+        # super() keeps this safe under async scheduling / PP.
+        if isinstance(self.kv_cache_manager, CopyOpMixin):
+            self.kv_cache_manager.release_copy_ops(scheduler_output.kv_cache_copy_ops)
 
         return result
 

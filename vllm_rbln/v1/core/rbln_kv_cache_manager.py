@@ -48,6 +48,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.kv_cache_copy import CopyOpMixin, KVCacheCopyOp
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -65,18 +66,6 @@ _SUB_BLOCK_ELIGIBLE_SPECS: tuple[type[KVCacheSpec], ...] = (
 )
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class KVCacheCopyOp:
-    """Describes a sub-block KV cache copy from a cached block to a new block."""
-
-    group_id: int
-    # NOTE: While pending, it holds a ref count of the source block to prevent eviction.
-    src_block_id: int
-    dst_block_id: int
-    # Number of tokens to copy (= num_matched_sub_blocks * sub_block_size).
-    num_tokens: int
 
 
 class SubBlockHasher:
@@ -285,7 +274,7 @@ class _GroupInfo:
     sub_block_index: SubBlockIndex
 
 
-class RBLNKVCacheManager(KVCacheManager):
+class RBLNKVCacheManager(CopyOpMixin, KVCacheManager):
     """KVCacheManager with sub-block prefix caching for RBLN.
 
     It first applies the upstream full-block prefix matching, then extends
@@ -354,11 +343,6 @@ class RBLNKVCacheManager(KVCacheManager):
 
         # Per-request sub-block hash cache (group-independent).
         self._req_sub_hashes: dict[str, _SubHashState] = {}
-
-        # Copy operations accumulated during a scheduling step; the scheduler
-        # drains this list when building SchedulerOutput. While pending, each
-        # copy op holds a ref count of its source block to prevent eviction.
-        self.pending_copy_ops: list[KVCacheCopyOp] = []
 
         # Requests for which sub-block indexing is pending.
         # Each entry stores the per-group full-block count snapshot
@@ -487,13 +471,13 @@ class RBLNKVCacheManager(KVCacheManager):
             block_list = blocks[i]
             # By this point, the destination block must have been allocated.
             dst_block = block_list[gm.dst_req_block_index]
-            self.pending_copy_ops.append(
+            self.queue_copy(
                 KVCacheCopyOp(
-                    group_id=i,
                     src_block_id=gm.src_block.block_id,
                     dst_block_id=dst_block.block_id,
                     num_tokens=match.num_tokens,
-                )
+                ),
+                (gm.src_block,),
             )
 
         if self.log_stats:
@@ -561,24 +545,6 @@ class RBLNKVCacheManager(KVCacheManager):
             request,
             num_full_blocks_before,
         )
-
-    def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
-        """Return and clear all pending copy operations.
-
-        Source-block refs are **retained** so the data remains valid until
-        the model runner finishes the copies.  The caller must call
-        :meth:`release_copy_ops` afterwards to free the refs.
-        """
-        ops = self.pending_copy_ops
-        self.pending_copy_ops = []
-        return ops
-
-    def release_copy_ops(self, ops: list[KVCacheCopyOp]) -> None:
-        """Release source-block refs held by previously drained copy ops."""
-        if ops:
-            self.block_pool.free_blocks(
-                [self.block_pool.blocks[op.src_block_id] for op in ops]
-            )
 
     def do_pending_indexing(self) -> None:
         """Index sub-blocks for requests whose indexing was deferred.

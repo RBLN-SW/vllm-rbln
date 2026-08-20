@@ -17,6 +17,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
+from dataclasses import replace
 from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -121,7 +122,8 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
 )
-from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.core.kv_cache_copy import KVCacheCopyOp
+from vllm_rbln.v1.core.page_layout import kernel_block_size_from_config
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
@@ -2702,6 +2704,60 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 else:
                     break
 
+    def _maybe_rescale_to_kernel_blocks(self, kv_cache_config: KVCacheConfig) -> None:
+        """Restate the KV geometry in kernel blocks so the worker sees one unit.
+
+        Every downstream path (tensor allocation, InputBatch, block tables,
+        attention metadata) then behaves as it does without the feature. This
+        is the inverse of upstream ``kernel_block_size``, which splits rather
+        than groups.
+        """
+        if not envs.VLLM_RBLN_PAGE_LAYOUT:
+            return
+        kernel_block_size = kernel_block_size_from_config(self.vllm_config)
+        if kernel_block_size is None:
+            return
+        page_size = self.cache_config.block_size
+        if kernel_block_size == page_size or kernel_block_size % page_size != 0:
+            return
+        pages_per_kernel_block = kernel_block_size // page_size
+
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not isinstance(spec, AttentionSpec) or spec.block_size != page_size:
+                return
+        for group in kv_cache_config.kv_cache_groups:
+            group.kv_cache_spec = replace(
+                group.kv_cache_spec, block_size=kernel_block_size
+            )
+
+        # Restate the spec only. `cache_config.block_size` must keep the page:
+        # the engine core reads it *after* this runs, in
+        # `resolve_kv_cache_block_sizes`, where for a single group it becomes
+        # both the scheduler block size and the hash block size. Under an
+        # in-process worker (uniproc, world_size 1) that read sees whatever we
+        # write here, and an kernel block-sized value contradicts the page-sized spec
+        # the scheduler kept -- `UnitaryKVCacheCoordinator` asserts on it.
+        old_num_blocks = kv_cache_config.num_blocks
+        num_kernel_blocks = old_num_blocks // pages_per_kernel_block
+        kv_cache_config.num_blocks = num_kernel_blocks
+        # A page count is not generally a whole number of kernel blocks, and the
+        # remainder is unusable anyway; without trimming, reshape trips on
+        # `numel() % page_size_bytes`.
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            bytes_per_page = kv_cache_tensor.size // old_num_blocks
+            kv_cache_tensor.size = (
+                bytes_per_page * pages_per_kernel_block * num_kernel_blocks
+            )
+        logger.info(
+            "Page/kernel block: worker KV geometry restated as %d kernel blocks of %d "
+            "tokens (page=%d, %d pages per kernel block).",
+            kv_cache_config.num_blocks,
+            kernel_block_size,
+            page_size,
+            pages_per_kernel_block,
+        )
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize KV cache based on `kv_cache_config`."""
         if envs.VLLM_RBLN_SUB_BLOCK_CACHE and (
@@ -2714,6 +2770,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
         kv_cache_config = deepcopy(kv_cache_config)
+        self._maybe_rescale_to_kernel_blocks(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
@@ -3129,32 +3186,46 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if (
+        use_runtime_kv_copy = (
             not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
             and envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
-            # in this path (VLLM_RBLN_USE_VLLM_MODEL).
-            for op in copy_ops:
-                runtime = self.runtime_holder[0]
-                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
-            return
-
+        )
+        if not getattr(self, "_logged_kv_copy_mode", False):
+            # Which copy path a measurement actually ran on, stated once per worker.
+            logger.info(
+                "KV copy path: %s",
+                "foreach" if envs.VLLM_RBLN_FOREACH_KV_COPY else "per-layer",
+            )
+            self._logged_kv_copy_mode = True
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         for op in copy_ops:
-            src = op.src_block_id
-            dst = op.dst_block_id
-            nt = op.num_tokens
+            src, dst = op.src_block_id, op.dst_block_id
+            src_start, dst_start, nt = op.src_start, op.dst_start, op.num_tokens
+            # The runtime helper can only copy a block prefix, which is the
+            # common case (a matched prefix starts at the kernel block boundary).
+            if use_runtime_kv_copy and src_start == 0 and dst_start == 0:
+                runtime = self.runtime_holder[0]
+                runtime._copy_kv_cache(src, dst, nt)
+                continue
+            src_end, dst_end = src_start + nt, dst_start + nt
             for kv_cache in self.kv_caches:
                 if self.model_config.use_mla:
-                    dsts.append(kv_cache[dst, :nt, :])
-                    srcs.append(kv_cache[src, :nt, :])
+                    d = kv_cache[dst, dst_start:dst_end, :]
+                    s = kv_cache[src, src_start:src_end, :]
                 else:
-                    dsts.append(kv_cache[:, dst, :, :, :nt, :])
-                    srcs.append(kv_cache[:, src, :, :, :nt, :])
-        torch._foreach_copy_(dsts, srcs)
+                    d = kv_cache[:, dst, :, :, dst_start:dst_end, :]
+                    s = kv_cache[:, src, :, :, src_start:src_end, :]
+                if envs.VLLM_RBLN_FOREACH_KV_COPY:
+                    dsts.append(d)
+                    srcs.append(s)
+                else:
+                    d.copy_(s)
+        if dsts:
+            # kv-copy-opt (fd996216): one dispatch for every layer of every op,
+            # instead of one slice assignment per layer.
+            torch._foreach_copy_(dsts, srcs)
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:

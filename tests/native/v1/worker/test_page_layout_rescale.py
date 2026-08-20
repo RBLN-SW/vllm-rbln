@@ -1,0 +1,130 @@
+# Copyright 2025 Rebellions Inc. All rights reserved.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Restating the worker's KV geometry from pages to kernel blocks."""
+
+import types
+from dataclasses import dataclass, field
+
+import pytest
+import torch
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+import vllm_rbln.envs as envs
+from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
+
+PAGE = 1024
+KERNEL_BLOCK = 8192
+BYTES_PER_PAGE = 4096
+
+
+@dataclass
+class FakeTensor:
+    size: int
+    shared_by: list = field(default_factory=lambda: ["layer0"])
+
+
+@dataclass
+class FakeGroup:
+    kv_cache_spec: object
+
+
+@dataclass
+class FakeConfig:
+    num_blocks: int
+    kv_cache_groups: list
+    kv_cache_tensors: list
+
+
+def make_config(num_pages=217, page_size=PAGE):
+    spec = FullAttentionSpec(
+        block_size=page_size, num_kv_heads=2, head_size=64, dtype=torch.float16
+    )
+    return FakeConfig(
+        num_blocks=num_pages,
+        kv_cache_groups=[FakeGroup(spec)],
+        kv_cache_tensors=[FakeTensor(size=num_pages * BYTES_PER_PAGE)],
+    )
+
+
+def rescale(
+    config, kernel_block=KERNEL_BLOCK, enabled=True, page=PAGE, monkeypatch=None
+):
+    runner = RBLNModelRunner.__new__(RBLNModelRunner)
+    cache_config = types.SimpleNamespace(block_size=page)
+    runner.vllm_config = types.SimpleNamespace(
+        additional_config={"attn_block_size": kernel_block} if kernel_block else {},
+        cache_config=cache_config,
+    )
+    runner.cache_config = cache_config
+    monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", enabled)
+    RBLNModelRunner._maybe_rescale_to_kernel_blocks(runner, config)
+    return runner, config
+
+
+def test_buffer_is_trimmed_to_whole_kernel_blocks(monkeypatch):
+    # 217 pages is not a whole number of 8-page kernel blocks; the leftover page
+    # cannot be allocated anyway, and leaving it in trips the reshape assert.
+    runner, config = rescale(make_config(217), monkeypatch=monkeypatch)
+    assert config.num_blocks == 27
+    assert config.kv_cache_groups[0].kv_cache_spec.block_size == KERNEL_BLOCK
+    assert config.kv_cache_tensors[0].size == BYTES_PER_PAGE * 8 * 27
+    assert config.kv_cache_tensors[0].size % (BYTES_PER_PAGE * 8) == 0
+
+
+def test_exact_multiple_loses_nothing(monkeypatch):
+    runner, config = rescale(make_config(216), monkeypatch=monkeypatch)
+    assert config.num_blocks == 27
+    assert config.kv_cache_tensors[0].size == 216 * BYTES_PER_PAGE
+
+
+def test_disabled_leaves_geometry_alone(monkeypatch):
+    runner, config = rescale(make_config(217), enabled=False, monkeypatch=monkeypatch)
+    assert config.num_blocks == 217
+    assert config.kv_cache_groups[0].kv_cache_spec.block_size == PAGE
+
+
+def test_model_without_published_kernel_block_is_untouched(monkeypatch):
+    runner, config = rescale(
+        make_config(217), kernel_block=None, monkeypatch=monkeypatch
+    )
+    assert config.num_blocks == 217
+    assert config.kv_cache_groups[0].kv_cache_spec.block_size == PAGE
+
+
+@pytest.mark.parametrize("kernel_block", [PAGE, 1536])
+def test_degenerate_or_misaligned_kernel_block_is_ignored(monkeypatch, kernel_block):
+    # kernel block == page is a no-op; a non-multiple is not expressible at all.
+    runner, config = rescale(
+        make_config(217), kernel_block=kernel_block, monkeypatch=monkeypatch
+    )
+    assert config.num_blocks == 217
+    assert config.kv_cache_groups[0].kv_cache_spec.block_size == PAGE
+
+
+def test_cache_config_keeps_the_page(monkeypatch):
+    # Only the spec is restated. The engine core reads cache_config.block_size
+    # after this, in resolve_kv_cache_block_sizes, where a single group makes it
+    # both the scheduler block size and the hash block size; an in-process
+    # worker shares the object, so an kernel block here contradicts the page-sized
+    # spec the scheduler kept and trips UnitaryKVCacheCoordinator's
+    # hash_block_size == block_size assert.
+    runner, _ = rescale(make_config(217), monkeypatch=monkeypatch)
+    assert runner.cache_config.block_size == PAGE
+    assert runner.vllm_config.cache_config.block_size == PAGE
+
+
+def test_block_size_is_untouched_when_disabled(monkeypatch):
+    runner, _ = rescale(make_config(217), enabled=False, monkeypatch=monkeypatch)
+    assert runner.cache_config.block_size == PAGE

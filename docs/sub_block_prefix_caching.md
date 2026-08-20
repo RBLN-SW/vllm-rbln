@@ -95,8 +95,10 @@ set the router's token processing block size to vLLM `--max-num-batched-tokens`
             * `do_pending_indexing()` executes the scheduled indexing work.
               Must be called after `super().update_from_output()`.
             * `can_use_sub_block_caching()` checks eligibility.
-   * `KVCacheCopyOp`: Dataclass describing a sub-block KV data copy:
-     `(group_id, src_block_id, dst_block_id, num_tokens)`.
+* `vllm_rbln.v1.core.kv_cache_copy`
+   * `KVCacheCopyOp`: Dataclass describing a KV data copy:
+     `(src_block_id, dst_block_id, num_tokens, src_start=0, dst_start=0)`.
+     Shared with page-layout caching.
 * `vllm_rbln.v1.core.rbln_scheduler`
    * `RBLNSchedulerOutput`: Extends `SchedulerOutput` with `kv_cache_copy_ops` field.
    * `RBLNScheduler.__init__`: Creates `RBLNKVCacheManager` when prefix caching is
@@ -185,7 +187,7 @@ produce logits).
 After `allocate_slots` succeeds, the scheduler calls
 `apply_sub_block_match(match)` which, for each group:
 1.  Looks up the destination block (newly allocated at the match boundary)
-2.  Appends `KVCacheCopyOp(group_id, src_block_id, dst_block_id, num_tokens)`
+2.  Appends `KVCacheCopyOp(src_block_id, dst_block_id, num_tokens)`
 
 ### Step 5: Copy execution (model runner)
 

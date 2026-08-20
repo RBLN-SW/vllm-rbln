@@ -23,6 +23,7 @@ import torch
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.native.v1.worker.utils import make_kv_cache_config, schedule_new
+from vllm_rbln.v1.core.kv_cache_copy import KVCacheCopyOp
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -144,3 +145,41 @@ class TestBuildAttentionMetadata:
         metadata = attn_metadata["layer.0"]
         assert metadata.kv_caches is None
         assert metadata.kv_cache_view_infos is runner.kv_cache_view_infos
+
+
+class TestProcessKVCacheCopyOps:
+    """The two copy paths must move identical bytes. VLLM_RBLN_FOREACH_KV_COPY
+    only changes how many dispatches it takes, never the result."""
+
+    @staticmethod
+    def _run(foreach, monkeypatch):
+        monkeypatch.setattr(mr.envs, "VLLM_RBLN_FOREACH_KV_COPY", foreach)
+        torch.manual_seed(0)
+        base = [torch.randn(2, 6, 2, 1, 16, 4) for _ in range(3)]
+        runner = SimpleNamespace(
+            kv_caches=[t.clone() for t in base],
+            model_config=SimpleNamespace(use_mla=False),
+            runtime_holder=[_unexpected("runtime._copy_kv_cache")],
+        )
+        mr.RBLNModelRunner._process_kv_cache_copy_ops(
+            runner,
+            [
+                KVCacheCopyOp(src_block_id=0, dst_block_id=3, num_tokens=16),
+                KVCacheCopyOp(
+                    src_block_id=1,
+                    dst_block_id=4,
+                    num_tokens=8,
+                    src_start=4,
+                    dst_start=0,
+                ),
+            ],
+        )
+        return base, runner.kv_caches
+
+    def test_paths_agree(self, monkeypatch):
+        base, per_layer = self._run(False, monkeypatch)
+        _, foreach = self._run(True, monkeypatch)
+        for a, b in zip(per_layer, foreach):
+            assert torch.equal(a, b)
+        # A path that copied nothing would pass the comparison above.
+        assert not torch.equal(per_layer[0], base[0])
