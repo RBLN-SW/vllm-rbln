@@ -1325,6 +1325,31 @@ def test_set_inputs_first_pass_slices_unsliced_decode_hidden() -> None:
     assert token_indices.tolist() == list(range(1, 8)) + list(range(9, 16))
 
 
+def test_dflash_preprocess_skips_discarded_hidden_states_copy() -> None:
+    """The decode-path override must pad ids/positions like the base class but
+    never touch self.hidden_states, whose padded copy propose() discards."""
+    proposer = _make_first_pass_proposer()
+    proposer.input_ids[:16] = torch.arange(16, dtype=torch.int32)
+    proposer.positions[:16] = torch.arange(100, 116, dtype=torch.int64)
+    # Any access raises: the override must not read the unused buffer.
+    proposer.hidden_states = object()
+
+    input_ids, positions, hidden, token_indices = proposer._preprocess(
+        2, 4, 16, torch.arange(3, dtype=torch.int32), False
+    )
+
+    assert hidden is None
+    assert input_ids.shape == (4, 8)
+    assert input_ids[:2].reshape(-1).tolist() == list(range(16))
+    assert input_ids[2:].abs().sum().item() == 0
+    assert positions.shape == (4, 8)
+    assert positions[:2].reshape(-1).tolist() == list(range(100, 116))
+    # dynamo non-view contract, same as the base pad path.
+    assert input_ids._base is None
+    assert positions._base is None
+    assert token_indices.tolist() == [0, 1, 2, 0]
+
+
 def test_rewind_rejected_tokens_subtracts_once_for_aliased_views() -> None:
     proposer = object.__new__(RBLNDFlashProposer)
     proposer.num_speculative_tokens = 7
@@ -1429,14 +1454,9 @@ def _make_propose_proposer(
     proposer._determine_draft_batch_padding = (
         lambda num_reqs_arg, num_tokens, is_prefill: (num_reqs_padded, None, None)
     )
-    proposer._preprocess = (
-        lambda num_reqs_arg, num_reqs_padded_arg, num_tokens, token_indices, is_prefill: (
-            proposer.input_ids[:num_tokens],
-            proposer.positions[:num_tokens],
-            None,
-            token_indices,
-        )
-    )
+    # Sentinel: the DFlash _preprocess override must never touch the base
+    # class's hidden-states buffer. Any access raises immediately.
+    proposer.hidden_states = object()
     return proposer
 
 

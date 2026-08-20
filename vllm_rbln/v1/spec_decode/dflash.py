@@ -1033,6 +1033,49 @@ class RBLNDFlashProposer(RBLNEagleProposer):
 
         return num_query_total, token_indices.to(torch.int32)
 
+    def _preprocess(
+        self,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_input_tokens: int,
+        token_indices_to_sample: torch.Tensor | None,
+        is_prefill: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
+        """The base decode path minus the discarded hidden-states copy.
+
+        DFlash's drafter reads the target's states out of its KV cache, so
+        both call sites here drop the third return value -- but the base
+        method still builds and pads `self.hidden_states` rows for it every
+        step, and `pad` clones view inputs even when no padding is needed
+        (the dynamo non-view contract). That is one per-step device copy
+        dispatch for a value nobody reads, the same class of per-step eager
+        cost this port removes everywhere else. input_ids and positions keep
+        the base padding behavior exactly; they feed the compiled graph.
+
+        DFlash always runs the decode shape (_DRAFT_IS_PREFILL); delegate a
+        prefill call to the base class rather than guessing at it.
+        """
+        if is_prefill:
+            return super()._preprocess(
+                num_reqs,
+                num_reqs_padded,
+                num_input_tokens,
+                token_indices_to_sample,
+                is_prefill,
+            )
+        input_ids = pad(
+            self.input_ids[:num_input_tokens].view(num_reqs, -1), 0, num_reqs_padded
+        )
+        positions = pad(
+            self.positions[:num_input_tokens].view(num_reqs, -1), 0, num_reqs_padded
+        )
+        token_indices_to_sample_padded = (
+            pad(token_indices_to_sample, 0, num_reqs_padded)
+            if token_indices_to_sample is not None
+            else None
+        )
+        return input_ids, positions, None, token_indices_to_sample_padded
+
     def build_per_group_and_layer_attn_metadata(self, cad, draft_index: int = 0):
         per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
             cad, draft_index
