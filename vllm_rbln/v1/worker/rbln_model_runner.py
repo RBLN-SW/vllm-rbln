@@ -2516,6 +2516,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         kv_caches: dict[str, torch.Tensor] = {}
         kv_cache_base_tensors: dict[str, torch.Tensor] = {}
         kv_cache_view_infos: dict[str, KVCacheViewInfo] = {}
+        marked_layers: list[str] = []
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -2569,6 +2570,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         .view(kv_cache_shape)
                     )
                     kv_caches[layer_name] = typed_base.permute(*inv_order)
+                    if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+                        # Keeps num_blocks resizable after compile; the compiler
+                        # allows one dynamic dim with a single attention use.
+                        torch._dynamo.mark_dynamic(kv_caches[layer_name], 1)
+                        marked_layers.append(layer_name)
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
                         view_shape=kv_cache_shape,
@@ -2576,6 +2582,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                 else:
                     raise NotImplementedError
+
+        if marked_layers:
+            logger.info(
+                "[Dynamic KV] mark_dynamic(kv_cache, dim=1) applied to %d layer(s); "
+                "%s shape=%s",
+                len(marked_layers),
+                marked_layers[0],
+                tuple(kv_caches[marked_layers[0]].shape),
+            )
 
         return kv_caches, kv_cache_base_tensors, kv_cache_view_infos
 
