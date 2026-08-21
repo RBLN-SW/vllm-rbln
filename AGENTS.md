@@ -16,7 +16,7 @@ uv run --no-sync pytest tests/native/v1/worker/test_rbln_worker.py::<one test> -
 uvx pre-commit run --files <every file you changed>
 ```
 
-Use the narrowest test target that covers the change. Start by running the specific affected test, such as `test_file.py::test_name`, and widen to the full test file only when necessary.
+Use the narrowest test target that covers the change. Start by running the specific affected test, such as `test_file.py::test_name`, and widen to the full test file only when necessary. Do not start by running an entire test directory.
 
 Treat an unexpectedly slow run as a signal to reassess, not something to wait out. Unless `--model-compile` was passed intentionally, stop any pytest run that continues for more than a couple of minutes, then reconsider the target and execution lane before rerunning it.
 
