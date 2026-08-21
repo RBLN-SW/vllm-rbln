@@ -83,6 +83,39 @@ steps:
       - *sync
       - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
 
+  - label: ":pytest: [CR13] pytest (T0)"
+    key: "nightly-t0-cr13"
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR13"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+
+  - label: ":pytest: [CR13] pytest (T2)"
+    key: "nightly-t2-cr13"
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR13"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    env:
+      VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
+      VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
+    timeout_in_minutes: 120
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
+
   # Measured, not gated: soft_fail keeps the build green and no measured lane
   # appears in the deploy step's depends_on. Every target under both targets/
   # directories names CR03/CR13 only, so there is no ATOM counterpart to run.
