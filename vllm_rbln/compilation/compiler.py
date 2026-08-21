@@ -102,10 +102,10 @@ def compile(
     set_option("process_group_dict", process_group_dict)
     set_option("guard_filter_fn", guard_filter_fn)
     set_option("_runtime_holder", runtime_holder)
-    if mode and isinstance(mode, str):
-        mode = [mode]
-        if envs.VLLM_RBLN_COMPILE_ONLY:
-            mode.append("compile_only")
+    if isinstance(mode, str):
+        mode = [mode] if mode else []
+    if envs.VLLM_RBLN_COMPILE_ONLY:
+        mode.append("compile_only")
     set_option("mode", mode)
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
