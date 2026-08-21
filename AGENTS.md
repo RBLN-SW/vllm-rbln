@@ -18,8 +18,6 @@ uvx pre-commit run --files <every file you changed>
 
 Use the narrowest test target that covers the change. Start by running the specific affected test, such as `test_file.py::test_name`, and widen to the full test file only when necessary. Do not start by running an entire test directory.
 
-Treat an unexpectedly slow run as a signal to reassess, not something to wait out. Unless `--model-compile` was passed intentionally, stop any pytest run that continues for more than a couple of minutes, then reconsider the target and execution lane before rerunning it.
-
 Run `pre-commit` through `uvx`, since it is not a project dependency. Pass `--files` explicitly to avoid depending on the current staging state.
 
 A new `.py` file needs the Apache header that every other file carries; `check-license-header` rejects it otherwise. Copy the header from a neighbouring file.
