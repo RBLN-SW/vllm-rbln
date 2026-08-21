@@ -1839,6 +1839,37 @@ def test_dflash_load_model_matches_current_eagle_contract(
     assert proposer.model_executable.__name__ == "dflash_wrapper"
 
 
+def test_dflash_reuses_dp_request_counts_at_block_width() -> None:
+    """Target-prefill token counts must not leak into block-shaped drafting."""
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.num_speculative_tokens = 7
+    proposer.max_num_tokens = 512
+    proposer.dp_rank = 0
+    proposer.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=2)
+    )
+    proposer.runner = SimpleNamespace(
+        specialized_moe_decode=True,
+        bucketing_manager=SimpleNamespace(
+            find_decode_batch_bucket=lambda n: next(
+                bucket for bucket in (1, 2, 4, 8) if bucket >= n
+            ),
+            decode_batch_buckets=[1, 2, 4, 8],
+        ),
+        # Target work is a 512-token prefill on rank 0 and decode on rank 1.
+        # DFlash nevertheless runs one eight-token block per request on both.
+        dp_status=(torch.tensor([512, 2]), torch.tensor([1, 2]), True),
+    )
+
+    num_reqs_padded, num_tokens_padded, tokens_across_dp = (
+        proposer._determine_draft_batch_padding(1, 8, False)
+    )
+
+    assert num_reqs_padded == 2
+    assert num_tokens_padded == 16
+    assert tokens_across_dp.tolist() == [8, 16]
+
+
 def test_causal_guard_rejects_causal_full_attention_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -730,6 +730,42 @@ class RBLNDFlashProposer(RBLNEagleProposer):
         return per_layer
 
     # ------------------------------------------------------------------
+    # Data-parallel shape reuse
+    # ------------------------------------------------------------------
+
+    def _reuse_dp_status(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        first_pass: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Translate the target's saved DP status to DFlash block shapes.
+
+        The runner saves target token and request counts so EAGLE can avoid a
+        second DP collective. Those token counts are also EAGLE's first-pass
+        counts, but they are never DFlash's: a 512-token target prefill still
+        leads to one fixed ``1 + num_speculative_tokens`` draft block.
+
+        Request counts are shared by both phases, so reuse those and derive the
+        per-rank DFlash token counts locally. DFlash is always decode-shaped;
+        the target's ``any_prefill`` bit must not force its draft to the largest
+        decode bucket.
+        """
+        assert first_pass, "DFlash has exactly one draft-model forward"
+        dp_status = self.runner.dp_status
+        assert dp_status is not None, (
+            "dp_status is not saved from _determine_batch_padding"
+        )
+        _, num_reqs_across_dp, _ = dp_status
+        local_reqs = int(num_reqs_across_dp[self.dp_rank])
+        assert local_reqs == num_reqs
+
+        block_width = 1 + self.num_speculative_tokens
+        assert num_tokens == num_reqs * block_width
+        num_tokens_across_dp = num_reqs_across_dp * block_width
+        return num_tokens_across_dp, num_reqs_across_dp, False
+
+    # ------------------------------------------------------------------
     # Compiled drafter graph
     # ------------------------------------------------------------------
 
