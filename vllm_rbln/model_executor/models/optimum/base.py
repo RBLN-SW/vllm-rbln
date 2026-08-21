@@ -46,7 +46,6 @@ class ModelInputForRBLN:
     input_positions: torch.Tensor
     block_tables: torch.Tensor
     running_requests_ids: list[str]
-    finished_requests_ids: list[str]
     is_prompt: bool = False
     multi_modal_kwargs: BatchedTensorInputs | None = None
     dummy_block: int | None = None  # for prefix caching

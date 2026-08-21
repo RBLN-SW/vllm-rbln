@@ -460,9 +460,6 @@ class RBLNOptimumModelRunner(
         if not isinstance(model, RBLNOptimumMultimodalMixin):
             return model_input
 
-        for request_id in model_input.finished_requests_ids:
-            self.mrope_position_deltas.pop(request_id, None)
-
         if model_input.is_prompt:
             return model.build_prefill_forward_inputs(
                 model_input, self.mrope_position_deltas
@@ -516,8 +513,6 @@ class RBLNOptimumModelRunner(
             multi_modal_kwargs: Batched multi-modal data,
             block_tables: [num_reqs, num_blocks_per_req] shaped tensor,
             running_requests_ids: RUNNING request IDs,
-            finished_requests_ids: FINISHED request IDs in between
-                the previous and the current steps,
             is_prompt: It is used only in V1
         ]
         """
@@ -532,7 +527,6 @@ class RBLNOptimumModelRunner(
         num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
         num_prefill_reqs = len(scheduler_output.scheduled_new_reqs)
         num_decode_reqs = scheduler_output.scheduled_cached_reqs.num_reqs
-        finished_requests_ids = scheduler_output.finished_req_ids
         is_prefill = False
 
         if num_prefill_reqs > 1 or (num_prefill_reqs >= 1 and num_decode_reqs > 0):
@@ -587,7 +581,6 @@ class RBLNOptimumModelRunner(
             block_tables=block_tables,
             cache_slot_ids=cache_slot_ids,
             running_requests_ids=running_request_ids,
-            finished_requests_ids=list(finished_requests_ids),
             # FIXME unify the variable name is_prefill and is_prompt
             is_prompt=is_prefill,
             dummy_block=scheduler_output.dummy_block,
@@ -885,6 +878,8 @@ class RBLNOptimumModelRunner(
 
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.mrope_position_deltas.pop(req_id, None)
+
             # Gemma3's attention manager still keeps per-request state the
             # model forward produces (attention mask, pad length); free it
             # here. Cache slot ids are owned by the scheduler.
