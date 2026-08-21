@@ -347,8 +347,8 @@ class RBLNOptimumModelRunner(
             # with self.synchronize_input_prep():
             self._update_states(scheduler_output)
             if not num_scheduled_tokens:
-                # FIXME If local block table exists in the model,
-                # clear the local block table.
+                # FIXME If the model keeps an attention manager (Gemma3),
+                # clear its per-request state.
                 # Because in the case of LLM (not AsyncLLMEngine),
                 # `finished_request_ids` is provided separately
                 # from new requests.
@@ -571,12 +571,21 @@ class RBLNOptimumModelRunner(
             + num_scheduled_tokens_np[:num_reqs]
         )
 
+        local_block_tables = torch.tensor(
+            [
+                scheduler_output.local_block_table_dict[req_id]
+                for req_id in running_request_ids
+            ],
+            dtype=torch.int16,
+        )
+
         # TODO interemediate_tensor should be set
         model_input = ModelInputForRBLN(
             input_tokens=input_ids,
             input_positions=positions,
             multi_modal_kwargs=multi_modal_kwargs if is_prefill else None,
             block_tables=block_tables,
+            local_block_tables=local_block_tables,
             running_requests_ids=running_request_ids,
             finished_requests_ids=list(finished_requests_ids),
             # FIXME unify the variable name is_prefill and is_prompt
@@ -876,8 +885,9 @@ class RBLNOptimumModelRunner(
 
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            # In case of sliding window / hybrid attention models,
-            # free the local block table id managed in the model's attention manager.
+            # Gemma3's attention manager still keeps per-request state the
+            # model forward produces (attention mask, pad length); free it
+            # here. Local block table ids are owned by the scheduler.
             if getattr(self.model, "attention_manager", None):
                 self.model.attention_manager.pop(req_id)
         # Remove the finished requests from the persistent batch.

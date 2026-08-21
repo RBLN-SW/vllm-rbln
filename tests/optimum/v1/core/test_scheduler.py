@@ -186,3 +186,63 @@ def test_schedule_alloc_block_policy(
     scheduler_output3 = scheduler.schedule()
     scheduled_cached_reqs = scheduler_output3.scheduled_cached_reqs
     assert scheduled_cached_reqs.new_block_ids[0][0] == exp_cached1_new
+
+
+def test_local_block_table_id_lifecycle():
+    """Each admitted request is pinned to the lowest free local block table id,
+    keeps it across decode steps, and releases it on finish for reuse."""
+    scheduler = create_scheduler(max_num_seqs=2)
+    requests = create_requests(num_requests=3, num_tokens=16)
+
+    scheduler.add_request(requests[0])
+    scheduler.add_request(requests[1])
+    output = scheduler.schedule()
+    assert output.local_block_table_dict == {"0": 0}
+    scheduler.update_from_output(output, create_model_runner_output(output))
+
+    output = scheduler.schedule()
+    assert output.local_block_table_dict == {"1": 1}
+    scheduler.update_from_output(output, create_model_runner_output(output))
+
+    # Decode covers every scheduled request with its pinned id.
+    output = scheduler.schedule()
+    assert output.local_block_table_dict == {"0": 0, "1": 1}
+    scheduler.update_from_output(output, create_model_runner_output(output))
+
+    # Finishing frees the id; the next admission reuses the lowest free one.
+    scheduler.finish_requests(requests[0].request_id, RequestStatus.FINISHED_STOPPED)
+    scheduler.add_request(requests[2])
+    output = scheduler.schedule()
+    assert output.local_block_table_dict == {"2": 0}
+
+
+def test_local_block_table_id_freed_on_preemption():
+    """A preempted request releases its local block table id immediately and is
+    re-admitted with a freshly allocated one."""
+    # 32-token prompts fill 2 blocks each; num_blocks=6 leaves 5 usable blocks
+    # (block 0 is the null block), so the first decode step preempts request 1:
+    # request 0 takes the fifth block and request 1 finds the pool empty.
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=64,
+        num_blocks=6,
+    )
+    requests = create_requests(num_requests=2, num_tokens=32)
+
+    for request in requests:
+        scheduler.add_request(request)
+    for _ in range(2):
+        output = scheduler.schedule()
+        scheduler.update_from_output(output, create_model_runner_output(output))
+
+    output = scheduler.schedule()
+    assert output.preempted_req_ids == {"1"}
+    assert output.local_block_table_dict == {"0": 0}
+    assert scheduler._local_block_table_ids == {"0": 0}
+    scheduler.update_from_output(output, create_model_runner_output(output))
+
+    # Once request 0 finishes, the preempted request resumes from prefill with
+    # the lowest free id, not its old one.
+    scheduler.finish_requests(requests[0].request_id, RequestStatus.FINISHED_STOPPED)
+    output = scheduler.schedule()
+    assert output.local_block_table_dict == {"1": 0}
