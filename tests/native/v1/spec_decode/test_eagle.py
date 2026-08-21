@@ -33,7 +33,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from tests.native.v1.spec_decode.utils import make_cad, make_eagle_proposer
-from vllm_rbln.v1.worker.dp_utils import ShapeConfig
+from vllm_rbln.v1.worker.dp_utils import DPStatus, ShapeConfig
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -506,6 +506,9 @@ class TestLoadModel:
         calls -- reaching its full-vocab scatter is the defect under test."""
 
         def __init__(self, d2t):
+            # Not super().__init__(): that builds the real head. Only the module
+            # bookkeeping is needed, so that load_model can walk modules().
+            torch.nn.Module.__init__(self)
             self.draft_id_to_target_id = d2t
             self.lm_head = object()
             self.logits_processor_calls: list[tuple[object, torch.Tensor]] = []
@@ -523,16 +526,42 @@ class TestLoadModel:
             return sample_hidden_states + 1
 
     @staticmethod
-    def _stub_super_load_model(monkeypatch, model=None):
+    def _stub_super_load_model(monkeypatch, model=None, modules=()):
         from vllm.v1.spec_decode.eagle import EagleProposer
 
         if model is None:
-            model = SimpleNamespace(compute_logits=lambda h: h)
+            model = SimpleNamespace(
+                compute_logits=lambda h: h, modules=lambda: iter(modules)
+            )
         monkeypatch.setattr(
             EagleProposer,
             "load_model",
             lambda self, target_model: setattr(self, "model", model),
         )
+
+    def test_a_dense_draft_reports_no_moe(self, monkeypatch):
+        # Nothing in a dense draft reads the step's padded token dimension, which
+        # is what lets an idle rank skip drafting altogether.
+        self._stub_super_load_model(monkeypatch)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        proposer.load_model(target_model=object())
+        assert proposer.draft_has_moe is False
+
+    def test_a_moe_draft_is_detected(self, monkeypatch):
+        # An MTP draft shares the target checkpoint, so its layer can be a fused
+        # MoE -- then its forward joins the DP all-gather and an idle rank has to
+        # run it to stay in step.
+        moe = mock.Mock(spec=eagle_module.MoERunner)
+        self._stub_super_load_model(monkeypatch, modules=(object(), moe))
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        proposer.load_model(target_model=object())
+        assert proposer.draft_has_moe is True
 
     def test_eager_wrapper_when_enforce_eager(self, monkeypatch):
         self._stub_super_load_model(monkeypatch)
@@ -577,6 +606,9 @@ class TestLoadModel:
 
             def compute_logits(self, sample_hidden_states):
                 return sample_hidden_states
+
+            def modules(self):
+                return iter(())
 
         monkeypatch.setattr(
             EagleProposer,
@@ -648,11 +680,11 @@ class TestLoadModel:
 
 
 class TestDummyRun:
-    def test_runs_and_invokes_model(self, monkeypatch):
-        # dummy_run is a warm-up: it drives the same orchestration and returns
-        # nothing, invoking the model at least once.
+    @staticmethod
+    def _proposer(monkeypatch, *, num_spec, dp_status=None, draft_has_moe=True):
         _neutralize(monkeypatch)
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        proposer = make_eagle_proposer(num_speculative_tokens=num_spec)
+        proposer.draft_has_moe = draft_has_moe
         proposer.runner = SimpleNamespace(
             is_prefill=False,
             input_batch=SimpleNamespace(
@@ -667,7 +699,7 @@ class TestDummyRun:
             kv_cache_bases=[],
             kv_cache_view_infos=[],
             shape_config=_shape_config(),
-            dp_status=None,
+            dp_status=dp_status,
             _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
                 np.cumsum(nt, dtype=cumsum_dtype),
                 None,
@@ -690,7 +722,26 @@ class TestDummyRun:
             ), torch.zeros(8, dtype=torch.int64)
 
         proposer.model_executable = executable
+        return proposer, calls
 
+    @staticmethod
+    def _status(*, idle):
+        # Two ranks, this one first. idle=True is the rank that drained while the
+        # peer keeps decoding, so it published the minimal entry rather than the
+        # three tokens per request the pass below actually runs.
+        local_tokens = 1 if idle else 3
+        return DPStatus(
+            num_tokens=(local_tokens, 8),
+            num_reqs=(1, 2),
+            is_prefill=(False, False),
+            is_idle=(idle, False),
+            num_tokens_across_dp=torch.tensor([local_tokens, 8], dtype=torch.int32),
+        )
+
+    def test_runs_and_invokes_model(self, monkeypatch):
+        # dummy_run is a warm-up: it drives the same orchestration and returns
+        # nothing, invoking the model at least once.
+        proposer, calls = self._proposer(monkeypatch, num_spec=1)
         assert (
             proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
             is None
@@ -700,47 +751,38 @@ class TestDummyRun:
     def test_multi_step_runs_second_loop(self, monkeypatch):
         # num_speculative_tokens > 1 warms up the extra draft loop too, so the
         # model runs once for the first pass plus once per extra step.
-        _neutralize(monkeypatch)
-        proposer = make_eagle_proposer(num_speculative_tokens=2)
-        proposer.runner = SimpleNamespace(
-            is_prefill=False,
-            input_batch=SimpleNamespace(
-                num_reqs=2,
-                block_table=[
-                    SimpleNamespace(
-                        get_cpu_tensor=lambda: torch.zeros((8, 4), dtype=torch.int32)
-                    )
-                ],
-            ),
-            kv_caches=[],
-            kv_cache_bases=[],
-            kv_cache_view_infos=[],
-            shape_config=_shape_config(),
-            dp_status=None,
-            _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
-                np.cumsum(nt, dtype=cumsum_dtype),
-                None,
-            ),
-        )
-        proposer.draft_attn_groups = [
-            SimpleNamespace(
-                get_metadata_builder=lambda: SimpleNamespace(
-                    build=lambda **k: object()
-                ),
-                layer_names=["draft.layer"],
-            )
-        ]
-        calls = []
-
-        def executable(**kwargs):
-            calls.append(1)
-            return kwargs["hidden_states"].reshape(
-                -1, proposer.hidden_size
-            ), torch.zeros(8, dtype=torch.int64)
-
-        proposer.model_executable = executable
+        proposer, calls = self._proposer(monkeypatch, num_spec=2)
         proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
         # first pass (1) + one extra draft step (num_speculative_tokens - 1 = 1).
+        assert len(calls) == 2
+
+    @pytest.mark.parametrize("idle,passes", [(True, 0), (False, 2)])
+    def test_a_dense_draft_runs_unless_this_rank_is_idle(
+        self, monkeypatch, idle, passes
+    ):
+        # An idle rank's passes are discarded and, with no fused MoE, no peer waits
+        # inside a collective for them, so the chain is skipped. A busy rank's are
+        # the drafts of the step and always run.
+        proposer, calls = self._proposer(
+            monkeypatch,
+            num_spec=2,
+            dp_status=self._status(idle=idle),
+            draft_has_moe=False,
+        )
+        proposer.dummy_run(num_reqs=1, num_tokens_per_req=3, is_prefill=False)
+        assert len(calls) == passes
+
+    def test_an_idle_rank_runs_an_moe_draft(self, monkeypatch):
+        # A fused-MoE draft all-gathers across DP inside its forward, so the busy
+        # ranks are waiting on this rank's passes even though its output is
+        # discarded.
+        proposer, calls = self._proposer(
+            monkeypatch,
+            num_spec=2,
+            dp_status=self._status(idle=True),
+            draft_has_moe=True,
+        )
+        proposer.dummy_run(num_reqs=1, num_tokens_per_req=3, is_prefill=False)
         assert len(calls) == 2
 
 

@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -77,6 +78,8 @@ class RBLNEagleProposer(EagleProposer):
         # Populated from the draft model in `load_model`. None means the draft
         # head shares the target vocabulary, so `propose()` maps no ids.
         self.draft_id_to_target_id: torch.Tensor | None = None
+        # Whether a draft forward joins the DP all-gather; see `load_model`.
+        self.draft_has_moe = False
 
     def propose(
         self,
@@ -370,6 +373,13 @@ class RBLNEagleProposer(EagleProposer):
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
 
+        # Fused MoE is the only reader of the step's padded token dimension, so a
+        # draft without it runs no collective of its own -- which is what lets an
+        # idle rank skip drafting entirely rather than draft a discarded result.
+        self.draft_has_moe = any(
+            isinstance(module, MoERunner) for module in self.model.modules()
+        )
+
         def model_wrapper(
             input_ids: torch.Tensor,
             positions: torch.Tensor,
@@ -478,6 +488,17 @@ class RBLNEagleProposer(EagleProposer):
         *,
         num_padded_tokens: int | None = None,
     ) -> None:
+        status = self.runner.dp_status
+        if (
+            status is not None
+            and status.is_idle[self.dp_rank]
+            and not self.draft_has_moe
+        ):
+            # This rank has no work, so what a draft pass produces here is
+            # discarded, and without fused MoE no busy rank is waiting inside a
+            # collective for it.
+            return
+
         num_tokens = num_tokens_per_req * num_reqs
         assert num_tokens <= self.max_num_tokens
         override_padded = num_padded_tokens
