@@ -35,39 +35,29 @@ class AttentionManager(Generic[StrategyT, EntryT, Result1T, Result2T]):
     def __init__(self, strategy: StrategyT):
         self._s: StrategyT = strategy
 
-    def add(self, running_requests_id: str, local_table_id: int, **kwargs) -> None:
-        self._s.add(running_requests_id, local_table_id, **kwargs)
-
-    def get(
+    def add(
         self,
-        is_prompt: bool,
-        decoder_batch_size: int,
-        running_requests_ids: list[str],
-        finished_requests_ids: list[str],
-        **kwargs,
-    ) -> Any:
-        return self._s.get(
-            is_prompt,
-            decoder_batch_size,
-            running_requests_ids,
-            finished_requests_ids,
-            **kwargs,
-        )
+        running_requests_id: str,
+        pad_len: int,
+        attention_mask: torch.Tensor,
+    ) -> None:
+        self._s.add(running_requests_id, pad_len, attention_mask)
+
+    def get(self, running_requests_ids: list[str]) -> Any:
+        return self._s.get(running_requests_ids)
 
     def preprocess(
         self,
-        local_block_table_ids: list[int],
         cache_positions: torch.Tensor,
-        request_nums: int,
         decoder_batch_size: int,
-        **kwargs,
+        pad_lens: list[int],
+        attention_masks: list[torch.Tensor],
     ) -> Any:
         return self._s.preprocess(
-            local_block_table_ids,
             cache_positions,
-            request_nums,
             decoder_batch_size,
-            **kwargs,
+            pad_lens,
+            attention_masks,
         )
 
     def clear(self):

@@ -66,7 +66,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
-        self.strategy = HybridAttentionImageStrategy(PAD_TOKEN_ID)
+        self.strategy = HybridAttentionImageStrategy()
         self.attention_manager: HybridAttentionImageManager = (
             HybridAttentionImageManager(self.strategy)
         )
@@ -75,38 +75,21 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         input_ids = model_input.input_tokens
         position_ids = model_input.input_positions
         block_tables = model_input.block_tables
+        cache_slot_ids = model_input.cache_slot_ids
+        assert cache_slot_ids is not None
 
         is_prompt = model_input.is_prompt
-
-        finished_requests_ids = model_input.finished_requests_ids
         running_requests_ids = model_input.running_requests_ids
         request_nums = input_ids.shape[0]
 
-        # In prefill phase, the length of list must be 1
-        sliding_window_table_ids, padded_cache_lengths, attention_masks = (
-            self.attention_manager.get(
-                is_prompt,
-                self.decoder_batch_size,
-                running_requests_ids,
-                finished_requests_ids,
-                input_ids=input_ids,
-            )
-        )
         kwargs = self.preprocess_for_decoder(
             is_prompt, block_tables, input_ids, position_ids
         )
-
-        # [prefill] the length of the padded cache is calculated
-        # during the forward pass and stored in self.sliding_window_table.
-        # [decode] `cache_position` and `position_ids` are distinguished
-        # due to the padding space reserved for the sliding window.
         cache_position = kwargs.pop("cache_position")
         input_ids = kwargs.pop("input_ids")
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
-            prefill_batch_idx = sliding_window_table_ids[0]
-            local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
             # token_type_ids model_input != token_type_ids of gemma3
             # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
             token_type_ids = torch.zeros_like(input_ids)
@@ -115,29 +98,26 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             # `image_token_id`. Subclasses override `_image_token_id()` accordingly.
             token_type_ids[input_ids == self._image_token_id()] = 1
 
+            attention_mask = (input_ids != PAD_TOKEN_ID).to(torch.int64).squeeze(0)
             inputs_embeds = model_input.inputs_embeds
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
-            assert attention_masks is not None
-            attention_mask = attention_masks[0]
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
-                local_block_tables=local_block_table_id,
+                local_block_tables=cache_slot_ids,
                 block_tables=block_tables,
                 token_type_ids=token_type_ids,
             )
             logits = output.logits
-            updated_attention_mask = output.attention_mask
-            updated_cache_lengths = output.padded_cache_lengths
-
-            assert len(running_requests_ids) == 1
+            # The prefill graph computes the padded cache length and the
+            # attention mask over the padded cache layout; keep them for the
+            # decode steps of this request.
             self.attention_manager.add(
                 running_requests_id=running_requests_ids[0],
-                local_table_id=sliding_window_table_ids[0],
-                pad_len=updated_cache_lengths,
-                attention_mask=updated_attention_mask,
+                pad_len=output.padded_cache_lengths,
+                attention_mask=output.attention_mask,
             )
         else:
             if self.model.language_model.decoders is None:
@@ -146,18 +126,18 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             self.model.language_model.decoder = self.model.language_model.decoders[
                 padded_batch_size
             ]
+            pad_lens, attention_masks = self.attention_manager.get(running_requests_ids)
+            # `cache_position` and `position_ids` are distinguished due to the
+            # padding space reserved in the cache during prefill.
             (
-                local_block_table_id,
                 cache_position,
                 position_ids,
                 attention_mask,
             ) = self.attention_manager.preprocess(
-                sliding_window_table_ids,
                 cache_position,
-                request_nums,
                 padded_batch_size,
-                pad_lens=padded_cache_lengths,
-                attention_masks=attention_masks,
+                pad_lens,
+                attention_masks,
             )
 
             attention_mask = self.attention_manager.update(
@@ -170,12 +150,12 @@ class RBLNOptimumGemma3ForConditionalGeneration(
                 input_ids=input_ids,
                 cache_position=cache_position,
                 block_tables=block_tables,
-                local_block_tables=local_block_table_id,
+                local_block_tables=self.pad_cache_slot_ids(
+                    cache_slot_ids, padded_batch_size
+                ),
                 attention_mask=attention_mask,
                 position_ids=position_ids,
             ).logits
-
-        if not is_prompt:
             logits = logits[:request_nums]
         return logits
 
@@ -196,8 +176,9 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         # enters here today. It documents the contract for when EC is extended.
         raise NotImplementedError(
             "EC disaggregation is not implemented for Gemma3: its hybrid "
-            "sliding-window attention prefill needs attention_manager state "
-            "that build_prefill_inputs_from_cache does not yet provide."
+            "sliding-window attention prefill needs the cache slot ids from "
+            "ModelInputForRBLN and must record the prefill graph's attention "
+            "mask, which build_prefill_inputs_from_cache does not support."
         )
 
     def _process_image_input(

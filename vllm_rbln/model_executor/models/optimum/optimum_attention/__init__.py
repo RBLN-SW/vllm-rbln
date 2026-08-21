@@ -12,15 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .optimum_attention_manager import AttentionManager, HybridAttentionImageManager
-from .optimum_attention_strategy import (
-    HybridAttentionImageStrategy,
-    InnerAttentionEntry,
-)
+from .optimum_attention_manager import HybridAttentionImageManager
+from .optimum_attention_strategy import HybridAttentionImageStrategy
 
 __all__ = [
-    "AttentionManager",
-    "InnerAttentionEntry",
     "HybridAttentionImageManager",
     "HybridAttentionImageStrategy",
 ]
