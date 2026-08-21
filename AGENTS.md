@@ -12,11 +12,15 @@ Two documents own their subjects; read them rather than duplicating them here:
 Run everything through `uv`. Never use the system `python3` or a bare `pip`.
 
 ```bash
-uv run --no-sync pytest tests/native/v1/worker/test_rbln_worker.py -x
+uv run --no-sync pytest tests/native/v1/worker/test_rbln_worker.py::<one test> -x
 uvx pre-commit run --files <every file you changed>
 ```
 
-Pick the narrowest test target that covers the change. `pre-commit` is not a project dependency, so run it through `uvx`. Passing `--files` explicitly keeps the run independent of what happens to be staged.
+Use the narrowest test target that covers the change. Start by running the specific affected test, such as `test_file.py::test_name`, and widen to the full test file only when necessary.
+
+Treat an unexpectedly slow run as a signal to reassess, not something to wait out. Unless `--model-compile` was passed intentionally, stop any pytest run that continues for more than a couple of minutes, then reconsider the target and execution lane before rerunning it.
+
+Run `pre-commit` through `uvx`, since it is not a project dependency. Pass `--files` explicitly to avoid depending on the current staging state.
 
 A new `.py` file needs the Apache header that every other file carries; `check-license-header` rejects it otherwise. Copy the header from a neighbouring file.
 
