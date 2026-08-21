@@ -182,7 +182,12 @@ def _agent_bin() -> str | None:
 
 
 def publish_summary(
-    lane: str, target_dir: Path, body: str, *, degraded: bool = False
+    lane: str,
+    target_dir: Path,
+    body: str,
+    *,
+    chip: str | None = None,
+    degraded: bool = False,
 ) -> None:
     """Report a target's results to the log, a file, and the build page.
 
@@ -190,16 +195,19 @@ def publish_summary(
     is allowed to raise: a lane that measured for two hours must not fail because
     its numbers could not be written down."""
     try:
-        _publish_summary(lane, target_dir, body, degraded=degraded)
+        _publish_summary(lane, target_dir, body, chip=chip, degraded=degraded)
     except Exception as exc:  # noqa: BLE001 -- see the docstring
         print(f"  summary: not published ({type(exc).__name__}: {exc})", flush=True)
 
 
-def _publish_summary(lane: str, target_dir: Path, body: str, *, degraded: bool) -> None:
+def _publish_summary(
+    lane: str, target_dir: Path, body: str, *, chip: str | None, degraded: bool
+) -> None:
     """Cheapest channel first, so a failure in one still leaves the rest.
 
-    One context per (lane, target): a driver that runs once per target would
-    otherwise leave only the last one, and each carries its own style."""
+    One context per (lane, chip, target): a driver runs once per target, and the
+    nightly runs a lane on two chips, so a context short of all three keeps only
+    whichever job annotated last. Each carries its own style."""
     # `+++` expands the group, putting the table at the top of the step's log.
     on_ci = bool(os.environ.get("BUILDKITE"))
     heading = f"+++ {lane} summary" if on_ci else f"=== {lane} summary"
@@ -221,7 +229,7 @@ def _publish_summary(lane: str, target_dir: Path, body: str, *, degraded: bool) 
             agent,
             "annotate",
             "--context",
-            f"{lane}-{target_dir.name}",
+            "-".join(part for part in (lane, chip, target_dir.name) if part),
             "--style",
             "warning" if degraded else "info",
         ],
