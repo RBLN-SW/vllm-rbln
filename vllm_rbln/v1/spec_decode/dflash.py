@@ -334,6 +334,8 @@ class _DFlashSplitForwardGraph:
 class RBLNDFlashProposer(RBLNEagleProposer):
     """DFlash drafting on the RBLN execution shell."""
 
+    _supports_extra_input_slots = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,

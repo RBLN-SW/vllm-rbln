@@ -49,6 +49,10 @@ logger = init_logger(__name__)
 
 
 class RBLNEagleProposer(EagleProposer):
+    # DFlash subclasses the RBLN EAGLE execution shell but implements its own
+    # expanded input-slot staging. Plain EAGLE does not support that path yet.
+    _supports_extra_input_slots = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -59,7 +63,7 @@ class RBLNEagleProposer(EagleProposer):
 
         if self.supports_mm_inputs:
             raise NotImplementedError
-        if self.needs_extra_input_slots:
+        if self.needs_extra_input_slots and not self._supports_extra_input_slots:
             raise NotImplementedError(
                 "vllm-rbln does not support EAGLE extra input slots required for "
                 "parallel drafting or draft-model speculative decoding yet."

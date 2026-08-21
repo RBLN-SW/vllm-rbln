@@ -1797,6 +1797,13 @@ def test_configure_dflash_layers_handles_absent_layer_types() -> None:
     assert proposer._dflash_sliding_window is None
 
 
+def test_dflash_declares_support_for_expanded_input_slots() -> None:
+    # Latest vLLM marks DFlash as parallel drafting and allocates seven masked
+    # query slots plus the bonus-token slot. The RBLN DFlash implementation
+    # stages those slots itself, so it must bypass the inherited EAGLE guard.
+    assert RBLNDFlashProposer._supports_extra_input_slots
+
+
 def test_causal_guard_rejects_causal_full_attention_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
