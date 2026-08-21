@@ -444,6 +444,7 @@ class RBLNEagleProposer(EagleProposer):
                 runtime_holder=self.runner.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                 use_static_output=True,
+                use_direct_dispatch=True,
             )
 
     def _build_dummy_attn_metadata(

@@ -22,6 +22,7 @@ from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 
 from vllm_rbln import envs
 from vllm_rbln.compilation.backends import rbln_backend
+from vllm_rbln.compilation.dispatch import Dispatcher
 
 CompiledTarget = TypeVar("CompiledTarget")
 
@@ -84,6 +85,7 @@ def compile(
     use_cache: bool = True,
     cache_dir: str = "",
     use_static_output: bool = False,
+    use_direct_dispatch: bool = False,
 ) -> CompiledTarget:
     _ensure_torch_dynamo_configured()
 
@@ -112,13 +114,13 @@ def compile(
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
         set_option("mega_cache_only", True)
 
-    return cast(
-        CompiledTarget,
-        torch.compile(
-            target,
-            backend=backend,
-            dynamic=dynamic,
-            fullgraph=fullgraph,
-            options=options,
-        ),
+    compiled = torch.compile(
+        target,
+        backend=backend,
+        dynamic=dynamic,
+        fullgraph=fullgraph,
+        options=options,
     )
+    if use_direct_dispatch:
+        return cast(CompiledTarget, Dispatcher(target, compiled))
+    return cast(CompiledTarget, compiled)

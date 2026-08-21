@@ -1895,6 +1895,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model_executable = compile(
                 model_wrapper,
                 dynamic=False,
+                # A graph break would put part of the step in a resume frame,
+                # which the dispatcher's __code__ swap cannot reach.
+                fullgraph=True,
                 compile_context=self.compile_context,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
@@ -1905,12 +1908,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # Logits are consumed by sampling within the same step, so the
                 # output buffer can be reused across steps even under async scheduling.
                 use_static_output=True,
+                use_direct_dispatch=True,
             )
             # NOTE(RBLN): We compile compute_logits separately to cover cases when
             # `self.use_wrapped_compute_logits` is `False`
             self.compute_logits = compile(
                 self.model.compute_logits,
                 dynamic=False,
+                fullgraph=True,
                 compile_context=self.compile_context,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
