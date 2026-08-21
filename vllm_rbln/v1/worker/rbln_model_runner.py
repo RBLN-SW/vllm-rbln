@@ -1679,7 +1679,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     host.copy_(prev_sampled[:n_fb, 0])
                     staged_model_inputs.input_ids[:n_fb, 0].copy_(host)
                 elif rows:
-                    staged_model_inputs.input_ids[dsts, 0] = prev_sampled[rows, 0]
+                    # index_put_ demands equal dtypes, unlike the copy_ above.
+                    # The sampling op's width is not fixed -- `rbln::argmax`
+                    # still returns int64 -- so cast to the staged buffer's.
+                    staged_model_inputs.input_ids[dsts, 0] = prev_sampled[rows, 0].to(
+                        staged_model_inputs.input_ids.dtype
+                    )
 
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear
