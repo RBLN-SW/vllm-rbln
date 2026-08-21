@@ -84,7 +84,9 @@ Conversation with the user is not a repository artifact. Reply in the language t
 
 ## What not to publish
 
-This repository is public. Keep measured numbers out of it: throughput, latency, memory footprint, and accuracy from internal runs do not belong in code, comments, tests, docs, commit messages, or PR descriptions. Benchmark scripts live here; their results do not. When a change needs a measurement to justify it, describe the direction and keep the figures to an internal channel.
+This repository is public. Absolute measurements stay out of it: throughput, latency, memory footprint, and accuracy from an internal run do not belong in code, comments, tests, docs, commit messages, or PR descriptions. Benchmark scripts live here; their results do not.
+
+A relative change is fine. Say that something got a third faster, not what the two numbers were, and keep the raw figures to an internal channel.
 
 Upstream vLLM asks for eval results in the PR description. That convention does not apply here.
 

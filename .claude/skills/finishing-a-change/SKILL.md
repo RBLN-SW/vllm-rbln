@@ -39,7 +39,7 @@ Look for each of these:
 - **`else` branches for cases that cannot happen** — should be `assert` or `raise`
 - **Dead leftovers** — renamed `_var`, unused re-exports, `# removed` comments
 - **Anything not in English**
-- **Measured numbers** — throughput, latency, memory, or accuracy from an internal run. Take them out; this repository is public.
+- **Absolute measurements** — throughput, latency, memory, or accuracy from an internal run. Take them out; this repository is public. A relative change is fine.
 
 Repository-specific checks:
 
@@ -66,5 +66,5 @@ An empty list is a claim. Only write it if it is true.
 - Summarise what changed in a line or two, then explain what the diff cannot show
 - Say which model path or paths the change affects
 - English
-- A perf change says the direction, not the number
+- A perf change may give a relative change, never an absolute measurement
 - Fill in `.github/PULL_REQUEST_TEMPLATE.md`. `gh pr create --body` does not apply it, so read the file and follow its sections rather than writing free-form prose.
