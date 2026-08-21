@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from collections.abc import Iterable
 
 import torch
@@ -25,6 +26,25 @@ from vllm.model_executor.models.utils import (
 )
 
 from vllm_rbln.patches import register_patch
+
+_LAYER_IDX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def _skip_truncated_layers(
+    weights: Iterable[tuple[str, torch.Tensor]], num_hidden_layers: int
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Drop checkpoint weights of layers a config-truncated model does not build.
+
+    Restores the [RBLN] skip that lived in the forked load_weights removed by
+    #947: a model truncated via hf_overrides (num_hidden_layers=N) still reads
+    the full checkpoint, and stock load_weights KeyErrors on `layers.N+`.
+    A model truncated via VLLM_RBLN_NUM_HIDDEN_LAYERS keeps the full config,
+    so this filter is a no-op on that path."""
+    for name, weight in weights:
+        m = _LAYER_IDX.search(name)
+        if m and int(m.group(1)) >= num_hidden_layers:
+            continue
+        yield name, weight
 
 
 # NOTE(RBLN): Introduced in https://github.com/RBLN-SW/vllm-rbln/pull/81
@@ -46,6 +66,12 @@ def patched_load_module(
 ) -> Iterable[str]:
     if isinstance(module, PPMissingLayer):
         return
+
+    if module is self.module and not base_prefix:
+        config = getattr(module, "config", None)
+        num_hidden_layers = getattr(config, "num_hidden_layers", 0)
+        if num_hidden_layers and not getattr(config, "_rbln_load_last_n_layers", False):
+            weights = _skip_truncated_layers(weights, num_hidden_layers)
 
     # Avoid infinite recursion since this function is typically
     # called inside load_weights of the module itself
