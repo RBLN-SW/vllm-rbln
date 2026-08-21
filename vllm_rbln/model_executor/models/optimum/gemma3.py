@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -27,11 +28,77 @@ from .model_base import (
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
 )
-from .optimum_attention import HybridAttentionImageManager, HybridAttentionImageStrategy
 
 logger = init_logger(__name__)
 
 PAD_TOKEN_ID = 0
+
+
+@dataclass
+class HybridAttentionEntry:
+    pad_len: int
+    attention_mask: torch.Tensor
+
+
+class HybridAttentionStateManager:
+    """Per-request decode state that the prefill graph produces and the
+    scheduler therefore cannot own: the padded cache length and the attention
+    mask over the padded cache layout. Recorded at prefill; every decode step
+    replays it, enables the newly generated token position, and stores the
+    advanced mask for the next step. The model runner frees an entry when its
+    request finishes.
+    """
+
+    def __init__(self) -> None:
+        self.table: dict[str, HybridAttentionEntry] = {}
+
+    def add(self, request_id: str, pad_len: int, attention_mask: torch.Tensor) -> None:
+        self.table[request_id] = HybridAttentionEntry(
+            pad_len=pad_len,
+            attention_mask=attention_mask,
+        )
+
+    def build_decode_inputs(
+        self,
+        running_requests_ids: list[str],
+        position_ids: torch.Tensor,
+        decoder_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batch the recorded state in running order.
+
+        `position_ids` must already be padded to `decoder_batch_size` rows.
+        Returns (cache_position, position_ids, attention_mask): each row's
+        cache_position offsets its position by the request's padded cache
+        length. The advanced attention mask is written back to the table for
+        the next step.
+        """
+        assert position_ids.shape[0] == decoder_batch_size
+        entries = [self.table[request_id] for request_id in running_requests_ids]
+
+        pad_lens = torch.zeros(decoder_batch_size, 1, dtype=torch.int16)
+        pad_lens[: len(entries), 0] = torch.tensor(
+            [entry.pad_len for entry in entries], dtype=torch.int16
+        )
+        cache_position = position_ids + pad_lens
+
+        masks = [entry.attention_mask for entry in entries]
+        attention_mask = torch.zeros(
+            decoder_batch_size, masks[0].shape[1], dtype=masks[0].dtype
+        )
+        attention_mask[: len(masks)] = torch.cat(masks)
+        # Enable attention for the token generated this step.
+        rows = torch.arange(attention_mask.shape[0])
+        attention_mask[rows, cache_position.squeeze(1)] = 1
+        for idx, request_id in enumerate(running_requests_ids):
+            self.table[request_id].attention_mask = attention_mask[idx : idx + 1]
+
+        return cache_position, position_ids, attention_mask
+
+    def pop(self, request_id: str) -> None:
+        self.table.pop(request_id, None)
+
+    def clear(self) -> None:
+        self.table.clear()
 
 
 class RBLNOptimumGemma3ForConditionalGeneration(
@@ -66,10 +133,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
-        self.strategy = HybridAttentionImageStrategy()
-        self.attention_manager: HybridAttentionImageManager = (
-            HybridAttentionImageManager(self.strategy)
-        )
+        self.attention_manager = HybridAttentionStateManager()
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
@@ -115,7 +179,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             # attention mask over the padded cache layout; keep them for the
             # decode steps of this request.
             self.attention_manager.add(
-                running_requests_id=running_requests_ids[0],
+                running_requests_ids[0],
                 pad_len=output.padded_cache_lengths,
                 attention_mask=output.attention_mask,
             )
@@ -126,24 +190,16 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             self.model.language_model.decoder = self.model.language_model.decoders[
                 padded_batch_size
             ]
-            pad_lens, attention_masks = self.attention_manager.get(running_requests_ids)
             # `cache_position` and `position_ids` are distinguished due to the
             # padding space reserved in the cache during prefill.
             (
                 cache_position,
                 position_ids,
                 attention_mask,
-            ) = self.attention_manager.preprocess(
+            ) = self.attention_manager.build_decode_inputs(
+                running_requests_ids,
                 cache_position,
                 padded_batch_size,
-                pad_lens,
-                attention_masks,
-            )
-
-            attention_mask = self.attention_manager.update(
-                running_requests_ids,
-                attention_mask,
-                cache_position,
             )
 
             logits = self.model.language_model.decoder(

@@ -25,11 +25,10 @@ import types
 import torch
 
 from vllm_rbln.model_executor.models.optimum.gemma3 import (
-    RBLNOptimumGemma3ForConditionalGeneration as Gemma3,
+    HybridAttentionStateManager,
 )
-from vllm_rbln.model_executor.models.optimum.optimum_attention import (
-    HybridAttentionImageManager,
-    HybridAttentionImageStrategy,
+from vllm_rbln.model_executor.models.optimum.gemma3 import (
+    RBLNOptimumGemma3ForConditionalGeneration as Gemma3,
 )
 
 
@@ -40,7 +39,7 @@ def _bare_gemma3(max_batch_size: int) -> Gemma3:
     obj.decoder_batch_size = max_batch_size
     obj.use_multiple_decoder = False
     obj.available_blocks = torch.arange(50, 60, dtype=torch.int16)
-    obj.attention_manager = HybridAttentionImageManager(HybridAttentionImageStrategy())
+    obj.attention_manager = HybridAttentionStateManager()
     obj._image_token_id = lambda: 999
     return obj
 
@@ -82,9 +81,9 @@ def test_forward_prefill_passes_slot_and_records_graph_state():
     )
     # No PAD tokens in the prompt -> all-ones prompt mask.
     assert torch.equal(passed["attention_mask"], torch.ones(3, dtype=torch.int64))
-    pad_lens, masks = obj.attention_manager.get(["A"])
-    assert pad_lens == [2]
-    assert torch.equal(masks[0], graph_mask)
+    entry = obj.attention_manager.table["A"]
+    assert entry.pad_len == 2
+    assert torch.equal(entry.attention_mask, graph_mask)
 
 
 def test_forward_decode_wires_state_by_running_order():
@@ -137,6 +136,6 @@ def test_forward_decode_wires_state_by_running_order():
         torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 0, 0, 1, 0]]),
     )
     # ...and is written back for the next step.
-    _, masks = obj.attention_manager.get(["B", "A"])
-    assert torch.equal(masks[0], torch.tensor([[1, 1, 1, 1, 0, 0]]))
-    assert torch.equal(masks[1], torch.tensor([[1, 1, 0, 0, 1, 0]]))
+    table = obj.attention_manager.table
+    assert torch.equal(table["B"].attention_mask, torch.tensor([[1, 1, 1, 1, 0, 0]]))
+    assert torch.equal(table["A"].attention_mask, torch.tensor([[1, 1, 0, 0, 1, 0]]))
