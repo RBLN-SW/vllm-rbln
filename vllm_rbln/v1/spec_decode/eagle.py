@@ -338,6 +338,7 @@ class RBLNEagleProposer(EagleProposer):
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
+            _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
             query_start_loc_cpu=query_start_loc,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,

@@ -945,14 +945,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             return blk_table_tensor
 
+        seq_lens_cpu = self.seq_lens[:num_reqs]
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc[: num_reqs + 1],
             query_start_loc_cpu=self.query_start_loc[: num_reqs + 1],
-            seq_lens=self.seq_lens[:num_reqs],
+            seq_lens=seq_lens_cpu,
+            _seq_lens_cpu=seq_lens_cpu,
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
-            max_seq_len=self.seq_lens[:num_reqs].max().item(),
+            max_seq_len=seq_lens_cpu.max().item(),
             block_table_tensor=_get_block_table(0),
             slot_mapping=torch.tensor(0),  # dummy
             causal=True,

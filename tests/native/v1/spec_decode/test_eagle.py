@@ -230,6 +230,7 @@ class TestPrepareInputsPadded:
         # assembles the padded spec-decode CommonAttentionMetadata around it.
         proposer = make_eagle_proposer()
         cad = make_cad([0, 3, 6, 9], [8, 8, 8])
+        cad._seq_lens_cpu = cad.seq_lens
         spec_md = SimpleNamespace(
             cu_num_draft_tokens=torch.tensor([2, 4, 6], dtype=torch.int32)
         )
@@ -246,6 +247,7 @@ class TestPrepareInputsPadded:
         assert spec_cad.max_query_len == 3
         assert spec_cad.max_seq_len == 8
         assert spec_cad.causal is True
+        assert spec_cad._seq_lens_cpu is cad._seq_lens_cpu
 
 
 class TestPrepareNextTokenIdsPadded:

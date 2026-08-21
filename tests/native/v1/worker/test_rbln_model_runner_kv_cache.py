@@ -144,3 +144,28 @@ class TestBuildAttentionMetadata:
         metadata = attn_metadata["layer.0"]
         assert metadata.kv_caches is None
         assert metadata.kv_cache_view_infos is runner.kv_cache_view_infos
+
+    def test_dflash_common_metadata_keeps_host_seq_lens(
+        self, make_model_runner, monkeypatch
+    ):
+        from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
+
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = _one_group_two_layers(make_model_runner)
+        runner._update_states(schedule_new("a"))
+        drafter = object.__new__(RBLNDFlashProposer)
+        drafter.kv_cache_gid = 0
+        runner.drafter = drafter
+
+        runner.query_start_loc[:2] = torch.tensor([0, 3], dtype=torch.int32)
+        runner.seq_lens[:1] = torch.tensor([3], dtype=torch.int32)
+
+        _, spec_common = runner._build_attention_metadata(
+            num_tokens=3, num_reqs=1, max_query_len=3
+        )
+
+        assert spec_common is not None
+        assert spec_common._seq_lens_cpu is spec_common.seq_lens
+        assert spec_common._seq_lens_cpu.tolist() == [3]
