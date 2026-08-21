@@ -259,6 +259,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else None
         )
         self.runtime_holder: list = []
+        # Set once warm-up has compiled every model shape (see warmup_model).
+        self._skip_guard_eval = False
 
         # Sampler
         if envs.VLLM_RBLN_SAMPLER:
@@ -1474,6 +1476,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
+            # Scoped to the model call: demand-driven compiled helpers (e.g.
+            # logprobs gathering in the sampler) legitimately compile after
+            # warm-up and must keep full guard evaluation.
+            torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+            if self._skip_guard_eval
+            else nullcontext(),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -3124,6 +3132,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter.dummy_run()
 
         mega_cache.save(self.model_config.model, sig)
+
+        # Warm-up compiled every shape the model executable dispatches, so
+        # keep only the guards that pick between cache entries; an un-warmed
+        # shape now raises instead of silently recompiling.
+        self._skip_guard_eval = True
+        logger.info("Dynamo guard evaluation reduced to diff guards.")
 
     def _process_kv_cache_copy_ops(
         self,
