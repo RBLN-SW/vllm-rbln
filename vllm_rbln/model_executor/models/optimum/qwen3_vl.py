@@ -362,8 +362,8 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         done by the scatter (input_block_ids in forward / compute_decode_position_embed)
         and undone by the logits gather (batch_indices in forward).
         """
-        assert model_input.local_block_tables is not None
-        return model_input.local_block_tables.to(torch.long)
+        assert model_input.cache_slot_ids is not None
+        return model_input.cache_slot_ids.to(torch.long)
 
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
         pass
@@ -417,8 +417,8 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         block_tables = model_input.block_tables
 
         if model_input.is_prompt:
-            assert model_input.local_block_tables is not None
-            batch_idx = int(model_input.local_block_tables[0])
+            assert model_input.cache_slot_ids is not None
+            batch_idx = int(model_input.cache_slot_ids[0])
             kw = self.preprocess_for_decoder(
                 True, block_tables, input_ids, cache_position
             )

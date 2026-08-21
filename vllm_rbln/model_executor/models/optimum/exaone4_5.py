@@ -179,9 +179,9 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         # NOTE: this guard is currently unreachable — init_model() only enables
         # the EC path for "RBLNQwen3VLForConditionalGeneration", so EXAONE-4.5
         # never enters here today. It documents the contract for when EC is
-        # extended: the sliding-window/hybrid-cache prefill needs the local
-        # block tables from ModelInputForRBLN, which build_prefill_inputs
-        # does not receive.
+        # extended: the sliding-window/hybrid-cache prefill needs the cache
+        # slot ids from ModelInputForRBLN, which build_prefill_inputs does
+        # not receive.
         raise NotImplementedError(
             "EC disaggregation is not implemented for EXAONE-4.5."
         )
@@ -227,8 +227,8 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions
         block_tables = model_input.block_tables
-        local_block_tables = model_input.local_block_tables
-        assert local_block_tables is not None
+        cache_slot_ids = model_input.cache_slot_ids
+        assert cache_slot_ids is not None
 
         request_nums = input_ids.shape[0]
         is_prompt = model_input.is_prompt
@@ -248,7 +248,7 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
-                local_block_tables=local_block_tables,
+                local_block_tables=cache_slot_ids,
                 block_tables=block_tables if self.is_hybrid else None,
             ).logits
         else:
@@ -260,8 +260,8 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
-                local_block_tables=self.pad_local_block_tables(
-                    local_block_tables, padded_batch_size
+                local_block_tables=self.pad_cache_slot_ids(
+                    cache_slot_ids, padded_batch_size
                 ),
                 block_tables=block_tables if self.is_hybrid else None,
             ).logits

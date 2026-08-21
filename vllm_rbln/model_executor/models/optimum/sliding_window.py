@@ -62,8 +62,8 @@ class RBLNOptimumSlidingWindowAttentionForCausalLM(
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions
         block_tables = model_input.block_tables
-        local_block_tables = model_input.local_block_tables
-        assert local_block_tables is not None
+        cache_slot_ids = model_input.cache_slot_ids
+        assert cache_slot_ids is not None
 
         request_nums = input_ids.shape[0]
         is_prompt = model_input.is_prompt
@@ -83,7 +83,7 @@ class RBLNOptimumSlidingWindowAttentionForCausalLM(
             output = self.model.prefill_decoder(
                 input_ids=input_ids,
                 cache_position=cache_position,
-                local_block_tables=local_block_tables,
+                local_block_tables=cache_slot_ids,
                 block_tables=block_tables if self.is_hybrid else None,
             )
             logits = output.logits
@@ -92,8 +92,8 @@ class RBLNOptimumSlidingWindowAttentionForCausalLM(
             logits = self.model.decoder(
                 input_ids=input_ids,
                 cache_position=cache_position,
-                local_block_tables=self.pad_local_block_tables(
-                    local_block_tables, padded_batch_size
+                local_block_tables=self.pad_cache_slot_ids(
+                    cache_slot_ids, padded_batch_size
                 ),
                 block_tables=block_tables if self.is_hybrid else None,
             ).logits

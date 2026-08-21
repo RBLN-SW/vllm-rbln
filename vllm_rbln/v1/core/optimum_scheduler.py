@@ -64,8 +64,8 @@ class RBLNSchedulerOutput(SchedulerOutput):
         The index of dummy block for padding. It is required
         if the number of requests is less than the number of batch_size
         in decode phase.
-    local_block_table_dict: dict[str, int]
-        Mapping from request ID to its local block table id, for every
+    cache_slot_id_dict: dict[str, int]
+        Mapping from request ID to its cache slot id, for every
         scheduled request. The id is the request's row in the per-sequence
         on-device caches (sliding-window KV, linear-attention state), pinned
         for the request's lifetime.
@@ -75,7 +75,7 @@ class RBLNSchedulerOutput(SchedulerOutput):
     cached_block_table: list[int] = field(default_factory=list)
     cached_length: list[int] = field(default_factory=list)
     dummy_block: int | None = None
-    local_block_table_dict: dict[str, int] = field(default_factory=dict)
+    cache_slot_id_dict: dict[str, int] = field(default_factory=dict)
 
 
 class RBLNOptimumScheduler(Scheduler):
@@ -171,13 +171,13 @@ class RBLNOptimumScheduler(Scheduler):
         self.block_size = self.cache_config.block_size
         # req_id -> Request
         self.requests: dict[str, Request] = {}
-        # req_id -> local block table id: the request's row in the
+        # req_id -> cache slot id: the request's row in the
         # per-sequence on-device caches (sliding-window KV, linear-attention
         # state). The rows are a fixed [max_num_seqs] pool; each request is
         # pinned to the lowest free row at admission and holds it until it
         # finishes or is preempted. Shipped to the worker through
-        # RBLNSchedulerOutput.local_block_table_dict.
-        self._local_block_table_ids: dict[str, int] = {}
+        # RBLNSchedulerOutput.cache_slot_id_dict.
+        self._cache_slot_ids: dict[str, int] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -465,10 +465,10 @@ class RBLNOptimumScheduler(Scheduler):
 
                 req_index += 1
                 self.running.append(request)
-                free_local_ids = set(range(self.max_num_running_reqs)) - set(
-                    self._local_block_table_ids.values()
+                free_slot_ids = set(range(self.max_num_running_reqs)) - set(
+                    self._cache_slot_ids.values()
                 )
-                self._local_block_table_ids[request_id] = min(free_local_ids)
+                self._cache_slot_ids[request_id] = min(free_slot_ids)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -659,9 +659,8 @@ class RBLNOptimumScheduler(Scheduler):
             cached_block_table=cached_block_table,
             cached_length=cached_length,
             dummy_block=dummy_block,
-            local_block_table_dict={
-                req_id: self._local_block_table_ids[req_id]
-                for req_id in num_scheduled_tokens
+            cache_slot_id_dict={
+                req_id: self._cache_slot_ids[req_id] for req_id in num_scheduled_tokens
             },
         )
 
@@ -700,7 +699,7 @@ class RBLNOptimumScheduler(Scheduler):
                 f.identifier for f in request.mm_features
             )
         # A request aborted while WAITING was never admitted and holds no id.
-        self._local_block_table_ids.pop(request.request_id, None)
+        self._cache_slot_ids.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks=delay_free_blocks)
 
     def update_block_table_dict(
@@ -732,8 +731,8 @@ class RBLNOptimumScheduler(Scheduler):
         request.num_computed_tokens = 0
         request.num_preemptions += 1
         # The preempted request restarts from prefill, so it releases its
-        # local block table id now and gets a fresh one at re-admission.
-        del self._local_block_table_ids[request.request_id]
+        # cache slot id now and gets a fresh one at re-admission.
+        del self._cache_slot_ids[request.request_id]
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 

@@ -16,7 +16,7 @@
 Qwen3.5's GatedDeltaNet ``linear_attention`` state is a fixed ``[max_num_seqs]``
 on-device cache indexed by batch ROW. The scheduler pins each request to a
 stable row for its lifetime and ships it as
-``ModelInputForRBLN.local_block_tables``: prefill writes that row, decode
+``ModelInputForRBLN.cache_slot_ids``: prefill writes that row, decode
 places the request at ``row == batch_idx`` and gathers logits back to running
 order. No hardware needed.
 """
@@ -91,7 +91,7 @@ class TestDecodeLayoutWiring:
             input_positions=torch.tensor([[5], [7]]),
             block_tables=torch.tensor([[10], [11]], dtype=torch.int16),
             position_embed=torch.zeros(2, 2, 1, 1, 1),
-            local_block_tables=torch.tensor([1, 0], dtype=torch.int16),
+            cache_slot_ids=torch.tensor([1, 0], dtype=torch.int16),
         )
 
         logits = obj.forward(model_input)
@@ -129,7 +129,7 @@ class TestDecodeLayoutWiring:
             input_positions=torch.tensor([[9]]),
             block_tables=torch.tensor([[10]], dtype=torch.int16),
             position_embed=torch.zeros(2, 1, 1, 1, 1),
-            local_block_tables=torch.tensor([1], dtype=torch.int16),
+            cache_slot_ids=torch.tensor([1], dtype=torch.int16),
         )
         logits = obj.forward(model_input)
 
@@ -163,7 +163,7 @@ class TestDecodeLayoutWiring:
             block_tables=torch.tensor([[10]], dtype=torch.int16),
             inputs_embeds=torch.zeros(1, 1, 1),
             position_embed=torch.zeros(2, 1, 1, 1, 1),
-            local_block_tables=torch.tensor([1], dtype=torch.int16),
+            cache_slot_ids=torch.tensor([1], dtype=torch.int16),
         )
         obj.forward(model_input)
 

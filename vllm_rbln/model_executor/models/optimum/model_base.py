@@ -408,21 +408,21 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         }
         return kwargs
 
-    def pad_local_block_tables(
+    def pad_cache_slot_ids(
         self,
-        local_block_tables: torch.Tensor,
+        cache_slot_ids: torch.Tensor,
         padded_batch_size: int,
     ) -> torch.Tensor:
-        """Pad the decode local block table ids to [padded_batch_size, 1].
+        """Pad the decode cache slot ids to [padded_batch_size, 1].
 
         Padding rows must not alias a scheduled request's row in the
         per-sequence cache, so the pad value is the lowest id no scheduled
         request owns (0 when the batch is full and no padding row exists).
         """
-        used_ids = set(local_block_tables.tolist())
+        used_ids = set(cache_slot_ids.tolist())
         pad_value = next((i for i in range(padded_batch_size) if i not in used_ids), 0)
         padded = torch.full((padded_batch_size, 1), pad_value, dtype=torch.int16)
-        padded[: local_block_tables.shape[0], 0] = local_block_tables
+        padded[: cache_slot_ids.shape[0], 0] = cache_slot_ids
         return padded
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:

@@ -311,7 +311,7 @@ def _schedule_new_request(
         cached_block_table=[],
         cached_length=[],
         dummy_block=None,
-        local_block_table_dict={req_id: i for i, req_id in enumerate(req_ids)},
+        cache_slot_id_dict={req_id: i for i, req_id in enumerate(req_ids)},
     )
 
 
@@ -359,7 +359,7 @@ def _schedule_new_request_from_request(
         cached_block_table=[],
         cached_length=[],
         dummy_block=None,
-        local_block_table_dict={req.request_id: 0},
+        cache_slot_id_dict={req.request_id: 0},
     )
 
 
@@ -409,7 +409,7 @@ def _schedule_cached_reqs(
         cached_block_table=[],
         cached_length=[],
         dummy_block=None,
-        local_block_table_dict={req.request_id: i for i, req in enumerate(reqs)},
+        cache_slot_id_dict={req.request_id: i for i, req in enumerate(reqs)},
     )
 
 

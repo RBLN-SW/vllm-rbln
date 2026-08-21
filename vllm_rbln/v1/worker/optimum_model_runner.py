@@ -571,9 +571,9 @@ class RBLNOptimumModelRunner(
             + num_scheduled_tokens_np[:num_reqs]
         )
 
-        local_block_tables = torch.tensor(
+        cache_slot_ids = torch.tensor(
             [
-                scheduler_output.local_block_table_dict[req_id]
+                scheduler_output.cache_slot_id_dict[req_id]
                 for req_id in running_request_ids
             ],
             dtype=torch.int16,
@@ -585,7 +585,7 @@ class RBLNOptimumModelRunner(
             input_positions=positions,
             multi_modal_kwargs=multi_modal_kwargs if is_prefill else None,
             block_tables=block_tables,
-            local_block_tables=local_block_tables,
+            cache_slot_ids=cache_slot_ids,
             running_requests_ids=running_request_ids,
             finished_requests_ids=list(finished_requests_ids),
             # FIXME unify the variable name is_prefill and is_prompt
@@ -887,7 +887,7 @@ class RBLNOptimumModelRunner(
             self.num_prompt_logprobs.pop(req_id, None)
             # Gemma3's attention manager still keeps per-request state the
             # model forward produces (attention mask, pad length); free it
-            # here. Local block table ids are owned by the scheduler.
+            # here. Cache slot ids are owned by the scheduler.
             if getattr(self.model, "attention_manager", None):
                 self.model.attention_manager.pop(req_id)
         # Remove the finished requests from the persistent batch.
