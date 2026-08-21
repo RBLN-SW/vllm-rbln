@@ -66,3 +66,20 @@ steps:
       - *sync
       - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
       - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t1-compile.sh"
+
+  - label: ":pytest: [CR13] pytest"
+    key: "vllm-rbln-pytest-cr13"
+    if_changed: *if_changed
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR13"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t1-compile.sh"
