@@ -28,7 +28,7 @@ into an actual TPOT win here.
 
 Why this subclasses RBLNEagleProposer rather than upstream DFlashProposer:
 upstream splits along "which drafting algorithm", but the expensive, fragile
-part on RBLN is the execution shell -- compiled graph wiring, DP rendezvous and
+part on RBLN is the execution shell -- compiled graph wiring, DP shape handling and
 padding, per-group attention metadata, KV-cache bindings, batch bucketing. All
 of that lives in RBLNEagleProposer and is written against SpecDecodeBaseProposer,
 not against anything EAGLE3-specific (upstream's EagleProposer is a 22-line
@@ -766,7 +766,6 @@ class RBLNDFlashProposer(RBLNEagleProposer):
 
         if target_rope_is_neox is not None:
             _check_draft_rope_style(self.model, target_rope_is_neox)
-        self._probe_dp_rendezvous_need()
         self._hidden_state_combiner = _BoundedHiddenStateCombiner(
             self.model.combine_hidden_states,
         )

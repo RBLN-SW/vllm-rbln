@@ -1804,6 +1804,41 @@ def test_dflash_declares_support_for_expanded_input_slots() -> None:
     assert RBLNDFlashProposer._supports_extra_input_slots
 
 
+def test_dflash_load_model_matches_current_eagle_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DFlash must not call helpers removed from the current EAGLE shell."""
+    from vllm.v1.spec_decode.eagle import EagleProposer
+
+    class FakeDraft(nn.Module):
+        def forward(self, input_ids, positions, inputs_embeds):
+            return torch.zeros((*input_ids.shape, 4))
+
+        def combine_hidden_states(self, hidden_states):
+            return hidden_states
+
+        def compute_logits(self, hidden_states):
+            return hidden_states
+
+    monkeypatch.setattr(
+        EagleProposer,
+        "load_model",
+        lambda self, target_model: setattr(self, "model", FakeDraft()),
+    )
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.hidden_size = 4
+    proposer.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(layer_types=[])
+    )
+    proposer.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enforce_eager=True)
+    )
+
+    proposer.load_model(nn.Identity())
+
+    assert proposer.model_executable.__name__ == "dflash_wrapper"
+
+
 def test_causal_guard_rejects_causal_full_attention_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
