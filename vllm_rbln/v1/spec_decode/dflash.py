@@ -909,6 +909,21 @@ class RBLNDFlashProposer(RBLNEagleProposer):
                 compile_forward(full_forward),
             )
 
+    def _build_dummy_attn_metadata(
+        self,
+        num_reqs: int,
+        num_tokens_per_req: int,
+    ) -> CommonAttentionMetadata:
+        metadata = super()._build_dummy_attn_metadata(
+            num_reqs, num_tokens_per_req
+        )
+        # The current EAGLE warmup only consumes the device-facing seq_lens,
+        # while every DFlash metadata transformation deliberately uses the host
+        # shadow to avoid compiling eager indexing micro-graphs. Real serving
+        # populates both views; make the inherited dummy metadata match it.
+        metadata._seq_lens_cpu = metadata.seq_lens
+        return metadata
+
     @torch.inference_mode()
     def dummy_run(
         self,

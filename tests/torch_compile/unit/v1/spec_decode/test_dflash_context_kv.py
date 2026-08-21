@@ -1870,6 +1870,26 @@ def test_dflash_reuses_dp_request_counts_at_block_width() -> None:
     assert tokens_across_dp.tolist() == [8, 16]
 
 
+def test_dflash_dummy_metadata_keeps_host_seq_lens_shadow() -> None:
+    proposer = object.__new__(RBLNDFlashProposer)
+    proposer.max_num_tokens = 512
+    proposer.runner = SimpleNamespace(
+        _get_cumsum_and_arange=lambda counts: (counts.cumsum(), None),
+        input_batch=SimpleNamespace(
+            block_table=[
+                SimpleNamespace(
+                    get_cpu_tensor=lambda: torch.zeros(1, 48, dtype=torch.int32)
+                )
+            ]
+        ),
+    )
+
+    metadata = proposer._build_dummy_attn_metadata(1, 8)
+
+    assert metadata._seq_lens_cpu is metadata.seq_lens
+    assert metadata._seq_lens_cpu.tolist() == [8]
+
+
 def test_causal_guard_rejects_causal_full_attention_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
