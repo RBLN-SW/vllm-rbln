@@ -66,7 +66,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
 )
-from vllm_rbln.v1.spec_decode.eagle import _DEVICE_ARGMAX, RBLNEagleProposer
+from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 
 logger = init_logger(__name__)
 
@@ -780,12 +780,12 @@ class RBLNDFlashProposer(RBLNEagleProposer):
                 # arrives on CPU and index_select would reject the device mix.
                 hidden_states = hidden_states[token_indices_to_sample]
             logits = self.model.compute_logits(hidden_states)
-            if _DEVICE_ARGMAX:
-                # Keep the reduction inside the region; eager would land on the
-                # host implementation.
-                ids = torch.ops.rbln.argmax(logits)
-                return hidden_states, ids.to(torch.int32)
-            return hidden_states, logits
+            # Keep the reduction inside the region; eager would land on the
+            # host implementation. Latest RBLNEagleProposer makes this proven
+            # optimization unconditional, so DFlash must follow the same ABI:
+            # the executable always returns token ids rather than logits.
+            ids = torch.ops.rbln.argmax(logits)
+            return hidden_states, ids.to(torch.int32)
 
         def dflash_wrapper(
             input_ids: torch.Tensor,

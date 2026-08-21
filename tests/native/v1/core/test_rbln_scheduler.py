@@ -264,6 +264,7 @@ class _DFlashSpecConfig:
 
     def __init__(self, num_speculative_tokens: int) -> None:
         self.num_speculative_tokens = num_speculative_tokens
+        self.num_speculative_tokens_per_batch_size = None
         self.parallel_drafting = True
         self.method = "dflash"
 
