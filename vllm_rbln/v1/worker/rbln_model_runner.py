@@ -233,27 +233,18 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
-        This function blocks until the copy is finished.
+        Blocks until the copy is finished. Under async scheduling this runs on
+        the worker's async output thread rather than the thread running the
+        model, so the copy is dispatched while the next forward is in flight.
 
-        With MultiprocExecutor + async scheduling it is called on the worker's
-        async output thread (WorkerProc.async_output_busy_loop ->
-        enqueue_output); with UniProcExecutor it is called inline from
-        AsyncOutputFuture.result().
-
-        The copy is therefore dispatched from a thread other than the one running
-        the model. Nothing in the rebel API documents that as supported, so read it
-        as an assumption this code rests on: that rebel serialises its own dispatch
-        well enough for VMemoryManager::DispatchFlatAsyncCopy to interleave with the
-        main thread's RuntimeInstance::Run.
-
-        inference_mode is re-entered for the copy: _sampled_token_ids_cpu was
-        allocated in __init__ under sample_tokens' inference_mode, so it is an
-        inference tensor, and InferenceMode is thread-local - it is off on this
-        thread. Updating an inference tensor in place with it off is a hard error.
+        inference_mode is re-entered because _sampled_token_ids_cpu is an
+        inference tensor, allocated under sample_tokens' inference_mode, and
+        InferenceMode is thread-local, so it is off on this thread. Updating an
+        inference tensor in place with it off is a hard error.
         """
-        # Blocking copy, not non_blocking + synchronize: rbln_device_synchronize
-        # waits on every pending handle, so once forward(N+1) is dispatched this
-        # thread would wait out a whole forward. DoCopy waits on the sampler only.
+        # Blocking copy, not non_blocking + a device synchronize: synchronizing
+        # waits on every pending transfer, so once forward(N+1) is dispatched
+        # this thread would wait out a whole forward. This waits on the sampler.
         with torch.inference_mode():
             self._sampled_token_ids_cpu.copy_(self._sampled_token_ids)
 
@@ -1364,29 +1355,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _apply_pending_token_writeback(self) -> None:
         """Put the real sampled tokens where every reader of them can see them.
 
-        Async scheduling stages -1 placeholders and repairs them with an
-        on-device copy, but only for requests that were also in the previous
-        step (upstream does the same - gpu_model_runner._prepare_input_ids skips
-        anything with prev_index < 0). Everyone else reads the host copy, so the
-        host copy has to be truthful.
+        Async scheduling stages -1 placeholders and repairs them on device, but
+        only for requests that were also in the previous step's batch. Everyone
+        else reads the host copy, so the host copy has to be truthful.
 
         Two places, not one. token_ids_cpu is what _prepare_inputs reads, but it
         is rebuilt from CachedRequestState.output_token_ids whenever a request
         is (re-)added to the persistent batch, so a placeholder left in the
-        request state comes back. That matters here and not upstream because
-        this runner evicts unscheduled requests every step, and with the prefill
-        batch pinned to 1 a whole wave of requests sits outside the batch while
-        their tokens arrive.
+        request state comes back. This runner evicts unscheduled requests every
+        step, which makes that rebuild routine rather than a corner case.
 
-        Nothing is dropped for a request that is currently out of the batch:
-        self.requests outlives eviction (only finished ids are popped), so
-        repairing the request state is enough to make the rebuild correct.
-        deque.popleft is atomic, so no lock is needed against the output
-        thread's append.
+        Repairing the request state is enough for a request that is currently
+        out of the batch: self.requests outlives eviction.
         """
         ib = self.input_batch
         while True:
             try:
+                # Atomic against the output thread's append, so no lock.
                 req_ids, tokens, pos = self._pending_token_writeback.popleft()
             except IndexError:
                 return
@@ -1658,20 +1643,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 and prev_sampled is not None
                 and prev_map is not None
             ):
-                # prev_sampled holds last step's tokens in last step's batch
-                # order, so each request needs its own row: prev_map[req_id] is
-                # where it sat then, j is where it sits now.
-                #
                 # A request missing from prev_map (it was not in last step's
                 # batch) keeps the placeholder here and gets its token from
                 # token_ids_cpu instead, which _apply_pending_token_writeback
                 # fills in. Only the rows found here are overwritten.
                 #
-                # Two ways to write them, because the order usually does not
-                # change: when it has not (identity), one contiguous slice copy
-                # does it, and that avoids turning `rows`/`dsts` into index
-                # tensors every step -- about a tenth of a decode step on
-                # gpt-oss-120b at DP4/b8. Otherwise fall back to the scatter.
+                # The batch order usually does not change, and the identity
+                # branch exploits that: one contiguous slice copy, instead of
+                # building index tensors from Python lists every step.
                 #
                 # prev_sampled aliases the sampler's ring, which has two slots:
                 # this read must happen before this step's sample() comes back
