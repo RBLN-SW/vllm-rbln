@@ -1273,6 +1273,11 @@ class RBLNWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.shutdown()
 
+    def reset_encoder_cache(self) -> None:
+        reset_fn = getattr(self.model_runner, "reset_encoder_cache", None)
+        if callable(reset_fn):
+            reset_fn()
+
     def _release_offload_temp_storage(self) -> None:
         # The runtime drops the offload dir on teardown, but that runs last and vLLM
         # SIGKILLs a worker seconds after asking it to stop, so reclaim up front.
