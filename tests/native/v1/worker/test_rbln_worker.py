@@ -477,8 +477,11 @@ class TestCompileOrWarmUpModel:
         compile_model=True,
         warm_up=True,
         warmup_side_effect=None,
+        data_parallel_size=1,
     ):
-        vcfg = _make_vllm_config(enforce_eager=enforce_eager)
+        vcfg = _make_vllm_config(
+            enforce_eager=enforce_eager, data_parallel_size=data_parallel_size
+        )
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_COMPILE_MODEL", compile_model)
@@ -497,6 +500,11 @@ class TestCompileOrWarmUpModel:
             calls.append("warmup")
             if warmup_side_effect is not None:
                 raise warmup_side_effect
+
+        monkeypatch.setattr(wm, "get_dp_group", lambda: SimpleNamespace(cpu_group="dp"))
+        monkeypatch.setattr(
+            wm.dist, "barrier", lambda group: calls.append(f"barrier:{group}")
+        )
 
         worker.model_runner = SimpleNamespace(
             warmup_model=warmup,
@@ -524,6 +532,28 @@ class TestCompileOrWarmUpModel:
         result = worker.compile_or_warm_up_model()
         assert calls == ["warmup"]
         assert isinstance(result, CompilationTimes)
+
+    def test_dp_ranks_rendezvous_after_warmup(self, make_worker, monkeypatch):
+        # The ranks must leave this method together: whatever skew survives it
+        # lands in the first forward's DP all-reduce, where it reads as the
+        # first request's prefill latency.
+        worker, calls = self._worker(make_worker, monkeypatch, data_parallel_size=4)
+        worker.compile_or_warm_up_model()
+        assert calls == ["warmup", "barrier:dp"]
+
+    def test_no_rendezvous_without_dp_peers(self, make_worker, monkeypatch):
+        worker, calls = self._worker(make_worker, monkeypatch, data_parallel_size=1)
+        worker.compile_or_warm_up_model()
+        assert calls == ["warmup"]
+
+    def test_no_rendezvous_when_warmup_skipped(self, make_worker, monkeypatch):
+        # Nothing compiled, so there is no skew to absorb -- and every skip
+        # reason is global config, so the ranks skip together.
+        worker, calls = self._worker(
+            make_worker, monkeypatch, warm_up=False, data_parallel_size=4
+        )
+        worker.compile_or_warm_up_model()
+        assert calls == []
 
     @pytest.mark.parametrize(
         "msg",
