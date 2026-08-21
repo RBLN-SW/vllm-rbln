@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import CodeType
+from types import CodeType, FunctionType, MethodType
 from typing import Any
 
 import torch
@@ -23,17 +23,35 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+# FunctionType's constructor takes five of a function's slots and the rest have
+# to be assigned, or the clone is not the target with a different body. Keyword
+# defaults are the one that changes results rather than just introspection.
+# test_dispatch.py enumerates the slots off the type, so a Python release that
+# adds one fails the test instead of silently dropping it here.
+_COPIED_SLOTS = (
+    "__kwdefaults__",
+    "__qualname__",
+    "__module__",
+    "__doc__",
+    "__annotations__",
+    "__type_params__",
+)
+
 
 def _value_key(value: Any) -> Any:
     """The part of an argument that decides which graph it belongs to."""
-    if value is None or isinstance(value, (bool, int)):
-        return value
     if isinstance(value, torch.Tensor):
         # torch.Size is a tuple, so this stays hashable and allocation-free.
         return value.shape, value.dtype
+    if value is None or isinstance(value, (bool, int, float, str, bytes, torch.dtype)):
+        return value
     if hasattr(value, "items"):  # IntermediateTensors and friends
         return tuple((k, t.shape, t.dtype) for k, t in value.items())
-    return type(value).__name__
+    raise TypeError(
+        f"Dispatcher cannot key a {type(value).__name__} argument. Dynamo may "
+        "guard on its value, and a key that does not carry it would serve the "
+        "graph recorded for a different value."
+    )
 
 
 def _forward_context_key() -> tuple[Any, ...]:
@@ -79,29 +97,41 @@ class Dispatcher:
     plus a guard-tree walk every step, and the answer is something the runner
     already knows. So this keeps the mapping itself: the first call for a key
     goes through Dynamo (which compiles it if needed) and the transformed
-    bytecode is recorded, and every later call with that key runs the bytecode
-    directly -- no frame eval, no guards.
+    bytecode is recorded as a clone of the target, and every later call with
+    that key runs the clone directly -- no frame eval, no guards.
+
+    A clone rather than the target with its `__code__` swapped, because a swap
+    is visible to every other holder of the target for as long as it is
+    installed. One clone per key keeps the fast path free of shared mutable
+    state, and lets a bound method be dispatched without touching the code
+    object its whole class shares.
 
     The table is a cache, not an allow-list: an unseen key is compiled on the
-    spot rather than rejected. What is rejected is a key that maps to two
-    different graphs -- that means the key is coarser than Dynamo's guards, and
-    serving either graph would be wrong.
-
-    Assumes one caller at a time: the swap goes through the function object, so
-    two threads calling the same target with different keys would collide. The
-    RBLN platform forces async scheduling off, so the step loop is serial.
+    spot rather than rejected. Key completeness is a precondition this class
+    does not check -- once a key is registered its graph is served forever, so
+    a key coarser than Dynamo's guards is wrong rather than reported. What
+    keeps it honest is `_value_key` refusing an argument it cannot key.
     """
 
     def __init__(self, target: Any, compiled: Any) -> None:
-        if not hasattr(target, "__code__"):
+        # Annotated Any, not FunctionType: a function is a descriptor, so a
+        # FunctionType-annotated attribute reads back as MethodType in mypy.
+        self._function: Any
+        self._instance: Any
+        if isinstance(target, MethodType):
+            self._function = target.__func__
+            self._instance = target.__self__
+        elif isinstance(target, FunctionType):
+            self._function = target
+            self._instance = None
+        else:
             raise TypeError(
-                "Dispatcher needs a plain function to swap code on, got "
+                "Dispatcher needs a function or a bound method, got "
                 f"{type(target).__name__}"
             )
-        self._target = target
         self._compiled = compiled
-        self._original_code: CodeType = target.__code__
-        self._codes: dict[tuple, CodeType] = {}
+        self._original_code: CodeType = self._function.__code__
+        self._graphs: dict[tuple, Any] = {}
         self._unregistered = 0
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -110,17 +140,12 @@ class Dispatcher:
             tuple((name, _value_key(v)) for name, v in sorted(kwargs.items())),
             *_forward_context_key(),
         )
-        code = self._codes.get(key)
-        if code is None:
+        graph = self._graphs.get(key)
+        if graph is None:
             result = self._compiled(*args, **kwargs)
             self._register(key)
             return result
-
-        self._target.__code__ = code
-        try:
-            return self._target(*args, **kwargs)
-        finally:
-            self._target.__code__ = self._original_code
+        return graph(*args, **kwargs)
 
     def _register(self, key: tuple) -> None:
         entries = torch._dynamo.eval_frame._debug_get_cache_entry_list(
@@ -139,20 +164,28 @@ class Dispatcher:
             )
             return
 
-        # Cache entries are MRU-ordered, so the call above put the graph it used
-        # at the head of the list.
+        # Cache entries are MRU-ordered, so the call above left the graph it
+        # used at the head of the list. That identification holds only while
+        # nothing else calls the target in between, which the serial step loop
+        # guarantees; a second concurrent caller would need this serialised.
         code = entries[0].code
-        previous = self._codes.get(key)
-        if previous is not None and previous is not code:
-            raise RuntimeError(
-                f"dispatch key {key} selected two different graphs for "
-                f"{self._original_code.co_name}; the key is missing a factor "
-                "that Dynamo's guards do distinguish"
-            )
-        self._codes[key] = code
+        self._graphs[key] = self._clone(code)
         logger.debug(
             "dispatch: registered %s as entry %d for %s",
             code.co_name,
-            len(self._codes),
+            len(self._graphs),
             self._original_code.co_name,
         )
+
+    def _clone(self, code: CodeType) -> Any:
+        clone = FunctionType(
+            code,
+            self._function.__globals__,
+            self._function.__name__,
+            self._function.__defaults__,
+            self._function.__closure__,
+        )
+        for slot in _COPIED_SLOTS:
+            setattr(clone, slot, getattr(self._function, slot))
+        clone.__dict__.update(self._function.__dict__)
+        return clone if self._instance is None else MethodType(clone, self._instance)
