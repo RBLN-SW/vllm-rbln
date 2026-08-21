@@ -277,6 +277,20 @@ class RblnPlatform(Platform):
             )
             scheduler_config.async_scheduling = False
 
+        # TODO(yskim): Support PP on RBLN under async scheduling.
+        if (
+            scheduler_config.async_scheduling
+            and parallel_config.pipeline_parallel_size > 1
+        ):
+            logger.warning(
+                "Ignoring --async-scheduling: pipeline parallelism is not "
+                "supported on RBLN under async scheduling. Under PP the "
+                "scheduler stops propagating sampled tokens and expects the "
+                "runner to broadcast prev_sampled_token_ids from the last "
+                "stage, which this runner does not do. Running synchronously."
+            )
+            scheduler_config.async_scheduling = False
+
         # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
         # that runs only inside the vLLM-native branch below, and the optimum
         # path is exactly where an unsupported flag would go unnoticed.

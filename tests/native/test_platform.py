@@ -345,6 +345,22 @@ class TestSchedulerOverrides:
         assert config.scheduler_config.async_scheduling is False
         assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
 
+    def test_async_scheduling_is_refused_under_pipeline_parallelism(self, reconfigure):
+        """Under PP the scheduler stops shipping the sampled tokens.
+
+        It expects the runner to broadcast prev_sampled_token_ids from the last
+        stage instead, which this runner does not do, so a non-last rank reaches
+        _update_states with no token source and dies on its assert mid-decode.
+        """
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.async_scheduling = True
+            _ranks(pipeline_parallel_size=2, max_num_seqs=2)(config)
+
+        config = reconfigure(mutate)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
+
     def test_cascade_attention_is_disabled(self, configured):
         assert configured.model_config.disable_cascade_attn is True
 
