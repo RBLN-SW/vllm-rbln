@@ -105,10 +105,11 @@ class TestCompileOptions:
         compile(object(), mode="foo")
         assert captured_compile["options"]["mode"] == ["foo"]
 
-    def test_mode_empty_skipped(self, captured_compile):
-        # An empty mode is not set.
+    def test_mode_empty_becomes_an_empty_list(self, captured_compile):
+        # The backend reads options.get("mode", []), so an empty list and an
+        # absent key are the same input to it.
         compile(object(), mode="")
-        assert "mode" not in captured_compile["options"]
+        assert captured_compile["options"]["mode"] == []
 
     def test_compile_only_appended_when_env_set(self, captured_compile, monkeypatch):
         # VLLM_RBLN_COMPILE_ONLY appends "compile_only" to a str mode.
@@ -116,12 +117,13 @@ class TestCompileOptions:
         compile(object(), mode="foo")
         assert captured_compile["options"]["mode"] == ["foo", "compile_only"]
 
-    # TODO(RBLN): compile_only is appended only when mode is a str, so a
-    # list-valued mode silently drops it. Fix the source, then drop this xfail.
-    @pytest.mark.xfail(
-        strict=True,
-        reason="compile_only not appended when mode is passed as a list",
-    )
+    def test_compile_only_appended_to_empty_mode(self, captured_compile, monkeypatch):
+        # Every call site passes "" unless VLLM_RBLN_COMPILE_STRICT_MODE is on,
+        # so this is the configuration compile-only actually runs in.
+        monkeypatch.setattr(compiler.envs, "VLLM_RBLN_COMPILE_ONLY", True)
+        compile(object(), mode="")
+        assert captured_compile["options"]["mode"] == ["compile_only"]
+
     def test_compile_only_appended_for_list_mode(self, captured_compile, monkeypatch):
         monkeypatch.setattr(compiler.envs, "VLLM_RBLN_COMPILE_ONLY", True)
         compile(object(), mode=["foo"])
