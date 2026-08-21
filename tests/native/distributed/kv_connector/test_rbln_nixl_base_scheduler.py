@@ -12,21 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnNixlPullConnectorScheduler: chunked-prefill save tracking, the
-# finished-request branches, and the fetch trimmed to a chunk boundary, all
-# exercised through the inherited entry points. Built bare with only the state
-# those paths read.
+# The scheduler-side shared layer: chunked-prefill save tracking, the chunk
+# alignment a fetch is trimmed to, and the finished-request branches, exercised
+# through the inherited entry points of whichever direction sits underneath.
+# Built bare with only the state those paths read.
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlPullConnectorScheduler,
+    NixlPushConnectorScheduler,
+)
 from vllm.v1.request import RequestStatus
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
     RblnNixlPullConnectorScheduler,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_scheduler import (
+    RblnNixlPushConnectorScheduler,
 )
 
 
@@ -364,3 +371,32 @@ class TestChunkAlignedFetch:
             kv_transfer_params={"do_remote_prefill": True},
         )
         assert sched.get_num_new_matched_tokens(req, 0) == (900, True)
+
+
+class TestSchedulerCleanupReachesBothDirections:
+    @pytest.mark.parametrize(
+        "scheduler_cls, direction_cls",
+        [
+            (RblnNixlPullConnectorScheduler, NixlPullConnectorScheduler),
+            (RblnNixlPushConnectorScheduler, NixlPushConnectorScheduler),
+        ],
+    )
+    def test_stale_chunk_accumulation_is_dropped(
+        self, monkeypatch, scheduler_cls, direction_cls
+    ):
+        # The accumulation belongs to the shared layer, so its cleanup must run
+        # and then hand over to whichever direction scheduler is underneath.
+        seen = []
+
+        def record(self, request, block_ids):
+            seen.append(request.request_id)
+            return False, None
+
+        monkeypatch.setattr(direction_cls, "request_finished", record)
+        scheduler = object.__new__(scheduler_cls)
+        scheduler._block_ids_need_save = {"r0": ([1, 2],)}
+
+        scheduler.request_finished(SimpleNamespace(request_id="r0"), ([1, 2],))
+
+        assert scheduler._block_ids_need_save == {}
+        assert seen == ["r0"]

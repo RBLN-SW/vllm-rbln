@@ -43,6 +43,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
+    RblnNixlPushConnectorWorker,
+)
 
 
 def _encode_payload(
@@ -439,7 +442,8 @@ class TestPpHandshakeFanout:
         assert w._add_remote_agent_head_matched.call_args.kwargs[
             "registered_layer_names"
         ] == ("layer.2",)
-        assert w._register_shard_xfer_state.call_args.kwargs["split"] == 2
+        kwargs = w._register_shard_xfer_state.call_args.kwargs
+        assert (kwargs["split"], kwargs["replica_fanout"]) == (2, 1)
 
     def test_a_split_region_alone_forces_the_per_shard_path(self):
         # Companion to test_a_finer_peer_alone_forces_the_per_shard_path: here
@@ -610,6 +614,7 @@ class TestShardLocalRegions:
             peer_areas=None,
             split=1,
             region_ids=None,
+            replica_fanout=1,
         )
 
     def test_a_borrowed_handle_is_recorded_as_borrowed(self):
@@ -1610,8 +1615,11 @@ class TestPublishHandshakeMetadata:
             physical_blocks_per_logical_kv_block=1,
         )
 
-    def _publish(self, *, pp_rank, pp_size, layer_names, areas=1, slices=1):
-        w = object.__new__(RblnNixlPullConnectorWorker)
+    def _publish(self, *, pp_rank, pp_size, layer_names, areas=1, slices=1, cls=None):
+        w = object.__new__(cls or RblnNixlPullConnectorWorker)
+        # __init__ never ran, so the writer state shutdown() reaches through
+        # __del__ is absent; silence it rather than leak an unraisable at GC.
+        w.shutdown = lambda: None
         w.compat_hash = "BASE"
         # _check_pp_constraints reads these; a plain PP producer passes.
         w.vllm_config = MagicMock()
@@ -1634,6 +1642,18 @@ class TestPublishHandshakeMetadata:
             w._publish_handshake_metadata(self._base_meta(), layer_names)
         return w
 
+    def test_a_writer_publishes_the_write_path_hash(self):
+        # The direction is a class fact, and the hash has to come from the class
+        # that is running: a producer that writes must not present the hash a
+        # reader would accept.
+        w = self._publish(
+            pp_rank=0,
+            pp_size=1,
+            layer_names=["l0"],
+            cls=RblnNixlPushConnectorWorker,
+        )
+        assert w.compat_hash == rbln_compat_hash("BASE", writes_into_peer=True)
+
     def test_advertises_chiplet_geometry(self):
         """Head-band matching on the consumer needs the producer's areas/slices;
         they cannot be derived from the address list without assuming exactly
@@ -1646,8 +1666,9 @@ class TestPublishHandshakeMetadata:
 
     def test_wraps_upstream_and_folds_compat(self):
         w = self._publish(pp_rank=1, pp_size=2, layer_names=["l7", "l8"])
-        # compat hash folded with our version and mirrored into the payload.
-        assert w.compat_hash == rbln_compat_hash("BASE")
+        # compat hash folded with our version and direction, mirrored into the
+        # payload. A read-path worker must publish the read-path hash.
+        assert w.compat_hash == rbln_compat_hash("BASE", writes_into_peer=False)
         assert w.xfer_handshake_metadata.compatibility_hash == w.compat_hash
         decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
             w.xfer_handshake_metadata.agent_metadata_bytes

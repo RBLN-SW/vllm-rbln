@@ -27,6 +27,7 @@ import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
 def test_native_backend_registers_every_connector():
     registry = KVConnectorFactory._registry
     assert "RblnNixlPullConnector" in registry
+    assert "RblnNixlPushConnector" in registry
     assert "RBLNLMCacheConnectorV1" in registry
 
 
@@ -34,6 +35,7 @@ def test_native_backend_registers_every_connector():
     ("name", "class_name"),
     [
         ("RblnNixlPullConnector", "RblnNixlPullConnector"),
+        ("RblnNixlPushConnector", "RblnNixlPushConnector"),
         # The name the read path shipped under is what deployments carry, so it
         # has to keep resolving -- to the class that no longer bears it.
         ("RblnNixlConnector", "RblnNixlPullConnector"),
