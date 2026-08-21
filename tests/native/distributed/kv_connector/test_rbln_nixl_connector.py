@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnNixlConnector's construction guards, role -> scheduler/worker wiring and
-# finalize delegation, with the base __init__ and sub-connectors patched out.
+# RblnNixlPullConnector's construction guards, role -> scheduler/worker wiring,
+# finalize delegation and the side-channel keying it hands upstream, with the
+# base __init__ and sub-connectors patched out.
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -23,7 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector as cm
 import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
-    RblnNixlConnector,
+    RblnNixlPullConnector,
 )
 
 
@@ -38,17 +40,19 @@ def _vllm_config(*, kv_buffer_device="cpu", engine_id="engine-0", has_transfer=T
 
 @pytest.fixture
 def isolated_connector(monkeypatch):
-    """Construct RblnNixlConnector with the upstream base __init__ neutralized
+    """Construct RblnNixlPullConnector with the upstream base __init__ neutralized
     and the sub-connectors faked, so only the guards + wiring execute. Returns a
     builder(vllm_config, role, use_device_tensor=True)."""
     monkeypatch.setattr(cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(cm, "RblnNixlConnectorScheduler", lambda *a, **k: "SCHEDULER")
-    monkeypatch.setattr(cm, "RblnNixlConnectorWorker", lambda *a, **k: "WORKER")
+    monkeypatch.setattr(
+        cm, "RblnNixlPullConnectorScheduler", lambda *a, **k: "SCHEDULER"
+    )
+    monkeypatch.setattr(cm, "RblnNixlPullConnectorWorker", lambda *a, **k: "WORKER")
 
     def build(vllm_config, role=KVConnectorRole.SCHEDULER, use_device_tensor=True):
         monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", use_device_tensor)
-        connector = object.__new__(RblnNixlConnector)
-        RblnNixlConnector.__init__(connector, vllm_config, role, {"kv_cache": 1})
+        connector = object.__new__(RblnNixlPullConnector)
+        RblnNixlPullConnector.__init__(connector, vllm_config, role, {"kv_cache": 1})
         return connector
 
     return build
@@ -96,7 +100,7 @@ class TestRoleWiring:
 class TestFinalizeDelegation:
     def test_delegates_to_worker_when_present(self):
         calls = []
-        connector = object.__new__(RblnNixlConnector)
+        connector = object.__new__(RblnNixlPullConnector)
         connector.connector_worker = SimpleNamespace(
             finalize_kv_cache_registration=lambda: calls.append(1)
         )
@@ -105,6 +109,59 @@ class TestFinalizeDelegation:
 
     def test_noop_on_scheduler_role(self):
         # Scheduler role has no worker; finalize must be a safe no-op.
-        connector = object.__new__(RblnNixlConnector)
+        connector = object.__new__(RblnNixlPullConnector)
         connector.connector_worker = None
         connector.finalize_kv_cache_registration()  # must not raise
+
+
+class TestSetXferHandshakeMetadataPpAware:
+    # Producer side: every (pp_rank, tp_rank) shard must reach the side channel.
+    #
+    # EngineCore hands the merged worker dicts to
+    # ``set_xfer_handshake_metadata_pp_aware``. Upstream's implementation rejects
+    # pp_rank > 0 and keys by tp_rank alone; this connector flattens the pair into
+    # the rank a consumer asks for in ``_nixl_handshake``.
+    #
+
+    @staticmethod
+    def _connector(tp_size):
+        c = object.__new__(RblnNixlPullConnector)
+        vllm_config = MagicMock()
+        vllm_config.parallel_config.tensor_parallel_size = tp_size
+        c._vllm_config = vllm_config
+        return c
+
+    def _flatten(self, metadata, *, tp_size):
+        c = self._connector(tp_size)
+        with patch.object(
+            RblnNixlPullConnector, "set_xfer_handshake_metadata"
+        ) as forward:
+            c.set_xfer_handshake_metadata_pp_aware(metadata)
+        forward.assert_called_once()
+        return forward.call_args[0][0]
+
+    def test_single_stage_reduces_to_tp_rank(self):
+        # pp_size == 1: flat rank == tp_rank, i.e. upstream's behavior.
+        assert self._flatten({(0, 0): "m0", (0, 1): "m1"}, tp_size=2) == {
+            0: "m0",
+            1: "m1",
+        }
+
+    def test_pp_stages_get_distinct_flat_ranks(self):
+        assert self._flatten({(0, 0): "s0", (1, 0): "s1"}, tp_size=1) == {
+            0: "s0",
+            1: "s1",
+        }
+        assert self._flatten(
+            {(0, 0): "a", (0, 1): "b", (1, 0): "c", (1, 1): "d"}, tp_size=2
+        ) == {0: "a", 1: "b", 2: "c", 3: "d"}
+
+    def test_pp_rank_gt_zero_is_accepted(self):
+        # Upstream would raise here; a PP-aware connector must not.
+        assert self._flatten({(3, 0): "s3"}, tp_size=1) == {3: "s3"}
+
+    def test_collision_is_rejected(self):
+        # A tp_size disagreeing with the reported ranks would silently drop a
+        # shard; fail loudly instead.
+        with pytest.raises(ValueError, match="Duplicate handshake metadata"):
+            self._flatten({(0, 1): "a", (1, 0): "b"}, tp_size=1)
