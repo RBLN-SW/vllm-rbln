@@ -35,12 +35,12 @@ PAD_TOKEN_ID = 0
 
 
 @dataclass
-class HybridAttentionEntry:
+class MultimodalHybridAttentionEntry:
     pad_len: int
     attention_mask: torch.Tensor
 
 
-class HybridAttentionStateManager:
+class MultimodalHybridAttentionStateManager:
     """Per-request decode state that the prefill graph produces and the
     scheduler therefore cannot own: the padded cache length and the attention
     mask over the padded cache layout. Recorded at prefill; every decode step
@@ -50,10 +50,10 @@ class HybridAttentionStateManager:
     """
 
     def __init__(self) -> None:
-        self.table: dict[str, HybridAttentionEntry] = {}
+        self.table: dict[str, MultimodalHybridAttentionEntry] = {}
 
     def add(self, request_id: str, pad_len: int, attention_mask: torch.Tensor) -> None:
-        self.table[request_id] = HybridAttentionEntry(
+        self.table[request_id] = MultimodalHybridAttentionEntry(
             pad_len=pad_len,
             attention_mask=attention_mask,
         )
@@ -133,7 +133,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
-        self.attention_manager = HybridAttentionStateManager()
+        self.attention_manager = MultimodalHybridAttentionStateManager()
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens

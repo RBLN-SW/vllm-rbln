@@ -25,7 +25,7 @@ import types
 import torch
 
 from vllm_rbln.model_executor.models.optimum.gemma3 import (
-    HybridAttentionStateManager,
+    MultimodalHybridAttentionStateManager,
 )
 from vllm_rbln.model_executor.models.optimum.gemma3 import (
     RBLNOptimumGemma3ForConditionalGeneration as Gemma3,
@@ -39,7 +39,7 @@ def _bare_gemma3(max_batch_size: int) -> Gemma3:
     obj.decoder_batch_size = max_batch_size
     obj.use_multiple_decoder = False
     obj.available_blocks = torch.arange(50, 60, dtype=torch.int16)
-    obj.attention_manager = HybridAttentionStateManager()
+    obj.attention_manager = MultimodalHybridAttentionStateManager()
     obj._image_token_id = lambda: 999
     return obj
 
