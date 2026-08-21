@@ -203,6 +203,50 @@ class TestPredicates:
         assert not _make_runner_stub(is_pooling_model=True).use_wrapped_compute_logits
 
 
+class TestPrepareAuxHiddenStatesForDrafter:
+    @staticmethod
+    def _aux_hidden_states():
+        return [torch.full((1, 2, 3), i) for i in range(1, 4)]
+
+    def test_dflash_keeps_raw_aux_layer_concatenation(self):
+        from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
+
+        drafter = object.__new__(RBLNDFlashProposer)
+
+        def reject_double_projection(_):
+            raise AssertionError("DFlash must project auxiliary states only once")
+
+        drafter.model = SimpleNamespace(combine_hidden_states=reject_double_projection)
+        aux_hidden_states = self._aux_hidden_states()
+
+        output = mr._prepare_aux_hidden_states_for_drafter(
+            drafter, aux_hidden_states
+        )
+
+        expected = torch.cat(
+            [hidden.view(-1, hidden.shape[-1]) for hidden in aux_hidden_states],
+            dim=-1,
+        )
+        assert torch.equal(output, expected)
+
+    def test_eagle3_combines_aux_layer_concatenation(self):
+        from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+
+        drafter = object.__new__(RBLNEagleProposer)
+        drafter.model = SimpleNamespace(combine_hidden_states=lambda hidden: hidden + 7)
+        aux_hidden_states = self._aux_hidden_states()
+
+        output = mr._prepare_aux_hidden_states_for_drafter(
+            drafter, aux_hidden_states
+        )
+
+        concatenated = torch.cat(
+            [hidden.view(-1, hidden.shape[-1]) for hidden in aux_hidden_states],
+            dim=-1,
+        )
+        assert torch.equal(output, concatenated + 7)
+
+
 class TestExecuteModelState:
     def test_field_names(self):
         assert ExecuteModelState._fields == (

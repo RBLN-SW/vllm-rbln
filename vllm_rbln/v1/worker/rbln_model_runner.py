@@ -149,6 +149,19 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = AttnMetadataDict  #  | list[AttnMetadataDict]
 
 
+def _prepare_aux_hidden_states_for_drafter(
+    drafter: RBLNEagleProposer,
+    aux_hidden_states: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    target_hidden_states = torch.cat(
+        [hidden.view(-1, hidden.shape[-1]) for hidden in aux_hidden_states],
+        dim=-1,
+    )
+    if isinstance(drafter, RBLNDFlashProposer):
+        return target_hidden_states
+    return drafter.model.combine_hidden_states(target_hidden_states)
+
+
 def _copy_pooler_output(
     raw_pooler_output: PoolerOutput, finished_mask: list[bool]
 ) -> list[torch.Tensor | None]:
@@ -1874,17 +1887,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits = self.model.compute_logits(sample_hidden_states)
                 logits = logits.view(-1, logits.size(-1))
 
-            # NOTE(RBLN): When eagle3 and aux hidden states are used,
-            # fuse combine_hidden_states projection into the target graph.
+            # NOTE(RBLN): Eagle3 fuses the auxiliary-state projection into the
+            # target graph. DFlash keeps the raw concatenation because its
+            # bounded combiner owns that projection and its stable profiles.
             combined_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 assert aux_hidden_states is not None
                 assert isinstance(self.drafter, RBLNEagleProposer)
-                target_hidden_states = torch.cat(
-                    [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
-                )
-                combined_hidden_states = self.drafter.model.combine_hidden_states(
-                    target_hidden_states
+                combined_hidden_states = _prepare_aux_hidden_states_for_drafter(
+                    self.drafter,
+                    aux_hidden_states,
                 )
 
             return hidden_states, logits, combined_hidden_states
