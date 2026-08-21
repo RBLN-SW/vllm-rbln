@@ -100,4 +100,3 @@ Watch it fail and read the failure — a test can fail for the wrong reason. If 
 - Duplicating the implementation's logic inside the test
 - Mocking what a real object or a temporary directory would do
 - A placeholder test that is skipped
-- A test diff larger than the code change it covers
