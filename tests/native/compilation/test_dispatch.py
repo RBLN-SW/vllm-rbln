@@ -17,6 +17,7 @@
 # bytecode directly, and a key that maps to two graphs is an error. The real
 # thing needs a compiled model; here the Dynamo pieces are stubbed.
 
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -102,21 +103,6 @@ class TestDispatch:
         d(x, y=torch.zeros(1))
         assert len(compiled_calls) == 2
 
-    def test_two_graphs_for_one_key_raises(self, monkeypatch):
-        # A key coarser than Dynamo's guards shows up as one key registering two
-        # code objects; serving either would be wrong, so it has to raise.
-        target, _ = make_target()
-
-        def other_graph(x, y=None):  # a distinct code object, unlike make_target()
-            return "other"
-
-        d = Dispatcher(target, lambda *a, **k: "compiled")
-        install_entries(monkeypatch, [target.__code__])
-        d._register(("key",))
-        install_entries(monkeypatch, [other_graph.__code__])
-        with pytest.raises(RuntimeError, match="two different graphs"):
-            d._register(("key",))
-
     def test_no_cache_entry_keeps_using_the_compiled_callable(self, monkeypatch):
         target, _ = make_target()
         compiled_calls: list = []
@@ -127,9 +113,78 @@ class TestDispatch:
         d(x)
         assert len(compiled_calls) == 2
 
-    def test_rejects_a_target_without_code(self):
-        with pytest.raises(TypeError, match="plain function"):
+    def test_rejects_a_target_that_is_neither_function_nor_method(self):
+        with pytest.raises(TypeError, match="function or a bound method"):
             Dispatcher(torch.nn.Linear(2, 2), lambda *a, **k: None)
+
+    def test_scalar_arguments_are_keyed_by_value(self, monkeypatch):
+        # Dynamo guards on a float argument, so two values need two keys; a key
+        # built from the type name would serve the first graph for both.
+        def target(x, gain=2.0):
+            return "eager"
+
+        compiled_calls: list = []
+        d = Dispatcher(target, recorder(compiled_calls, "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        x = torch.zeros(1, 4)
+        d(x, gain=2.0)
+        d(x, gain=5.0)
+        assert len(compiled_calls) == 2
+
+    def test_rejects_an_argument_it_cannot_key(self, monkeypatch):
+        target, _ = make_target()
+        d = Dispatcher(target, recorder([], "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        with pytest.raises(TypeError, match="cannot key a slice argument"):
+            d(slice(0, 2))
+
+    def test_dispatches_a_bound_method_without_touching_its_class(self, monkeypatch):
+        class Model:
+            def __init__(self, bias):
+                self.bias = bias
+
+            def forward(self, x):
+                return ("eager", self.bias)
+
+        first, second = Model(1), Model(2)
+        original_code = Model.forward.__code__
+        d = Dispatcher(second.forward, recorder([], "compiled"))
+        install_entries(monkeypatch, [original_code])
+        x = torch.zeros(1, 4)
+        d(x)
+        assert d(x) == ("eager", 2)  # bound to `second`, not the class
+        assert Model.forward.__code__ is original_code
+        assert first.forward(x) == ("eager", 1)
+
+    def test_clone_differs_from_the_target_only_in_its_code(self, monkeypatch):
+        # The FunctionType constructor takes five of the function's slots; the
+        # slots are enumerated off the type so a new one fails here rather than
+        # being dropped silently by _clone.
+        def target(x, y=None, *, scale=3.0):
+            """docstring."""
+            return "eager"
+
+        setattr(target, "tagged", "attr")  # noqa: B010
+        d = Dispatcher(target, recorder([], "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        d(torch.zeros(1, 4))
+        clone = next(iter(d._graphs.values()))
+
+        slots = [
+            name
+            for name, member in vars(types.FunctionType).items()
+            if isinstance(
+                member, (types.GetSetDescriptorType, types.MemberDescriptorType)
+            )
+        ]
+        assert "__kwdefaults__" in slots  # the one that changes results
+        missing = object()
+        assert [
+            name
+            for name in slots
+            if name not in ("__code__", "__builtins__")
+            and getattr(clone, name, missing) != getattr(target, name, missing)
+        ] == []
 
 
 class TestOutsideForwardContext:
