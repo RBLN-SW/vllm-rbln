@@ -44,7 +44,7 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln~=0.4.0rc0 ; platform_machine == 'x86_64'",
+    "torch-rbln==0.4.0rc1.dev9+g999f587 ; platform_machine == 'x86_64'",
     "optimum-rbln>=0.11.2a1",
 ]
 
@@ -70,7 +70,7 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler~=0.11.2.dev256",
+    "rebel-compiler==0.11.2.dev382+g22b7dd70",
 ]
 
 
@@ -179,9 +179,25 @@ url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/"
 name = "rbln-release"
 url = "https://pypi.rbln.ai/simple/"
 
+# ⚠️ Exception to the "pypi.rebellions.in not registered" policy above — approved
+# one-off for feat/page-layout-kv-manager to pin:
+#   - torch-rbln 0.4.0rc1.dev9+g999f587, which hasn't reached nexus yet.
+#   - rebel-compiler 0.11.2.dev382+g22b7dd70, which passed nexus nightly CI
+#     (already used in 4cbad554) but has since rotated out of nexus's retention
+#     window — same validated build, just re-sourced from where it still exists.
+# `explicit = true` + the `tool.uv.sources` pins below scope it to these two
+# packages only; nothing else resolves from here. Drop this and the source
+# pins once nexus carries both builds (or newer ones) again.
+[[tool.uv.index]]
+name = "rebel"
+url = "https://pypi.rebellions.in/simple/"
+explicit = true
+
 [tool.uv.sources]
 vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
+torch-rbln = { index = "rebel" }
+rebel-compiler = { index = "rebel" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
 torchcodec = { index = "pytorch-cpu" }
