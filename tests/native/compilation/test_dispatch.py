@@ -17,6 +17,7 @@
 # bytecode directly, and a key that maps to two graphs is an error. The real
 # thing needs a compiled model; here the Dynamo pieces are stubbed.
 
+import contextlib
 import types
 from types import SimpleNamespace
 
@@ -54,7 +55,10 @@ def recorder(calls, result):
 
 def install_entries(monkeypatch, codes):
     """Stub Dynamo's cache so the head of the list is `codes[-1]`."""
-    entries = [SimpleNamespace(code=c) for c in reversed(codes)]
+    entries = [
+        SimpleNamespace(code=c, compile_id=f"0/{i}")
+        for i, c in enumerate(reversed(codes))
+    ]
     monkeypatch.setattr(
         torch._dynamo.eval_frame, "_debug_get_cache_entry_list", lambda code: entries
     )
@@ -156,6 +160,26 @@ class TestDispatch:
         assert Model.forward.__code__ is original_code
         assert first.forward(x) == ("eager", 1)
 
+    def test_records_a_profiler_scope_naming_the_dispatched_graph(self, monkeypatch):
+        # Bypassing the frame eval bypasses Dynamo's own profiler scope, so the
+        # region is only identifiable in a trace if the dispatcher opens one.
+        target, _ = make_target()
+        scopes: list = []
+
+        @contextlib.contextmanager
+        def spy(name):
+            scopes.append(name)
+            yield
+
+        monkeypatch.setattr(dispatch, "record_function_or_nullcontext", spy)
+        d = Dispatcher(target, recorder([], "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        x = torch.zeros(1, 4)
+        d(x)
+        assert scopes == []  # the cold call runs through Dynamo's own scope
+        d(x)
+        assert scopes == ["Dispatched Region: 0/0"]
+
     def test_clone_differs_from_the_target_only_in_its_code(self, monkeypatch):
         # The FunctionType constructor takes five of the function's slots; the
         # slots are enumerated off the type so a new one fails here rather than
@@ -168,7 +192,7 @@ class TestDispatch:
         d = Dispatcher(target, recorder([], "compiled"))
         install_entries(monkeypatch, [target.__code__])
         d(torch.zeros(1, 4))
-        clone = next(iter(d._graphs.values()))
+        clone, _annotation = next(iter(d._graphs.values()))
 
         slots = [
             name
