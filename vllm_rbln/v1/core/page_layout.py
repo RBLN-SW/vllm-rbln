@@ -192,3 +192,41 @@ def validate_fragmentation(
             max_num_seqs,
             blocks_per_seq,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Known gap: page layout under a KV connector (PD-disaggregation)
+# --------------------------------------------------------------------------- #
+#
+# Page layout is developed and benchmarked without a KV connector -- see
+# `benchmarks/page_layout/serve.sh`, "No KV connector: this compares vLLM-local
+# mechanisms only". Running it under PD-disaggregation does not work yet, and
+# the reason is that the page/kernel-block distinction has to reach every layer
+# that names a block, not just the ones that allocate.
+#
+# Measured 2026-08-22 (MiniMax-M2.5 / R100, 2P2D, NIXL + LMCache mp). The engine
+# starts and short requests answer correctly, so this looks healthy until a
+# request is long enough to actually move KV:
+#
+#   1. NIXL descriptor prep fails. The connector registers kernel blocks (49)
+#      after `RblnNixlConnectorWorker._pages_per_kernel_block` converts, but the
+#      block ids that reach `_read_blocks` are still pages (53 for a ~20k
+#      prompt), so the ids overrun the descriptor space:
+#        "NIXL transfer failure: transfer_setup_failed ...
+#         num_local_blocks: 53, num_remote_blocks: 53"
+#      `RBLNScheduler._rewrite_block_ids_to_kernel_blocks` converts the ids the
+#      *worker's block table* wants; the connector metadata path is separate and
+#      still carries pages.
+#
+#   2. LMCache's mp adapter reshapes on the page geometry:
+#        "unflatten: Provided sizes [8, 4096] don't multiply up to the size of
+#         dim 2 (4096)"  (lmcache/integration/vllm/vllm_multi_process_adapter)
+#      That is upstream lmcache code, so it needs either a fix there or a guard
+#      that refuses the combination.
+#
+# Closing this means threading the unit through the connector metadata path on
+# both sides of a transfer (local ids, remote ids, and the handshake that pairs
+# them), and deciding what to do about the upstream reshape. Until then a stack
+# that sets VLLM_RBLN_PAGE_LAYOUT together with a KV connector will start and
+# then fail on the first long request -- the worst shape of failure, so treat
+# the combination as unsupported rather than merely untested.
