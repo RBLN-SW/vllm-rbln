@@ -59,23 +59,47 @@ from vllm_rbln.patches import register_patch
 
 logger = init_logger(__name__)
 
-# Captured before the registry swaps them in. lmcache is optional: images built
-# for the in-process (non-mp) stack do not ship it.
-try:
-    from lmcache.integration.vllm import (  # type: ignore[import-not-found]
-        vllm_multi_process_adapter as _mp,
-    )
-
-    _ORIGINAL_INITS = {
-        "LMCacheMPSchedulerAdapter": _mp.LMCacheMPSchedulerAdapter.__init__,
-        "LMCacheMPWorkerAdapter": _mp.LMCacheMPWorkerAdapter.__init__,
-    }
-except Exception:  # noqa: BLE001 - absence is normal, not an error
-    _ORIGINAL_INITS = {}
+# Originals, captured the first time the patch can actually see lmcache.
+#
+# Not at module import: this module is imported from `vllm_rbln.patches`, which
+# `register_ops()` pulls in while the vLLM platform is still initialising.
+# Importing lmcache there re-enters a half-built `vllm` and fails, and a patch
+# whose condition is False at that moment is simply skipped -- the registry
+# evaluates conditions once, so the patch would never apply. Measured: the
+# descriptors were registered but `_applied_patch_keys` stayed empty, while the
+# same import succeeded from a normal interpreter in the same container.
+#
+# So the import is deferred, and `ensure_applied()` re-runs the registry later,
+# from call sites that only exist once vLLM is up.
+_ORIGINAL_INITS: dict[str, Any] = {}
 
 
 def _lmcache_mp_available() -> bool:
-    return bool(_ORIGINAL_INITS)
+    """True once lmcache's mp adapters can be imported; captures the originals."""
+    if _ORIGINAL_INITS:
+        return True
+    try:
+        from lmcache.integration.vllm import (  # type: ignore[import-not-found]
+            vllm_multi_process_adapter as _mp,
+        )
+    except Exception:  # noqa: BLE001 - absent (in-process image) or too early
+        return False
+    _ORIGINAL_INITS["LMCacheMPSchedulerAdapter"] = _mp.LMCacheMPSchedulerAdapter.__init__
+    _ORIGINAL_INITS["LMCacheMPWorkerAdapter"] = _mp.LMCacheMPWorkerAdapter.__init__
+    return True
+
+
+def ensure_applied() -> None:
+    """Re-run the registry, for callers that run after vLLM has come up.
+
+    Idempotent: already-applied descriptors are skipped by key, and this one is
+    a no-op when lmcache is not installed.
+    """
+    if not _lmcache_mp_available():
+        return
+    from vllm_rbln.patches import apply_registered_patches
+
+    apply_registered_patches()
 
 
 def _kernel_block_size(vllm_config: Any) -> int | None:

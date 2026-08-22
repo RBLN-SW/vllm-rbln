@@ -108,3 +108,46 @@ class TestRedirect:
             {"vllm_config": _config(), "vllm_block_size": 512, "model_name": "m"},
         )
         assert self.seen["model_name"] == "m"
+
+
+class TestLateApplication:
+    """The patch must survive being unable to import lmcache at platform init.
+
+    `register_ops()` imports `vllm_rbln.patches` while vLLM is still coming up;
+    importing lmcache there re-enters a half-built `vllm` and fails. The registry
+    evaluates each condition once, so a False there means the patch never
+    applies -- measured in-cluster: descriptors registered, `_applied_patch_keys`
+    empty, and the adapter still sizing in pages.
+    """
+
+    def test_condition_is_false_while_lmcache_cannot_be_imported(self, monkeypatch):
+        monkeypatch.setattr(mod, "_ORIGINAL_INITS", {})
+        real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+        def boom(name, *a, **k):
+            if name.startswith("lmcache"):
+                raise ImportError("half-built vllm")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr("builtins.__import__", boom)
+        assert mod._lmcache_mp_available() is False
+
+    def test_ensure_applied_is_a_noop_without_lmcache(self, monkeypatch):
+        monkeypatch.setattr(mod, "_ORIGINAL_INITS", {})
+        monkeypatch.setattr(mod, "_lmcache_mp_available", lambda: False)
+        mod.ensure_applied()  # must not raise, must not import the registry
+
+    def test_scheduler_and_worker_call_ensure_applied(self):
+        """Both processes need it: the scheduler builds one adapter, the worker
+        the other. Losing either hook silently restores the page-sized sizing."""
+        import inspect
+
+        from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
+        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
+
+        for cls in (RBLNScheduler, RBLNWorker):
+            src = inspect.getsource(cls.__init__)
+            assert "ensure_applied()" in src, f"{cls.__name__} lost the hook"
+            assert src.index("ensure_applied()") < src.index("super().__init__"), (
+                f"{cls.__name__} must apply before super() builds the connector"
+            )
