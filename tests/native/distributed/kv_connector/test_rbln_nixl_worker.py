@@ -440,58 +440,55 @@ class TestPageGranularTransfer:
     write lands on top of them. Folding the ids to kernel blocks instead was
     tried and produced 200 OK with incoherent output, so the transfer is lowered
     to the page.
-
-    A page is H discontiguous runs (`[..., H, 1, S, D]` puts the head axis
-    between block and token), but the descriptors stay dense because
-    `offset/page_bytes == ppe*H*b + ppe*h + s`.
     """
 
     @staticmethod
-    def _worker(monkeypatch, *, page=512, kernel=4096, heads=8, blocks=49):
+    def _worker(monkeypatch, *, pages=392):
         monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
-        worker = _prep_impl_worker(monkeypatch, num_blocks=blocks, block_size=page)
-        worker.vllm_config.additional_config = {"attn_block_size": kernel}
-        worker.kv_cache_config.num_blocks = blocks
+        worker = _prep_impl_worker(monkeypatch, num_blocks=pages, block_size=512)
+        worker.vllm_config.additional_config = {"attn_block_size": 4096}
         return worker
 
     @staticmethod
-    def _region(heads=8, kernel=4096, blocks=49):
+    def _tensor(dims):
         t = MagicMock()
-        t.dim.return_value = 5
-        t.shape = (blocks, heads, 1, kernel, 128)
+        t.dim.return_value = len(dims)
+        t.shape = dims
         return t
 
-    def test_geometry_off_without_the_env(self, monkeypatch):
-        worker = self._worker(monkeypatch)
+    def test_off_without_the_env(self, monkeypatch):
+        w = self._worker(monkeypatch)
         monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", False)
-        assert worker._page_transfer_geometry(self._region()) == (1, 1)
+        assert w._page_transfer_geometry(self._tensor((49, 8, 1, 4096, 128))) == (1, 1)
 
-    def test_geometry_off_without_attn_block_size(self, monkeypatch):
-        worker = self._worker(monkeypatch)
-        worker.vllm_config.additional_config = {}
-        assert worker._page_transfer_geometry(self._region()) == (1, 1)
+    def test_off_without_attn_block_size(self, monkeypatch):
+        w = self._worker(monkeypatch)
+        w.vllm_config.additional_config = {}
+        assert w._page_transfer_geometry(self._tensor((49, 8, 1, 4096, 128))) == (1, 1)
 
-    def test_geometry_reads_heads_and_pages_off_the_tensor(self, monkeypatch):
-        worker = self._worker(monkeypatch)
-        assert worker._page_transfer_geometry(self._region()) == (8, 8)
+    def test_ratio_from_pages_over_kernel_blocks(self, monkeypatch):
+        """392 pages over 49 kernel blocks is 8 pages each; H comes off the tensor."""
+        w = self._worker(monkeypatch, pages=392)
+        assert w._page_transfer_geometry(self._tensor((49, 8, 1, 4096, 128))) == (8, 8)
 
-    def test_geometry_tolerates_the_leading_kv_axis(self, monkeypatch):
-        """Per-layer tensors carry [2, B, H, 1, S, D]; regions drop the 2."""
-        worker = self._worker(monkeypatch)
-        t = MagicMock()
-        t.dim.return_value = 6
-        t.shape = (2, 49, 8, 1, 4096, 128)
-        assert worker._page_transfer_geometry(t) == (8, 8)
+    def test_ratio_ignores_cache_config_block_size(self, monkeypatch):
+        """`cache_config.block_size` reads as the kernel block in this process.
 
-    def test_geometry_bails_when_the_token_axis_is_not_the_kernel_block(
-        self, monkeypatch
-    ):
-        """A layout change must fall back loudly, not mis-stride descriptors."""
-        worker = self._worker(monkeypatch)
-        t = MagicMock()
-        t.dim.return_value = 5
-        t.shape = (49, 8, 1, 1024, 128)  # token axis != attn_block_size
-        assert worker._page_transfer_geometry(t) == (1, 1)
+        Deriving the ratio from it collapsed to 1 and registration failed with
+        `shape[0]=49 vs expected=392`, so the geometry must not consult it.
+        """
+        w = self._worker(monkeypatch, pages=392)
+        w.vllm_config.cache_config.block_size = 4096  # what the worker really sees
+        assert w._page_transfer_geometry(self._tensor((49, 8, 1, 4096, 128))) == (8, 8)
+
+    def test_falls_back_when_pages_do_not_divide(self, monkeypatch):
+        w = self._worker(monkeypatch, pages=100)
+        assert w._page_transfer_geometry(self._tensor((49, 8, 1, 4096, 128))) == (1, 1)
+
+    def test_off_when_the_ratio_is_one(self, monkeypatch):
+        """Degenerate geometry: page == kernel block, nothing to lower."""
+        w = self._worker(monkeypatch, pages=49)
+        assert w._page_transfer_geometry(self._tensor((49, 8, 1, 4096, 128))) == (1, 1)
 
 
 class TestPageDescExpansion:

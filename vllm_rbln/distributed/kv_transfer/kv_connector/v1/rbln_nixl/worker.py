@@ -356,7 +356,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         output.) So the transfer is lowered to the page.
 
         A page is not one contiguous run. The region tensor is
-        `[B, H, 1, S, D]` (`FlashAttentionBackend.get_kv_cache_shape`), so the
+        `[.., H, 1, S, D]` (`FlashAttentionBackend.get_kv_cache_shape`), so the
         head axis sits between the block axis and the token axis: page `s` of
         block `b` is H separate runs, one per head. Descriptors are still dense,
         because dividing the offset by the page's own size linearises it:
@@ -365,23 +365,26 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
 
         so a region carries `ppe*H*B` descriptors with no gaps, and one page is
         the H of them that share `b` and `s`. That is the 64x descriptor count
-        this buys (24,304 -> 1,555,456 here), which is the price of the transfer
-        agreeing with prefix caching.
+        this buys (24,304 -> 1,555,456 here), the price of the transfer agreeing
+        with prefix caching.
+
+        The ratio comes from the two things this process can actually see:
+
+            self.num_blocks   pages   -- captured from `kv_cache_config` at
+                                         construction, before the runner restated it
+            cache.shape[0]    kernel blocks -- the tensor as allocated
+
+        **Not** from `cache_config.block_size`. That reads as the page in the
+        engine core but as the kernel block here (the runner restates the spec,
+        and `resolve_kv_cache_block_sizes` propagates it for a single group), so
+        a config-derived ratio silently collapsed to 1 and registration failed
+        with `shape[0]=49 vs expected=392`.
         """
         if not envs.VLLM_RBLN_PAGE_LAYOUT:
             return 1, 1
         additional = getattr(self.vllm_config, "additional_config", None)
-        kernel_block_size = additional.get("attn_block_size") if additional else None
-        if not kernel_block_size:
+        if not (additional and additional.get("attn_block_size")):
             return 1, 1
-        kernel_block_size = int(kernel_block_size)
-        page_size = self.vllm_config.cache_config.block_size
-        if kernel_block_size == page_size or kernel_block_size % page_size != 0:
-            return 1, 1
-        # `[..., H, 1, S, D]` -- the per-layer tensor carries a leading K/V axis
-        # and a region does not, so index from the end. H and S come off the
-        # tensor rather than the config, so a layout change fails here instead
-        # of silently mis-striding the descriptors.
         if cache.dim() < 4:
             logger.warning(
                 "Page-granular transfer expects [..., H, 1, S, D], got %s dims; "
@@ -389,16 +392,19 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 cache.dim(),
             )
             return 1, 1
-        heads, tokens_per_block = cache.shape[-4], cache.shape[-2]
-        if tokens_per_block != kernel_block_size:
+        kernel_blocks = cache.shape[-5] if cache.dim() >= 5 else None
+        if not kernel_blocks or self.num_blocks % kernel_blocks != 0:
             logger.warning(
-                "Page-granular transfer: region token axis is %d but the kernel "
-                "block is %d; falling back to kernel-block transfer.",
-                tokens_per_block,
-                kernel_block_size,
+                "Page-granular transfer: %s pages do not divide into %s kernel "
+                "blocks; falling back to kernel-block transfer.",
+                self.num_blocks,
+                kernel_blocks,
             )
             return 1, 1
-        return kernel_block_size // page_size, heads
+        ppe = self.num_blocks // kernel_blocks
+        if ppe <= 1:
+            return 1, 1
+        return ppe, cache.shape[-4]
 
     def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Direct variant of NixlConnectorWorker.register_kv_caches:
@@ -426,7 +432,9 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         ppe, heads = self._page_transfer_geometry(sample)
         self._pages_per_kernel_block_xfer, self._kv_heads_per_desc = ppe, heads
         if ppe > 1:
-            kernel_blocks = self.kv_cache_config.num_blocks
+            # From the tensor, not `kv_cache_config` -- the latter still holds
+            # the pre-restate page count in this process.
+            kernel_blocks = self.num_blocks // ppe
             # Dense desc space: ppe*H*b + ppe*h + s covers every (block, head,
             # page) exactly once.
             self.num_blocks = kernel_blocks * heads * ppe
