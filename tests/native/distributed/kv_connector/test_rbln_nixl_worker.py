@@ -431,86 +431,109 @@ def _fake_nixl_rbln(xfer_result):
     return module
 
 
-class TestPageLayoutUnits:
-    """Under VLLM_RBLN_PAGE_LAYOUT the connector must count kernel blocks.
+class TestPageGranularTransfer:
+    """Under page layout the transfer moves **pages**, not kernel blocks.
 
-    The runner converts the KV geometry from pages to kernel blocks, but on its
-    **own** `KVCacheConfig` -- this connector holds a different instance, so it
-    cannot just re-read `num_blocks` (measured: still 392 pages while the tensors
-    held 49 kernel blocks). The ratio is derived from `vllm_config`, which both
-    sides share, mirroring the runner's guard so the two cannot disagree.
+    Prefix caching decides in pages which blocks a decode still needs. Moving
+    whole kernel blocks makes the two disagree at the boundary -- the block
+    holding the first uncached page also holds cached ones, and a whole-block
+    write lands on top of them. Folding the ids to kernel blocks instead was
+    tried and produced 200 OK with incoherent output, so the transfer is lowered
+    to the page.
+
+    A page is H discontiguous runs (`[..., H, 1, S, D]` puts the head axis
+    between block and token), but the descriptors stay dense because
+    `offset/page_bytes == ppe*H*b + ppe*h + s`.
     """
 
     @staticmethod
-    def _page_layout_worker(monkeypatch, *, pages=392, page=512, kernel=4096):
+    def _worker(monkeypatch, *, page=512, kernel=4096, heads=8, blocks=49):
         monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
-        spec = _impl_layer_spec()
-        spec.block_size = page  # pre-restate: the connector's copy sees pages
-        worker = _prep_impl_worker(monkeypatch, num_blocks=pages, block_size=page)
+        worker = _prep_impl_worker(monkeypatch, num_blocks=blocks, block_size=page)
         worker.vllm_config.additional_config = {"attn_block_size": kernel}
-        worker.kv_cache_config.kv_cache_groups = [MagicMock(kv_cache_spec=spec)]
-        worker._layer_specs = {"l0": spec, "l1": spec}
+        worker.kv_cache_config.num_blocks = blocks
         return worker
 
-    def test_ratio_is_one_without_the_env(self, monkeypatch):
-        worker = self._page_layout_worker(monkeypatch)
+    @staticmethod
+    def _region(heads=8, kernel=4096, blocks=49):
+        t = MagicMock()
+        t.dim.return_value = 5
+        t.shape = (blocks, heads, 1, kernel, 128)
+        return t
+
+    def test_geometry_off_without_the_env(self, monkeypatch):
+        worker = self._worker(monkeypatch)
         monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", False)
-        assert worker._pages_per_kernel_block() == 1
+        assert worker._page_transfer_geometry(self._region()) == (1, 1)
 
-    def test_ratio_is_one_without_attn_block_size(self, monkeypatch):
-        worker = self._page_layout_worker(monkeypatch)
+    def test_geometry_off_without_attn_block_size(self, monkeypatch):
+        worker = self._worker(monkeypatch)
         worker.vllm_config.additional_config = {}
-        assert worker._pages_per_kernel_block() == 1
+        assert worker._page_transfer_geometry(self._region()) == (1, 1)
 
-    def test_ratio_from_kernel_block_over_page(self, monkeypatch):
-        worker = self._page_layout_worker(monkeypatch)
-        assert worker._pages_per_kernel_block() == 8
+    def test_geometry_reads_heads_and_pages_off_the_tensor(self, monkeypatch):
+        worker = self._worker(monkeypatch)
+        assert worker._page_transfer_geometry(self._region()) == (8, 8)
 
-    def test_ratio_is_one_when_the_config_was_already_restated(self, monkeypatch):
-        """Self-correcting: a restated spec no longer matches the page size, so
-        the ratio collapses and nothing is converted twice."""
-        worker = self._page_layout_worker(monkeypatch)
-        worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size = 4096
-        assert worker._pages_per_kernel_block() == 1
+    def test_geometry_tolerates_the_leading_kv_axis(self, monkeypatch):
+        """Per-layer tensors carry [2, B, H, 1, S, D]; regions drop the 2."""
+        worker = self._worker(monkeypatch)
+        t = MagicMock()
+        t.dim.return_value = 6
+        t.shape = (2, 49, 8, 1, 4096, 128)
+        assert worker._page_transfer_geometry(t) == (8, 8)
 
-    def test_registration_converts_pages_to_kernel_blocks(self, monkeypatch):
-        """The whole bug in one assertion: registered in pages, tensors in kernel
-        blocks. 392 pages / 8 = 49, and the block grows 512 -> 4096."""
-        worker = self._page_layout_worker(monkeypatch)
-        assert worker.num_blocks == 392, "precondition: constructed on pages"
-        assert worker.block_size == 512, "precondition: constructed on pages"
+    def test_geometry_bails_when_the_token_axis_is_not_the_kernel_block(
+        self, monkeypatch
+    ):
+        """A layout change must fall back loudly, not mis-stride descriptors."""
+        worker = self._worker(monkeypatch)
+        t = MagicMock()
+        t.dim.return_value = 5
+        t.shape = (49, 8, 1, 1024, 128)  # token axis != attn_block_size
+        assert worker._page_transfer_geometry(t) == (1, 1)
 
-        kv_caches = _impl_kv_caches(num_blocks=49)
-        xfer_result = MagicMock()
-        xfer_result.base_addrs = [0x20000, 0x20100]
-        xfer_result.block_lens = [256, 256]
-        xfer_result.reg_handle = "reg-handle"
-        xfer_result.n_shards = 1
-        topo = MagicMock(
-            is_kv_layout_blocks_first=False,
-            _cross_layers_blocks=False,
-            cross_layers_blocks=False,
-        )
-        topo.get_transfer_cache_regions.side_effect = _split_kv(49)
 
-        with (
-            _patch_worker_nixl_symbols(topo),
-            patch.dict(sys.modules, {"nixl_rbln": _fake_nixl_rbln(xfer_result)}),
-            patch.object(wm, "rebel") as mock_rebel,
-            patch.object(
-                worker,
-                "register_local_xfer_handler",
-                return_value=("local-handle", [(0x0, 0, 0)]),
-            ),
-        ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
-            # Raises "All kv cache tensors must have the same number of blocks"
-            # if the page count survives into registration.
-            worker._register_kv_caches_impl(kv_caches)
+class TestPageDescExpansion:
+    """One page is H descriptors, and they must be the right H."""
 
-        assert worker.num_blocks == 49
-        assert worker._logical_num_blocks == 49
-        assert worker.block_size == 4096
+    @staticmethod
+    def _worker(monkeypatch, ppe=8, heads=8):
+        w = _prep_impl_worker(monkeypatch, num_blocks=49, block_size=512)
+        w._pages_per_kernel_block_xfer = ppe
+        w._kv_heads_per_desc = heads
+        w.num_regions = 1
+        return w
+
+    def test_untouched_without_page_granular_transfer(self, monkeypatch):
+        w = self._worker(monkeypatch, ppe=1, heads=1)
+        got = w._compute_desc_ids([[0, 1, 2]], dst_num_blocks=49, block_size_ratio=None,
+                                  physical_blocks_per_logical=1)
+        assert list(got) == [0, 1, 2], "must be upstream's mapping unchanged"
+
+    def test_page_expands_to_one_desc_per_head(self, monkeypatch):
+        w = self._worker(monkeypatch, ppe=8, heads=8)
+        # page 0 = block 0, slot 0 -> ppe*H*0 + ppe*h + 0 = 0, 8, 16, ... 56
+        got = w._compute_desc_ids([[0]], dst_num_blocks=8 * 8 * 49,
+                                  block_size_ratio=None, physical_blocks_per_logical=1)
+        assert list(got) == [0, 8, 16, 24, 32, 40, 48, 56]
+
+    def test_slot_and_block_land_where_the_offset_formula_says(self, monkeypatch):
+        w = self._worker(monkeypatch, ppe=8, heads=8)
+        # page 11 = block 1, slot 3 -> 8*8*1 + 8h + 3
+        got = w._compute_desc_ids([[11]], dst_num_blocks=8 * 8 * 49,
+                                  block_size_ratio=None, physical_blocks_per_logical=1)
+        assert list(got) == [67 + 8 * h for h in range(8)]
+
+    def test_desc_ids_stay_inside_the_registered_space(self, monkeypatch):
+        """The last page of the last block must still address a real descriptor."""
+        blocks, ppe, heads = 49, 8, 8
+        w = self._worker(monkeypatch, ppe=ppe, heads=heads)
+        space = ppe * heads * blocks
+        last_page = blocks * ppe - 1
+        got = w._compute_desc_ids([[last_page]], dst_num_blocks=space,
+                                  block_size_ratio=None, physical_blocks_per_logical=1)
+        assert max(got) < space, f"desc {max(got)} outside registered {space}"
 
 
 class TestRegisterKvCachesImpl:

@@ -151,6 +151,12 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         self._physical_blocks_per_logical_kv_block = 1
         self._logical_num_blocks = self.num_blocks
 
+        # Page-granular transfer (VLLM_RBLN_PAGE_LAYOUT). Set at registration
+        # from the KV tensor itself; 1 / None means "kernel-block transfer, as
+        # before". See `_page_transfer_geometry`.
+        self._pages_per_kernel_block_xfer = 1
+        self._kv_heads_per_desc = 1
+
         # SWA view-opt: publish a second sliding_window-length desc range at the
         # same NIXL base addrs as the Full range, so SWA groups transport only the
         # populated prefix (kernel slot 0 is pinned at the block base). Storage and
@@ -311,6 +317,89 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 return 1
         return kernel_block_size // page_size
 
+    def _expand_pages_to_descs(self, block_ids: BlockIds) -> BlockIds:
+        """Each page id becomes the H descriptors that page occupies.
+
+        Upstream maps one block id to one descriptor per region, which holds
+        while a block is contiguous. A page is not (`[..., H, 1, S, D]` puts the
+        head axis between block and token), so page `s` of block `b` is the H
+        descriptors sharing that `(b, s)`:
+
+            desc(b, h, s) = ppe*H*b + ppe*h + s
+
+        dense over `[0, ppe*H*B)` -- the space registration sized `num_blocks`
+        to. A no-op when the transfer moves kernel blocks.
+        """
+        ppe = self._pages_per_kernel_block_xfer
+        if ppe <= 1:
+            return block_ids
+        heads = self._kv_heads_per_desc
+        expanded: list[list[int]] = []
+        for group in block_ids:
+            descs: list[int] = []
+            for page_id in group:
+                block, slot = divmod(int(page_id), ppe)
+                base = ppe * heads * block + slot
+                descs.extend(base + ppe * h for h in range(heads))
+            expanded.append(descs)
+        return expanded
+
+    def _page_transfer_geometry(self, cache: "torch.Tensor") -> tuple[int, int]:
+        """(pages_per_kernel_block, kv_heads) for page-granular transfer, or (1, 1).
+
+        Under VLLM_RBLN_PAGE_LAYOUT the KV tensors are laid out in kernel blocks
+        while prefix caching -- and therefore which blocks a decode still needs --
+        works in pages. Moving whole kernel blocks makes those two disagree at
+        the boundary: the kernel block holding the first uncached page also holds
+        pages that are already cached, and a whole-block write lands on top of
+        them. (Measured: folding the ids instead produced 200 OK with incoherent
+        output.) So the transfer is lowered to the page.
+
+        A page is not one contiguous run. The region tensor is
+        `[B, H, 1, S, D]` (`FlashAttentionBackend.get_kv_cache_shape`), so the
+        head axis sits between the block axis and the token axis: page `s` of
+        block `b` is H separate runs, one per head. Descriptors are still dense,
+        because dividing the offset by the page's own size linearises it:
+
+            offset(b, h, s) / page_bytes = ppe*H*b + ppe*h + s
+
+        so a region carries `ppe*H*B` descriptors with no gaps, and one page is
+        the H of them that share `b` and `s`. That is the 64x descriptor count
+        this buys (24,304 -> 1,555,456 here), which is the price of the transfer
+        agreeing with prefix caching.
+        """
+        if not envs.VLLM_RBLN_PAGE_LAYOUT:
+            return 1, 1
+        additional = getattr(self.vllm_config, "additional_config", None)
+        kernel_block_size = additional.get("attn_block_size") if additional else None
+        if not kernel_block_size:
+            return 1, 1
+        kernel_block_size = int(kernel_block_size)
+        page_size = self.vllm_config.cache_config.block_size
+        if kernel_block_size == page_size or kernel_block_size % page_size != 0:
+            return 1, 1
+        # `[..., H, 1, S, D]` -- the per-layer tensor carries a leading K/V axis
+        # and a region does not, so index from the end. H and S come off the
+        # tensor rather than the config, so a layout change fails here instead
+        # of silently mis-striding the descriptors.
+        if cache.dim() < 4:
+            logger.warning(
+                "Page-granular transfer expects [..., H, 1, S, D], got %s dims; "
+                "falling back to kernel-block transfer.",
+                cache.dim(),
+            )
+            return 1, 1
+        heads, tokens_per_block = cache.shape[-4], cache.shape[-2]
+        if tokens_per_block != kernel_block_size:
+            logger.warning(
+                "Page-granular transfer: region token axis is %d but the kernel "
+                "block is %d; falling back to kernel-block transfer.",
+                tokens_per_block,
+                kernel_block_size,
+            )
+            return 1, 1
+        return kernel_block_size // page_size, heads
+
     def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Direct variant of NixlConnectorWorker.register_kv_caches:
         build the upstream topology, hand the logical K/V regions to
@@ -329,11 +418,29 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         # `__init__` counted pages. Leaving it in pages is what produced
         # "All kv cache tensors must have the same number of blocks"
         # (392 pages against tensors holding 49 kernel blocks).
-        ratio = self._pages_per_kernel_block()
-        if ratio > 1:
-            self.num_blocks = self.num_blocks // ratio
+        # Page-granular transfer: the descriptor unit is the page, not the
+        # kernel block. `_page_transfer_geometry` explains why and derives the
+        # numbers; here they only have to reach the registration below and
+        # `_compute_desc_ids`.
+        sample = next(iter(kv_caches.values()))
+        ppe, heads = self._page_transfer_geometry(sample)
+        self._pages_per_kernel_block_xfer, self._kv_heads_per_desc = ppe, heads
+        if ppe > 1:
+            kernel_blocks = self.kv_cache_config.num_blocks
+            # Dense desc space: ppe*H*b + ppe*h + s covers every (block, head,
+            # page) exactly once.
+            self.num_blocks = kernel_blocks * heads * ppe
             self._logical_num_blocks = self.num_blocks
-            self.block_size = self.block_size * ratio
+            self.block_size = self.vllm_config.cache_config.block_size
+            logger.info(
+                "Page-granular KV transfer: %d kernel blocks x %d heads x %d "
+                "pages = %d descriptors per region (page=%d tokens).",
+                kernel_blocks,
+                heads,
+                ppe,
+                self.num_blocks,
+                self.block_size,
+            )
 
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
@@ -396,6 +503,13 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             # For when registering multiple tensors eg K/V in separate
             # regions.
             physical_page_size = physical_page_size // len(cache_list)
+            if self._pages_per_kernel_block_xfer > 1:
+                # One descriptor is one page of one head (see
+                # `_page_transfer_geometry`): the kernel block's bytes split
+                # across H heads and ppe pages.
+                physical_page_size = physical_page_size // (
+                    self._kv_heads_per_desc * self._pages_per_kernel_block_xfer
+                )
             if self.transfer_topo._cross_layers_blocks:
                 physical_page_size = physical_page_size * len(
                     self.kv_cache_config.kv_cache_tensors
@@ -423,13 +537,18 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 else:
                     full_block_len = physical_page_size
 
-                # With the units aligned above this is the plain identity
-                # again: the tensor's outer dim is the block count the connector
-                # registered, page layout or not.
-                assert cache.shape[0] == num_blocks, (
+                # The tensor's outer dim is the kernel-block count. Without
+                # page-granular transfer that is also `num_blocks`; with it,
+                # `num_blocks` is the descriptor space (kernel blocks x heads x
+                # pages), so scale before comparing rather than dropping the
+                # check -- it is what catches a layer whose KV pool differs.
+                expected_outer = num_blocks // (
+                    self._kv_heads_per_desc * self._pages_per_kernel_block_xfer
+                )
+                assert cache.shape[0] == expected_outer, (
                     "All kv cache tensors must have the same number of blocks "
                     f"({layer_name}: shape[0]={cache.shape[0]} vs "
-                    f"num_blocks={num_blocks})"
+                    f"expected={expected_outer})"
                 )
                 if not self.use_mla:
                     assert tensor_size_bytes == curr_tensor_size_bytes, (
@@ -716,6 +835,10 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         block_size_ratio: float | None,
         physical_blocks_per_logical: int,
     ) -> np.ndarray:
+        # Page-granular transfer expands first: everything below indexes the
+        # descriptor space, and under page layout one page is H descriptors.
+        block_ids = self._expand_pages_to_descs(block_ids)
+
         if self._sw_ratio is None:
             # No SWA view opt: upstream's Full/SSM desc layout applies.
             return super()._compute_desc_ids(

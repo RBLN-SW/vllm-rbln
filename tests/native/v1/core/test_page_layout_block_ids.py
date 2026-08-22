@@ -165,30 +165,27 @@ class TestDisabled:
         assert out.scheduled_new_reqs[0].block_ids == ([0, 1],)
 
 
-def test_rewrite_runs_before_the_connector_reads_the_output():
-    """The rewrite must precede `build_connector_meta` in `schedule()`.
+def test_rewrite_runs_after_the_connector_reads_the_output():
+    """Connectors keep **pages**; only the worker's block table is converted.
 
-    Both consumers index the same ids: the worker builds its block table from
-    `scheduled_*_reqs`, and a KV connector builds its transfer descriptors from
-    the same output. Whichever runs first decides the unit each one sees.
+    The NIXL transfer is page-granular (see `_page_transfer_geometry`), so the
+    ids it indexes descriptors with must be pages. LMCache needs kernel blocks
+    instead -- it indexes the KV tensor directly -- and gets them from
+    `_connector_blocks`, a different accessor. That split is the only reason two
+    connectors can disagree about the unit without one of them corrupting KV.
 
-    It used to run last, so the worker got kernel blocks and the connector kept
-    pages. Nothing complained until a request was long enough to move KV across
-    a PD pair -- NIXL then prepped descriptors over 49 kernel blocks and was
-    handed 53 page ids for a ~20k prompt ("transfer_setup_failed ...
-    num_local_blocks: 53", measured 2026-08-22 on MiniMax-M2.5 / R100 2P2D).
-    Short requests kept answering correctly the whole time, which is what makes
-    the ordering worth pinning rather than leaving to review.
+    This ordering was inverted once, to give connectors kernel blocks. It fixed
+    NIXL's descriptor math at the time and broke LMCache's, and the version that
+    folded ids for both silently corrupted generation (a2b0a118).
     """
     import inspect
 
     src = inspect.getsource(RBLNScheduler.schedule)
     rewrite = src.index("_rewrite_block_ids_to_kernel_blocks(scheduler_output)")
     connector = src.index("self.connector.build_connector_meta(")
-    assert rewrite < connector, (
-        "_rewrite_block_ids_to_kernel_blocks must run before "
-        "build_connector_meta, or the KV connector indexes its descriptors "
-        "with page ids while the worker uses kernel blocks"
+    assert rewrite > connector, (
+        "the connector must see page ids; only the worker block table is "
+        "rewritten to kernel blocks"
     )
 
 
@@ -230,50 +227,22 @@ def _bare_scheduler(**attrs):
     return sched
 
 
-def test_connector_finished_hands_over_kernel_blocks():
-    """`_connector_finished` is the one id path that skips `scheduler_output`.
-
-    Upstream reads `kv_cache_manager.get_block_ids()` straight, which is pages
-    under page layout. On a prefill those ids become `remote_block_ids` in
-    `kv_transfer_params`, and the decode indexes its transfer descriptors with
-    them -- so pages leaking here land as NIXL_ERR_INVALID_PARAM on the far side
-    of the P/D boundary (measured 2026-08-22: a 26.7k-token prefill shipped 53
-    ids = 53 x 512 tokens, i.e. pages).
-    """
-    kernel_blocks = [7, 8, 9]
-    connector = _FakeConnector()
-    sched = _bare_scheduler(
-        kv_cache_manager=_page_layout_manager(kernel_blocks),
-        connector=connector,
-        kv_cache_config=SimpleNamespace(kv_cache_groups=[object()]),
-    )
-    request = SimpleNamespace(request_id="r0", num_computed_tokens=4096)
-
-    sched._connector_finished(request)
-    assert connector.seen == kernel_blocks, (
-        "the connector must receive kernel blocks; pages here become "
-        "remote_block_ids and break the transfer on the decode side"
-    )
-
-
-def test_connector_finished_defers_to_upstream_without_page_layout():
-    """No page layout -> untouched: upstream's own path runs."""
+def test_connector_finished_leaves_pages_alone():
+    """A prefill's `remote_block_ids` are pages -- the decode indexes its
+    page-granular descriptors with them."""
+    called = {}
     import vllm.v1.core.sched.scheduler as up
 
-    called = {}
-    sched = _bare_scheduler(
-        kv_cache_manager=SimpleNamespace(),  # not the page-layout manager
-        connector=_FakeConnector(),
-    )
+    sched = _bare_scheduler(kv_cache_manager=_page_layout_manager([3]),
+                            connector=_FakeConnector())
     request = SimpleNamespace(request_id="r0", num_computed_tokens=0)
-
     original = up.Scheduler._connector_finished
     up.Scheduler._connector_finished = lambda self, req: called.setdefault("hit", True)
     try:
         sched._connector_finished(request)
     finally:
         up.Scheduler._connector_finished = original
-    assert called.get("hit"), "should fall through to upstream"
+    assert called.get("hit"), "must defer to upstream, which yields pages"
 
 
 def test_connector_blocks_reports_kernel_blocks():

@@ -1144,24 +1144,15 @@ class RBLNScheduler(Scheduler):
                 self.kv_cache_manager.drain_pending_copy_ops()
             )
 
-        # Page ids -> the kernel blocks backing them, **before** the connector
-        # reads this output. Both consumers must see the same unit: the worker
-        # builds its block table from `scheduled_*_reqs`, and a KV connector
-        # indexes its transfer descriptors with the very same ids.
+        # Page ids -> the kernel blocks backing them, for the **worker's block
+        # table**. The worker addresses attention by kernel block, so this stays.
         #
-        # This used to run at the end of schedule(), after `build_connector_meta`
-        # below. The worker got kernel blocks and the connector kept pages, and
-        # nothing complained until a request was long enough to move KV across a
-        # PD pair -- then NIXL prepped descriptors over 49 kernel blocks and was
-        # handed 53 page ids for a ~20k prompt:
-        #   "NIXL transfer failure: transfer_setup_failed ... num_local_blocks: 53"
-        # (measured 2026-08-22, MiniMax-M2.5 / R100 2P2D).
-        #
-        # Safe to run here: allocation for this step is complete, and nothing
-        # between this point and the old one reads `scheduler_output`'s block ids
-        # -- `_update_after_schedule` takes them from the KV cache manager, not
-        # from the output.
-        self._rewrite_block_ids_to_kernel_blocks(scheduler_output)
+        # It deliberately runs after `build_connector_meta` below: connectors
+        # keep pages. The NIXL transfer is page-granular (see
+        # `_page_transfer_geometry`), and LMCache is handed kernel blocks by a
+        # different route (`_connector_blocks`), because it indexes the KV
+        # tensor directly. The two consumers read different accessors, which is
+        # what lets them disagree on the unit safely.
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1187,6 +1178,7 @@ class RBLNScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._rewrite_block_ids_to_kernel_blocks(scheduler_output)
         return scheduler_output
 
     def _connector_blocks(self, request_id: str):
@@ -1218,39 +1210,15 @@ class RBLNScheduler(Scheduler):
         return _KernelBlockView(blocks, kernel_blocks)
 
     def _connector_finished(self, request):
-        """Hand the connector kernel blocks here too.
+        """Upstream's -- the ids a connector gets here are **pages**.
 
-        This is the one block-id path that does not run through
-        `scheduler_output`: upstream reads
-        `kv_cache_manager.get_block_ids()` directly, which under page layout
-        returns *pages*. On a prefill that becomes `remote_block_ids` in the
-        request's `kv_transfer_params` -- the list the decode side then indexes
-        its transfer descriptors with -- so pages leaking out here reproduce the
-        same unit mismatch `_rewrite_block_ids_to_kernel_blocks` exists to
-        prevent, just one hop later and across the P/D boundary.
-
-        Measured 2026-08-22 (MiniMax-M2.5 / R100 2P2D): with the scheduler-output
-        path already fixed, a ~26.7k-token prefill still shipped 53 ids --
-        53 x 512 = 27,136 tokens, i.e. pages -- and the decode's
-        `makeXferReq` rejected them with NIXL_ERR_INVALID_PARAM.
+        This used to convert to kernel blocks, back when the NIXL transfer moved
+        kernel blocks. It moves pages now (see `_page_transfer_geometry` in the
+        RBLN NIXL worker), and these ids become a prefill's `remote_block_ids`,
+        which the decode indexes descriptors with. Pages is what that space is
+        keyed by, so upstream's own path is correct again.
         """
-        manager = self.kv_cache_manager
-        if self.connector is None or not isinstance(
-            manager, RBLNPageLayoutKVCacheManager
-        ):
-            return super()._connector_finished(request)
-
-        # Same preamble as upstream: drop out-of-window prefix blocks before the
-        # connector sees the table.
-        manager.remove_skipped_blocks(
-            request_id=request.request_id,
-            total_computed_tokens=request.num_computed_tokens,
-        )
-        kernel_blocks = list(manager.block_table(request.request_id))
-        if not isinstance(self.connector, SupportsHMA):
-            assert len(self.kv_cache_config.kv_cache_groups) == 1
-            return self.connector.request_finished(request, kernel_blocks)
-        return self.connector.request_finished_all_groups(request, (kernel_blocks,))
+        return super()._connector_finished(request)
 
     def _rewrite_block_ids_to_kernel_blocks(
         self, scheduler_output: RBLNSchedulerOutput
