@@ -1,0 +1,110 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""LMCache mp adapters must size paged-KV work in kernel blocks under page layout.
+
+`blocks_in_chunk = chunk // vllm_block_size` decides how many block ids a
+retrieve expects. Feeding it the page while the ids (and the KV tensors) are
+kernel blocks is an 8x miscount:
+
+    ValueError: block_ids length (6) must be at least len(chunks) (6)
+                * blocks_per_chunk (8)
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+import vllm_rbln.envs as envs
+from vllm_rbln.patches import lmcache_mp_block_size as mod
+
+
+def _config(*, page=512, kernel=4096, additional=True):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=page),
+        model_config=object(),
+        additional_config={"attn_block_size": kernel} if additional else None,
+    )
+
+
+class TestKernelBlockSize:
+    def test_none_without_the_env(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", False)
+        assert mod._kernel_block_size(_config()) is None
+
+    def test_none_without_attn_block_size(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
+        assert mod._kernel_block_size(_config(additional=False)) is None
+
+    def test_none_when_kernel_equals_page(self, monkeypatch):
+        """Degenerate geometry -- page layout is a no-op, leave the value alone."""
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
+        assert mod._kernel_block_size(_config(page=512, kernel=512)) is None
+
+    def test_none_when_not_a_multiple(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
+        assert mod._kernel_block_size(_config(page=512, kernel=700)) is None
+
+    def test_kernel_block_when_it_applies(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
+        assert mod._kernel_block_size(_config()) == 4096
+
+
+class TestRedirect:
+    @pytest.fixture(autouse=True)
+    def _capture(self, monkeypatch):
+        self.seen = {}
+
+        def fake_original(_self, *args, **kwargs):
+            self.seen.update(kwargs)
+
+        monkeypatch.setitem(mod._ORIGINAL_INITS, "LMCacheMPWorkerAdapter", fake_original)
+
+    def test_page_becomes_kernel_block(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
+        cfg = _config()
+        mod._redirect(
+            "LMCacheMPWorkerAdapter",
+            object(),
+            (),
+            {"vllm_config": cfg, "vllm_block_size": 512},
+        )
+        assert self.seen["vllm_block_size"] == 4096
+
+    def test_untouched_without_page_layout(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", False)
+        mod._redirect(
+            "LMCacheMPWorkerAdapter",
+            object(),
+            (),
+            {"vllm_config": _config(), "vllm_block_size": 512},
+        )
+        assert self.seen["vllm_block_size"] == 512
+
+    def test_finds_the_config_passed_positionally(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
+        cfg = _config()
+        mod._redirect(
+            "LMCacheMPWorkerAdapter", object(), (cfg,), {"vllm_block_size": 512}
+        )
+        assert self.seen["vllm_block_size"] == 4096
+
+    def test_leaves_other_kwargs_alone(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
+        mod._redirect(
+            "LMCacheMPWorkerAdapter",
+            object(),
+            (),
+            {"vllm_config": _config(), "vllm_block_size": 512, "model_name": "m"},
+        )
+        assert self.seen["model_name"] == "m"
