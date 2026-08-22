@@ -100,6 +100,14 @@ def ensure_applied() -> None:
 
 _ORIGINAL_CREATE_CONNECTOR = None
 
+# The VllmConfig the factory was handed, kept for `_redirect`.
+# `LMCacheMPConnector` does **not** pass vllm_config to its adapters --
+# only server_url / context / model_name / vllm_block_size /
+# parallel_strategy / extra_config -- so the adapter's own __init__ has no
+# way to reach it. The factory hook runs immediately before, in the same
+# process, with the config in hand.
+_VLLM_CONFIG: Any = None
+
 
 def _capture_create_connector():
     global _ORIGINAL_CREATE_CONNECTOR
@@ -130,6 +138,12 @@ def patched_create_connector(*args, **kwargs):
     hooked `RBLNScheduler.__init__` and `RBLNWorker.__init__` and still missed
     the worker-side adapter.
     """
+    global _VLLM_CONFIG
+    config = kwargs.get("config")
+    if config is None and args:
+        config = args[0]
+    if config is not None and hasattr(config, "cache_config"):
+        _VLLM_CONFIG = config
     ensure_applied()
     return _ORIGINAL_CREATE_CONNECTOR(*args, **kwargs)
 
@@ -162,6 +176,11 @@ def _redirect(name: str, self: Any, args: tuple, kwargs: dict) -> Any:
             if hasattr(arg, "cache_config") and hasattr(arg, "model_config"):
                 vllm_config = arg
                 break
+    if vllm_config is None:
+        # The usual case: the adapters are built without the config (see
+        # `_VLLM_CONFIG`). Measured -- assuming otherwise is why an earlier
+        # version of this patch applied cleanly and rewrote nothing.
+        vllm_config = _VLLM_CONFIG
     if vllm_config is not None and "vllm_block_size" in kwargs:
         kernel_block = _kernel_block_size(vllm_config)
         if kernel_block is not None and kwargs["vllm_block_size"] != kernel_block:

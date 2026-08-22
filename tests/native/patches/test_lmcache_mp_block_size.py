@@ -154,3 +154,49 @@ class TestLateApplication:
         assert src.index("ensure_applied()") < src.index("_ORIGINAL_CREATE_CONNECTOR("), (
             "the patch must be applied before the connector is constructed"
         )
+
+
+class TestConfigIsNotPassedToAdapters:
+    """`LMCacheMPConnector` builds its adapters **without** the VllmConfig.
+
+    Its call site passes only server_url / context / model_name /
+    vllm_block_size / parallel_strategy / extra_config. An earlier version of
+    this patch looked for `vllm_config` among the adapter's own arguments, found
+    nothing, and rewrote nothing -- applying cleanly while doing exactly zero
+    (measured in-cluster: patch installed, blocks_per_chunk still 8). The config
+    has to come from the factory hook, which runs just before in the same
+    process.
+    """
+
+    def test_rewrites_from_the_stashed_config(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
+        monkeypatch.setattr(mod, "_VLLM_CONFIG", _config())
+        seen = {}
+        monkeypatch.setitem(
+            mod._ORIGINAL_INITS,
+            "LMCacheMPWorkerAdapter",
+            lambda _s, *a, **k: seen.update(k),
+        )
+        # exactly the kwargs LMCacheMPConnector uses -- no vllm_config
+        mod._redirect(
+            "LMCacheMPWorkerAdapter",
+            object(),
+            (),
+            {
+                "server_url": "tcp://x:5555",
+                "model_name": "m",
+                "vllm_block_size": 512,
+                "extra_config": {},
+            },
+        )
+        assert seen["vllm_block_size"] == 4096
+
+    def test_factory_hook_stashes_the_config(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(mod, "_VLLM_CONFIG", None)
+        monkeypatch.setattr(mod, "_ORIGINAL_CREATE_CONNECTOR", lambda *a, **k: "conn")
+        monkeypatch.setattr(mod, "ensure_applied", lambda: captured.setdefault("ok", 1))
+        cfg = _config()
+        assert mod.patched_create_connector(cfg, "role", "kvcfg") == "conn"
+        assert mod._VLLM_CONFIG is cfg
+        assert captured.get("ok"), "the patch must still be applied"
