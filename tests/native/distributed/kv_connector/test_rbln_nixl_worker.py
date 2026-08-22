@@ -431,6 +431,92 @@ def _fake_nixl_rbln(xfer_result):
     return module
 
 
+class TestPageLayoutUnits:
+    """Under VLLM_RBLN_PAGE_LAYOUT the connector must count kernel blocks.
+
+    The worker rewrites `kv_cache_config` in place -- pages to kernel blocks --
+    *after* this connector is constructed, and restates each group's spec to the
+    kernel block while leaving `cache_config.block_size` at the page on purpose.
+    A connector that keeps what __init__ saw registers 8x too many blocks of the
+    wrong size and dies at registration with "All kv cache tensors must have the
+    same number of blocks" (measured 2026-08-22: 432 pages vs 54 kernel blocks
+    for a 4096/512 geometry).
+    """
+
+    def test_transport_block_size_follows_the_spec_not_cache_config(self, monkeypatch):
+        # cache_config keeps the page (512); the restated spec carries the
+        # kernel block (4096). The transport moves kernel blocks.
+        spec = _impl_layer_spec()
+        spec.block_size = 4096
+        worker = _build_worker(monkeypatch, block_size=512, specs=[spec])
+        assert worker.block_size == 4096
+
+    def test_transport_block_size_is_cache_config_without_page_layout(
+        self, monkeypatch
+    ):
+        spec = _impl_layer_spec()
+        spec.block_size = 64
+        worker = _build_worker(monkeypatch, block_size=64, specs=[spec])
+        assert worker.block_size == 64
+
+    def test_hybrid_specs_keep_the_engine_wide_block(self, monkeypatch):
+        # Per-spec ratios differ: picking one group's block arbitrarily would be
+        # worse than the engine-wide value.
+        a, b = _impl_layer_spec(), _impl_layer_spec()
+        a.block_size, b.block_size = 64, 128
+        worker = _build_worker(monkeypatch, block_size=64, specs=[a, b])
+        assert worker.block_size == 64
+
+    def test_registration_rereads_num_blocks_after_the_worker_restates_it(
+        self, monkeypatch
+    ):
+        """The whole bug in one assertion: __init__ saw pages, registration must
+        see the kernel blocks the worker has since written into the config."""
+        spec = _impl_layer_spec()
+        spec.block_size = 512
+        worker = _prep_impl_worker(monkeypatch, num_blocks=432, block_size=512)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        worker.kv_cache_config.kv_cache_groups = [MagicMock(kv_cache_spec=spec)]
+        assert worker.num_blocks == 432, "precondition: constructed on pages"
+        assert worker.block_size == 512, "precondition: constructed on pages"
+
+        # What RBLNModelRunner does in place before compile_or_warm_up_model:
+        # pages -> kernel blocks, and the spec restated to the kernel block.
+        worker.kv_cache_config.num_blocks = 54
+        spec.block_size = 4096
+
+        kv_caches = _impl_kv_caches(num_blocks=54)
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000, 0x20100]
+        xfer_result.block_lens = [256, 256]
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = 1
+        topo = MagicMock(
+            is_kv_layout_blocks_first=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = _split_kv(54)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": _fake_nixl_rbln(xfer_result)}),
+            patch.object(wm, "rebel") as mock_rebel,
+            patch.object(
+                worker,
+                "register_local_xfer_handler",
+                return_value=("local-handle", [(0x0, 0, 0)]),
+            ),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            # Would raise "All kv cache tensors must have the same number of
+            # blocks" if the stale page count were still in use.
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert worker.num_blocks == 54
+        assert worker.block_size == 4096
+
+
 class TestRegisterKvCachesImpl:
     # The deferred D2D body: hands the logical K/V regions to
     # nixl_rbln.register_kv_regions and absorbs the returned transfer tables.

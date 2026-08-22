@@ -147,7 +147,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         # attention backend's kernel ratio, which doesn't reflect per-spec
         # ratios in hybrid models.
         self.num_blocks = self.kv_cache_config.num_blocks
-        self.block_size = self.vllm_config.cache_config.block_size
+        self.block_size = self._transport_block_size()
         self._physical_blocks_per_logical_kv_block = 1
         self._logical_num_blocks = self.num_blocks
 
@@ -280,6 +280,32 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         assert self.use_host_buffer
         self.copy_blocks = copy_operation
 
+    def _transport_block_size(self) -> int:
+        """The block the transport moves, which is the *spec's* block.
+
+        Normally that equals `cache_config.block_size`. Under
+        VLLM_RBLN_PAGE_LAYOUT it does not: the worker restates each group's spec
+        to the kernel block while deliberately leaving `cache_config.block_size`
+        at the page (see `rbln_model_runner`, "Restate the spec only" -- the
+        engine core reads cache_config afterwards and a kernel-sized value there
+        would contradict the page-sized spec the scheduler kept).
+
+        The transport must follow the spec, because everything it touches is in
+        kernel blocks under page layout: the KV tensors are allocated that way,
+        `page_size_bytes` comes off the restated spec, and the scheduler rewrites
+        block ids to kernel blocks before they reach us
+        (`RBLNScheduler._rewrite_block_ids_to_kernel_blocks`). Reading
+        cache_config here left this one value in pages while its neighbours were
+        kernel blocks -- an 8x unit mismatch for a 4096/512 geometry.
+        """
+        specs = [g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups]
+        sizes = {s.block_size for s in specs if hasattr(s, "block_size")}
+        if len(sizes) == 1:
+            return sizes.pop()
+        # Hybrid models keep per-spec ratios; fall back to the engine-wide value
+        # rather than picking one group's block arbitrarily.
+        return self.vllm_config.cache_config.block_size
+
     def _register_kv_caches_impl(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Direct variant of NixlConnectorWorker.register_kv_caches:
         build the upstream topology, hand the logical K/V regions to
@@ -288,6 +314,16 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         transfer state.
         """
         import nixl_rbln
+
+        # Re-read the block accounting: under VLLM_RBLN_PAGE_LAYOUT the worker
+        # rewrites `kv_cache_config` in place (pages -> kernel blocks) *after*
+        # this connector was constructed, so what __init__ captured is stale by
+        # exactly `pages_per_kernel_block`. Registering with the stale count is
+        # what produced "All kv cache tensors must have the same number of
+        # blocks" -- 432 pages against tensors holding 54 kernel blocks.
+        self.num_blocks = self.kv_cache_config.num_blocks
+        self._logical_num_blocks = self.num_blocks
+        self.block_size = self._transport_block_size()
 
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
@@ -377,8 +413,13 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 else:
                     full_block_len = physical_page_size
 
+                # With the units aligned above this is the plain identity
+                # again: the tensor's outer dim is the block count the connector
+                # registered, page layout or not.
                 assert cache.shape[0] == num_blocks, (
-                    "All kv cache tensors must have the same number of blocks"
+                    "All kv cache tensors must have the same number of blocks "
+                    f"({layer_name}: shape[0]={cache.shape[0]} vs "
+                    f"num_blocks={num_blocks})"
                 )
                 if not self.use_mla:
                     assert tensor_size_bytes == curr_tensor_size_bytes, (
