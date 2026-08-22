@@ -13,8 +13,17 @@
 # limitations under the License.
 
 # Compile parity for the W8A16 block-FP8 kernel: CPU eager is the oracle, and the
-# rbln-compiled graph (plus device eager on the device lane) must agree. Inputs use
-# production-sized 128-blocks because toy shapes trip an rbln-compiler edge case.
+# rbln-compiled graph (plus device eager on the device lane) must agree.
+#
+# Three shapes here are dictated by what the compiler accepts, not by taste:
+#
+#   - The fp8 weight is a module buffer, never a graph argument: a 1-byte dtype
+#     cannot be a graph input at all. It is also what a real model holds.
+#   - Every graph ends in the linear; a dequant with no matmul is rejected. The
+#     dequant test therefore reads out through F.linear(I, W), which is W
+#     transposed -- one output element per weight element, nothing to hide in.
+#   - The weight spans more than one block per axis: a 128x128 weight, a 1x1
+#     scale grid, fails to compile.
 
 from typing import Any
 
@@ -27,28 +36,20 @@ from vllm_rbln.model_executor.kernels.linear.block_fp8 import (
     RBLNW8A16BlockFp8LinearKernel,
 )
 
-# TODO(rbln-fp8-compile): the whole file is skipped -- the rbln-compiled kernel
-# diverges from CPU eager on fp8 weights (a bare fp8->float dequant already gives
-# alternating ~2x values), which looks like a 1-byte .view()/reshape layout issue
-# in the compile path. W8A8 shares the root cause; extend the parity here to its
-# forward once resolved.
-pytestmark = [
-    pytest.mark.use_device,
-    pytest.mark.skip(
-        reason="TODO(rbln-fp8-compile): compiled fp8 dequant diverges "
-        "from eager; see file header."
-    ),
-]
+pytestmark = pytest.mark.use_device
 
-# The compiled/device fp8 paths round differently from CPU eager, so parity is
-# checked within an fp8-sized tolerance rather than exactly.
 _RTOL, _ATOL = 1e-2, 1e-2
 
 # Production-sized fp8 block; toy blocks hit an rbln-compiler reshape edge case.
 _BLOCK_N = _BLOCK_K = 128
+# Non-square, so a transposed view would not silently have the right numel.
+_OUT_FEATURES, _IN_FEATURES = 2 * _BLOCK_N, 4 * _BLOCK_K
+_NUM_TOKENS = 8
+# One scale per (block_n, block_k) tile of the weight.
+_SCALE = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
 
-# The activation (and thus the output) is fp16 on the W8A16 path.
-_ACT_DTYPE = torch.float16
+_ACT_DTYPES = [torch.float16, torch.bfloat16]
+_ACT_DTYPE_IDS = ["fp16", "bf16"]
 
 # Built once outside any compiled region so torch.compile sees weight_group_shape
 # as a constant instead of tracing the (untraceable) object construction.
@@ -67,20 +68,22 @@ def _to_session_device(args):
     return tuple(a.to(dev) if torch.is_tensor(a) else a for a in args)
 
 
-def _assert_parity(run_fn, *cpu_args):
+def _assert_parity(build, *cpu_args):
+    # Each step gets its own module: a weight-free compile relays the weight
+    # buffer into the hardware layout in place -- that buffer is the weight pool,
+    # not a copy -- so a compiled module no longer reads back as a plain tensor.
+    dev = current_platform.device_type
     # 1. CPU eager oracle.
-    ref = run_fn(*cpu_args)
-    # 2. rbln-compiled on the session's tensors (cpu lane -> cpu, device lane ->
-    #    device, matching how the backend runs the compiled graph in production).
+    ref = build()(*cpu_args)
+    # 2. rbln-compiled, on whichever tensors the lane selects.
     dev_args = _to_session_device(cpu_args)
-    assert _agrees(rbln_compile(run_fn, fullgraph=True)(*dev_args), ref)
+    assert _agrees(rbln_compile(build().to(dev), fullgraph=True)(*dev_args), ref)
     # 3. device eager, only when device tensors are on (--device-tensor 1).
-    if current_platform.device_type == "rbln":
-        assert _agrees(run_fn(*dev_args), ref)
+    if dev == "rbln":
+        assert _agrees(build().to(dev)(*dev_args), ref)
 
 
 def _fp8_weight(out_features, in_features):
-    # Block-FP8 weights are stored as fp8; the graph dequantizes them.
     return (
         torch.linspace(0.1, 2.0, out_features * in_features)
         .reshape(out_features, in_features)
@@ -88,28 +91,51 @@ def _fp8_weight(out_features, in_features):
     )
 
 
-def test_dequantize_block_weight_matches_rbln_compiled():
-    def run_dequant(weight, scale):
-        return _KERNEL._dequantize_block_fp8_weight(weight, scale, _ACT_DTYPE)
+class _Dequant(torch.nn.Module):
+    def __init__(self, weight, scale, act_dtype):
+        super().__init__()
+        self.act_dtype = act_dtype
+        self.register_buffer("weight", weight)
+        self.register_buffer("scale", scale)
 
-    # 256x256 fp8 weight over 128-blocks -> a 2x2 block-scale grid.
+    def forward(self, readout):
+        dequantized = _KERNEL._dequantize_block_fp8_weight(
+            self.weight, self.scale, self.act_dtype
+        )
+        return torch.nn.functional.linear(readout, dequantized)
+
+
+class _Apply(torch.nn.Module):
+    def __init__(self, weight, scale):  # act dtype follows the activation
+        super().__init__()
+        self.register_buffer("weight", weight)
+        self.register_buffer("scale", scale)
+
+    def forward(self, activation):
+        return _KERNEL.apply_block_scaled_mm(activation, self.weight, None, self.scale)
+
+
+@pytest.mark.parametrize("act_dtype", _ACT_DTYPES, ids=_ACT_DTYPE_IDS)
+def test_dequantize_block_weight_matches_rbln_compiled(act_dtype):
     _assert_parity(
-        run_dequant,
-        _fp8_weight(256, 256),
-        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        lambda: _Dequant(
+            _fp8_weight(_OUT_FEATURES, _IN_FEATURES),
+            torch.tensor(_SCALE),
+            act_dtype,
+        ),
+        torch.eye(_IN_FEATURES, dtype=act_dtype),
     )
 
 
-def test_apply_block_scaled_mm_matches_rbln_compiled():
-    # The W8A16 forward: dequant the fp8 weight and run the fp16 linear, all in
-    # one compiled graph. The activation stays fp16 (A16, not quantized).
-    def run_apply(activation, weight, scale):
-        return _KERNEL.apply_block_scaled_mm(activation, weight, None, scale)
-
-    activation = torch.linspace(0.5, 3.0, 128).reshape(1, 128).to(_ACT_DTYPE)
+@pytest.mark.parametrize("act_dtype", _ACT_DTYPES, ids=_ACT_DTYPE_IDS)
+def test_apply_block_scaled_mm_matches_rbln_compiled(act_dtype):
+    # Many tokens, the way a real decoder layer calls this.
+    activation = (
+        torch.linspace(0.5, 3.0, _NUM_TOKENS * _IN_FEATURES)
+        .reshape(_NUM_TOKENS, _IN_FEATURES)
+        .to(act_dtype)
+    )
     _assert_parity(
-        run_apply,
+        lambda: _Apply(_fp8_weight(_OUT_FEATURES, _IN_FEATURES), torch.tensor(_SCALE)),
         activation,
-        _fp8_weight(128, 128),
-        torch.full((1, 1), 2.0),
     )

@@ -25,6 +25,7 @@ MODELS = [
     CompileModelSpec("Qwen/Qwen3-0.6B"),
     # SWA models are incompatible with sub-block prefix caching.
     CompileModelSpec("google/gemma-3-1b-it", envs={"VLLM_RBLN_SUB_BLOCK_CACHE": "0"}),
+    CompileModelSpec("Qwen/Qwen3-0.6B-FP8", envs={"VLLM_RBLN_USE_W8A16": "1"}),
 ]
 
 MAX_TOKENS = 5
