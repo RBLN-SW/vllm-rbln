@@ -64,6 +64,26 @@ from ..ops.sliding_window_attention_naive import (
 logger = init_logger(__name__)
 
 
+def _resolve_is_causal(vllm_config: VllmConfig) -> bool:
+    """Per-model causality instead of one process-wide switch.
+
+    `VLLM_RBLN_FLASH_CAUSAL_ATTN` cannot express "this model is non-causal": a
+    cross-attention drafter needs the drafter non-causal while the target stays
+    causal in the same process. DFlash asks for exactly that -- upstream's
+    `_create_draft_vllm_config` sets `attention_config.use_non_causal` on the
+    draft config only -- and each model's attention layers are constructed under
+    their own config, so reading the field here scopes causality to the model
+    that requested it.
+
+    Falls back to the env flag when the field is absent, so target models,
+    EAGLE3, medusa and ngram are unchanged.
+    """
+    if not envs.VLLM_RBLN_FLASH_CAUSAL_ATTN:
+        return False
+    attention_config = getattr(vllm_config, "attention_config", None)
+    return not getattr(attention_config, "use_non_causal", False)
+
+
 def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
     """Real element dtype the uint8 fp8 KV-cache container holds, or None on
     the non-fp8 "auto" path (the cache tensor's own dtype is real). Upstream's
@@ -180,7 +200,7 @@ class RBLNFlashAttentionMetadataBuilder(
         self.block_size = kv_cache_spec.block_size
         self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        self.is_causal = _resolve_is_causal(vllm_config)
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
@@ -388,7 +408,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if len(self.sinks.size()) == 1:
                 self.sinks = self.sinks[:, None]
 
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        self.is_causal = _resolve_is_causal(vllm_config)
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None

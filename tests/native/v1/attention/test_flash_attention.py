@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -28,6 +30,7 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionImpl,
     RBLNFlashAttentionMetadata,
     RBLNFlashAttentionMetadataBuilder,
+    _resolve_is_causal,
 )
 
 # RBLN's flash-attention backend: the static contract, __post_init__ dtype
@@ -593,3 +596,29 @@ class TestFlashImplInit:
 
     def test_is_normal_false_when_sinks_present(self, cfg_square):
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
+
+
+class TestResolveIsCausal:
+    """`VLLM_RBLN_FLASH_CAUSAL_ATTN` cannot say "this model is non-causal".
+
+    The resolver only reads `attention_config.use_non_causal`, through getattr,
+    so these cases need no model config -- and stay runnable where the default
+    test model is not reachable.
+    """
+
+    def test_env_off_stays_non_causal(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_FLASH_CAUSAL_ATTN", False)
+        cfg = SimpleNamespace(attention_config=SimpleNamespace(use_non_causal=False))
+        assert _resolve_is_causal(cfg) is False
+
+    def test_config_without_the_field_follows_the_env(self, monkeypatch):
+        # Target models, EAGLE3, medusa and ngram never set the field.
+        monkeypatch.setattr(envs, "VLLM_RBLN_FLASH_CAUSAL_ATTN", True)
+        assert _resolve_is_causal(SimpleNamespace()) is True
+
+    def test_draft_config_asking_for_non_causal_wins(self, monkeypatch):
+        # `_create_draft_vllm_config` sets this on the draft config only, so the
+        # drafter resolves non-causal while the target stays causal.
+        monkeypatch.setattr(envs, "VLLM_RBLN_FLASH_CAUSAL_ATTN", True)
+        cfg = SimpleNamespace(attention_config=SimpleNamespace(use_non_causal=True))
+        assert _resolve_is_causal(cfg) is False
