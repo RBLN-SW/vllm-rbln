@@ -133,6 +133,7 @@ from vllm_rbln.v1.core.utils import (
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
+from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     eagle3_aux_hidden_states_enabled,
@@ -162,6 +163,11 @@ from vllm_rbln.v1.worker.utils import (
 from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
 )
+
+# Proposers that load a draft model and run it through the RBLN compile path:
+# they own draft attention groups, a warmup, and weights the runner has to make
+# contiguous. The n-gram and suffix proposers do none of that.
+DRAFT_MODEL_PROPOSERS = (RBLNEagleProposer, RBLNDFlashProposer)
 
 logger = init_logger(__name__)
 
@@ -324,6 +330,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             | RBLNMedusaProposer
             | NgramProposer
             | SuffixDecodingProposer
+            | RBLNDFlashProposer
             | None
         ) = None
         self.use_aux_hidden_state_outputs = eagle3_aux_hidden_states_enabled(
@@ -337,6 +344,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.method == "medusa":
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
+            elif self.speculative_config.method == "dflash":
+                self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
+                # Upstream turns this on unconditionally for DFlash: the drafter
+                # consumes the target's aux states through
+                # `precompute_and_store_context_kv`, not through a projection.
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
@@ -1001,7 +1014,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # rank has): only the last PP rank drafts, and no other rank consumes
             # this.
             if self.drafter is not None and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, RBLNEagleProposer):
+                if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -1946,7 +1959,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     target_hidden_states, sampling_metadata
                 )
         elif spec_config.use_eagle():
-            assert isinstance(self.drafter, RBLNEagleProposer)
+            assert isinstance(self.drafter, DRAFT_MODEL_PROPOSERS)
             assert isinstance(sampled_token_ids, torch.Tensor)
 
             next_token_ids, valid_sampled_tokens_count = (
@@ -2096,17 +2109,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits = self.model.compute_logits(sample_hidden_states)
                 logits = logits.view(-1, logits.size(-1))
 
-            # NOTE(RBLN): When eagle3 and aux hidden states are used,
-            # fuse combine_hidden_states projection into the target graph.
+            # NOTE(RBLN): fuse the drafter's combine_hidden_states projection
+            # into the target graph. Both drafters that consume aux states
+            # reduce them the same way -- eagle3 through its own projection,
+            # DFlash through `self.model.fc` -- so neither proposer projects
+            # again.
             combined_hidden_states = None
             if aux_hidden_states is not None:
-                assert isinstance(self.drafter, RBLNEagleProposer)
-                target_hidden_states = torch.cat(
+                combined_hidden_states = torch.cat(
                     [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
                 )
-                combined_hidden_states = self.drafter.model.combine_hidden_states(
-                    target_hidden_states
-                )
+                if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
+                    combined_hidden_states = self.drafter.model.combine_hidden_states(
+                        combined_hidden_states
+                    )
 
             return hidden_states, logits, combined_hidden_states
 
@@ -2432,7 +2448,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
 
-        if isinstance(self.drafter, RBLNEagleProposer):
+        if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
             if warmup:
                 self.drafter.dummy_run(
                     num_reqs,
@@ -2623,7 +2639,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
 
         # Initialize drafter attention backend.
-        if isinstance(self.drafter, RBLNEagleProposer):
+        if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def may_reinitialize_input_batch(
@@ -3262,7 +3278,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         yield value
 
         models = [self.model]
-        if isinstance(self.drafter, RBLNEagleProposer):
+        if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
             models.append(self.drafter.model)
 
         for model in models:
