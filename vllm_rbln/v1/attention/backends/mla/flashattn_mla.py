@@ -191,7 +191,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             [batch, seq_len, num_heads * v_head_dim]
         """
         b_size, num_heads, seq_len, _ = x.size()
-        x = torch.matmul(x, W_UV)
+        x = torch.matmul(x, W_UV).to(torch.bfloat16)
         x = x.transpose(1, 2).reshape(b_size, seq_len, num_heads * self.v_head_dim)
         return x
 
