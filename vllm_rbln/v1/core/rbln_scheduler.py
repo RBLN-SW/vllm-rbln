@@ -18,7 +18,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    SupportsHMA,
+)
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
@@ -1163,6 +1166,41 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _connector_finished(self, request):
+        """Hand the connector kernel blocks here too.
+
+        This is the one block-id path that does not run through
+        `scheduler_output`: upstream reads
+        `kv_cache_manager.get_block_ids()` directly, which under page layout
+        returns *pages*. On a prefill that becomes `remote_block_ids` in the
+        request's `kv_transfer_params` -- the list the decode side then indexes
+        its transfer descriptors with -- so pages leaking out here reproduce the
+        same unit mismatch `_rewrite_block_ids_to_kernel_blocks` exists to
+        prevent, just one hop later and across the P/D boundary.
+
+        Measured 2026-08-22 (MiniMax-M2.5 / R100 2P2D): with the scheduler-output
+        path already fixed, a ~26.7k-token prefill still shipped 53 ids --
+        53 x 512 = 27,136 tokens, i.e. pages -- and the decode's
+        `makeXferReq` rejected them with NIXL_ERR_INVALID_PARAM.
+        """
+        manager = self.kv_cache_manager
+        if self.connector is None or not isinstance(
+            manager, RBLNPageLayoutKVCacheManager
+        ):
+            return super()._connector_finished(request)
+
+        # Same preamble as upstream: drop out-of-window prefix blocks before the
+        # connector sees the table.
+        manager.remove_skipped_blocks(
+            request_id=request.request_id,
+            total_computed_tokens=request.num_computed_tokens,
+        )
+        kernel_blocks = list(manager.block_table(request.request_id))
+        if not isinstance(self.connector, SupportsHMA):
+            assert len(self.kv_cache_config.kv_cache_groups) == 1
+            return self.connector.request_finished(request, kernel_blocks)
+        return self.connector.request_finished_all_groups(request, (kernel_blocks,))
 
     def _rewrite_block_ids_to_kernel_blocks(
         self, scheduler_output: RBLNSchedulerOutput

@@ -190,3 +190,81 @@ def test_rewrite_runs_before_the_connector_reads_the_output():
         "build_connector_meta, or the KV connector indexes its descriptors "
         "with page ids while the worker uses kernel blocks"
     )
+
+
+class _FakeConnector:
+    """Non-HMA connector: records what `request_finished` was handed."""
+
+    def __init__(self):
+        self.seen = None
+
+    def request_finished(self, request, block_ids):
+        self.seen = block_ids
+        return False, None
+
+
+def _page_layout_manager(kernel_blocks):
+    """A real page-layout manager instance (isinstance matters) without __init__."""
+    from vllm_rbln.v1.core.rbln_page_layout_kv_cache_manager import (
+        RBLNPageLayoutKVCacheManager,
+    )
+
+    mgr = RBLNPageLayoutKVCacheManager.__new__(RBLNPageLayoutKVCacheManager)
+    mgr.remove_skipped_blocks = lambda **_: None
+    mgr.block_table = lambda _req_id: kernel_blocks
+    # what upstream would have used -- pages, deliberately different
+    mgr.get_block_ids = lambda _req_id: ([0, 1, 2, 3, 4, 5, 6, 7],)
+    return mgr
+
+
+def _bare_scheduler(**attrs):
+    sched = RBLNScheduler.__new__(RBLNScheduler)
+    for k, v in attrs.items():
+        setattr(sched, k, v)
+    return sched
+
+
+def test_connector_finished_hands_over_kernel_blocks():
+    """`_connector_finished` is the one id path that skips `scheduler_output`.
+
+    Upstream reads `kv_cache_manager.get_block_ids()` straight, which is pages
+    under page layout. On a prefill those ids become `remote_block_ids` in
+    `kv_transfer_params`, and the decode indexes its transfer descriptors with
+    them -- so pages leaking here land as NIXL_ERR_INVALID_PARAM on the far side
+    of the P/D boundary (measured 2026-08-22: a 26.7k-token prefill shipped 53
+    ids = 53 x 512 tokens, i.e. pages).
+    """
+    kernel_blocks = [7, 8, 9]
+    connector = _FakeConnector()
+    sched = _bare_scheduler(
+        kv_cache_manager=_page_layout_manager(kernel_blocks),
+        connector=connector,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[object()]),
+    )
+    request = SimpleNamespace(request_id="r0", num_computed_tokens=4096)
+
+    sched._connector_finished(request)
+    assert connector.seen == kernel_blocks, (
+        "the connector must receive kernel blocks; pages here become "
+        "remote_block_ids and break the transfer on the decode side"
+    )
+
+
+def test_connector_finished_defers_to_upstream_without_page_layout():
+    """No page layout -> untouched: upstream's own path runs."""
+    import vllm.v1.core.sched.scheduler as up
+
+    called = {}
+    sched = _bare_scheduler(
+        kv_cache_manager=SimpleNamespace(),  # not the page-layout manager
+        connector=_FakeConnector(),
+    )
+    request = SimpleNamespace(request_id="r0", num_computed_tokens=0)
+
+    original = up.Scheduler._connector_finished
+    up.Scheduler._connector_finished = lambda self, req: called.setdefault("hit", True)
+    try:
+        sched._connector_finished(request)
+    finally:
+        up.Scheduler._connector_finished = original
+    assert called.get("hit"), "should fall through to upstream"
