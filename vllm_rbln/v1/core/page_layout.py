@@ -195,38 +195,32 @@ def validate_fragmentation(
 
 
 # --------------------------------------------------------------------------- #
-# Known gap: page layout under a KV connector (PD-disaggregation)
+# Page layout under a KV connector (PD-disaggregation)
 # --------------------------------------------------------------------------- #
 #
 # Page layout is developed and benchmarked without a KV connector -- see
 # `benchmarks/page_layout/serve.sh`, "No KV connector: this compares vLLM-local
-# mechanisms only". Running it under PD-disaggregation does not work yet, and
-# the reason is that the page/kernel-block distinction has to reach every layer
-# that names a block, not just the ones that allocate.
+# mechanisms only". Running it under PD-disaggregation needed three fixes, all
+# of them the same mistake in different places: a block id is a *page*, the KV
+# tensors are *kernel blocks*, and every layer that names a block has to say
+# which one it means.
 #
-# Measured 2026-08-22 (MiniMax-M2.5 / R100, 2P2D, NIXL + LMCache mp). The engine
-# starts and short requests answer correctly, so this looks healthy until a
-# request is long enough to actually move KV:
+#   1. `validate_fragmentation` rejected concurrency the pool cannot hold at
+#      once, which is preemption's job, not a startup error (see above).
+#   2. `RblnNixlConnectorWorker` registered its descriptors over pages while the
+#      tensors held kernel blocks.
+#   3. `RBLNScheduler.schedule` translated block ids *after* the connector had
+#      already read them, so the worker got kernel blocks and the connector kept
+#      pages.
 #
-#   1. NIXL descriptor prep fails. The connector registers kernel blocks (49)
-#      after `RblnNixlConnectorWorker._pages_per_kernel_block` converts, but the
-#      block ids that reach `_read_blocks` are still pages (53 for a ~20k
-#      prompt), so the ids overrun the descriptor space:
-#        "NIXL transfer failure: transfer_setup_failed ...
-#         num_local_blocks: 53, num_remote_blocks: 53"
-#      `RBLNScheduler._rewrite_block_ids_to_kernel_blocks` converts the ids the
-#      *worker's block table* wants; the connector metadata path is separate and
-#      still carries pages.
+# (3) is what made the other two hard to see: the engine starts, and short
+# requests answer correctly, because nothing crosses a block boundary. Only a
+# request long enough to actually move KV fails -- and it failed twice over,
+# once in NIXL's descriptor prep and once in LMCache's `scatter_chunk_to_blocks`,
+# which reads its block size off the tensor (kernel block) and its block *count*
+# off the connector's ids (pages). Neither needed its own fix; both came right
+# once the ids arrived in the same unit as the tensors.
 #
-#   2. LMCache's mp adapter reshapes on the page geometry:
-#        "unflatten: Provided sizes [8, 4096] don't multiply up to the size of
-#         dim 2 (4096)"  (lmcache/integration/vllm/vllm_multi_process_adapter)
-#      That is upstream lmcache code, so it needs either a fix there or a guard
-#      that refuses the combination.
-#
-# Closing this means threading the unit through the connector metadata path on
-# both sides of a transfer (local ids, remote ids, and the handshake that pairs
-# them), and deciding what to do about the upstream reshape. Until then a stack
-# that sets VLLM_RBLN_PAGE_LAYOUT together with a KV connector will start and
-# then fail on the first long request -- the worst shape of failure, so treat
-# the combination as unsupported rather than merely untested.
+# Measured 2026-08-22 (MiniMax-M2.5 / R100, 2P2D, NIXL + LMCache mp). If this
+# combination breaks again, suspect a fourth place where the two units meet
+# before suspecting the transport.
