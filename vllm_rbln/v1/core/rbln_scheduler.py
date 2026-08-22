@@ -62,6 +62,10 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 
 class RBLNScheduler(Scheduler):
+    # Restoring the DFlash budget assigns to this inherited attribute, which
+    # leaves mypy unable to infer its type.
+    max_num_scheduled_tokens: int
+
     def __init__(
         self,
         *args,
@@ -69,6 +73,34 @@ class RBLNScheduler(Scheduler):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.method == "dflash"
+            and self.max_num_scheduled_tokens
+            == self.scheduler_config.max_num_batched_tokens
+            - speculative_config.max_num_new_slots_for_drafting
+            * self.scheduler_config.max_num_seqs
+        ):
+            # `VllmConfig._set_max_num_scheduled_tokens` holds batch slots back
+            # for drafters that append their draft tokens to the target batch.
+            # This drafter runs its own graph over its own batch, so the
+            # reservation buys nothing and only shifts the prefill chunk off the
+            # KV block boundary, which the paged prefill attention kernel cannot
+            # straddle. EAGLE3 never sees it: its net new slots per request is
+            # zero, so its budget is left whole.
+            #
+            # It has to be restored here rather than on the config, which a
+            # validator rejects: `max_num_scheduled_tokens` is required to carry
+            # the reservation. The equality test leaves an explicit
+            # user-supplied budget alone.
+            logger.info(
+                "Restoring the DFlash target token budget: %d -> %d.",
+                self.max_num_scheduled_tokens,
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
