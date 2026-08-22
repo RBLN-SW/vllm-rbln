@@ -129,23 +129,61 @@ def validate_fragmentation(
     """A running request pins every kernel block it spans, not just one.
 
     Only its last block is partly filled, but all of them are held, so demand
-    scales with request length. Sizing for one block per sequence under-counts
-    by that factor and lets a pool through that then runs out at runtime.
+    scales with request length.
+
+    Two different things follow from that, and they need different answers:
+
+    **No forward progress** (fatal). If the pool cannot hold *one* request at
+    `max_model_len` plus a spare block, that request can never complete: it is
+    admitted, grows, fails to allocate, gets preempted, and repeats forever. The
+    spare is not slack -- `allocate_slots` needs one idle kernel block for the
+    tail copy (`has_idle_kernel_blocks(1)`), so a pool sized to exactly one
+    request deadlocks on that path.
+
+    **Concurrency below max_num_seqs** (normal). If the pool cannot hold
+    `max_num_seqs` requests *all at max_model_len simultaneously*, the scheduler
+    admits what fits and preempts the rest. That is ordinary vLLM behaviour, not
+    a misconfiguration: `allocate_slots` returns ``None`` and the scheduler
+    preempts, exactly as it does for the upstream manager. Sizing every serving
+    stack for the absolute worst case would demand a pool `max_num_seqs` times
+    larger than the model's own context -- on this hardware that is several times
+    the available HBM, so it rejects configurations that in fact run fine.
+
+    The earlier version raised on the second case too. Measured counter-example
+    (2026-08-22, MiniMax-M2.5 on R100): the two non-page-layout stacks ran
+    `max_num_seqs=4` against a KV pool of exactly `max_model_len` -- one
+    max-length request's worth, a quarter of that worst case -- and both
+    completed 152/152 requests with zero failures. Preemption absorbed the
+    difference. Rejecting that shape at startup would have been wrong.
     """
     if geometry.is_degenerate:
         return
     blocks_per_seq = (
         1 if not max_model_len else -(-max_model_len // geometry.kernel_block_size)
     )
+    # +1: the tail-copy path needs one idle kernel block on top of the request.
+    needed_for_progress = blocks_per_seq + 1
+    if needed_for_progress > num_kernel_blocks:
+        raise ValueError(
+            f"one request at max_model_len spans {blocks_per_seq} kernel blocks "
+            f"and the tail copy needs 1 more, so {needed_for_progress} are "
+            f"required, but the pool holds only {num_kernel_blocks} of "
+            f"{geometry.kernel_block_size} tokens. No request could ever "
+            f"complete; lower max_model_len or raise the KV cache size"
+        )
     peak = max_num_seqs * blocks_per_seq
     if peak >= num_kernel_blocks:
-        raise ValueError(
-            f"max_num_seqs ({max_num_seqs}) x {blocks_per_seq} kernel blocks per "
-            f"request at max_model_len needs {peak} kernel blocks, but the pool "
-            f"holds only {num_kernel_blocks} of {geometry.kernel_block_size} "
-            f"tokens; lower max_num_seqs or max_model_len, or raise the KV cache size"
+        logger.warning(
+            "Page layout: %d requests x %d kernel blocks at max_model_len would "
+            "need %d blocks but the pool holds %d -- concurrency will be limited "
+            "by preemption below max_num_seqs=%d.",
+            max_num_seqs,
+            blocks_per_seq,
+            peak,
+            num_kernel_blocks,
+            max_num_seqs,
         )
-    if peak / num_kernel_blocks > 0.5:
+    elif peak / num_kernel_blocks > 0.5:
         logger.warning(
             "Page layout: up to %d of %d kernel blocks can be pinned at once "
             "(%d requests x %d blocks each at max_model_len).",

@@ -70,10 +70,42 @@ class TestPageLayoutConfig:
         assert not cfg.enabled
         assert cfg.geometry.pages_per_kernel_block == 1
 
-    def test_fragmentation_rejects_pool_smaller_than_concurrency(self):
+    def test_fragmentation_rejects_a_pool_that_cannot_finish_one_request(self):
+        """The fatal case is **no forward progress**, not merely low concurrency.
+
+        A request spanning more kernel blocks than the pool holds can never
+        complete — it is admitted, grows, fails, is preempted, repeats.
+        """
         geo = PageLayout(page_size=512, kernel_block_size=4096)
-        with pytest.raises(ValueError, match="kernel blocks per request"):
-            validate_fragmentation(geo, max_num_seqs=8, num_kernel_blocks=8)
+        with pytest.raises(ValueError, match="No request could ever complete"):
+            # one request at 40960 spans 10 kernel blocks; the pool holds 4.
+            validate_fragmentation(
+                geo, max_num_seqs=1, num_kernel_blocks=4, max_model_len=40960
+            )
+
+    def test_fragmentation_rejects_a_pool_with_no_room_for_the_tail_copy(self):
+        """Exactly one request's worth still deadlocks — `allocate_slots` needs
+        one idle kernel block for the tail copy on top of the request itself."""
+        geo = PageLayout(page_size=512, kernel_block_size=4096)
+        with pytest.raises(ValueError, match="the tail copy needs 1 more"):
+            validate_fragmentation(
+                geo, max_num_seqs=1, num_kernel_blocks=10, max_model_len=40960
+            )
+
+    def test_fragmentation_allows_concurrency_the_pool_cannot_hold_at_once(self, caplog):
+        """max_num_seqs above what the pool fits is **preemption, not an error**.
+
+        Measured (2026-08-22, MiniMax-M2.5 on R100): the two non-page-layout
+        stacks ran max_num_seqs=4 against a pool of exactly one max-length
+        request and completed 152/152 with zero failures. Raising here would
+        reject a shape that demonstrably works.
+        """
+        geo = PageLayout(page_size=512, kernel_block_size=4096)
+        # 4 seqs x 10 blocks = 40 wanted, pool holds 12 (one request + slack).
+        validate_fragmentation(
+            geo, max_num_seqs=4, num_kernel_blocks=12, max_model_len=40960
+        )
+        assert "concurrency will be limited by preemption" in caplog.text
 
     def test_fragmentation_warns_when_most_of_the_pool_can_be_pinned(self, caplog):
         geo = PageLayout(page_size=512, kernel_block_size=4096)
