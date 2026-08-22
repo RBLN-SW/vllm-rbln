@@ -214,6 +214,12 @@ def _page_layout_manager(kernel_blocks):
     mgr.block_table = lambda _req_id: kernel_blocks
     # what upstream would have used -- pages, deliberately different
     mgr.get_block_ids = lambda _req_id: ([0, 1, 2, 3, 4, 5, 6, 7],)
+    # what upstream hands the connector: pages, plus an attribute that must
+    # survive the wrapper.
+    real = SimpleNamespace(
+        get_block_ids=lambda *_a, **_k: ([0, 1, 2, 3, 4, 5, 6, 7],), marker=object()
+    )
+    mgr.get_blocks = lambda _req_id: real
     return mgr
 
 
@@ -268,3 +274,47 @@ def test_connector_finished_defers_to_upstream_without_page_layout():
     finally:
         up.Scheduler._connector_finished = original
     assert called.get("hit"), "should fall through to upstream"
+
+
+def test_connector_blocks_reports_kernel_blocks():
+    """`update_state_after_alloc` is the last id path outside scheduler_output.
+
+    Connectors read `get_block_ids()` off this object and index device memory
+    with it. Pages here made LMCache's retrieve scatter on the wrong stride --
+    "unflatten: Provided sizes [8, 4096] ... dim 2 (4096)" (measured 2026-08-22).
+    """
+    kernel_blocks = [3, 4]
+    sched = _bare_scheduler(kv_cache_manager=_page_layout_manager(kernel_blocks))
+    view = sched._connector_blocks("r0")
+    assert view.get_block_ids() == ([3, 4],)
+
+
+def test_connector_blocks_delegates_everything_else():
+    """Only the id view is swapped; the real block object still answers."""
+    sched = _bare_scheduler(kv_cache_manager=_page_layout_manager([3]))
+    original = sched.kv_cache_manager.get_blocks("r0")
+    view = sched._connector_blocks("r0")
+    assert view.marker is original.marker
+
+
+def test_connector_blocks_untouched_without_page_layout():
+    manager = SimpleNamespace(get_blocks=lambda _r: "the-real-blocks")
+    sched = _bare_scheduler(kv_cache_manager=manager)
+    assert sched._connector_blocks("r0") == "the-real-blocks"
+
+
+def test_update_state_after_alloc_uses_the_converted_blocks():
+    """The call site must pass `_connector_blocks`, not the raw manager blocks.
+
+    Testing the helper alone would not catch a call site that goes back to
+    `kv_cache_manager.get_blocks()` -- which is exactly the shape of the bug.
+    """
+    import inspect
+
+    src = inspect.getsource(RBLNScheduler.schedule)
+    call = src.index("self.connector.update_state_after_alloc(")
+    window = src[call : call + 300]
+    assert "_connector_blocks(" in window, (
+        "update_state_after_alloc must receive _connector_blocks(request_id); "
+        "kv_cache_manager.get_blocks() yields pages under page layout"
+    )

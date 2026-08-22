@@ -72,6 +72,28 @@ class RBLNSchedulerOutput(SchedulerOutput):
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
 
 
+class _KernelBlockView:
+    """A `KVCacheBlocks` that reports kernel-block ids, delegating the rest.
+
+    Wrapping rather than rebuilding: `KVCacheBlocks` carries real block objects
+    that the allocator owns, and a connector may reach for anything on it. Only
+    the id view differs under page layout, so only that is replaced -- anything
+    else a connector touches still goes to the object the manager handed us.
+    """
+
+    __slots__ = ("_blocks", "_kernel_block_ids")
+
+    def __init__(self, blocks, kernel_block_ids):
+        object.__setattr__(self, "_blocks", blocks)
+        object.__setattr__(self, "_kernel_block_ids", kernel_block_ids)
+
+    def get_block_ids(self, *args, **kwargs):
+        return self._kernel_block_ids
+
+    def __getattr__(self, name):
+        return getattr(self._blocks, name)
+
+
 class RBLNScheduler(Scheduler):
     def __init__(
         self,
@@ -850,7 +872,7 @@ class RBLNScheduler(Scheduler):
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
-                        self.kv_cache_manager.get_blocks(request_id),
+                        self._connector_blocks(request_id),
                         num_external_computed_tokens,
                     )
                     if (
@@ -1166,6 +1188,34 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _connector_blocks(self, request_id: str):
+        """The blocks a connector sees, in the unit it indexes KV with.
+
+        `update_state_after_alloc` is the last block-id path that does not run
+        through `scheduler_output`: upstream hands the connector
+        `kv_cache_manager.get_blocks()`, whose ids are *pages* under page layout.
+        Connectors read `get_block_ids()` off it and index device memory with the
+        result, so pages here mean a load lands on the wrong side of an 8x
+        stride.
+
+        Measured 2026-08-22 (MiniMax-M2.5 / R100 2P2D): with the other paths
+        already converted, LMCache's retrieve still scattered on pages --
+        "unflatten: Provided sizes [8, 4096] don't multiply up to the size of
+        dim 2 (4096)" from `scatter_chunk_to_blocks`, which takes its block
+        *size* off the KV tensor (kernel block) and its block *count* off these
+        ids (pages).
+
+        Only `get_block_ids()` is substituted. Connectors use it alone from this
+        object, and the list stays cumulative -- LMCache appends
+        `group_blocks[existing:]` across the two calls an async load makes, so a
+        non-cumulative view would corrupt its tracker.
+        """
+        blocks = self.kv_cache_manager.get_blocks(request_id)
+        if not isinstance(self.kv_cache_manager, RBLNPageLayoutKVCacheManager):
+            return blocks
+        kernel_blocks = (list(self.kv_cache_manager.block_table(request_id)),)
+        return _KernelBlockView(blocks, kernel_blocks)
 
     def _connector_finished(self, request):
         """Hand the connector kernel blocks here too.
