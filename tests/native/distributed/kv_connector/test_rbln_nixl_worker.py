@@ -434,58 +434,53 @@ def _fake_nixl_rbln(xfer_result):
 class TestPageLayoutUnits:
     """Under VLLM_RBLN_PAGE_LAYOUT the connector must count kernel blocks.
 
-    The worker rewrites `kv_cache_config` in place -- pages to kernel blocks --
-    *after* this connector is constructed, and restates each group's spec to the
-    kernel block while leaving `cache_config.block_size` at the page on purpose.
-    A connector that keeps what __init__ saw registers 8x too many blocks of the
-    wrong size and dies at registration with "All kv cache tensors must have the
-    same number of blocks" (measured 2026-08-22: 432 pages vs 54 kernel blocks
-    for a 4096/512 geometry).
+    The runner converts the KV geometry from pages to kernel blocks, but on its
+    **own** `KVCacheConfig` -- this connector holds a different instance, so it
+    cannot just re-read `num_blocks` (measured: still 392 pages while the tensors
+    held 49 kernel blocks). The ratio is derived from `vllm_config`, which both
+    sides share, mirroring the runner's guard so the two cannot disagree.
     """
 
-    def test_transport_block_size_follows_the_spec_not_cache_config(self, monkeypatch):
-        # cache_config keeps the page (512); the restated spec carries the
-        # kernel block (4096). The transport moves kernel blocks.
+    @staticmethod
+    def _page_layout_worker(monkeypatch, *, pages=392, page=512, kernel=4096):
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", True)
         spec = _impl_layer_spec()
-        spec.block_size = 4096
-        worker = _build_worker(monkeypatch, block_size=512, specs=[spec])
-        assert worker.block_size == 4096
-
-    def test_transport_block_size_is_cache_config_without_page_layout(
-        self, monkeypatch
-    ):
-        spec = _impl_layer_spec()
-        spec.block_size = 64
-        worker = _build_worker(monkeypatch, block_size=64, specs=[spec])
-        assert worker.block_size == 64
-
-    def test_hybrid_specs_keep_the_engine_wide_block(self, monkeypatch):
-        # Per-spec ratios differ: picking one group's block arbitrarily would be
-        # worse than the engine-wide value.
-        a, b = _impl_layer_spec(), _impl_layer_spec()
-        a.block_size, b.block_size = 64, 128
-        worker = _build_worker(monkeypatch, block_size=64, specs=[a, b])
-        assert worker.block_size == 64
-
-    def test_registration_rereads_num_blocks_after_the_worker_restates_it(
-        self, monkeypatch
-    ):
-        """The whole bug in one assertion: __init__ saw pages, registration must
-        see the kernel blocks the worker has since written into the config."""
-        spec = _impl_layer_spec()
-        spec.block_size = 512
-        worker = _prep_impl_worker(monkeypatch, num_blocks=432, block_size=512)
-        worker._layer_specs = {"l0": spec, "l1": spec}
+        spec.block_size = page  # pre-restate: the connector's copy sees pages
+        worker = _prep_impl_worker(monkeypatch, num_blocks=pages, block_size=page)
+        worker.vllm_config.additional_config = {"attn_block_size": kernel}
         worker.kv_cache_config.kv_cache_groups = [MagicMock(kv_cache_spec=spec)]
-        assert worker.num_blocks == 432, "precondition: constructed on pages"
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        return worker
+
+    def test_ratio_is_one_without_the_env(self, monkeypatch):
+        worker = self._page_layout_worker(monkeypatch)
+        monkeypatch.setattr(envs, "VLLM_RBLN_PAGE_LAYOUT", False)
+        assert worker._pages_per_kernel_block() == 1
+
+    def test_ratio_is_one_without_attn_block_size(self, monkeypatch):
+        worker = self._page_layout_worker(monkeypatch)
+        worker.vllm_config.additional_config = {}
+        assert worker._pages_per_kernel_block() == 1
+
+    def test_ratio_from_kernel_block_over_page(self, monkeypatch):
+        worker = self._page_layout_worker(monkeypatch)
+        assert worker._pages_per_kernel_block() == 8
+
+    def test_ratio_is_one_when_the_config_was_already_restated(self, monkeypatch):
+        """Self-correcting: a restated spec no longer matches the page size, so
+        the ratio collapses and nothing is converted twice."""
+        worker = self._page_layout_worker(monkeypatch)
+        worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size = 4096
+        assert worker._pages_per_kernel_block() == 1
+
+    def test_registration_converts_pages_to_kernel_blocks(self, monkeypatch):
+        """The whole bug in one assertion: registered in pages, tensors in kernel
+        blocks. 392 pages / 8 = 49, and the block grows 512 -> 4096."""
+        worker = self._page_layout_worker(monkeypatch)
+        assert worker.num_blocks == 392, "precondition: constructed on pages"
         assert worker.block_size == 512, "precondition: constructed on pages"
 
-        # What RBLNModelRunner does in place before compile_or_warm_up_model:
-        # pages -> kernel blocks, and the spec restated to the kernel block.
-        worker.kv_cache_config.num_blocks = 54
-        spec.block_size = 4096
-
-        kv_caches = _impl_kv_caches(num_blocks=54)
+        kv_caches = _impl_kv_caches(num_blocks=49)
         xfer_result = MagicMock()
         xfer_result.base_addrs = [0x20000, 0x20100]
         xfer_result.block_lens = [256, 256]
@@ -496,7 +491,7 @@ class TestPageLayoutUnits:
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
-        topo.get_transfer_cache_regions.side_effect = _split_kv(54)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(49)
 
         with (
             _patch_worker_nixl_symbols(topo),
@@ -509,11 +504,12 @@ class TestPageLayoutUnits:
             ),
         ):
             mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
-            # Would raise "All kv cache tensors must have the same number of
-            # blocks" if the stale page count were still in use.
+            # Raises "All kv cache tensors must have the same number of blocks"
+            # if the page count survives into registration.
             worker._register_kv_caches_impl(kv_caches)
 
-        assert worker.num_blocks == 54
+        assert worker.num_blocks == 49
+        assert worker._logical_num_blocks == 49
         assert worker.block_size == 4096
 
 

@@ -47,6 +47,7 @@ import vllm.v1.core.kv_cache_coordinator as kv_cache_coordinator
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.request import RequestStatus
 
 from vllm_rbln.logger import init_logger
@@ -116,14 +117,28 @@ class RBLNPageLayoutKVCacheManager(CopyOpMixin, KVCacheManager):
         kv_cache_config: KVCacheConfig,
         config: PageLayoutConfig,
     ) -> bool:
-        """Eligibility: the MVP groups a single full-attention group only."""
+        """Eligibility: the MVP groups a single full-attention group only.
+
+        `_match` assumes upstream's own hit-finding never returns a null
+        prefix -- true for `FullAttentionSpec` but not for
+        `SlidingWindowSpec` / `ChunkedLocalAttentionSpec`, whose managers
+        skip positions outside the window. Nothing upstream of this call
+        currently produces that combination (RBLN's own
+        `RBLNSlidingWindowManager` disables prefix-cache hits outright, and
+        `disable_unsupported_prefix_caching` turns off prefix caching
+        entirely for sliding-window models), but the guard belongs here,
+        at the one place that assumes it, rather than in those other call
+        sites.
+        """
         if not config.enabled:
             return False
         groups = kv_cache_config.kv_cache_groups
         if len(groups) != 1:
             return False
-        block_size = groups[0].kv_cache_spec.block_size
-        return block_size == config.geometry.page_size
+        spec = groups[0].kv_cache_spec
+        if not isinstance(spec, FullAttentionSpec):
+            return False
+        return spec.block_size == config.geometry.page_size
 
     def __init__(
         self,

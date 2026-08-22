@@ -32,7 +32,12 @@ from vllm_rbln.v1.core.rbln_page_layout_kv_cache_manager import (
 )
 from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
 
-from .utils import full_attention_spec, make_kv_cache_config, make_request
+from .utils import (
+    full_attention_spec,
+    make_kv_cache_config,
+    make_request,
+    sliding_window_spec,
+)
 
 PAGE = 4
 PPE = 4  # pages per kernel block
@@ -304,3 +309,14 @@ class TestConfig:
     def test_a_pool_smaller_than_one_kernel_block_is_rejected(self):
         with pytest.raises(ValueError, match="less than one kernel block"):
             make_manager(num_pages=PPE - 1)
+
+    def test_a_single_sliding_window_group_is_rejected(self):
+        # `_match` assumes upstream never returns a null prefix, which does
+        # not hold for a spec whose manager skips out-of-window positions.
+        config = resolve_config(
+            page_size=PAGE, kernel_block_size=KERNEL_BLOCK, num_pages=32
+        )
+        group = sliding_window_spec(PAGE, sliding_window=PAGE * 2)
+        assert not RBLNPageLayoutKVCacheManager.can_use_page_layout(
+            make_kv_cache_config([group], 32), config
+        )
