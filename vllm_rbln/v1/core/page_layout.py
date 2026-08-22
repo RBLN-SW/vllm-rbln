@@ -222,5 +222,28 @@ def validate_fragmentation(
 # once the ids arrived in the same unit as the tensors.
 #
 # Measured 2026-08-22 (MiniMax-M2.5 / R100, 2P2D, NIXL + LMCache mp). If this
-# combination breaks again, suspect a fourth place where the two units meet
+# combination breaks again, suspect another place where the two units meet
 # before suspecting the transport.
+#
+# ⚠️ STILL NOT USABLE WITH A KV CONNECTOR. Six unit fixes later the engine runs
+# and short requests answer correctly, but a decode that pulls KV from a remote
+# prefill hits upstream's prefix-caching trim:
+#
+#     assert num_local_blocks <= len(remote_group)   # nixl/base_worker.py
+#
+# because the blocks a decode must fill come from
+# `KVCacheBlocks.get_unhashed_block_ids_all_groups()` -- pages -- while the
+# remote offers kernel blocks (measured: local=[53] remote=[7]).
+#
+# Converting that list is **not** a fix, and it is worth knowing why before
+# trying: it was tried (2060848b, reverted in a2b0a118) and it silently
+# corrupted generation -- 200 OK, incoherent tokens, on requests of any length.
+# "Unhashed" means "the tail that is not cached yet", and that boundary is a
+# page boundary. The kernel block holding those pages can also hold pages that
+# are already cached, and upstream's trim overwrites a whole block per local
+# entry, so folding to kernel blocks writes remote data over live cached pages.
+#
+# Prefix caching works in pages; the transfer works in kernel blocks. At the
+# boundary those genuinely disagree, and no amount of unit translation settles
+# it. Closing this needs a decision -- move the transfer to page granularity, or
+# align prefix matching to kernel blocks -- not another conversion.
