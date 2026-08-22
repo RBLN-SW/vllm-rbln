@@ -220,6 +220,7 @@ def _page_layout_manager(kernel_blocks):
         get_block_ids=lambda *_a, **_k: ([0, 1, 2, 3, 4, 5, 6, 7],), marker=object()
     )
     mgr.get_blocks = lambda _req_id: real
+    mgr.geometry = SimpleNamespace(pages_per_kernel_block=8)
     return mgr
 
 
@@ -318,3 +319,18 @@ def test_update_state_after_alloc_uses_the_converted_blocks():
         "update_state_after_alloc must receive _connector_blocks(request_id); "
         "kv_cache_manager.get_blocks() yields pages under page layout"
     )
+
+
+def test_connector_blocks_converts_unhashed_ids_too():
+    """NIXL's pull scheduler reads `get_unhashed_block_ids_all_groups`, not
+    `get_block_ids` -- converting only the latter left the decode asking for
+    pages while the prefill offered kernel blocks (measured: local=[53]
+    remote=[7], and upstream's trim asserts local <= remote)."""
+    mgr = _page_layout_manager([9])
+    mgr.get_blocks("r0").get_unhashed_block_ids_all_groups = lambda *a, **k: (
+        [40, 41, 42, 43, 44, 45, 46, 47, 48],
+    )
+    sched = _bare_scheduler(kv_cache_manager=mgr)
+    view = sched._connector_blocks("r0")
+    # pages 40..47 share kernel block 5; page 48 starts kernel block 6.
+    assert view.get_unhashed_block_ids_all_groups() == [[5, 6]]

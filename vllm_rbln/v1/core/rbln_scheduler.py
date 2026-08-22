@@ -77,18 +77,55 @@ class _KernelBlockView:
 
     Wrapping rather than rebuilding: `KVCacheBlocks` carries real block objects
     that the allocator owns, and a connector may reach for anything on it. Only
-    the id view differs under page layout, so only that is replaced -- anything
-    else a connector touches still goes to the object the manager handed us.
+    the id views differ under page layout, so only those are replaced.
+
+    Two accessors matter, and missing either is silent:
+
+    * `get_block_ids()` -- what LMCache's mp connector reads.
+    * `get_unhashed_block_ids_all_groups()` -- what NIXL's pull scheduler reads
+      to decide which blocks a decode must fill from the remote prefill.
+
+    The second was overlooked at first. Everything else had already been
+    converted, so the decode asked for 53 *pages* while the prefill offered 7
+    kernel blocks, and upstream's prefix-caching trim
+    (`assert num_local_blocks <= len(remote_group)`) fired with no numbers
+    attached (measured 2026-08-22: `local=[53] remote=[7]`).
+
+    Note this is *not* upstream's logical/physical axis
+    (`_physical_blocks_per_logical_kv_block`). That one expands -- one logical
+    block covers N smaller kernel blocks -- while page layout contracts: N pages
+    share one larger kernel block. Reusing it would grow the list 8x instead of
+    shrinking it 8x.
     """
 
-    __slots__ = ("_blocks", "_kernel_block_ids")
+    __slots__ = ("_blocks", "_kernel_block_ids", "_pages_per_kernel_block")
 
-    def __init__(self, blocks, kernel_block_ids):
+    def __init__(self, blocks, kernel_block_ids, pages_per_kernel_block):
         object.__setattr__(self, "_blocks", blocks)
         object.__setattr__(self, "_kernel_block_ids", kernel_block_ids)
+        object.__setattr__(self, "_pages_per_kernel_block", pages_per_kernel_block)
 
     def get_block_ids(self, *args, **kwargs):
         return self._kernel_block_ids
+
+    def get_unhashed_block_ids_all_groups(self, *args, **kwargs):
+        """The kernel blocks the unhashed pages live in, in order, deduped.
+
+        `kernel block = page_id // pages_per_kernel_block` is the identity
+        `KernelBlockPool` allocates to preserve (see
+        `rbln_page_layout_kv_cache_manager`), so no lookup is needed. Pages of
+        one kernel block collapse to a single entry: the transfer moves whole
+        kernel blocks, and a duplicate would ask for the same one twice.
+        """
+        ppe = self._pages_per_kernel_block
+        groups = self._blocks.get_unhashed_block_ids_all_groups(*args, **kwargs)
+        out = []
+        for group in groups:
+            seen: dict[int, None] = {}
+            for page_id in group:
+                seen.setdefault(page_id // ppe, None)
+            out.append(list(seen))
+        return out
 
     def __getattr__(self, name):
         return getattr(self._blocks, name)
@@ -1215,7 +1252,8 @@ class RBLNScheduler(Scheduler):
         if not isinstance(self.kv_cache_manager, RBLNPageLayoutKVCacheManager):
             return blocks
         kernel_blocks = (list(self.kv_cache_manager.block_table(request_id)),)
-        return _KernelBlockView(blocks, kernel_blocks)
+        ppe = self.kv_cache_manager.geometry.pages_per_kernel_block
+        return _KernelBlockView(blocks, kernel_blocks, ppe)
 
     def _connector_finished(self, request):
         """Hand the connector kernel blocks here too.
