@@ -163,3 +163,30 @@ class TestDisabled:
         out = FakeOutput(scheduled_new_reqs=[FakeNewReq("a", ([0, 1],))])
         translate(scheduler, out)
         assert out.scheduled_new_reqs[0].block_ids == ([0, 1],)
+
+
+def test_rewrite_runs_before_the_connector_reads_the_output():
+    """The rewrite must precede `build_connector_meta` in `schedule()`.
+
+    Both consumers index the same ids: the worker builds its block table from
+    `scheduled_*_reqs`, and a KV connector builds its transfer descriptors from
+    the same output. Whichever runs first decides the unit each one sees.
+
+    It used to run last, so the worker got kernel blocks and the connector kept
+    pages. Nothing complained until a request was long enough to move KV across
+    a PD pair -- NIXL then prepped descriptors over 49 kernel blocks and was
+    handed 53 page ids for a ~20k prompt ("transfer_setup_failed ...
+    num_local_blocks: 53", measured 2026-08-22 on MiniMax-M2.5 / R100 2P2D).
+    Short requests kept answering correctly the whole time, which is what makes
+    the ordering worth pinning rather than leaving to review.
+    """
+    import inspect
+
+    src = inspect.getsource(RBLNScheduler.schedule)
+    rewrite = src.index("_rewrite_block_ids_to_kernel_blocks(scheduler_output)")
+    connector = src.index("self.connector.build_connector_meta(")
+    assert rewrite < connector, (
+        "_rewrite_block_ids_to_kernel_blocks must run before "
+        "build_connector_meta, or the KV connector indexes its descriptors "
+        "with page ids while the worker uses kernel blocks"
+    )

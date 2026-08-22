@@ -1119,6 +1119,25 @@ class RBLNScheduler(Scheduler):
                 self.kv_cache_manager.drain_pending_copy_ops()
             )
 
+        # Page ids -> the kernel blocks backing them, **before** the connector
+        # reads this output. Both consumers must see the same unit: the worker
+        # builds its block table from `scheduled_*_reqs`, and a KV connector
+        # indexes its transfer descriptors with the very same ids.
+        #
+        # This used to run at the end of schedule(), after `build_connector_meta`
+        # below. The worker got kernel blocks and the connector kept pages, and
+        # nothing complained until a request was long enough to move KV across a
+        # PD pair -- then NIXL prepped descriptors over 49 kernel blocks and was
+        # handed 53 page ids for a ~20k prompt:
+        #   "NIXL transfer failure: transfer_setup_failed ... num_local_blocks: 53"
+        # (measured 2026-08-22, MiniMax-M2.5 / R100 2P2D).
+        #
+        # Safe to run here: allocation for this step is complete, and nothing
+        # between this point and the old one reads `scheduler_output`'s block ids
+        # -- `_update_after_schedule` takes them from the KV cache manager, not
+        # from the output.
+        self._rewrite_block_ids_to_kernel_blocks(scheduler_output)
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -1143,7 +1162,6 @@ class RBLNScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
-        self._rewrite_block_ids_to_kernel_blocks(scheduler_output)
         return scheduler_output
 
     def _rewrite_block_ids_to_kernel_blocks(
