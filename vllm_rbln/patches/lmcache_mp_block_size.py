@@ -90,16 +90,48 @@ def _lmcache_mp_available() -> bool:
 
 
 def ensure_applied() -> None:
-    """Re-run the registry, for callers that run after vLLM has come up.
-
-    Idempotent: already-applied descriptors are skipped by key, and this one is
-    a no-op when lmcache is not installed.
-    """
+    """Re-run the registry. Idempotent; a no-op when lmcache is not installed."""
     if not _lmcache_mp_available():
         return
     from vllm_rbln.patches import apply_registered_patches
 
     apply_registered_patches()
+
+
+_ORIGINAL_CREATE_CONNECTOR = None
+
+
+def _capture_create_connector():
+    global _ORIGINAL_CREATE_CONNECTOR
+    if _ORIGINAL_CREATE_CONNECTOR is None:
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        _ORIGINAL_CREATE_CONNECTOR = KVConnectorFactory.create_connector
+    return True
+
+
+@register_patch(
+    target="vllm.distributed.kv_transfer.kv_connector.factory."
+    "KVConnectorFactory.create_connector",
+    reason=(
+        "Apply the LMCache mp block-size patch immediately before any connector "
+        "is built -- the only point that is after vLLM is up and before the mp "
+        "adapters exist, in whichever process builds them."
+    ),
+    condition=_capture_create_connector,
+)
+def patched_create_connector(*args, **kwargs):
+    """Give the registry its chance, then build the connector as usual.
+
+    The mp adapters are constructed inside `LMCacheMPConnector.__init__`, so the
+    patch has to be in place by the time this returns. Hooking here rather than
+    in our scheduler/worker keeps it independent of which process builds the
+    connector and of the order those constructors run in -- an earlier attempt
+    hooked `RBLNScheduler.__init__` and `RBLNWorker.__init__` and still missed
+    the worker-side adapter.
+    """
+    ensure_applied()
+    return _ORIGINAL_CREATE_CONNECTOR(*args, **kwargs)
 
 
 def _kernel_block_size(vllm_config: Any) -> int | None:

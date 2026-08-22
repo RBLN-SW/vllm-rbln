@@ -160,15 +160,6 @@ class RBLNWorker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ) -> None:
-        # LMCache's mp adapters are constructed below (scheduler side) / by the
-        # connector this worker builds. Their block-size patch cannot apply
-        # during platform init -- importing lmcache there re-enters a half-built
-        # vllm -- so give the registry the one chance it needs, now that vLLM is
-        # up. No-op without lmcache, and idempotent.
-        from vllm_rbln.patches.lmcache_mp_block_size import ensure_applied
-
-        ensure_applied()
-
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,

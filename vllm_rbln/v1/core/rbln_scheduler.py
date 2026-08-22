@@ -101,15 +101,6 @@ class RBLNScheduler(Scheduler):
         sub_block_size: int | None = None,
         **kwargs,
     ) -> None:
-        # LMCache's mp adapters are constructed below (scheduler side) / by the
-        # connector this worker builds. Their block-size patch cannot apply
-        # during platform init -- importing lmcache there re-enters a half-built
-        # vllm -- so give the registry the one chance it needs, now that vLLM is
-        # up. No-op without lmcache, and idempotent.
-        from vllm_rbln.patches.lmcache_mp_block_size import ensure_applied
-
-        ensure_applied()
-
         super().__init__(*args, **kwargs)
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager

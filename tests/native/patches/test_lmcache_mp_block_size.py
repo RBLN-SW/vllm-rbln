@@ -137,17 +137,20 @@ class TestLateApplication:
         monkeypatch.setattr(mod, "_lmcache_mp_available", lambda: False)
         mod.ensure_applied()  # must not raise, must not import the registry
 
-    def test_scheduler_and_worker_call_ensure_applied(self):
-        """Both processes need it: the scheduler builds one adapter, the worker
-        the other. Losing either hook silently restores the page-sized sizing."""
+    def test_connector_factory_applies_before_building(self):
+        """The hook must sit on the connector factory, not on our constructors.
+
+        The mp adapters are built inside `LMCacheMPConnector.__init__`, and the
+        worker-side one is built in a different process from the scheduler-side
+        one. Hooking `RBLNScheduler.__init__` / `RBLNWorker.__init__` looked
+        equivalent and was not -- it still missed the worker adapter in-cluster
+        (blocks_per_chunk stayed 8). The factory is the one point that is after
+        vLLM is up and before any connector exists, whichever process it is.
+        """
         import inspect
 
-        from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
-        from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
-
-        for cls in (RBLNScheduler, RBLNWorker):
-            src = inspect.getsource(cls.__init__)
-            assert "ensure_applied()" in src, f"{cls.__name__} lost the hook"
-            assert src.index("ensure_applied()") < src.index("super().__init__"), (
-                f"{cls.__name__} must apply before super() builds the connector"
-            )
+        src = inspect.getsource(mod.patched_create_connector)
+        assert "ensure_applied()" in src
+        assert src.index("ensure_applied()") < src.index("_ORIGINAL_CREATE_CONNECTOR("), (
+            "the patch must be applied before the connector is constructed"
+        )
