@@ -1119,19 +1119,6 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         # the next remote engine appears; a producer we keep reading from must
         # never look idle. Cleanup runs on this (main) thread, so no race.
         self._engine_last_active[engine_id] = time.perf_counter()
-        # TEMPORARY (fsw-418 page-layout bring-up): upstream's prefix-caching trim
-        # asserts local <= remote and gives no numbers when it fires. Log both so
-        # the mismatch can be read off a run instead of guessed at.
-        try:
-            logger.info(
-                "KV read %s: local=%s remote=%s remote_tokens=%s",
-                req_id,
-                [len(g) for g in meta.local_physical_block_ids],
-                [len(g) for g in meta.remote.block_ids],
-                getattr(meta.remote, "num_tokens", None),
-            )
-        except Exception:  # noqa: BLE001 - diagnostics must never break a read
-            pass
         pp_size = self._remote_pp_size.get(engine_id, 1)
         if pp_size == 1:
             return super()._read_blocks_for_req(req_id, meta)
