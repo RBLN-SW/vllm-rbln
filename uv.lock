@@ -2107,7 +2107,7 @@ wheels = [
 
 [[package]]
 name = "rebel-compiler"
-version = "0.11.2.dev382+g22b7dd70"
+version = "0.11.3.dev5+gd41dbbf5"
 source = { registry = "https://pypi.rebellions.in/simple/" }
 dependencies = [
     { name = "attrs" },
@@ -2129,10 +2129,7 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.2.dev382+g22b7dd70-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:e3b6e92ed8281e8eaa1918f2d5ad8b5bc93a959f82f5c789d95fbf641ce793ec" },
-    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.2.dev382+g22b7dd70-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:5a94a0128d6a56b9437065df50b0707fe0e2bbc08a32a32ad0ebef97460f9bcb" },
-    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.2.dev382+g22b7dd70-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:fafde85ae1d779369a68e43e348f03163467b122d3746ecee829dc54adbd8878" },
-    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.2.dev382+g22b7dd70-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:e670694b1d3fb1edea5fcd531176784f129c9b19d567c93db16ae057502df69d" },
+    { url = "https://pypi.rebellions.in/api/package/rebel-compiler/rebel_compiler-0.11.3.dev5+gd41dbbf5-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:ee2099e90032cc32941891d4b914c385f071220e03353543cbf4b1eb80292d56" },
 ]
 
 [[package]]
@@ -2937,7 +2934,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils" },
-    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "==0.11.2.dev382+g22b7dd70", index = "https://pypi.rebellions.in/simple/" },
+    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "==0.11.3.dev5+gd41dbbf5", index = "https://pypi.rebellions.in/simple/" },
     { name = "setuptools", specifier = ">=64" },
     { name = "setuptools-scm", specifier = ">=8" },
     { name = "setuptools-scm", marker = "extra == 'build'" },
