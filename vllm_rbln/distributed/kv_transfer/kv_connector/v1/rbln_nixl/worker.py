@@ -393,16 +393,25 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             )
             return 1, 1
         kernel_blocks = cache.shape[-5] if cache.dim() >= 5 else None
-        if not kernel_blocks or self.num_blocks % kernel_blocks != 0:
-            logger.warning(
-                "Page-granular transfer: %s pages do not divide into %s kernel "
-                "blocks; falling back to kernel-block transfer.",
-                self.num_blocks,
-                kernel_blocks,
-            )
+        if not kernel_blocks:
             return 1, 1
         ppe = self.num_blocks // kernel_blocks
         if ppe <= 1:
+            return 1, 1
+        # The page count need not be a whole number of kernel blocks -- the
+        # runner floors and trims the remainder (`num_kernel_blocks =
+        # old_num_blocks // ppe`), so e.g. 435 pages become 54 blocks and three
+        # pages are dropped. Reproducing that floor is the check: it confirms
+        # this ratio is the one the runner used, without demanding divisibility
+        # (requiring it sent prefill down the fallback and broke registration
+        # with `shape[0]=54 vs expected=435`).
+        if self.num_blocks // ppe != kernel_blocks:
+            logger.warning(
+                "Page-granular transfer: %s pages over %s kernel blocks gives no "
+                "consistent ratio; falling back to kernel-block transfer.",
+                self.num_blocks,
+                kernel_blocks,
+            )
             return 1, 1
         return ppe, cache.shape[-4]
 
@@ -434,7 +443,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         if ppe > 1:
             # From the tensor, not `kv_cache_config` -- the latter still holds
             # the pre-restate page count in this process.
-            kernel_blocks = self.num_blocks // ppe
+            kernel_blocks = self.num_blocks // ppe  # floors, like the runner's trim
             # Dense desc space: ppe*H*b + ppe*h + s covers every (block, head,
             # page) exactly once.
             self.num_blocks = kernel_blocks * heads * ppe

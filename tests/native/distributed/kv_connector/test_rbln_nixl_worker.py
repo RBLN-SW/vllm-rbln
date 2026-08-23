@@ -481,7 +481,18 @@ class TestPageGranularTransfer:
         w.vllm_config.cache_config.block_size = 4096  # what the worker really sees
         assert w._page_transfer_geometry(self._tensor((49, 8, 1, 4096, 128))) == (8, 8)
 
-    def test_falls_back_when_pages_do_not_divide(self, monkeypatch):
+    def test_ratio_survives_a_trimmed_remainder(self, monkeypatch):
+        """Pages need not be a whole number of kernel blocks.
+
+        The runner floors and drops the remainder (435 pages -> 54 blocks, three
+        pages discarded). Demanding divisibility sent prefill down the fallback
+        and broke registration with `shape[0]=54 vs expected=435`.
+        """
+        w = self._worker(monkeypatch, pages=435)
+        assert w._page_transfer_geometry(self._tensor((54, 8, 1, 4096, 128))) == (8, 8)
+
+    def test_falls_back_when_the_ratio_is_inconsistent(self, monkeypatch):
+        """A ratio that does not reproduce the runner's floor is not the runner's."""
         w = self._worker(monkeypatch, pages=100)
         assert w._page_transfer_geometry(self._tensor((49, 8, 1, 4096, 128))) == (1, 1)
 
