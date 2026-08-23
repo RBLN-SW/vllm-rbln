@@ -83,7 +83,13 @@ class RBLNInputBatch(InputBatch):
         # For non-pooling models - generate and apply logitsprocs update;
         # reset batch update tracking.
         # Update sampling metadata if batch state is changed.
-        batch_update = self.batch_update_builder.get_and_reset(self.num_reqs)
+        #
+        # Logits processors size their per-request state from
+        # BatchUpdate.batch_size, and the RBLN sampler applies them to
+        # pooled logits with bucket_size rows - so report bucket_size,
+        # not num_reqs. Padding slots hold default params and stay
+        # no-ops.
+        batch_update = self.batch_update_builder.get_and_reset(bucket_size)
         if self.thinking_budget_state_holder is not None and batch_update:
             self.thinking_budget_state_holder.sync_batch(batch_update)
         for logit_proc in self.logitsprocs.all:
@@ -97,6 +103,15 @@ class RBLNInputBatch(InputBatch):
         # to pad sampling metadata for RBLN sampler.
         num_reqs = bucket_size
         if not self.all_greedy:
+            # `__init__` defaults every slot to 1.0, but a slot keeps the
+            # temperature of the request that last occupied it once that request
+            # is removed. The sampler divides logits in place, and the rows
+            # these slots scale are the padding rows of the pooled logits
+            # buffer, which no step ever refreshes. A leftover temperature would
+            # therefore compound every step until the row overflows to inf and
+            # softmax turns it into nan, so restore the padding to a temperature
+            # that divides to a no-op.
+            self.temperature_cpu_tensor[self.num_reqs : bucket_size] = 1.0
             temperature = copy_slice(
                 self.temperature_cpu_tensor, self.temperature, num_reqs
             )

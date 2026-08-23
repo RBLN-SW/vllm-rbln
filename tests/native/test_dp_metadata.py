@@ -72,15 +72,16 @@ class TestNumTokensAndReqsAcrossDP:
                 3: _encode(14, 7, False),
             }
         )
-        tokens, reqs = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+        tokens, reqs, any_prefill = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
             num_tokens=8, num_reqs=8, dp_size=4, dp_rank=0, is_prefill=False
         )
         assert tokens.cpu().tolist() == [8, 10, 6, 14]
         assert reqs.cpu().tolist() == [8, 5, 3, 7]
+        assert any_prefill is False
 
-    def test_any_remote_prefill_drops_reqs(self, fake_dp_collective):
-        # A single prefill rank makes per-rank reqs meaningless -> None, while
-        # the token counts are still extracted from the low bits.
+    def test_any_remote_prefill_flags(self, fake_dp_collective):
+        # A single prefill rank raises the flag; both count fields are still
+        # extracted, so a consumer can pick what to trust.
         fake_dp_collective(
             {
                 1: _encode(300, 1, True),  # prefill rank
@@ -88,25 +89,27 @@ class TestNumTokensAndReqsAcrossDP:
                 3: _encode(6, 6, False),
             }
         )
-        tokens, reqs = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+        tokens, reqs, any_prefill = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
             num_tokens=8, num_reqs=8, dp_size=4, dp_rank=0, is_prefill=False
         )
-        assert reqs is None
+        assert any_prefill is True
         assert tokens.cpu().tolist() == [8, 300, 4, 6]
+        assert reqs.cpu().tolist() == [8, 1, 4, 6]
 
-    def test_local_prefill_drops_reqs(self, fake_dp_collective):
+    def test_local_prefill_flags(self, fake_dp_collective):
         # The local rank being in prefill also trips any_prefill.
         fake_dp_collective({r: _encode(8, 8, False) for r in (1, 2, 3)})
-        tokens, reqs = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+        tokens, reqs, any_prefill = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
             num_tokens=512, num_reqs=1, dp_size=4, dp_rank=0, is_prefill=True
         )
-        assert reqs is None
+        assert any_prefill is True
         assert tokens.cpu().tolist() == [512, 8, 8, 8]
+        assert reqs.cpu().tolist() == [1, 8, 8, 8]
 
     def test_boundary_max_values_round_trip(self, fake_dp_collective):
         # The largest values each field can hold must survive pack/unpack.
         fake_dp_collective({r: _encode(0xFFFF, 0x3FFF, False) for r in (1, 2, 3)})
-        tokens, reqs = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+        tokens, reqs, _ = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
             num_tokens=0xFFFF, num_reqs=0x3FFF, dp_size=4, dp_rank=0, is_prefill=False
         )
         assert tokens.cpu().tolist() == [0xFFFF] * 4

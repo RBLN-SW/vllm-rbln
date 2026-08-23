@@ -54,4 +54,3 @@ def register_ops():
 
         # TODO(RBLN): remove the following imports after we have a better way
         import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
-        import vllm_rbln.model_executor.model_loader.weight_loader  # noqa
