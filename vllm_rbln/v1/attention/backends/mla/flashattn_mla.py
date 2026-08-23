@@ -235,7 +235,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
 
         if topk_indices is not None:
             attn_output = torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla(
-                q,
+                q * self.scale,
                 kv_c_normed,
                 k_pe,
                 kv_cache,
