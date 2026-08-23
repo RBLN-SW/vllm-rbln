@@ -255,7 +255,9 @@ def run_target(path: Path, out_dir: Path, run_id: str, passthrough: list[str]) -
     except Exception as exc:  # noqa: BLE001
         print(f"  summary: not built ({type(exc).__name__}: {exc})")
     else:
-        publish_summary("perf", out_dir / run_id / name, body, degraded=degraded)
+        publish_summary(
+            "perf", out_dir / run_id / name, body, chip=chip, degraded=degraded
+        )
     return status
 
 
