@@ -167,12 +167,17 @@ def _rbln_gated_mla_forward(
     return self.o_proj(attn_out)[0]
 
 
+def _rbln_axk2_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    return self.experts(hidden_states=hidden_states, router=lambda x: self.gate(x)[0])
+
+
 from vllm_rbln.patches.axk2 import config as _config  # noqa: E402, F401
 
 _module = load_frozen_module(CANONICAL_NAME, "_skt_model.py")
 
 _module.Indexer.forward = _rbln_indexer_forward
 _module.AXK2GatedMultiHeadLatentAttentionWrapper.forward = _rbln_gated_mla_forward
+_module.AXK2MoE.forward = _rbln_axk2_moe_forward
 
 AXK2ForCausalLM = _module.AXK2ForCausalLM
 
