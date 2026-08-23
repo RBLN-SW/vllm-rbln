@@ -228,11 +228,18 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         )  # [B, H, S, lora_rank+rope]
 
         if topk_indices is not None:
+            # NOTE(RBLN): softmax_scale is an OPERAND, not folded into q. The
+            # kernel applies it between the QK matmul and the softmax (matmul ->
+            # mul -> softmax -> matmul), matching the DSA indexer and the
+            # in-memory flash-causal kernels; the compiler folds that multiply
+            # into the QK matmul's scale attribute, so it costs nothing and
+            # leaves q unrounded.
             attn_output = torch.ops.rbln_custom_ops.sparse_attn_deepseek_mla(
-                q * self.scale,
+                q,
                 kv_c_normed,
                 k_pe,
                 kv_cache,
+                self.scale_tensor,
                 attn_metadata.seq_lens,
                 attn_metadata.block_tables,
                 topk_indices,
