@@ -20,7 +20,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
@@ -46,16 +45,23 @@ def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
     input) by index; that index must be relative to the layers that live on
     this pipeline-parallel rank, so subtract the rank's starting layer.
     """
-    self.layer_index = extract_layer_index(self.layer_name)
+    from vllm_rbln.patches.models_utils import (
+        rbln_extract_layer_index,
+        rbln_num_attn_module,
+    )
 
     # NOTE(RBLN): Consider PP
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
+    num_attn_module = (
+        rbln_num_attn_module(model_config) if model_config is not None else 1
+    )
+    self.layer_index = rbln_extract_layer_index(self.layer_name, num_attn_module)
     if model_config is not None:
         start, _ = model_config.get_layers_start_end_indices(
             vllm_config.parallel_config
         )
-        self.layer_index -= start
+        self.layer_index -= start * num_attn_module
 
 
 # NOTE(RBLN) - To represent kv cache as model input,
