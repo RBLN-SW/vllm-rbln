@@ -681,10 +681,17 @@ class TestLoadModel:
 
 class TestDummyRun:
     @staticmethod
-    def _proposer(monkeypatch, *, num_spec, dp_status=None, draft_has_moe=True):
+    def _proposer(
+        monkeypatch, *, num_spec, dp_status=None, draft_has_moe=True, specialized=False
+    ):
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=num_spec)
         proposer.draft_has_moe = draft_has_moe
+        if dp_status is not None:
+            # A status is a DP fact: the draft reads one only when there is a group.
+            monkeypatch.setattr(
+                proposer.vllm_config.parallel_config, "data_parallel_size", 2
+            )
         proposer.runner = SimpleNamespace(
             is_prefill=False,
             input_batch=SimpleNamespace(
@@ -698,18 +705,23 @@ class TestDummyRun:
             kv_caches=[],
             kv_cache_bases=[],
             kv_cache_view_infos=[],
-            shape_config=_shape_config(),
+            shape_config=_shape_config(specialized=specialized),
             dp_status=dp_status,
             _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
                 np.cumsum(nt, dtype=cumsum_dtype),
                 None,
             ),
         )
+        # The batch the draft runs on reaches the attention builder as batch_pad.
+        builds: list[dict] = []
+
+        def build_metadata(**kwargs):
+            builds.append(kwargs)
+            return object()
+
         proposer.draft_attn_groups = [
             SimpleNamespace(
-                get_metadata_builder=lambda: SimpleNamespace(
-                    build=lambda **k: object()
-                ),
+                get_metadata_builder=lambda: SimpleNamespace(build=build_metadata),
                 layer_names=["draft.layer"],
             )
         ]
@@ -722,6 +734,7 @@ class TestDummyRun:
             ), torch.zeros(8, dtype=torch.int64)
 
         proposer.model_executable = executable
+        proposer.builds = builds
         return proposer, calls
 
     @staticmethod
@@ -771,6 +784,41 @@ class TestDummyRun:
         )
         proposer.dummy_run(num_reqs=1, num_tokens_per_req=3, is_prefill=False)
         assert len(calls) == passes
+
+    @pytest.mark.parametrize("has_moe,batch_pad", [(True, 8), (False, 2)])
+    def test_only_a_moe_draft_takes_the_peers_batch(
+        self, monkeypatch, has_moe, batch_pad
+    ):
+        # A peer reading a prompt forces the top bucket on whoever reads the token
+        # dimension it dictates. A dense draft does not, so it keeps its own two
+        # requests instead of padding to the top bucket's eight.
+        prefilling_peer = DPStatus(
+            num_tokens=(2, 512),
+            num_reqs=(2, 1),
+            is_prefill=(False, True),
+            is_idle=(False, False),
+            num_tokens_across_dp=torch.tensor([2, 512], dtype=torch.int32),
+        )
+        proposer, _ = self._proposer(
+            monkeypatch,
+            num_spec=1,
+            dp_status=prefilling_peer,
+            draft_has_moe=has_moe,
+            specialized=True,
+        )
+        proposer.dummy_run(num_reqs=2, num_tokens_per_req=1, is_prefill=False)
+        assert [b["batch_pad"] for b in proposer.builds] == [batch_pad]
+
+    def test_a_dp_pass_without_a_published_status_fails_here(self, monkeypatch):
+        # The draft decides from what the step published, so a pass reaching it with
+        # nothing published is a caller in the wrong place. Left to the rule it
+        # would look like a single rank and quietly size the pass for one.
+        proposer, _ = self._proposer(monkeypatch, num_spec=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.parallel_config, "data_parallel_size", 2
+        )
+        with pytest.raises(AssertionError, match="published no status"):
+            proposer.dummy_run(num_reqs=2, num_tokens_per_req=1, is_prefill=False)
 
     def test_an_idle_rank_runs_an_moe_draft(self, monkeypatch):
         # A fused-MoE draft all-gathers across DP inside its forward, so the busy

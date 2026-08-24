@@ -664,7 +664,16 @@ class TestDetermineDraftBatch:
     # published status. Its bounds are its own: the token dimension follows the
     # busiest rank and query_len stays what this rank stages.
     @staticmethod
-    def _determine(status, *, num_reqs, num_tokens, is_prefill=False, dp_rank=0, **kw):
+    def _determine(
+        status,
+        *,
+        num_reqs,
+        num_tokens,
+        is_prefill=False,
+        dp_rank=0,
+        draft_has_moe=True,
+        **kw,
+    ):
         return determine_draft_batch_execution_and_padding(
             cfg=_cfg(LADDER),
             status=status,
@@ -672,6 +681,7 @@ class TestDetermineDraftBatch:
             num_reqs=num_reqs,
             num_tokens=num_tokens,
             is_prefill=is_prefill,
+            draft_has_moe=draft_has_moe,
             **kw,
         )
 
@@ -715,6 +725,30 @@ class TestDetermineDraftBatch:
         )
         assert desc.num_reqs_padded == 8
         assert desc.num_tokens_padded == MAX_NUM_TOKENS
+
+    @pytest.mark.parametrize(
+        "peer",
+        [
+            pytest.param(
+                _status(num_tokens=[2, 16], num_reqs=[2, 4]), id="busier-peer"
+            ),
+            pytest.param(
+                _status(num_tokens=[2, 512], num_reqs=[2, 1], is_prefill=[0, 1]),
+                id="prefilling-peer",
+            ),
+        ],
+    )
+    def test_a_dense_draft_answers_from_its_own_pass(self, peer):
+        # Nothing in a dense draft reads the token dimension, so no peer decides
+        # anything for it: neither the busiest rank's batch nor the top bucket a
+        # prefilling peer would dictate, and the dimension is the two tokens this
+        # pass stages rather than a shared target.
+        desc, _ = self._determine(peer, num_reqs=2, num_tokens=2, draft_has_moe=False)
+        assert (desc.num_reqs_padded, desc.query_len, desc.num_tokens_padded) == (
+            2,
+            1,
+            2,
+        )
 
     def test_the_drafting_loop_restates_the_status(self):
         # Every rank runs the loop one token per request whatever it staged for the

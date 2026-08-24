@@ -41,7 +41,10 @@ from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
-from vllm_rbln.v1.worker.dp_utils import determine_draft_batch_execution_and_padding
+from vllm_rbln.v1.worker.dp_utils import (
+    BatchDescriptor,
+    determine_draft_batch_execution_and_padding,
+)
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager
 
 if TYPE_CHECKING:
@@ -103,13 +106,10 @@ class RBLNEagleProposer(EagleProposer):
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
-            cfg=self.runner.shape_config,
-            status=self.runner.dp_status,
-            dp_rank=self.dp_rank,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            is_prefill=is_prefill,
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_tokens,
+            is_prefill,
         )
         num_reqs_padded = batch_desc.num_reqs_padded
         num_padded_tokens = batch_desc.num_tokens_padded
@@ -205,13 +205,10 @@ class RBLNEagleProposer(EagleProposer):
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
 
-        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
-            cfg=self.runner.shape_config,
-            status=self.runner.dp_status,
-            dp_rank=self.dp_rank,
-            num_reqs=num_reqs,
-            num_tokens=num_reqs,
-            is_prefill=False,
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_reqs,
+            False,
             first_pass=False,
         )
         num_reqs_padded = batch_desc.num_reqs_padded
@@ -506,13 +503,10 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata = self._build_dummy_attn_metadata(
             num_reqs, num_tokens_per_req
         )
-        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
-            cfg=self.runner.shape_config,
-            status=self.runner.dp_status,
-            dp_rank=self.dp_rank,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            is_prefill=is_prefill,
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_tokens,
+            is_prefill,
             pinned_num_tokens_padded=override_padded,
         )
         num_reqs_padded = batch_desc.num_reqs_padded
@@ -577,13 +571,10 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
         common_attn_metadata.seq_lens += 1
 
-        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
-            cfg=self.runner.shape_config,
-            status=self.runner.dp_status,
-            dp_rank=self.dp_rank,
-            num_reqs=num_reqs,
-            num_tokens=num_reqs,
-            is_prefill=False,
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_reqs,
+            False,
             first_pass=False,
             pinned_num_tokens_padded=override_padded,
         )
@@ -631,6 +622,40 @@ class RBLNEagleProposer(EagleProposer):
                     inputs_embeds=inputs_embeds,
                     token_indices_to_sample=None,
                 )
+
+    def _determine_batch_execution_and_padding(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        is_prefill: bool,
+        *,
+        first_pass: bool = True,
+        pinned_num_tokens_padded: int | None = None,
+    ) -> tuple[BatchDescriptor, torch.Tensor | None]:
+        """This pass's padded batch (see v1/worker/dp_utils.py).
+
+        Under DP the draft decides from the status the step published, so a step
+        that has not published one is a caller in the wrong place rather than a
+        rank on its own; on a single rank there is no group to read.
+        """
+        if self.vllm_config.parallel_config.data_parallel_size == 1:
+            status = None
+        else:
+            status = self.runner.dp_status
+            assert status is not None, (
+                "the step published no status for the draft to decide from"
+            )
+        return determine_draft_batch_execution_and_padding(
+            cfg=self.runner.shape_config,
+            status=status,
+            dp_rank=self.dp_rank,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            is_prefill=is_prefill,
+            draft_has_moe=self.draft_has_moe,
+            first_pass=first_pass,
+            pinned_num_tokens_padded=pinned_num_tokens_padded,
+        )
 
     def _preprocess(
         self,

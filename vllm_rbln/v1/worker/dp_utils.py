@@ -253,6 +253,7 @@ def determine_draft_batch_execution_and_padding(
     num_reqs: int,
     num_tokens: int,
     is_prefill: bool,
+    draft_has_moe: bool,
     first_pass: bool = True,
     pinned_num_tokens_padded: int | None = None,
 ) -> tuple[BatchDescriptor, torch.Tensor | None]:
@@ -266,6 +267,10 @@ def determine_draft_batch_execution_and_padding(
     Past the first pass every rank runs the drafting loop one token per request
     deep, whatever it staged before, so the counts are read at that length: the
     request counts are the token counts, and no rank is prefilling any more.
+
+    ``draft_has_moe`` says whether the draft's forward reads the token dimension
+    at all. Without fused MoE nothing does, so the batch stays this rank's own
+    bucket rather than the one a peer's phase would ask for.
 
     Returns the descriptor and the per-rank token counts the draft's forward
     context consumes.
@@ -310,15 +315,25 @@ def determine_draft_batch_execution_and_padding(
         any_prefill = False
         tokens_across_dp = torch.tensor(status.num_reqs, dtype=torch.int32)
 
-    num_tokens_padded = cfg.max_num_tokens
-    if cfg.specialized_moe_decode and not is_prefill:
+    if not draft_has_moe:
+        # Nothing in this draft reads the token dimension, so it states what this
+        # pass stages rather than a dimension the ranks have to share.
+        num_tokens_padded = num_reqs_padded * query_len
+    elif cfg.specialized_moe_decode and not is_prefill:
         if any_prefill:
+            # The prefilling rank dictates the dimension, and only the top bucket
+            # is compiled with it.
             num_reqs_padded = cfg.decode_batch_buckets[-1]
+            num_tokens_padded = cfg.max_num_tokens
         else:
             num_reqs_padded = cfg.find_bucket(max(status.num_reqs))
             num_tokens_padded = num_reqs_padded * max(
                 tokens // reqs for tokens, reqs in zip(tokens_per_rank, status.num_reqs)
             )
+    else:
+        # The dispatch dimension has to be the same on every rank, and this is the
+        # one value they all reach without agreeing on a batch.
+        num_tokens_padded = cfg.max_num_tokens
     if pinned_num_tokens_padded is not None:
         num_tokens_padded = pinned_num_tokens_padded
 
