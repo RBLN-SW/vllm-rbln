@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Sub-block prefix caching on a real compiled engine: the KV copy execution the
-# CPU tests cannot reach. Caching ON must match OFF greedily, and hits above
-# len(PROMPTS) * BLOCK_SIZE prove the sub-block path really ran.
+# CPU tests cannot reach. Caching ON must match OFF greedily, and cached tokens
+# above len(PROMPTS) * BLOCK_SIZE prove the sub-block path really ran.
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ import random
 import pytest
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
-from vllm.v1.metrics.reader import Counter, Metric
 
 from tests.native.utils import TokensTextLogprobs, check_outputs_almost_equal
 
@@ -48,12 +47,7 @@ _ENGINE_OVERRIDES = dict(
     max_model_len=4096,
     num_gpu_blocks_override=8,
     seed=0,
-    disable_log_stats=False,
 )
-
-
-def _get_counter(metrics: list[Metric], name: str) -> int:
-    return sum(m.value for m in metrics if isinstance(m, Counter) and m.name == name)
 
 
 def _generated_token_ids(outputs) -> list[list[int]]:
@@ -74,13 +68,18 @@ def test_sub_block_prefix_cache_matches_baseline(vllm_runner) -> None:
     with vllm_runner(MODEL, enable_prefix_caching=True, **_ENGINE_OVERRIDES) as cached:
         # Warm the prefix cache with the first prompt only.
         cached.llm.generate(PROMPTS[0], SAMPLING_PARAMS)
-        hits_before = _get_counter(cached.llm.get_metrics(), "vllm:prefix_cache_hits")
         outputs = cached.llm.generate(PROMPTS, SAMPLING_PARAMS)
-        hits_after = _get_counter(cached.llm.get_metrics(), "vllm:prefix_cache_hits")
         cached_tokens = _generated_token_ids(outputs)
+        # Per request, not the vllm:prefix_cache_hits counter. LLMEngine.step()
+        # forwards a step's SchedulerStats only when that step also produced a
+        # request output, and make_stats() has already reset them, so a dropped
+        # snapshot is gone (AsyncLLM records unconditionally, so serving is
+        # unaffected). Under async scheduling the step whose snapshot carries a
+        # prefill's hits has no output, and the counter loses most of them.
+        num_cached = sum(o.num_cached_tokens for o in outputs)
 
     # Sub-block hits push the total past what full-block hits alone could reach.
-    assert hits_after - hits_before > len(PROMPTS) * BLOCK_SIZE
+    assert num_cached > len(PROMPTS) * BLOCK_SIZE
     # The copied KV must reproduce the uncached greedy output exactly.
     assert cached_tokens == baseline_tokens
 
