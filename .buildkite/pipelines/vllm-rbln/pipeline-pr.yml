@@ -5,6 +5,7 @@ notify:
 env:
   UV_CACHE_DIR: "/root/.cache/uv"
   UV_LINK_MODE: "symlink"
+  UV_LOCK_TIMEOUT: "1200"
   UV_INDEX_STRATEGY: "unsafe-best-match"
 
 _if_changed: &if_changed
