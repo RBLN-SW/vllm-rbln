@@ -23,7 +23,11 @@ from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
@@ -38,6 +42,12 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     RBLNKVCacheManager,
     SubBlockMatch,
 )
+from vllm_rbln.v1.core.utils import (
+    DecodeBatchBudget,
+    is_prefill,
+    num_base_tokens,
+    should_defer_spec_step,
+)
 
 logger = init_logger(__name__)
 
@@ -48,10 +58,6 @@ class RBLNSchedulerOutput(SchedulerOutput):
     prefix caching."""
 
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
-
-
-def is_prefill(request: Request) -> bool:
-    return request.num_computed_tokens < request.num_tokens - 1
 
 
 class RBLNScheduler(Scheduler):
@@ -82,6 +88,7 @@ class RBLNScheduler(Scheduler):
             self.kv_cache_manager = RBLNKVCacheManager(
                 kv_cache_config=self.kv_cache_config,
                 max_model_len=self.max_model_len,
+                scheduler_block_size=self.block_size,
                 hash_block_size=self.block_size,
                 sub_block_size=sub_block_size,
                 hash_fn=hash_fn,
@@ -91,6 +98,7 @@ class RBLNScheduler(Scheduler):
                 dcp_world_size=self.dcp_world_size,
                 pcp_world_size=self.pcp_world_size,
                 metrics_collector=self.kv_metrics_collector,
+                watermark=self.scheduler_config.watermark,
             )
 
             logger.info(
@@ -113,6 +121,27 @@ class RBLNScheduler(Scheduler):
         # lifecycle hooks clear its pending delta before it can resume with
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
+
+        # NOTE(RBLN): PP degree for the per-step decode-admission budget
+        # (DecodeBatchBudget.for_step): hard cap = max_num_seqs // pp, soft cap =
+        # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
+        # the soft cap a no-op. See v1/core/utils.py.
+        self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+
+    def _decode_demand(self) -> int:
+        """Total decode demand for this step's soft (ceil(demand/pp)) cap.
+
+        = running decodes + remote-KV requests ready to be admitted (transfer
+        complete, awaiting promotion). Including the ready remote-KV gives the
+        soft cap headroom to ramp the decode batch on the P/D-disaggregated
+        decode side; running-only would stall the ramp. Demand is invariant
+        under admission (promoting a ready remote-KV moves it from ready ->
+        running), so this snapshot is exact even as the running/ready split
+        shifts during the waiting loop.
+        """
+        num_running_decodes = sum(1 for r in self.running if not is_prefill(r))
+        num_ready_remote_kv = len(self.finished_recving_kv_req_ids)
+        return num_running_decodes + num_ready_remote_kv
 
     def _add_pending_runner_block_delta(
         self,
@@ -147,15 +176,7 @@ class RBLNScheduler(Scheduler):
                     pending_delta + req_to_new_blocks[req.request_id]
                 )
 
-    def schedule(self) -> RBLNSchedulerOutput:
-        # Copied from vllm.v1.core.sched.Scheduler.schedule: https://github.com/vllm-project/vllm/blob/v0.18.0/vllm/v1/core/sched/scheduler.py#L338-L927
-        # The only differences are:
-        # - Disable mixed batching
-        # - Limit prefill batch size to 1
-        # - Limit decode batch size to (max_num_seqs // pipeline_parallel_size)
-        # - Do not schedule spec tokens when they are across block boundaries
-        # Search for NOTE(RBLN) for details
-
+    def schedule(self, throttle_prefills: bool = False) -> RBLNSchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -173,6 +194,16 @@ class RBLNScheduler(Scheduler):
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        # NOTE(RBLN): The runner reads this step's phase off this dict
+        # (step_is_prefill), which holds because a step is never mixed -- all
+        # decodes, or a lone prefill. Four guards keep it that way:
+        #   (A) the running loop schedules a trailing prefill alone;
+        #   (B) that prefill then skips the waiting loop;
+        #   (C) a waiting prefill defers once anything else is admitted;
+        #   (D) an admitted waiting prefill evicts the decode batch.
+        # Relaxing any of (A)-(D), or clamping a prefill chunk to a single token,
+        # breaks that read; see the step-phase section in v1/core/utils.py for
+        # what it would cost.
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -191,10 +222,24 @@ class RBLNScheduler(Scheduler):
 
         self.kv_cache_manager.new_step_starts()
 
+        # NOTE(RBLN): Per-step decode-batch admission budget shared by the
+        # running loop and the waiting-loop remote-KV promotion. can_admit()
+        # enforces the hard cap (max_num_seqs // pp == compiled bucket ceiling)
+        # plus a ceil(demand/pp) soft cap that spreads decodes across
+        # microbatches. At pp == 1 the soft cap == demand (a no-op), so this is
+        # exactly the old `len(scheduled_running_reqs) >= max_num_seqs` gate.
+        decode_budget = DecodeBatchBudget.for_step(
+            max_num_seqs=self.max_num_running_reqs,
+            pipeline_parallel_size=self._pp_size,
+            demand=self._decode_demand(),
+        )
+
         # First, schedule the RUNNING requests.
         # NOTE(RBLN): Prioritize prefill requests. Given our constraint that the prefill
         # batch size fixed to 1 if any prefill request is running there must be exactly
         # one at the end of the list.
+        # Guard (A) of the no-mixed-batching invariant; see the step-phase
+        # section in v1/core/utils.py.
         req_index = (
             len(self.running) - 1
             if self.running and is_prefill(self.running[-1])
@@ -224,6 +269,17 @@ class RBLNScheduler(Scheduler):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            # NOTE(RBLN): Under sync-scheduling PP + spec decode, defer a step
+            # with no reconciled base (anchor) token yet -- num_computed_tokens
+            # is optimistically advanced by the drafts, so the RAW num_new_tokens
+            # can still be draft-inflated (drafts held) or negative (post-verify
+            # overshoot). See should_defer_spec_step. Non-spec decode is untouched
+            # (its no-new-tokens case is the plain `<= 0` continue below).
+            if should_defer_spec_step(
+                self.num_spec_tokens, request.spec_token_ids, num_new_tokens
+            ):
+                req_index += 1
+                continue
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -275,7 +331,7 @@ class RBLNScheduler(Scheduler):
                         unsafe_backfill_req_ids.add(request.request_id)
                         num_new_tokens = 1
 
-            if num_new_tokens <= 0:
+            if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -287,8 +343,6 @@ class RBLNScheduler(Scheduler):
                 # 3. The encoder cache is exhausted.
                 # 4. Insufficient budget for a block-aligned chunk in hybrid
                 #    models with mamba cache mode \"align\".
-                # 5. (RBLN) Speculative decoding left num_computed_tokens ahead
-                #    of num_tokens_with_spec, so there is nothing to schedule.
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
@@ -321,6 +375,10 @@ class RBLNScheduler(Scheduler):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
+                            # NOTE(RBLN): the victim was admitted just below its
+                            # append; un-admit it so the stale (over)count does
+                            # not make can_admit() stop admitting early.
+                            decode_budget.discard()
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -351,6 +409,10 @@ class RBLNScheduler(Scheduler):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            # NOTE(RBLN): every scheduled running req joins this step's decode
+            # batch; admit() keeps the shared budget's count == batch size so the
+            # can_admit() gate (this loop's end and the waiting loop) stops at cap.
+            decode_budget.admit()
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -390,13 +452,10 @@ class RBLNScheduler(Scheduler):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
-            # NOTE(RBLN): We restrict the decode batch size to
-            # (max_num_seqs // pipeline_parallel_size) to prevent pipeline
-            # bubbles.
-            if len(scheduled_running_reqs) >= (
-                self.max_num_running_reqs
-                // self.vllm_config.parallel_config.pipeline_parallel_size
-            ):
+            # NOTE(RBLN): hold the running decode batch within the shared budget
+            # -- the compiled ceiling (max_num_seqs // pp) and the ceil(demand/pp)
+            # spreading cap -- to keep the PP stages balanced (avoid bubbles).
+            if not decode_budget.can_admit():
                 break
 
         # Record the LoRAs in scheduled_running_reqs
@@ -412,6 +471,8 @@ class RBLNScheduler(Scheduler):
         # Next, schedule the WAITING requests.
         # NOTE(RBLN): We do not attempt to schedule a new prefill request when a running
         # prefill request is already scheduled.
+        # Guard (B) of the no-mixed-batching invariant; see the step-phase
+        # section in v1/core/utils.py.
         if (
             not preempted_reqs
             and self._pause_state == PauseState.UNPAUSED
@@ -433,6 +494,16 @@ class RBLNScheduler(Scheduler):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # NOTE(RBLN): gate every waiting admission by the shared decode
+                # budget so running + waiting stay within the compiled shape
+                # (max_num_seqs // pipeline_parallel_size). It rarely gates a
+                # prefill (this P/D-disagg target's waiting queue holds remote-KV
+                # decodes); when it does, the prefill just waits a few steps for a
+                # slot -- a trade, not a deadlock. Soft cap: remote-KV only.
+                apply_soft_cap = request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                if not decode_budget.can_admit(apply_soft_cap=apply_soft_cap):
+                    break
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -587,6 +658,8 @@ class RBLNScheduler(Scheduler):
                         # eviction only clears scheduled_running_reqs, so running a
                         # local prefill now would illegally mix it with those decode
                         # reqs. Left un-popped at the queue head, re-tried next step.
+                        # Guard (C) of the no-mixed-batching invariant
+                        # (see the step-phase section in v1/core/utils.py).
                         break
 
                     # Schedule encoder inputs.
@@ -638,22 +711,23 @@ class RBLNScheduler(Scheduler):
                         for i in encoder_inputs_to_schedule
                     )
 
-                # NOTE(RBLN): Even when chunked prefill is enabled, we should schedule
-                # a new prefill request only if there is enough KV cache space to
-                # accommodate the full token count. Therefore, we allocate based on
-                # request.num_tokens - num_computed_tokens, not num_new_tokens.
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    request.num_tokens - num_computed_tokens,
+                    num_new_tokens,
                     num_new_computed_tokens=(
                         num_new_local_computed_tokens + num_sub_block_tokens
                     ),
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
+                    num_encoder_tokens=num_encoder_tokens,
                     # NOTE(RBLN): Cache blocks only after scheduling is finalized.
                     delay_cache_blocks=True,
-                    num_encoder_tokens=num_encoder_tokens,
+                    has_scheduled_reqs=bool(self.running),
+                    # NOTE(RBLN): Even when chunked prefill is enabled, we should
+                    # schedule a new prefill request only if there is enough
+                    # KV cache space to accommodate the full token count.
+                    full_sequence_must_fit=True,
                 )
 
                 if new_blocks is None:
@@ -780,18 +854,21 @@ class RBLNScheduler(Scheduler):
                         required_backfill = self.num_spec_tokens  # (num_spec+1)-1
                         if required_backfill > tokens_used_in_block:
                             unsafe_backfill_req_ids.add(request.request_id)
+                    # NOTE(RBLN): this decode-ready request has just joined the
+                    # decode batch (any route -- full remote-KV match or full
+                    # local prefix-cache match), so count it against the shared
+                    # per-step cap. A PARTIAL remote-KV match stays is_prefill
+                    # (not here) and is counted via the running loop next step.
+                    decode_budget.admit()
                     # The scheduled new request is added as a decoding-phase req, so
                     # we can continue to schedule the next request.
                     continue
 
-                # NOTE(RBLN): Reaching this point means that this request can now be
-                # added to the running batch. However, since we do not support mixed
-                # batching for now, we remove all currently scheduled running requests
-                # from the scheduler output and run only this prefill request for the
-                # current step. In the next step (or after this request’s prefill
-                # completes if it cannot finish within a single step) this request will
-                # be scheduled together with the other running requests in the decoding
-                # phase.
+                # NOTE(RBLN): admit this prefill by evicting all scheduled running
+                # reqs and running it alone (no mixed batching); they rejoin as
+                # decodes next step (or once its prefill finishes).
+                # Guard (D) of the no-mixed-batching invariant; see the step-phase
+                # section in v1/core/utils.py.
                 for req in scheduled_running_reqs:
                     evicted_delta = req_to_new_blocks.pop(req.request_id)
                     num_scheduled_tokens.pop(req.request_id)
@@ -803,6 +880,10 @@ class RBLNScheduler(Scheduler):
                     self._add_pending_runner_block_delta(req.request_id, evicted_delta)
 
                 scheduled_running_reqs.clear()
+                # NOTE(RBLN): the decode batch was just evicted to make room for
+                # a prefill (no mixed batching); zero the admission count so the
+                # budget tracks the now-empty batch.
+                decode_budget.reset()
                 token_budget = prefill_token_budget
 
                 # NOTE(RBLN): we restrict the prefill batch size to 1 for now.
@@ -963,6 +1044,11 @@ class RBLNScheduler(Scheduler):
             )
             scheduler_output.ec_connector_metadata = ec_meta
 
+        # Advance the fence only for non-empty steps (those that actually
+        # write KV and have their output processed later in update_from_output).
+        if self.defer_block_free and total_num_scheduled_tokens > 0:
+            self.sched_step_seq += 1
+
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -974,6 +1060,44 @@ class RBLNScheduler(Scheduler):
         # from the previous running state are stale.
         self._pending_runner_block_deltas.pop(request.request_id, None)
         return super()._preempt_request(request, timestamp)
+
+    def _make_cached_request_data(
+        self,
+        running_reqs: list[Request],
+        resumed_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        spec_decode_tokens: dict[str, list[int]],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+    ) -> CachedRequestData:
+        data = super()._make_cached_request_data(
+            running_reqs,
+            resumed_reqs,
+            num_scheduled_tokens,
+            spec_decode_tokens,
+            req_to_new_blocks,
+        )
+        # NOTE(RBLN): multi-accept token propagation to the non-last PP rank
+        # (sync scheduling). After a verify accepts k drafts, that rank's write
+        # cursor lags num_computed by up to num_spec, so the base's base-length
+        # new_token_ids can't fill [cursor : num_computed + base] -> stale tokens.
+        # Extend the payload backward by num_spec to cover the max lag; the runner
+        # writes it by absolute position, idempotently overwriting mis-speculated
+        # slots. Only the sync-PP spec path is touched.
+        if (
+            self.use_pp
+            and not self.scheduler_config.async_scheduling
+            and self.num_spec_tokens > 0
+            and data.new_token_ids
+        ):
+            for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
+                if idx >= len(data.new_token_ids):
+                    break
+                req_id = req.request_id
+                base = num_base_tokens(num_scheduled_tokens, spec_decode_tokens, req_id)
+                lo = max(0, req.num_computed_tokens - self.num_spec_tokens)
+                hi = req.num_computed_tokens + base
+                data.new_token_ids[idx] = req.all_token_ids[lo:hi]
+        return data
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False

@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import torch
-from vllm.model_executor.layers.fused_moe import FusedMoE, UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 
 class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
-    """Unquantized MoE method for the RBLN FusedMoE forward path.
+    """Unquantized MoE method for the RBLNMoERunner forward path.
 
     vLLM creates UnquantizedFusedMoEMethod directly when no quantization config
     is provided. Registering this OOT implementation preserves that selection
@@ -26,11 +27,11 @@ class RBLNUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        # RBLNFusedMoE computes router logits after RBLN DP multicast and then calls
+        # RBLNMoERunner computes router logits after RBLN DP multicast and then calls
         # quant_method.apply(layer, x, router_logits). Keep this router-logits interface
         # instead of upstream MoERunner's topk_weights/topk_ids interface.
         assert isinstance(w13 := layer.w13_weight, torch.Tensor)

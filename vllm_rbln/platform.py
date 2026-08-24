@@ -28,21 +28,16 @@ else:
 
 import rebel
 from torch._dynamo import register_backend
+from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
+import vllm_rbln.logger  # noqa: F401
 from vllm_rbln import envs
-from vllm_rbln.logger import init_logger
-from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
-from vllm_rbln.utils.optimum.converter.common import (
-    USER_MAX_NUM_BATCHED_TOKENS_KEY,
-)
-from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
-from vllm_rbln.utils.optimum.registry import (
-    is_enc_dec_arch,
-    is_pooling_arch,
-)
 
 logger = init_logger(__name__)
+# Earliest point at which `vllm.envs` is guaranteed to exist, and still before
+# any engine code reads a variable.
+envs.publish_to_vllm_envs()
 
 try:
     import torch.rbln  # noqa: F401
@@ -200,6 +195,10 @@ class RblnPlatform(Platform):
         """
         from vllm.engine.arg_utils import EngineArgs
 
+        from vllm_rbln.utils.optimum.converter.common import (
+            USER_MAX_NUM_BATCHED_TOKENS_KEY,
+        )
+
         if getattr(EngineArgs, "_rbln_user_mnbt_patched", False):
             return
 
@@ -240,6 +239,9 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+        from vllm_rbln.utils.optimum.registry import is_pooling_arch
+
         if envs.VLLM_USE_V2_MODEL_RUNNER:
             raise ValueError(
                 "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
@@ -255,6 +257,12 @@ class RblnPlatform(Platform):
                 "Overriding scheduler_config.async_scheduling to False."
             )
             scheduler_config.async_scheduling = False
+
+        # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
+        # that runs only inside the vLLM-native branch below, and the optimum
+        # path is exactly where an unsupported flag would go unnoticed.
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            cls._validate_dynamic_kv_config(vllm_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             if vllm_config.lora_config is not None:
@@ -296,6 +304,33 @@ class RblnPlatform(Platform):
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
             )
+
+            # Under PP the compiled per-stage decode batch is max_num_seqs // pp_size
+            # (see decode_batch_size). Fail fast on an impossible config.
+            pp_size = parallel_config.pipeline_parallel_size
+            if pp_size > 1:
+                max_num_seqs = scheduler_config.max_num_seqs
+                if max_num_seqs < pp_size:
+                    raise ValueError(
+                        f"pipeline_parallel_size={pp_size} requires "
+                        f"max_num_seqs >= {pp_size} (got {max_num_seqs}); "
+                        f"per-stage decode batch would floor to 0."
+                    )
+                if max_num_seqs % pp_size != 0:
+                    logger.warning(
+                        "max_num_seqs=%d is not a multiple of "
+                        "pipeline_parallel_size=%d; %d decode slot(s) will be unused.",
+                        max_num_seqs,
+                        pp_size,
+                        max_num_seqs % pp_size,
+                    )
+                logger.info_once(
+                    "pipeline_parallel_size=%d, max_num_seqs=%d -> "
+                    "per-stage decode batch=%d.",
+                    pp_size,
+                    max_num_seqs,
+                    max_num_seqs // pp_size,
+                )
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
@@ -399,6 +434,59 @@ class RblnPlatform(Platform):
                 ),
                 parallel_config.distributed_executor_backend,
             )
+
+    @staticmethod
+    def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
+        """Reject configurations the dynamic-KV path cannot size.
+
+        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
+        Configurations".
+        """
+        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
+                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
+            )
+
+        if vllm_config.model_config.use_mla:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
+                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
+            )
+
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
+                "decoding; the merged profiles cannot be attributed per artifact."
+            )
+
+        if not USE_DEVICE_TENSOR:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
+                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
+                "no dynamic KV dimension."
+            )
+
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
+                "transfer connector; the resize invalidates its registrations."
+            )
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+        from vllm_rbln.v1.kv_cache import (
+            RBLNSlidingWindowManager,
+            RBLNSlidingWindowSpec,
+        )
+
+        KVCacheSpecRegistry.register(
+            RBLNSlidingWindowSpec,
+            RBLNSlidingWindowManager,
+            uniform_type_base_spec=RBLNSlidingWindowSpec,
+        )
 
     @classmethod
     def is_pin_memory_available(cls):
@@ -515,6 +603,15 @@ class RblnPlatform(Platform):
 
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.utils.optimum.predicates import (
+            is_qwen3_embedding,
+            is_qwen3_reranker,
+        )
+        from vllm_rbln.utils.optimum.registry import (
+            is_enc_dec_arch,
+            is_pooling_arch,
+        )
+
         if not vllm_config.cache_config.enable_prefix_caching:
             return
         # An EC producer runs only the (vision) encoder and never executes the
@@ -534,7 +631,8 @@ class RblnPlatform(Platform):
 
         else:
             # Prefix caching is supported only for decoder-only models for now.
-            if is_qwen3_pooling(vllm_config.model_config):
+            model_config = vllm_config.model_config
+            if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
                 # Qwen3 pooling model does not support prefix caching for now.
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):

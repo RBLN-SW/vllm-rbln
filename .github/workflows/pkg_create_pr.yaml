@@ -32,6 +32,9 @@ jobs:
           
       - name: Update Optimum Version in uv
         id: uv-update-optimum-rbln
+        env:
+          UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: ${{ secrets.UDC_NEXUS_USERNAME }}
+          UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: ${{ secrets.UDC_NEXUS_PASSWORD }}
         run: |
           set -euo pipefail
           VERSION="${{ inputs.optimum-version }}"

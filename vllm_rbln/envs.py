@@ -15,11 +15,11 @@
 import os
 from typing import TYPE_CHECKING
 
-from vllm.envs import environment_variables as vllm_envs
-
-from vllm_rbln.logger import init_logger
-
-logger = init_logger(__name__)
+# NOTE(eunji.lee): Keep this module a leaf -- import `vllm` and `vllm_rbln` only
+# inside functions. Touching `vllm` resolves the platform plugin, which imports
+# `vllm_rbln.platform`, which reads `VLLM_RBLN_*` from here; were that to happen
+# while this module's own imports ran, it would hit a half-initialized module.
+# `vllm/envs.py` is a leaf upstream for the same reason.
 
 if TYPE_CHECKING:
     # ====================================================================
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
@@ -58,6 +59,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     VLLM_RBLN_NUM_RAY_NODES: int = 1
+    # --- DYNAMIC KV CACHE ---
+    VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -119,7 +122,9 @@ def get_num_devices_per_local_rank() -> int:
     legacy_value = os.environ.get("VLLM_RBLN_TP_SIZE")
 
     if legacy_value is not None:
-        logger.warning_once(
+        from vllm_rbln.logger import init_logger
+
+        init_logger(__name__).warning_once(
             "VLLM_RBLN_TP_SIZE is deprecated and will be removed in a future "
             "release. Please use VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK instead."
         )
@@ -191,7 +196,6 @@ def use_auto_port() -> bool:
 
 # extended environments
 environment_variables = {
-    **vllm_envs,
     # ====================================================================
     # Path selector: the value of VLLM_RBLN_USE_VLLM_MODEL splits the model
     # path in two, which decides which variables below take effect.
@@ -263,6 +267,16 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
+    # Build only the first N decoder layers and leave the rest as
+    # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
+    # truncation. The HF config is left untouched, so layer indices still line
+    # up with the checkpoint and the untruncated count remains available to
+    # anything that reads it (e.g. the MTP start index). For a hybrid attention
+    # model, pick a multiple of the layer-type period (2 for gpt-oss) to keep
+    # the KV cache group structure the full model would have.
+    "VLLM_RBLN_NUM_HIDDEN_LAYERS": lambda: int(
+        os.environ.get("VLLM_RBLN_NUM_HIDDEN_LAYERS", 0)
+    ),
     # Use RBLN device tensors end-to-end (platform device_type="rbln",
     # KV cache / inputs on device, CPU-first attention metadata, padded
     # sampling metadata, no CompileContext). Enabled by default; set to False
@@ -294,6 +308,14 @@ environment_variables = {
     # Number of Ray nodes
     "VLLM_RBLN_NUM_RAY_NODES": lambda: int(
         os.environ.get("VLLM_RBLN_NUM_RAY_NODES", 1)
+    ),
+    # --- DYNAMIC KV CACHE ---
+    # Size the KV cache from the compiled artifact instead of the estimate
+    "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
+            in ("true", "1")
+        )
     ),
     # --- ATTENTION ---
     # Use flash attention for causal attention
@@ -384,16 +406,74 @@ environment_variables = {
     "VLLM_RBLN_USE_W8A16": get_use_w8a16,
 }
 
+# Partition for the mega-cache config signature: COMPILE vars are hashed into
+# the bundle key, NON_COMPILE vars are ignored. test_mega_cache.py asserts the
+# two sets exactly cover environment_variables — classify every new var here.
+RBLN_COMPILE_ENV = frozenset(
+    {
+        "VLLM_RBLN_USE_VLLM_MODEL",
+        "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
+        "VLLM_RBLN_COMPILE_MODEL",
+        "VLLM_RBLN_NUM_HIDDEN_LAYERS",
+        "VLLM_RBLN_USE_DEVICE_TENSOR",
+        "VLLM_RBLN_ENFORCE_MODEL_FP32",
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+        "VLLM_RBLN_FLASH_CAUSAL_ATTN",
+        "VLLM_RBLN_BATCH_ATTN_OPT",
+        "VLLM_RBLN_USE_CUSTOM_KERNEL",
+        "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
+        "VLLM_RBLN_USE_MOE_TOKENS_MASK",
+        "VLLM_RBLN_DISPATCH_ALL2ALL",
+        "VLLM_RBLN_COMBINE_ALL2ALL",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
+        "VLLM_RBLN_USE_W8A16",
+    }
+)
+
+RBLN_NON_COMPILE_ENV = frozenset(
+    {
+        # sampler graphs compile with use_cache=False, never enter the bundle
+        "VLLM_RBLN_SAMPLER",
+        "VLLM_RBLN_COMPILE_STRICT_MODE",
+        "VLLM_RBLN_NUM_RAY_NODES",
+        "VLLM_RBLN_ENABLE_WARM_UP",
+        "VLLM_RBLN_METRICS",
+        "VLLM_RBLN_METRICS_FILE",
+        "VLLM_RBLN_METRICS_DIR",
+        "VLLM_RBLN_NUMA",
+        "VLLM_RBLN_COMPILE_ONLY",
+        "VLLM_RBLN_DISABLE_OFFLOAD",
+        "VLLM_RBLN_AUTO_PORT",
+        "VLLM_RBLN_SORT_BATCH",
+        "VLLM_RBLN_SUB_BLOCK_CACHE",
+        "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
+    }
+)
+
 
 def __getattr__(name: str):
     # lazy evaluation of environment variables
     if name in environment_variables:
         return environment_variables[name]()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import vllm.envs as vllm_envs
+
+    try:
+        return getattr(vllm_envs, name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
 
 def __dir__():
-    return list(environment_variables.keys())
+    import vllm.envs as vllm_envs
+
+    return sorted({*environment_variables, *dir(vllm_envs)})
 
 
-vllm_envs.update(environment_variables)
+def publish_to_vllm_envs() -> None:
+    from vllm.envs import environment_variables as vllm_envs
+
+    vllm_envs.update(environment_variables)

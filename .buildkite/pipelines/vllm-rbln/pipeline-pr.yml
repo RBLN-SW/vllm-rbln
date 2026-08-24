@@ -1,0 +1,85 @@
+notify:
+  - github_commit_status:
+      context: "[OB] vLLM-RBLN pytest"
+
+env:
+  UV_CACHE_DIR: "/root/.cache/uv"
+  UV_LINK_MODE: "symlink"
+  UV_INDEX_STRATEGY: "unsafe-best-match"
+
+_if_changed: &if_changed
+  include:
+    - ".buildkite/**"
+    - "tests/native/**"
+    - "vllm_rbln/**"
+    - "pyproject.toml"
+    - "uv.lock"
+  exclude:
+    - ".buildkite/pipelines/optimum-pr/**"
+    - "tests/optimum/**"
+    - "vllm_rbln/distributed/ec_transfer/**"
+    - "vllm_rbln/model_executor/models/**"
+    - "vllm_rbln/utils/optimum/**"
+    - "vllm_rbln/v1/**/optimum_*"
+    - "vllm_rbln/v1/core/prefix_cache_manager/**"
+    - "vllm_rbln/v1/worker/ec_disagg_helpers.py"
+
+_secrets: &secrets
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
+  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
+  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+  HF_TOKEN: FSW_HF_TOKEN
+  HF_HOME: FSW_HF_HOME
+
+_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
+
+steps:
+  - label: ":pytest: [CA25] pytest"
+    key: "vllm-rbln-pytest-ca25"
+    if_changed: *if_changed
+    agents:
+      queue: r18s
+      resource_class: "RBLN-CA25-32"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "echo '--- :pytest: pytest (sampler)' && uv run --no-sync pytest tests/torch_compile/unit/v1/sample -v"
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t1-compile.sh"
+
+  - label: ":pytest: [CR03] pytest"
+    key: "vllm-rbln-pytest-cr03"
+    if_changed: *if_changed
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR03"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t1-compile.sh"
+
+  - label: ":pytest: [CR13] pytest"
+    key: "vllm-rbln-pytest-cr13"
+    if_changed: *if_changed
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR13"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t1-compile.sh"
