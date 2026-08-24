@@ -45,7 +45,7 @@ def patched_minimax_m2_moe_forward(
     if self.tp_size > 1:
         final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-    return final_hidden_states
+    return final_hidden_states.to(hidden_states.dtype)
 
 
 def _forward_qk(
