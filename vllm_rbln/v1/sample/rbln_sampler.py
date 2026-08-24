@@ -139,7 +139,7 @@ class RBLNSampler(VLLMSampler):
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
     ):
-        super().__init__()
+        super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
         compile_context = (
             compile_context
@@ -186,7 +186,7 @@ class RBLNSampler(VLLMSampler):
             # greedy rows through the random-sampling path with top_k=1, so the op
             # can only draw their argmax.
             processed_logprobs = None
-            if sampling_metadata.max_num_logprobs is not None:
+            if sampling_metadata.max_num_logprobs is not None or sampling_metadata.logprob_token_ids:
                 if logprobs_mode == "processed_logits":
                     processed_logprobs = logits
                 elif logprobs_mode == "processed_logprobs":
@@ -245,7 +245,8 @@ class RBLNSampler(VLLMSampler):
         # This is different from the V0 sampler, which uses the logits that
         # is used for sampling (after penalties and temperature scaling).
         num_logprobs = sampling_metadata.max_num_logprobs
-        if num_logprobs is not None:
+        raw_logprobs: torch.Tensor | None = None
+        if num_logprobs is not None or sampling_metadata.logprob_token_ids:
             if logprobs_mode == "raw_logprobs":
                 raw_logprobs = self.compute_logprobs(logits)
             elif logprobs_mode == "raw_logits":
@@ -271,8 +272,15 @@ class RBLNSampler(VLLMSampler):
         # the same reason upstream needs this on its FlashInfer backend.
         sampled = sampled.long()
 
+        logprob_token_ids_tensors = None
+        if sampling_metadata.logprob_token_ids:
+            assert raw_logprobs is not None
+            logprob_token_ids_tensors = self.gather_specific_token_logprobs(
+                raw_logprobs, sampling_metadata.logprob_token_ids, sampled
+            )
+
         if num_logprobs is None:
-            logprobs_tensors = None
+            logprobs_tensors = logprob_token_ids_tensors
         elif num_logprobs == -1:
             # Return the full unsorted and unranked logprobs.
             logprobs_tensors = LogprobsTensors(
@@ -283,6 +291,11 @@ class RBLNSampler(VLLMSampler):
             logprobs_tensors = self.gather_logprobs(
                 raw_logprobs, num_logprobs, token_ids=sampled
             )
+
+        # If we have both num_logprobs and logprob_token_ids, prefer
+        # logprob_token_ids as it's more specific
+        if logprob_token_ids_tensors is not None and num_logprobs is not None:
+            logprobs_tensors = logprob_token_ids_tensors
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)

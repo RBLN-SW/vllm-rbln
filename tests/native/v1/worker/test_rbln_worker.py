@@ -18,7 +18,9 @@
 
 import inspect
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -475,8 +477,11 @@ class TestCompileOrWarmUpModel:
         compile_model=True,
         warm_up=True,
         warmup_side_effect=None,
+        data_parallel_size=1,
     ):
-        vcfg = _make_vllm_config(enforce_eager=enforce_eager)
+        vcfg = _make_vllm_config(
+            enforce_eager=enforce_eager, data_parallel_size=data_parallel_size
+        )
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_COMPILE_MODEL", compile_model)
@@ -495,6 +500,11 @@ class TestCompileOrWarmUpModel:
             calls.append("warmup")
             if warmup_side_effect is not None:
                 raise warmup_side_effect
+
+        monkeypatch.setattr(wm, "get_dp_group", lambda: SimpleNamespace(cpu_group="dp"))
+        monkeypatch.setattr(
+            wm.dist, "barrier", lambda group: calls.append(f"barrier:{group}")
+        )
 
         worker.model_runner = SimpleNamespace(
             warmup_model=warmup,
@@ -522,6 +532,28 @@ class TestCompileOrWarmUpModel:
         result = worker.compile_or_warm_up_model()
         assert calls == ["warmup"]
         assert isinstance(result, CompilationTimes)
+
+    def test_dp_ranks_rendezvous_after_warmup(self, make_worker, monkeypatch):
+        # The ranks must leave this method together: whatever skew survives it
+        # lands in the first forward's DP all-reduce, where it reads as the
+        # first request's prefill latency.
+        worker, calls = self._worker(make_worker, monkeypatch, data_parallel_size=4)
+        worker.compile_or_warm_up_model()
+        assert calls == ["warmup", "barrier:dp"]
+
+    def test_no_rendezvous_without_dp_peers(self, make_worker, monkeypatch):
+        worker, calls = self._worker(make_worker, monkeypatch, data_parallel_size=1)
+        worker.compile_or_warm_up_model()
+        assert calls == ["warmup"]
+
+    def test_no_rendezvous_when_warmup_skipped(self, make_worker, monkeypatch):
+        # Nothing compiled, so there is no skew to absorb -- and every skip
+        # reason is global config, so the ranks skip together.
+        worker, calls = self._worker(
+            make_worker, monkeypatch, warm_up=False, data_parallel_size=4
+        )
+        worker.compile_or_warm_up_model()
+        assert calls == []
 
     @pytest.mark.parametrize(
         "msg",
@@ -707,3 +739,376 @@ class TestHandshakeMetadata:
         self, make_worker, monkeypatch
     ):
         assert self._metadata(make_worker, monkeypatch, metadata=None) is None
+
+
+# ---------------------------------------------------------------------------
+# Dynamic KV: the compile-time cache TP>=2 does not return
+# ---------------------------------------------------------------------------
+class TestRetainedCompileKvCacheCharge:
+    """`_charge_retained_compile_kv_cache` keeps the budget from being spent
+    twice on TP>=2, where `_release_kv_cache_tensors` does not get the
+    compile-time cache back and cannot tell that it did not.
+    """
+
+    BUDGET_PER_CHIPLET = 33_772_535_808
+
+    @staticmethod
+    def _profile(regions):
+        from vllm_rbln.v1.worker.kv_profile import (
+            MergedKvCacheMemoryProfile,
+            MergedMemoryRegion,
+        )
+
+        return MergedKvCacheMemoryProfile(
+            device_regions=[MergedMemoryRegion(*r) for r in regions]
+        )
+
+    @classmethod
+    def _budget(cls, num_chiplets=4):
+        return {0: {c: cls.BUDGET_PER_CHIPLET for c in range(num_chiplets)}}
+
+    @staticmethod
+    def _charge(fake_self_tp, resident_blocks, budget, merged):
+        # The charge reads the block count the runner actually allocated, not
+        # the env var: see `_charge_retained_compile_kv_cache`.
+        worker = SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=fake_self_tp),
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=resident_blocks)
+            ),
+        )
+        return RBLNWorker._charge_retained_compile_kv_cache(worker, budget, merged)
+
+    # (node_id, chiplet_id, base_bytes, bytes_per_block, alignment)
+    MINIMAX_TP4EP = [(0, 0, 0, 65_011_712, 1)]
+
+    def test_tp1_is_not_charged_because_the_cache_comes_back(self):
+        budget = self._budget()
+        out = self._charge(1, 8, budget, self._profile(self.MINIMAX_TP4EP))
+        assert out == budget
+
+    def test_tp4_is_charged_on_the_chiplet_that_holds_the_growth(self):
+        out = self._charge(4, 8, self._budget(), self._profile(self.MINIMAX_TP4EP))
+
+        # The MiniMax TP4+EP profile puts every growth region on chiplet 0, so
+        # only chiplet 0 loses the 8 x 62 MiB the outgoing cache still holds.
+        assert out[0][0] == self.BUDGET_PER_CHIPLET - 8 * 65_011_712
+        for chiplet_id in (1, 2, 3):
+            assert out[0][chiplet_id] == self.BUDGET_PER_CHIPLET
+
+    def test_an_empty_cache_has_nothing_resident_to_charge(self):
+        budget = self._budget()
+        out = self._charge(4, 0, budget, self._profile(self.MINIMAX_TP4EP))
+        assert out == budget
+
+    def test_a_base_only_profile_is_not_charged(self):
+        budget = self._budget()
+        out = self._charge(4, 8, budget, self._profile([(0, 0, 1 << 30, 0, 1)]))
+        assert out == budget
+
+    def test_alignment_is_accounted_per_region(self):
+        # align_up(10059840 + 8*3000000) - align_up(10059840) at 2 MiB
+        # = 35651584 - 10485760, which is 1165824 more than 8 * 3000000.
+        out = self._charge(
+            4,
+            8,
+            self._budget(),
+            self._profile([(0, 0, 10_059_840, 3_000_000, 1 << 21)]),
+        )
+        assert out[0][0] == self.BUDGET_PER_CHIPLET - 25_165_824
+
+    def test_a_budget_the_retained_cache_exhausts_is_refused(self):
+        huge = [(0, 0, 0, self.BUDGET_PER_CHIPLET // 4, 1)]
+        with pytest.raises(RuntimeError, match="leaves no budget"):
+            self._charge(4, 8, self._budget(), self._profile(huge))
+
+    def test_the_caller_s_budget_is_not_mutated(self):
+        budget = self._budget()
+        self._charge(4, 8, budget, self._profile(self.MINIMAX_TP4EP))
+        assert budget[0][0] == self.BUDGET_PER_CHIPLET
+
+
+class TestMaybeShrinkKvCacheForCompile:
+    """The shrink decides the compile size and, through the latch, whether the
+    resize runs at all: every branch returning the config unchanged turns the
+    feature off for that run, so the branch taken and its log are the behaviour.
+    """
+
+    ESTIMATED_BLOCKS = 211
+    PAGE_SIZE = 1 << 20
+
+    @classmethod
+    def _config(cls, num_blocks=None):
+        blocks = cls.ESTIMATED_BLOCKS if num_blocks is None else num_blocks
+        return SimpleNamespace(
+            num_blocks=blocks,
+            kv_cache_tensors=[
+                SimpleNamespace(size=blocks * cls.PAGE_SIZE, shared_by=["layer.0"]),
+                SimpleNamespace(size=blocks * cls.PAGE_SIZE, shared_by=["layer.1"]),
+            ],
+        )
+
+    @staticmethod
+    def _shrink(config, *, dynamic=True, override=None, warmup_skipped=False):
+        # The flag is patched as a module attribute, not via os.environ: a
+        # setattr elsewhere would leave an attribute shadowing envs.__getattr__.
+        worker = SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks_override=override),
+            _kv_blocks_before_shrink=None,
+            _compile_and_warmup_skip_reason=lambda: (
+                "enforce_eager is set" if warmup_skipped else None
+            ),
+        )
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+            dynamic,
+        ):
+            out = RBLNWorker._maybe_shrink_kv_cache_for_compile(worker, config)
+        return worker, out
+
+    def test_the_flag_alone_shrinks_to_the_constant(self, caplog):
+        config = self._config()
+        with caplog.at_level("INFO"):
+            worker, out = self._shrink(config)
+
+        assert out is not config
+        assert out.num_blocks == wm.COMPILE_KV_CACHE_NUM_BLOCKS
+        assert worker._kv_blocks_before_shrink == self.ESTIMATED_BLOCKS
+        # The tensors have to shrink with num_blocks or the allocation and the
+        # config disagree.
+        for kv_tensor in out.kv_cache_tensors:
+            assert kv_tensor.size == out.num_blocks * self.PAGE_SIZE
+        # The caller's config must survive: it is what the resize restores to.
+        assert config.num_blocks == self.ESTIMATED_BLOCKS
+        assert all(
+            t.size == self.ESTIMATED_BLOCKS * self.PAGE_SIZE
+            for t in config.kv_cache_tensors
+        )
+
+    def test_the_flag_off_returns_the_config_untouched_and_silently(self, caplog):
+        config = self._config()
+        with caplog.at_level("WARNING"):
+            worker, out = self._shrink(config, dynamic=False)
+        assert out is config
+        assert worker._kv_blocks_before_shrink is None
+        assert "[Dynamic KV]" not in caplog.text
+
+    def test_a_pinned_block_count_cancels_the_shrink(self, caplog):
+        config = self._config()
+        with caplog.at_level("WARNING"):
+            worker, out = self._shrink(config, override=64)
+
+        assert out is config
+        assert worker._kv_blocks_before_shrink is None
+        assert "num-gpu-blocks-override" in caplog.text
+
+    def test_a_hint_that_cannot_shrink_refuses(self):
+        # The estimate is free memory over the cost of one block, so a large
+        # block_size can legally put it at or below the hint. Serving on there
+        # would silently keep the pre-compile estimate, so it is a refusal.
+        with pytest.raises(RuntimeError, match="nothing to shrink"):
+            self._shrink(self._config(num_blocks=wm.COMPILE_KV_CACHE_NUM_BLOCKS))
+
+    def test_no_warmup_means_no_shrink(self, caplog):
+        """Skipping compile/warm-up has to skip the shrink too: otherwise the
+        latch is set, the profile query finds no runtimes, and the restore path
+        trips an assertion whose message names none of the cause.
+        """
+        config = self._config()
+        with caplog.at_level("WARNING"):
+            worker, out = self._shrink(config, warmup_skipped=True)
+
+        assert out is config
+        assert worker._kv_blocks_before_shrink is None
+        assert "compile/warm-up is skipped" in caplog.text
+        assert "does nothing for this run" in caplog.text
+
+
+class TestDynamicKvLayoutGuards:
+    """The layout guard is split across `initialize_kv_cache`: the attention half
+    runs before it, the binding half after, and neither may drift."""
+
+    @staticmethod
+    def _layer(sliding_window=None, is_causal=True, is_normal=False):
+        return SimpleNamespace(
+            impl=SimpleNamespace(
+                sliding_window=sliding_window,
+                is_causal=is_causal,
+                is_normal=is_normal,
+            )
+        )
+
+    def test_the_attention_guard_runs_before_the_shrink(self):
+        calls: list[str] = []
+
+        def record(name: str, ret: object = None) -> object:
+            calls.append(name)
+            return ret
+
+        config = SimpleNamespace(num_blocks=4, kv_cache_tensors=[])
+        worker = SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
+            vllm_config=object(),
+            model_runner=SimpleNamespace(
+                initialize_kv_cache=lambda cfg: record("initialize_kv_cache")
+            ),
+            _assert_dynamic_kv_attention_layout=lambda: record("attention"),
+            _assert_dynamic_kv_cache_layout=lambda: record("bindings"),
+            _maybe_shrink_kv_cache_for_compile=lambda cfg: record("shrink", cfg),
+        )
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+                True,
+            ),
+            patch("vllm_rbln.v1.worker.rbln_worker.ensure_kv_transfer_initialized"),
+        ):
+            RBLNWorker.initialize_from_config(worker, config)
+
+        assert calls.index("attention") < calls.index("shrink")
+        assert calls.index("bindings") > calls.index("initialize_kv_cache")
+
+    def test_a_non_paged_causal_layer_is_refused_by_name(self):
+        """`block_size == max_model_len` makes is_normal True -- and is also where
+        the estimate can fall below the hint, so the wrong refusal could fire."""
+        worker = SimpleNamespace(vllm_config=object())
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.get_layers_from_vllm_config",
+                return_value={"layer.0": self._layer(is_normal=True)},
+            ),
+            pytest.raises(RuntimeError) as exc,
+        ):
+            RBLNWorker._assert_dynamic_kv_attention_layout(worker)
+        assert "paged_flash_causal_attention_naive" in str(exc.value)
+        assert "layer.0" in str(exc.value)
+        assert "nothing to shrink" not in str(exc.value)
+
+    def test_a_paged_causal_layer_passes(self):
+        worker = SimpleNamespace(vllm_config=object())
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.get_layers_from_vllm_config",
+            return_value={"layer.0": self._layer()},
+        ):
+            RBLNWorker._assert_dynamic_kv_attention_layout(worker)
+
+    def test_deduped_bases_are_still_refused_after_the_split(self):
+        """Guards the split itself: moving this check earlier would make it see an
+        empty list and pass, so its refusal has to stay asserted."""
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                kv_cache_bases=[object()], shared_kv_cache_layers={}
+            )
+        )
+        with pytest.raises(RuntimeError, match="KV base deduplication"):
+            RBLNWorker._assert_dynamic_kv_cache_layout(worker)
+
+    def test_cross_layer_sharing_is_still_refused_after_the_split(self):
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                kv_cache_bases=[], shared_kv_cache_layers={"layer.1": "layer.0"}
+            )
+        )
+        with pytest.raises(RuntimeError, match="cross-layer KV"):
+            RBLNWorker._assert_dynamic_kv_cache_layout(worker)
+
+
+class TestDynamicKvFailuresRaise:
+    """After the shrink, failing to size from the device must not boot: the run
+    would serve the pre-compile estimate. The gates before it stay a quiet None."""
+
+    @staticmethod
+    def _worker(*, shrunk=True, override=None, runtimes=()):
+        return SimpleNamespace(
+            rank=0,
+            cache_config=SimpleNamespace(num_gpu_blocks_override=override),
+            _kv_blocks_before_shrink=211 if shrunk else None,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=211)
+            ),
+            _collect_dynamic_kv_runtimes=lambda: list(runtimes),
+        )
+
+    def test_no_runtime_after_the_shrink_raises(self):
+        with pytest.raises(RuntimeError, match="not one of the 0"):
+            RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(runtimes=()))
+
+    def test_no_profile_after_the_shrink_raises(self):
+        """Every runtime refusing the query is the documented static-artifact case.
+
+        It used to log an error and boot on the estimate, which is the bug this
+        feature exists to remove.
+        """
+        runtime = SimpleNamespace(
+            _executor=SimpleNamespace(
+                kv_cache_memory_profile=lambda: (_ for _ in ()).throw(
+                    RuntimeError("no dynamic-shape variable")
+                )
+            )
+        )
+        with pytest.raises(RuntimeError) as exc:
+            RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(runtimes=(runtime,)))
+        assert "did not return" in str(exc.value) or "not one of the" in str(exc.value)
+        assert "VLLM_CACHE_ROOT" in str(exc.value)
+
+    def test_the_pre_shrink_gates_still_return_none(self):
+        """An override and "not shrunk" are legitimate: nothing moved."""
+        assert (
+            RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(override=64)) is None
+        )
+        # The shrink did not happen, so there is nothing to size from.
+        assert (
+            RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(shrunk=False)) is None
+        )
+
+
+class TestApplyResizesThenMaterializes:
+    """`apply_dynamic_kv_num_blocks` settles the latch, and any actual resize
+    must be followed by the boot-time materialization: without it the first
+    request pays the whole pool's physical allocation (measured 19.8 s TTFT)."""
+
+    @staticmethod
+    def _worker(*, before_shrink=211, current=4):
+        calls: list = []
+        worker = SimpleNamespace(
+            _kv_blocks_before_shrink=before_shrink,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=current)
+            ),
+            _reallocate_kv_cache=lambda target: calls.append(("realloc", target)),
+            _materialize_kv_cache=lambda: calls.append(("materialize",)),
+        )
+        return worker, calls
+
+    def test_a_computed_count_reallocates_then_materializes(self):
+        worker, calls = self._worker()
+        assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, 1368) == 1368
+        assert calls == [("realloc", 1368), ("materialize",)]
+        assert worker._kv_blocks_before_shrink is None
+
+    def test_none_restores_the_pre_shrink_count(self):
+        worker, calls = self._worker()
+        assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, None) == 211
+        assert calls == [("realloc", 211), ("materialize",)]
+
+    def test_a_matching_count_skips_both(self):
+        worker, calls = self._worker(before_shrink=4, current=4)
+        assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, 4) == 4
+        assert calls == []
+
+    def test_nothing_pending_returns_none(self):
+        worker, calls = self._worker(before_shrink=None)
+        assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, None) is None
+        assert calls == []
+
+    def test_materialize_runs_the_smallest_compiled_decode_bucket(self):
+        ran: list = []
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                bucketing_manager=SimpleNamespace(decode_batch_buckets=[8, 4, 16]),
+                offload_context=nullcontext,
+                _dummy_run=lambda *args: ran.append(args),
+            )
+        )
+        RBLNWorker._materialize_kv_cache(worker)
+        assert ran == [(4, 1, False)]

@@ -136,11 +136,6 @@ from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
-from vllm_rbln.v1.worker.metrics_v2 import (
-    PerformanceContext,
-    e2e_ends,
-    e2e_starts,
-)
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
     prepare_kernel_block_sizes,
@@ -206,7 +201,7 @@ class ExecuteModelState(NamedTuple):
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor
-    aux_hidden_states: list[torch.Tensor] | None
+    combined_hidden_states: torch.Tensor | None
 
 
 class RBLNModelRunner(KVConnectorModelRunnerMixin):
@@ -447,11 +442,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
 
-        self.performance_ctx = PerformanceContext("runner", self.runtime_holder)
-
         self.offload_context = nullcontext
         if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             self.offload_context = torch.rbln.offload
+
+        # NOTE(RBLN): DP status for the current step.
+        # Since num_tokens_and_reqs_across_dp contains a collective op,
+        # we save it for possible reuse in a drafter.
+        self.dp_status: tuple[torch.Tensor, torch.Tensor, bool] | None = None
 
     def _get_positions(self, num_tokens: Any):
         assert not isinstance(num_tokens, int)
@@ -915,7 +913,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_tokens_padded: int | None = None,
         num_reqs_padded: int | None = None,
         logits_indices: torch.Tensor | None = None,
-        use_spec_decode: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1244,23 +1241,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
-        with self.performance_ctx.profile_sampler():
-            if spec_decode_metadata is None:
-                bucket = logits.shape[0]
-                num_reqs = self.input_batch.num_reqs
-                padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
-                out = self.sampler(
-                    logits=logits,
-                    sampling_metadata=padded_md,
-                )
-                return _depad_sampler_output(out, num_reqs)
-
-            return self.rejection_sampler(
-                spec_decode_metadata,
-                None,  # draft_probs
-                logits,
-                sampling_metadata,
+        if spec_decode_metadata is None:
+            bucket = logits.shape[0]
+            num_reqs = self.input_batch.num_reqs
+            padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
+            out = self.sampler(
+                logits=logits,
+                sampling_metadata=padded_md,
             )
+            return _depad_sampler_output(out, num_reqs)
+
+        return self.rejection_sampler(
+            spec_decode_metadata,
+            None,  # draft_probs
+            logits,
+            sampling_metadata,
+        )
 
     def _bookkeeping_sync(
         self,
@@ -1368,7 +1364,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_id_to_index_output_copy,
         )
 
-    @e2e_starts
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1434,8 +1429,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self._determine_batch_padding(num_reqs, num_query_tokens)
             )
 
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_query_tokens,
@@ -1444,7 +1437,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded,
                     logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
                 )
             )
 
@@ -1482,7 +1474,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
-            self.performance_ctx.profile_model(self.is_prefill),
         ):
             model_output = self.model_executable(
                 **staged_model_inputs.as_kwargs(),
@@ -1490,7 +1481,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
-            hidden_states, aux_hidden_states, logits = model_output
+            hidden_states, logits, combined_hidden_states = model_output
 
             if not get_pp_group().is_last_rank:
                 # Return the intermediate tensors; carry the connector output
@@ -1521,12 +1512,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             spec_decode_common_attn_metadata,
             hidden_states,
             sample_hidden_states,
-            aux_hidden_states,
+            combined_hidden_states,
         )
         self.kv_connector_output = kv_connector_output
         return None
 
-    @e2e_ends
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -1550,7 +1540,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             spec_decode_common_attn_metadata,
             hidden_states,
             sample_hidden_states,
-            aux_hidden_states,
+            combined_hidden_states,
         ) = self.execute_model_state
         self.execute_model_state = None  # Clear ephemeral state
 
@@ -1579,9 +1569,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     self.input_batch.sampling_metadata,
                     hidden_states,
                     sample_hidden_states,
-                    aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
+                    combined_hidden_states,
                 )
 
         spec_config = self.speculative_config
@@ -1667,9 +1657,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         sampling_metadata: SamplingMetadata,
         hidden_states: torch.Tensor,
         sample_hidden_states: torch.Tensor,
-        aux_hidden_states: list[torch.Tensor] | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
+        combined_hidden_states: torch.Tensor | None,
     ) -> list[list[int]] | torch.Tensor:
         assert (spec_config := self.speculative_config) is not None
         if spec_config.method == "ngram":
@@ -1732,20 +1722,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
             )
 
-            target_hidden_states = hidden_states
+            # eagle3 pre-combines the aux states inside the target graph; every
+            # other EAGLE flavour drafts straight off the target hidden states.
+            target_hidden_states = (
+                hidden_states
+                if combined_hidden_states is None
+                else combined_hidden_states
+            )
             num_rejected_tokens: torch.Tensor | None = None
             if spec_decode_metadata is None:
                 token_indices_to_sample = None
                 num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
                 target_token_ids = self.input_ids[:num_scheduled_tokens]
                 target_positions = self.positions[:num_scheduled_tokens]
-                if self.use_aux_hidden_state_outputs:
-                    assert aux_hidden_states is not None
-                    target_hidden_states = torch.cat(
-                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
-                    )
-                else:
-                    target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
                 (
                     common_attn_metadata,
@@ -1759,11 +1748,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 total_num_tokens = common_attn_metadata.num_actual_tokens
                 target_token_ids = self.input_ids[:total_num_tokens]
                 target_positions = self.positions[:total_num_tokens]
-                if self.use_aux_hidden_state_outputs:
-                    assert aux_hidden_states is not None
-                    target_hidden_states = torch.cat(
-                        [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
-                    )
 
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
@@ -1868,7 +1852,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits = self.model.compute_logits(sample_hidden_states)
                 logits = logits.view(-1, logits.size(-1))
 
-            return hidden_states, aux_hidden_states, logits
+            # NOTE(RBLN): When eagle3 and aux hidden states are used,
+            # fuse combine_hidden_states projection into the target graph.
+            combined_hidden_states = None
+            if self.use_aux_hidden_state_outputs:
+                assert aux_hidden_states is not None
+                assert isinstance(self.drafter, RBLNEagleProposer)
+                target_hidden_states = torch.cat(
+                    [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
+                )
+                combined_hidden_states = self.drafter.model.combine_hidden_states(
+                    target_hidden_states
+                )
+
+            return hidden_states, logits, combined_hidden_states
 
         if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
             self.model_executable = model_wrapper
@@ -2110,7 +2107,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             max_query_len=num_tokens_per_req,
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
-            use_spec_decode=self.speculative_config is not None,
         )
 
         input_ids = self.input_ids[:num_tokens_unpadded]
@@ -2169,9 +2165,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
 
-        if isinstance(self.drafter, RBLNEagleProposer) and (
-            is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens
-        ):
+        if isinstance(self.drafter, RBLNEagleProposer):
             self.drafter.dummy_run(
                 num_reqs,
                 num_tokens_per_req,
@@ -2522,6 +2516,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         kv_caches: dict[str, torch.Tensor] = {}
         kv_cache_base_tensors: dict[str, torch.Tensor] = {}
         kv_cache_view_infos: dict[str, KVCacheViewInfo] = {}
+        marked_layers: list[str] = []
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -2575,6 +2570,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         .view(kv_cache_shape)
                     )
                     kv_caches[layer_name] = typed_base.permute(*inv_order)
+                    if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+                        # Keeps num_blocks resizable after compile; the compiler
+                        # allows one dynamic dim with a single attention use.
+                        torch._dynamo.mark_dynamic(kv_caches[layer_name], 1)
+                        marked_layers.append(layer_name)
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
                         view_shape=kv_cache_shape,
@@ -2582,6 +2582,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                 else:
                     raise NotImplementedError
+
+        if marked_layers:
+            logger.info(
+                "[Dynamic KV] mark_dynamic(kv_cache, dim=1) applied to %d layer(s); "
+                "%s shape=%s",
+                len(marked_layers),
+                marked_layers[0],
+                tuple(kv_caches[marked_layers[0]].shape),
+            )
 
         return kv_caches, kv_cache_base_tensors, kv_cache_view_infos
 
@@ -2894,18 +2903,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if self.parallel_config.data_parallel_size == 1:
             return num_reqs_padded, None, None
 
-        num_tokens_across_dp, num_reqs_across_dp = (
-            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens_unpadded,
-                num_reqs_unpadded,
-                self.parallel_config.data_parallel_size,
-                self.parallel_config.data_parallel_rank,
-                is_prefill,
-            )
+        dp_status = RBLNDPMetadata.num_tokens_and_reqs_across_dp(
+            num_tokens_unpadded,
+            num_reqs_unpadded,
+            self.parallel_config.data_parallel_size,
+            self.parallel_config.data_parallel_rank,
+            is_prefill,
         )
+        self.dp_status = dp_status
+        num_tokens_across_dp, num_reqs_across_dp, any_prefill = dp_status
         num_tokens_padded = self.max_num_tokens
         if self.specialized_moe_decode:
-            if num_reqs_across_dp is None:
+            if any_prefill:
                 # any_prefill (PD disaggregation): route padded-decode to the max
                 # bucket so only ONE padded-decode graph is ever needed.
                 num_reqs_padded = self.bucketing_manager.decode_batch_buckets[-1]
@@ -2917,6 +2926,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
                 tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
                 max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
+                if self.use_aux_hidden_state_outputs:
+                    # NOTE(RBLN): This can rarely cause some redundant padding in MoE.
+                    # However, there's a compiler failure with eagle3 on a case where
+                    # qlen=1 on every rank. So we pad to num_spec_tokens + 1 if every
+                    # rank has qlen=1 for now.
+                    max_tokens_per_req = max(
+                        max_tokens_per_req, self.num_spec_tokens + 1
+                    )
                 num_tokens_padded = num_reqs_padded * max_tokens_per_req
 
         return num_reqs_padded, num_tokens_padded, num_tokens_across_dp

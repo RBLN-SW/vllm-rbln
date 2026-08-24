@@ -12,11 +12,13 @@ Two documents own their subjects; read them rather than duplicating them here:
 Run everything through `uv`. Never use the system `python3` or a bare `pip`.
 
 ```bash
-uv run --no-sync pytest tests/native/v1/worker/test_rbln_worker.py -x
+uv run --no-sync pytest tests/native/v1/worker/test_rbln_worker.py::<one test> -x
 uvx pre-commit run --files <every file you changed>
 ```
 
-Pick the narrowest test target that covers the change. `pre-commit` is not a project dependency, so run it through `uvx`. Passing `--files` explicitly keeps the run independent of what happens to be staged.
+Use the narrowest test target that covers the change. Start by running the specific affected test, such as `test_file.py::test_name`, and widen to the full test file only when necessary. Do not start by running an entire test directory.
+
+Run `pre-commit` through `uvx`, since it is not a project dependency. Pass `--files` explicitly to avoid depending on the current staging state.
 
 A new `.py` file needs the Apache header that every other file carries; `check-license-header` rejects it otherwise. Copy the header from a neighbouring file.
 
@@ -62,6 +64,14 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 **`@register_patch` overwrites an upstream symbol and is the last resort.** Use it only when no extension point exists, and make `reason` say what upstream cannot express — not what the replacement does. When you are unsure whether an extension point exists, ask instead of defaulting to a patch.
 
+These are the cases that legitimately reach a patch:
+
+- Upstream's shape cannot express an RBLN constraint, such as a KV cache that has to enter the compiled graph as an input, or a kernel RBLN does not provide.
+- An upstream module needs adapting to an RBLN interface, and replacing one method beats reimplementing the model.
+- An upstream bug, or a fix that is not released yet. Cite the upstream issue and give the version that removes the need, such as `TODO(vllm>=0.26.0): delete`. A temporary patch with no removal condition becomes a permanent one.
+
+The registry rules:
+
 - Never `setattr` an upstream symbol directly. Every replacement goes through the registry, which verifies that it took.
 - A new module under `patches/` must be added to the import list in `patches/__init__.py`. A decorator in a module nobody imports registers nothing.
 - Duplicate keys and duplicate targets raise. Two patches may share a target only when their `condition` predicates are mutually exclusive.
@@ -73,6 +83,14 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 Everything in the repository is written in English: code, comments, docstrings, log and error messages, test names, docs, commit messages, PR titles and bodies. This extends the English requirement in `CONTRIBUTING.md`.
 
 Conversation with the user is not a repository artifact. Reply in the language the user writes in.
+
+## What not to publish
+
+This repository is public. Absolute measurements stay out of it: throughput, latency, memory footprint, and accuracy from an internal run do not belong in code, comments, tests, docs, commit messages, or PR descriptions. Benchmark scripts live here; their results do not.
+
+A relative change is fine. Say that something got a third faster, not what the two numbers were, and keep the raw figures to an internal channel.
+
+Upstream vLLM asks for eval results in the PR description. That convention does not apply here.
 
 ## Scope
 
@@ -106,7 +124,6 @@ Code either succeeds or fails with a clear error.
 
 - A test must fail without the change it covers. Verify that; do not assume it.
 - Cover what the change touched. Do not test pre-existing logic, third-party functions, or statically defined values.
-- If the test diff dwarfs the code change, cut scope.
 - Extend an existing file, `conftest.py` fixture, or `utils.py` helper before adding a new file.
 - Do not add a test that is skipped as a placeholder. A test that never runs covers nothing while reading as coverage that exists.
 - `--strict-markers` turns a misspelled mark into a collection error, but a mark you leave off is silent. Forgetting `model_compile` is how a whole-model compile ends up in the lane that runs on every PR.
@@ -128,11 +145,11 @@ Some of the rules above cost something to follow. When you believe a case is a r
 
 Follow the existing convention: `type(scope): summary`, for example `fix(mega-cache): key the bundle on the warm-up graph set`.
 
-Explain intent. The diff already shows what changed, so a message that narrates it adds nothing.
+Explain intent. Summarise what changed in a line or two, then spend the space on what the diff cannot show — the reason behind an unusual approach, a constraint that forced the shape, a tradeoff that was weighed. Do not walk through the diff file by file; that is the part a reader can already see.
 
 ## Skills
 
-Read and follow the matching skill before you start:
+Read and follow the matching skill at the point it applies:
 
 - Adding or changing tests under `tests/native/`: `.claude/skills/writing-tests/SKILL.md`
 - Investigating a bug, a test failure, or unexpected behavior: `.claude/skills/debugging/SKILL.md`

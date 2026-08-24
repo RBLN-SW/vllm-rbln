@@ -407,3 +407,10 @@ def test_compile_env_partition_is_disjoint():
 def test_unknown_variable_raises():
     with pytest.raises(AttributeError, match="VLLM_RBLN_NOT_A_REAL_VARIABLE"):
         getattr(envs, "VLLM_RBLN_NOT_A_REAL_VARIABLE")  # noqa: B009
+
+
+def test_dynamic_kv_cache_is_opt_in(monkeypatch):
+    # The flag is read during compile, so a non-False default would change the
+    # compiled artifact for every existing deployment.
+    monkeypatch.delenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", raising=False)
+    assert envs.environment_variables["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"]() is False

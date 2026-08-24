@@ -212,7 +212,7 @@ class TestExecuteModelState:
             "spec_decode_common_attn_metadata",
             "hidden_states",
             "sample_hidden_states",
-            "aux_hidden_states",
+            "combined_hidden_states",
         )
 
     def test_is_named_tuple(self):
@@ -358,8 +358,7 @@ class TestDummyRunPadding:
 
         def fake_across_dp(num_tokens, num_reqs, dp_size, dp_rank, is_prefill):
             reqs = torch.tensor(reqs_across_dp, dtype=torch.int32)
-            # The real one returns no per-rank counts while any rank prefills.
-            return reqs.clone(), None if is_prefill else reqs
+            return reqs.clone(), reqs, is_prefill
 
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
@@ -401,6 +400,9 @@ class TestDummyRunPadding:
             # use_wrapped_compute_logits is a property over this.
             is_pooling_model=True,
             speculative_config=None,
+            # Read by _determine_batch_padding to floor the MoE dispatch pad
+            # at the spec width; __init__ always sets it.
+            use_aux_hidden_state_outputs=False,
             # Gates the drafter's dummy run; __init__ always sets it.
             drafter=None,
             kv_cache_bases=None,

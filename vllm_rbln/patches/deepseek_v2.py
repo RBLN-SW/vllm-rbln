@@ -38,14 +38,20 @@ def patched_deepseek_v2_moe_forward(
     if hidden_states.dtype != torch.float16:
         final_hidden_states *= self.routed_scaling_factor
 
+    shared_output = None
     if self.shared_experts is not None:
         shared_output = self.shared_experts(hidden_states)
         if hidden_states.dtype == torch.float16:
             shared_output *= 1.0 / self.routed_scaling_factor
-        final_hidden_states = final_hidden_states + shared_output
+        if not self.is_sequence_parallel:
+            final_hidden_states = final_hidden_states + shared_output
+            shared_output = None
 
     if self.tp_size > 1:
         final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+    if shared_output is not None:
+        final_hidden_states = final_hidden_states + shared_output
     # FIXME(RBLN) - DO NOT reshape
     # return final_hidden_states.view(orig_shape)
     return final_hidden_states

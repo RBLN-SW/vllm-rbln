@@ -21,6 +21,7 @@ from vllm_rbln.model_executor.models.optimum.base import (
     ModelInputForRBLN,
     PartialPrefixInfo,
 )
+from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
     _RBLN_MULTIMODAL_MODELS,
     is_enc_dec_arch,
@@ -42,6 +43,7 @@ from .qwen2_vl import (  # noqa: F401
     RBLNOptimumQwen2_5_VLForConditionalGeneration,
     RBLNOptimumQwen2VLForConditionalGeneration,
 )
+from .qwen3_reranker import RBLNOptimumQwen3RerankerModel
 from .qwen3_vl import (  # noqa: F401
     RBLNOptimumQwen3_5ForConditionalGeneration,
     RBLNOptimumQwen3VLForConditionalGeneration,
@@ -85,6 +87,14 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
             raise NotImplementedError(
                 "Encoder-decoder models are not supportedsince vLLM RBLN v0.10.1"
             )
+    elif is_qwen3_reranker(model_config):
+        # Scored through the generation graph, so the HF arch was remapped to
+        # Qwen3ForCausalLM and the pooling dispatch below would miss it.
+        assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
+            "Prefix caching is not supported with pooling models. Please set "
+            "`enable_prefix_caching` to False."
+        )
+        rbln_model = RBLNOptimumQwen3RerankerModel(vllm_config)
     elif is_pooling_arch(model_config.hf_config):
         assert vllm_config.cache_config.enable_prefix_caching in (False, None), (
             "Prefix caching is not supported with pooling models. Please set "

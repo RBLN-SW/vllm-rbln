@@ -150,6 +150,12 @@ wheels = [
 ]
 
 [[package]]
+name = "arctic-inference"
+version = "0.1.1"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/arctic-inference/0.1.1/arctic_inference-0.1.1.tar.gz", hash = "sha256:36857e2fbe3ead34821a04be98dfab95086050c1e38199c8fdfe308234fdcf63" }
+
+[[package]]
 name = "astor"
 version = "0.8.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -1527,8 +1533,8 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.2a1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.11.2a3"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "accelerate" },
     { name = "diffusers" },
@@ -1540,9 +1546,9 @@ dependencies = [
     { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/22/4f0ace819ba138d2aa6f70f92c097b3bc0796d561ab9daea7e54b306336d/optimum_rbln-0.11.2a1.tar.gz", hash = "sha256:10d10abd186e7e3b59b1b622c45326b83df465036018ce15de65679b6cbf07a9", size = 602350, upload-time = "2026-08-13T11:12:37.693Z" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.2a3/optimum_rbln-0.11.2a3.tar.gz", hash = "sha256:c3901b05ab0aa0abbfe7d1a0235b37de5cc746b5c3089e1101db8dec35b229d6" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b6/b5/f7b9565052823ed3ec5b86178a65faa96ac00eee6859c5a9bce8646d6d5e/optimum_rbln-0.11.2a1-py3-none-any.whl", hash = "sha256:418c976cf884576c5bb286eef0ea302c27ae10ebbbb88f08c1dc29d1bfd0451e", size = 656637, upload-time = "2026-08-13T11:12:35.854Z" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.2a3/optimum_rbln-0.11.2a3-py3-none-any.whl", hash = "sha256:9526166c6a3354f63917f6feed81a66bdd472d13efe58345b19d906d6b567f72" },
 ]
 
 [[package]]
@@ -2101,7 +2107,7 @@ wheels = [
 
 [[package]]
 name = "rebel-compiler"
-version = "0.11.2.dev256+gc5eaca9d.prod"
+version = "0.11.3.dev4+g139aa35e.prod"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "attrs" },
@@ -2123,10 +2129,10 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.2.dev256+gc5eaca9d.prod/rebel_compiler-0.11.2.dev256+gc5eaca9d.prod-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:2b910d83875d22ece19d8ed625799f5c" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.2.dev256+gc5eaca9d.prod/rebel_compiler-0.11.2.dev256+gc5eaca9d.prod-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:ca7866151a548865f701f27ce135427d" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.2.dev256+gc5eaca9d.prod/rebel_compiler-0.11.2.dev256+gc5eaca9d.prod-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:7367c11a20b9f861eef84396a038020d" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.2.dev256+gc5eaca9d.prod/rebel_compiler-0.11.2.dev256+gc5eaca9d.prod-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:14713b6bf1349cbb7a3ad128cdfd82f0" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev4+g139aa35e.prod/rebel_compiler-0.11.3.dev4+g139aa35e.prod-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:e1f91a491455877e04ad5ea90b88ed6c" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev4+g139aa35e.prod/rebel_compiler-0.11.3.dev4+g139aa35e.prod-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:c1d36e8aa4cf1812fda303b7b99466a9" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev4+g139aa35e.prod/rebel_compiler-0.11.3.dev4+g139aa35e.prod-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:914c88f30ae07dd18e22e951bf89de81" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev4+g139aa35e.prod/rebel_compiler-0.11.3.dev4+g139aa35e.prod-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:fa4a9f0266bba94a0eefe2c120737588" },
 ]
 
 [[package]]
@@ -2581,7 +2587,7 @@ wheels = [
 [[package]]
 name = "torch-rbln"
 version = "0.4.0rc0"
-source = { registry = "https://pypi.org/simple" }
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "libcst" },
     { name = "pyyaml" },
@@ -2591,10 +2597,10 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d3/30/a30524970d1208bc2bf6d26720faf6c463b58dfe015bdbe2bf4394518c03/torch_rbln-0.4.0rc0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:7687f86a22bc75ee5c86182facbbdbb8a7a34914a0bd4a2e48d6eb873fdae785", size = 1257550, upload-time = "2026-08-13T02:15:59.62Z" },
-    { url = "https://files.pythonhosted.org/packages/56/a3/75c73b473afcb74f02bd4e11b11b01514945ab96648bc19751818c25e193/torch_rbln-0.4.0rc0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:60fc4a9f9b744414c010b8f5e5184c35194e0c722f811fb74f0ac117b6995a6e", size = 1259238, upload-time = "2026-08-13T02:16:01.587Z" },
-    { url = "https://files.pythonhosted.org/packages/de/c3/851f7c6886fb6dca5f737c15eff06942ef496f5ac695a9fc4f3d57194959/torch_rbln-0.4.0rc0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:e1f0ce90935b314f7cccc20964ad0c79516620d40f0c7c8a09a2e17a7c926637", size = 1264731, upload-time = "2026-08-13T02:16:03.062Z" },
-    { url = "https://files.pythonhosted.org/packages/50/3c/7f110587a35833b2d5e0a1f5b9c44353b8944a14d48c28ed4f19e97c7ab1/torch_rbln-0.4.0rc0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:1bd2aa1e263b59a8b0b214bb79ededd7efa4a64b479da5fb89cf37a2a7ed5a39", size = 1266411, upload-time = "2026-08-13T02:16:05.153Z" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.4.0rc0/torch_rbln-0.4.0rc0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:7687f86a22bc75ee5c86182facbbdbb8a7a34914a0bd4a2e48d6eb873fdae785" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.4.0rc0/torch_rbln-0.4.0rc0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:60fc4a9f9b744414c010b8f5e5184c35194e0c722f811fb74f0ac117b6995a6e" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.4.0rc0/torch_rbln-0.4.0rc0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:e1f0ce90935b314f7cccc20964ad0c79516620d40f0c7c8a09a2e17a7c926637" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.4.0rc0/torch_rbln-0.4.0rc0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:1bd2aa1e263b59a8b0b214bb79ededd7efa4a64b479da5fb89cf37a2a7ed5a39" },
 ]
 
 [[package]]
@@ -2908,6 +2914,7 @@ runtime = [
     { name = "rebel-compiler" },
 ]
 test = [
+    { name = "arctic-inference" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -2917,12 +2924,13 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "arctic-inference", marker = "extra == 'test'", specifier = "==0.1.1" },
     { name = "build", marker = "extra == 'build'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
-    { name = "optimum-rbln", specifier = ">=0.11.2a1" },
+    { name = "optimum-rbln", specifier = ">=0.11.2a3" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
@@ -2932,7 +2940,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils" },
-    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "~=0.11.2.dev256" },
+    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "~=0.11.3.dev4" },
     { name = "setuptools", specifier = ">=64" },
     { name = "setuptools-scm", specifier = ">=8" },
     { name = "setuptools-scm", marker = "extra == 'build'" },

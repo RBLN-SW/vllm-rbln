@@ -6,6 +6,7 @@ env:
   VLLM_RBLN_USE_VLLM_MODEL: "1"
   VLLM_RBLN_BATCH_ATTN_OPT: "1"
   VLLM_RBLN_SORT_BATCH: "1"
+  VLLM_RBLN_USE_W8A16: "1"
 
 serve:
   max_model_len: 16384

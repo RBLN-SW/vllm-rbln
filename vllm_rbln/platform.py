@@ -258,6 +258,12 @@ class RblnPlatform(Platform):
             )
             scheduler_config.async_scheduling = False
 
+        # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
+        # that runs only inside the vLLM-native branch below, and the optimum
+        # path is exactly where an unsupported flag would go unnoticed.
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            cls._validate_dynamic_kv_config(vllm_config)
+
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             if vllm_config.lora_config is not None:
                 raise ValueError("LoRA is not supported on RBLN.")
@@ -429,6 +435,44 @@ class RblnPlatform(Platform):
                 parallel_config.distributed_executor_backend,
             )
 
+    @staticmethod
+    def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
+        """Reject configurations the dynamic-KV path cannot size.
+
+        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
+        Configurations".
+        """
+        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
+                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
+            )
+
+        if vllm_config.model_config.use_mla:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
+                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
+            )
+
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
+                "decoding; the merged profiles cannot be attributed per artifact."
+            )
+
+        if not USE_DEVICE_TENSOR:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
+                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
+                "no dynamic KV dimension."
+            )
+
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
+                "transfer connector; the resize invalidates its registrations."
+            )
+
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -559,7 +603,10 @@ class RblnPlatform(Platform):
 
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+        from vllm_rbln.utils.optimum.predicates import (
+            is_qwen3_embedding,
+            is_qwen3_reranker,
+        )
         from vllm_rbln.utils.optimum.registry import (
             is_enc_dec_arch,
             is_pooling_arch,
@@ -584,7 +631,8 @@ class RblnPlatform(Platform):
 
         else:
             # Prefix caching is supported only for decoder-only models for now.
-            if is_qwen3_pooling(vllm_config.model_config):
+            model_config = vllm_config.model_config
+            if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
                 # Qwen3 pooling model does not support prefix caching for now.
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):

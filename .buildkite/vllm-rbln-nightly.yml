@@ -14,6 +14,14 @@ _secrets: &secrets
 
 _sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
 
+_perf: &perf
+  - *sync
+  - "bash .buildkite/pipelines/vllm-rbln/scripts/perf/run-perf.sh"
+
+_lm_eval: &lm_eval
+  - *sync
+  - "bash .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run-lm-eval.sh"
+
 steps:
   - label: ":pytest: [CA25] pytest (T0)"
     key: "nightly-t0-ca25"
@@ -75,9 +83,42 @@ steps:
       - *sync
       - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
 
-  # Measured, not gated: soft_fail keeps the build green and neither lane appears
-  # in the deploy step's depends_on. Every target under both targets/ directories
-  # names CR03/CR13 only, so there is no ATOM counterpart to run.
+  - label: ":pytest: [CR13] pytest (T0)"
+    key: "nightly-t0-cr13"
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR13"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+
+  - label: ":pytest: [CR13] pytest (T2)"
+    key: "nightly-t2-cr13"
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR13"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    env:
+      VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
+      VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
+    timeout_in_minutes: 120
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
+
+  # Measured, not gated: soft_fail keeps the build green and no measured lane
+  # appears in the deploy step's depends_on. Every target under both targets/
+  # directories names CR03/CR13 only, so there is no ATOM counterpart to run.
   - label: ":chart_with_upwards_trend: [CR03] perf"
     key: "nightly-perf-cr03"
     soft_fail: true
@@ -85,16 +126,30 @@ steps:
       queue: udc
     resources:
       npu:
-        count: 4
+        count: 8
         product: "RBLN-CR03"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
     timeout_in_minutes: 120
     artifact_paths:
       - "perf-results/**/*"
-    command:
-      - *sync
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/perf/run-perf.sh"
+    command: *perf
+
+  - label: ":chart_with_upwards_trend: [CR13] perf"
+    key: "nightly-perf-cr13"
+    soft_fail: true
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 8
+        product: "RBLN-CR13"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "perf-results/**/*"
+    command: *perf
 
   - label: ":dart: [CR03] lm-eval"
     key: "nightly-lm-eval-cr03"
@@ -110,9 +165,23 @@ steps:
     timeout_in_minutes: 120
     artifact_paths:
       - "lm-eval-results/**/*"
-    command:
-      - *sync
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run-lm-eval.sh"
+    command: *lm_eval
+
+  - label: ":dart: [CR13] lm-eval"
+    key: "nightly-lm-eval-cr13"
+    soft_fail: true
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR13"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 120
+    artifact_paths:
+      - "lm-eval-results/**/*"
+    command: *lm_eval
 
   # The four gating lanes above; perf and lm-eval are measured, not gated, so
   # they stay out of depends_on. No NPU needed -- the wheel is a pure CPU build,
