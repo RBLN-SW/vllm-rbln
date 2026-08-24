@@ -186,7 +186,10 @@ class RBLNSampler(VLLMSampler):
             # greedy rows through the random-sampling path with top_k=1, so the op
             # can only draw their argmax.
             processed_logprobs = None
-            if sampling_metadata.max_num_logprobs is not None or sampling_metadata.logprob_token_ids:
+            if (
+                sampling_metadata.max_num_logprobs is not None
+                or sampling_metadata.logprob_token_ids
+            ):
                 if logprobs_mode == "processed_logits":
                     processed_logprobs = logits
                 elif logprobs_mode == "processed_logprobs":
