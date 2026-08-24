@@ -312,7 +312,7 @@ class RBLNSampler(VLLMSampler):
         if sampling_metadata.logprob_token_ids:
             assert raw_logprobs is not None
             logprob_token_ids_tensors = self.gather_specific_token_logprobs(
-                raw_logprobs, sampling_metadata.logprob_token_ids, sampled
+                raw_logprobs, sampling_metadata.logprob_token_ids, sampled.long()
             )
 
         if num_logprobs is None:
