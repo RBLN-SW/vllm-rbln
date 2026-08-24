@@ -25,6 +25,7 @@ TODO(vllm-pr-47505): delete this module and its entry in
 up.
 """
 
+import importlib.util
 from typing import TYPE_CHECKING
 
 from vllm_rbln.patches import register_patch
@@ -37,6 +38,18 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
+def _lmcache_available() -> bool:
+    """True when the optional ``lmcache`` package is installed.
+
+    The vLLM-vendored target module exists in the pin, but importing it
+    does ``from lmcache.utils import ...`` at module scope, so without
+    ``lmcache`` the import raises ``ModuleNotFoundError`` and the registry
+    then AttributeErrors on the parent package. Native CI does not install
+    ``lmcache``.
+    """
+    return importlib.util.find_spec("lmcache") is not None
+
+
 @register_patch(
     target=(
         "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector."
@@ -47,6 +60,7 @@ if TYPE_CHECKING:
         "sub-connector sees num_external_tokens=0 but needs_retrieve() ignores "
         "that, so it wrongly waits to load and leaks lookup locks."
     ),
+    condition=_lmcache_available,
 )
 def patched_update_state_after_alloc(
     self: "LMCacheMPConnectorUpstream",
