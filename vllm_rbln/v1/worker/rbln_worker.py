@@ -445,6 +445,9 @@ class RBLNWorker(WorkerBase):
             )
 
             # Draft runtimes: one per bucket, plus the specialized-MoE fallback.
+            # TODO(RBLN): an undercount since the draft started compiling both decode
+            # query lengths. Reserving for what it actually compiles needs the count
+            # split by speculative method, which the medusa path would want too.
             num_draft_runtimes = 1 + decode_batch_buckets_count
             if has_specialized_moe_decode:
                 num_draft_runtimes += 1

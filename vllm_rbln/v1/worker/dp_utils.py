@@ -322,6 +322,16 @@ def determine_draft_batch_execution_and_padding(
     if pinned_num_tokens_padded is not None:
         num_tokens_padded = pinned_num_tokens_padded
 
+    # The fused-MoE dispatch pads what a pass stages up to this dimension and only
+    # up to it: staging past it hands the all-gather a tensor the peers do not
+    # expect. Every caller reaches it through a length the ranks reported or the
+    # one they settled on, so the bound holds -- this states it rather than
+    # leaving a pass that got the length wrong to run truncated.
+    assert num_reqs_padded * query_len <= num_tokens_padded, (
+        f"the draft stages {num_reqs_padded} x {query_len} tokens, more than the "
+        f"{num_tokens_padded} the group settled on"
+    )
+
     return (
         BatchDescriptor(
             num_reqs_padded=num_reqs_padded,

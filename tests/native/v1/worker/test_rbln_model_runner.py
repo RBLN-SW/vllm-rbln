@@ -936,9 +936,8 @@ class TestMixinConformance:
 
 class TestDummyRunDraftParticipation:
     # On a serving DP-idle step (warmup=False) the rank still runs the draft dummy,
-    # so a draft whose forward joins a DP all-gather keeps this rank in it. The
-    # length it runs is warm-up's, which is not always the one the step decided for
-    # the model leg.
+    # so a draft whose forward joins a DP all-gather keeps this rank in it -- on the
+    # length the step decided, which is what the group's dimension was sized for.
     NUM_SPEC = 2
 
     @classmethod
@@ -978,8 +977,8 @@ class TestDummyRunDraftParticipation:
             lambda nr, ql, ip: (np.full(nr, ql, dtype=np.int32), ql * nr),
         )
         # The idle case decides query length 1 -- what a rank beside a prefilling
-        # peer gets, its own -- so a draft handed the decided length rather than
-        # the warmed one is visible here.
+        # peer gets, its own -- which is not the speculative length, so a draft run
+        # on anything but the decision is visible here.
         monkeypatch.setattr(
             runner,
             "_determine_batch_execution_and_padding",
@@ -1002,20 +1001,26 @@ class TestDummyRunDraftParticipation:
         monkeypatch.setattr(mr, "build_kv_cache_forward_context_kwargs", lambda b: {})
         return runner, drafter
 
-    def test_idle_draft_runs_the_warmed_decode_length(self, monkeypatch):
-        # The step decided query length 1 for this rank and the model leg stages
-        # that, but warm-up compiles the draft at 1 + num_spec, so the draft has to
-        # get the warmed length or it lands on a graph nobody compiled.
+    def test_idle_draft_runs_the_decided_length(self, monkeypatch):
+        # Beside a prefilling peer the step decides this rank's own single token,
+        # and the group's token dimension is sized for that. Running the draft at
+        # the speculative length instead would stage past it.
         runner, drafter = self._runner(monkeypatch, has_drafter=True)
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
-        drafter.dummy_run.assert_called_once_with(1, 1 + self.NUM_SPEC, False)
+        drafter.dummy_run.assert_called_once_with(1, 1, False)
 
-    def test_warmup_compiles_draft_at_spec_qlen(self, monkeypatch):
+    @pytest.mark.parametrize("query_len", [1, 1 + NUM_SPEC])
+    def test_warmup_compiles_the_draft_at_every_query_length(
+        self, monkeypatch, query_len
+    ):
+        # Both decode lengths reach the draft. Query length 1 is the one a step
+        # forced to no-spec runs, and compiling only the spec length leaves that
+        # step to compile its own graph while it serves.
         runner, drafter = self._runner(monkeypatch, has_drafter=True)
-        runner._dummy_run(2, 1 + self.NUM_SPEC, is_prefill=False, warmup=True)
+        runner._dummy_run(2, query_len, is_prefill=False, warmup=True)
         # warmup path keeps the num_padded_tokens kwarg (draft's own pad target).
         drafter.dummy_run.assert_called_once_with(
-            2, 1 + self.NUM_SPEC, False, num_padded_tokens=None
+            2, query_len, False, num_padded_tokens=None
         )
 
     def test_no_drafter_skips_cleanly(self, monkeypatch):

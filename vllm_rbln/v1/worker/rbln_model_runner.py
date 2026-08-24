@@ -2218,24 +2218,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if isinstance(self.drafter, RBLNEagleProposer):
             if warmup:
-                # TODO(RBLN): a decode step whose drafts the drafter-length skip
-                # zeroed runs the draft's first pass at query length 1, which
-                # this skips.
-                if is_prefill or query_len == 1 + self.num_spec_tokens:
-                    self.drafter.dummy_run(
-                        num_reqs,
-                        query_len,
-                        is_prefill,
-                        num_padded_tokens=num_tokens_padded_override,
-                    )
+                self.drafter.dummy_run(
+                    num_reqs,
+                    query_len,
+                    is_prefill,
+                    num_padded_tokens=num_tokens_padded_override,
+                )
             else:
                 # DP-idle step: run the draft so one whose forward joins a DP
-                # all-gather stays in step with the busy ranks. Its length is the
-                # warmed decode one, not the length this step decided: only the
-                # agreeing route hands an idle rank the busy ranks' length, and on
-                # the others it would get its own 1, which warm-up skips for the
-                # draft.
-                self.drafter.dummy_run(num_reqs, 1 + self.num_spec_tokens, False)
+                # all-gather stays in step with the busy ranks, on the length this
+                # step decided -- what it stages then fits the dimension the group
+                # settled on, whichever route decided it.
+                self.drafter.dummy_run(num_reqs, query_len, False)
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 

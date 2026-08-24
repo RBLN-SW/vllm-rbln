@@ -737,17 +737,42 @@ class TestDetermineDraftBatch:
         # An idle rank reported the minimal entry so it would not drive the
         # decision, then runs the warmed decode length. Its own token count is the
         # one that cannot be checked against the status; a busy rank's still is.
-        idle = _status(num_tokens=[1, 8], num_reqs=[1, 4], is_idle=[1, 0])
+        # The peer decodes four requests three tokens deep, which is the length the
+        # idle rank runs too.
+        idle = _status(num_tokens=[1, 12], num_reqs=[1, 4], is_idle=[1, 0])
         desc, _ = self._determine(idle, num_reqs=1, num_tokens=3)
         # The busy ranks' padding, so the all-gather buffer matches theirs.
         assert (desc.num_reqs_padded, desc.query_len, desc.num_tokens_padded) == (
             4,
             3,
-            8,
+            12,
         )
-        busy = _status(num_tokens=[1, 8], num_reqs=[1, 4])
+        busy = _status(num_tokens=[1, 12], num_reqs=[1, 4])
         with pytest.raises(AssertionError, match="not on the step"):
             self._determine(busy, num_reqs=1, num_tokens=3)
+
+    def test_a_busy_rank_at_one_token_stays_inside_the_bound(self):
+        # The other half of the step the drafter-length skip leaves behind: a busy
+        # rank drafts its own single token, so what it stages is exactly the
+        # dimension the ranks settle on. Only the warmed graph is missing there,
+        # which is not this rule's to see.
+        desc, _ = self._determine(
+            _status(num_tokens=[4, 4], num_reqs=[4, 4]), num_reqs=4, num_tokens=4
+        )
+        assert (desc.num_reqs_padded, desc.query_len, desc.num_tokens_padded) == (
+            4,
+            1,
+            4,
+        )
+
+    def test_a_length_the_group_never_reported_is_rejected(self):
+        # An idle rank runs the warmed decode length even when the busy ranks are a
+        # token deep -- the case the drafter-length skip leaves behind. Their
+        # dimension cannot hold it, and the dispatch pad would drop rows rather
+        # than raise, so the shortfall has to be stated here.
+        idle = _status(num_tokens=[1, 1], num_reqs=[1, 1], is_idle=[1, 0])
+        with pytest.raises(AssertionError, match="more than the"):
+            self._determine(idle, num_reqs=1, num_tokens=3)
 
     def test_a_pin_replaces_only_the_token_dimension(self):
         # Warm-up asks for a token dimension the ranks would not choose; the batch
