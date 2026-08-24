@@ -116,9 +116,20 @@ class BatchDescriptor:
     length so it runs their graph."""
     num_tokens_padded: int | None
     """Token dimension of the graph the step runs, or None when the caller does
-    not pad tokens (single-DP). Always at least ``num_reqs * query_len`` -- what
-    this rank stages fits, and pads up to the dimension when it is smaller. The
-    exact value follows from which warmed graph the route picked."""
+    not pad tokens (single-DP). The exact value follows from which warmed graph
+    the route picked."""
+
+    def __post_init__(self) -> None:
+        # The rows this batch stages have to fit the token dimension: the fused-MoE
+        # dispatch pads up to it and only up to it, so a shortfall drops rows
+        # instead of failing. Stating it here covers the draft's shapes too, which
+        # is where a length the ranks never settled on can arrive.
+        assert self.num_tokens_padded is None or (
+            self.num_reqs_padded * self.query_len <= self.num_tokens_padded
+        ), (
+            f"a batch of {self.num_reqs_padded} x {self.query_len} does not fit "
+            f"the {self.num_tokens_padded} tokens the group settled on"
+        )
 
 
 def determine_batch_execution_and_padding(
@@ -332,16 +343,6 @@ def determine_draft_batch_execution_and_padding(
         num_tokens_padded = cfg.max_num_tokens
     if pinned_num_tokens_padded is not None:
         num_tokens_padded = pinned_num_tokens_padded
-
-    # The fused-MoE dispatch pads what a pass stages up to this dimension and only
-    # up to it: staging past it hands the all-gather a tensor the peers do not
-    # expect. Every caller reaches it through a length the ranks reported or the
-    # one they settled on, so the bound holds -- this states it rather than
-    # leaving a pass that got the length wrong to run truncated.
-    assert num_reqs_padded * query_len <= num_tokens_padded, (
-        f"the draft stages {num_reqs_padded} x {query_len} tokens, more than the "
-        f"{num_tokens_padded} the group settled on"
-    )
 
     return (
         BatchDescriptor(

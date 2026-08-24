@@ -24,6 +24,7 @@ import torch
 
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 from vllm_rbln.v1.worker.dp_utils import (
+    BatchDescriptor,
     BatchRoute,
     DPStatus,
     ShapeConfig,
@@ -549,6 +550,15 @@ INVARIANT_CASES = [
         ),
     ),
     (
+        "pinned",
+        dict(
+            num_reqs=2,
+            num_tokens=2,
+            status=_status(num_tokens=[2, 2], num_reqs=[2, 2]),
+            pinned_num_tokens_padded=MAX_NUM_TOKENS,
+        ),
+    ),
+    (
         "agreed-idle",
         dict(
             num_reqs=1,
@@ -559,6 +569,18 @@ INVARIANT_CASES = [
         ),
     ),
 ]
+
+
+class TestBatchDescriptor:
+    def test_a_batch_that_does_not_fit_its_tokens_is_refused(self):
+        # The dispatch pads the staged rows up to the token dimension and only up
+        # to it, so a descriptor that does not fit would drop rows at run time
+        # rather than fail here. Two requests three tokens deep need six.
+        with pytest.raises(AssertionError, match="does not fit"):
+            BatchDescriptor(num_reqs_padded=2, query_len=3, num_tokens_padded=5)
+        BatchDescriptor(num_reqs_padded=2, query_len=3, num_tokens_padded=6)
+        # Single-DP states no dimension, so there is nothing to fit inside.
+        BatchDescriptor(num_reqs_padded=8, query_len=3, num_tokens_padded=None)
 
 
 class TestInvariants:
@@ -576,11 +598,9 @@ class TestInvariants:
         assert desc.num_reqs_padded >= 1
         # The staged batch fits the compiled batch dimension.
         assert desc.num_reqs_padded >= kwargs["num_reqs"]
-        # What this rank stages fits in the graph's token dimension. Which exact
-        # dimension each route picks is pinned by the golden cases above, so this
-        # stays the one property that has to hold everywhere.
-        if desc.num_tokens_padded is not None:
-            assert desc.num_tokens_padded >= kwargs["num_reqs"] * desc.query_len
+        # The token dimension holding the staged rows is BatchDescriptor's own
+        # contract, checked at construction, so every case here has already passed
+        # it by getting this far.
         # Decode picks a compiled bucket; prefill passes num_reqs through (D1).
         if kwargs.get("is_prefill"):
             assert desc.num_reqs_padded == kwargs["num_reqs"]
@@ -803,7 +823,7 @@ class TestDetermineDraftBatch:
         # that got its length anywhere else stages past the dimension, and the
         # dispatch pad drops rows instead of raising.
         idle = _status(num_tokens=[1, 1], num_reqs=[1, 1], is_idle=[1, 0])
-        with pytest.raises(AssertionError, match="more than the"):
+        with pytest.raises(AssertionError, match="does not fit"):
             self._determine(idle, num_reqs=1, num_tokens=3)
 
     def test_a_pin_replaces_only_the_token_dimension(self):
