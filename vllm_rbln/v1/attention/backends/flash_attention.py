@@ -68,11 +68,11 @@ def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
     """Real element dtype the uint8 fp8 KV-cache container holds, or None on
     the non-fp8 "auto" path (the cache tensor's own dtype is real). Upstream's
     kv_cache_dtype_str_to_dtype gives the uint8 byte-container dtype instead,
-    so it cannot be used here. "fp8" is an alias of e4m3 upstream."""
+    so it cannot be used here. "fp8" is an alias of e4m3 upstream; e5m2 is
+    rejected in RBLNFlashAttentionImpl.__init__."""
     return {
         "fp8": torch.float8_e4m3fn,
         "fp8_e4m3": torch.float8_e4m3fn,
-        "fp8_e5m2": torch.float8_e5m2,
     }.get(kv_cache_dtype)
 
 
@@ -359,12 +359,17 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 f"Head size {head_size} is not supported by RBLNFlashAttention. "
                 f"Supported head sizes are: {supported_head_sizes}."
             )
-        if is_quantized_kv_cache(
+        # supported_kv_cache_dtypes is not enforced upstream for out-of-tree
+        # platforms (validate_configuration is never called), so this is the
+        # gate. fp8_e5m2 in particular has no compiled attention kernel.
+        if is_quantized_kv_cache(self.kv_cache_dtype) and (
             self.kv_cache_dtype
-        ) and not self.kv_cache_dtype.startswith("fp8"):
+            not in RBLNFlashAttentionBackend.supported_kv_cache_dtypes
+        ):
             raise NotImplementedError(
-                "FlashAttention does not support "
-                f"kv_cache_dtype={self.kv_cache_dtype!r}"
+                "RBLNFlashAttention does not support "
+                f"kv_cache_dtype={self.kv_cache_dtype!r}; supported: "
+                f"{RBLNFlashAttentionBackend.supported_kv_cache_dtypes}"
             )
         self.attn_type = attn_type
 
@@ -383,6 +388,29 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
+
+        # forward() dispatches on (sliding_window, is_causal, is_normal), and
+        # only the flash causal target hands the fp8 dequant scales and the
+        # real cache dtype to the compiled op -- and only on the
+        # rbln_custom_ops path (the rbln_triton_ops kernels take neither).
+        # Every other target would read the uint8 byte container as raw bytes
+        # with no scales, so reject those combinations here rather than
+        # producing garbage. All the dispatch inputs are fixed by __init__.
+        if self.kv_cache_dtype.startswith("fp8"):
+            if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+                raise NotImplementedError(
+                    "fp8 KV cache is not supported with "
+                    "VLLM_RBLN_USE_CUSTOM_KERNEL=1: the rbln_triton_ops "
+                    "attention kernels take no dequant scales."
+                )
+            if self.sliding_window is not None or not self.is_causal or self.is_normal:
+                raise NotImplementedError(
+                    "fp8 KV cache is only supported by the flash causal "
+                    "attention path (VLLM_RBLN_FLASH_CAUSAL_ATTN=1, "
+                    "block_size != max_model_len, no sliding window); got "
+                    f"sliding_window={self.sliding_window}, "
+                    f"is_causal={self.is_causal}, is_normal={self.is_normal}."
+                )
 
     def forward(
         self,

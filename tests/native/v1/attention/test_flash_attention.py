@@ -512,7 +512,6 @@ class TestFlashImplInit:
             ("auto", None),
             ("fp8", torch.float8_e4m3fn),  # upstream alias of e4m3
             ("fp8_e4m3", torch.float8_e4m3fn),
-            ("fp8_e5m2", torch.float8_e5m2),
         ],
     )
     def test_fp8_cache_dtype_mapping(self, kv_cache_dtype, expected):
@@ -526,6 +525,35 @@ class TestFlashImplInit:
     def test_fp8_kv_cache_accepted(self, cfg):
         # fp8 KV cache dtypes pass the __init__ quantization guard.
         assert make_impl(cfg, kv_cache_dtype="fp8").kv_cache_dtype == "fp8"
+
+    def test_fp8_e5m2_raises(self, cfg):
+        # e5m2 is outside supported_kv_cache_dtypes: no compiled kernel.
+        with pytest.raises(NotImplementedError, match="does not support"):
+            make_impl(cfg, kv_cache_dtype="fp8_e5m2")
+
+    def test_fp8_with_sliding_window_raises(self, cfg):
+        # forward() would route to the sliding-window ops, which take no
+        # dequant scales and would read the uint8 container as raw bytes.
+        with pytest.raises(NotImplementedError, match="flash causal"):
+            make_impl(cfg, kv_cache_dtype="fp8", sliding_window=16)
+
+    def test_fp8_normal_attention_raises(self, cfg_square):
+        # cfg_square makes is_normal True, routing to the scale-less
+        # causal_attention_naive ops.
+        with pytest.raises(NotImplementedError, match="flash causal"):
+            make_impl(cfg_square, kv_cache_dtype="fp8")
+
+    def test_fp8_non_causal_raises(self, cfg, monkeypatch):
+        # is_causal off routes to the plain attention ops.
+        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
+        with pytest.raises(NotImplementedError, match="flash causal"):
+            make_impl(cfg, kv_cache_dtype="fp8")
+
+    def test_fp8_with_custom_kernel_raises(self, cfg, custom_kernel_on):
+        # The rbln_triton_ops variants drop the scales even on the flash
+        # causal path.
+        with pytest.raises(NotImplementedError, match="CUSTOM_KERNEL"):
+            make_impl(cfg, kv_cache_dtype="fp8")
 
     def test_logits_soft_cap_disabled_with_warning(self, cfg, monkeypatch):
         # RBLN does not support a logits soft cap: it warns and forces it to 0.
