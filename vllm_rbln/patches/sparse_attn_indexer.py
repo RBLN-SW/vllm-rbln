@@ -148,7 +148,7 @@ def rbln_indexer_forward(
         k_cache,
         softmax_scale,
         weights,
-        attn_metadata.seq_lens,
+        attn_metadata.seq_lens.to(torch.int32),
         attn_metadata.block_tables,
         self.topk_tokens,
         scale_cache,

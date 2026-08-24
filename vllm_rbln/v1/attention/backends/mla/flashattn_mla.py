@@ -246,7 +246,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
                 k_pe,
                 kv_cache,
                 self.scale_tensor,
-                attn_metadata.seq_lens,
+                attn_metadata.seq_lens.to(torch.int32),
                 attn_metadata.block_tables,
                 topk_indices,
             )
