@@ -35,7 +35,7 @@ _secrets: &secrets
 _sync: &sync |
   echo '--- :package: uv sync'
   uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
-  bash .buildkite/pipelines/vllm-rbln/scripts/rebel-compiler-override.sh
+  bash .buildkite/scripts/rebel-compiler-override.sh
 
 steps:
   - label: ":pytest: [CA25] pytest"
