@@ -187,3 +187,20 @@ class TestContextWriteContiguity:
         assert blocks == [0, 0, 0, 0, 1, 1]
         offsets = (positions % BLOCK_SIZE).tolist()
         assert offsets == [1020, 1021, 1022, 1023, 0, 1]
+
+
+class TestSingleSequenceGuard:
+    """`--max-num-seqs > 1` costs no errors and no output damage, only
+    acceptance -- 2.96 tokens/step against 1.27 on the same eight ShareGPT
+    prompts, which is below the no-speculation baseline. The cause is not
+    identified; the point here is that it fails loudly rather than quietly."""
+
+    def test_one_sequence_is_allowed(self):
+        RBLNDFlashProposer._require_single_sequence(SimpleNamespace(max_num_seqs=1))
+
+    @pytest.mark.parametrize("max_num_seqs", [2, 4, 16])
+    def test_a_wider_batch_is_refused(self, max_num_seqs):
+        with pytest.raises(NotImplementedError, match="max-num-seqs 1"):
+            RBLNDFlashProposer._require_single_sequence(
+                SimpleNamespace(max_num_seqs=max_num_seqs)
+            )

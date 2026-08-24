@@ -55,7 +55,37 @@ class RBLNDFlashProposer(DFlashProposer):
     prepare_next_token_ids_padded = RBLNEagleProposer.prepare_next_token_ids_padded
     prepare_inputs_padded = RBLNEagleProposer.prepare_inputs_padded
 
+    @staticmethod
+    def _require_single_sequence(scheduler_config) -> None:
+        """DFlash measurably loses acceptance on a wider decode batch."""
+        if scheduler_config.max_num_seqs > 1:
+            # Measured on ShareGPT, eight prompts at concurrency 1, with
+            # `max_num_seqs` the only variable: acceptance falls from 2.96 to
+            # 1.27 tokens per step (28.4% to 3.9% per drafted token), which is
+            # slower than running with no speculation at all. Every request
+            # still returns and the output stays coherent, so it fails quietly
+            # -- hence an error rather than a warning.
+            #
+            # The cause is not identified. What is ruled out: the scheduler's
+            # token-budget restore (it fires at every `max_num_seqs`), a step
+            # mixing prefill with decode (one request in flight reproduces it),
+            # the padded hidden-state layout (padding lands in the tail rows,
+            # which `valid_ctx_lens` never reads), and corrupt target hidden
+            # states (the degenerate rows are the padded slots that low
+            # acceptance leaves behind -- a symptom, not the cause). The drafts
+            # on the prefill step, which is not batch-padded, are bit-identical
+            # between the two configurations, so the divergence begins with the
+            # first padded decode step.
+            raise NotImplementedError(
+                "DFlash speculative decoding requires --max-num-seqs 1; got "
+                f"{scheduler_config.max_num_seqs}. A wider decode batch "
+                "silently collapses acceptance to below the no-speculation "
+                "baseline."
+            )
+
     def __init__(self, vllm_config, device: torch.device, runner=None):
+        # Checked before the base class does any work.
+        self._require_single_sequence(vllm_config.scheduler_config)
         super().__init__(vllm_config=vllm_config, device=device, runner=runner)
         self.runner = runner
         # `self.arange` is on the device. The RBLN metadata builder reads
