@@ -339,6 +339,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         self.runtime_holder: list = []
 
+        # bool(), not the field: vLLM resolves an unset value before this runs,
+        # but a directly-built config (a unit test) can still carry None.
+        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
+
         # Sampler
         if envs.VLLM_RBLN_SAMPLER:
             from vllm_rbln.v1.sample import RBLNSampler
@@ -346,6 +350,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
+                use_async_scheduling=self.use_async_scheduling,
             )
             logger.info("Using RBLN sampler.")
         else:
@@ -420,10 +425,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
-
-        # bool(), not the field: vLLM resolves an unset value before this runs,
-        # but a directly-built config (a unit test) can still carry None.
-        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
