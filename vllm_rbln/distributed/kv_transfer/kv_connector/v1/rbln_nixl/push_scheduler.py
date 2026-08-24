@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import TYPE_CHECKING, Any
+
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPushConnectorScheduler,
 )
@@ -20,6 +23,29 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler 
     RblnNixlSchedulerBase,
 )
 
+if TYPE_CHECKING:
+    from vllm.v1.request import Request
+
 
 class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorScheduler):
     """Scheduler side of the write path."""
+
+    def request_finished(
+        self, request: "Request", block_ids: BlockIds
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Give a request turned away before it was scheduled the field the
+        metadata builder will read from it.
+
+        NOTE(RBLN): a request the serving layer rejects -- a prompt past the
+        context length, a client that left -- reaches the base still flagged for
+        a remote prefill, and the base registers an empty receive for it so the
+        producer stops holding the blocks it pinned. Building that receive reads
+        `remote_block_ids`, which on this direction is filled by
+        `update_state_after_alloc`, the one call a rejected request never makes,
+        and the engine dies on the missing key. The read path is unaffected:
+        there the field arrives with the producer's own reply.
+        """
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_prefill"):
+            params.setdefault("remote_block_ids", ())
+        return super().request_finished(request, block_ids)

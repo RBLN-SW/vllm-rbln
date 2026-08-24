@@ -86,8 +86,8 @@ def _sched_output(req_id, block_ids, num_scheduled_tokens, *, is_new=True):
     )
 
 
-def _scheduler(*, use_host_buffer=False):
-    sched = object.__new__(RblnNixlPullConnectorScheduler)
+def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
+    sched = object.__new__(cls)
     sched.vllm_config = MagicMock()
     sched.vllm_config.parallel_config.tensor_parallel_size = 1
     sched.block_size = 16
@@ -116,6 +116,12 @@ def _scheduler(*, use_host_buffer=False):
     sched.kv_recompute_threshold = 64
     sched._has_mamba = False
     sched.vllm_config.scheduler_config.max_num_batched_tokens = 512
+    if cls is RblnNixlPushConnectorScheduler:
+        sched._push_pending_registrations = {}
+        sched._push_registration_deadlines = {}
+        sched._push_registration_timeout = 480
+        sched._finished_request_blocks = {}
+        sched._newly_finished_push_blocks = {}
     return sched
 
 
@@ -396,7 +402,61 @@ class TestSchedulerCleanupReachesBothDirections:
         scheduler = object.__new__(scheduler_cls)
         scheduler._block_ids_need_save = {"r0": ([1, 2],)}
 
-        scheduler.request_finished(SimpleNamespace(request_id="r0"), ([1, 2],))
+        # A real Request always carries the field, even when it is None.
+        scheduler.request_finished(
+            SimpleNamespace(request_id="r0", kv_transfer_params=None), ([1, 2],)
+        )
 
         assert scheduler._block_ids_need_save == {}
         assert seen == ["r0"]
+
+
+class TestRejectedBeforeScheduling:
+    """The serving layer can turn a request away before it is ever scheduled --
+    a prompt past the context length, a client that left. The base registers an
+    empty receive for it so the producer stops holding the blocks it pinned,
+    and building that receive reads a field only `update_state_after_alloc`
+    fills, which such a request never reaches."""
+
+    @staticmethod
+    def _rejected():
+        return _Request(
+            "rejected",
+            num_prompt_tokens=1,
+            status=RequestStatus.FINISHED_ABORTED,
+            # What the serving layer hands back: still flagged for a remote
+            # prefill, and without the field D fills for itself.
+            kv_transfer_params={
+                "do_remote_decode": False,
+                "do_remote_prefill": True,
+                "remote_engine_id": "prefill0",
+                "remote_request_id": "abc",
+                "remote_host": "localhost",
+                "remote_port": 5559,
+                "tp_size": 1,
+            },
+        )
+
+    def test_the_metadata_for_a_rejected_request_can_be_built(self):
+        # Calls the base's own builder rather than checking the key by hand:
+        # what has to hold is that upstream's read of it succeeds.
+        sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
+        req = self._rejected()
+
+        sched.request_finished(req, ([],))
+        meta = sched.build_connector_meta(_sched_output("other", ([9],), 16))
+
+        assert "rejected" in meta.reqs_to_recv
+        assert meta.reqs_to_recv["rejected"].remote.block_ids == ()
+
+    def test_the_producers_own_block_ids_are_not_clobbered(self):
+        # The producer's reply carries both the remote-prefill flag and its
+        # block ids, so a proxy that forwards it leaves the field already
+        # filled; only one dispatching to both sides at once leaves it absent.
+        sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
+        req = self._rejected()
+        req.kv_transfer_params["remote_block_ids"] = ([4, 5],)
+
+        sched.request_finished(req, ([],))
+
+        assert req.kv_transfer_params["remote_block_ids"] == ([4, 5],)
