@@ -277,24 +277,6 @@ class TestAnyPrefillRoute:
         assert route is BatchRoute.ANY_PREFILL
         assert desc.num_reqs_padded == 8  # buckets[-1], not find_bucket(1) == 1
 
-    def test_idle_rank_joins_on_the_same_shape(self):
-        desc, route = _determine(
-            _cfg(),
-            num_reqs=1,
-            num_tokens=1,
-            status=_status(
-                num_tokens=[1, 512, 1, 1],
-                num_reqs=[1, 1, 1, 1],
-                is_prefill=[0, 1, 0, 0],
-                is_idle=[1, 0, 0, 0],
-            ),
-        )
-        assert (desc.num_reqs_padded, desc.query_len, desc.num_tokens_padded) == (
-            8,
-            1,
-            512,
-        )
-
     def test_spec_decode_rank_keeps_its_own_query_len(self):
         # 2 reqs x 4 tokens: the draft length stays visible in query_len even though
         # the token dimension is the padding target.
@@ -492,17 +474,19 @@ class TestPrefillIsNormalized:
     @pytest.mark.parametrize("specialized", [True, False])
     @pytest.mark.parametrize("buckets", [SINGLE, LADDER])
     def test_prefill_reports_num_reqs(self, specialized, buckets):
+        # Three requests: on a ladder the bucket rule would round up to 4, so a
+        # prefill that came back padded is visible here as well as on SINGLE.
         desc, route = _determine(
             _cfg(buckets, specialized=specialized),
-            num_reqs=1,
+            num_reqs=3,
             num_tokens=69,
             is_prefill=True,
             status=_status(
-                num_tokens=[69, 1, 1, 1], num_reqs=[1, 1, 1, 1], is_prefill=[1, 0, 0, 0]
+                num_tokens=[69, 1, 1, 1], num_reqs=[3, 1, 1, 1], is_prefill=[1, 0, 0, 0]
             ),
         )
-        assert desc.num_reqs_padded == 1
-        assert desc.query_len == 69
+        assert desc.num_reqs_padded == 3
+        assert desc.query_len == 23
 
     def test_single_dp_prefill_reports_num_reqs(self):
         desc, route = _determine(_cfg(), num_reqs=1, num_tokens=69, is_prefill=True)
@@ -882,6 +866,36 @@ class TestDPStatus:
         assert status.is_prefill == (True, False, False, False)
         assert status.num_tokens == (512, 8, 8, 8)
 
+    def test_the_idle_flag_round_trips(self, fake_dp_collective):
+        # An idle rank reports the minimum, so the flag is what tells it apart from
+        # a rank genuinely running one request one token deep.
+        fake_dp_collective({1: _encode(8, 2, is_prefill=False)})
+        status = dp_utils._synchronize_dp_ranks(
+            num_tokens=1,
+            num_reqs=1,
+            dp_size=2,
+            dp_rank=0,
+            is_prefill=False,
+            is_idle=True,
+        )
+        assert status.is_idle == (True, False)
+        assert status.num_tokens == (1, 8)
+        assert status.num_reqs == (1, 2)
+        assert status.num_tokens_across_dp.cpu().tolist() == [1, 8]
+
+    def test_the_phase_and_idle_flags_do_not_bleed(self, fake_dp_collective):
+        # Adjacent bits: a prefilling rank must not come back idle, and the peer's
+        # flags must not land on this rank.
+        fake_dp_collective({1: _encode(8, 2, is_prefill=False, is_idle=True)})
+        status = dp_utils._synchronize_dp_ranks(
+            num_tokens=5,
+            num_reqs=1,
+            dp_size=2,
+            dp_rank=0,
+            is_prefill=True,
+        )
+        assert (status.is_prefill, status.is_idle) == ((True, False), (False, True))
+
     def test_boundary_max_values_round_trip(self, fake_dp_collective):
         # The largest values each field can hold must survive pack/unpack.
         fake_dp_collective({r: _encode(0xFFFF, 0x1FFF, False) for r in (1, 2, 3)})
@@ -912,13 +926,7 @@ class TestCoordinateBatchAcrossDp:
 
     @staticmethod
     def _peer(num_tokens, num_reqs, *, prefill=False, idle=False):
-        token_bits, req_bits = 16, 13
-        value = num_tokens | (num_reqs << token_bits)
-        if prefill:
-            value |= 1 << (token_bits + req_bits)
-        if idle:
-            value |= 1 << (token_bits + req_bits + 1)
-        return value
+        return _encode(num_tokens, num_reqs, prefill, idle)
 
     def _coordinate(self, monkeypatch, *, peer, **kwargs):
         def fake_run_ar(encoded, dp_size, dp_rank):
@@ -998,55 +1006,3 @@ class TestRunAr:
         fake_dp_collective({0: 11, 1: 22, 3: 33})
         out = dp_utils._run_ar(7, dp_size=4, dp_rank=2)
         assert out.cpu().tolist() == [11, 22, 7, 33]
-
-
-def test_synchronize_dp_ranks_bit_pack(monkeypatch):
-    # Round-trip the bit-packed (num_tokens, num_reqs, is_prefill, is_idle)
-    # all-reduce. Intercepts the inner all-gather so no real DP group is needed,
-    # and checks every field unpacks per rank -- the transport reports what each
-    # rank said and decides nothing.
-    token_bits = 16
-
-    def peer_encoded(num_tokens, num_reqs):
-        return num_tokens | (num_reqs << token_bits)
-
-    def make_fake_inner(peer_value):
-        def fake_inner(encoded, dp_size, dp_rank):
-            arr = [0, 0]
-            arr[dp_rank] = encoded
-            arr[1 - dp_rank] = peer_value
-            return torch.tensor(arr, dtype=torch.int32)
-
-        return fake_inner
-
-    # Decode: this rank (rank0) = idle (num_tokens=1, num_reqs=1, is_idle);
-    # peer (rank1) = busy (num_tokens=8, num_reqs=2).
-    monkeypatch.setattr(dp_utils, "_run_ar", make_fake_inner(peer_encoded(8, 2)))
-    status = dp_utils._synchronize_dp_ranks(
-        num_tokens=1,
-        num_reqs=1,
-        dp_size=2,
-        dp_rank=0,
-        is_prefill=False,
-        is_idle=True,
-    )
-    assert status.num_tokens == (1, 8)
-    assert status.num_reqs == (1, 2)
-    assert status.is_idle == (True, False)
-    assert status.is_prefill == (False, False)
-    assert status.num_tokens_across_dp.tolist() == [1, 8]
-
-    # Prefill on this rank: reported as a flag, and the reqs stay available.
-    monkeypatch.setattr(dp_utils, "_run_ar", make_fake_inner(peer_encoded(8, 2)))
-    status = dp_utils._synchronize_dp_ranks(
-        num_tokens=5,
-        num_reqs=1,
-        dp_size=2,
-        dp_rank=0,
-        is_prefill=True,
-        is_idle=False,
-    )
-    assert status.num_tokens == (5, 8)
-    assert status.num_reqs == (1, 2)
-    assert status.is_prefill == (True, False)
-    assert status.is_idle == (False, False)
