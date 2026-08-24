@@ -46,15 +46,15 @@ def _ring_copy(owner: nn.Module, out: torch.Tensor) -> torch.Tensor:
     Two slots, because the output thread reads one while the next step writes
     the other.
     """
-    ring = owner._tok_stage
+    ring = owner._sampled_token_ring
     if not ring or ring[0].shape != out.shape or ring[0].device != out.device:
         ring = [
             torch.empty(out.shape, dtype=out.dtype, device=out.device) for _ in range(2)
         ]
-        owner._tok_stage = ring
-        owner._tok_slot = 0
-    buf = ring[owner._tok_slot]
-    owner._tok_slot ^= 1
+        owner._sampled_token_ring = ring
+        owner._ring_slot = 0
+    buf = ring[owner._ring_slot]
+    owner._ring_slot ^= 1
     # non_blocking, or the copy waits on the sampling graph.
     buf.copy_(out, non_blocking=True)
     return buf
@@ -139,9 +139,9 @@ class RBLNTopKTopPSampler(nn.Module):
         self._compiled_rbln_topk_topp_sampler = compile_sampler(
             rbln_top_k_top_p_sample, compile_context
         )
-        # Staging buffers for the sampled tokens; see _ring_copy.
-        self._tok_stage: list[torch.Tensor] = []
-        self._tok_slot = 0
+        # Sampled-token buffers handed to async scheduling; see _ring_copy.
+        self._sampled_token_ring: list[torch.Tensor] = []
+        self._ring_slot = 0
 
     def forward(
         self,
@@ -201,9 +201,9 @@ class RBLNSampler(VLLMSampler):
         self._compiled_greedy_sample = compile_sampler(
             rbln_greedy_sample, compile_context
         )
-        # Staging buffers for the sampled tokens; see _ring_copy.
-        self._tok_stage: list[torch.Tensor] = []
-        self._tok_slot = 0
+        # Sampled-token buffers handed to async scheduling; see _ring_copy.
+        self._sampled_token_ring: list[torch.Tensor] = []
+        self._ring_slot = 0
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         out = self._compiled_greedy_sample(logits)

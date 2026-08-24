@@ -210,7 +210,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         self._invalid_req_indices = invalid_req_indices
         self._device_index = device_index
         # For the token_ids_cpu write-back, applied by the main thread.
-        self._pending = pending_token_writeback
+        self._pending_token_writeback = pending_token_writeback
         self._req_ids = req_ids
         self._placeholder_pos = placeholder_pos
 
@@ -256,8 +256,8 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # replaced by the real tokens, but not from this thread: the main thread
         # reads token_ids_cpu in _preprocess. Queue the tokens instead and let the
         # main thread apply them at the top of its next step.
-        if self._pending is not None and self._req_ids is not None:
-            self._pending.append(
+        if self._pending_token_writeback is not None and self._req_ids is not None:
+            self._pending_token_writeback.append(
                 (self._req_ids, valid_sampled_token_ids, self._placeholder_pos)
             )
 
@@ -1372,30 +1372,40 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         Repairing the request state is enough for a request that is currently
         out of the batch: self.requests outlives eviction.
         """
-        ib = self.input_batch
+        input_batch = self.input_batch
         while True:
             try:
                 # Atomic against the output thread's append, so no lock.
-                req_ids, tokens, pos = self._pending_token_writeback.popleft()
+                req_ids, tokens, placeholder_pos = (
+                    self._pending_token_writeback.popleft()
+                )
             except IndexError:
                 return
-            if not pos:
+            if not placeholder_pos:
                 continue
             for i, req_id in enumerate(req_ids):
                 if i >= len(tokens) or not tokens[i]:
                     continue
-                start = pos.get(req_id)
+                start = placeholder_pos.get(req_id)
                 if start is None:
                     continue
-                toks = tokens[i]
+                sampled_ids = tokens[i]
                 req_state = self.requests.get(req_id)
                 if req_state is not None:
-                    off = start - req_state.num_prompt_tokens
-                    if 0 <= off <= len(req_state.output_token_ids) - len(toks):
-                        req_state.output_token_ids[off : off + len(toks)] = toks
-                idx = ib.req_id_to_index.get(req_id)
-                if idx is not None:
-                    ib.token_ids_cpu[idx, start : start + len(toks)] = toks
+                    output_offset = start - req_state.num_prompt_tokens
+                    if (
+                        0
+                        <= output_offset
+                        <= len(req_state.output_token_ids) - len(sampled_ids)
+                    ):
+                        req_state.output_token_ids[
+                            output_offset : output_offset + len(sampled_ids)
+                        ] = sampled_ids
+                req_index = input_batch.req_id_to_index.get(req_id)
+                if req_index is not None:
+                    input_batch.token_ids_cpu[
+                        req_index, start : start + len(sampled_ids)
+                    ] = sampled_ids
 
     def _apply_async_token_feedback(
         self, staged_model_inputs: StagedModelInputs, req_ids: list[str]
