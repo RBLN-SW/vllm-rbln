@@ -200,7 +200,6 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         sampled_token_ids: torch.Tensor,
         invalid_req_indices: list[int],
-        device_index: int,
         pending_token_writeback: Any = None,
         req_ids: list[str] | None = None,
         placeholder_pos: dict[str, int] | None = None,
@@ -208,7 +207,6 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
-        self._device_index = device_index
         # For the token_ids_cpu write-back, applied by the main thread.
         self._pending_token_writeback = pending_token_writeback
         self._req_ids = req_ids
@@ -329,7 +327,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
 
         # TODO(RBLN): Multi-modal data support
-        # TODO(RBLN): Async scheduling
 
         # NOTE(RBLN): Compilation context for marking the KV cache address as static.
         self.compile_context = (
@@ -1951,12 +1948,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if not self.use_async_scheduling:
             return output
 
-        device_index = self.device.index if self.device.index is not None else 0
         async_output = AsyncRBLNModelRunnerOutput(
             model_runner_output=output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             invalid_req_indices=invalid_req_indices,
-            device_index=device_index,
             pending_token_writeback=self._pending_token_writeback,
             req_ids=list(self.input_batch.req_ids),
             placeholder_pos=dict(self._placeholder_pos),
