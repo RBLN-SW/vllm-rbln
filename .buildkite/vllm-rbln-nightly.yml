@@ -133,7 +133,7 @@ steps:
         product: "RBLN-CR03"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
-    timeout_in_minutes: 120
+    timeout_in_minutes: 180
     artifact_paths:
       - "perf-results/**/*"
     command: *perf
@@ -149,7 +149,7 @@ steps:
         product: "RBLN-CR13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
-    timeout_in_minutes: 120
+    timeout_in_minutes: 180
     artifact_paths:
       - "perf-results/**/*"
     command: *perf
