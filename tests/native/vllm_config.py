@@ -19,6 +19,7 @@ platform's check_and_update_config). Import lazily from a fixture."""
 from __future__ import annotations
 
 import functools
+import glob
 import os
 
 from huggingface_hub import hf_hub_download, try_to_load_from_cache
@@ -53,6 +54,35 @@ def local_model_path(model: str) -> str:
     if isinstance(cached, str):
         return os.path.dirname(cached)
     return os.path.dirname(hf_hub_download(model, "config.json"))
+
+
+# What a loader reads. Not a bare *.bin: an old repo ships training_args.bin
+# beside its weights, so that pattern would accept a snapshot holding the one
+# without the other.
+_WEIGHT_PATTERNS = ("*.safetensors", "pytorch_model*.bin")
+
+
+@functools.cache
+def local_weights_path(model: str) -> str:
+    """``model``'s snapshot directory when the cache holds its weights too,
+    otherwise ``model`` unchanged.
+
+    A lane that loads the model cannot take local_model_path's answer: that one
+    proves only that config.json is cached, and it creates config-only snapshots
+    itself for the models the unit lane shares with the compile lane. The repo id
+    goes back unchanged on a miss, leaving the loaders to fetch what they need.
+    """
+    # A caller may already hold a resolved directory (test_runners pins one), and
+    # the cache lookup below takes a repo id, which a path is not.
+    if os.path.isdir(model):
+        return model
+    cached = try_to_load_from_cache(model, "config.json")
+    if not isinstance(cached, str):
+        return model
+    path = os.path.dirname(cached)
+    if not any(glob.glob(os.path.join(path, p)) for p in _WEIGHT_PATTERNS):
+        return model
+    return path
 
 
 def make_vllm_config(
