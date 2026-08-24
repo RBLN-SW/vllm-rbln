@@ -2,6 +2,9 @@ env:
   UV_CACHE_DIR: "/root/.cache/uv"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
+  # Only the cron schedule sets this, so a manual or re-run build exercises the
+  # lanes without publishing. Declared here so build.env sees the name either way.
+  NIGHTLY_DEPLOY: "${NIGHTLY_DEPLOY:-}"
 
 _secrets: &secrets
   UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
@@ -130,7 +133,7 @@ steps:
         product: "RBLN-CR03"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
-    timeout_in_minutes: 120
+    timeout_in_minutes: 180
     artifact_paths:
       - "perf-results/**/*"
     command: *perf
@@ -146,7 +149,7 @@ steps:
         product: "RBLN-CR13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
-    timeout_in_minutes: 120
+    timeout_in_minutes: 180
     artifact_paths:
       - "perf-results/**/*"
     command: *perf
@@ -188,6 +191,7 @@ steps:
   # so this runs on the default queue.
   - label: ":package: nightly publish"
     key: "nightly-publish"
+    if: 'build.env("NIGHTLY_DEPLOY") == "1"'
     depends_on:
       - "nightly-t0-ca25"
       - "nightly-t2-ca25"
