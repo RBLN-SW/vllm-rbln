@@ -1333,6 +1333,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logprobs_tensors=None,
             )
 
+        if self.use_async_scheduling:
+            self._repair_async_output_token_ids()
+
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
@@ -1392,6 +1395,42 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 idx = ib.req_id_to_index.get(req_id)
                 if idx is not None:
                     ib.token_ids_cpu[idx, start : start + len(toks)] = toks
+
+    def _repair_async_output_token_ids(self) -> None:
+        """Replace the placeholder the async path left at the tail of
+        output_token_ids, before the logits processors read it.
+
+        Penalties, bad words and custom logits processors get
+        CachedRequestState.output_token_ids through sampling_metadata, and under
+        async scheduling its last entry is still the -1 written in
+        _bookkeeping_sync: the real token only lands there when the output thread
+        has run and the main thread has drained the write-back queue, which is a
+        step too late. Left alone, apply_all_penalties folds the -1 onto its pad
+        slot -- so the newest token silently stops counting -- and bad words
+        matches against a suffix that never occurred.
+
+        prev_sampled_token_ids carries exactly that token and needs no thread
+        hand-off, so pull it here. The D2H is paid only by requests that asked
+        for one of these features; a batch without them has an empty
+        output_token_ids and returns above.
+        """
+        output_token_ids = self.input_batch.sampling_metadata.output_token_ids
+        prev_sampled = self.input_batch.prev_sampled_token_ids
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        if not output_token_ids or prev_sampled is None or prev_req_id_to_index is None:
+            return
+
+        sampled: list[int] | None = None
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            prev_row = prev_req_id_to_index.get(req_id)
+            if prev_row is None:
+                continue
+            req_output_token_ids = output_token_ids[req_index]
+            if not req_output_token_ids or req_output_token_ids[-1] != -1:
+                continue
+            if sampled is None:
+                sampled = prev_sampled[:, 0].tolist()
+            req_output_token_ids[-1] = sampled[prev_row]
 
     def _bookkeeping_sync(
         self,
