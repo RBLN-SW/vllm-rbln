@@ -35,11 +35,7 @@ _secrets: &secrets
 _sync: &sync |
   echo '--- :package: uv sync'
   uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
-  if [ -n "${REBEL_COMPILER_VERSION:-}" ]; then
-    creds="${UV_INDEX_REBELLIONS_USERNAME}:${UV_INDEX_REBELLIONS_PASSWORD}"
-    index=$(printf '%s' "$REBEL_PYPI_ENDPOINT" | sed "s#://#://${creds}@#")
-    uv pip install --extra-index-url "$index" "rebel-compiler==${REBEL_COMPILER_VERSION}"
-  fi
+  bash .buildkite/pipelines/vllm-rbln/scripts/rebel-compiler-override.sh
 
 steps:
   - label: ":pytest: [CA25] pytest"
