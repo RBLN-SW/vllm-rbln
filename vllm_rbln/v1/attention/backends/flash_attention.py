@@ -68,17 +68,22 @@ def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
     """Real element dtype the uint8 fp8 KV-cache container holds, or None on
     the non-fp8 "auto" path (the cache tensor's own dtype is real). Upstream's
     kv_cache_dtype_str_to_dtype gives the uint8 byte-container dtype instead,
-    so it cannot be used here. "fp8" is an alias of e4m3 upstream; e5m2 is
-    rejected in RBLNFlashAttentionImpl.__init__."""
+    so it cannot be used here. "fp8" is an alias of e4m3 upstream."""
     return {
         "fp8": torch.float8_e4m3fn,
         "fp8_e4m3": torch.float8_e4m3fn,
+        "fp8_e5m2": torch.float8_e5m2,
     }.get(kv_cache_dtype)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
 class RBLNFlashAttentionBackend(AttentionBackend):
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "fp8", "fp8_e4m3"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ]
 
     @staticmethod
     def get_name() -> str:
@@ -361,7 +366,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             )
         # supported_kv_cache_dtypes is not enforced upstream for out-of-tree
         # platforms (validate_configuration is never called), so this is the
-        # gate. fp8_e5m2 in particular has no compiled attention kernel.
+        # gate.
         if is_quantized_kv_cache(self.kv_cache_dtype) and (
             self.kv_cache_dtype
             not in RBLNFlashAttentionBackend.supported_kv_cache_dtypes

@@ -512,6 +512,7 @@ class TestFlashImplInit:
             ("auto", None),
             ("fp8", torch.float8_e4m3fn),  # upstream alias of e4m3
             ("fp8_e4m3", torch.float8_e4m3fn),
+            ("fp8_e5m2", torch.float8_e5m2),
         ],
     )
     def test_fp8_cache_dtype_mapping(self, kv_cache_dtype, expected):
@@ -522,14 +523,12 @@ class TestFlashImplInit:
 
         assert _fp8_cache_dtype(kv_cache_dtype) == expected
 
-    def test_fp8_kv_cache_accepted(self, cfg):
-        # fp8 KV cache dtypes pass the __init__ quantization guard.
-        assert make_impl(cfg, kv_cache_dtype="fp8").kv_cache_dtype == "fp8"
-
-    def test_fp8_e5m2_raises(self, cfg):
-        # e5m2 is outside supported_kv_cache_dtypes: no compiled kernel.
-        with pytest.raises(NotImplementedError, match="does not support"):
-            make_impl(cfg, kv_cache_dtype="fp8_e5m2")
+    @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3", "fp8_e5m2"])
+    def test_fp8_kv_cache_accepted(self, cfg, kv_cache_dtype):
+        # every fp8 dtype in supported_kv_cache_dtypes passes the __init__
+        # quantization guard.
+        impl = make_impl(cfg, kv_cache_dtype=kv_cache_dtype)
+        assert impl.kv_cache_dtype == kv_cache_dtype
 
     def test_fp8_with_sliding_window_raises(self, cfg):
         # forward() would route to the sliding-window ops, which take no
