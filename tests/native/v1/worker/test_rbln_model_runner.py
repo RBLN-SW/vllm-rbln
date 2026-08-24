@@ -953,6 +953,7 @@ class TestDummyRunDraftParticipation:
             input_ids=torch.zeros(64, dtype=torch.int32),
             positions=torch.zeros(64, dtype=torch.int64),
             input_batch=SimpleNamespace(num_tokens_no_spec=np.zeros(8, dtype=np.int32)),
+            seq_lens_np=np.zeros(8, dtype=np.int32),
             model_config=SimpleNamespace(dtype=torch.float16),
             device=torch.device("cpu"),
             vllm_config=SimpleNamespace(),
@@ -971,11 +972,6 @@ class TestDummyRunDraftParticipation:
         # Stub the model body so _dummy_run reaches the drafter leg with no NPU.
         # The decided shape: bucket 2 at this step's own query length (nothing here
         # is idle-adopted), so 8 padded tokens.
-        monkeypatch.setattr(
-            runner,
-            "_stage_dummy_seq_lens",
-            lambda nr, ql, ip: (np.full(nr, ql, dtype=np.int32), ql * nr),
-        )
         # The idle case decides query length 1 -- what a rank beside a prefilling
         # peer gets, its own -- which is not the speculative length, so a draft run
         # on anything but the decision is visible here.
@@ -1062,17 +1058,13 @@ class TestDummyRunPPIntermediateTensors:
             input_ids=torch.zeros(64, dtype=torch.int32),
             positions=torch.zeros(64, dtype=torch.int64),
             input_batch=SimpleNamespace(num_tokens_no_spec=np.zeros(8, dtype=np.int32)),
+            seq_lens_np=np.zeros(8, dtype=np.int32),
             kv_cache_bases=None,
             vllm_config=SimpleNamespace(),
             input_stager=SimpleNamespace(stage=stage),
             model_executable=lambda **k: None,
         )
         monkeypatch.setattr(RBLNModelRunner, "use_wrapped_compute_logits", False)
-        monkeypatch.setattr(
-            runner,
-            "_stage_dummy_seq_lens",
-            lambda nr, ql, ip: (np.full(nr, ql, dtype=np.int32), ql * nr),
-        )
         monkeypatch.setattr(
             runner,
             "_determine_batch_execution_and_padding",

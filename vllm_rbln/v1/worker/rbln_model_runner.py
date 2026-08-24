@@ -2074,26 +2074,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         except IndexError:
             return {}
 
-    def _stage_dummy_seq_lens(
-        self, num_reqs: int, num_tokens_per_req: int, is_prefill: bool
-    ) -> tuple[np.ndarray, int]:
-        """Set seq_lens / num_tokens_no_spec for a dummy batch of this shape and
-        return (num_scheduled_tokens, num_tokens_unpadded). Shared by the initial
-        prep and the DP-idle adopt path so both size the dummy identically.
-
-        num_tokens_no_spec is the per-request no-spec logical length consumed
-        downstream (query backfill, spec metadata); for decode it stays 1 so a
-        multi-token speculative-decode query is still sized as decode.
-        """
-        num_scheduled_tokens = np.array([num_tokens_per_req] * num_reqs, dtype=np.int32)
-        self.seq_lens_np[:num_reqs] = num_scheduled_tokens
-        self.seq_lens_np[num_reqs:] = 0
-        if is_prefill:
-            self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
-        else:
-            self.input_batch.num_tokens_no_spec[:num_reqs] = 1
-        return num_scheduled_tokens, int(num_scheduled_tokens.sum())
-
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -2143,9 +2123,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return
         query_len = batch_desc.query_len
 
-        num_scheduled_tokens, num_tokens = self._stage_dummy_seq_lens(
-            num_reqs, query_len, is_prefill
-        )
+        num_scheduled_tokens = np.array([query_len] * num_reqs, dtype=np.int32)
+        num_tokens = int(num_scheduled_tokens.sum())
+        self.seq_lens_np[:num_reqs] = num_scheduled_tokens
+        self.seq_lens_np[num_reqs:] = 0
+        # num_tokens_no_spec is the per-request no-spec logical length read
+        # downstream (query backfill, spec metadata); on decode it stays 1 so a
+        # multi-token speculative query is still sized as a decode.
+        if is_prefill:
+            self.input_batch.num_tokens_no_spec[:num_reqs] = num_scheduled_tokens
+        else:
+            self.input_batch.num_tokens_no_spec[:num_reqs] = 1
 
         cu_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
         self.query_start_loc_np[0] = 0
