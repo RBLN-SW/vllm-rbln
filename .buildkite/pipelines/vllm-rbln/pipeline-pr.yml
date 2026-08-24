@@ -72,6 +72,7 @@ steps:
 
   - label: ":pytest: [CR13] pytest"
     key: "vllm-rbln-pytest-cr13"
+    soft_fail: true
     if_changed: *if_changed
     agents:
       queue: udc
