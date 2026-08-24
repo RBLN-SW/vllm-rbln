@@ -32,6 +32,8 @@ from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
+from tests.native.vllm_config import local_weights_path
+
 # RBLN requires an explicit block_size; the rest are the known-good native config
 # for these small models (chunked prefill, small batch/token budget).
 _RBLN_RUNNER_DEFAULTS = dict(
@@ -101,6 +103,7 @@ class VllmRunner:
     """System under test: ``vllm.LLM`` with the native RBLN config; kwargs override."""
 
     def __init__(self, model: str, **kwargs) -> None:
+        model = local_weights_path(model)
         self.llm = LLM(model=model, **rbln_engine_args(model, **kwargs))
 
     def generate_greedy(
@@ -183,6 +186,7 @@ class AsyncVllmRunner:
         self, model: str, *, request_timeout_s: float = 600.0, **kwargs
     ) -> None:
         self.request_timeout_s = request_timeout_s
+        model = local_weights_path(model)
         args = AsyncEngineArgs(model=model, **rbln_engine_args(model, **kwargs))
         # One loop for the runner's lifetime; a fresh asyncio.run() per call would
         # orphan the engine's output handler on a closed loop.
@@ -290,6 +294,7 @@ class HfRunner:
     def __init__(self, model: str, dtype: str = "auto") -> None:
         from vllm_rbln import envs
 
+        model = local_weights_path(model)
         config = AutoConfig.from_pretrained(model, trust_remote_code=True)
         # Mirror the engine's truncation, or the oracle is a different model.
         if envs.VLLM_RBLN_NUM_HIDDEN_LAYERS > 0:
