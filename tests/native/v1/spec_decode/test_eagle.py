@@ -539,6 +539,20 @@ class TestLoadModel:
             lambda self, target_model: setattr(self, "model", model),
         )
 
+    def test_the_detection_rests_on_the_runner_being_a_submodule(self):
+        # The two cases below stub modules() and mock the runner, so neither walks a
+        # real module tree. What they cannot see is the structure the detection needs:
+        # the runner has to be a module for modules() to reach it, and RBLN's has to
+        # be the class the check names. If upstream ever breaks either, a fused-MoE
+        # draft reads as dense, an idle rank skips it, and the busy ranks wait on a
+        # collective it never joins.
+        from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
+            RBLNMoERunner,
+        )
+
+        assert issubclass(eagle_module.MoERunner, torch.nn.Module)
+        assert issubclass(RBLNMoERunner, eagle_module.MoERunner)
+
     def test_a_dense_draft_reports_no_moe(self, monkeypatch):
         # Nothing in a dense draft reads the step's padded token dimension, which
         # is what lets an idle rank skip drafting altogether.
