@@ -437,8 +437,8 @@ class RblnPlatform(Platform):
             if scheduler_config.async_scheduling:
                 logger.warning(
                     "Ignoring --async-scheduling: the optimum model runner does "
-                    "not support it. Running synchronously. Unset "
-                    "VLLM_RBLN_USE_VLLM_MODEL=0 to use the runner that does."
+                    "not support it. Running synchronously. Set "
+                    "VLLM_RBLN_USE_VLLM_MODEL=1 to use the runner that does."
                 )
             scheduler_config.async_scheduling = False
 
