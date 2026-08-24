@@ -19,7 +19,7 @@ _secrets: &secrets
   HF_TOKEN: HF_TOKEN
   HF_HOME: HF_HOME
 
-_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime && echo '+++ :pytest: pytest'"
+_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime && bash .buildkite/scripts/rebel-compiler-override.sh && echo '+++ :pytest: pytest'"
 
 steps:
   # ===========================================================================
