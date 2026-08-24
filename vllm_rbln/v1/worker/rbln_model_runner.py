@@ -357,8 +357,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.sampler = Sampler(self.model_config.logprobs_mode)
 
         # Host hop for the token feedback; see the identity branch in
-        # execute_model.
-        self._tokfb_host = None
+        # _apply_async_token_feedback.
+        self._token_feedback_host = None
         # Logprobs handed to the deferred output; see the async branch of
         # _bookkeeping_sync.
         self._async_logprobs_tensors = None
@@ -1397,6 +1397,69 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if idx is not None:
                     ib.token_ids_cpu[idx, start : start + len(toks)] = toks
 
+    def _apply_async_token_feedback(
+        self, staged_model_inputs: StagedModelInputs, req_ids: list[str]
+    ) -> None:
+        """Scatter the previous step's real tokens over the staged placeholders.
+
+        The staged input_ids hold what the scheduler sent, which under async
+        scheduling is a -1 for every request whose token this step is supposed to
+        consume. prev_sampled_token_ids has the real ones, still on device, in
+        the previous step's batch order -- prev_req_id_to_index remaps them.
+
+        A request missing from prev_req_id_to_index (it was not in last step's
+        batch) keeps the placeholder here and gets its token from token_ids_cpu
+        instead, which _apply_pending_token_writeback fills in. Only the rows
+        found here are overwritten.
+
+        prev_sampled_token_ids aliases the sampler's ring, which has two slots:
+        this read must happen before this step's sample() comes back around to
+        the slot it points at.
+        """
+        prev_sampled = self.input_batch.prev_sampled_token_ids
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        if (
+            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
+            or self.is_prefill
+            or prev_sampled is None
+            or prev_req_id_to_index is None
+        ):
+            return
+
+        # The batch order usually does not change, and the identity branch
+        # exploits that: one contiguous slice copy, instead of building index
+        # tensors from Python lists every step.
+        prev_rows, cur_rows, identity = [], [], True
+        for cur_row, req_id in enumerate(req_ids):
+            prev_row = prev_req_id_to_index.get(req_id)
+            if prev_row is None:
+                identity = False
+                continue
+            if prev_row != cur_row:
+                identity = False
+            prev_rows.append(prev_row)
+            cur_rows.append(cur_row)
+        if identity:
+            num_feedback = len(prev_rows)
+            # staged input_ids is a host tensor, so this is a D2H either way;
+            # the intermediate buffer keeps it contiguous.
+            host_buffer = self._token_feedback_host
+            if host_buffer is None or host_buffer.shape[0] < num_feedback:
+                host_buffer = torch.empty(
+                    prev_sampled.shape[0], dtype=prev_sampled.dtype
+                )
+                self._token_feedback_host = host_buffer
+            host = host_buffer[:num_feedback]
+            host.copy_(prev_sampled[:num_feedback, 0])
+            staged_model_inputs.input_ids[:num_feedback, 0].copy_(host)
+        elif prev_rows:
+            # index_put_ demands equal dtypes, unlike the copy_ above. The
+            # sampling op's width is not fixed -- `rbln::argmax` still returns
+            # int64 -- so cast to the staged buffer's.
+            staged_model_inputs.input_ids[cur_rows, 0] = prev_sampled[prev_rows, 0].to(
+                staged_model_inputs.input_ids.dtype
+            )
+
     def _repair_async_output_token_ids(self) -> None:
         """Replace the placeholder the async path left at the tail of
         output_token_ids, before the logits processors read it.
@@ -1671,60 +1734,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 intermediate_tensors,
             )
 
-            # Device-tensor async token feedback (decode fast path). staged input_ids
-            # holds the scheduler's placeholders; scatter the real previous token from
-            # prev_sampled_token_ids, remapped via prev_req_id_to_index.
-            prev_sampled = self.input_batch.prev_sampled_token_ids
-            prev_map = self.input_batch.prev_req_id_to_index
-            if (
-                envs.VLLM_RBLN_USE_DEVICE_TENSOR
-                and self.use_async_scheduling
-                and not self.is_prefill
-                and prev_sampled is not None
-                and prev_map is not None
-            ):
-                # A request missing from prev_map (it was not in last step's
-                # batch) keeps the placeholder here and gets its token from
-                # token_ids_cpu instead, which _apply_pending_token_writeback
-                # fills in. Only the rows found here are overwritten.
-                #
-                # The batch order usually does not change, and the identity
-                # branch exploits that: one contiguous slice copy, instead of
-                # building index tensors from Python lists every step.
-                #
-                # prev_sampled aliases the sampler's ring, which has two slots:
-                # this read must happen before this step's sample() comes back
-                # around to the slot it points at.
-                rows, dsts, identity = [], [], True
-                for j, r in enumerate(req_ids):
-                    idx = prev_map.get(r)
-                    if idx is None:
-                        identity = False
-                        continue
-                    if idx != j:
-                        identity = False
-                    rows.append(idx)
-                    dsts.append(j)
-                if identity:
-                    n_fb = len(rows)
-                    # staged input_ids is a host tensor, so this is a D2H
-                    # either way; the intermediate buffer keeps it contiguous.
-                    tokfb_host = self._tokfb_host
-                    if tokfb_host is None or tokfb_host.shape[0] < n_fb:
-                        tokfb_host = torch.empty(
-                            prev_sampled.shape[0], dtype=prev_sampled.dtype
-                        )
-                        self._tokfb_host = tokfb_host
-                    host = tokfb_host[:n_fb]
-                    host.copy_(prev_sampled[:n_fb, 0])
-                    staged_model_inputs.input_ids[:n_fb, 0].copy_(host)
-                elif rows:
-                    # index_put_ demands equal dtypes, unlike the copy_ above.
-                    # The sampling op's width is not fixed -- `rbln::argmax`
-                    # still returns int64 -- so cast to the staged buffer's.
-                    staged_model_inputs.input_ids[dsts, 0] = prev_sampled[rows, 0].to(
-                        staged_model_inputs.input_ids.dtype
-                    )
+            if self.use_async_scheduling:
+                self._apply_async_token_feedback(staged_model_inputs, req_ids)
 
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear
