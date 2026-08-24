@@ -75,8 +75,10 @@ def _resolved_batch(
 
 def _make_runner_stub(**attrs):
     # A bare RBLNModelRunner (no __init__); set only the attributes the method
-    # under test reads.
+    # under test reads. dp_status is the exception: __init__ always sets it, and
+    # the dummy step reads it before anything publishes one.
     runner = object.__new__(RBLNModelRunner)
+    runner.dp_status = None
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -546,12 +548,17 @@ class TestDummyRunPadding:
         assert captured["layout"].num_reqs_padded == 2
         assert captured["layout"].query_len == 4
 
-    def test_a_fully_drained_group_runs_nothing(self, monkeypatch):
-        # Every rank reported idle, so every rank reaches the same answer and stops:
-        # no peer is waiting on this rank inside a forward, and the output of a step
-        # nobody asked for is discarded anyway. Nothing may be staged or run.
+    @pytest.mark.parametrize("specialized", [True, False])
+    def test_a_fully_drained_group_runs_nothing(self, monkeypatch, specialized):
+        # Every rank read the same status, so they all stop: no peer is waiting on
+        # this rank inside a forward, and the output of a step nobody asked for is
+        # discarded anyway. The status says so whatever the MoE configuration is,
+        # which a shape route could not -- the configurations answer differently.
         runner, captured = self._runner(
-            monkeypatch, reqs_across_dp=[1, 1, 1, 1], peers_idle=True
+            monkeypatch,
+            reqs_across_dp=[1, 1, 1, 1],
+            peers_idle=True,
+            specialized=specialized,
         )
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
 

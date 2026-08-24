@@ -311,6 +311,10 @@ def load_model(self, *args, **kwargs):
 def determine_batch_execution_and_padding(self, *args, **kwargs):
     result = _determine_batch_execution_and_padding(self, *args, **kwargs)
     batch_desc, _route, _num_tokens_across_dp = result
+    if batch_desc is None:
+        # A drained group runs nothing, so no pass opens and there is no phase to
+        # attribute this step to.
+        return result
     num_tokens_padded = batch_desc.num_tokens_padded
     if self.is_prefill:
         phase = _Phase.PREFILL

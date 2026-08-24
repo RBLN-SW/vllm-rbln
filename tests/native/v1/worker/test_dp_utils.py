@@ -195,6 +195,29 @@ class TestUnspecializedRoute:
         )
         assert (desc.num_reqs_padded, desc.num_tokens_padded) == (8, 512)
 
+    def test_a_prefilling_peer_leaves_this_rank_its_own_bucket(self):
+        # Specialization only decides a decode token dimension, and this route
+        # already pads to the prefill-sized one -- so every bucket is compiled for
+        # it and a prefilling peer changes nothing. Deciding the phase first would
+        # move this rank onto the top bucket's graph and pad seven rows it does not
+        # have.
+        desc, route = _determine(
+            _cfg(LADDER, specialized=False),
+            num_reqs=1,
+            num_tokens=1,
+            status=_status(
+                num_tokens=[1, 512, 1, 1],
+                num_reqs=[1, 1, 1, 1],
+                is_prefill=[0, 1, 0, 0],
+            ),
+        )
+        assert route is BatchRoute.UNSPECIALIZED
+        assert (desc.num_reqs_padded, desc.query_len, desc.num_tokens_padded) == (
+            1,
+            1,
+            MAX_NUM_TOKENS,
+        )
+
     def test_prefill_keeps_num_reqs(self):
         desc, route = _determine(
             _cfg(specialized=False),
@@ -312,35 +335,20 @@ class TestAnyPrefillRoute:
         )
 
 
-class TestAllIdleRoute:
+class TestDrainedGroup:
     # Every rank drained but the engine has not synced yet (vllm only checks every
-    # 32 steps), so all ranks run the cheapest identical graph.
-    def test_single_bucket_layout(self):
+    # 32 steps). There is no shape for a step none of them runs, so the rule says
+    # so instead of naming one -- in any configuration, since a drained group is
+    # answered before the split that decides token dimensions.
+    @pytest.mark.parametrize("specialized", [True, False])
+    def test_answers_with_no_shape(self, specialized):
         desc, route = _determine(
-            _cfg(),
+            _cfg(LADDER, specialized=specialized),
             num_reqs=1,
             num_tokens=1,
             status=_status(num_tokens=[1] * 4, num_reqs=[1] * 4, is_idle=[1, 1, 1, 1]),
         )
-        assert route is BatchRoute.ALL_IDLE
-        assert (desc.num_reqs_padded, desc.query_len, desc.num_tokens_padded) == (
-            8,
-            1,
-            8,
-        )
-
-    def test_ladder_layout_takes_the_smallest_bucket(self):
-        desc, route = _determine(
-            _cfg(LADDER),
-            num_reqs=1,
-            num_tokens=1,
-            status=_status(num_tokens=[1] * 4, num_reqs=[1] * 4, is_idle=[1, 1, 1, 1]),
-        )
-        assert (desc.num_reqs_padded, desc.query_len, desc.num_tokens_padded) == (
-            1,
-            1,
-            1,
-        )
+        assert (desc, route) == (None, BatchRoute.ALL_IDLE)
 
 
 class TestQlenAsymRoute:
@@ -523,14 +531,6 @@ INVARIANT_CASES = [
                 num_reqs=[1, 1, 1, 1],
                 is_prefill=[0, 1, 0, 0],
             ),
-        ),
-    ),
-    (
-        "all-idle",
-        dict(
-            num_reqs=1,
-            num_tokens=1,
-            status=_status(num_tokens=[1] * 4, num_reqs=[1] * 4, is_idle=[1] * 4),
         ),
     ),
     (
@@ -859,7 +859,7 @@ class TestCoordinateBatchAcrossDp:
         # is_prefill and is_idle occupy separate bits and mean opposite things: a
         # rank that prefills is the busiest rank there is. Feeding the phase in as
         # the idle bit would empty the busy set and take the all-idle route, which
-        # decides the cheapest graph and discards the output.
+        # answers with no shape at all and would stop the step.
         desc, route, status = self._coordinate(
             monkeypatch,
             peer=self._peer(1, 1),

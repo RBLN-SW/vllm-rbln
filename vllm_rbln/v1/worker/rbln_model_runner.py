@@ -1447,6 +1447,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             batch_desc, _route, num_tokens_across_dp = (
                 self._determine_batch_execution_and_padding(num_reqs, num_query_tokens)
             )
+            # A real step has work on this rank, so the group is not drained.
+            assert batch_desc is not None
 
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -2127,7 +2129,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Decide before staging, then run on the descriptor alone: on the idle path
         # the decided query length is the busy ranks' rather than this rank's own,
         # so this rank runs their graph.
-        batch_desc, route, num_tokens_across_dp = (
+        batch_desc, _route, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(
                 num_reqs,
                 num_tokens,
@@ -2135,10 +2137,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 pinned_num_tokens_padded=num_tokens_padded_override,
             )
         )
-        if route is BatchRoute.ALL_IDLE:
-            # Every rank reported idle, so every rank stops here and no collective
-            # inside the forward is left half-done. What the connector has to do
-            # when a step runs no tokens rides on the scheduler's own path.
+        if batch_desc is None:
+            # A drained group: every rank read the same status, so they all stop
+            # here and no collective inside the forward is left half-done.
             return
         query_len = batch_desc.query_len
 
@@ -2955,7 +2956,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_tokens: int,
         is_idle: bool = False,
         pinned_num_tokens_padded: int | None = None,
-    ) -> tuple[BatchDescriptor, BatchRoute, torch.Tensor | None]:
+    ) -> tuple[BatchDescriptor | None, BatchRoute, torch.Tensor | None]:
         """This step's padded batch (see v1/worker/dp_utils.py).
 
         Under DP the ranks have to land on one batch, so the decision goes through
@@ -2988,20 +2989,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # ranks reported here rather than repeating the collective.
             self.dp_status = dp_status
             num_tokens_across_dp = dp_status.num_tokens_across_dp
-        logger.debug_once(
-            "RBLN batch: dp_rank=%d route=%s prefill=%d idle=%d "
-            "in=(num_reqs=%d query_len=%d) -> "
-            "(num_reqs_padded=%d query_len=%d num_tokens_padded=%s)",
-            self.parallel_config.data_parallel_rank,
-            route.value,
-            int(self.is_prefill),
-            int(is_idle),
-            num_reqs,
-            num_tokens // num_reqs,
-            batch_desc.num_reqs_padded,
-            batch_desc.query_len,
-            batch_desc.num_tokens_padded,
-        )
+        if batch_desc is None:
+            logger.debug_once(
+                "RBLN batch: dp_rank=%d route=%s -> nothing to run",
+                self.parallel_config.data_parallel_rank,
+                route.value,
+            )
+        else:
+            logger.debug_once(
+                "RBLN batch: dp_rank=%d route=%s prefill=%d idle=%d "
+                "in=(num_reqs=%d query_len=%d) -> "
+                "(num_reqs_padded=%d query_len=%d num_tokens_padded=%s)",
+                self.parallel_config.data_parallel_rank,
+                route.value,
+                int(self.is_prefill),
+                int(is_idle),
+                num_reqs,
+                num_tokens // num_reqs,
+                batch_desc.num_reqs_padded,
+                batch_desc.query_len,
+                batch_desc.num_tokens_padded,
+            )
         return batch_desc, route, num_tokens_across_dp
 
     def _update_kv_cache_base_bindings(

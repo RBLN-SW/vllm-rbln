@@ -44,7 +44,7 @@ import torch.distributed as dist
 from vllm.distributed.parallel_state import get_dp_group
 
 
-class BatchRoute(str, Enum):
+class BatchRoute(Enum):
     """Which rule decided this step's shape.
 
     Not derivable from the numbers: two rules can land on the same
@@ -52,7 +52,8 @@ class BatchRoute(str, Enum):
     decode and a decode alongside a prefilling peer both give ``(8, 1,
     max_num_tokens)`` -- so a log line or a test that only checked the values
     could not tell a right-numbers-wrong-rule step from a correct one. Nothing
-    branches on it: callers run on the numbers and log the route.
+    branches on it: callers run on the numbers and log the route, and the one
+    route that has no numbers says so by coming back without a descriptor.
     """
 
     PINNED = "PINNED"
@@ -65,7 +66,7 @@ class BatchRoute(str, Enum):
     ANY_PREFILL = "ANY_PREFILL"
     """Some rank is prefilling, so decoding ranks run the padded-decode graph."""
     ALL_IDLE = "ALL_IDLE"
-    """Every rank drained; run the cheapest identical graph and discard it."""
+    """Every rank drained: there is no shape to run, so the descriptor is None."""
     QLEN_ASYM = "QLEN_ASYM"
     """Busy ranks disagree on query_len; only the top bucket's padding is warmed."""
     AGREED = "AGREED"
@@ -132,12 +133,16 @@ def determine_batch_execution_and_padding(
     is_prefill: bool,
     status: DPStatus | None,
     pinned_num_tokens_padded: int | None = None,
-) -> tuple[BatchDescriptor, BatchRoute]:
-    """Decide this step's padded batch.
+) -> tuple[BatchDescriptor | None, BatchRoute]:
+    """Decide this step's padded batch, or that there is none to run.
 
     ``status`` is None for single-DP. ``num_tokens`` must be ``num_reqs *
     query_len``: RBLN runs one query length per step, so a non-uniform batch is a
     caller bug rather than a shape to be chosen.
+
+    A drained group comes back as ``(None, ALL_IDLE)``: every rank reads the same
+    status, so they stop together, and there is no shape to state for a step none
+    of them runs.
 
     ``pinned_num_tokens_padded`` is warm-up asking for a specific token dimension
     instead of a decided one; the returned descriptor is still the one value the
@@ -174,7 +179,14 @@ def determine_batch_execution_and_padding(
             BatchRoute.LOCAL,
         )
 
+    busy = [i for i, idle in enumerate(status.is_idle) if not idle]
+    if not busy:
+        return None, BatchRoute.ALL_IDLE
+
     if not cfg.specialized_moe_decode:
+        # Answered before the phase routes below: every bucket is compiled with
+        # this token dimension here, so a prefilling peer leaves this rank's own
+        # bucket usable and there is nothing to agree on.
         return (
             BatchDescriptor(
                 num_reqs_padded=local_num_reqs_padded,
@@ -199,28 +211,14 @@ def determine_batch_execution_and_padding(
             BatchRoute.ANY_PREFILL,
         )
 
-    busy = [i for i, idle in enumerate(status.is_idle) if not idle]
-    if not busy:
-        # Output is discarded, so take the cheapest graph -- identical on every
-        # rank because every rank sees the same status.
-        cheapest = cfg.decode_batch_buckets[0]
-        return (
-            BatchDescriptor(
-                num_reqs_padded=cheapest,
-                query_len=1,
-                num_tokens_padded=cheapest,
-            ),
-            BatchRoute.ALL_IDLE,
-        )
-
     assert all(status.num_tokens[i] % status.num_reqs[i] == 0 for i in busy), (
         "a busy rank reported a non-uniform query length: "
         f"num_tokens={status.num_tokens} num_reqs={status.num_reqs}"
     )
-    busy_query_lens = [status.num_tokens[i] // status.num_reqs[i] for i in busy]
-    max_query_len = max(busy_query_lens)
+    query_lens = [status.num_tokens[i] // status.num_reqs[i] for i in busy]
+    max_query_len = max(query_lens)
 
-    if min(busy_query_lens) != max_query_len:
+    if min(query_lens) != max_query_len:
         # Spec-decode asymmetry (one rank drafted, another did not). Only the top
         # bucket is warmed for it, and each rank pads its own tokens up to the
         # graph's dimension, so query_len stays this rank's own.
@@ -419,7 +417,7 @@ def coordinate_batch_across_dp(
     is_prefill: bool,
     is_idle: bool = False,
     pinned_num_tokens_padded: int | None = None,
-) -> tuple[BatchDescriptor, BatchRoute, DPStatus]:
+) -> tuple[BatchDescriptor | None, BatchRoute, DPStatus]:
     """Agree on this step's padded batch with the other DP ranks.
 
     Only for ``dp_size > 1``: it joins the collective, so every rank of the group
