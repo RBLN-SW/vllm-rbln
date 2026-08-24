@@ -396,23 +396,77 @@ class TestShapeConfigWiring:
     # wired to the wrong source would keep every one of them green.
 
     @pytest.mark.maybe_use_device
-    def test_fields_come_from_their_sources(self, make_model_runner):
+    def test_a_real_runners_shapes_reach_the_decision(self, make_model_runner):
+        # Drive the rule with this runner's own config and a two-rank status, so
+        # every field shows up in the answer: the bucket rule (3 sits between two
+        # buckets, so a pass-through would keep 3), the token dimension a padded
+        # route uses, and specialization -- off at a single rank, which is why this
+        # is the unspecialized answer rather than a peer-driven one.
         runner = make_model_runner()
-        cfg = runner.shape_config
-        manager = runner.bucketing_manager
+        desc, route = dp_utils.determine_batch_execution_and_padding(
+            cfg=runner.shape_config,
+            num_reqs=3,
+            num_tokens=3,
+            is_prefill=False,
+            status=DPStatus(
+                num_tokens=(3, 3),
+                num_reqs=(3, 3),
+                is_prefill=(False, False),
+                is_idle=(False, False),
+                num_tokens_across_dp=torch.tensor([3, 3], dtype=torch.int32),
+            ),
+        )
+        assert route is BatchRoute.UNSPECIALIZED
+        assert (
+            desc.num_reqs_padded == runner.bucketing_manager.find_decode_batch_bucket(3)
+        )
+        assert desc.num_tokens_padded == runner.max_num_tokens
 
-        assert cfg.decode_batch_buckets is manager.decode_batch_buckets
-        # The manager's rule, not an identity: 3 sits between two buckets, so a
-        # pass-through would return 3 where the rule rounds up.
-        assert [cfg.find_bucket(n) for n in (1, 3)] == [
-            manager.find_decode_batch_bucket(1),
-            manager.find_decode_batch_bucket(3),
-        ]
-        # The token budget, not the request count -- the routes pad tokens with it.
-        assert cfg.max_num_tokens == runner.max_num_tokens
-        # Single DP: no cross-rank padding to specialize for, so the flag is off
-        # even though its env default is on.
-        assert cfg.specialized_moe_decode is False
+    @pytest.mark.maybe_use_device
+    def test_the_bucket_list_reaches_the_routes_that_read_it(self, make_model_runner):
+        # decode_batch_buckets is read by the two routes that pick an end of it, and
+        # both need data parallelism to specialize at all -- so this runner is built
+        # with a peer and a ladder of buckets, or the top and the first would be the
+        # same entry and the answers indistinguishable.
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", "4")
+        runner = make_model_runner(data_parallel_size=2, max_num_seqs=8)
+        monkeypatch.undo()
+        buckets = runner.bucketing_manager.decode_batch_buckets
+        assert len(buckets) > 1, buckets
+
+        def decide(status):
+            return dp_utils.determine_batch_execution_and_padding(
+                cfg=runner.shape_config,
+                num_reqs=2,
+                num_tokens=2,
+                is_prefill=False,
+                status=status,
+            )
+
+        desc, route = decide(
+            DPStatus(
+                num_tokens=(2, 128),
+                num_reqs=(2, 1),
+                is_prefill=(False, True),
+                is_idle=(False, False),
+                num_tokens_across_dp=torch.tensor([2, 128], dtype=torch.int32),
+            )
+        )
+        assert (route, desc.num_reqs_padded) == (BatchRoute.ANY_PREFILL, buckets[-1])
+
+        # The other end is read where the busy ranks disagree on a query length, so
+        # this one comes from a status that says so.
+        desc, route = decide(
+            DPStatus(
+                num_tokens=(2, 6),
+                num_reqs=(2, 2),
+                is_prefill=(False, False),
+                is_idle=(False, False),
+                num_tokens_across_dp=torch.tensor([2, 6], dtype=torch.int32),
+            )
+        )
+        assert (route, desc.num_reqs_padded) == (BatchRoute.QLEN_ASYM, buckets[-1])
 
 
 class TestDummyRunPadding:
