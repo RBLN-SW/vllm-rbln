@@ -341,8 +341,8 @@ class TestDetermineAvailableMemory:
             wm, "estimate_available_memory", lambda **kw: captured.update(kw) or 999
         )
         monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
-        if speculative_config is not None:
-            worker.speculative_config = speculative_config
+        # WorkerBase always carries the field; None is what no spec decode means.
+        worker.speculative_config = speculative_config
         worker.model_runner = SimpleNamespace(
             model=SimpleNamespace(
                 named_parameters=lambda: iter((params or _params()).items())

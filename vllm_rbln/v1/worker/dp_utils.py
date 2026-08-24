@@ -15,20 +15,16 @@
 """Which padded batch a step runs, agreed across the data-parallel ranks.
 
 RBLN compiles fixed decode shapes, so every step must land on a compiled
-``(num_reqs_padded, query_len)`` pair -- and under data parallelism every rank
-must land on the *same* one, or the ranks enter different graphs and the
-collective hangs. The layers, mirroring upstream's ``vllm/v1/worker/dp_utils.py``:
+``(num_reqs_padded, query_len)`` pair. The ranks need not land on the *same*
+pair: a rank whose peers drafted while it did not runs its own query length and
+nothing hangs. Two things have to hold instead, and the module mirrors upstream's
+``vllm/v1/worker/dp_utils.py`` in shape:
 
-- ``_run_ar``: one int per rank, sum-reduced into a tensor.
-- ``synchronize_dp_ranks``: bit-packs this rank's counts, all-reduces them and
-  unpacks a ``DPStatus`` -- transport only, it decides nothing.
-- ``determine_batch_execution_and_padding``: the rule, a pure function of this
-  rank's counts plus the status (None on a single rank), so every route is
-  testable without a runner.
-- ``coordinate_batch_across_dp``: the two together, for callers under DP.
-- ``determine_draft_batch_execution_and_padding``: the draft's rule. Its shapes
-  follow different bounds, but it runs inside a step that already agreed, so it
-  reads the published status instead of reducing again.
+- ``num_tokens_padded`` is the same on every rank, because that is what the
+  fused-MoE all-gather sizes off.
+- each rank's ``num_reqs_padded * query_len`` fits inside it. A caller can break
+  this one by running a pass at a length the ranks never settled on, so the rules
+  state it where they return.
 
 ``(num_reqs, query_len)`` are the free variables; tokens are their product. The
 result therefore always states ``query_len`` outright: callers stage from it and

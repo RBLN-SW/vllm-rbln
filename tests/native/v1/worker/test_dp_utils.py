@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# determine_batch_execution_and_padding: the per-step decode shape decision, as
-# a pure function of (config, this rank's counts, cross-DP status). The golden
-# values below are the
-# contract each route has to satisfy; they pin the exact padded dimensions rather
-# than a range, since a compiled graph is selected by them.
+# determine_batch_execution_and_padding: the per-step decode shape decision, as a
+# pure function of (config, this rank's counts, cross-DP status). The golden values
+# below are the contract each route has to satisfy; they pin the exact padded
+# dimensions rather than a range, since a compiled graph is selected by them.
 
 from unittest.mock import MagicMock
 
@@ -786,10 +785,9 @@ class TestDetermineDraftBatch:
             self._determine(busy, num_reqs=1, num_tokens=3)
 
     def test_a_busy_rank_at_one_token_stays_inside_the_bound(self):
-        # The other half of the step the drafter-length skip leaves behind: a busy
-        # rank drafts its own single token, so what it stages is exactly the
-        # dimension the ranks settle on. Only the warmed graph is missing there,
-        # which is not this rule's to see.
+        # A step the scheduler forced to no-spec: every rank drafts its own single
+        # token, so what one stages is exactly the dimension they settle on. The
+        # bound is tight there, which is the case worth pinning.
         desc, _ = self._determine(
             _status(num_tokens=[4, 4], num_reqs=[4, 4]), num_reqs=4, num_tokens=4
         )
@@ -800,10 +798,10 @@ class TestDetermineDraftBatch:
         )
 
     def test_a_length_the_group_never_reported_is_rejected(self):
-        # An idle rank runs the warmed decode length even when the busy ranks are a
-        # token deep -- the case the drafter-length skip leaves behind. Their
-        # dimension cannot hold it, and the dispatch pad would drop rows rather
-        # than raise, so the shortfall has to be stated here.
+        # Callers reach a length by reporting it or by taking the one the ranks
+        # settled on, so this is the contract rather than a reachable step: a pass
+        # that got its length anywhere else stages past the dimension, and the
+        # dispatch pad drops rows instead of raising.
         idle = _status(num_tokens=[1, 1], num_reqs=[1, 1], is_idle=[1, 0])
         with pytest.raises(AssertionError, match="more than the"):
             self._determine(idle, num_reqs=1, num_tokens=3)

@@ -933,9 +933,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
 
-        Unlike the base runner this takes no padded token count: the metadata
-        handed to the drafter is built from the unpadded counts here, where the
-        base builds it padded and unpads it again on the way out. The padded
+        Unlike upstream's runner this takes no padded token count: the metadata
+        handed to the drafter is built from the unpadded counts here, where
+        upstream builds it padded and unpads it again on the way out. The padded
         request count is still needed -- the decode branch of the builder pads
         the batch to it.
         """
@@ -2097,7 +2097,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         graph the busy ranks run.
         """
         num_tokens = num_tokens_per_req * num_reqs
-        assert num_tokens <= self.max_num_tokens
         assert num_reqs <= self.max_num_reqs
 
         # Stamp the dummy's own phase before any step setup; on the DP-idle path
@@ -2125,6 +2124,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         num_scheduled_tokens = np.array([query_len] * num_reqs, dtype=np.int32)
         num_tokens = int(num_scheduled_tokens.sum())
+        # The decided length, not the requested one, is what the buffers below are
+        # sliced to.
+        assert num_tokens <= self.max_num_tokens
         self.seq_lens_np[:num_reqs] = num_scheduled_tokens
         self.seq_lens_np[num_reqs:] = 0
         # num_tokens_no_spec is the per-request no-spec logical length read

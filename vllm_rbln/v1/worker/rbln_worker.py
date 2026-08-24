@@ -303,7 +303,7 @@ class RBLNWorker(WorkerBase):
             self.model_runner.bucketing_manager.decode_batch_buckets_count
         )
 
-        spec_enabled = getattr(self, "speculative_config", None) is not None
+        spec_enabled = self.speculative_config is not None
         num_decode_query_lens = 2 if spec_enabled else 1
         num_runtimes = 1 + decode_batch_buckets_count * num_decode_query_lens
         if has_specialized_moe_decode:
@@ -410,7 +410,7 @@ class RBLNWorker(WorkerBase):
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
 
-        speculative_config = getattr(self, "speculative_config", None)
+        speculative_config = self.speculative_config
         drafter = getattr(self.model_runner, "drafter", None)
         draft_model = getattr(drafter, "model", None)
         draft_model_config = getattr(speculative_config, "draft_model_config", None)
