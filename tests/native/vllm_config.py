@@ -21,7 +21,7 @@ from __future__ import annotations
 import functools
 import os
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, try_to_load_from_cache
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 
@@ -34,15 +34,24 @@ def local_model_path(model: str) -> str:
 
     A hub id makes transformers revalidate config.json over the network on every
     single build -- five HEAD requests each, and the unit lane builds well over a
-    hundred configs. Handing it the directory instead resolves everything locally,
-    so the whole suite pays one lookup per model. What comes out differs only in
-    the identity strings (``model``, ``tokenizer``, ``served_model_name``,
-    ``_name_or_path``); every other field is identical.
+    hundred configs. Handing it the directory instead resolves everything locally.
+    What comes out differs only in the identity strings (``model``, ``tokenizer``,
+    ``served_model_name``, ``_name_or_path``); every other field is identical.
+
+    The cache is read directly rather than through hf_hub_download, which
+    revalidates the etag over the network even on a hit -- one HEAD per model per
+    process, and the device lanes spawn one process per test module. The revision
+    the cache holds is pinned as a result, which for configs read only for their
+    shapes is determinism rather than staleness.
 
     Not a stand-in for the repo id: on a cold cache the directory holds config.json
     and nothing else, so anything that loads weights or a tokenizer -- the
     ``vllm_runner`` fixtures, the whole --model-compile lane -- keeps the id.
     """
+    cached = try_to_load_from_cache(model, "config.json")
+    # Not a truthiness check: a known-absent file comes back as a sentinel object.
+    if isinstance(cached, str):
+        return os.path.dirname(cached)
     return os.path.dirname(hf_hub_download(model, "config.json"))
 
 
