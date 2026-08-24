@@ -188,8 +188,12 @@ class MultimodalSmoke:
             if self.USE_CHAT_TEMPLATE:
                 from transformers import AutoProcessor
 
+                # setUpClass's LLM(...) already pulled this model -- processor
+                # included -- into the HF cache, so resolve from disk. Re-fetching
+                # re-issues an etag HEAD per file against the hub for nothing, and
+                # that redundant round is a real contributor to CI rate-limit hits.
                 processor = AutoProcessor.from_pretrained(
-                    self.MODEL_ID, **self.PROCESSOR_KWARGS
+                    self.MODEL_ID, local_files_only=True, **self.PROCESSOR_KWARGS
                 )
                 messages = [
                     {
