@@ -32,15 +32,13 @@ _secrets: &secrets
   HF_TOKEN: FSW_HF_TOKEN
   HF_HOME: FSW_HF_HOME
 
-# Sync the locked env, then (when triggered by compiler CI) reinstall rebel-compiler at
-# the version under test from REBEL_PYPI_ENDPOINT.
 _sync: &sync |
   echo '--- :package: uv sync'
   uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
   if [ -n "${REBEL_COMPILER_VERSION:-}" ]; then
-    echo "--- :package: override rebel-compiler==${REBEL_COMPILER_VERSION}"
-    pypi=$(printf '%s' "${REBEL_PYPI_ENDPOINT}" | sed "s#//#//${UV_INDEX_REBELLIONS_USERNAME}:${UV_INDEX_REBELLIONS_PASSWORD}@#")
-    uv pip install --extra-index-url "$pypi" "rebel-compiler==${REBEL_COMPILER_VERSION}"
+    creds="${UV_INDEX_REBELLIONS_USERNAME}:${UV_INDEX_REBELLIONS_PASSWORD}"
+    index=$(printf '%s' "$REBEL_PYPI_ENDPOINT" | sed "s#://#://${creds}@#")
+    uv pip install --extra-index-url "$index" "rebel-compiler==${REBEL_COMPILER_VERSION}"
   fi
 
 steps:
