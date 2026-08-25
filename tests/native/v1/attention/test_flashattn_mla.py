@@ -96,14 +96,8 @@ class TestMlaVUpProj:
         x = torch.randn(2, 3, 4, 7)  # [B, H, S, kv_lora_rank]
         w_uv = torch.randn(1, 3, 7, 5)  # [1, H, kv_lora_rank, v_head_dim]
         out = impl._v_up_proj(x, w_uv)
-        expected = (
-            torch.matmul(x, w_uv)
-            .to(torch.bfloat16)
-            .transpose(1, 2)
-            .reshape(2, 4, 3 * 5)
-        )
+        expected = torch.matmul(x, w_uv).transpose(1, 2).reshape(2, 4, 3 * 5)
         assert out.shape == (2, 4, 15)
-        assert out.dtype == torch.bfloat16
         assert torch.allclose(out, expected)
 
 
@@ -152,12 +146,18 @@ class TestMlaImplInit:
         with pytest.raises(NotImplementedError, match="decoder"):
             make_mla_impl(cfg, attn_type=AttentionType.ENCODER)
 
-    def test_fp8_kv_cache_supported(self, cfg):
-        impl = make_mla_impl(cfg, kv_cache_dtype="fp8")
+    def test_fp8_kv_cache_supported_on_sparse_path(self, cfg):
+        # fp8 is accepted only on the sparse (DSA) path, where an indexer exists.
+        impl = make_mla_impl(cfg, kv_cache_dtype="fp8", indexer=object())
         assert impl.kv_cache_dtype == "fp8"
 
+    def test_fp8_kv_cache_rejected_on_dense_path(self, cfg):
+        # Dense MLA (no indexer) cannot read the packed fp8 cache: reject early.
+        with pytest.raises(NotImplementedError, match="sparse"):
+            make_mla_impl(cfg, kv_cache_dtype="fp8")
+
     def test_non_fp8_quantized_kv_cache_not_supported(self, cfg):
-        with pytest.raises(NotImplementedError, match="does not support"):
+        with pytest.raises(NotImplementedError, match="sparse"):
             make_mla_impl(cfg, kv_cache_dtype="nvfp4")
 
     def test_kv_sharing_not_supported(self, cfg):

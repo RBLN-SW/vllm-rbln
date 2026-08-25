@@ -135,11 +135,16 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
                 "Only decoder self-attention is implemented for FlashAttnMLAImpl"
             )
 
-        if is_quantized_kv_cache(
-            self.kv_cache_dtype
-        ) and not self.kv_cache_dtype.startswith("fp8"):
+        if is_quantized_kv_cache(self.kv_cache_dtype) and not (
+            self.kv_cache_dtype.startswith("fp8") and self.indexer is not None
+        ):
+            # Only the sparse (DSA) path packs an fp8 latent cache the kernel can
+            # read; a dense MLA layer would be handed a cache its bf16 kernel
+            # cannot read, so reject it here instead of failing later.
             raise NotImplementedError(
-                f"FlashAttnMLA does not support kv_cache_dtype={self.kv_cache_dtype!r}"
+                "FlashAttnMLA supports an fp8 KV cache only on the sparse (DSA) "
+                "path with a lightning indexer; kv_cache_dtype="
+                f"{self.kv_cache_dtype!r} is not supported here."
             )
         if kv_sharing_target_layer_name is not None:
             raise NotImplementedError("KV sharing is not supported in RBLN.")
