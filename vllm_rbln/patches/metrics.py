@@ -19,7 +19,7 @@ sum, so MODEL + SAMPLE carries the same call count as E2E and the difference of 
 means is the host overhead around the graphs. A pass is recorded only once its phase
 and its graph time are both known, which is what keeps those counts equal. The graph
 runs asynchronously: the last PP rank waits for it in the sampler, the other ranks in
-the model range.
+the model range on an event recorded right after the call.
 
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
@@ -305,9 +305,11 @@ def load_model(self, *args, **kwargs):
         start = time.perf_counter()
         output = executable(*call_args, **call_kwargs)
         if USE_DEVICE_TENSOR and not get_pp_group().is_last_rank:
-            # Without a sampler the wait would land in the worker's PP send.
+            # Without a sampler the wait would land in the worker's PP send. Wait on
+            # this graph's seq only: a device synchronize drains every stream and
+            # stalls the other in-flight PP batches.
             hidden_states = next(iter(output[0].tensors.values()))
-            torch.rbln.synchronize(hidden_states.device)
+            torch.rbln.current_stream(hidden_states.device).record_event().synchronize()
         ctx.add_graph_time(time.perf_counter() - start)
         return output
 

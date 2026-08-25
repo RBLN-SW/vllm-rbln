@@ -501,12 +501,16 @@ class TestModelExecutable:
     def _fake_rbln(self, monkeypatch, clock=None) -> list[str]:
         synced: list[str] = []
 
-        def synchronize(device: str) -> None:
-            synced.append(device)
-            if clock is not None:
-                clock.advance(0.5)
+        def current_stream(device: str):
+            def synchronize() -> None:
+                synced.append(device)
+                if clock is not None:
+                    clock.advance(0.5)
 
-        rbln = types.SimpleNamespace(synchronize=synchronize)
+            event = types.SimpleNamespace(synchronize=synchronize)
+            return types.SimpleNamespace(record_event=lambda: event)
+
+        rbln = types.SimpleNamespace(current_stream=current_stream)
         monkeypatch.setattr(pm, "torch", types.SimpleNamespace(rbln=rbln))
         monkeypatch.setattr(pm, "USE_DEVICE_TENSOR", True)
         return synced
@@ -523,7 +527,7 @@ class TestModelExecutable:
         assert ctx._graph_latency is not None
         assert calls == [{"step": 1}, {"step": 2}]
 
-    def test_non_last_pp_rank_waits_on_the_output_device_inside_the_model_range(
+    def test_non_last_pp_rank_waits_on_its_graph_event_inside_the_model_range(
         self, monkeypatch, clock
     ):
         synced = self._fake_rbln(monkeypatch, clock=clock)
