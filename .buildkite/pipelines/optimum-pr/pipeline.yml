@@ -21,11 +21,33 @@ _secrets: &secrets
   HF_TOKEN: HF_TOKEN
   HF_HOME: HF_HOME
 
+# Run a step only when the PR touches a path that can affect the optimum path.
+# Honored solely when the pipeline is uploaded with --git-diff-base (see
+# .buildkite/pr.yml); without that flag every step runs, as it did before.
+# The exclude list is deliberately conservative -- it drops only paths that are
+# native-path-only, since over-including merely wastes a run while
+# over-excluding would silently skip a suite that should have caught a break.
+_if_changed: &if_changed
+  include:
+    - ".buildkite/**"
+    - "tests/optimum/**"
+    - "vllm_rbln/**"
+    - "pyproject.toml"
+    - "uv.lock"
+  exclude:
+    - ".buildkite/pipelines/vllm-rbln/**"
+    - "tests/native/**"
+    - "vllm_rbln/patches/**"
+    - "vllm_rbln/compilation/**"
+    - "vllm_rbln/v1/worker/rbln_*.py"
+    - "vllm_rbln/v1/spec_decode/**"
+
 _needs_venv: &needs_venv ["venv"]
 
 steps:
   - label: ":package: shared venv"
     key: "venv"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
     command:
@@ -37,6 +59,7 @@ steps:
   # CPU suites
   # ===========================================================================
   - label: ":pytest: tests/optimum/v1/core"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: &cpu-only-resources
       cpu:
@@ -51,6 +74,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/core --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
@@ -59,6 +83,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker/test_rebel_optimum_model_runner.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/converter"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
@@ -70,6 +95,7 @@ steps:
   # NPU suites
   # ===========================================================================
   - label: ":pytest: tests/optimum/entrypoints/openai"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -81,6 +107,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/openai --durations 0 --timeout=600"
 
   - label: ":pytest: tests/optimum/entrypoints/llm"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -92,6 +119,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/llm --durations 0"
 
   - label: ":pytest: tests/optimum/v1/models"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -103,6 +131,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/models --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker/test_sampler*.py"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -119,6 +148,7 @@ steps:
   # Optimum smoke suites -> NPU using RSD
   # ===========================================================================
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-1"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     env:
       # TODO single-threaded OpenMP works around a libgomp fork-safety deadlock in the
@@ -136,6 +166,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd1.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-4"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -147,6 +178,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd4.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-8"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
