@@ -94,9 +94,15 @@ class _PerformanceContext:
         self.rank_tag = _rank_tag()
         self._graph: dict[_Phase, _Metrics] = defaultdict(_Metrics)
         self._e2e: dict[_Phase, _Metrics] = defaultdict(_Metrics)
+        self._model: dict[_Phase, _Metrics] = defaultdict(_Metrics)
+        self._sample: dict[_Phase, _Metrics] = defaultdict(_Metrics)
+        self._tokens: dict[_Phase, int] = defaultdict(int)
         self._start: float | None = None
         self._phase: _Phase | None = None
         self._graph_latency: float | None = None
+        self._model_latency: float | None = None
+        self._sample_latency: float | None = None
+        self._pass_tokens: int | None = None
 
     @property
     def in_pass(self) -> bool:
@@ -106,36 +112,80 @@ class _PerformanceContext:
         self._start = time.perf_counter()
         self._phase = None
         self._graph_latency = None
+        self._model_latency = None
+        self._sample_latency = None
+        self._pass_tokens = None
 
     def end_pass(self) -> None:
         end = time.perf_counter()
         start, self._start = self._start, None
         phase, self._phase = self._phase, None
         graph, self._graph_latency = self._graph_latency, None
+        model, self._model_latency = self._model_latency, None
+        sample, self._sample_latency = self._sample_latency, None
+        tokens, self._pass_tokens = self._pass_tokens, None
         if start is None or phase is None or graph is None:
             # No pass was open, or it never reached the forward: an empty batch, KV
             # send/recv with no forward work, or a pass that raised.
             return
         self._e2e[phase].record(end - start)
         self._graph[phase].record(graph)
+        if model is not None:
+            self._model[phase].record(model)
+        if sample is not None:
+            self._sample[phase].record(sample)
+        if tokens is not None:
+            self._tokens[phase] += tokens
+
+    def record_tokens(self, n: int) -> None:
+        if self._start is not None:
+            self._pass_tokens = (self._pass_tokens or 0) + n
 
     def mark_phase(self, phase: _Phase) -> None:
         if self._start is not None:
             self._phase = phase
 
-    def add_graph_time(self, latency: float) -> None:
-        if self._start is not None:
-            self._graph_latency = (self._graph_latency or 0.0) + latency
+    def add_graph_time(self, latency: float, is_sample: bool = False) -> None:
+        if self._start is None:
+            return
+        self._graph_latency = (self._graph_latency or 0.0) + latency
+        if is_sample:
+            self._sample_latency = (self._sample_latency or 0.0) + latency
+        else:
+            self._model_latency = (self._model_latency or 0.0) + latency
 
     def print_stats(self) -> None:
         sections: dict[str, _Metrics] = {}
-        for label, table in (("MODEL + SAMPLE", self._graph), ("E2E", self._e2e)):
+        for label, table in (
+            ("MODEL + SAMPLE", self._graph),
+            ("MODEL ONLY", self._model),
+            ("SAMPLE ONLY", self._sample),
+            ("E2E", self._e2e),
+        ):
             for phase in _Phase:
                 if phase in table:
                     sections[f"{label} ({phase.value})"] = table[phase]
         name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
-        logger.info("%s", "\n".join(_render_metrics_report(name, sections)))
+        lines = _render_metrics_report(name, sections)
+        lines.extend(self._render_generation_per_token())
+        logger.info("%s", "\n".join(lines))
         _write_metrics_json(self.name, self.rank_tag, sections)
+
+    def _render_generation_per_token(self) -> list[str]:
+        gen = (_Phase.DECODE, _Phase.PADDED_DECODE)
+        tokens = sum(self._tokens.get(p, 0) for p in gen)
+        if tokens <= 0:
+            return []
+        lines = ["GENERATION (decode + padded-decode total / tokens committed):"]
+        for label, table in (
+            ("E2E", self._e2e),
+            ("MODEL", self._model),
+            ("SAMPLE", self._sample),
+        ):
+            total_ms = sum(sum(table[p].latencies) for p in gen if p in table) * 1000.0
+            lines.append(f"  {label:<6} per-token (ms): {total_ms / tokens:.3f}")
+        lines.append(f"  tokens committed         : {tokens}")
+        return lines
 
 
 def _rank_tag() -> str:
@@ -271,6 +321,13 @@ def execute_model(self, *args, **kwargs):
 @functools.wraps(_sample_tokens)
 def sample_tokens(self, *args, **kwargs):
     output = _sample_tokens(self, *args, **kwargs)
+    sampled = getattr(output, "sampled_token_ids", None)
+    if sampled is not None:
+        try:
+            n = sum(len(t) for t in sampled)
+        except TypeError:
+            n = 0
+        _ctx(self).record_tokens(n)
     _ctx(self).end_pass()
     return output
 
@@ -283,7 +340,7 @@ def sample(self, *args, **kwargs):
         return _sample(self, *args, **kwargs)
     start = time.perf_counter()
     output = _sample(self, *args, **kwargs)
-    _ctx(self).add_graph_time(time.perf_counter() - start)
+    _ctx(self).add_graph_time(time.perf_counter() - start, is_sample=True)
     return output
 
 
