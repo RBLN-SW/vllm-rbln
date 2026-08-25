@@ -69,7 +69,11 @@ class TestMlaBackendStatic:
             torch.float16,
             torch.bfloat16,
         ]
-        assert RBLNFlashAttnMLABackend.supported_kv_cache_dtypes == ["auto"]
+        assert RBLNFlashAttnMLABackend.supported_kv_cache_dtypes == [
+            "auto",
+            "fp8",
+            "fp8_e4m3",
+        ]
         assert RBLNFlashAttnMLABackend.accept_output_buffer is False
 
 
@@ -142,9 +146,19 @@ class TestMlaImplInit:
         with pytest.raises(NotImplementedError, match="decoder"):
             make_mla_impl(cfg, attn_type=AttentionType.ENCODER)
 
-    def test_quantized_kv_cache_not_supported(self, cfg):
-        with pytest.raises(NotImplementedError, match="FP8"):
+    def test_fp8_kv_cache_supported_on_sparse_path(self, cfg):
+        # fp8 is accepted only on the sparse (DSA) path, where an indexer exists.
+        impl = make_mla_impl(cfg, kv_cache_dtype="fp8", indexer=object())
+        assert impl.kv_cache_dtype == "fp8"
+
+    def test_fp8_kv_cache_rejected_on_dense_path(self, cfg):
+        # Dense MLA (no indexer) cannot read the packed fp8 cache: reject early.
+        with pytest.raises(NotImplementedError, match="sparse"):
             make_mla_impl(cfg, kv_cache_dtype="fp8")
+
+    def test_non_fp8_quantized_kv_cache_not_supported(self, cfg):
+        with pytest.raises(NotImplementedError, match="sparse"):
+            make_mla_impl(cfg, kv_cache_dtype="nvfp4")
 
     def test_kv_sharing_not_supported(self, cfg):
         with pytest.raises(NotImplementedError, match="KV sharing"):

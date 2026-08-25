@@ -98,7 +98,8 @@ class RblnPlatform(Platform):
             AttentionBackendEnum.FLASH_ATTN_MLA,
         ):
             raise ValueError(f"Cannot use {selected_backend} backend on RBLN.")
-        if attn_selector_config.use_sparse:
+
+        if attn_selector_config.use_sparse and not attn_selector_config.use_mla:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
         logger.info("Using %s Backend", selected_backend)
