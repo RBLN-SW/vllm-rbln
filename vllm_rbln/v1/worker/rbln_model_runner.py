@@ -1267,11 +1267,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             bucket = logits.shape[0]
             num_reqs = self.input_batch.num_reqs
             padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
-            out = self.sampler(
-                logits=logits,
-                sampling_metadata=padded_md,
-                staging_owner=self if self.use_async_scheduling else None,
-            )
+            # The kwarg is omitted rather than passed as None: with
+            # VLLM_RBLN_SAMPLER=0 this is upstream's Sampler, which does not
+            # accept it. The platform refuses async scheduling in that case, so
+            # the two conditions cannot disagree.
+            staging = {"staging_owner": self} if self.use_async_scheduling else {}
+            out = self.sampler(logits=logits, sampling_metadata=padded_md, **staging)
             sampler_output = _depad_sampler_output(out, num_reqs)
         else:
             sampler_output = self.rejection_sampler(
