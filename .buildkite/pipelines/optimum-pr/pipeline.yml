@@ -21,11 +21,12 @@ _secrets: &secrets
 
 # Every job hashes to the same editable entry in the shared NFS cache and uv holds that
 # lock for the whole build, so the project install skips the cache (astral-sh/uv#15380).
-# uv rejects --no-cache under this pipeline's symlink link mode, hence the copy override.
+# Both overrides are load-bearing: uv rejects --no-cache under this pipeline's symlink
+# link mode, and uv pip otherwise targets the image's VIRTUAL_ENV over the project .venv.
 _sync: &sync |
   echo '--- :package: uv sync'
   uv sync --locked --python 3.12 --extra test --extra dev --extra runtime --no-install-project
-  UV_LINK_MODE=copy uv pip install -e . --no-deps --no-cache
+  UV_LINK_MODE=copy uv pip install --python .venv/bin/python -e . --no-deps --no-cache
   bash .buildkite/scripts/rebel-compiler-override.sh
   echo '+++ :pytest: pytest'
 
