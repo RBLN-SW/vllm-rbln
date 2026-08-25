@@ -283,8 +283,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Async scheduling state.
         self._prev_token_host_buffer: torch.Tensor | None = None
-        self._sampled_token_ring: list[torch.Tensor] = []
-        self._ring_slot = 0
         self._async_logprobs_tensors: LogprobsTensors | None = None
         self._pending_token_writeback: PendingTokenWriteback = collections.deque()
         self._placeholder_pos: dict[str, int] = {}
@@ -1376,38 +1374,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
     def _stage_sampled_tokens(self, sampled_token_ids: torch.Tensor) -> torch.Tensor:
-        """Hand back a copy of the sampled tokens, alternating two buffers.
+        """Copy the sampled tokens out of the sampling graph's own output, which
+        async holds past the step boundary and whose next launch would block.
 
-        Async scheduling holds this tensor past the step boundary, through
-        prev_sampled_token_ids and AsyncRBLNModelRunnerOutput. Holding the
-        sampling graph's own output there makes that graph's next launch block
-        on the device. Two slots, because the output thread reads one while the
-        next step writes the other.
+        A fresh buffer each step, not a pool: the output thread's D2H in
+        get_output() outlives the step, and a pool cannot know when it is done.
         """
-        num_reqs = sampled_token_ids.shape[0]
-        ring = self._sampled_token_ring
-        if (
-            not ring
-            or ring[0].shape[0] < num_reqs
-            or ring[0].shape[1:] != sampled_token_ids.shape[1:]
-            or ring[0].dtype != sampled_token_ids.dtype
-            or ring[0].device != sampled_token_ids.device
-        ):
-            ring = [
-                torch.empty(
-                    (max(self.max_num_reqs, num_reqs), *sampled_token_ids.shape[1:]),
-                    dtype=sampled_token_ids.dtype,
-                    device=sampled_token_ids.device,
-                )
-                for _ in range(2)
-            ]
-            self._sampled_token_ring = ring
-            self._ring_slot = 0
-        buf = ring[self._ring_slot][:num_reqs]
-        self._ring_slot ^= 1
-        # non_blocking, or the copy waits on the sampling graph.
-        buf.copy_(sampled_token_ids, non_blocking=True)
-        return buf
+        return torch.empty_like(sampled_token_ids).copy_(
+            sampled_token_ids, non_blocking=True
+        )
 
     def _repair_async_output_token_ids(self) -> None:
         """Replace the -1 at the tail of output_token_ids before penalties, bad
