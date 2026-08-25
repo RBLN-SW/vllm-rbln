@@ -189,40 +189,12 @@ def test_schedule_alloc_block_policy(
 
 
 def test_cache_slot_id_lifecycle():
-    """Each admitted request is pinned to the lowest free cache slot id,
-    keeps it across decode steps, and releases it on finish for reuse."""
-    scheduler = create_scheduler(max_num_seqs=2)
-    requests = create_requests(num_requests=3, num_tokens=16)
+    """One cache slot id from admission through reuse by another request.
 
-    scheduler.add_request(requests[0])
-    scheduler.add_request(requests[1])
-    output = scheduler.schedule()
-    assert output.cache_slot_id_dict == {"0": 0}
-    scheduler.update_from_output(output, create_model_runner_output(output))
-
-    output = scheduler.schedule()
-    assert output.cache_slot_id_dict == {"1": 1}
-    scheduler.update_from_output(output, create_model_runner_output(output))
-
-    # Decode covers every scheduled request with its pinned id.
-    output = scheduler.schedule()
-    assert output.cache_slot_id_dict == {"0": 0, "1": 1}
-    scheduler.update_from_output(output, create_model_runner_output(output))
-
-    # Finishing frees the id; the next admission reuses the lowest free one.
-    scheduler.finish_requests(requests[0].request_id, RequestStatus.FINISHED_STOPPED)
-    scheduler.add_request(requests[2])
-    output = scheduler.schedule()
-    assert output.cache_slot_id_dict == {"2": 0}
-
-
-def test_cache_slot_id_reuse_prefers_lowest_free():
-    """A freed cache slot id is reused before a never-allocated one.
-
-    Two ids are free at once and they differ in history: id 1 was released by
-    a finished request, id 2 was never handed out. Only here does the choice
-    between the two show up -- the lifecycle test above leaves a single id
-    free when it reuses, so every reuse policy picks the same one there.
+    Three ids exist and only two are ever in use at once, so when the middle
+    request finishes, the next admission chooses between the id it just
+    released and an id never handed out: the lowest wins. Each decode step in
+    between carries the id every scheduled request was admitted with.
     """
     scheduler = create_scheduler(max_num_seqs=3)
     requests = create_requests(num_requests=3, num_tokens=16)
@@ -235,16 +207,18 @@ def test_cache_slot_id_reuse_prefers_lowest_free():
         assert output.cache_slot_id_dict == expected
         scheduler.update_from_output(output, create_model_runner_output(output))
 
-    # Free the middle id, leaving 1 (just freed) and 2 (never used) free.
-    scheduler.finish_requests(requests[1].request_id, RequestStatus.FINISHED_STOPPED)
+    output = scheduler.schedule()
+    assert output.cache_slot_id_dict == {"0": 0, "1": 1}
+    scheduler.update_from_output(output, create_model_runner_output(output))
 
+    # Finishing releases id 1, leaving it and the never-used id 2 free.
+    scheduler.finish_requests(requests[1].request_id, RequestStatus.FINISHED_STOPPED)
     scheduler.add_request(requests[2])
     output = scheduler.schedule()
     assert output.cache_slot_id_dict == {"2": 1}
     scheduler.update_from_output(output, create_model_runner_output(output))
 
-    # The request that never finished still holds the id it was admitted with,
-    # so the next decode step pairs both requests with their pinned ids.
+    # The request that never finished still holds the id it started with.
     output = scheduler.schedule()
     assert output.cache_slot_id_dict == {"0": 0, "2": 1}
 
