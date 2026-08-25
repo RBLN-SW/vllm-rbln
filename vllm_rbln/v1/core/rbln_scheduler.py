@@ -597,9 +597,8 @@ class RBLNScheduler(Scheduler):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            # A sub-block hit is a local prefix cache hit: those
-                            # tokens are copied, not recomputed, so leaving them
-                            # out makes num_computed_tokens overstate the work.
+                            # Sub-block hits are local prefix cache hits: the
+                            # tokens are copied, not recomputed.
                             num_local_cached_tokens=(
                                 num_new_local_computed_tokens + num_sub_block_tokens
                             ),

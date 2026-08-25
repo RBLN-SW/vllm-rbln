@@ -272,8 +272,8 @@ class RblnPlatform(Platform):
             logger.warning(
                 "Ignoring --async-scheduling: speculative decoding is not "
                 "supported on RBLN under async scheduling, because the async "
-                "token feedback carries one sampled token per step. Running "
-                "synchronously."
+                "path feeds one sampled token per step back into the next. "
+                "Running synchronously."
             )
             scheduler_config.async_scheduling = False
 

@@ -56,20 +56,13 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # them to the host mid-step and serialises what async just decoupled.
         self._logprobs_tensors = logprobs_tensors
 
-        # The D2H is neither dispatched nor awaited here - both happen in
-        # get_output().
-
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
-        Blocks until the copy is finished. Under async scheduling this runs on
-        the worker's async output thread rather than the thread running the
-        model, so the copy is dispatched while the next forward is in flight.
-
-        inference_mode is re-entered because _sampled_token_ids_cpu is an
-        inference tensor, allocated under sample_tokens' inference_mode, and
-        InferenceMode is thread-local, so it is off on this thread. Updating an
-        inference tensor in place with it off is a hard error.
+        Blocks until the copy finishes. Runs on the worker's async output thread.
+        InferenceMode is thread-local, hence off here, and updating
+        _sampled_token_ids_cpu - an inference tensor allocated
+        under sample_tokens - in place with it off is a hard error.
         """
         # Blocking copy, not non_blocking + a device synchronize: synchronizing
         # waits on every pending transfer, so once forward(N+1) is dispatched

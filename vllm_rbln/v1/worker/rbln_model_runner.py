@@ -278,17 +278,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             self.sampler = Sampler(self.model_config.logprobs_mode)
 
-        # Host hop for the token feedback; see the identity branch in
-        # _apply_async_token_feedback.
-        self._token_feedback_host = None
-        # Sampled tokens handed to the deferred output; see _stage_sampled_tokens.
+        # Async scheduling state.
+        self._prev_token_host_buffer = None
         self._sampled_token_ring: list[torch.Tensor] = []
         self._ring_slot = 0
-        # Logprobs handed to the deferred output; see the async branch of
-        # _bookkeeping_sync.
         self._async_logprobs_tensors = None
-        # Sampled tokens handed back by the output thread, applied to
-        # token_ids_cpu by the main thread; see _apply_pending_token_writeback.
         self._pending_token_writeback: collections.deque = collections.deque()
         self._placeholder_pos: dict[str, int] = {}
 
@@ -1288,20 +1282,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         return sampler_output
 
     def _apply_pending_token_writeback(self) -> None:
-        """Put the real sampled tokens where every reader of them can see them.
+        """Put the real sampled tokens where every reader can see them.
 
-        Async scheduling stages -1 placeholders and repairs them on device, but
-        only for requests that were also in the previous step's batch. Everyone
-        else reads the host copy, so the host copy has to be truthful.
-
-        Two places, not one. token_ids_cpu is what _prepare_inputs reads, but it
-        is rebuilt from CachedRequestState.output_token_ids whenever a request
-        is (re-)added to the persistent batch, so a placeholder left in the
-        request state comes back. This runner evicts unscheduled requests every
-        step, which makes that rebuild routine rather than a corner case.
-
-        Repairing the request state is enough for a request that is currently
-        out of the batch: self.requests outlives eviction.
+        _repair_staged_input_ids reaches only requests that were in the previous
+        step's batch. Repairs CachedRequestState.output_token_ids as well as
+        token_ids_cpu, because token_ids_cpu is rebuilt from the request state
+        whenever a request re-enters the persistent batch.
         """
         input_batch = self.input_batch
         while True:
@@ -1338,33 +1324,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         req_index, start : start + len(sampled_ids)
                     ] = sampled_ids
 
-    def _apply_async_token_feedback(
+    def _repair_staged_input_ids(
         self, staged_model_inputs: StagedModelInputs, req_ids: list[str]
     ) -> None:
-        """Scatter the previous step's real tokens over the staged placeholders.
-
-        The staged input_ids hold what the scheduler sent, which under async
-        scheduling is a -1 for every request whose token this step is supposed to
-        consume. prev_sampled_token_ids has the real ones, still on device, in
-        the previous step's batch order -- prev_req_id_to_index remaps them.
-
-        A request missing from prev_req_id_to_index (it was not in last step's
-        batch) keeps the placeholder here and gets its token from token_ids_cpu
-        instead, which _apply_pending_token_writeback fills in. Only the rows
-        found here are overwritten.
-
-        prev_sampled_token_ids aliases the sampler's ring, which has two slots:
-        this read must happen before this step's sample() comes back around to
-        the slot it points at.
+        """Overwrite the scheduler's -1 placeholders with the previous step's
+        sampled tokens, still on device. A request that was not in the previous
+        batch is skipped and gets its token from token_ids_cpu instead, via
+        _apply_pending_token_writeback. prev_sampled_token_ids aliases the
+        two-slot ring, so this must run before this step's sampling writes the
+        slot it points at.
         """
         prev_sampled = self.input_batch.prev_sampled_token_ids
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
-        if (
-            not envs.VLLM_RBLN_USE_DEVICE_TENSOR
-            or self.is_prefill
-            or prev_sampled is None
-            or prev_req_id_to_index is None
-        ):
+        if self.is_prefill or prev_sampled is None or prev_req_id_to_index is None:
             return
 
         # The batch order usually does not change, and the identity branch
@@ -1381,22 +1353,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             prev_rows.append(prev_row)
             cur_rows.append(cur_row)
         if identity:
-            num_feedback = len(prev_rows)
+            num_rows = len(prev_rows)
             # staged input_ids is a host tensor, so this is a D2H either way;
             # the intermediate buffer keeps it contiguous.
-            host_buffer = self._token_feedback_host
-            if host_buffer is None or host_buffer.shape[0] < num_feedback:
+            host_buffer = self._prev_token_host_buffer
+            if host_buffer is None or host_buffer.shape[0] < num_rows:
                 host_buffer = torch.empty(
                     prev_sampled.shape[0], dtype=prev_sampled.dtype
                 )
-                self._token_feedback_host = host_buffer
-            host = host_buffer[:num_feedback]
-            host.copy_(prev_sampled[:num_feedback, 0])
-            staged_model_inputs.input_ids[:num_feedback, 0].copy_(host)
+                self._prev_token_host_buffer = host_buffer
+            host = host_buffer[:num_rows]
+            host.copy_(prev_sampled[:num_rows, 0])
+            staged_model_inputs.input_ids[:num_rows, 0].copy_(host)
         elif prev_rows:
-            # index_put_ demands equal dtypes, unlike the copy_ above. The
-            # sampling op's width is not fixed -- `rbln::argmax` still returns
-            # int64 -- so cast to the staged buffer's.
+            # index_put_ demands equal dtypes, unlike the copy_ above, and the
+            # sampling op's output width is not fixed.
             staged_model_inputs.input_ids[cur_rows, 0] = prev_sampled[prev_rows, 0].to(
                 staged_model_inputs.input_ids.dtype
             )
@@ -1409,9 +1380,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         sampling graph's own output there makes that graph's next launch block
         on the device. Two slots, because the output thread reads one while the
         next step writes the other.
-
-        The buffers are sized for a full batch and sliced, so a step whose batch
-        shrank reuses them instead of allocating a new pair.
         """
         num_reqs = sampled_token_ids.shape[0]
         ring = self._sampled_token_ring
@@ -1439,22 +1407,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         return buf
 
     def _repair_async_output_token_ids(self) -> None:
-        """Replace the placeholder the async path left at the tail of
-        output_token_ids, before the logits processors read it.
-
-        Penalties, bad words and custom logits processors get
-        CachedRequestState.output_token_ids through sampling_metadata, and under
-        async scheduling its last entry is still the -1 written in
-        _bookkeeping_sync: the real token only lands there when the output thread
-        has run and the main thread has drained the write-back queue, which is a
-        step too late. Left alone, apply_all_penalties folds the -1 onto its pad
-        slot -- so the newest token silently stops counting -- and bad words
-        matches against a suffix that never occurred.
-
-        prev_sampled_token_ids carries exactly that token and needs no thread
-        hand-off, so pull it here. The D2H is paid only by requests that asked
-        for one of these features; a batch without them has an empty
-        output_token_ids and returns above.
+        """Replace the -1 at the tail of output_token_ids before penalties, bad
+        words and custom logits processors read it through sampling_metadata.
+        _apply_pending_token_writeback only repairs it a step later, whereas
+        prev_sampled_token_ids carries the token now, with no thread hand-off.
         """
         output_token_ids = self.input_batch.sampling_metadata.output_token_ids
         prev_sampled = self.input_batch.prev_sampled_token_ids
@@ -1542,18 +1498,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                 )
         else:
-            # Async scheduling: defer the sampled-token D2H to get_output(). Cache
-            # the tokens on-device (prev_sampled_token_ids) for next-step feedback;
-            # valid_sampled_token_ids is filled later by AsyncRBLNModelRunnerOutput.
-            # Logprobs are deferred the same way.
+            # The sampled tokens and the logprobs stay on device; the D2H is
+            # deferred to AsyncRBLNModelRunnerOutput.get_output().
             if logprobs_tensors is not None:
                 logger.warning_once(
-                    "Requesting logprobs adds host CPU to every decode step: "
-                    "gather_logprobs indexes the full vocab by the sampled ids, "
-                    "and integer eager ops have no device kernel, so it runs on "
-                    "the host. Both scheduling modes pay it, so this is not a "
-                    "reason to turn async scheduling off - only a reason not to "
-                    "read decode timings off a run that asks for logprobs."
+                    "Requesting logprobs adds host CPU work to every decode "
+                    "step, so it runs on the host."
                 )
             self._async_logprobs_tensors = logprobs_tensors
             valid_sampled_token_ids = []
@@ -1715,7 +1665,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
             if self.use_async_scheduling:
-                self._apply_async_token_feedback(staged_model_inputs, req_ids)
+                self._repair_staged_input_ids(staged_model_inputs, req_ids)
 
         # Run the model.
         # With spec decode, defer connector finalization (wait_for_save + clear

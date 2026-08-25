@@ -70,12 +70,10 @@ def test_sub_block_prefix_cache_matches_baseline(vllm_runner) -> None:
         cached.llm.generate(PROMPTS[0], SAMPLING_PARAMS)
         outputs = cached.llm.generate(PROMPTS, SAMPLING_PARAMS)
         cached_tokens = _generated_token_ids(outputs)
-        # Per request, not the vllm:prefix_cache_hits counter. LLMEngine.step()
-        # forwards a step's SchedulerStats only when that step also produced a
-        # request output, and make_stats() has already reset them, so a dropped
-        # snapshot is gone (AsyncLLM records unconditionally, so serving is
-        # unaffected). Under async scheduling the step whose snapshot carries a
-        # prefill's hits has no output, and the counter loses most of them.
+        # Per request, not the vllm:prefix_cache_hits counter: LLMEngine.step()
+        # drops a step's SchedulerStats when that step produced no request output,
+        # which under async scheduling is the step carrying a prefill's hits.
+        # Serving is unaffected - AsyncLLM records unconditionally.
         num_cached = sum(o.num_cached_tokens for o in outputs)
 
     # Sub-block hits push the total past what full-block hits alone could reach.
