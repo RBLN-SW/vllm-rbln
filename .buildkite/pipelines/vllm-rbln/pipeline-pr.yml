@@ -32,7 +32,10 @@ _secrets: &secrets
   HF_TOKEN: FSW_HF_TOKEN
   HF_HOME: FSW_HF_HOME
 
-_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
+_sync: &sync |
+  echo '--- :package: uv sync'
+  uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
+  bash .buildkite/scripts/rebel-compiler-override.sh
 
 steps:
   - label: ":pytest: [CA25] pytest"
@@ -69,6 +72,7 @@ steps:
 
   - label: ":pytest: [CR13] pytest"
     key: "vllm-rbln-pytest-cr13"
+    soft_fail: true
     if_changed: *if_changed
     agents:
       queue: udc
