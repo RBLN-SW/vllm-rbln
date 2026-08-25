@@ -140,7 +140,6 @@ from vllm_rbln.v1.worker.async_output import (
     AsyncRBLNModelRunnerOutput,
     PendingTokenWriteback,
 )
-from vllm_rbln.v1.worker._step_probe import StepProbe
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
@@ -265,7 +264,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else None
         )
         self.runtime_holder: list = []
-        self.step_probe = StepProbe()
 
         # bool(), not the field: vLLM resolves an unset value before this runs,
         # but a directly-built config (a unit test) can still carry None.
@@ -1749,10 +1747,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
             logits = logits.to(origin_dtype).to(origin_device)
 
-        with (
-            record_function_or_nullcontext("rbln_model_runner: sample"),
-            self.step_probe.region("sample"),
-        ):
+        with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._draft_token_ids = None
@@ -1840,8 +1835,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_nans_in_logits=num_nans_in_logits,
                 kv_connector_output=kv_connector_output,
             )
-
-        self.step_probe.tick()
 
         if not self.use_async_scheduling:
             return output
