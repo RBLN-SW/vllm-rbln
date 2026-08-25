@@ -61,6 +61,7 @@ steps:
   # CPU suites
   # ===========================================================================
   - label: ":pytest: tests/optimum/v1/core"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: &cpu-only-resources
       cpu:
@@ -75,6 +76,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/core --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
@@ -83,6 +85,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker/test_rebel_optimum_model_runner.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/converter"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
@@ -94,6 +97,7 @@ steps:
   # NPU suites
   # ===========================================================================
   - label: ":pytest: tests/optimum/entrypoints/openai"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -105,6 +109,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/openai --durations 0 --timeout=600"
 
   - label: ":pytest: tests/optimum/entrypoints/llm"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -116,6 +121,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/llm --durations 0"
 
   - label: ":pytest: tests/optimum/v1/models"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -127,6 +133,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/models --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker/test_sampler*.py"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -143,6 +150,7 @@ steps:
   # Optimum smoke suites -> NPU using RSD
   # ===========================================================================
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-1"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     env:
       # TODO single-threaded OpenMP works around a libgomp fork-safety deadlock in the
@@ -160,6 +168,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd1.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-4"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
@@ -171,6 +180,7 @@ steps:
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd4.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-8"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
