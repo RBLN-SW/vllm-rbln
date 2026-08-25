@@ -225,7 +225,12 @@ def finish_request(manager: KVCacheManager, request: Request):
     manager.free(request)
 
 
-def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float):
+def get_vllm_config(
+    async_scheduling=False,
+    max_num_seqs=None,
+    dtype=torch.float,
+    logprobs_mode="raw_logprobs",
+):
     max_model_len = MAX_MODEL_LEN
     max_num_batched_tokens = max(max_num_seqs, MAX_MODEL_LEN)
     scheduler_config = SchedulerConfig(
@@ -240,6 +245,7 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float
         max_model_len=max_model_len,
         dtype=dtype,
         seed=42,
+        logprobs_mode=logprobs_mode,
     )
     cache_config = CacheConfig(
         block_size=OB_SIZE,
@@ -414,8 +420,11 @@ def create_model_runner(
     max_num_seqs: int = MAX_NUM_SEQ,
     dtype: torch.dtype = torch.float,
     decoder_batch_sizes: tuple[int, ...] | None = None,
+    logprobs_mode: str = "raw_logprobs",
 ):
-    vllm_config = get_vllm_config(max_num_seqs=max_num_seqs, dtype=dtype)
+    vllm_config = get_vllm_config(
+        max_num_seqs=max_num_seqs, dtype=dtype, logprobs_mode=logprobs_mode
+    )
     with set_current_vllm_config(vllm_config, check_compile=False):
         temp_file = tempfile.mkstemp()[1]
         init_distributed_environment(

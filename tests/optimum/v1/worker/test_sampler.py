@@ -461,3 +461,22 @@ def test_sampler_logits_reshape_keeps_shape_and_stride_stable(monkeypatch):
     assert seen[0] == seen[1], (
         f"sampler input changed across stride change: {seen[0]} -> {seen[1]}"
     )
+
+
+@pytest.mark.parametrize("logprobs_mode", ["processed_logits", "processed_logprobs"])
+def test_processed_logprobs_modes_are_refused_by_the_rbln_sampler(
+    monkeypatch, logprobs_mode
+):
+    """Both modes want the distribution sampling drew from, which RBLN cannot give.
+
+    `rbln::top_k_top_p` builds and consumes it inside its compiled graph. The
+    CPU sampler has it, so the modes stay available with VLLM_RBLN_SAMPLER=0.
+    """
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    with pytest.raises(ValueError, match=logprobs_mode):
+        create_model_runner(max_num_seqs=1, logprobs_mode=logprobs_mode)
+
+    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
+    runner = create_model_runner(max_num_seqs=1, logprobs_mode=logprobs_mode)
+    assert not runner.use_rbln_sampler
+    assert runner.model_config.logprobs_mode == logprobs_mode
