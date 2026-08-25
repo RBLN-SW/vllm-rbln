@@ -25,8 +25,11 @@ import pytest
 
 import tests.native.runners as runners
 from tests.native.runners import AsyncVllmRunner, DPRequest
+from tests.native.vllm_config import DEFAULT_MODEL, local_model_path
 
-MODEL = "fake/model-for-args-only"
+# The engine is faked, so nothing loads this -- but rbln_engine_args still reads
+# the config to size the KV pool, so it has to name a model that resolves.
+MODEL = local_model_path(DEFAULT_MODEL)
 
 
 class _FakeCompletion:

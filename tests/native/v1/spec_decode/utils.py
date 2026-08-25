@@ -37,13 +37,13 @@ _DRAFT = {
 def _spec_vllm_config(method: str, num_speculative_tokens: int) -> Any:
     # Memoized: the config build (HF resolution + check_and_update_config)
     # dominates, while the proposer's own allocation is cheap.
-    from tests.native.vllm_config import make_vllm_config
+    from tests.native.vllm_config import local_model_path, make_vllm_config
 
     return make_vllm_config(
         model=TARGET_MODEL,
         speculative_config={
             "method": method,
-            "model": _DRAFT[method],
+            "model": local_model_path(_DRAFT[method]),
             "num_speculative_tokens": num_speculative_tokens,
         },
     )
@@ -97,14 +97,14 @@ _DEFAULT_COMPILE_CONTEXT = object()
 
 @functools.cache
 def _medusa_vllm_config(num_speculative_tokens: int) -> Any:
-    from tests.native.vllm_config import make_vllm_config
+    from tests.native.vllm_config import local_model_path, make_vllm_config
 
     return make_vllm_config(
         model=MEDUSA_TARGET,
         max_model_len=2048,
         speculative_config={
             "method": "medusa",
-            "model": MEDUSA_DRAFT,
+            "model": local_model_path(MEDUSA_DRAFT),
             "num_speculative_tokens": num_speculative_tokens,
         },
     )
