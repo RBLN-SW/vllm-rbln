@@ -1595,11 +1595,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
             if self.use_async_scheduling:
-                # The surrounding code is written for a run of tokens, but the
-                # async placeholder is a single -1: end_idx, and with it
-                # num_tokens_no_spec, would be short if a step ever sampled more.
-                # Speculative decoding is the case that would, and the platform
-                # refuses it under async.
+                # TODO: support spec decode with async scheduling
                 assert num_sampled_ids == 1
                 # Remember where the placeholder landed. num_tokens_no_spec moves on
                 # every step, so the position cannot be re-derived later.
