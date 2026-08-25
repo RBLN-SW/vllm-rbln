@@ -28,6 +28,7 @@ from vllm_rbln.compilation import (
     compile,
     create_compile_context,
 )
+from vllm_rbln.compilation.dispatch import Dispatcher
 
 
 @pytest.fixture(autouse=True)
@@ -174,6 +175,14 @@ class TestCompileOptions:
         monkeypatch.setattr(compiler.envs, "VLLM_DISABLE_COMPILE_CACHE", disabled)
         compile(object(), use_cache=use_cache)
         assert "mega_cache_only" not in captured_compile["options"]
+
+    def test_direct_dispatch_wraps_the_compiled_callable(self, captured_compile):
+        def target(x):
+            return x
+
+        assert isinstance(
+            compile(target, fullgraph=True, use_direct_dispatch=True), Dispatcher
+        )
 
     def test_direct_dispatch_requires_fullgraph(self, captured_compile):
         # Whatever Dynamo leaves outside the one graph is unreachable from a clone.

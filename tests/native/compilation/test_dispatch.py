@@ -107,6 +107,22 @@ class TestDispatch:
         d(x, y=torch.zeros(1))
         assert len(compiled_calls) == 2
 
+    def test_forward_context_is_part_of_the_key(self, monkeypatch):
+        # Identical inputs in a different phase must not share a graph.
+        target, _ = make_target()
+        compiled_calls: list = []
+        phase = [True]
+        monkeypatch.setattr(
+            dispatch, "_forward_context_key", lambda: (phase[0], None, False)
+        )
+        d = Dispatcher(target, recorder(compiled_calls, "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        x = torch.zeros(1, 4)
+        d(x)
+        phase[0] = False
+        d(x)
+        assert len(compiled_calls) == 2
+
     def test_no_cache_entry_keeps_using_the_compiled_callable(self, monkeypatch):
         target, _ = make_target()
         compiled_calls: list = []
@@ -209,6 +225,52 @@ class TestDispatch:
             if name not in ("__code__", "__builtins__")
             and getattr(clone, name, missing) != getattr(target, name, missing)
         ] == []
+
+
+@pytest.mark.use_device
+class TestDynamoContract:
+    """Drift alarm against Dynamo. Everything above stubs the cache lookup, so
+    what _register reads out of it and what _clone does with the bytecode is
+    checked here against the real thing -- on the eager backend, since none of
+    it depends on how the graph was lowered."""
+
+    def test_the_clone_runs_the_graph_dynamo_recorded(self):
+        compiles: list = []
+
+        def backend(gm, example_inputs):
+            compiles.append(gm)
+            return gm.forward
+
+        scale = 2.0  # a freevar, so the clone needs the target's __closure__
+
+        def target(x, y=None):
+            out = x * scale
+            return out if y is None else out + y
+
+        d = Dispatcher(target, torch.compile(target, backend=backend, fullgraph=True))
+        x = torch.ones(2, 4)
+        assert torch.equal(d(x), target(x))
+        assert torch.equal(d(x), target(x))  # the clone, not the compiled callable
+        assert len(compiles) == 1
+        clone, _annotation = next(iter(d._graphs.values()))
+        assert clone.__code__ is not target.__code__
+
+    def test_the_cache_list_head_is_the_graph_the_last_call_used(self):
+        # _register takes entries[0], which is only the graph the call it follows
+        # used while Dynamo keeps the list MRU-ordered.
+        def target(x):
+            return x + 1
+
+        compiled = torch.compile(target, backend="eager", dynamic=False, fullgraph=True)
+        entries_of = torch._dynamo.eval_frame._debug_get_cache_entry_list
+        compiled(torch.zeros(4))
+        four = entries_of(target.__code__)[0]
+        assert isinstance(four.code, types.CodeType)  # _clone's input
+        assert four.compile_id is not None  # the profiler annotation
+        compiled(torch.zeros(8))
+        assert entries_of(target.__code__)[0] is not four
+        compiled(torch.zeros(4))
+        assert entries_of(target.__code__)[0] is four
 
 
 class TestOutsideForwardContext:
