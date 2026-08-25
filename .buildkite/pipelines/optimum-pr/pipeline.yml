@@ -8,6 +8,8 @@ env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
+  UV_PROJECT_ENVIRONMENT: "/mnt/cache/venv"
+  VIRTUAL_ENV: "/mnt/cache/venv"
   NUM_INPUT_PROMPT: "1"
   VLLM_LOGGING_LEVEL: "DEBUG"
 
@@ -40,9 +42,21 @@ _if_changed: &if_changed
     - "vllm_rbln/v1/worker/rbln_*.py"
     - "vllm_rbln/v1/spec_decode/**"
 
-_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime && bash .buildkite/scripts/rebel-compiler-override.sh && echo '+++ :pytest: pytest'"
+_needs_venv: &needs_venv ["venv"]
 
 steps:
+  - label: ":package: shared venv"
+    key: "venv"
+    if_changed: *if_changed
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    command:
+      - |
+        echo '--- :package: uv sync'
+        uv sync --locked --python 3.12 --extra test --extra dev --extra runtime --no-editable --compile-bytecode
+        echo '--- :hammer: rebel-compiler-override'
+        bash .buildkite/scripts/rebel-compiler-override.sh
+
   # ===========================================================================
   # CPU suites
   # ===========================================================================
@@ -57,8 +71,8 @@ steps:
         requests: "32Gi"
         limits: "32Gi"
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/core --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker"
@@ -66,8 +80,8 @@ steps:
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker/test_rebel_optimum_model_runner.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/converter"
@@ -75,8 +89,8 @@ steps:
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/converter --durations 0"
 
   # ===========================================================================
@@ -90,8 +104,8 @@ steps:
         count: 1
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/openai --durations 0 --timeout=600"
 
   - label: ":pytest: tests/optimum/entrypoints/llm"
@@ -102,8 +116,8 @@ steps:
         count: 1
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/llm --durations 0"
 
   - label: ":pytest: tests/optimum/v1/models"
@@ -114,8 +128,8 @@ steps:
         count: 1
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/models --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker/test_sampler*.py"
@@ -126,8 +140,8 @@ steps:
         count: 8
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py --durations 0'
       - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py --durations 0'
       - 'uv run --no-sync pytest -x -vvs -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py tests/optimum/v1/worker/test_sampler_bucket.py --durations 0'
@@ -149,8 +163,8 @@ steps:
         count: 1
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd1.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-4"
@@ -161,8 +175,8 @@ steps:
         count: 4
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd4.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-8"
@@ -173,6 +187,6 @@ steps:
         count: 8
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd8.py --durations 0"
