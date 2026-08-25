@@ -17,7 +17,9 @@ Three ranges are timed with perf_counter: the pass (execute_model through
 sample_tokens), the model call, and the sampler call. The last two are reported as one
 sum, so MODEL + SAMPLE carries the same call count as E2E and the difference of the two
 means is the host overhead around the graphs. A pass is recorded only once its phase
-and its graph time are both known, which is what keeps those counts equal.
+and its graph time are both known, which is what keeps those counts equal. The graph
+runs asynchronously: the last PP rank waits for it in the sampler, the other ranks in
+the model range.
 
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
@@ -34,10 +36,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+import torch
+from vllm.distributed import get_pp_group
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
+from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 
@@ -299,6 +304,10 @@ def load_model(self, *args, **kwargs):
             return executable(*call_args, **call_kwargs)
         start = time.perf_counter()
         output = executable(*call_args, **call_kwargs)
+        if USE_DEVICE_TENSOR and not get_pp_group().is_last_rank:
+            # Without a sampler the wait would land in the worker's PP send.
+            hidden_states = next(iter(output[0].tensors.values()))
+            torch.rbln.synchronize(hidden_states.device)
         ctx.add_graph_time(time.perf_counter() - start)
         return output
 

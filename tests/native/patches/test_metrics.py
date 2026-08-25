@@ -478,19 +478,41 @@ class TestSamplerTiming:
 
 
 class TestModelExecutable:
-    def test_the_executable_is_timed_only_inside_a_pass(self, monkeypatch):
+    def _load(self, monkeypatch, *, is_last_rank: bool):
         calls: list[dict] = []
+        hidden = types.SimpleNamespace(device="rbln:1")
+        output = (types.SimpleNamespace(tensors={"hidden_states": hidden}), None, None)
 
         def fake_load_model(self, *args, **kwargs):
             def executable(**kwargs):
                 calls.append(kwargs)
-                return "logits"
+                return "logits" if is_last_rank else output
 
             self.model_executable = executable
 
         monkeypatch.setattr(pm, "_load_model", fake_load_model)
+        monkeypatch.setattr(
+            pm, "get_pp_group", lambda: types.SimpleNamespace(is_last_rank=is_last_rank)
+        )
         runner = _Runner()
         pm.load_model(runner)
+        return runner, calls
+
+    def _fake_rbln(self, monkeypatch, clock=None) -> list[str]:
+        synced: list[str] = []
+
+        def synchronize(device: str) -> None:
+            synced.append(device)
+            if clock is not None:
+                clock.advance(0.5)
+
+        rbln = types.SimpleNamespace(synchronize=synchronize)
+        monkeypatch.setattr(pm, "torch", types.SimpleNamespace(rbln=rbln))
+        monkeypatch.setattr(pm, "USE_DEVICE_TENSOR", True)
+        return synced
+
+    def test_the_executable_is_timed_only_inside_a_pass(self, monkeypatch):
+        runner, calls = self._load(monkeypatch, is_last_rank=True)
         ctx = pm._ctx(runner)
 
         assert runner.model_executable(step=1) == "logits"  # warm-up
@@ -500,6 +522,33 @@ class TestModelExecutable:
         runner.model_executable(step=2)
         assert ctx._graph_latency is not None
         assert calls == [{"step": 1}, {"step": 2}]
+
+    def test_non_last_pp_rank_waits_on_the_output_device_inside_the_model_range(
+        self, monkeypatch, clock
+    ):
+        synced = self._fake_rbln(monkeypatch, clock=clock)
+        runner, _ = self._load(monkeypatch, is_last_rank=False)
+        ctx = pm._ctx(runner)
+
+        ctx.start_pass()
+        runner.model_executable(step=1)
+        assert synced == ["rbln:1"]
+        assert ctx._graph_latency == pytest.approx(0.5)
+
+    def test_last_pp_rank_leaves_the_wait_to_the_sampler(self, monkeypatch):
+        synced = self._fake_rbln(monkeypatch)
+        runner, _ = self._load(monkeypatch, is_last_rank=True)
+
+        pm._ctx(runner).start_pass()
+        runner.model_executable(step=1)
+        assert synced == []
+
+    def test_no_wait_outside_a_pass(self, monkeypatch):
+        synced = self._fake_rbln(monkeypatch)
+        runner, _ = self._load(monkeypatch, is_last_rank=False)
+
+        runner.model_executable(step=1)
+        assert synced == []
 
 
 class TestShutdown:
