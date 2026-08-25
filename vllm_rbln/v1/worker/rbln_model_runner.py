@@ -140,6 +140,7 @@ from vllm_rbln.v1.worker.async_output import (
     AsyncRBLNModelRunnerOutput,
     PendingTokenWriteback,
 )
+from vllm_rbln.v1.worker._step_probe import StepProbe
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
@@ -264,6 +265,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else None
         )
         self.runtime_holder: list = []
+        self.step_probe = StepProbe()
 
         # bool(), not the field: vLLM resolves an unset value before this runs,
         # but a directly-built config (a unit test) can still carry None.
@@ -281,8 +283,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             self.sampler = Sampler(self.model_config.logprobs_mode)
 
-        # Async scheduling state.
+        # Async scheduling state. The sampled-token buffers live here because
+        # async scheduling is the runner's concern; the copy into them is
+        # enqueued by the sampler, next to the launch that produces the source.
         self._prev_token_host_buffer: torch.Tensor | None = None
+        self._sampled_token_ring: list[torch.Tensor] = []
+        self._ring_slot = 0
         self._async_logprobs_tensors: LogprobsTensors | None = None
         self._pending_token_writeback: PendingTokenWriteback = collections.deque()
         self._placeholder_pos: dict[str, int] = {}
@@ -1266,6 +1272,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             out = self.sampler(
                 logits=logits,
                 sampling_metadata=padded_md,
+                staging_owner=self if self.use_async_scheduling else None,
             )
             sampler_output = _depad_sampler_output(out, num_reqs)
         else:
@@ -1276,10 +1283,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
 
-        if self.use_async_scheduling:
-            sampler_output.sampled_token_ids = self._stage_sampled_tokens(
-                sampler_output.sampled_token_ids
-            )
         return sampler_output
 
     def _apply_pending_token_writeback(self) -> None:
@@ -1372,17 +1375,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             staged_model_inputs.input_ids[cur_rows, 0] = prev_sampled[prev_rows, 0].to(
                 staged_model_inputs.input_ids.dtype
             )
-
-    def _stage_sampled_tokens(self, sampled_token_ids: torch.Tensor) -> torch.Tensor:
-        """Copy the sampled tokens out of the sampling graph's own output, which
-        async holds past the step boundary and whose next launch would block.
-
-        A fresh buffer each step, not a pool: the output thread's D2H in
-        get_output() outlives the step, and a pool cannot know when it is done.
-        """
-        return torch.empty_like(sampled_token_ids).copy_(
-            sampled_token_ids, non_blocking=True
-        )
 
     def _repair_async_output_token_ids(self) -> None:
         """Replace the -1 at the tail of output_token_ids before penalties, bad
@@ -1757,7 +1749,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
             logits = logits.to(origin_dtype).to(origin_device)
 
-        with record_function_or_nullcontext("rbln_model_runner: sample"):
+        with (
+            record_function_or_nullcontext("rbln_model_runner: sample"),
+            self.step_probe.region("sample"),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._draft_token_ids = None
@@ -1845,6 +1840,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_nans_in_logits=num_nans_in_logits,
                 kv_connector_output=kv_connector_output,
             )
+
+        self.step_probe.tick()
 
         if not self.use_async_scheduling:
             return output
