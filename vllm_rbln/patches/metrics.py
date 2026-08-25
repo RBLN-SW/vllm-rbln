@@ -155,16 +155,22 @@ class _PerformanceContext:
             self._model_latency = (self._model_latency or 0.0) + latency
 
     def print_stats(self) -> None:
-        sections: dict[str, _Metrics] = {}
-        for label, table in (
-            ("MODEL + SAMPLE", self._graph),
-            ("MODEL ONLY", self._model),
-            ("SAMPLE ONLY", self._sample),
-            ("E2E", self._e2e),
+        full = (50.0, 90.0, 99.0)
+        # MODEL ONLY is only interesting where sampling is a real fraction of the
+        # pass: on decode the (rejection) sampler is heavy, but on prefill it is
+        # sub-millisecond, so MODEL ONLY (PREFILL) just duplicates MODEL + SAMPLE.
+        # Its tail latencies add little, so it reports mean/median only.
+        sections: list[tuple[str, _Metrics, tuple[float, ...]]] = []
+        for label, table, phases, percentiles in (
+            ("MODEL + SAMPLE", self._graph, tuple(_Phase), full),
+            ("MODEL ONLY", self._model, (_Phase.DECODE, _Phase.PADDED_DECODE), (50.0,)),
+            ("E2E", self._e2e, tuple(_Phase), full),
         ):
-            for phase in _Phase:
+            for phase in phases:
                 if phase in table:
-                    sections[f"{label} ({phase.value})"] = table[phase]
+                    sections.append(
+                        (f"{label} ({phase.value})", table[phase], percentiles)
+                    )
         name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
         lines = _render_metrics_report(name, sections)
         lines.extend(self._render_generation_per_token())
@@ -176,16 +182,19 @@ class _PerformanceContext:
         tokens = sum(self._tokens.get(p, 0) for p in gen)
         if tokens <= 0:
             return []
-        lines = ["GENERATION (decode + padded-decode total / tokens committed):"]
-        for label, table in (
-            ("E2E", self._e2e),
-            ("MODEL", self._model),
-            ("SAMPLE", self._sample),
-        ):
+
+        def per_token_ms(table: dict) -> float:
             total_ms = sum(sum(table[p].latencies) for p in gen if p in table) * 1000.0
-            lines.append(f"  {label:<6} per-token (ms): {total_ms / tokens:.3f}")
-        lines.append(f"  tokens committed         : {tokens}")
-        return lines
+            return total_ms / tokens
+
+        e2e = per_token_ms(self._e2e)
+        model = per_token_ms(self._model)
+        tps = 1000.0 / e2e if e2e > 0 else 0.0
+        return [
+            "GENERATION (per committed token, decode + padded-decode):",
+            f"  E2E: {e2e:.3f} ms/tok | MODEL: {model:.3f} ms/tok "
+            f"| TPS: {tps:.1f} tok/s/rank | tokens: {tokens}",
+        ]
 
 
 def _rank_tag() -> str:
@@ -217,7 +226,9 @@ def _rank_tag() -> str:
     return " ".join(parts)
 
 
-def _render_metrics(label: str, m: _Metrics) -> list[str]:
+def _render_metrics(
+    label: str, m: _Metrics, percentiles: tuple[float, ...] = (50.0, 90.0, 99.0)
+) -> list[str]:
     if m.call_count == 0:
         return [f"{label} METRICS: No data recorded"]
 
@@ -227,7 +238,7 @@ def _render_metrics(label: str, m: _Metrics) -> list[str]:
         f"  {'Mean latency (ms)':<25}: {m.mean_latency_ms():.2f}",
     ]
 
-    for key, value in m.latency_percentiles_ms().items():
+    for key, value in m.latency_percentiles_ms(percentiles).items():
         stat = "Median" if key == "p50" else key.upper()
         metric_label = f"{stat} latency (ms)"
         lines.append(f"  {metric_label:<25}: {value:.2f}")
@@ -236,7 +247,7 @@ def _render_metrics(label: str, m: _Metrics) -> list[str]:
 
 
 def _render_metrics_report(
-    name: str | None, sections: dict[str, _Metrics]
+    name: str | None, sections: list[tuple[str, "_Metrics", tuple[float, ...]]]
 ) -> list[str]:
     lines = [
         "=" * 50,
@@ -244,8 +255,8 @@ def _render_metrics_report(
         "=" * 50,
     ]
 
-    for label, metrics in sections.items():
-        lines.extend(_render_metrics(label, metrics))
+    for label, metrics, percentiles in sections:
+        lines.extend(_render_metrics(label, metrics, percentiles))
         lines.append("-" * 50)
 
     lines.append("=" * 50)
@@ -253,7 +264,9 @@ def _render_metrics_report(
 
 
 def _write_metrics_json(
-    name: str | None, rank_tag: str, sections: dict[str, _Metrics]
+    name: str | None,
+    rank_tag: str,
+    sections: list[tuple[str, "_Metrics", tuple[float, ...]]],
 ) -> None:
     if not envs.VLLM_RBLN_METRICS_DIR:
         return
@@ -264,7 +277,7 @@ def _write_metrics_json(
     payload = {
         "name": name,
         "rank": rank_tag,
-        "sections": {label: m.to_dict() for label, m in sections.items()},
+        "sections": {label: m.to_dict() for label, m, _ in sections},
     }
 
     try:
