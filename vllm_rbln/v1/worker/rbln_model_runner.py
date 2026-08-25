@@ -1341,38 +1341,37 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if self.is_prefill or prev_sampled is None or prev_req_id_to_index is None:
             return
 
-        # The batch order usually does not change, and the identity branch
-        # exploits that: one contiguous slice copy, instead of building index
-        # tensors from Python lists every step.
-        prev_rows, cur_rows, identity = [], [], True
+        prev_rows, cur_rows = [], []
         for cur_row, req_id in enumerate(req_ids):
             prev_row = prev_req_id_to_index.get(req_id)
             if prev_row is None:
-                identity = False
                 continue
-            if prev_row != cur_row:
-                identity = False
             prev_rows.append(prev_row)
             cur_rows.append(cur_row)
-        if identity:
-            num_rows = len(prev_rows)
-            # staged input_ids is a host tensor, so this is a D2H either way;
-            # the intermediate buffer keeps it contiguous.
-            host_buffer = self._prev_token_host_buffer
-            if host_buffer is None or host_buffer.shape[0] < num_rows:
-                host_buffer = torch.empty(
-                    prev_sampled.shape[0], dtype=prev_sampled.dtype
-                )
-                self._prev_token_host_buffer = host_buffer
-            host = host_buffer[:num_rows]
-            host.copy_(prev_sampled[:num_rows, 0])
-            staged_model_inputs.input_ids[:num_rows, 0].copy_(host)
-        elif prev_rows:
-            # index_put_ demands equal dtypes, unlike the copy_ above, and the
-            # sampling op's output width is not fixed.
-            staged_model_inputs.input_ids[cur_rows, 0] = prev_sampled[prev_rows, 0].to(
-                staged_model_inputs.input_ids.dtype
-            )
+        if not prev_rows:
+            return
+
+        # One contiguous D2H of the whole column, then remap on the host. An
+        # advanced-index gather or a dtype cast on prev_sampled would each be
+        # another eager op reading the ring, and the copy that refills the ring
+        # then waits on it -- most of a decode step, in the sampler call.
+        num_prev = prev_sampled.shape[0]
+        host_buffer = self._prev_token_host_buffer
+        if (
+            host_buffer is None
+            or host_buffer.shape[0] < num_prev
+            or host_buffer.dtype != prev_sampled.dtype
+        ):
+            host_buffer = torch.empty(num_prev, dtype=prev_sampled.dtype)
+            self._prev_token_host_buffer = host_buffer
+        host = host_buffer[:num_prev]
+        host.copy_(prev_sampled[:num_prev, 0])
+
+        input_ids = staged_model_inputs.input_ids
+        if cur_rows == prev_rows:
+            input_ids[: len(cur_rows), 0].copy_(host[: len(cur_rows)])
+        else:
+            input_ids[cur_rows, 0] = host[prev_rows].to(input_ids.dtype)
 
     def _repair_async_output_token_ids(self) -> None:
         """Replace the -1 at the tail of output_token_ids before penalties, bad
