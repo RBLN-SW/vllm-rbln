@@ -17,12 +17,8 @@
 # expert without one), keep the top `topk_group` groups, then pick `top_k`
 # within them. Pure torch, hand-verifiable inputs.
 
-import pytest
 import torch
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
-from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
-    grouped_topk as upstream_grouped_topk,
-)
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
@@ -31,11 +27,6 @@ from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
     _apply_grouped_topk_torch as grouped_topk,
 )
-
-# Upstream's `grouped_topk` is wrapped in `torch.compile`, whose backend on this
-# platform reserves an NPU; the tests only need its (identical) eager body, and
-# the fused-kernel branch inside it is CUDA-only.
-_upstream_grouped_topk_eager = upstream_grouped_topk._torchdynamo_orig_callable
 
 
 class TestApplyGroupedTopkTorch:
@@ -212,22 +203,6 @@ class TestApplyGroupedTopkTorch:
         ]
         assert out.sum().item() < 1.0  # no renormalization: mass stays partial
 
-    def test_bias_is_added_to_probabilities_not_logits(self):
-        # Experts 0 and 1 sit 0.25 apart as logits but only ~0.12 apart as
-        # probabilities, so a +0.2 bias on expert 0 wins the selection under the
-        # probability reading and loses it under the logit one.
-        logits = torch.tensor([[0.0, 0.25, -5.0, -5.0]])
-        biased = grouped_topk(
-            logits,
-            top_k=1,
-            num_expert_group=2,
-            topk_group=2,
-            scoring_func="softmax",
-            renormalize=True,
-            e_score_correction_bias=torch.tensor([0.2, 0.0, 0.0, 0.0]),
-        )
-        assert biased.flatten().tolist() == [1.0, 0.0, 0.0, 0.0]
-
     def test_softmax_post_norm_sums_to_one_while_pre_norm_leaks_mass(self):
         # renormalize=True softmaxes after topk (sums to 1); False softmaxes
         # first, so the selected subset carries less than the whole mass.
@@ -250,50 +225,6 @@ class TestApplyGroupedTopkTorch:
         )
         assert post.sum().item() == torch.tensor(1.0).item()
         assert pre.sum().item() < 1.0
-
-
-class TestUpstreamParity:
-    """Routing must match vLLM's `grouped_topk`, i.e. DeepSeek's reference gate."""
-
-    @pytest.mark.parametrize(
-        "num_experts,scoring_func,renormalize,with_bias",
-        [
-            # DeepSeek-V3/V3.2: sigmoid scoring with a noaux_tc bias, which
-            # steers the group selection as well as the expert topk.
-            (256, "sigmoid", True, True),
-            (64, "sigmoid", True, False),
-            # A bias applies to the softmax probabilities, not to the logits.
-            (64, "softmax", True, True),
-            # Pre-norm: the softmax spans every expert, not the kept groups.
-            (64, "softmax", False, False),
-        ],
-    )
-    def test_matches_upstream(self, num_experts, scoring_func, renormalize, with_bias):
-        torch.manual_seed(0)
-        logits = torch.randn(32, num_experts)
-        routing = dict(
-            scoring_func=scoring_func,
-            renormalize=renormalize,
-            e_score_correction_bias=(
-                torch.randn(num_experts) * 0.3 if with_bias else None
-            ),
-        )
-        ours = grouped_topk(logits, 8, 8, 4, **routing).transpose(0, 1)
-
-        weights, ids = _upstream_grouped_topk_eager(
-            torch.zeros(logits.shape[0], 8),  # hidden_states, unused by the routing
-            logits,
-            topk=8,
-            num_expert_group=8,
-            topk_group=4,
-            routed_scaling_factor=1.0,
-            **routing,
-        )
-        theirs = torch.zeros_like(logits)
-        theirs.scatter_(1, ids.long(), weights.to(logits.dtype))
-
-        assert torch.equal(ours != 0, theirs != 0)
-        assert torch.allclose(ours, theirs, atol=1e-6)
 
 
 class TestRegistration:

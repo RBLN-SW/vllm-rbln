@@ -153,6 +153,17 @@ ignore_missing_imports = true
 check_untyped_defs = true
 follow_imports = "silent"
 
+# FIXME(kblee): remove when axk2 support in upstream
+# `_skt_*.py` are byte-identical copies of SKT-AI/vllm's axk2 sources (see
+# vllm_rbln/patches/axk2/ORIGIN); they are frozen, so exclude them from
+# type-checking, mirroring the [tool.ruff] extend-exclude above.
+[[tool.mypy.overrides]]
+module = [
+    "vllm_rbln.patches.axk2._skt_model",
+    "vllm_rbln.patches.axk2._skt_config",
+]
+ignore_errors = true
+
 [tool.uv]
 # 0.11.25 changed lockfile serialization (redundant `environments` markers factored
 # out into `supported-markers`, astral-sh/uv#19933); older uv re-locking writes them
