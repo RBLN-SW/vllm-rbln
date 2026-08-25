@@ -43,7 +43,7 @@ _MINIMAX_BASE = CompileModelSpec(
         "max_num_batched_tokens": 512,
         "enable_expert_parallel": True,
     },
-    OPT_ENVS,
+    {**OPT_ENVS, "VLLM_RBLN_USE_W8A16": "1"},
     chips=REBEL,
 )
 

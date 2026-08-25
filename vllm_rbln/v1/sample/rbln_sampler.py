@@ -18,6 +18,7 @@ import rebel
 import torch
 import torch.nn as nn
 from vllm.config.model import LogprobsMode
+from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
@@ -27,12 +28,7 @@ import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
-
-# NOTE:
-# Greedy requests use a small temperature (1e-3) so softmax collapses to a near
-# one-hot at argmax. Upstream's _SAMPLING_EPS (1e-5) is too small here —
-# it pushes logits past softmax's safe exp range and overflows.
-_SAMPLING_EPS = 1e-3
+from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
 
@@ -218,30 +214,27 @@ class RBLNSampler(VLLMSampler):
 
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
-        if not sampling_metadata.all_greedy:
-            greedy_sampled = None
-        else:
-            # It runs only all_greedy is True
-            greedy_sampled = self.greedy_sample(logits, staging_owner)
-            if sampling_metadata.all_greedy:
-                processed_logprobs = None
-                if (
-                    sampling_metadata.max_num_logprobs is not None
-                    or sampling_metadata.logprob_token_ids
-                ):
-                    if logprobs_mode == "processed_logits":
-                        processed_logprobs = logits
-                    elif logprobs_mode == "processed_logprobs":
-                        processed_logprobs = self.compute_logprobs(logits)
-                return greedy_sampled, processed_logprobs
+        if sampling_metadata.all_greedy:
+            # Upstream vLLM keeps this result to merge with the random one via
+            # `torch.where`. vLLM RBLN has no merge step: a mixed batch sends its
+            # greedy rows through the random-sampling path with top_k=1, so the op
+            # can only draw their argmax.
+            processed_logprobs = None
+            if (
+                sampling_metadata.max_num_logprobs is not None
+                or sampling_metadata.logprob_token_ids
+            ):
+                if logprobs_mode == "processed_logits":
+                    processed_logprobs = logits
+                elif logprobs_mode == "processed_logprobs":
+                    processed_logprobs = self.compute_logprobs(logits)
+            return self.greedy_sample(logits, staging_owner), processed_logprobs
 
         assert sampling_metadata.temperature is not None
 
         temperature = sampling_metadata.temperature
         if not sampling_metadata.all_random:
-            temperature = torch.where(
-                temperature < _SAMPLING_EPS, _SAMPLING_EPS, temperature
-            )
+            temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
 
         argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
         # if argmax_invariant processors are active, apply temperature scaling
@@ -259,23 +252,22 @@ class RBLNSampler(VLLMSampler):
         for processor in argmax_invariant:
             logits = processor.apply(logits)
 
+        k, p = build_op_top_k_top_p(
+            sampling_metadata,
+            logits.shape[0],
+            logits.shape[-1],
+            logits.device,
+        )
         # Apply temperature and top_k and/or top_p.
         random_sampled, processed_logprobs = self.topk_topp_sampler(
             logits,
             sampling_metadata.generators,
             temperature,
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
+            k,
+            p,
             staging_owner,
         )
 
-        assert greedy_sampled is None, (
-            "Upstream vLLM runs greedy and random sampling "
-            "separately and merges the results, "
-            "but vLLM RBLN processes greedy and random requests together: "
-            "greedy requests are routed through the random-sampling path "
-            "with a very small temperature value."
-        )
         return random_sampled, processed_logprobs
 
     def forward(

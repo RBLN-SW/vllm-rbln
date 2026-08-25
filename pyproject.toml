@@ -45,7 +45,7 @@ dependencies = [
     "torchaudio",
     "torchcodec",
     "torch-rbln~=0.4.0rc0 ; platform_machine == 'x86_64'",
-    "optimum-rbln>=0.11.2a1",
+    "optimum-rbln>=0.11.2a4",
 ]
 
 [project.optional-dependencies]
@@ -70,7 +70,7 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler~=0.11.2.dev256",
+    "rebel-compiler~=0.11.3.dev4",
 ]
 
 

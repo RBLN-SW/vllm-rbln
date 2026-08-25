@@ -2,12 +2,14 @@
 
 notify:
 - github_commit_status:
-    context: "[OB] vllm-rbln optimum tests"
+    context: "[OB] vLLM-RBLN Optimum pytest"
 
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
   UV_INDEX_STRATEGY: "unsafe-best-match"
+  UV_PROJECT_ENVIRONMENT: "/mnt/cache/venv"
+  VIRTUAL_ENV: "/mnt/cache/venv"
   NUM_INPUT_PROMPT: "1"
   VLLM_LOGGING_LEVEL: "DEBUG"
 
@@ -19,13 +21,47 @@ _secrets: &secrets
   HF_TOKEN: HF_TOKEN
   HF_HOME: HF_HOME
 
-_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime && echo '+++ :pytest: pytest'"
+# Run a step only when the PR touches a path that can affect the optimum path.
+# Honored solely when the pipeline is uploaded with --git-diff-base (see
+# .buildkite/pr.yml); without that flag every step runs, as it did before.
+# The exclude list is deliberately conservative -- it drops only paths that are
+# native-path-only, since over-including merely wastes a run while
+# over-excluding would silently skip a suite that should have caught a break.
+_if_changed: &if_changed
+  include:
+    - ".buildkite/**"
+    - "tests/optimum/**"
+    - "vllm_rbln/**"
+    - "pyproject.toml"
+    - "uv.lock"
+  exclude:
+    - ".buildkite/pipelines/vllm-rbln/**"
+    - "tests/native/**"
+    - "vllm_rbln/patches/**"
+    - "vllm_rbln/compilation/**"
+    - "vllm_rbln/v1/worker/rbln_*.py"
+    - "vllm_rbln/v1/spec_decode/**"
+
+_needs_venv: &needs_venv ["venv"]
 
 steps:
+  - label: ":package: shared venv"
+    key: "venv"
+    if_changed: *if_changed
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    command:
+      - |
+        echo '--- :package: uv sync'
+        uv sync --locked --python 3.12 --extra test --extra dev --extra runtime --no-editable --compile-bytecode
+        echo '--- :hammer: rebel-compiler-override'
+        bash .buildkite/scripts/rebel-compiler-override.sh
+
   # ===========================================================================
   # CPU suites
   # ===========================================================================
   - label: ":pytest: tests/optimum/v1/core"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: &cpu-only-resources
       cpu:
@@ -35,71 +71,77 @@ steps:
         requests: "32Gi"
         limits: "32Gi"
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/core --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker/test_rebel_optimum_model_runner.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/converter"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources: *cpu-only-resources
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/converter --durations 0"
 
   # ===========================================================================
   # NPU suites
   # ===========================================================================
   - label: ":pytest: tests/optimum/entrypoints/openai"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
         count: 1
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/openai --durations 0 --timeout=600"
 
   - label: ":pytest: tests/optimum/entrypoints/llm"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
         count: 1
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/entrypoints/llm --durations 0"
 
   - label: ":pytest: tests/optimum/v1/models"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
         count: 1
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/models --durations 0"
 
   - label: ":pytest: tests/optimum/v1/worker/test_sampler*.py"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
         count: 8
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py --durations 0'
       - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py --durations 0'
       - 'uv run --no-sync pytest -x -vvs -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py tests/optimum/v1/worker/test_sampler_bucket.py --durations 0'
@@ -108,6 +150,7 @@ steps:
   # Optimum smoke suites -> NPU using RSD
   # ===========================================================================
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-1"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     env:
       # TODO single-threaded OpenMP works around a libgomp fork-safety deadlock in the
@@ -120,28 +163,30 @@ steps:
         count: 1
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd1.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-4"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
         count: 4
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd4.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/smoke rsd-8"
+    if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
       npu:
         count: 8
         product: ["RBLN-CA22", "RBLN-CA25"]
     secrets: *secrets
+    depends_on: *needs_venv
     command:
-      - *sync
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/smoke/test_rsd8.py --durations 0"

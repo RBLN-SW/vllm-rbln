@@ -154,7 +154,7 @@ def summarize(
     degraded = bool(skipped)
     lines = []
     for launch, row in rows:
-        cells = [launch]
+        cells = [launch, str(row.get("_benchmark_name", "--"))]
         for key, _, fmt in _METRICS:
             value = _num(row, key)
             cells.append(fmt(value) if value is not None else "--")
@@ -166,14 +166,14 @@ def summarize(
             degraded = True
         lines.append("| " + " | ".join(cells) + " |")
 
-    titles = ["launch", *(title for _, title, _ in _METRICS), "done"]
+    titles = ["launch", "bench", *(title for _, title, _ in _METRICS), "done"]
     body = [
         f"#### {target}" + (f" -- {chip}" if chip else ""),
         "",
         " · ".join(f"{k} {v}" for k, v in shared.items()),
         "",
         "| " + " | ".join(titles) + " |",
-        "|:--" + "|--:" * (len(titles) - 1) + "|",
+        "|:--|:--" + "|--:" * (len(titles) - 2) + "|",
         *lines,
     ]
     if skipped:
@@ -255,7 +255,9 @@ def run_target(path: Path, out_dir: Path, run_id: str, passthrough: list[str]) -
     except Exception as exc:  # noqa: BLE001
         print(f"  summary: not built ({type(exc).__name__}: {exc})")
     else:
-        publish_summary("perf", out_dir / run_id / name, body, degraded=degraded)
+        publish_summary(
+            "perf", out_dir / run_id / name, body, chip=chip, degraded=degraded
+        )
     return status
 
 
