@@ -62,17 +62,6 @@ class RBLNDFlashProposer(DFlashProposer):
     draft_has_moe = False
 
     @staticmethod
-    def _require_single_sequence(scheduler_config) -> None:
-        """DFlash loses acceptance on a wider decode batch. Cause unidentified."""
-        if scheduler_config.max_num_seqs > 1:
-            raise NotImplementedError(
-                "DFlash speculative decoding requires --max-num-seqs 1; got "
-                f"{scheduler_config.max_num_seqs}. A wider decode batch "
-                "silently collapses acceptance to below the no-speculation "
-                "baseline."
-            )
-
-    @staticmethod
     def _require_dense_drafter(draft_model) -> None:
         """Fused MoE reads the token dimension `_run_query_pass` does not pad."""
         if any(isinstance(module, MoERunner) for module in draft_model.modules()):
@@ -84,8 +73,6 @@ class RBLNDFlashProposer(DFlashProposer):
             )
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
-        # Checked before the base class does any work.
-        self._require_single_sequence(vllm_config.scheduler_config)
         if (
             vllm_config.speculative_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL

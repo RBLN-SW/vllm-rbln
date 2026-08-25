@@ -32,6 +32,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.spec_decode.dflash import DFlashProposer
 
 import vllm_rbln.v1.spec_decode.dflash as dflash_module
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
@@ -190,21 +191,37 @@ class TestContextWriteContiguity:
         assert offsets == [1020, 1021, 1022, 1023, 0, 1]
 
 
-class TestSingleSequenceGuard:
-    """`--max-num-seqs > 1` costs no errors and no output damage, only
-    acceptance, which drops below the no-speculation baseline on the same
-    prompts. The cause is not identified; the point here is that it fails
-    loudly rather than quietly."""
+class TestSchedulerCapacity:
+    @pytest.mark.parametrize("max_num_seqs", [1, 2, 4, 16])
+    def test_initialization_accepts_any_scheduler_capacity(
+        self, monkeypatch, max_num_seqs
+    ):
+        """The configured capacity may exceed the number of active requests."""
 
-    def test_one_sequence_is_allowed(self):
-        RBLNDFlashProposer._require_single_sequence(SimpleNamespace(max_num_seqs=1))
+        def initialize_base(proposer, **_kwargs):
+            proposer.arange = torch.arange(NUM_SPEC + 1)
+            proposer.dflash_causal = False
 
-    @pytest.mark.parametrize("max_num_seqs", [2, 4, 16])
-    def test_a_wider_batch_is_refused(self, max_num_seqs):
-        with pytest.raises(NotImplementedError, match="max-num-seqs 1"):
-            RBLNDFlashProposer._require_single_sequence(
-                SimpleNamespace(max_num_seqs=max_num_seqs)
-            )
+        monkeypatch.setattr(DFlashProposer, "__init__", initialize_base)
+        monkeypatch.setattr(dflash_module, "USE_DEVICE_TENSOR", True)
+        monkeypatch.setattr(dflash_module.envs, "VLLM_RBLN_COMPILE_MODEL", True)
+        vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+            speculative_config=SimpleNamespace(
+                enforce_eager=False,
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(layer_types=[], sliding_window=None)
+                ),
+            ),
+        )
+
+        proposer = RBLNDFlashProposer(
+            vllm_config=vllm_config,
+            device=torch.device("cpu"),
+        )
+
+        assert proposer.runner is None
+        assert proposer.arange_cpu.shape == (NUM_SPEC + 1,)
 
 
 class TestRedirectTarget:
@@ -276,18 +293,13 @@ class TestPlatformRefusals:
     discards it."""
 
     @staticmethod
-    def _config(max_num_seqs=1, enforce_eager=False):
+    def _config(enforce_eager=False):
         return SimpleNamespace(
-            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
             speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
         )
 
     def _construct(self):
         return RBLNDFlashProposer(self._config(), torch.device("cpu"))
-
-    def test_a_wider_batch_is_refused_at_construction(self):
-        with pytest.raises(NotImplementedError, match="max-num-seqs 1"):
-            RBLNDFlashProposer(self._config(max_num_seqs=4), torch.device("cpu"))
 
     def test_eager_is_refused(self):
         with pytest.raises(NotImplementedError, match="cannot run eager"):
