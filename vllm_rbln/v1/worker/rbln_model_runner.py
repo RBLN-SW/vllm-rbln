@@ -136,7 +136,10 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
-from vllm_rbln.v1.worker.async_output import AsyncRBLNModelRunnerOutput
+from vllm_rbln.v1.worker.async_output import (
+    AsyncRBLNModelRunnerOutput,
+    PendingTokenWriteback,
+)
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
@@ -279,11 +282,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.sampler = Sampler(self.model_config.logprobs_mode)
 
         # Async scheduling state.
-        self._prev_token_host_buffer = None
+        self._prev_token_host_buffer: torch.Tensor | None = None
         self._sampled_token_ring: list[torch.Tensor] = []
         self._ring_slot = 0
-        self._async_logprobs_tensors = None
-        self._pending_token_writeback: collections.deque = collections.deque()
+        self._async_logprobs_tensors: LogprobsTensors | None = None
+        self._pending_token_writeback: PendingTokenWriteback = collections.deque()
         self._placeholder_pos: dict[str, int] = {}
 
         # Lazy initialization

@@ -19,10 +19,15 @@ get_output() on the worker's async output thread, once the next forward is
 already in flight.
 """
 
-from typing import Any
+from collections import deque
 
 import torch
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
+
+# Queued by get_output() on the output thread, drained by the main thread in
+# RBLNModelRunner._apply_pending_token_writeback: the step's request ids, its
+# sampled token ids per request, and where each request's placeholder landed.
+PendingTokenWriteback = deque[tuple[list[str], list[list[int]], dict[str, int]]]
 
 
 class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
@@ -31,10 +36,10 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         sampled_token_ids: torch.Tensor,
         invalid_req_indices: list[int],
-        pending_token_writeback: Any = None,
-        req_ids: list[str] | None = None,
-        placeholder_pos: dict[str, int] | None = None,
-        logprobs_tensors: Any = None,
+        pending_token_writeback: PendingTokenWriteback,
+        req_ids: list[str],
+        placeholder_pos: dict[str, int],
+        logprobs_tensors: LogprobsTensors | None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -78,10 +83,9 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # replaced by the real tokens, but not from this thread: the main thread
         # reads token_ids_cpu in _preprocess. Queue the tokens instead and let the
         # main thread apply them at the top of its next step.
-        if self._pending_token_writeback is not None and self._req_ids is not None:
-            self._pending_token_writeback.append(
-                (self._req_ids, valid_sampled_token_ids, self._placeholder_pos)
-            )
+        self._pending_token_writeback.append(
+            (self._req_ids, valid_sampled_token_ids, self._placeholder_pos)
+        )
 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
