@@ -127,6 +127,7 @@ class RBLNFlashAttentionMetadata:
         # path(VLLM_RBLN_USE_CUSTOM_KERNEL=1), so we explicitly cast the input to a
         # supported dtype here. This can be removed when the triton-rbln kernel path
         # performs the same dtype conversion.
+
         if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
             return
 
