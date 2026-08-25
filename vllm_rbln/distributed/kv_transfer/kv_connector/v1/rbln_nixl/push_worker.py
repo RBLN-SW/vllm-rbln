@@ -172,6 +172,15 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # Per-shard lists exist exactly for peers serving part of what a
         # whole-engine handle covers; without any, the base describes them all.
         if not self._overlapping_ranks.get(engine_id):
+            # NOTE(RBLN): the base aligns by truncating the longer list and
+            # keeping its HEAD -- the wrong end (see _trim_to_consumer_blocks)
+            # -- and the lengths match either way so nothing catches it. Trim
+            # first, only where the base's expansion of the remote list is the
+            # identity: past that the two lengths are not the same unit.
+            if remote_info.remote_physical_blocks_per_logical == 1:
+                meta.local_physical_block_ids = self._trim_to_consumer_blocks(
+                    meta.local_physical_block_ids, meta.remote.block_ids
+                )
             return super()._xfer_blocks_for_req(req_id, meta)
 
         block_size_ratio = self.transfer_topo.block_size_ratio(

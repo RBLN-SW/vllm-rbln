@@ -683,3 +683,61 @@ class TestTheThreeListsAgree:
         # And that length is the fan-out times what one copy would have needed.
         assert len(remote) % fanout == 0
         assert (cls is RblnNixlPushConnectorWorker) == (fanout == 2)
+
+
+class TestDelegatedRouteAlignment:
+    """A peer a whole-engine handle already describes is written by the base,
+    whose alignment truncates the longer block list and keeps its head. Under a
+    partial prefix hit the consumer registered its tail, so the head is wrong."""
+
+    @staticmethod
+    def _worker(*, blocks_per_logical=1):
+        w = TestPerShardWrite._writing_worker(ranks=1)
+        w._overlapping_ranks = {}  # nothing narrowed: the base's route
+        w.transfer_topo.get_engine_info.return_value = MagicMock(
+            remote_tp_size=1,
+            remote_block_size=16,
+            remote_physical_blocks_per_logical=blocks_per_logical,
+        )
+        return w
+
+    @staticmethod
+    def _local_reaching_base(monkeypatch, worker, meta):
+        seen: dict[str, tuple] = {}
+        monkeypatch.setattr(
+            NixlPushConnectorWorker,
+            "_xfer_blocks_for_req",
+            lambda self, req_id, meta: seen.update(local=meta.local_physical_block_ids),
+        )
+        worker._xfer_blocks_for_req("r0", meta)
+        return seen["local"]
+
+    def test_the_producer_tail_is_what_reaches_the_base(self, monkeypatch):
+        # The consumer kept one block: its cache covered everything before it.
+        local = self._local_reaching_base(
+            monkeypatch, self._worker(), TestPerShardWrite._meta(([5, 6, 7],), ([9],))
+        )
+
+        assert local == ([7],)
+
+    def test_an_expanded_remote_list_is_left_to_the_base(self, monkeypatch):
+        # Guard: past the identity expansion the two lengths count different
+        # things, so trimming one against the other would be arithmetic on
+        # unlike units.
+        local = self._local_reaching_base(
+            monkeypatch,
+            self._worker(blocks_per_logical=2),
+            TestPerShardWrite._meta(([5, 6, 7],), ([9],)),
+        )
+
+        assert local == ([5, 6, 7],)
+
+    def test_without_a_prefix_hit_nothing_moves(self, monkeypatch):
+        # Guard: equal lists are the ordinary case and must pass through.
+        local = self._local_reaching_base(
+            monkeypatch,
+            self._worker(),
+            TestPerShardWrite._meta(([5, 6, 7],), ([1, 2, 3],)),
+        )
+
+        assert local == ([5, 6, 7],)
