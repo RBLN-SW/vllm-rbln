@@ -81,25 +81,16 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     return base * num_attn_module + sub
 
 
-def _dsa_indexer_cache_is_fp8() -> bool:
-    from vllm.config import get_current_vllm_config
-
-    try:
-        cache_dtype = get_current_vllm_config().cache_config.cache_dtype
-    except Exception:
-        return False
-    return bool(cache_dtype) and cache_dtype.startswith("fp8")
-
-
-def num_attn_module(model_config) -> int:
+def num_attn_module(model_config, cache_dtype) -> int:
     hf_config = model_config.hf_config
     if getattr(hf_config, "model_type", None) == "longcat_flash":
         return 2
     text_config = getattr(model_config, "hf_text_config", hf_config)
-    # A DSA model puts the lightning-indexer key cache next to MLA:
-    # 2 modules, or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
+    # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
+    # or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
-        return 3 if _dsa_indexer_cache_is_fp8() else 2
+        is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
+        return 3 if is_fp8 else 2
     return 1
 
 

@@ -98,7 +98,6 @@ from vllm.v1.worker.utils import (
     KVCacheGroupSpec,
     KVCacheSpec,
     add_kv_sharing_layers_to_kv_cache_groups,
-    bind_kv_cache,
 )
 
 from vllm_rbln import envs
@@ -2640,20 +2639,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         from vllm_rbln.patches.models_utils import rbln_num_attn_module
 
-        num_attn_module = rbln_num_attn_module(self.model_config)
+        num_attn_module = rbln_num_attn_module(
+            self.model_config, self.cache_config.cache_dtype
+        )
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
             num_attn_module,
         )
-        bind_kv_cache(
-            kv_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_caches,
-            num_attn_module,
-        )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
-        assert len(self.kv_cache_names) == len(self.kv_caches)
+        self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
+        forward_context = self.compilation_config.static_forward_context
+        for layer_name, kv_cache in kv_caches.items():
+            forward_context[layer_name].kv_cache = kv_cache
 
         if (
             not USE_DEVICE_TENSOR
