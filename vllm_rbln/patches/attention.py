@@ -16,10 +16,18 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.attention.attention import Attention
+from vllm.model_executor.layers.attention.attention import (
+    Attention,
+    set_default_quant_scales,
+    should_load_quant_weights,
+)
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+)
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
@@ -213,6 +221,48 @@ def patched_attention_forward(
         output = attention_original_forward(self, query, key, value, output_shape)
         return output.view(output_shape)
     return attention_original_forward(self, query, key, value, output_shape)
+
+
+@register_patch(
+    target="vllm.model_executor.layers.attention.attention._init_kv_cache_quant",
+    reason=(
+        "Upstream keys its fp8_e5m2 KV-cache gate on the checkpoint format: "
+        "every quantized checkpoint is rejected unless it is a weight-only "
+        "compressed-tensors one, so an fp8-weight checkpoint that declares no "
+        "KV scales (quant_method=fp8, no kv_cache_scheme) cannot use e5m2 at "
+        "all. The hazard the gate names is a checkpoint that stores KV scales "
+        "calibrated for e4m3; RBLN's flash causal op receives the cache dtype "
+        "and the k/v scales explicitly and assumes nothing about the format "
+        "the scales were calibrated for, so the gate is keyed on whether the "
+        "checkpoint declares KV scales instead. Upstream offers no hook to "
+        "relax the gate per platform, and vllm-project/vllm#45040 kept the "
+        "format clause on purpose. TODO(vllm): delete once upstream keys the "
+        "gate on kv_cache_scheme alone."
+    ),
+)
+def patched_init_kv_cache_quant(
+    layer: Attention, quant_config: QuantizationConfig | None, prefix: str
+) -> None:
+    set_default_quant_scales(layer, register_buffer=True)
+    layer._o_scale_float = None
+
+    quant_method = (
+        quant_config.get_quant_method(layer, prefix=prefix) if quant_config else None
+    )
+    if should_load_quant_weights(quant_method):
+        assert isinstance(quant_method, BaseKVCacheMethod)
+        # Upstream's own comment defines the hazard as a checkpoint that
+        # stores fp8 KV scales, which a config declares via kv_cache_scheme.
+        if (
+            layer.kv_cache_dtype == "fp8_e5m2"
+            and getattr(quant_method.quant_config, "kv_cache_scheme", None) is not None
+        ):
+            raise ValueError(
+                "fp8_e5m2 kv-cache is not supported with a checkpoint that "
+                "declares a kv_cache_scheme."
+            )
+        layer.quant_method = quant_method
+        layer.quant_method.create_weights(layer)
 
 
 @register_patch(
