@@ -30,6 +30,12 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.worker.utils import (
+    extract_layer_index,
+)
+from vllm_rbln.v1.worker.utils import (
+    num_attn_module as rbln_num_attn_module,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -44,19 +50,18 @@ def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
     RBLN resolves each layer's KV cache from attention metadata (a graph
     input) by index; that index must be relative to the layers that live on
     this pipeline-parallel rank, so subtract the rank's starting layer.
-    """
-    from vllm_rbln.patches.models_utils import (
-        rbln_extract_layer_index,
-        rbln_num_attn_module,
-    )
 
+    Models with more than one attention module per decoder layer (e.g.
+    DeepSeek-V3.2, whose lightning indexer adds a second KV-cache module per
+    layer) index each module as ``base_layer * num_attn_module + sub``
+    """
     # NOTE(RBLN): Consider PP
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
     num_attn_module = (
         rbln_num_attn_module(model_config) if model_config is not None else 1
     )
-    self.layer_index = rbln_extract_layer_index(self.layer_name, num_attn_module)
+    self.layer_index = extract_layer_index(self.layer_name, num_attn_module)
     if model_config is not None:
         start, _ = model_config.get_layers_start_end_indices(
             vllm_config.parallel_config

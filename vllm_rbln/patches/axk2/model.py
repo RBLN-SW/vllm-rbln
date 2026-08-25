@@ -24,7 +24,6 @@ def _rbln_indexer_forward(
     positions: torch.Tensor,
     rotary_emb,
 ) -> torch.Tensor:
-
     batch_size, seq_len, _ = hidden_states.shape
 
     # q [B, S, n_head, head_dim]
@@ -79,7 +78,7 @@ def _rbln_indexer_forward(
         k_cache,
         softmax_scale,
         weights,
-        attn_metadata.seq_lens,
+        attn_metadata.seq_lens.to(torch.int32),
         attn_metadata.block_tables,
         self.topk_tokens,
         scale_cache,
@@ -92,7 +91,6 @@ def _rbln_gated_mla_forward(
     hidden_states: torch.Tensor,
     llama_4_scaling: torch.Tensor | None = None,
 ) -> torch.Tensor:
-
     assert not self.dsv3_pad, (
         "axk2 DSv3 dim padding is not supported on RBLN yet "
         f"(native kv_lora={self.native_kv_lora_rank} vs {self.kv_lora_rank}, "

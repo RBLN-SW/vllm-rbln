@@ -67,12 +67,16 @@ def patched_get_mla_prefill_backend(vllm_config) -> type[_RBLNNoOpMLAPrefillBack
         "sparse_attn_deepseek_mla fp8 kernel. The compiler routes fp8 vs bf16 by "
         "the cache channel width (768 != 576), so allocate head_size=768 int8. "
         "cache_dtype_str stays 'auto' so the page size is the plain "
-        "head_size*itemsize (768B), not the upstream fp8_ds_mla 656B layout."
+        "head_size*itemsize (768B), not the upstream fp8_ds_mla 656B layout. "
+        "Only the sparse (DSA) path packs this way; a dense MLA layer keeps the "
+        "upstream spec even under --kv-cache-dtype fp8, since its kernel cannot "
+        "read the packed row."
     ),
 )
 def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
     cache_dtype = vllm_config.cache_config.cache_dtype
-    if cache_dtype and cache_dtype.startswith("fp8"):
+    use_sparse = getattr(self, "use_sparse", False)
+    if use_sparse and cache_dtype and cache_dtype.startswith("fp8"):
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
         impl = getattr(self, "impl", None)

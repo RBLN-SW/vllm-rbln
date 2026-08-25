@@ -128,6 +128,9 @@ class RBLNFlashAttentionMetadata:
         # supported dtype here. This can be removed when the triton-rbln kernel path
         # performs the same dtype conversion.
 
+        if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            return
+
         self.seq_lens = self.seq_lens.to(torch.int32)
         self.cache_seq_lens = (
             self.cache_seq_lens.to(torch.int32) if self.cache_seq_lens else None
