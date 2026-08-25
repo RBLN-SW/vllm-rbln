@@ -408,8 +408,8 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         }
         return kwargs
 
+    @staticmethod
     def pad_cache_slot_ids(
-        self,
         cache_slot_ids: torch.Tensor,
         padded_batch_size: int,
     ) -> torch.Tensor:
