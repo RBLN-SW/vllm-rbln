@@ -46,16 +46,24 @@ def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
     input) by index; that index must be relative to the layers that live on
     this pipeline-parallel rank, so subtract the rank's starting layer.
     """
-    self.layer_index = extract_layer_index(self.layer_name)
+    raw_layer_index = extract_layer_index(self.layer_name)
 
     # NOTE(RBLN): Consider PP
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
-    if model_config is not None:
-        start, _ = model_config.get_layers_start_end_indices(
-            vllm_config.parallel_config
-        )
-        self.layer_index -= start
+    if model_config is None:
+        self.layer_index = raw_layer_index
+        return
+
+    start, end = model_config.get_layers_start_end_indices(vllm_config.parallel_config)
+    total_num_hidden_layers = model_config.get_total_num_hidden_layers()
+    if raw_layer_index >= total_num_hidden_layers:
+        # NOTE(RBLN): MTP/nextn layers are named past the target's layer count
+        # (mtp_start_layer_idx == num_hidden_layers), so their KV cache sits
+        # right after the target layers in the compacted per-rank cache list.
+        self.layer_index = (end - start) + (raw_layer_index - total_num_hidden_layers)
+    else:
+        self.layer_index = raw_layer_index - start
 
 
 # NOTE(RBLN) - To represent kv cache as model input,
