@@ -28,7 +28,6 @@ class RBLNDeepseekV32IndexerBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        # vLLM 0.22: AttentionBackend requires get_name (abstract).
         return "RBLN_DEEPSEEK_V32_INDEXER"
 
     @staticmethod
@@ -37,7 +36,6 @@ class RBLNDeepseekV32IndexerBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        # TODO(kblee): check no quant in k indexer cache
         return [128]
 
     @staticmethod

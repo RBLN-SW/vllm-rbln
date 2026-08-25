@@ -65,13 +65,6 @@ def rbln_extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     return base * num_attn_module + sub
 
 
-# ``vllm.v1.worker.utils`` binds ``extract_layer_index`` into its own namespace
-# with a module-level ``from ... import``, so patching the defining module alone
-# leaves ``bind_kv_cache`` on the upstream implementation whenever that module
-# was imported before this one -- which is what happens with data parallelism,
-# where the parent process imports the worker stack before forking. Rebind the
-# snapshot so the collapse of a DeepSeek-V3.2 layer's MLA and indexer caches
-# onto one index (-> NotImplementedError) cannot come back on import order.
 rbln_extract_layer_index = register_patch(
     target="vllm.v1.worker.utils.extract_layer_index",
     reason=(
@@ -98,9 +91,8 @@ def rbln_num_attn_module(model_config) -> int:
     if getattr(hf_config, "model_type", None) == "longcat_flash":
         return 2
     text_config = getattr(model_config, "hf_text_config", hf_config)
-    # TODO(kblee): check general?
-    # DeepSeek-V3.2 (``index_topk`` in the text config): each decoder layer has
-    # MLA + the lightning-indexer key cache, sclae (3 modules).
+    # A DSA model puts the lightning-indexer key cache next to MLA:
+    # 2 modules, or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
         return 3 if _dsa_indexer_cache_is_fp8() else 2
     return 1
