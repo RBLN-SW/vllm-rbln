@@ -1348,9 +1348,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return
 
         prev_rows, cur_rows = [], []
+        any_skipped = False
         for cur_row, req_id in enumerate(req_ids):
             prev_row = prev_req_id_to_index.get(req_id)
             if prev_row is None:
+                any_skipped = True
                 continue
             prev_rows.append(prev_row)
             cur_rows.append(cur_row)
@@ -1374,7 +1376,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         host.copy_(prev_sampled[:num_prev, 0])
 
         input_ids = staged_model_inputs.input_ids
-        if cur_rows == prev_rows:
+        # Equal row lists are not the identity prefix: a skipped request leaves a
+        # hole, and [0, 2, 3] written contiguously lands on rows 0, 1, 2.
+        if not any_skipped and cur_rows == prev_rows:
             input_ids[: len(cur_rows), 0].copy_(host[: len(cur_rows)])
         else:
             input_ids[cur_rows, 0] = host[prev_rows].to(input_ids.dtype)
