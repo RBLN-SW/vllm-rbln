@@ -529,20 +529,9 @@ def _apply_grouped_topk_torch(
     elif scoring_func == "softmax" and (
         e_score_correction_bias is not None or not renormalize
     ):
-        # Both of these need the probabilities up front: the reference gate adds
-        # the correction bias to the *probabilities*, and the pre-norm path
-        # (renormalize=False) softmaxes over *all* experts rather than over the
-        # kept groups only. The renormalized no-bias path instead softmaxes after
-        # the topk -- equivalent there, and the op order the fused kernel
-        # expects.
         router_logits_2d = F.softmax(router_logits_2d, dim=-1)
     grouped = router_logits_2d.reshape(T, G, epg)
 
-    # Step 2: Score each group.
-    # DeepSeek's `noaux_tc` gate makes every *selection* (groups and experts) on
-    # the biased scores and takes the routing weights from the unbiased ones.
-    # Without a bias the reference (and vLLM's `grouped_topk`) scores a group by
-    # its best expert.
     if e_score_correction_bias is not None:
         biased = (router_logits_2d + e_score_correction_bias.unsqueeze(0)).reshape(
             T, G, epg
@@ -574,13 +563,6 @@ def _apply_grouped_topk_torch(
         grouped_masked = minus_inf.scatter(1, idx_expanded, gathered)  # [T, G, epg]
         # [T, G, epg] -> [G, epg, T] -> [E, T]
         scores_t = grouped_masked.permute(1, 2, 0).reshape(E, T)
-
-        # The bias is applied a second time here instead of reusing `biased`
-        # above: the compiler collapses add(data, bias) -> topk -> gather(*that
-        # same* data, indices) -> divide by clip(sum) -> scatter_elements(zeros,
-        # ...) into one `contrib_top_k_routing` op. A topk over the pre-masked
-        # `biased`, or weights gathered from any tensor other than `scores_t`,
-        # leaves the whole block unfused.
         scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)
         _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
         topk_weights = scores_t.gather(0, selected_experts)
