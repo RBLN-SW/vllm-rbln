@@ -347,7 +347,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
-                use_async_scheduling=self.use_async_scheduling,
             )
             logger.info("Using RBLN sampler.")
         else:
@@ -356,6 +355,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Host hop for the token feedback; see the identity branch in
         # _apply_async_token_feedback.
         self._token_feedback_host = None
+        # Sampled tokens handed to the deferred output; see _stage_sampled_tokens.
+        self._sampled_token_ring: list[torch.Tensor] = []
+        self._ring_slot = 0
         # Logprobs handed to the deferred output; see the async branch of
         # _bookkeeping_sync.
         self._async_logprobs_tensors = None
@@ -1344,14 +1346,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits=logits,
                 sampling_metadata=padded_md,
             )
-            return _depad_sampler_output(out, num_reqs)
+            sampler_output = _depad_sampler_output(out, num_reqs)
+        else:
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
 
-        return self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+        if self.use_async_scheduling:
+            sampler_output.sampled_token_ids = self._stage_sampled_tokens(
+                sampler_output.sampled_token_ids
+            )
+        return sampler_output
 
     def _apply_pending_token_writeback(self) -> None:
         """Put the real sampled tokens where every reader of them can see them.
@@ -1466,6 +1474,43 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             staged_model_inputs.input_ids[cur_rows, 0] = prev_sampled[prev_rows, 0].to(
                 staged_model_inputs.input_ids.dtype
             )
+
+    def _stage_sampled_tokens(self, sampled_token_ids: torch.Tensor) -> torch.Tensor:
+        """Hand back a copy of the sampled tokens, alternating two buffers.
+
+        Async scheduling holds this tensor past the step boundary, through
+        prev_sampled_token_ids and AsyncRBLNModelRunnerOutput. Holding the
+        sampling graph's own output there makes that graph's next launch block
+        on the device. Two slots, because the output thread reads one while the
+        next step writes the other.
+
+        The buffers are sized for a full batch and sliced, so a step whose batch
+        shrank reuses them instead of allocating a new pair.
+        """
+        num_reqs = sampled_token_ids.shape[0]
+        ring = self._sampled_token_ring
+        if (
+            not ring
+            or ring[0].shape[0] < num_reqs
+            or ring[0].shape[1:] != sampled_token_ids.shape[1:]
+            or ring[0].dtype != sampled_token_ids.dtype
+            or ring[0].device != sampled_token_ids.device
+        ):
+            ring = [
+                torch.empty(
+                    (max(self.max_num_reqs, num_reqs), *sampled_token_ids.shape[1:]),
+                    dtype=sampled_token_ids.dtype,
+                    device=sampled_token_ids.device,
+                )
+                for _ in range(2)
+            ]
+            self._sampled_token_ring = ring
+            self._ring_slot = 0
+        buf = ring[self._ring_slot][:num_reqs]
+        self._ring_slot ^= 1
+        # non_blocking, or the copy waits on the sampling graph.
+        buf.copy_(sampled_token_ids, non_blocking=True)
+        return buf
 
     def _repair_async_output_token_ids(self) -> None:
         """Replace the placeholder the async path left at the tail of

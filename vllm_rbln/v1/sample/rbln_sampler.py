@@ -37,29 +37,6 @@ _SAMPLING_EPS = 1e-3
 logger = init_logger(__name__)
 
 
-def _ring_copy(owner: nn.Module, out: torch.Tensor) -> torch.Tensor:
-    """Hand back a copy of `out`, alternating two buffers owned by `owner`.
-
-    Async scheduling holds the returned tensor past the step boundary, via
-    prev_sampled_token_ids and AsyncRBLNModelRunnerOutput. Holding the sampling
-    graph's own output there makes that graph's next launch block on the device.
-    Two slots, because the output thread reads one while the next step writes
-    the other.
-    """
-    ring = owner._sampled_token_ring
-    if not ring or ring[0].shape != out.shape or ring[0].device != out.device:
-        ring = [
-            torch.empty(out.shape, dtype=out.dtype, device=out.device) for _ in range(2)
-        ]
-        owner._sampled_token_ring = ring
-        owner._ring_slot = 0
-    buf = ring[owner._ring_slot]
-    owner._ring_slot ^= 1
-    # non_blocking, or the copy waits on the sampling graph.
-    buf.copy_(out, non_blocking=True)
-    return buf
-
-
 def rbln_top_k_top_p_sample(
     logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -124,13 +101,11 @@ class RBLNTopKTopPSampler(nn.Module):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         compile_context: rebel.CompileContext | None = None,
-        use_async_scheduling: bool = False,
     ):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
         super().__init__()
         self.logprobs_mode = logprobs_mode
-        self.use_async_scheduling = use_async_scheduling
 
         assert self.logprobs_mode not in ("processed_logits", "processed_logprobs"), (
             "RBLN Sampling does not support returning logits/logprobs"
@@ -139,9 +114,6 @@ class RBLNTopKTopPSampler(nn.Module):
         self._compiled_rbln_topk_topp_sampler = compile_sampler(
             rbln_top_k_top_p_sample, compile_context
         )
-        # Sampled-token buffers handed to async scheduling; see _ring_copy.
-        self._sampled_token_ring: list[torch.Tensor] = []
-        self._ring_slot = 0
 
     def forward(
         self,
@@ -161,10 +133,7 @@ class RBLNTopKTopPSampler(nn.Module):
                 "per-request generators. Ignoring generators."
             )
 
-        out = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
-        if self.use_async_scheduling:
-            out = _ring_copy(self, out)
-        return out, None
+        return self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p), None
 
 
 class RBLNSampler(VLLMSampler):
@@ -173,10 +142,8 @@ class RBLNSampler(VLLMSampler):
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
-        use_async_scheduling: bool = False,
     ):
         super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
-        self.use_async_scheduling = use_async_scheduling
 
         compile_context = (
             compile_context
@@ -188,9 +155,7 @@ class RBLNSampler(VLLMSampler):
         )
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
-                logprobs_mode=logprobs_mode,
-                compile_context=compile_context,
-                use_async_scheduling=use_async_scheduling,
+                logprobs_mode=logprobs_mode, compile_context=compile_context
             )
         else:
             logger.warning_once(
@@ -201,13 +166,9 @@ class RBLNSampler(VLLMSampler):
         self._compiled_greedy_sample = compile_sampler(
             rbln_greedy_sample, compile_context
         )
-        # Sampled-token buffers handed to async scheduling; see _ring_copy.
-        self._sampled_token_ring: list[torch.Tensor] = []
-        self._ring_slot = 0
 
     def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        out = self._compiled_greedy_sample(logits)
-        return _ring_copy(self, out) if self.use_async_scheduling else out
+        return self._compiled_greedy_sample(logits)
 
     def sample(
         self,
