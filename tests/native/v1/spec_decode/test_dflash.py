@@ -15,13 +15,13 @@
 """Tests for RBLNDFlashProposer's draft-block geometry and cache write.
 
 Every case here pins something a run measured rather than something the code
-merely does, because each was a regression that cost a full 26-instance
-measurement to find:
+merely does, because each was a regression that only a full measurement run
+surfaced:
 
   - the mask's query positions must name the block's real slots; naming the
     slots one block further on admitted the previous step's rejected draft K/V
-  - the block is open within itself, not causal; closing it measured 3.25
-    tokens/step against 3.62
+  - the block is open within itself, not causal; closing it within itself
+    reduced acceptance compared with leaving it open
   - one seq_idx and one block table for the whole drafter, because a second
     dynamic index on a partition is a compiler error that arrives as a segfault
   - the context write is contiguous on both sides, because a strided pair is
@@ -191,9 +191,9 @@ class TestContextWriteContiguity:
 
 class TestSingleSequenceGuard:
     """`--max-num-seqs > 1` costs no errors and no output damage, only
-    acceptance -- 2.96 tokens/step against 1.27 on the same eight ShareGPT
-    prompts, which is below the no-speculation baseline. The cause is not
-    identified; the point here is that it fails loudly rather than quietly."""
+    acceptance, which drops below the no-speculation baseline on the same
+    prompts. The cause is not identified; the point here is that it fails
+    loudly rather than quietly."""
 
     def test_one_sequence_is_allowed(self):
         RBLNDFlashProposer._require_single_sequence(SimpleNamespace(max_num_seqs=1))

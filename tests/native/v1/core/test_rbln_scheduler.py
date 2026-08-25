@@ -36,7 +36,11 @@ from tests.native.v1.core.utils import (
     prefill_request,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
+from vllm_rbln.v1.core.rbln_scheduler import (
+    RBLNScheduler,
+    RBLNSchedulerOutput,
+    restored_dflash_token_budget,
+)
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
@@ -1368,3 +1372,56 @@ class TestDeferredBlockFree:
         assert request.request_id not in manager._req_sub_hashes
         assert request.request_id not in manager._pending_indexing
         assert partial_block.block_hash is not None
+
+
+class TestRestoredDflashTokenBudget:
+    """The reservation `_set_max_num_scheduled_tokens` makes for appended draft
+    tokens buys DFlash nothing and moves the prefill chunk off the KV block
+    boundary, so the scheduler puts the budget back. The value carries no
+    provenance, so an explicit budget that happens to equal the reserved one is
+    restored as well."""
+
+    MNBT = 512
+    SLOTS = 6
+    SEQS = 1
+
+    def _configs(self, method="dflash", seqs=None):
+        scheduler = SimpleNamespace(
+            max_num_batched_tokens=self.MNBT, max_num_seqs=seqs or self.SEQS
+        )
+        speculative = SimpleNamespace(
+            method=method, max_num_new_slots_for_drafting=self.SLOTS
+        )
+        return scheduler, speculative
+
+    def test_reserved_budget_is_restored(self):
+        scheduler, speculative = self._configs()
+        reserved = self.MNBT - self.SLOTS * self.SEQS
+        assert (
+            restored_dflash_token_budget(scheduler, speculative, reserved) == self.MNBT
+        )
+
+    def test_reservation_scales_with_max_num_seqs(self):
+        scheduler, speculative = self._configs(seqs=4)
+        reserved = self.MNBT - self.SLOTS * 4
+        assert (
+            restored_dflash_token_budget(scheduler, speculative, reserved) == self.MNBT
+        )
+
+    def test_any_other_budget_is_left_alone(self):
+        scheduler, speculative = self._configs()
+        reserved = self.MNBT - self.SLOTS * self.SEQS
+        assert (
+            restored_dflash_token_budget(scheduler, speculative, reserved - 1) is None
+        )
+        assert restored_dflash_token_budget(scheduler, speculative, self.MNBT) is None
+
+    @pytest.mark.parametrize("method", ["eagle3", "ngram", "suffix", "medusa"])
+    def test_only_dflash_is_touched(self, method):
+        scheduler, speculative = self._configs(method=method)
+        reserved = self.MNBT - self.SLOTS * self.SEQS
+        assert restored_dflash_token_budget(scheduler, speculative, reserved) is None
+
+    def test_no_speculation_is_left_alone(self):
+        scheduler, _ = self._configs()
+        assert restored_dflash_token_budget(scheduler, None, self.MNBT) is None

@@ -61,6 +61,42 @@ class RBLNSchedulerOutput(SchedulerOutput):
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
 
 
+def restored_dflash_token_budget(
+    scheduler_config, speculative_config, max_num_scheduled_tokens: int
+) -> int | None:
+    """The full token budget when DFlash is running under the reserved one.
+
+    `VllmConfig._set_max_num_scheduled_tokens` holds batch slots back for
+    drafters that append their draft tokens to the target batch. This drafter
+    runs its own graph over its own batch, so the reservation buys nothing and
+    only shifts the prefill chunk off the KV block boundary, which the paged
+    prefill attention kernel cannot straddle. EAGLE3 never sees it: its net new
+    slots per request is zero, so its budget is left whole.
+
+    It has to be restored on the scheduler rather than on the config, which a
+    validator rejects: `max_num_scheduled_tokens` is required to carry the
+    reservation.
+
+    The equality test only recognises the reserved value, so it leaves any other
+    budget alone -- but the value carries no provenance. A user who sets
+    `max_num_scheduled_tokens` to exactly the reserved boundary is
+    indistinguishable from the auto-computed case and gets restored too; that
+    boundary is treated as auto-computed.
+
+    Returns None when nothing should change.
+    """
+    if speculative_config is None or speculative_config.method != "dflash":
+        return None
+    reserved = (
+        scheduler_config.max_num_batched_tokens
+        - speculative_config.max_num_new_slots_for_drafting
+        * scheduler_config.max_num_seqs
+    )
+    if max_num_scheduled_tokens != reserved:
+        return None
+    return scheduler_config.max_num_batched_tokens
+
+
 class RBLNScheduler(Scheduler):
     # Restoring the DFlash budget assigns to this inherited attribute, which
     # leaves mypy unable to infer its type.
@@ -74,33 +110,18 @@ class RBLNScheduler(Scheduler):
     ) -> None:
         super().__init__(*args, **kwargs)
 
-        speculative_config = self.vllm_config.speculative_config
-        if (
-            speculative_config is not None
-            and speculative_config.method == "dflash"
-            and self.max_num_scheduled_tokens
-            == self.scheduler_config.max_num_batched_tokens
-            - speculative_config.max_num_new_slots_for_drafting
-            * self.scheduler_config.max_num_seqs
-        ):
-            # `VllmConfig._set_max_num_scheduled_tokens` holds batch slots back
-            # for drafters that append their draft tokens to the target batch.
-            # This drafter runs its own graph over its own batch, so the
-            # reservation buys nothing and only shifts the prefill chunk off the
-            # KV block boundary, which the paged prefill attention kernel cannot
-            # straddle. EAGLE3 never sees it: its net new slots per request is
-            # zero, so its budget is left whole.
-            #
-            # It has to be restored here rather than on the config, which a
-            # validator rejects: `max_num_scheduled_tokens` is required to carry
-            # the reservation. The equality test leaves an explicit
-            # user-supplied budget alone.
+        restored = restored_dflash_token_budget(
+            self.scheduler_config,
+            self.vllm_config.speculative_config,
+            self.max_num_scheduled_tokens,
+        )
+        if restored is not None:
             logger.info(
                 "Restoring the DFlash target token budget: %d -> %d.",
                 self.max_num_scheduled_tokens,
-                self.scheduler_config.max_num_batched_tokens,
+                restored,
             )
-            self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
+            self.max_num_scheduled_tokens = restored
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.

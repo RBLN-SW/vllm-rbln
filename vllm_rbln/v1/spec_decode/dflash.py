@@ -59,9 +59,8 @@ class RBLNDFlashProposer(DFlashProposer):
     def _require_single_sequence(scheduler_config) -> None:
         """DFlash measurably loses acceptance on a wider decode batch."""
         if scheduler_config.max_num_seqs > 1:
-            # Measured on ShareGPT, eight prompts at concurrency 1, with
-            # `max_num_seqs` the only variable: acceptance falls from 2.96 to
-            # 1.27 tokens per step (28.4% to 3.9% per drafted token), which is
+            # Measured with `max_num_seqs` as the only variable: acceptance
+            # falls to roughly a third of its single-sequence value, which is
             # slower than running with no speculation at all. Every request
             # still returns and the output stays coherent, so it fails quietly
             # -- hence an error rather than a warning.
@@ -121,7 +120,7 @@ class RBLNDFlashProposer(DFlashProposer):
         common_attn_metadata: CommonAttentionMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | list[list[int]]:
         """Draft `num_speculative_tokens` tokens in one forward.
 
         Upstream's `propose` cannot drive this platform. It coordinates the
@@ -444,11 +443,16 @@ class RBLNDFlashProposer(DFlashProposer):
     ) -> dict[str, object]:
         per_layer: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
-            attn_metadata = attn_group.get_metadata_builder().build(
+            builder = attn_group.get_metadata_builder()
+            attn_metadata = builder.build(
                 common_attn_metadata=cad,
                 positions=positions,
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
+                # Every mask here is replaced below, so the builder's own
+                # `max_model_len`-wide one would be host work and a staged
+                # buffer for nothing.
+                build_attn_masks=False,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -456,14 +460,15 @@ class RBLNDFlashProposer(DFlashProposer):
                 self.runner.kv_cache_bases,
                 self.runner.kv_cache_view_infos,
             )
-            if attn_metadata.attn_masks is None:
+            if builder.is_causal:
                 raise RuntimeError(
                     "the draft pass needs an explicit mask; the drafter must be "
                     "built non-causal (attention_config.use_non_causal)"
                 )
-            max_seq_len = attn_metadata.attn_masks.shape[-1]
-            mask_dtype = attn_metadata.attn_masks.dtype
-            mask_device = attn_metadata.attn_masks.device
+            # What the builder would have produced, without producing it.
+            max_seq_len = builder.model_config.max_model_len
+            mask_dtype = torch.float16 if builder.enforce_eager else torch.float32
+            mask_device = builder.device
 
             # One attention group covers the whole drafter -- groups are keyed by
             # backend class -- so the two attention types are separated by the
@@ -606,31 +611,26 @@ class RBLNDFlashProposer(DFlashProposer):
             runs.append((start, i - start, blocks[start], offsets[start]))
             start = i
 
-        # The context of one step is not bounded by the scheduler's token
-        # budget -- several requests, or a step that follows a chunked prefill,
-        # can carry more -- so it is projected in slices the compiled region has
-        # a shape for instead of assuming one call covers it.
+        # One call, not a loop: `_project_context_kv` is compiled with static
+        # output buffers, so two calls would hand back views of the same storage
+        # and the second would clobber the first. The scheduler caps a step's
+        # tokens at `max_num_batched_tokens`, which is what `max_num_tokens`
+        # holds, so one call always covers the context.
+        assert num_context <= self.max_num_tokens, (
+            f"context of {num_context} tokens exceeds the projection's "
+            f"{self.max_num_tokens}-token buffers"
+        )
         states = target_hidden_states[self._ctx_gather]
-        positions_dev = self._context_positions_buffer[:num_context]
-        key_slices: list[torch.Tensor] = []
-        value_slices: list[torch.Tensor] = []
-        offset = 0
-        while offset < num_context:
-            take = min(self.max_num_tokens, num_context - offset)
-            bucket = next(size for size in self._proj_buckets if size >= take)
-            self._proj_states[:take].copy_(states[offset : offset + take])
-            self._proj_positions[0, :take].copy_(positions_dev[offset : offset + take])
-            k, v = self._project_context_kv(
-                self._proj_states[:bucket], self._proj_positions[:, :bucket]
-            )
-            key_slices.append(k[:, :, :take])
-            value_slices.append(v[:, :, :take])
-            offset += take
-        if len(key_slices) == 1:
-            keys, values = key_slices[0], value_slices[0]
-        else:
-            keys = torch.cat(key_slices, dim=2)
-            values = torch.cat(value_slices, dim=2)
+        bucket = next(size for size in self._proj_buckets if size >= num_context)
+        self._proj_states[:num_context].copy_(states)
+        self._proj_positions[0, :num_context].copy_(
+            self._context_positions_buffer[:num_context]
+        )
+        keys, values = self._project_context_kv(
+            self._proj_states[:bucket], self._proj_positions[:, :bucket]
+        )
+        keys = keys[:, :, :num_context]
+        values = values[:, :, :num_context]
 
         # One copy per layer and head. Taking all heads at once is contiguous
         # on neither side, and the runtime stages a strided pair through host

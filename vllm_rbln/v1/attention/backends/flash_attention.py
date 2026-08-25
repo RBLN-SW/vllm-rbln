@@ -236,7 +236,14 @@ class RBLNFlashAttentionMetadataBuilder(
         positions: torch.Tensor,
         batch_pad: int,
         is_prefill: bool,
+        build_attn_masks: bool = True,
     ) -> RBLNFlashAttentionMetadata:
+        """`build_attn_masks=False` skips the non-causal mask.
+
+        The mask is built on the host at `max_model_len` width every step and
+        staged to the device. A caller that replaces it -- the DFlash draft pass
+        builds its own block mask -- otherwise pays for one it throws away.
+        """
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.
@@ -278,7 +285,7 @@ class RBLNFlashAttentionMetadataBuilder(
         else:
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
-            if not self.is_causal:
+            if not self.is_causal and build_attn_masks:
                 decode_attention_mask = torch.zeros(
                     batch_pad,
                     1,
