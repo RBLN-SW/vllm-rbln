@@ -23,47 +23,19 @@ from vllm.model_executor.models.utils import (
     logger,
     maybe_prefix,
 )
-from vllm.model_executor.models.utils import (
-    extract_layer_index as _upstream_extract_layer_index,
-)
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.v1.worker.utils import extract_layer_index, num_attn_module
 
-
-@register_patch(
+rbln_num_attn_module = num_attn_module
+rbln_extract_layer_index = register_patch(
     target="vllm.model_executor.models.utils.extract_layer_index",
     reason=(
         "DeepSeek-V3.2 sparse attention adds another KV-cache module "
-        "(the lightning indexer) per decoder layer. "
+        "(the lightning indexer) per decoder layer."
     ),
     apply_immediately=True,
-)
-def rbln_extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
-    if num_attn_module <= 1 or "attn" not in layer_name:
-        return _upstream_extract_layer_index(layer_name, num_attn_module)
-
-    int_vals: list[int] = []
-    for subname in layer_name.split("."):
-        try:
-            int_vals.append(int(subname))
-        except ValueError:
-            continue
-    assert int_vals, f"layer name {layer_name} has no integer layer index"
-    base = int_vals[0]
-    # Sub-index within a decoder layer's KV-cache modules:
-    #   0 = MLA self-attention
-    #   1 = DSA lightning-indexer (value) key cache  ("indexer" in name)
-    #   2 = fp8 indexer companion scale cache        ("scale" in name)
-    if len(int_vals) >= 2:
-        sub = int_vals[1]
-    elif "scale" in layer_name:
-        sub = 2
-    elif "indexer" in layer_name:
-        sub = 1
-    else:
-        sub = 0
-    return base * num_attn_module + sub
-
+)(extract_layer_index)
 
 rbln_extract_layer_index = register_patch(
     target="vllm.v1.worker.utils.extract_layer_index",
@@ -74,28 +46,6 @@ rbln_extract_layer_index = register_patch(
     key="vllm_rbln.patches.models_utils.rbln_extract_layer_index.v1_worker_utils",
     apply_immediately=True,
 )(rbln_extract_layer_index)
-
-
-def _dsa_indexer_cache_is_fp8() -> bool:
-    from vllm.config import get_current_vllm_config
-
-    try:
-        cache_dtype = get_current_vllm_config().cache_config.cache_dtype
-    except Exception:
-        return False
-    return bool(cache_dtype) and cache_dtype.startswith("fp8")
-
-
-def rbln_num_attn_module(model_config) -> int:
-    hf_config = model_config.hf_config
-    if getattr(hf_config, "model_type", None) == "longcat_flash":
-        return 2
-    text_config = getattr(model_config, "hf_text_config", hf_config)
-    # A DSA model puts the lightning-indexer key cache next to MLA:
-    # 2 modules, or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
-    if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
-        return 3 if _dsa_indexer_cache_is_fp8() else 2
-    return 1
 
 
 # NOTE(RBLN): Introduced in https://github.com/RBLN-SW/vllm-rbln/pull/81

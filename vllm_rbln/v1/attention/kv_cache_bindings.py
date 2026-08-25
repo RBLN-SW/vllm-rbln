@@ -17,7 +17,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-from vllm.model_executor.models import utils as model_executor_utils
+
+from vllm_rbln.v1.worker.utils import extract_layer_index
 
 
 def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
@@ -158,9 +159,7 @@ def _get_ordered_layer_names(
 ) -> list[str]:
     index_to_names: dict[int, list[str]] = defaultdict(list)
     for layer_name in kv_caches:
-        layer_index = model_executor_utils.extract_layer_index(
-            layer_name, num_attn_module
-        )
+        layer_index = extract_layer_index(layer_name, num_attn_module)
         index_to_names[layer_index].append(layer_name)
 
     ordered_layer_names: list[str] = []

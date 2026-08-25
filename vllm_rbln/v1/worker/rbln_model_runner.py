@@ -141,6 +141,9 @@ from vllm_rbln.v1.worker.utils import (
     prepare_kernel_block_sizes,
     reorder_input_batch,
 )
+from vllm_rbln.v1.worker.utils import (
+    num_attn_module as rbln_num_attn_module,
+)
 
 logger = init_logger(__name__)
 
@@ -2637,8 +2640,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
         )
-
-        from vllm_rbln.patches.models_utils import rbln_num_attn_module
 
         num_attn_module = rbln_num_attn_module(self.model_config)
         self._update_kv_cache_base_bindings(
