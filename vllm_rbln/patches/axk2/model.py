@@ -8,6 +8,7 @@
 #
 
 import torch
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 
 from vllm_rbln.patches.attention import _resolve_kv_cache
@@ -168,7 +169,28 @@ def _rbln_gated_mla_forward(
 
 
 def _rbln_axk2_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    return self.experts(hidden_states=hidden_states, router=lambda x: self.gate(x)[0])
+    final_hidden_states = self.experts(
+        hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
+    )
+    if hidden_states.dtype != torch.float16:
+        final_hidden_states *= self.routed_scaling_factor
+
+    shared_output = None
+    if self.shared_experts is not None:
+        shared_output = self.shared_experts(hidden_states)
+        if hidden_states.dtype == torch.float16:
+            shared_output *= 1.0 / self.routed_scaling_factor
+        if not self.is_sequence_parallel:
+            final_hidden_states = final_hidden_states + shared_output
+            shared_output = None
+
+    if self.tp_size > 1:
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+    if shared_output is not None:
+        final_hidden_states = final_hidden_states + shared_output
+
+    return final_hidden_states
 
 
 from vllm_rbln.patches.axk2 import config as _config  # noqa: E402, F401
