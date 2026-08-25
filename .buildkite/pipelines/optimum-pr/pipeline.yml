@@ -30,7 +30,9 @@ steps:
     secrets: *secrets
     command:
       - |
+        echo '--- :package: uv sync'
         uv sync --locked --python 3.12 --extra test --extra dev --extra runtime --no-editable --compile-bytecode
+        echo '--- :hammer: rebel-compiler-override'
         bash .buildkite/scripts/rebel-compiler-override.sh
 
   # ===========================================================================
