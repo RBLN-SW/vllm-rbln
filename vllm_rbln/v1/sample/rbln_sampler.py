@@ -86,9 +86,6 @@ def compile_sampler(
         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
         global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
-        # FIXME: Currently, sampler ops do not support caching.
-        # Reusing seed buffer is not supported when the compiled sampler is loaded.
-        use_cache=False,
     )
 
 
