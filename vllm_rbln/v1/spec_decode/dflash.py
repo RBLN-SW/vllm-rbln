@@ -685,16 +685,15 @@ class RBLNDFlashProposer(DFlashProposer):
         # whole block there, so it cannot split a block across two pages: the
         # last `num_query_per_req - 1` offsets of a page are unrepresentable
         # and would scatter past the page, into a block owned by another
-        # request. Redirect just those rows' writes to their next page start
-        # -- allocate_slots already gave this request the lookahead block that
-        # crossing implies -- and drop their drafts, keeping the rest of the
-        # batch drafting. Model-input positions stay true, so RoPE is unaffected.
+        # request. Redirect those rows' writes to their next page start and drop
+        # their drafts. Model-input positions stay true, so RoPE is unaffected.
         crossing = (seq_lens % self.block_size) + num_query_per_req > self.block_size
         if bool(crossing.any()):
             next_page = (seq_lens // self.block_size + 1) * self.block_size
-            table_width = cad.block_table_tensor.shape[-1]
-            if int((next_page // self.block_size).max()) >= table_width:
-                # At the context ceiling there is no next page to redirect to.
+            if self._page_unallocated(cad.block_table_tensor, next_page, crossing):
+                # Nothing to redirect into, so the whole step gives up its
+                # drafts: returning here is what keeps the query graph -- and
+                # its scatter -- from running at all.
                 self._dropped_rows = torch.ones_like(crossing)
                 return self.positions.new_zeros(num_query_total)
             seq_lens = torch.where(crossing, next_page, seq_lens)
@@ -732,6 +731,36 @@ class RBLNDFlashProposer(DFlashProposer):
                     num_reqs, num_query_per_req
                 ),
             )
+
+    def _page_unallocated(
+        self,
+        block_table: torch.Tensor,
+        next_page: torch.Tensor,
+        crossing: torch.Tensor,
+    ) -> bool:
+        """Would a crossing row's redirect land outside what it was given?
+
+        Two ways it can. Past the end of the table is the context ceiling.
+        Inside the table but holding 0 is a slot the allocator never filled, and
+        block 0 is the pool's reserved null block -- shared, with a refcount it
+        does not maintain. Scattering a draft block's K/V there breaks the cache
+        contract whatever it does downstream.
+
+        The second case is reachable with a single request. Upstream reserves
+        the lookahead block a crossing needs, but `RBLNScheduler` zeroes the
+        lookahead while `request.num_computed_tokens` is 0 and that field is
+        only assigned after allocation. A request whose prefix-cache hit leaves
+        one waiting-path chunk therefore gets none, and if that chunk ends in
+        the last `num_speculative_tokens` offsets of a page there is no next
+        page to move into. Restricting the zeroing to P/D disaggregation -- what
+        it exists for -- would close that path but leave the P/D configuration
+        itself open, so the check belongs here too.
+        """
+        pages = (next_page // self.block_size).to(torch.int64)
+        if int(pages.max()) >= block_table.shape[-1]:
+            return True
+        rows = torch.arange(pages.shape[0])
+        return bool((block_table.cpu()[rows, pages][crossing] == 0).any())
 
     def _sample_indices(self, num_reqs: int, num_query_per_req: int) -> torch.Tensor:
         """The mask positions -- the ones the target verifies."""

@@ -204,3 +204,50 @@ class TestSingleSequenceGuard:
             RBLNDFlashProposer._require_single_sequence(
                 SimpleNamespace(max_num_seqs=max_num_seqs)
             )
+
+
+class TestRedirectTarget:
+    """A crossing row is redirected to its next page, which the scheduler is
+    supposed to have allocated. It does not always: the lookahead is zeroed
+    while `num_computed_tokens` is 0, and that field is assigned only after
+    allocation, so a prefix-cache hit that leaves one waiting-path chunk can end
+    in a page's last slots with nothing reserved beyond it. An unfilled slot
+    reads 0, which is the pool's shared null block, and the query graph would
+    scatter the draft block's K/V there -- dropping the row afterwards does not
+    unwind the write, so the step has to give up before the forward."""
+
+    def _self(self):
+        return SimpleNamespace(
+            block_size=BLOCK_SIZE,
+            _page_unallocated=RBLNDFlashProposer._page_unallocated,
+        )
+
+    def _call(self, table, next_page, crossing):
+        return RBLNDFlashProposer._page_unallocated(
+            self._self(),
+            torch.tensor(table, dtype=torch.int32),
+            torch.tensor(next_page, dtype=torch.int64),
+            torch.tensor(crossing, dtype=torch.bool),
+        )
+
+    def test_allocated_next_page_is_accepted(self):
+        # page 1 holds block 6, so the redirect has somewhere to land.
+        assert not self._call([[71, 6, 0, 0]], [BLOCK_SIZE], [True])
+
+    def test_unfilled_next_page_is_refused(self):
+        """The reviewed regression: inside the table, but never allocated."""
+        assert self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [True])
+
+    def test_past_the_table_is_refused(self):
+        """The context ceiling -- no next page exists at all."""
+        assert self._call([[71, 6]], [2 * BLOCK_SIZE], [True])
+
+    def test_a_non_crossing_row_does_not_veto_the_step(self):
+        """Only the rows that actually redirect are checked."""
+        assert not self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [False])
+
+    def test_any_crossing_row_with_an_unfilled_target_stops_the_step(self):
+        table = [[71, 6, 0, 0], [12, 0, 0, 0]]
+        assert self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, True])
+        # the second row is the unfilled one, so vetoing depends on it crossing
+        assert not self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, False])
