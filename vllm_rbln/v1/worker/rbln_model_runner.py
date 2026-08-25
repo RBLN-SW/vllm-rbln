@@ -133,6 +133,7 @@ from vllm_rbln.v1.core.utils import (
 )
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
@@ -271,8 +272,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sampler
         if envs.VLLM_RBLN_SAMPLER:
-            from vllm_rbln.v1.sample import RBLNSampler
-
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
@@ -1267,11 +1266,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             bucket = logits.shape[0]
             num_reqs = self.input_batch.num_reqs
             padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
-            # The kwarg is omitted rather than passed as None: with
-            # VLLM_RBLN_SAMPLER=0 this is upstream's Sampler, which does not
-            # accept it. The platform refuses async scheduling in that case, so
-            # the two conditions cannot disagree.
-            staging = {"staging_owner": self} if self.use_async_scheduling else {}
+            # Keyed off the installed sampler, not off use_async_scheduling:
+            # only RBLNSampler accepts the kwarg, and self.sampler can be
+            # swapped for upstream's Sampler after __init__ -- the executor's
+            # golden validation does exactly that to read raw host logprobs.
+            # Passing the kwarg as None instead of omitting it would still
+            # raise, since upstream's signature has no such parameter.
+            staging = (
+                {"staging_owner": self}
+                if self.use_async_scheduling and isinstance(self.sampler, RBLNSampler)
+                else {}
+            )
             out = self.sampler(logits=logits, sampling_metadata=padded_md, **staging)
             sampler_output = _depad_sampler_output(out, num_reqs)
         else:
