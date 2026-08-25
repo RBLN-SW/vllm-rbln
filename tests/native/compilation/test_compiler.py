@@ -175,6 +175,11 @@ class TestCompileOptions:
         compile(object(), use_cache=use_cache)
         assert "mega_cache_only" not in captured_compile["options"]
 
+    def test_direct_dispatch_requires_fullgraph(self, captured_compile):
+        # Whatever Dynamo leaves outside the one graph is unreachable from a clone.
+        with pytest.raises(ValueError, match="fullgraph"):
+            compile(object(), use_direct_dispatch=True)
+
     def test_forwards_backend_dynamic_fullgraph(self, captured_compile):
         # backend / dynamic / fullgraph pass straight through to torch.compile.
         backend = object()

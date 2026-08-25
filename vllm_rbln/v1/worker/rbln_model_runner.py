@@ -1877,8 +1877,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model_executable = compile(
                 model_wrapper,
                 dynamic=False,
-                # A graph break would put part of the step in a resume frame,
-                # which the dispatcher's __code__ swap cannot reach.
                 fullgraph=True,
                 compile_context=self.compile_context,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,

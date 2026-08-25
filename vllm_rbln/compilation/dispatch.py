@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from types import CodeType, FunctionType, MethodType
 from typing import Any
 
@@ -35,7 +36,8 @@ _COPIED_SLOTS = (
     "__module__",
     "__doc__",
     "__annotations__",
-    "__type_params__",
+    # A function carries type params only from 3.12, as does the test's enumeration.
+    *(("__type_params__",) if sys.version_info >= (3, 12) else ()),
 )
 
 
@@ -65,27 +67,28 @@ def _forward_context_key() -> tuple[Any, ...]:
     is attached (which changes the attention wrapper's graph).
 
     Not every dispatched target runs inside a forward context -- the model
-    forward does, the samplers run after it has been exited -- so a missing
-    context is a normal state and contributes nothing to the key.
+    forward does, the medusa drafter runs after execute_model has left it -- so
+    a missing context is a normal state and contributes nothing to the key.
+
+    A missing context, missing DP metadata and a missing pad width are states
+    that really occur. A missing attribute is not, and must not be defaulted:
+    it would drop a key component instead of failing.
     """
     if not is_forward_context_available():
         return (None, None, has_kv_transfer_group())
 
     ctx = get_forward_context()
 
-    dp_metadata = getattr(ctx, "dp_metadata", None)
-    max_pads = getattr(dp_metadata, "max_pads_across_dp", None)
+    dp_metadata = ctx.dp_metadata
+    max_pads = None if dp_metadata is None else dp_metadata.max_pads_across_dp
     max_pad = None if max_pads is None else max_pads.shape[0]
 
     attn_metadata = ctx.attn_metadata
     if isinstance(attn_metadata, dict):
         attn_metadata = next(iter(attn_metadata.values()), None)
-    elif isinstance(attn_metadata, list):
-        first = attn_metadata[0] if attn_metadata else None
-        attn_metadata = next(iter(first.values()), None) if first else None
 
     return (
-        getattr(attn_metadata, "is_prefill", None),
+        None if attn_metadata is None else attn_metadata.is_prefill,
         max_pad,
         has_kv_transfer_group(),
     )
@@ -133,7 +136,6 @@ class Dispatcher:
         self._compiled = compiled
         self._original_code: CodeType = self._function.__code__
         self._graphs: dict[tuple, Any] = {}
-        self._unregistered = 0
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         key = (
@@ -154,15 +156,13 @@ class Dispatcher:
             self._original_code
         )
         if not entries:
-            # Dynamo ran the frame without leaving a cache entry (it bails out
-            # once accumulated_cache_size_limit is hit, for one). Nothing to
-            # dispatch to, so this key keeps taking the Dynamo path.
-            self._unregistered += 1
+            # Dynamo ran the frame without leaving a cache entry -- the frame was
+            # skipped, or an entry it had was invalidated. Nothing to dispatch to,
+            # so this key keeps taking the Dynamo path.
             logger.warning_once(
-                "no Dynamo cache entry for %s; %d key(s) will keep paying the "
-                "frame-eval cost",
+                "no Dynamo cache entry for %s; keys that reach this path keep "
+                "paying the frame-eval cost",
                 self._original_code.co_name,
-                self._unregistered,
             )
             return
 
