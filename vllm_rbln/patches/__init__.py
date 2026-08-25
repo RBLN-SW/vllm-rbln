@@ -44,7 +44,6 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
-    sparse_attn_indexer,
 )
 
 __all__ = (
