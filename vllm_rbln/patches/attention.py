@@ -59,7 +59,9 @@ def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
     num_attn_module = (
-        rbln_num_attn_module(model_config) if model_config is not None else 1
+        rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype)
+        if model_config is not None
+        else 1
     )
     raw_layer_index = extract_layer_index(self.layer_name, num_attn_module)
 

@@ -153,7 +153,7 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
     self.dtype = torch.float8_e4m3fn if self.is_fp8_cache else torch.bfloat16
 
     model_config = vllm_config.model_config
-    num_attn_module = rbln_num_attn_module(model_config)
+    num_attn_module = rbln_num_attn_module(model_config, cache_dtype)
     start = 0
     if model_config is not None:
         start, _end = model_config.get_layers_start_end_indices(

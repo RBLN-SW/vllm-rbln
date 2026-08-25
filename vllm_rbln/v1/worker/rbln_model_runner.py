@@ -2640,7 +2640,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_cache_view_infos,
         )
 
-        num_attn_module = rbln_num_attn_module(self.model_config)
+        num_attn_module = rbln_num_attn_module(
+            self.model_config, self.cache_config.cache_dtype
+        )
         self._update_kv_cache_base_bindings(
             kv_cache_bases_by_layer,
             kv_cache_view_infos,
