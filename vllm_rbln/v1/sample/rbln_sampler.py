@@ -141,6 +141,15 @@ class RBLNSampler(VLLMSampler):
     ):
         super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
+        if logprobs_mode not in ("raw_logprobs", "raw_logits"):
+            raise ValueError(
+                f"VLLM_RBLN_SAMPLER=1 does not support logprobs_mode "
+                f"{logprobs_mode!r}. The distribution `rbln::top_k_top_p` draws "
+                "from is built and consumed inside its compiled graph, so there "
+                "is nothing to hand back. Use raw_logprobs or raw_logits, or run "
+                "with VLLM_RBLN_SAMPLER=0."
+            )
+
         compile_context = (
             compile_context
             or create_compile_context(
@@ -149,15 +158,9 @@ class RBLNSampler(VLLMSampler):
             if not USE_DEVICE_TENSOR
             else None
         )
-        if logprobs_mode in ("raw_logprobs", "raw_logits"):
-            self.topk_topp_sampler = RBLNTopKTopPSampler(
-                logprobs_mode=logprobs_mode, compile_context=compile_context
-            )
-        else:
-            logger.warning_once(
-                f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
-                "Using native sampler instead."
-            )
+        self.topk_topp_sampler = RBLNTopKTopPSampler(
+            logprobs_mode=logprobs_mode, compile_context=compile_context
+        )
 
         self._compiled_greedy_sample = compile_sampler(
             rbln_greedy_sample, compile_context
