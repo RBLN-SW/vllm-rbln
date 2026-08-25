@@ -87,6 +87,14 @@ def compile(
     use_static_output: bool = False,
     use_direct_dispatch: bool = False,
 ) -> CompiledTarget:
+    if use_direct_dispatch and not fullgraph:
+        # A dispatched call runs one code object, so whatever Dynamo leaves
+        # outside the graph is unreachable: a graph break's resume function only
+        # runs compiled under the frame eval, and a recompile-limit bail-out adds
+        # no cache entry, so _register binds the previous call's graph to the new
+        # key. fullgraph turns both into an exception.
+        raise ValueError("use_direct_dispatch requires fullgraph=True")
+
     _ensure_torch_dynamo_configured()
 
     options = {}

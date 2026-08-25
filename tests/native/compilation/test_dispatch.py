@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # Dispatcher's contract: first call per key goes through the compiled
-# callable and records the graph, later calls with that key run the recorded
-# bytecode directly, and a key that maps to two graphs is an error. The real
-# thing needs a compiled model; here the Dynamo pieces are stubbed.
+# callable and records the graph, and later calls with that key run the recorded
+# bytecode directly. The real thing needs a compiled model; here the Dynamo
+# pieces are stubbed.
 
 import contextlib
 import types
