@@ -136,6 +136,7 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
+from vllm_rbln.v1.worker.async_output import AsyncRBLNModelRunnerOutput
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
@@ -191,81 +192,6 @@ def _copy_pooler_output(
         if include and out is not None:
             pooler_output[i] = out
     return pooler_output
-
-
-# Wrapper for ModelRunnerOutput to support overlapped execution.
-class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
-    def __init__(
-        self,
-        model_runner_output: ModelRunnerOutput,
-        sampled_token_ids: torch.Tensor,
-        invalid_req_indices: list[int],
-        pending_token_writeback: Any = None,
-        req_ids: list[str] | None = None,
-        placeholder_pos: dict[str, int] | None = None,
-        logprobs_tensors: Any = None,
-    ):
-        self._model_runner_output = model_runner_output
-        self._invalid_req_indices = invalid_req_indices
-        # For the token_ids_cpu write-back, applied by the main thread.
-        self._pending_token_writeback = pending_token_writeback
-        self._req_ids = req_ids
-        self._placeholder_pos = placeholder_pos
-
-        # Keep a reference to the device tensor to avoid it being
-        # deallocated until we finish copying it to the host.
-        self._sampled_token_ids = sampled_token_ids
-        self._sampled_token_ids_cpu = torch.empty(
-            sampled_token_ids.shape,
-            dtype=sampled_token_ids.dtype,
-            device="cpu",
-        )
-        # Logprobs ride the same deferral. Only the dense form is free of the
-        # tokens: the topk form indexes by the sampled ids, so building it pulls
-        # them to the host mid-step and serialises what async just decoupled.
-        self._logprobs_tensors = logprobs_tensors
-
-        # The D2H is neither dispatched nor awaited here - both happen in
-        # get_output().
-
-    def get_output(self) -> ModelRunnerOutput:
-        """Copy the device tensors to the host and return a ModelRunnerOutput.
-
-        Blocks until the copy is finished. Under async scheduling this runs on
-        the worker's async output thread rather than the thread running the
-        model, so the copy is dispatched while the next forward is in flight.
-
-        inference_mode is re-entered because _sampled_token_ids_cpu is an
-        inference tensor, allocated under sample_tokens' inference_mode, and
-        InferenceMode is thread-local, so it is off on this thread. Updating an
-        inference tensor in place with it off is a hard error.
-        """
-        # Blocking copy, not non_blocking + a device synchronize: synchronizing
-        # waits on every pending transfer, so once forward(N+1) is dispatched
-        # this thread would wait out a whole forward. This waits on the sampler.
-        with torch.inference_mode():
-            self._sampled_token_ids_cpu.copy_(self._sampled_token_ids)
-
-        valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
-        for i in self._invalid_req_indices:
-            valid_sampled_token_ids[i].clear()
-
-        # The -1 placeholders the async path left in token_ids_cpu still have to be
-        # replaced by the real tokens, but not from this thread: the main thread
-        # reads token_ids_cpu in _preprocess. Queue the tokens instead and let the
-        # main thread apply them at the top of its next step.
-        if self._pending_token_writeback is not None and self._req_ids is not None:
-            self._pending_token_writeback.append(
-                (self._req_ids, valid_sampled_token_ids, self._placeholder_pos)
-            )
-
-        output = self._model_runner_output
-        output.sampled_token_ids = valid_sampled_token_ids
-        if self._logprobs_tensors is not None:
-            # tolists() is where the logprobs D2H actually happens - on this
-            # thread, off the step's critical path.
-            output.logprobs = self._logprobs_tensors.tolists()
-        return output
 
 
 class ExecuteModelState(NamedTuple):
