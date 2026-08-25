@@ -29,15 +29,6 @@ from vllm_rbln.v1.worker.utils import extract_layer_index, num_attn_module
 
 rbln_num_attn_module = num_attn_module
 rbln_extract_layer_index = register_patch(
-    target="vllm.model_executor.models.utils.extract_layer_index",
-    reason=(
-        "DeepSeek-V3.2 sparse attention adds another KV-cache module "
-        "(the lightning indexer) per decoder layer."
-    ),
-    apply_immediately=True,
-)(extract_layer_index)
-
-rbln_extract_layer_index = register_patch(
     target="vllm.v1.worker.utils.extract_layer_index",
     reason=(
         "vllm.v1.worker.utils snapshots extract_layer_index at import time, so "
@@ -45,7 +36,7 @@ rbln_extract_layer_index = register_patch(
     ),
     key="vllm_rbln.patches.models_utils.rbln_extract_layer_index.v1_worker_utils",
     apply_immediately=True,
-)(rbln_extract_layer_index)
+)(extract_layer_index)
 
 
 # NOTE(RBLN): Introduced in https://github.com/RBLN-SW/vllm-rbln/pull/81
