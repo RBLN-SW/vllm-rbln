@@ -2927,14 +2927,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 assert torch.all(num_tokens_across_dp % num_reqs_across_dp == 0)
                 tokens_per_req_across_dp = num_tokens_across_dp // num_reqs_across_dp
                 max_tokens_per_req = int(torch.max(tokens_per_req_across_dp).item())
-                if self.use_aux_hidden_state_outputs:
-                    # NOTE(RBLN): This can rarely cause some redundant padding in MoE.
-                    # However, there's a compiler failure with eagle3 on a case where
-                    # qlen=1 on every rank. So we pad to num_spec_tokens + 1 if every
-                    # rank has qlen=1 for now.
-                    max_tokens_per_req = max(
-                        max_tokens_per_req, self.num_spec_tokens + 1
-                    )
                 num_tokens_padded = num_reqs_padded * max_tokens_per_req
 
         return num_reqs_padded, num_tokens_padded, num_tokens_across_dp
