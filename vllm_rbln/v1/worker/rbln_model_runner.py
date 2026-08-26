@@ -2167,7 +2167,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
 
-        if isinstance(self.drafter, RBLNEagleProposer):
+        if isinstance(self.drafter, RBLNEagleProposer) and (
+            is_prefill or num_tokens_per_req == 1 + self.num_spec_tokens
+        ):
             self.drafter.dummy_run(
                 num_reqs,
                 num_tokens_per_req,
