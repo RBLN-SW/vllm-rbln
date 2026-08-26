@@ -22,5 +22,11 @@ from vllm_rbln.patches import register_patch
 
 register_patch(
     target="vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a16_fp8.CompressedTensorsW8A16Fp8MoEMethod",
-    reason="",
+    reason=(
+        "Replace upstream CompressedTensorsW8A16Fp8MoEMethod with the RBLN "
+        "weight-only fp8 MoE method: it runs the custom_moe_glu_group_dequantize "
+        "op on the fp8 expert weights and per-channel or block scales, with the "
+        "pre-computed routing weights RBLNMoERunner passes in as router_logits "
+        "(topk/softmax done outside the op)."
+    ),
 )(CompressedTensorsW8A16Fp8MoEMethod)

@@ -84,13 +84,27 @@ class AXK1MLP(torch.nn.Module):
 
 register_patch(
     target="vllm.model_executor.models.AXK1.AXK1MLP",
-    reason="",
+    reason=(
+        "Keep gate_proj and up_proj as two plain linears instead of upstream's "
+        "MergedColumnParallelLinear + SiluAndMul. RBLNW8A16Fp8LinearKernel emits "
+        "dequantize-then-linear per layer for rebel_compiler to map onto its fp8 "
+        "kernel, and when a.x-k1 was brought up the compiler could not convert "
+        "the fused gate_up form (48da43da). The load_weights patch below matches "
+        "this layout. TODO: drop once rebel_compiler converts the fused pattern; "
+        "origin/revert_forced_pattern holds the removal."
+    ),
 )(AXK1MLP)
 
 
 @register_patch(
     target="vllm.model_executor.models.AXK1.AXK1Attention.forward",
-    reason="",
+    reason=(
+        "RBLN non-MLA (use_mla=False) path: keep the [batch, seq, ...] layout "
+        "the RBLN runner feeds instead of upstream's flattened token axis, "
+        "materialize K per head by repeating k_pe, and pad V to qk_head_dim so "
+        "the regular RBLN attention backend can run AXK1 attention. Unused when "
+        "use_mla=True (AXK1MLAAttention)."
+    ),
 )
 def patched_ax_k1_attention_forward(
     self: AXK1Attention,
@@ -144,7 +158,12 @@ def patched_ax_k1_attention_forward(
 
 @register_patch(
     target="vllm.model_executor.models.AXK1.AXK1MoE.forward",
-    reason="",
+    reason=(
+        "Replace AXK1MoE.forward with the RBLN form: call RBLNMoERunner with a "
+        "`router` callback, keep 3-D tensors, and add the shared experts here. "
+        "Upstream hands shared_experts to the experts layer to fuse, but the "
+        "RBLN runner returns only the routed output."
+    ),
 )
 def patched_ax_k1_moe_foward_rsd(
     self: AXK1MoE,
