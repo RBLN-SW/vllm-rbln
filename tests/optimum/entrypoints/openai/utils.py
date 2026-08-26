@@ -46,14 +46,7 @@ def _warm_hf_cache_with_retry(
     model: str, revision: str | None, *, retries: int = 5, base_delay: float = 2.0
 ) -> None:
     """Download the model's complete snapshot into the local HF cache, retrying
-    on transient connection errors.
-
-    The server is launched with ``HF_HUB_OFFLINE=1`` (see ``_start_server``), the
-    offline path this vllm-rbln build is built around: EngineArgs then resolves
-    the model through ``get_model_path() -> snapshot_download(local_files_only=
-    True)``, which demands the *complete* snapshot and raises
-    ``IncompleteSnapshotError`` if any repo file is missing -- a weights-only
-    cache is not enough."""
+    on transient connection errors."""
     for attempt in range(1, retries + 1):
         try:
             huggingface_hub.snapshot_download(model, revision=revision)
