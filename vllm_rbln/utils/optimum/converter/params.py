@@ -15,7 +15,6 @@
 """Helpers for reading and parsing rbln_config.json parameters."""
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
@@ -28,6 +27,7 @@ else:
 from optimum.rbln.configuration_utils import RBLNModelConfig
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_multi_modal,
@@ -60,9 +60,7 @@ def load_compiled_rbln_config(vllm_config: VllmConfig) -> dict | None:
     Returns ``None`` if the model directory has no compiled artefact yet
     (e.g. pre-compile stage or HuggingFace-only model path).
     """
-    rbln_config_path = Path(
-        os.path.join(vllm_config.model_config.model, "rbln_config.json")
-    )
+    rbln_config_path = Path(vllm_config.model_config.model) / RBLN_CONFIG_FILE
     if not rbln_config_path.exists():  # for pytest
         logger.warning(
             "rbln_config.json not found in model directory: %s. "

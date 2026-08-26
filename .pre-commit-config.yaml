@@ -88,6 +88,9 @@ repos:
     entry: python tools/pre_commit/check_license_header.py
     language: python
     types: [python]
+    # _skt_*.py are byte-identical vendored SKT-AI/vllm sources (see
+    # vllm_rbln/patches/axk2/ORIGIN); frozen, so they keep their upstream header.
+    exclude: '^vllm_rbln/patches/axk2/_skt_.*\.py$'
   - id: check-filenames
     name: Check for spaces in all filenames
     entry: bash

@@ -31,10 +31,10 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.utils import (
-    extract_layer_index,
+    num_attn_module as rbln_num_attn_module,
 )
 from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
+    pipeline_adjusted_layer_index,
 )
 
 if TYPE_CHECKING:
@@ -45,17 +45,6 @@ attention_original_forward = Attention.forward
 
 
 def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
-    """Record a pipeline-adjusted layer index on an attention layer.
-
-    RBLN resolves each layer's KV cache from attention metadata (a graph
-    input) by index; that index must be relative to the layers that live on
-    this pipeline-parallel rank, so subtract the rank's starting layer.
-
-    Models with more than one attention module per decoder layer (e.g.
-    DeepSeek-V3.2, whose lightning indexer adds a second KV-cache module per
-    layer) index each module as ``base_layer * num_attn_module + sub``
-    """
-    # NOTE(RBLN): Consider PP
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
     num_attn_module = (
@@ -63,25 +52,12 @@ def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
         if model_config is not None
         else 1
     )
-    raw_layer_index = extract_layer_index(self.layer_name, num_attn_module)
-
-    if model_config is None:
-        self.layer_index = raw_layer_index
-        return
-
-    # The index is relative to the layers on this pipeline-parallel rank, and
-    # each layer contributes num_attn_module KV-cache modules
-    start, end = model_config.get_layers_start_end_indices(vllm_config.parallel_config)
-    total_num_hidden_layers = model_config.get_total_num_hidden_layers()
-    if raw_layer_index >= total_num_hidden_layers * num_attn_module:
-        # MTP/nextn layers are named past the target's layer count
-        # (mtp_start_layer_idx == num_hidden_layers), so their KV cache sits
-        # right after the target layers in the compacted per-rank cache list.
-        self.layer_index = (end - start) * num_attn_module + (
-            raw_layer_index - total_num_hidden_layers * num_attn_module
-        )
-    else:
-        self.layer_index = raw_layer_index - start * num_attn_module
+    self.layer_index = pipeline_adjusted_layer_index(
+        self.layer_name,
+        model_config,
+        vllm_config.parallel_config,
+        num_attn_module,
+    )
 
 
 # NOTE(RBLN) - To represent kv cache as model input,
