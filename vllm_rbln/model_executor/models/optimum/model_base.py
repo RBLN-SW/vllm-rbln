@@ -45,6 +45,8 @@ logger = init_logger(__name__)
 
 
 def _is_compiled_dir(path: str | None) -> bool:
+    if path is None:
+        return False
     return bool(path) and os.path.isfile(os.path.join(path, "rbln_config.json"))
 
 
