@@ -171,6 +171,30 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = AttnMetadataDict  #  | list[AttnMetadataDict]
 
 
+def _decode_batch_bucket_limit(
+    *,
+    configured_limit: int,
+    max_batch_size: int,
+    strategy: str,
+    speculative_method: str | None,
+) -> int:
+    """Keep every exponential decode bucket required by DFlash.
+
+    DFlash projects target states into the draft cache after every verification
+    step. Padding a smaller active batch directly to the maximum capacity changes
+    the target graph's numerical trajectory, while the drafter still follows the
+    active request count. Let the existing exponential manager enumerate its full
+    ladder so each step uses the smallest available target batch graph.
+
+    ``max_batch_size`` is a safe upper bound on the number of buckets: integer
+    division strictly decreases every exponential candidate, so the manager will
+    stop at ``min_batch_size`` long before reaching the limit.
+    """
+    if strategy == "exponential" and speculative_method == "dflash":
+        return max(configured_limit, max_batch_size)
+    return configured_limit
+
+
 def _copy_pooler_output(
     raw_pooler_output: PoolerOutput, finished_mask: list[bool]
 ) -> list[torch.Tensor | None]:
@@ -459,14 +483,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(RBLN): RBLN compiles a fixed decode-batch shape, so bucket to the
         # per-PP-stage decode batch (max_num_seqs // pp_size) -- the same ceiling
         # the scheduler's admission cap uses -- not the raw max_num_seqs.
+        max_decode_batch_size = decode_batch_size(
+            self.max_num_reqs, self.parallel_config.pipeline_parallel_size
+        )
+        bucket_limit = _decode_batch_bucket_limit(
+            configured_limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
+            max_batch_size=max_decode_batch_size,
+            strategy=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
+            speculative_method=(
+                None
+                if self.speculative_config is None
+                else self.speculative_config.method
+            ),
+        )
         self.bucketing_manager = get_bucketing_manager(
             envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
-            max_batch_size=decode_batch_size(
-                self.max_num_reqs, self.parallel_config.pipeline_parallel_size
-            ),
+            max_batch_size=max_decode_batch_size,
             min_batch_size=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MIN,
             step=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STEP,
-            limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
+            limit=bucket_limit,
             manual_buckets=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS,
         )
         logger.info(
