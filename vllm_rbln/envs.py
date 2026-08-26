@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     # --- KV CONNECTOR ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
     # --- QUANTIZATION ---
-    VLLM_RBLN_USE_W8A16: bool = True
+    VLLM_RBLN_USE_W8A8: bool = False
 
 
 def get_num_devices_per_local_rank() -> int:
@@ -379,8 +379,8 @@ environment_variables = {
     # --- QUANTIZATION ---
     # W8A16 runs on every RBLN NPU, W8A8 only on the ones whose kernels take an
     # fp8 activation, so W8A8 is opted into rather than derived from the device.
-    "VLLM_RBLN_USE_W8A16": (
-        lambda: os.environ.get("VLLM_RBLN_USE_W8A16", "True").lower() in ("true", "1")
+    "VLLM_RBLN_USE_W8A8": (
+        lambda: os.environ.get("VLLM_RBLN_USE_W8A8", "False").lower() in ("true", "1")
     ),
 }
 
@@ -408,7 +408,7 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
         "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
         "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
-        "VLLM_RBLN_USE_W8A16",
+        "VLLM_RBLN_USE_W8A8",
     }
 )
 
