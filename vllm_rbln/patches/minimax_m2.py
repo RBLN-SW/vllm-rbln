@@ -209,19 +209,19 @@ def forward(
     # for a later stage that index is the previous stage's final capture, and
     # taking it again would duplicate a boundary layer. Layer 31 of the 62-layer
     # [15,16,16,15] split is exactly such a boundary.
+    #
+    # The capture is written out at both sites rather than factored into a closure
+    # over hidden_states/residual: dynamo does not inline such a closure, it lifts
+    # the captured variables into arguments and compiles the body as its own graph.
+    # For a residual-stream add that graph is two no-op bf16 casts, which the
+    # builder then rejects while registering the module.
     aux: dict[int, torch.Tensor] = {}
-
-    def capture(index: int) -> None:
-        if index in self.aux_hidden_state_layers:
-            aux[index] = (
-                hidden_states + residual if residual is not None else hidden_states
-            )
-
-    if get_pp_group().is_first_rank:
-        capture(0)
+    if get_pp_group().is_first_rank and 0 in self.aux_hidden_state_layers:
+        aux[0] = hidden_states
     for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
         hidden_states, residual = layer(positions, hidden_states, residual)
-        capture(self.start_layer + idx + 1)
+        if self.start_layer + idx + 1 in self.aux_hidden_state_layers:
+            aux[self.start_layer + idx + 1] = hidden_states + residual
 
     # A received index is at or before start_layer and a local one is past it, so
     # the two sets never collide.
