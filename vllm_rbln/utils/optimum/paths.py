@@ -13,8 +13,6 @@
 # limitations under the License.
 import os
 
-# The artefact optimum-rbln writes at the top level of a compiled model
-# directory. A plain HuggingFace checkpoint never has one.
 RBLN_CONFIG_FILE = "rbln_config.json"
 
 
