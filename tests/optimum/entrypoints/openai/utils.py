@@ -22,18 +22,53 @@ from typing import Any
 
 import anthropic
 import httpx
+import huggingface_hub
 import openai
 import requests
-from vllm.engine.arg_utils import AsyncEngineArgs
+from huggingface_hub.errors import LocalEntryNotFoundError
 
 # from tests.models.utils import TextTextLogprobs
 from vllm.entrypoints.cli.serve import ServeSubcommand
-from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_open_port
 
 VLLM_PATH = Path(__file__).parent.parent
 """Path to root of the vLLM repository."""
+
+
+_HF_NETWORK_ERRORS = (
+    requests.exceptions.RequestException,
+    LocalEntryNotFoundError,
+)
+
+
+def _warm_hf_cache_with_retry(
+    model: str, revision: str | None, *, retries: int = 5, base_delay: float = 2.0
+) -> None:
+    """Download the model's complete snapshot into the local HF cache, retrying
+    on transient connection errors.
+
+    The server is launched with ``HF_HUB_OFFLINE=1`` (see ``_start_server``), the
+    offline path this vllm-rbln build is built around: EngineArgs then resolves
+    the model through ``get_model_path() -> snapshot_download(local_files_only=
+    True)``, which demands the *complete* snapshot and raises
+    ``IncompleteSnapshotError`` if any repo file is missing -- a weights-only
+    cache is not enough."""
+    for attempt in range(1, retries + 1):
+        try:
+            huggingface_hub.snapshot_download(model, revision=revision)
+            return
+        except _HF_NETWORK_ERRORS as e:
+            if attempt == retries:
+                raise
+            delay = base_delay * 2 ** (attempt - 1)
+            print(
+                f"HF cache warm-up attempt {attempt}/{retries} failed with a "
+                f"connection error ({type(e).__name__}: {e}); "
+                f"retrying in {delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
 
 
 class RemoteOpenAIServer:
@@ -47,6 +82,11 @@ class RemoteOpenAIServer:
         # the current process might initialize cuda,
         # to be safe, we should use spawn method
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        # The model is fully warmed into the HF cache before we get here (see
+        # __init__), so the server needs no hub access. Force it offline so that
+        # neither a flaky link nor a hub rate-limit during startup's etag
+        # revalidation can fail the test. A local model path needs no hub either.
+        env["HF_HUB_OFFLINE"] = "1"
         if env_dict is not None:
             env.update(env_dict)
         serve_cmd = ["vllm", "serve", model, *vllm_serve_args]
@@ -107,18 +147,14 @@ class RemoteOpenAIServer:
 
         self.show_hidden_metrics = args.show_hidden_metrics_for_version is not None
 
-        # download the model before starting the server to avoid timeout
+        # Warm the HF cache before starting the server: it lets the server run
+        # offline (see _start_server) and avoids a startup download timeout.
         is_local = os.path.isdir(model)
         if not is_local:
-            engine_args = AsyncEngineArgs.from_cli_args(args)
-            model_config = engine_args.create_model_config()
-            load_config = engine_args.create_load_config()
-
-            model_loader = get_model_loader(load_config)
-            model_loader.download_model(model_config)
+            _warm_hf_cache_with_retry(model, getattr(args, "revision", None))
 
         self._start_server(model, vllm_serve_args, env_dict)
-        max_wait_seconds = max_wait_seconds or 240
+        max_wait_seconds = max_wait_seconds or 600
         self._wait_for_server(url=self.url_for("health"), timeout=max_wait_seconds)
 
     def __enter__(self):
