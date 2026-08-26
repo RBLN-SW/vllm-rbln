@@ -526,11 +526,20 @@ def _apply_grouped_topk_torch(
     # Step 1: Apply scoring function & reshape to groups [T, G, E/G]
     if scoring_func == "sigmoid":
         router_logits_2d = torch.sigmoid(router_logits_2d)
+    elif scoring_func == "softmax" and (
+        e_score_correction_bias is not None or not renormalize
+    ):
+        router_logits_2d = F.softmax(router_logits_2d, dim=-1)
     grouped = router_logits_2d.reshape(T, G, epg)
 
-    # Step 2: Score each group by sum of top-2 expert values
-    group_top2_values, _ = torch.topk(grouped, 2, dim=2)  # [T, G, 2]
-    group_scores = group_top2_values.sum(dim=2)  # [T, G]
+    if e_score_correction_bias is not None:
+        biased = (router_logits_2d + e_score_correction_bias.unsqueeze(0)).reshape(
+            T, G, epg
+        )
+        group_top2_values, _ = torch.topk(biased, 2, dim=2)  # [T, G, 2]
+        group_scores = group_top2_values.sum(dim=2)  # [T, G]
+    else:
+        group_scores = grouped.max(dim=2).values  # [T, G]
 
     # Step 3: Select top topk_group groups per token
     _, selected_group_idx = torch.topk(
@@ -554,12 +563,9 @@ def _apply_grouped_topk_torch(
         grouped_masked = minus_inf.scatter(1, idx_expanded, gathered)  # [T, G, epg]
         # [T, G, epg] -> [G, epg, T] -> [E, T]
         scores_t = grouped_masked.permute(1, 2, 0).reshape(E, T)
-
         scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)
         _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
         topk_weights = scores_t.gather(0, selected_experts)
-        if scoring_func == "softmax":
-            topk_weights = F.softmax(topk_weights, dim=0)
         if renormalize:
             topk_weights = topk_weights / topk_weights.sum(
                 dim=0, keepdim=True
@@ -570,18 +576,15 @@ def _apply_grouped_topk_torch(
         return result  # [E, T]
 
     # --- no-bias branch ---
-    # Flatten gathered groups to [topk_group*epg, T] and run topk routing there.
+    # Flatten the selected groups to [topk_group*epg, T] and run topk there.
     gathered_flat = gathered.permute(1, 2, 0).reshape(-1, T)  # [topk_group*epg, T]
 
     if scoring_func == "softmax":
+        topk_weights, selected_experts = torch.topk(gathered_flat, k=top_k, dim=0)
         if renormalize:
-            # post_norm: topk first, then softmax on selected values
-            topk_weights, selected_experts = torch.topk(gathered_flat, k=top_k, dim=0)
+            # post_norm: topk first, then softmax over the selected values;
+            # pre_norm is already normalized over all experts (step 1).
             topk_weights = F.softmax(topk_weights, dim=0)
-        else:
-            # pre_norm: softmax first, then topk
-            sw = F.softmax(gathered_flat, dim=0)
-            topk_weights, selected_experts = torch.topk(sw, k=top_k, dim=0)
     else:
         topk_weights, selected_experts = torch.topk(gathered_flat, k=top_k, dim=0)
         if renormalize:

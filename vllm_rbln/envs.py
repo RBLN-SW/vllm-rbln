@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     VLLM_RBLN_NUM_RAY_NODES: int = 1
+    # --- DYNAMIC KV CACHE ---
+    VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -307,6 +309,14 @@ environment_variables = {
     "VLLM_RBLN_NUM_RAY_NODES": lambda: int(
         os.environ.get("VLLM_RBLN_NUM_RAY_NODES", 1)
     ),
+    # --- DYNAMIC KV CACHE ---
+    # Size the KV cache from the compiled artifact instead of the estimate
+    "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
+            in ("true", "1")
+        )
+    ),
     # --- ATTENTION ---
     # Use flash attention for causal attention
     "VLLM_RBLN_FLASH_CAUSAL_ATTN": (
@@ -407,6 +417,7 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",

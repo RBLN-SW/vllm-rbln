@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # _apply_grouped_topk_torch turns router logits [T, E] into an [E, T] weight
-# table: score groups by their top-2 experts, keep the top `topk_group` groups,
-# then pick `top_k` within them. Pure torch, hand-verifiable inputs.
+# table: score each group (top-2 biased experts with a correction bias, best
+# expert without one), keep the top `topk_group` groups, then pick `top_k`
+# within them. Pure torch, hand-verifiable inputs.
 
 import torch
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
@@ -179,11 +180,13 @@ class TestApplyGroupedTopkTorch:
         )
         assert out.sum(dim=0).tolist() == [torch.tensor(1.0).item()]
 
-    def test_bias_branch_softmaxes_selected_original_scores(self):
-        # In the bias branch, scoring_func="softmax" softmaxes the weights that
-        # were gathered from the original scores (here experts 3 and 2 -> [4,3]).
+    def test_bias_branch_weights_are_softmax_probabilities(self):
+        # With a bias the softmax runs over all experts *before* the bias is
+        # applied (the reference gate biases probabilities, not logits), so an
+        # unrenormalized weight is that expert's full-vocabulary probability.
+        logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
         out = grouped_topk(
-            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            logits,
             top_k=2,
             num_expert_group=2,
             topk_group=2,
@@ -191,13 +194,14 @@ class TestApplyGroupedTopkTorch:
             renormalize=False,
             e_score_correction_bias=torch.zeros(4),
         )
-        expected = torch.softmax(torch.tensor([4.0, 3.0]), dim=0)
+        probs = torch.softmax(logits, dim=-1).flatten()
         assert out.flatten().tolist() == [
             0.0,
             0.0,
-            expected[1].item(),  # expert 2 <- score 3
-            expected[0].item(),  # expert 3 <- score 4
+            probs[2].item(),  # expert 2
+            probs[3].item(),  # expert 3
         ]
+        assert out.sum().item() < 1.0  # no renormalization: mass stays partial
 
     def test_softmax_post_norm_sums_to_one_while_pre_norm_leaks_mass(self):
         # renormalize=True softmaxes after topk (sums to 1); False softmaxes

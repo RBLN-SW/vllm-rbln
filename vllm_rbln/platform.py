@@ -98,7 +98,8 @@ class RblnPlatform(Platform):
             AttentionBackendEnum.FLASH_ATTN_MLA,
         ):
             raise ValueError(f"Cannot use {selected_backend} backend on RBLN.")
-        if attn_selector_config.use_sparse:
+
+        if attn_selector_config.use_sparse and not attn_selector_config.use_mla:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
         logger.info("Using %s Backend", selected_backend)
@@ -258,6 +259,12 @@ class RblnPlatform(Platform):
             )
             scheduler_config.async_scheduling = False
 
+        # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
+        # that runs only inside the vLLM-native branch below, and the optimum
+        # path is exactly where an unsupported flag would go unnoticed.
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            cls._validate_dynamic_kv_config(vllm_config)
+
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             if vllm_config.lora_config is not None:
                 raise ValueError("LoRA is not supported on RBLN.")
@@ -298,6 +305,33 @@ class RblnPlatform(Platform):
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
             )
+
+            # Under PP the compiled per-stage decode batch is max_num_seqs // pp_size
+            # (see decode_batch_size). Fail fast on an impossible config.
+            pp_size = parallel_config.pipeline_parallel_size
+            if pp_size > 1:
+                max_num_seqs = scheduler_config.max_num_seqs
+                if max_num_seqs < pp_size:
+                    raise ValueError(
+                        f"pipeline_parallel_size={pp_size} requires "
+                        f"max_num_seqs >= {pp_size} (got {max_num_seqs}); "
+                        f"per-stage decode batch would floor to 0."
+                    )
+                if max_num_seqs % pp_size != 0:
+                    logger.warning(
+                        "max_num_seqs=%d is not a multiple of "
+                        "pipeline_parallel_size=%d; %d decode slot(s) will be unused.",
+                        max_num_seqs,
+                        pp_size,
+                        max_num_seqs % pp_size,
+                    )
+                logger.info_once(
+                    "pipeline_parallel_size=%d, max_num_seqs=%d -> "
+                    "per-stage decode batch=%d.",
+                    pp_size,
+                    max_num_seqs,
+                    max_num_seqs // pp_size,
+                )
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
@@ -400,6 +434,44 @@ class RblnPlatform(Platform):
                     "distributed executor backend."
                 ),
                 parallel_config.distributed_executor_backend,
+            )
+
+    @staticmethod
+    def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
+        """Reject configurations the dynamic-KV path cannot size.
+
+        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
+        Configurations".
+        """
+        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
+                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
+            )
+
+        if vllm_config.model_config.use_mla:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
+                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
+            )
+
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
+                "decoding; the merged profiles cannot be attributed per artifact."
+            )
+
+        if not USE_DEVICE_TENSOR:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
+                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
+                "no dynamic KV dimension."
+            )
+
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
+                "transfer connector; the resize invalidates its registrations."
             )
 
     @classmethod
@@ -532,7 +604,10 @@ class RblnPlatform(Platform):
 
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+        from vllm_rbln.utils.optimum.predicates import (
+            is_qwen3_embedding,
+            is_qwen3_reranker,
+        )
         from vllm_rbln.utils.optimum.registry import (
             is_enc_dec_arch,
             is_pooling_arch,
@@ -557,7 +632,8 @@ class RblnPlatform(Platform):
 
         else:
             # Prefix caching is supported only for decoder-only models for now.
-            if is_qwen3_pooling(vllm_config.model_config):
+            model_config = vllm_config.model_config
+            if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
                 # Qwen3 pooling model does not support prefix caching for now.
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):

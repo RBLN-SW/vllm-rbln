@@ -24,6 +24,7 @@ from tests.native.v1.core.utils import (
     make_model_runner_output,
     make_request,
 )
+from vllm_rbln.v1.core.utils import step_is_prefill
 
 BLOCK_SIZE = 16
 PROMPT_LEN = 2 * BLOCK_SIZE
@@ -149,6 +150,9 @@ class TestCoexistenceWithDecodes:
 
         assert out2.num_scheduled_tokens["0"] == 1
         assert out2.num_scheduled_tokens["R"] == 1
+        # The promoted request brought its whole prompt with it, so the step the
+        # runner sees is a plain decode step.
+        assert step_is_prefill(out2) is False
 
     def test_local_prefill_is_deferred_behind_a_promoted_request(self):
         # A promotion was admitted this step, so a local prefill must wait:

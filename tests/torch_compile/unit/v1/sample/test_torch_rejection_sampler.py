@@ -14,17 +14,23 @@
 
 # Copied from tests.v1.sample.test_rejection_sampler: https://github.com/vllm-project/vllm/blob/v0.13.0/tests/v1/sample/test_rejection_sampler.py
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn.functional as F
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+from vllm_rbln.v1.sample.rbln_logits_processor import (
+    RBLNMinTokensLogitsProcessor,
+    build_rbln_logitsprocs,
+)
 from vllm_rbln.v1.sample.rbln_rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RBLNRejectionSampler,
@@ -124,6 +130,7 @@ def create_sampling_metadata(
     repetition_penalties: list[float] | None = None,
     bad_words_token_ids: dict[int, list[list[int]]] | None = None,
     allowed_token_ids_mask: torch.Tensor | None = None,
+    logitsprocs: LogitsProcessors | None = None,
 ) -> SamplingMetadata:
     """Create a v1 sampling metadata object with all_greedy set
     to the given value. Either all greedy or all random sampling
@@ -167,7 +174,7 @@ def create_sampling_metadata(
         spec_token_ids=[] if spec_token_ids is None else spec_token_ids,
         allowed_token_ids_mask=allowed_token_ids_mask,
         bad_words_token_ids={} if bad_words_token_ids is None else bad_words_token_ids,
-        logitsprocs=LogitsProcessors(),
+        logitsprocs=logitsprocs or LogitsProcessors(),
     )
 
 
@@ -821,6 +828,73 @@ def test_allowed_token_ids(rejection_sampler):
 
     expected = torch.tensor(
         [[15, -1, -1, -1], [10, 5, 10, -1], [7, 10, 12, 5]],
+        dtype=torch.int,
+        device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_min_tokens_masks_stop_tokens(rejection_sampler):
+    """min_tokens must mask stop tokens at draft positions that would
+    otherwise let the request finish early.
+
+    Runs with bfloat16 logits as a dtype regression test: within one
+    spec-decode step the same MinTokens processor sees model-dtype logits
+    (bonus path, via the sampler) and float32-upcast target logits
+    (rejection path), and index_put_ rejects mixed dtypes.
+    """
+    stop_token_id = 9
+    runner_up_token_id = 5
+    spec_tokens = [[1, 2]]
+    # Target row 0 agrees with the draft; target row 1 puts the stop token
+    # first and the runner-up token second.
+    output_tokens = [[1, stop_token_id, 0]]
+
+    logits = create_logits_tensor(output_tokens).to(torch.bfloat16)
+    logits[1, runner_up_token_id] = 50.0
+
+    # Build through the RBLN builder, as the model runner does; with
+    # speculative decoding enabled it creates only the MinTokens processor.
+    logitsprocs = build_rbln_logitsprocs(
+        SimpleNamespace(speculative_config=Mock()),
+        torch.device(DEVICE),
+        is_pin_memory=False,
+        is_pooling_model=False,
+    )
+    (proc,) = logitsprocs.all
+    assert isinstance(proc, RBLNMinTokensLogitsProcessor)
+
+    # No output tokens yet and min_tokens=2, so both draft positions mask
+    # the stop token.
+    params = SamplingParams(min_tokens=2, max_tokens=18, stop_token_ids=[stop_token_id])
+    proc.update_state(
+        BatchUpdate(
+            batch_size=1,
+            removed=[],
+            moved=[],
+            added=[(0, params, None, [])],
+        )
+    )
+    # Simulate the bonus path that precedes rejection sampling in a real
+    # step: apply() on model-dtype logits, followed inside forward() by
+    # apply_with_spec_decode() on float32 target logits.
+    proc.apply(torch.zeros(1, logits.shape[-1], dtype=logits.dtype))
+
+    metadata = create_sampling_metadata(all_greedy=True, logitsprocs=logitsprocs)
+    spec_decode_metadata = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(rejection_sampler, torch.tensor([0], device=logits.device))
+
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+    # At draft position 1 the stop token is masked, so the target argmax
+    # falls to the runner-up token and the draft token is rejected in its
+    # favor.
+    expected = torch.tensor(
+        [[1, runner_up_token_id, PLACEHOLDER_TOKEN_ID]],
         dtype=torch.int,
         device=logits.device,
     )
