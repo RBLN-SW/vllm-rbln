@@ -1266,12 +1266,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             bucket = logits.shape[0]
             num_reqs = self.input_batch.num_reqs
             padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
-            # Keyed off the installed sampler, not off use_async_scheduling:
-            # only RBLNSampler accepts the kwarg, and self.sampler can be
-            # swapped for upstream's Sampler after __init__ -- the executor's
-            # golden validation does exactly that to read raw host logprobs.
-            # Passing the kwarg as None instead of omitting it would still
-            # raise, since upstream's signature has no such parameter.
+            # Keyed off the installed sampler: only RBLNSampler takes the kwarg,
+            # and the executor's golden validation swaps self.sampler after __init__.
             staging = (
                 {"staging_owner": self}
                 if self.use_async_scheduling and isinstance(self.sampler, RBLNSampler)
@@ -1292,10 +1288,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _apply_pending_token_writeback(self) -> None:
         """Put the real sampled tokens where every reader can see them.
 
-        _repair_staged_input_ids reaches only requests that were in the previous
-        step's batch. Repairs CachedRequestState.output_token_ids as well as
-        token_ids_cpu, because token_ids_cpu is rebuilt from the request state
-        whenever a request re-enters the persistent batch.
+        Repairs CachedRequestState.output_token_ids too: token_ids_cpu is rebuilt
+        from it whenever a request re-enters the persistent batch.
         """
         input_batch = self.input_batch
         while True:
@@ -1335,12 +1329,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _repair_staged_input_ids(
         self, staged_model_inputs: StagedModelInputs, req_ids: list[str]
     ) -> None:
-        """Overwrite the scheduler's -1 placeholders with the previous step's
-        sampled tokens, still on device. A request that was not in the previous
-        batch is skipped and gets its token from token_ids_cpu instead, via
-        _apply_pending_token_writeback. prev_sampled_token_ids aliases the
-        two-slot ring, so this must run before this step's sampling writes the
-        slot it points at.
+        """Overwrite the scheduler's -1 placeholders with the previous step's tokens.
+
+        Skips requests absent from the previous batch; they are repaired by
+        _apply_pending_token_writeback. Must run before this step's sampling,
+        which overwrites the ring slot prev_sampled_token_ids aliases.
         """
         prev_sampled = self.input_batch.prev_sampled_token_ids
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
@@ -1359,10 +1352,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if not prev_rows:
             return
 
-        # One contiguous D2H of the whole column, then remap on the host. An
-        # advanced-index gather or a dtype cast on prev_sampled would each be
-        # another eager op reading the ring, and the copy that refills the ring
-        # then waits on it -- most of a decode step, in the sampler call.
+        # Remap on the host: any eager device op reading the ring makes the copy
+        # that refills it wait, which costs most of a decode step.
         num_prev = prev_sampled.shape[0]
         host_buffer = self._prev_token_host_buffer
         if (
@@ -1384,10 +1375,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             input_ids[cur_rows, 0] = host[prev_rows].to(input_ids.dtype)
 
     def _repair_async_output_token_ids(self) -> None:
-        """Replace the -1 at the tail of output_token_ids before penalties, bad
-        words and custom logits processors read it through sampling_metadata.
-        _apply_pending_token_writeback only repairs it a step later, whereas
-        prev_sampled_token_ids carries the token now, with no thread hand-off.
+        """Replace the -1 tail of output_token_ids before the logits processors read it.
+
+        _apply_pending_token_writeback is a step too late; prev_sampled_token_ids
+        carries the token now.
         """
         output_token_ids = self.input_batch.sampling_metadata.output_token_ids
         prev_sampled = self.input_batch.prev_sampled_token_ids
