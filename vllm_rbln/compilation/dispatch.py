@@ -17,9 +17,9 @@ from types import CodeType, FunctionType, MethodType
 from typing import Any
 
 import torch
+from torch._C._profiler import _RecordFunctionFast
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.logger import init_logger
 
@@ -143,12 +143,12 @@ class Dispatcher:
             tuple((name, _value_key(v)) for name, v in sorted(kwargs.items())),
             *_forward_context_key(),
         )
-        graph, annotation = self._graphs.get(key, (None, None))
+        graph, scope = self._graphs.get(key, (None, None))
         if graph is None:
             result = self._compiled(*args, **kwargs)
             self._register(key)
             return result
-        with record_function_or_nullcontext(annotation):
+        with scope:
             return graph(*args, **kwargs)
 
     def _register(self, key: tuple) -> None:
@@ -173,10 +173,11 @@ class Dispatcher:
         entry = entries[0]
         # Bypassing the frame eval also bypasses the profiler scope it opens, so
         # the region is invisible unless we open one. Dynamo's compile id keeps a
-        # dispatched trace comparable with one taken without the dispatcher.
+        # dispatched trace comparable with one taken without the dispatcher, and
+        # this scope is gated on the profiler, not on an env var like vLLM's.
         self._graphs[key] = (
             self._clone(entry.code),
-            f"Dispatched Region: {entry.compile_id}",
+            _RecordFunctionFast(f"Dispatched Region: {entry.compile_id}"),
         )
         logger.debug(
             "dispatch: registered %s as entry %d for %s",
