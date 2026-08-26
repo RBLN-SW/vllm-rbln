@@ -44,6 +44,10 @@ from .compilation import RBLNCompileSpec
 logger = init_logger(__name__)
 
 
+def _is_compiled_dir(path: str | None) -> bool:
+    return bool(path) and os.path.isfile(os.path.join(path, "rbln_config.json"))
+
+
 class KVCacheBlockAdapter:
     """
      KV cache block allocation behavior (v1 vs v0).
@@ -182,9 +186,9 @@ class RBLNOptimumModelBase(nn.Module):
         rbln_overrides = self.vllm_config.additional_config.get("rbln_config", {})
         _, model_cls_name = get_rbln_model_info(hf_config)
         model_path = self.vllm_config.model_config.model
-        if os.path.exists(model_path):
+        if _is_compiled_dir(model_path):
             valid_path = model_path
-        elif cached_model_path and os.path.exists(cached_model_path):
+        elif _is_compiled_dir(cached_model_path):
             valid_path = cached_model_path
         else:
             valid_path = None
