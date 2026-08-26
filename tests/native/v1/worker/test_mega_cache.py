@@ -93,7 +93,7 @@ class TestSignatureComposition:
 # survive is the round trip through normalize_value()/hash_factors().
 GRAPH_ENV = [
     ("VLLM_RBLN_NUM_HIDDEN_LAYERS", "0", "4"),  # int
-    ("VLLM_RBLN_USE_W8A16", "0", "1"),  # bool
+    ("VLLM_RBLN_USE_W8A8", "0", "1"),  # bool
     ("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "exponential", "linear"),  # str
     ("VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS", "1,2,4", "1,2,4,8"),  # list
 ]

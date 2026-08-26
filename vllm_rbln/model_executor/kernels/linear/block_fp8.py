@@ -68,8 +68,8 @@ class RBLNW8A16BlockFp8LinearKernel(Fp8BlockScaledMMLinearKernel):
 
         from vllm_rbln import envs
 
-        if not envs.VLLM_RBLN_USE_W8A16:
-            return False, "RBLN W8A16 block fp8 kernel applies only on W8A16 devices."
+        if envs.VLLM_RBLN_USE_W8A8:
+            return False, "RBLN W8A16 block fp8 kernel is off when W8A8 is requested."
         return True, None
 
     def apply_block_scaled_mm(
@@ -122,8 +122,8 @@ class RBLNW8A8BlockFp8LinearKernel(RBLNW8A16BlockFp8LinearKernel):
 
         from vllm_rbln import envs
 
-        if envs.VLLM_RBLN_USE_W8A16:
-            return False, "RBLN W8A8 block fp8 kernel applies only on W8A8 devices."
+        if not envs.VLLM_RBLN_USE_W8A8:
+            return False, "RBLN W8A8 block fp8 kernel requires VLLM_RBLN_USE_W8A8."
         return True, None
 
     def apply_weights(
