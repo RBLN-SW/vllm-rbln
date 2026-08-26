@@ -15,6 +15,7 @@
 from itertools import islice
 
 import torch
+from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp import (
     MiniMaxText01RMSNormTP,
@@ -24,7 +25,6 @@ from vllm.model_executor.models.minimax_m2 import (
     MiniMaxM2Model,
     MiniMaxM2MoE,
 )
-from vllm.model_executor.models.utils import make_empty_intermediate_tensors_factory
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches import register_patch
@@ -117,6 +117,10 @@ def patched_minimax_m2_attention_forward(
 
 _AUX_SLOT = "aux_hidden_states_"
 
+# Captured at import time: the registry replaces targets outright, so wrapping
+# upstream behaviour means holding the original here.
+_orig_model_init = MiniMaxM2Model.__init__
+
 
 def _aux_slots_received(model: MiniMaxM2Model) -> tuple[int, ...]:
     """Global aux layer indices that reach this stage from upstream stages.
@@ -132,22 +136,36 @@ def _aux_slots_received(model: MiniMaxM2Model) -> tuple[int, ...]:
 
 
 @register_patch(
-    target="vllm.model_executor.models.minimax_m2.MiniMaxM2Model._set_aux_hidden_state_layers",
+    target="vllm.model_executor.models.minimax_m2.MiniMaxM2Model.__init__",
     reason=(
-        "Size the pipeline handoff to carry the EAGLE3 aux hidden states. The "
-        "handoff key set is fixed in __init__, but the aux layers are only known "
-        "once the model runner calls this setter, so the factory has to be rebuilt "
-        "here. Upstream has no hook between the two. "
+        "Size the pipeline handoff to carry the EAGLE3 aux hidden states. Upstream "
+        "fixes the handoff key set here, but the aux layers are only known later, "
+        "when the model runner calls set_aux_hidden_state_layers -- and rebuilding "
+        "the attribute then is too late: MiniMaxM2ForCausalLM.__init__ copies this "
+        "callable onto itself, and the runner calls that copy. Read the key set at "
+        "call time instead, so the copy stays correct. "
         "TODO(vllm-project/vllm#50514): delete once that lands and is released."
     ),
 )
-def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-    self.aux_hidden_state_layers = layers
-    keys = ["hidden_states", "residual"]
-    keys += [f"{_AUX_SLOT}{i}" for i in _aux_slots_received(self)]
-    self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-        keys, self.config.hidden_size
-    )
+def patched_minimax_m2_model_init(
+    self, *, vllm_config: VllmConfig, prefix: str = ""
+) -> None:
+    _orig_model_init(self, vllm_config=vllm_config, prefix=prefix)
+
+    def make_empty_intermediate_tensors(
+        batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        keys = ["hidden_states", "residual"]
+        keys += [f"{_AUX_SLOT}{i}" for i in _aux_slots_received(self)]
+        hidden_size = self.config.hidden_size
+        return IntermediateTensors(
+            {
+                key: torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
+                for key in keys
+            }
+        )
+
+    self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
 
 
 @register_patch(
