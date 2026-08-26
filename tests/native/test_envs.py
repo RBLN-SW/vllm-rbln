@@ -32,8 +32,7 @@ RBLN_KEYS = sorted(
 
 
 def read(name: str) -> Any:
-    """Resolve ``name`` through the env table, clearing the one sticky cache."""
-    envs._USE_W8A16 = None
+    """Resolve ``name`` through the env table."""
     return envs.environment_variables[name]()
 
 
@@ -160,68 +159,6 @@ def test_auto_port_follows_device_tensor(
     assert envs.use_auto_port() is expected
 
 
-# Value parsing is the boolean convention's job; what matters here is only
-# that an explicit setting is consulted before the device is.
-@pytest.mark.parametrize(("raw", "expected"), [("1", True), ("0", False)])
-def test_w8a16_env_overrides_device(monkeypatch, raw, expected):
-    """An explicit setting wins without consulting the platform at all."""
-    monkeypatch.setattr(envs, "_USE_W8A16", None)
-    monkeypatch.setenv("VLLM_RBLN_USE_W8A16", raw)
-    assert envs.get_use_w8a16() is expected
-
-
-@pytest.mark.parametrize(
-    ("device_name", "expected"),
-    [
-        ("RBLN-CR13", False),  # W8A8-capable, so no need to fall back to W8A16
-        ("RBLN-CR23", False),
-        ("  rbln-cr13  ", False),  # case and padding are normalized away
-        ("RBLN-CA25", True),
-        ("", True),  # unknown device errs toward W8A16
-    ],
-)
-def test_w8a16_derived_from_device(monkeypatch, device_name, expected):
-    from vllm.platforms import current_platform
-
-    monkeypatch.delenv("VLLM_RBLN_USE_W8A16", raising=False)
-    monkeypatch.setattr(envs, "_USE_W8A16", None)
-    monkeypatch.setattr(
-        current_platform, "get_device_name", lambda *a, **kw: device_name
-    )
-    assert envs.get_use_w8a16() is expected
-
-
-def test_w8a16_survives_device_query_failure(monkeypatch):
-    """A host with no NPU mounted must still resolve, not raise."""
-    from vllm.platforms import current_platform
-
-    def explode(*args, **kwargs):
-        raise RuntimeError("no NPU mounted")
-
-    monkeypatch.delenv("VLLM_RBLN_USE_W8A16", raising=False)
-    monkeypatch.setattr(envs, "_USE_W8A16", None)
-    monkeypatch.setattr(current_platform, "get_device_name", explode)
-    assert envs.get_use_w8a16() is True
-
-
-def test_w8a16_device_lookup_is_cached(monkeypatch):
-    """The device is queried once; later calls reuse the answer."""
-    from vllm.platforms import current_platform
-
-    calls = []
-
-    def counting(*args, **kwargs):
-        calls.append(1)
-        return "RBLN-CR13"
-
-    monkeypatch.delenv("VLLM_RBLN_USE_W8A16", raising=False)
-    monkeypatch.setattr(envs, "_USE_W8A16", None)
-    monkeypatch.setattr(current_platform, "get_device_name", counting)
-    assert envs.get_use_w8a16() is False
-    assert envs.get_use_w8a16() is False
-    assert len(calls) == 1
-
-
 # The bool lambdas come in two shapes differing only in their default; an
 # unrecognized value has opposite consequences, so one of each is covered.
 BOOL_DEFAULT_OFF = "VLLM_RBLN_METRICS"
@@ -338,14 +275,7 @@ def test_type_checking_block_lists_every_variable():
     assert sorted(declared) == RBLN_KEYS
 
 
-# Resolved from the NPU present at runtime rather than from a fixed default,
-# so its declared value cannot match on every host.
-_HOST_DEPENDENT = {"VLLM_RBLN_USE_W8A16"}
-
-
-@pytest.mark.parametrize(
-    "name", [key for key in RBLN_KEYS if key not in _HOST_DEPENDENT]
-)
+@pytest.mark.parametrize("name", RBLN_KEYS)
 def test_declared_default_matches_resolved(monkeypatch, name):
     """A clean environment resolves to the declared default. All RBLN vars are
     cleared, since some derive from a neighbour (use_auto_port falls back to
