@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
@@ -55,6 +54,44 @@ RBLN_DEV_DIR = "/dev"
 
 # 144 GiB of quad-chiplet DRAM minus the 4 GiB system region
 REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
+
+
+def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
+    int_vals: list[int] = []
+    for subname in layer_name.split("."):
+        try:
+            int_vals.append(int(subname))
+        except ValueError:
+            continue
+    if num_attn_module <= 1 or "attn" not in layer_name:
+        assert len(int_vals) == 1, (
+            f"layer name {layer_name} should only contain one integer"
+        )
+        return int_vals[0]
+    assert int_vals, f"layer name {layer_name} has no integer layer index"
+    base = int_vals[0]
+    if len(int_vals) >= 2:
+        sub = int_vals[1]
+    elif "scale" in layer_name:
+        sub = 2
+    elif "indexer" in layer_name:
+        sub = 1
+    else:
+        sub = 0
+    return base * num_attn_module + sub
+
+
+def num_attn_module(model_config, cache_dtype) -> int:
+    hf_config = model_config.hf_config
+    if getattr(hf_config, "model_type", None) == "longcat_flash":
+        return 2
+    text_config = getattr(model_config, "hf_text_config", hf_config)
+    # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
+    # or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
+    if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
+        is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
+        return 3 if is_fp8 else 2
+    return 1
 
 
 def get_rbln_visible_card_indices() -> list[int]:

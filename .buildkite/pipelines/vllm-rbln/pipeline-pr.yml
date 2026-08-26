@@ -32,7 +32,10 @@ _secrets: &secrets
   HF_TOKEN: FSW_HF_TOKEN
   HF_HOME: FSW_HF_HOME
 
-_sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
+_sync: &sync |
+  echo '--- :package: uv sync'
+  uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
+  bash .buildkite/scripts/rebel-compiler-override.sh
 
 steps:
   - label: ":pytest: [CA25] pytest"
@@ -59,6 +62,24 @@ steps:
       npu:
         count: 4
         product: "RBLN-CR03"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *secrets
+    timeout_in_minutes: 60
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t1-compile.sh"
+
+  - label: ":pytest: [CR13] pytest"
+    key: "vllm-rbln-pytest-cr13"
+    soft_fail: true
+    if_changed: *if_changed
+    agents:
+      queue: udc
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CR13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
     timeout_in_minutes: 60

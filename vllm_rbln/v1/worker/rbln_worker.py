@@ -30,6 +30,7 @@ try:
 except ImportError:
     has_torch_rbln = False
 
+import torch.distributed as dist
 import torch.nn as nn
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import (
@@ -51,7 +52,7 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
 )
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
@@ -963,16 +964,17 @@ class RBLNWorker(WorkerBase):
         kv_device_types = {kv_cache.device.type for kv_cache in mr.kv_caches}
         was_device_resident = bool(kv_device_types - {"meta", "cpu"})
 
-        # NOTE(RBLN): upstream `bind_kv_cache` asserts kv_caches starts empty,
-        # and `initialize_kv_cache_tensors` asserts kv_cache_names has equal
-        # length, so the two must be cleared together.
+        # NOTE(RBLN): the rebind (initialize_kv_cache_tensors) reassigns
+        # kv_caches and kv_cache_names from one ordered name list and rebuilds
+        # kv_cache_bases, so drop all three stale bindings together before the
+        # reallocation.
         mr.kv_caches = []
         mr.kv_cache_bases = []
         mr.kv_cache_names = []
 
-        # NOTE(RBLN): `bind_kv_cache` also parks each layer's view on the
-        # Attention module; the next bind overwrites it only *after* the new
-        # tensors exist, which is the window this closes.
+        # NOTE(RBLN): the rebind also parks each layer's view on the Attention
+        # module; the next bind overwrites it only *after* the new tensors
+        # exist, which is the window this closes.
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
         # `KVCacheTensor.shared_by` is the same list `_allocate_kv_cache_tensors`
@@ -1036,9 +1038,9 @@ class RBLNWorker(WorkerBase):
         )
         mr.kv_cache_config = new_cfg
         # Order is load-bearing: see `_release_kv_cache_tensors`. It also does
-        # the `mr.kv_caches = []` that upstream bind_kv_cache() asserts on.
+        # the `mr.kv_caches = []` that the rebind reassigns.
         self._release_kv_cache_tensors(old_cfg)
-        # Re-applies mark_dynamic and calls bind_kv_cache itself.
+        # Re-applies mark_dynamic and rebinds the KV caches itself.
         mr.initialize_kv_cache_tensors(new_cfg, mr._kernel_block_sizes)
 
         if mr.kv_cache_bases:
@@ -1083,6 +1085,16 @@ class RBLNWorker(WorkerBase):
                 # successful warm-up — not on the skipped or failed path.
                 if has_kv_transfer_group():
                     finalize_kv_cache_registrations(get_kv_transfer_group())
+
+                # NOTE(RBLN): the sampler warm-up and the deferred KV-cache
+                # registration above are per-rank, so ranks reach this point
+                # hundreds of ms apart. Nothing left before the first request is
+                # collective, so that skew would otherwise land in the first
+                # forward's DP all-reduce and be billed to the prefill it runs.
+                if self.parallel_config.data_parallel_size > 1:
+                    logger.info("Warm-up done; waiting for the other DP ranks.")
+                    dist.barrier(group=get_dp_group().cpu_group)
+                    logger.info("All DP ranks left warm-up.")
 
         except BackendCompilerFailed as e:
 
@@ -1261,6 +1273,11 @@ class RBLNWorker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
+
+    def reset_encoder_cache(self) -> None:
+        reset_fn = getattr(self.model_runner, "reset_encoder_cache", None)
+        if callable(reset_fn):
+            reset_fn()
 
     def _release_offload_temp_storage(self) -> None:
         # The runtime drops the offload dir on teardown, but that runs last and vLLM

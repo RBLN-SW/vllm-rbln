@@ -156,7 +156,13 @@ def _flush(target_dir: Path, summary: _Summary) -> None:
         body.append("no lm-eval results.")
     if summary.notes:
         body += ["", *summary.notes]
-    publish_summary("lm-eval", target_dir, "\n".join(body), degraded=summary.degraded)
+    publish_summary(
+        "lm-eval",
+        target_dir,
+        "\n".join(body),
+        chip=summary.chip,
+        degraded=summary.degraded,
+    )
 
 
 @contextlib.contextmanager

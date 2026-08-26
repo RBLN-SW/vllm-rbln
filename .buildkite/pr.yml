@@ -38,7 +38,10 @@ steps:
           sparse:
             paths:
               - .buildkite
-        command: "buildkite-agent pipeline upload .buildkite/pipelines/optimum-pr/pipeline.yml"
+        command: |
+          TARGET_BRANCH=$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-dev}
+          git fetch origin $$TARGET_BRANCH
+          buildkite-agent pipeline upload .buildkite/pipelines/optimum-pr/pipeline.yml --git-diff-base origin/$$TARGET_BRANCH
 
   - group: ":snake: vllm-rbln tests"
     key: "vllm-rbln"
