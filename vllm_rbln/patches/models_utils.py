@@ -25,10 +25,15 @@ from vllm.model_executor.models.utils import (
 )
 
 from vllm_rbln.patches import register_patch
-from vllm_rbln.v1.worker.utils import extract_layer_index, num_attn_module
+from vllm_rbln.v1.worker.utils import (
+    extract_layer_index,
+    num_attn_module,
+    pipeline_adjusted_layer_index,
+)
 
 rbln_num_attn_module = num_attn_module
 rbln_extract_layer_index = extract_layer_index
+rbln_pipeline_adjusted_layer_index = pipeline_adjusted_layer_index
 
 
 # NOTE(RBLN): Introduced in https://github.com/RBLN-SW/vllm-rbln/pull/81
