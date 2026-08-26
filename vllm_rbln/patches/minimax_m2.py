@@ -12,12 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from itertools import islice
+
 import torch
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp import (
     MiniMaxText01RMSNormTP,
 )
-from vllm.model_executor.models.minimax_m2 import MiniMaxM2Attention, MiniMaxM2MoE
+from vllm.model_executor.models.minimax_m2 import (
+    MiniMaxM2Attention,
+    MiniMaxM2Model,
+    MiniMaxM2MoE,
+)
+from vllm.model_executor.models.utils import make_empty_intermediate_tensors_factory
+from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches import register_patch
 
@@ -105,3 +113,116 @@ def patched_minimax_m2_attention_forward(
     attn_output = self.attn(q, k, v)
     output, _ = self.o_proj(attn_output)
     return output
+
+
+_AUX_SLOT = "aux_hidden_states_"
+
+
+def _aux_slots_received(model: MiniMaxM2Model) -> tuple[int, ...]:
+    """Global aux layer indices that reach this stage from upstream stages.
+
+    A capture at index ``i`` is the input to layer ``i``, so this stage receives
+    every requested index at or before its first owned layer. On the first stage
+    the set is empty: index ``start_layer == 0`` is captured locally from the
+    embedding output.
+    """
+    if get_pp_group().is_first_rank:
+        return ()
+    return tuple(i for i in model.aux_hidden_state_layers if i <= model.start_layer)
+
+
+@register_patch(
+    target="vllm.model_executor.models.minimax_m2.MiniMaxM2Model._set_aux_hidden_state_layers",
+    reason=(
+        "Size the pipeline handoff to carry the EAGLE3 aux hidden states. The "
+        "handoff key set is fixed in __init__, but the aux layers are only known "
+        "once the model runner calls this setter, so the factory has to be rebuilt "
+        "here. Upstream has no hook between the two. "
+        "TODO(vllm-project/vllm#50514): delete once that lands and is released."
+    ),
+)
+def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+    self.aux_hidden_state_layers = layers
+    keys = ["hidden_states", "residual"]
+    keys += [f"{_AUX_SLOT}{i}" for i in _aux_slots_received(self)]
+    self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+        keys, self.config.hidden_size
+    )
+
+
+@register_patch(
+    target="vllm.model_executor.models.minimax_m2.MiniMaxM2Model.forward",
+    reason=(
+        "Collect EAGLE3 aux hidden states correctly under pipeline parallelism. "
+        "Upstream indexes the capture with `enumerate(islice(...))`, which restarts "
+        "at zero on every stage, so a non-first stage matches a requested global "
+        "layer index against a stage-local one and harvests the wrong layer. It "
+        "then drops `aux_hidden_states` entirely on non-last stages, while the "
+        "drafter runs on the last one. Carry them in the existing IntermediateTensors "
+        "handoff under global-index slots and reassemble in layer order; no new "
+        "collective is introduced. "
+        "TODO(vllm-project/vllm#50514): delete once that lands and is released."
+    ),
+)
+def forward(
+    self,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None,
+    inputs_embeds: torch.Tensor | None = None,
+) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+    incoming: dict[int, torch.Tensor] = {}
+    if get_pp_group().is_first_rank:
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_input_ids(input_ids)
+        residual = None
+    else:
+        assert intermediate_tensors is not None
+        hidden_states = intermediate_tensors["hidden_states"]
+        residual = intermediate_tensors["residual"]
+        incoming = {
+            i: intermediate_tensors[f"{_AUX_SLOT}{i}"]
+            for i in _aux_slots_received(self)
+        }
+
+    # Index i means "input to layer i". The pre-loop capture is first-rank only:
+    # for a later stage that index is the previous stage's final capture, and
+    # taking it again would duplicate a boundary layer. Layer 31 of the 62-layer
+    # [15,16,16,15] split is exactly such a boundary.
+    aux: dict[int, torch.Tensor] = {}
+
+    def capture(index: int) -> None:
+        if index in self.aux_hidden_state_layers:
+            aux[index] = (
+                hidden_states + residual if residual is not None else hidden_states
+            )
+
+    if get_pp_group().is_first_rank:
+        capture(0)
+    for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+        hidden_states, residual = layer(positions, hidden_states, residual)
+        capture(self.start_layer + idx + 1)
+
+    # A received index is at or before start_layer and a local one is past it, so
+    # the two sets never collide.
+    aux.update(incoming)
+
+    if not get_pp_group().is_last_rank:
+        tensors = {"hidden_states": hidden_states, "residual": residual}
+        for i, value in aux.items():
+            tensors[f"{_AUX_SLOT}{i}"] = value
+        return IntermediateTensors(tensors)
+
+    hidden_states, _ = self.norm(hidden_states, residual)
+
+    if not self.aux_hidden_state_layers:
+        return hidden_states
+
+    missing = set(self.aux_hidden_state_layers) - aux.keys()
+    assert not missing, (
+        f"EAGLE3 aux hidden states missing for layers {sorted(missing)}; "
+        f"requested {self.aux_hidden_state_layers}, arrived {sorted(aux)}"
+    )
+    return hidden_states, [aux[i] for i in sorted(aux)]
