@@ -132,7 +132,33 @@ def _aux_slots_received(model: MiniMaxM2Model) -> tuple[int, ...]:
     """
     if get_pp_group().is_first_rank:
         return ()
-    return tuple(i for i in model.aux_hidden_state_layers if i <= model.start_layer)
+    return tuple(
+        sorted(i for i in model.aux_hidden_state_layers if i <= model.start_layer)
+    )
+
+
+def _aux_slots_captured(model: MiniMaxM2Model) -> tuple[int, ...]:
+    """Global aux layer indices this stage produces, in the order it produces them.
+
+    The loop captures at ``start_layer + idx + 1`` for each owned layer, so the
+    reachable indices are ``start_layer + 1 .. end_layer``; the first stage adds
+    index 0 from the embedding output. Every index is a compile-time constant, so
+    deriving the order here keeps it out of the traced graph -- the capture itself
+    appends to a list and never keys a dict inside the loop.
+
+    Together with `_aux_slots_received` this partitions the requested set: received
+    indices are at or before ``start_layer``, captured ones past it. Received then
+    captured is therefore already ascending, which is the order the drafter's `fc`
+    expects its concatenated blocks in.
+    """
+    captured = [
+        i
+        for i in sorted(model.aux_hidden_state_layers)
+        if model.start_layer < i <= model.end_layer
+    ]
+    if get_pp_group().is_first_rank and 0 in model.aux_hidden_state_layers:
+        captured.insert(0, 0)
+    return tuple(captured)
 
 
 @register_patch(
@@ -189,7 +215,7 @@ def forward(
     intermediate_tensors: IntermediateTensors | None,
     inputs_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-    incoming: dict[int, torch.Tensor] = {}
+    received: list[torch.Tensor] = []
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -200,37 +226,33 @@ def forward(
         assert intermediate_tensors is not None
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
-        incoming = {
-            i: intermediate_tensors[f"{_AUX_SLOT}{i}"]
-            for i in _aux_slots_received(self)
-        }
+        received = [
+            intermediate_tensors[f"{_AUX_SLOT}{i}"] for i in _aux_slots_received(self)
+        ]
 
     # Index i means "input to layer i". The pre-loop capture is first-rank only:
     # for a later stage that index is the previous stage's final capture, and
     # taking it again would duplicate a boundary layer. Layer 31 of the 62-layer
     # [15,16,16,15] split is exactly such a boundary.
     #
-    # The capture is written out at both sites rather than factored into a closure
-    # over hidden_states/residual: dynamo does not inline such a closure, it lifts
-    # the captured variables into arguments and compiles the body as its own graph.
-    # For a residual-stream add that graph is two no-op bf16 casts, which the
-    # builder then rejects while registering the module.
-    aux: dict[int, torch.Tensor] = {}
+    # The capture appends to a list; it must not key a dict inside the loop. Doing
+    # so breaks the graph at that statement -- the backend then receives the
+    # residual-stream add on its own, as two no-op bf16 casts, and rejects it while
+    # registering the module. `_aux_slots_captured` recovers which global index each
+    # append holds, from constants, outside the graph.
+    captured: list[torch.Tensor] = []
     if get_pp_group().is_first_rank and 0 in self.aux_hidden_state_layers:
-        aux[0] = hidden_states
+        captured.append(hidden_states)
     for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
         hidden_states, residual = layer(positions, hidden_states, residual)
         if self.start_layer + idx + 1 in self.aux_hidden_state_layers:
-            aux[self.start_layer + idx + 1] = hidden_states + residual
-
-    # A received index is at or before start_layer and a local one is past it, so
-    # the two sets never collide.
-    aux.update(incoming)
+            captured.append(hidden_states + residual)
 
     if not get_pp_group().is_last_rank:
         tensors = {"hidden_states": hidden_states, "residual": residual}
-        for i, value in aux.items():
-            tensors[f"{_AUX_SLOT}{i}"] = value
+        slots = _aux_slots_received(self) + _aux_slots_captured(self)
+        for index, value in zip(slots, received + captured):
+            tensors[f"{_AUX_SLOT}{index}"] = value
         return IntermediateTensors(tensors)
 
     hidden_states, _ = self.norm(hidden_states, residual)
@@ -238,9 +260,11 @@ def forward(
     if not self.aux_hidden_state_layers:
         return hidden_states
 
-    missing = set(self.aux_hidden_state_layers) - aux.keys()
-    assert not missing, (
-        f"EAGLE3 aux hidden states missing for layers {sorted(missing)}; "
-        f"requested {self.aux_hidden_state_layers}, arrived {sorted(aux)}"
+    aux = received + captured
+    assert len(aux) == len(self.aux_hidden_state_layers), (
+        f"EAGLE3 expected {len(self.aux_hidden_state_layers)} aux hidden states for "
+        f"layers {sorted(self.aux_hidden_state_layers)}, but "
+        f"{len(_aux_slots_received(self))} arrived and "
+        f"{len(_aux_slots_captured(self))} were captured"
     )
-    return hidden_states, [aux[i] for i in sorted(aux)]
+    return hidden_states, aux
