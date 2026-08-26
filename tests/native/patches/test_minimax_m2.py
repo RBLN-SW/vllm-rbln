@@ -47,6 +47,11 @@ AUX_LAYERS = (2, NUM_LAYERS // 2, NUM_LAYERS - 3)
 # lands one index in each of stages 0, 1 and 3, so the carry has to work for a set
 # the model did not pick itself.
 CHECKPOINT_AUX_LAYERS = (1, 30, 58)
+# Every index sits exactly on a PP4 band boundary ([0,15) [15,31) [31,47) [47,62)).
+# A boundary index is both one stage's last capture and the next stage's incoming
+# hidden state, so an off-by-one in the split double-counts all three at once --
+# and compiles, and passes a short probe, and only shows up as wrong output.
+BOUNDARY_AUX_LAYERS = (15, 31, 47)
 
 
 class _Group:
@@ -150,7 +155,9 @@ def _run_pipeline(pp_size: int, aux_layers: tuple[int, ...], monkeypatch):
 
 
 @pytest.mark.parametrize("pp_size", [2, 4])
-@pytest.mark.parametrize("aux_layers", [AUX_LAYERS, CHECKPOINT_AUX_LAYERS])
+@pytest.mark.parametrize(
+    "aux_layers", [AUX_LAYERS, CHECKPOINT_AUX_LAYERS, BOUNDARY_AUX_LAYERS]
+)
 def test_last_stage_receives_every_aux_layer_in_order(pp_size, aux_layers, monkeypatch):
     out, _ = _run_pipeline(pp_size, aux_layers, monkeypatch)
 
