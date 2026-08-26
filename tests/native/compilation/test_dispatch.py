@@ -17,15 +17,17 @@
 # bytecode directly. The real thing needs a compiled model; here the Dynamo
 # pieces are stubbed.
 
-import contextlib
+import json
 import types
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sequence import IntermediateTensors
 
 import vllm_rbln.compilation.dispatch as dispatch
 from vllm_rbln.compilation.dispatch import Dispatcher
+from vllm_rbln.v1.worker.input_stager import StagedModelInputs
 
 
 @pytest.fixture
@@ -176,25 +178,23 @@ class TestDispatch:
         assert Model.forward.__code__ is original_code
         assert first.forward(x) == ("eager", 1)
 
-    def test_records_a_profiler_scope_naming_the_dispatched_graph(self, monkeypatch):
-        # Bypassing the frame eval bypasses Dynamo's own profiler scope, so the
-        # region is only identifiable in a trace if the dispatcher opens one.
+    def test_the_dispatched_region_lands_in_a_profile(self, monkeypatch, tmp_path):
+        # Bypassing the frame eval bypasses Dynamo's own annotation, so a dispatched
+        # call is a blank in the trace unless the dispatcher names it -- and it must
+        # do so without VLLM_CUSTOM_SCOPES_FOR_PROFILING.
         target, _ = make_target()
-        scopes: list = []
-
-        @contextlib.contextmanager
-        def spy(name):
-            scopes.append(name)
-            yield
-
-        monkeypatch.setattr(dispatch, "record_function_or_nullcontext", spy)
         d = Dispatcher(target, recorder([], "compiled"))
         install_entries(monkeypatch, [target.__code__])
         x = torch.zeros(1, 4)
         d(x)
-        assert scopes == []  # the cold call runs through Dynamo's own scope
-        d(x)
-        assert scopes == ["Dispatched Region: 0/0"]
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as prof:
+            d(x)
+        trace = tmp_path / "trace.json"
+        prof.export_chrome_trace(str(trace))
+        names = {e["name"] for e in json.loads(trace.read_text())["traceEvents"]}
+        assert "Dispatched Region: 0/0" in names
 
     def test_clone_differs_from_the_target_only_in_its_code(self, monkeypatch):
         # The FunctionType constructor takes five of the function's slots; the
@@ -225,6 +225,123 @@ class TestDispatch:
             if name not in ("__code__", "__builtins__")
             and getattr(clone, name, missing) != getattr(target, name, missing)
         ] == []
+
+
+# The situations one runner process stages, as (kwargs, forward-context key).
+# Faithful to what reaches a dispatched model: input_stager.StagedModelInputs
+# .as_kwargs() names the arguments, rbln_model_runner._prepare_model_inputs
+# shapes them (int32 ids, int64 positions, [num_reqs, query_len]), and
+# dispatch._forward_context_key reads (is_prefill, dp pad width, kv connector).
+#
+# Only variation a single process can produce is listed. The batch buckets and
+# the DP pad width change from step to step; the query length grows with
+# speculative tokens; intermediate tensors arrive on a non-first pipeline rank.
+# has_kv_transfer_group() is fixed for the process's lifetime, so it cannot
+# collide with itself and is not a case here.
+def _staged(num_reqs, query_len, *, token_indices=0, intermediate=False):
+    shape = (num_reqs, query_len)
+    tensors = None
+    if intermediate:
+        tensors = IntermediateTensors(
+            {"hidden_states": torch.zeros(num_reqs, query_len, 8)}
+        )
+    return {
+        "input_ids": torch.zeros(shape, dtype=torch.int32),
+        "positions": torch.zeros(shape, dtype=torch.int64),
+        "intermediate_tensors": tensors,
+        "inputs_embeds": None,
+        "token_indices": (
+            torch.zeros(token_indices, dtype=torch.int32) if token_indices else None
+        ),
+    }
+
+
+PREFILL = (True, None, False)
+DECODE = (False, None, False)
+
+SITUATIONS: dict[str, tuple[dict, tuple]] = {
+    "prefill": (_staged(1, 512, token_indices=1), PREFILL),
+    "decode-b1": (_staged(1, 1), DECODE),
+    "decode-b2": (_staged(2, 1), DECODE),
+    "decode-b4": (_staged(4, 1), DECODE),
+    "decode-b8": (_staged(8, 1), DECODE),
+    # A drafted step carries 1 + num_spec_tokens columns.
+    "decode-b4-spec4": (_staged(4, 5), DECODE),
+    # Same staged tensors as decode-b4; only the DP-agreed pad width differs,
+    # and the graph reads it as dp_metadata.max_pads_across_dp.shape[0].
+    "decode-b4-dp8": (_staged(4, 1), (False, 8, False)),
+    "decode-b4-dp16": (_staged(4, 1), (False, 16, False)),
+    # Same again, with a pipeline rank's inbound activations.
+    "decode-b4-pp": (_staged(4, 1, intermediate=True), DECODE),
+}
+
+
+def key_of(monkeypatch, kwargs, context_key):
+    """The one key a fresh Dispatcher registers for a single call."""
+
+    def model_wrapper(
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        token_indices=None,
+    ):
+        return "eager"
+
+    monkeypatch.setattr(dispatch, "_forward_context_key", lambda: context_key)
+    d = Dispatcher(model_wrapper, recorder([], "compiled"))
+    install_entries(monkeypatch, [model_wrapper.__code__])
+    d(**kwargs)
+    (key,) = d._graphs
+    return key
+
+
+class TestKeyDiscrimination:
+    """The key must separate every situation that needs its own graph.
+
+    Key completeness is the one precondition Dispatcher cannot check: a key
+    coarser than Dynamo's guards serves one graph for two situations, forever
+    and unreported, and no count of compiled graphs reveals it because the
+    second graph is never requested. What this class can do is pin the
+    situations down as an explicit list and require the key to tell them apart
+    -- so a change that collapses two of them fails here instead of in a model.
+    """
+
+    def test_distinct_situations_never_share_a_key(self, monkeypatch):
+        keys = {
+            name: key_of(monkeypatch, kwargs, context_key)
+            for name, (kwargs, context_key) in SITUATIONS.items()
+        }
+        by_key: dict[tuple, list[str]] = {}
+        for name, key in keys.items():
+            by_key.setdefault(key, []).append(name)
+        collided = sorted(names for names in by_key.values() if len(names) > 1)
+        assert not collided, f"situations sharing one graph: {collided}"
+
+    def test_the_same_situation_reuses_its_key(self, monkeypatch):
+        # The other direction: a key finer than the guards would recompile every
+        # step. Fresh tensors of the same shape and dtype must land on one key.
+        for name, (kwargs, context_key) in SITUATIONS.items():
+            first = key_of(monkeypatch, kwargs, context_key)
+            again = key_of(monkeypatch, {**kwargs}, context_key)
+            assert first == again, f"{name} keyed two identical calls apart"
+            rebuilt, _ = SITUATIONS[name]
+            assert first == key_of(monkeypatch, rebuilt, context_key), (
+                f"{name} keys on tensor identity, not shape/dtype"
+            )
+
+    def test_the_situations_cover_every_dispatched_argument(self):
+        # Drift alarm: a new argument on the model call is a new axis the key may
+        # have to carry, and a table that does not mention it would keep passing.
+        staged = StagedModelInputs(
+            input_ids=torch.zeros(1, 1, dtype=torch.int32),
+            positions=torch.zeros(1, 1, dtype=torch.int64),
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            token_indices=None,
+        )
+        for kwargs, _context_key in SITUATIONS.values():
+            assert set(kwargs) == set(staged.as_kwargs())
 
 
 @pytest.mark.use_device
