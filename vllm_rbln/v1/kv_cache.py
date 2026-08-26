@@ -99,8 +99,7 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         if num_external_computed_tokens <= 0:
             return
         req_blocks = self.req_to_blocks[request_id]
-        if req_blocks:
-            return
+        assert len(req_blocks) == 0
         req_blocks.extend(self.block_pool.get_new_blocks(1))
 
     @classmethod

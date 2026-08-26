@@ -126,11 +126,13 @@ class TestRBLNSlidingWindowManager:
         assert len(m.req_to_blocks["r"]) == 1
         assert pool.get_num_free_blocks() == free0 - 1
 
-    def test_allocate_external_noop_when_present(self):
+    def test_allocate_external_rejects_preexisting_blocks(self):
+        # add_local_computed_blocks runs first and leaves the list empty; a
+        # block already present means the coordinator sequence broke.
         m = _manager(_never_pool())
         m.req_to_blocks["r"] = [object()]
-        m.allocate_external_computed_blocks("r", 0, 5)
-        assert len(m.req_to_blocks["r"]) == 1
+        with pytest.raises(AssertionError):
+            m.allocate_external_computed_blocks("r", 0, 5)
 
     def test_find_longest_cache_hit_returns_empty_per_group(self):
         # Prefix caching disabled: one empty list per kv_cache_group_id.
