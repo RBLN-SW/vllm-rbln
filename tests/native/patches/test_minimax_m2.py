@@ -43,6 +43,10 @@ HIDDEN = 8
 BATCH = 2
 # What get_eagle3_default_aux_hidden_state_layers() returns for this depth.
 AUX_LAYERS = (2, NUM_LAYERS // 2, NUM_LAYERS - 3)
+# What MiniMax-M2.5-Eagle3 asks for in its eagle_config, one off the default. It
+# lands one index in each of stages 0, 1 and 3, so the carry has to work for a set
+# the model did not pick itself.
+CHECKPOINT_AUX_LAYERS = (1, 30, 58)
 
 
 class _Group:
@@ -137,12 +141,13 @@ def _run_pipeline(pp_size: int, aux_layers: tuple[int, ...], monkeypatch):
 
 
 @pytest.mark.parametrize("pp_size", [2, 4])
-def test_last_stage_receives_every_aux_layer_in_order(pp_size, monkeypatch):
-    out, _ = _run_pipeline(pp_size, AUX_LAYERS, monkeypatch)
+@pytest.mark.parametrize("aux_layers", [AUX_LAYERS, CHECKPOINT_AUX_LAYERS])
+def test_last_stage_receives_every_aux_layer_in_order(pp_size, aux_layers, monkeypatch):
+    out, _ = _run_pipeline(pp_size, aux_layers, monkeypatch)
 
     _, aux = out
     stamped = [int(tensor.flatten()[0].item()) for tensor in aux]
-    assert stamped == list(AUX_LAYERS)
+    assert stamped == list(aux_layers)
 
 
 def test_a_boundary_layer_is_captured_once(monkeypatch):

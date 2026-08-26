@@ -299,6 +299,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             | SuffixDecodingProposer
             | None
         ) = None
+        # Read the EAGLE3 aux-hidden-state flag from the config rather than from
+        # the drafter, which exists only on the last rank. Every stage has to know
+        # it: the aux tensors are captured across the stages and only consumed on
+        # the last one, so a non-last stage that thinks EAGLE3 is off captures
+        # nothing and the last stage comes up short.
+        if self.speculative_config and self.speculative_config.method == "eagle3":
+            eagle_config = getattr(
+                self.speculative_config.draft_model_config.hf_config,
+                "eagle_config",
+                None,
+            )
+            self.use_aux_hidden_state_outputs = (
+                True
+                if not isinstance(eagle_config, dict)
+                else eagle_config.get("use_aux_hidden_state", True)
+            )
+
         if self.speculative_config and get_pp_group().is_last_rank:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
@@ -308,10 +325,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
-                if self.speculative_config.method == "eagle3":
-                    self.use_aux_hidden_state_outputs = (
-                        self.drafter.eagle3_use_aux_hidden_state
-                    )
             else:
                 raise ValueError(
                     "Unsupported speculative decoding method: "
@@ -1829,7 +1842,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
             logits = None
-            if self.use_aux_hidden_state_outputs:
+            # Only the last stage gets the aux tensors as a second return value;
+            # earlier stages carry them inside the IntermediateTensors handoff, which
+            # is model_output itself.
+            if self.use_aux_hidden_state_outputs and get_pp_group().is_last_rank:
                 hidden_states, aux_hidden_states = model_output
             else:
                 hidden_states = model_output
@@ -1857,8 +1873,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # NOTE(RBLN): When eagle3 and aux hidden states are used,
             # fuse combine_hidden_states projection into the target graph.
             combined_hidden_states = None
-            if self.use_aux_hidden_state_outputs:
-                assert aux_hidden_states is not None
+            if aux_hidden_states is not None:
                 assert isinstance(self.drafter, RBLNEagleProposer)
                 target_hidden_states = torch.cat(
                     [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1

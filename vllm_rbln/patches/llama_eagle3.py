@@ -49,6 +49,7 @@ message.
 """
 
 import torch
+from vllm.config import VllmConfig
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 from vllm_rbln.logger import init_logger
@@ -75,8 +76,15 @@ _REASON_SUFFIX = (
     target=f"{_TARGET}.__init__",
     reason=f"Register the scatter index as a named buffer: {_REASON_SUFFIX}",
 )
-def patched_eagle3_llama_init(self, *args, **kwargs) -> None:
-    _orig_init(self, *args, **kwargs)
+def patched_eagle3_llama_init(
+    self, *, vllm_config: VllmConfig, prefix: str = ""
+) -> None:
+    # The signature has to name vllm_config and prefix, not absorb them into
+    # **kwargs: `initialize_model` inspects it and takes the new-style path only
+    # when both names are present (model_loader/utils.py:56-62). A wrapper that
+    # forwards opaquely is read as an old-style model class and called with no
+    # arguments at all.
+    _orig_init(self, vllm_config=vllm_config, prefix=prefix)
     # Identity default: safe to execute even if never filled.
     self.register_buffer(
         "target_ids",
@@ -87,7 +95,9 @@ def patched_eagle3_llama_init(self, *args, **kwargs) -> None:
 
 @register_patch(
     target=f"{_TARGET}.load_weights",
-    reason=f"Fill the named scatter index from the loaded d2t mapping: {_REASON_SUFFIX}",
+    reason=(
+        f"Fill the named scatter index from the loaded d2t mapping: {_REASON_SUFFIX}"
+    ),
 )
 def patched_eagle3_llama_load_weights(self, weights):
     loaded = _orig_load_weights(self, weights)
