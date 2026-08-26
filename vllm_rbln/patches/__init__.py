@@ -44,6 +44,7 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
+    speculative_config,
 )
 
 __all__ = (
