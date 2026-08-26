@@ -29,6 +29,7 @@ from vllm_rbln.patches.attention import (
 
 mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
+mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
 
 
 class _RBLNNoOpMLAPrefillBackend:
@@ -53,6 +54,44 @@ class _RBLNNoOpMLAPrefillBackend:
 )
 def patched_get_mla_prefill_backend(vllm_config) -> type[_RBLNNoOpMLAPrefillBackend]:
     return _RBLNNoOpMLAPrefillBackend
+
+
+@register_patch(
+    target=(
+        "vllm.model_executor.layers.attention.mla_attention."
+        "MLAAttention.get_kv_cache_spec"
+    ),
+    reason=(
+        "fp8 DSA MLA stores the latent cache as an RBLN-packed 768-byte int8 row "
+        "(512 fp8 kv_c + fp16 scale + k_pe), quantized/packed in-kernel by the "
+        "sparse_attn_deepseek_mla fp8 kernel. The compiler routes fp8 vs bf16 by "
+        "the cache channel width (768 != 576), so allocate head_size=768 int8. "
+        "cache_dtype_str stays 'auto' so the page size is the plain "
+        "head_size*itemsize (768B), not the upstream fp8_ds_mla 656B layout. "
+        "Only the sparse (DSA) path packs this way; a dense MLA layer keeps the "
+        "upstream spec even under --kv-cache-dtype fp8, since its kernel cannot "
+        "read the packed row."
+    ),
+)
+def patched_mla_get_kv_cache_spec(self: MLAAttention, vllm_config):
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    use_sparse = getattr(self, "use_sparse", False)
+    if use_sparse and cache_dtype and cache_dtype.startswith("fp8"):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        impl = getattr(self, "impl", None)
+        kv_lora_rank = getattr(impl, "kv_lora_rank", 512)
+        rope_dim = getattr(impl, "qk_rope_head_dim", 64)
+        _FP8_KV_SCALE_BYTES = 128
+        packed_head_size = kv_lora_rank + _FP8_KV_SCALE_BYTES + rope_dim * 2
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=packed_head_size,
+            dtype=torch.int8,
+            cache_dtype_str="auto",
+        )
+    return mla_attention_original_get_kv_cache_spec(self, vllm_config)
 
 
 @register_patch(
@@ -85,6 +124,7 @@ def patched_mla_attention_forward(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     output_shape: torch.Size | None = None,
+    topk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if self.calculate_kv_scales:
         torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
@@ -109,10 +149,17 @@ def patched_mla_attention_forward(
                 self_kv_cache,
                 attn_metadata,
                 output=output,
+                topk_indices=topk_indices,
             )
             return output
         return self.impl.forward(
-            self, q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+            self,
+            q,
+            kv_c_normed,
+            k_pe,
+            self_kv_cache,
+            attn_metadata,
+            topk_indices=topk_indices,
         )
 
     if self.attn_backend.accept_output_buffer:

@@ -20,7 +20,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
@@ -31,6 +30,12 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.worker.utils import (
+    extract_layer_index,
+)
+from vllm_rbln.v1.worker.utils import (
+    num_attn_module as rbln_num_attn_module,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -45,25 +50,38 @@ def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
     RBLN resolves each layer's KV cache from attention metadata (a graph
     input) by index; that index must be relative to the layers that live on
     this pipeline-parallel rank, so subtract the rank's starting layer.
-    """
-    raw_layer_index = extract_layer_index(self.layer_name)
 
+    Models with more than one attention module per decoder layer (e.g.
+    DeepSeek-V3.2, whose lightning indexer adds a second KV-cache module per
+    layer) index each module as ``base_layer * num_attn_module + sub``
+    """
     # NOTE(RBLN): Consider PP
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
+    num_attn_module = (
+        rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype)
+        if model_config is not None
+        else 1
+    )
+    raw_layer_index = extract_layer_index(self.layer_name, num_attn_module)
+
     if model_config is None:
         self.layer_index = raw_layer_index
         return
 
+    # The index is relative to the layers on this pipeline-parallel rank, and
+    # each layer contributes num_attn_module KV-cache modules
     start, end = model_config.get_layers_start_end_indices(vllm_config.parallel_config)
     total_num_hidden_layers = model_config.get_total_num_hidden_layers()
-    if raw_layer_index >= total_num_hidden_layers:
-        # NOTE(RBLN): MTP/nextn layers are named past the target's layer count
+    if raw_layer_index >= total_num_hidden_layers * num_attn_module:
+        # MTP/nextn layers are named past the target's layer count
         # (mtp_start_layer_idx == num_hidden_layers), so their KV cache sits
         # right after the target layers in the compacted per-rank cache list.
-        self.layer_index = (end - start) + (raw_layer_index - total_num_hidden_layers)
+        self.layer_index = (end - start) * num_attn_module + (
+            raw_layer_index - total_num_hidden_layers * num_attn_module
+        )
     else:
-        self.layer_index = raw_layer_index - start
+        self.layer_index = raw_layer_index - start * num_attn_module
 
 
 # NOTE(RBLN) - To represent kv cache as model input,
