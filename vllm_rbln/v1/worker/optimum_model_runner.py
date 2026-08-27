@@ -1617,20 +1617,6 @@ class RBLNOptimumModelRunner(
         prefill_logits: torch.Tensor,
         scheduler_output: "SchedulerOutput",
     ) -> dict[str, LogprobsTensors | None]:
-        """Prompt logprobs for the request prefilled in this step.
-
-        Upstream indexes a flattened token batch, offsetting into it per request
-        and accumulating one chunk per step. Neither applies here. This path
-        never schedules a prefill alongside another request and submits the whole
-        prompt in one call, so one request's logits fill ``prefill_logits`` from
-        row 0 and the result is complete after a single step. A request asking
-        for prompt logprobs also never reads the prefix cache
-        (``Request.skip_reading_prefix_cache``), so row i is prompt position i.
-
-        ``prefill_logits`` carries a row per prompt position only when the model
-        was compiled with ``logits_to_keep=0``; the default of 1 returns just the
-        last position and cannot serve this at all.
-        """
         if not self.num_prompt_logprobs:
             return {}
 
