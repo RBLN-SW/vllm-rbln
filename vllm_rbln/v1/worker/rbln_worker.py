@@ -284,16 +284,32 @@ class RBLNWorker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
+        """Estimate KV-cache DRAM, discounting the fixed command-stream buffers
+        that warm-up's compiled decode runtimes reserve.
+
+        One runtime per (decode bucket, query length): non-spec has a single
+        query length (1); spec adds a second (num_spec + 1) per bucket;
+        specialized-MoE decode repeats those plus one DP-asymmetric spec dummy.
+        A draft model, when present, adds its own -- one per bucket, plus the
+        specialized-MoE fallback. Counting all of them keeps the KV-block estimate
+        from over-reserving and OOMing at runtime.
+        """
         params_dict = dict(self.model_runner.model.named_parameters())
         device_name = current_platform.get_device_name().lower()
         assert "rbln" in device_name
 
-        specialized_moe_decode = int(self.model_runner.specialized_moe_decode)
+        has_specialized_moe_decode = self.model_runner.specialized_moe_decode
         decode_batch_buckets_count = (
             self.model_runner.bucketing_manager.decode_batch_buckets_count
         )
 
-        num_runtimes = 1 + decode_batch_buckets_count + specialized_moe_decode
+        spec_enabled = self.speculative_config is not None
+        num_decode_query_lens = 2 if spec_enabled else 1
+        num_runtimes = 1 + decode_batch_buckets_count * num_decode_query_lens
+        if has_specialized_moe_decode:
+            num_runtimes += num_decode_query_lens
+            if spec_enabled:
+                num_runtimes += 1
 
         ratio: float = 1.0
         if self.model_config.quantization is not None:
@@ -394,7 +410,7 @@ class RBLNWorker(WorkerBase):
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
 
-        speculative_config = getattr(self, "speculative_config", None)
+        speculative_config = self.speculative_config
         drafter = getattr(self.model_runner, "drafter", None)
         draft_model = getattr(drafter, "model", None)
         draft_model_config = getattr(speculative_config, "draft_model_config", None)
@@ -428,7 +444,13 @@ class RBLNWorker(WorkerBase):
                 n_model_bytes=n_model_bytes,
             )
 
+            # Draft runtimes: one per bucket, plus the specialized-MoE fallback.
+            # TODO(RBLN): an undercount since the draft started compiling both decode
+            # query lengths. Reserving for what it actually compiles needs the count
+            # split by speculative method, which the medusa path would want too.
             num_draft_runtimes = 1 + decode_batch_buckets_count
+            if has_specialized_moe_decode:
+                num_draft_runtimes += 1
             draft_n_model_bytes = 0
 
             for value in draft_model.parameters():
@@ -1241,13 +1263,13 @@ class RBLNWorker(WorkerBase):
             self.profiler.stop()
 
     def execute_dummy_batch(self) -> None:
-        bucket_size = self.model_runner.bucketing_manager.find_decode_batch_bucket(1)
-        spec = self.model_runner.speculative_config
-        if spec is not None and spec.use_eagle():
-            query_len = 1 + self.model_runner.num_spec_tokens
-        else:
-            query_len = 1
-        self.model_runner._dummy_run(bucket_size, query_len, is_prefill=False)
+        # Serving-time DP-idle step: this rank has no real work. Run a non-warmup
+        # dummy (warmup=False) so it contributes a minimal (num_reqs=1, qlen=1)
+        # entry to the cross-DP collective, is EXCLUDED from the shape decision,
+        # then adopts the busy-decided shape and runs the same compiled decode
+        # graph the busy ranks run -- so an idle rank never drags the collective
+        # into a fall-back route nor lands on an uncompiled shape.
+        self.model_runner._dummy_run(1, 1, is_prefill=False, warmup=False)
 
     # def add_lora(self, lora_request: LoRARequest) -> bool:
     #     return self.model_runner.add_lora(lora_request)
