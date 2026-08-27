@@ -14,7 +14,7 @@
 
 from collections import defaultdict
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import msgspec
 import numpy as np
@@ -104,6 +104,12 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
 
     compat_hash: str | None
     xfer_handshake_metadata: NixlHandshakePayload | None
+
+    #: Whether this side originates the bytes into the peer's memory. Two things
+    #: turn on it: a chiplet replica is a valid source to read from but not a
+    #: valid sole destination to write to (`_head_matched_desc`), and a peer
+    #: moving bytes the other way must not pass the handshake (`rbln_compat_hash`).
+    _writes_into_peer: ClassVar[bool] = False
 
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
@@ -548,9 +554,15 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         peer_areas: list[int] | None = None,
         split: int = 1,
         region_ids: list[int] | None = None,
+        replica_fanout: int = 1,
     ) -> tuple[int, list[tuple[int, int, int]]]:
         if self._sw_ratio is None:
-            if registered_layer_names is None and peer_areas is None and split == 1:
+            if (
+                registered_layer_names is None
+                and peer_areas is None
+                and split == 1
+                and replica_fanout == 1
+            ):
                 # No SWA view opt, whole-engine peer: upstream's Full-only
                 # layout, one handle covering every region.
                 return super().register_local_xfer_handler(block_size)
@@ -562,8 +574,14 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 peer_areas=peer_areas,
                 split=split,
                 region_ids=region_ids,
+                replica_fanout=replica_fanout,
             )
-        assert registered_layer_names is None and peer_areas is None and split == 1, (
+        assert (
+            registered_layer_names is None
+            and peer_areas is None
+            and split == 1
+            and replica_fanout == 1
+        ), (
             "RBLN NIXL: SWA view-opt is not supported with pipeline "
             "parallelism or heterogeneous tensor parallelism"
         )
@@ -720,9 +738,13 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                         num_blocks=num_blocks,
                     )
                 )
-        # The same count `_register_shard_local_xfer_handler` builds locally
-        # and `_shard_descs_per_block` records.
-        assert len(out) == len(logical_pairs) * len(areas_iter) * num_blocks * split
+        # Per block, a region becomes one descriptor per head piece per peer
+        # copy -- the same count `_register_shard_local_xfer_handler` builds
+        # locally and `_shard_descs_per_block` records.
+        fanout = replicas_r if self._writes_into_peer else 1
+        assert len(out) == (
+            len(logical_pairs) * len(areas_iter) * num_blocks * split * fanout
+        )
         return out
 
     def _fan_in_peer_areas(
@@ -800,7 +822,9 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         sub_len = desc_len // split
 
         # Replicas of a slice hold identical bytes, so reading any one of them
-        # answers; take the first.
+        # answers -- but writing only one leaves the peer's other chiplets on
+        # stale KV. Reading takes the first; writing takes them all.
+        fanout = replicas_r if self._writes_into_peer else 1
 
         out: list[tuple[int, int, int]] = []
         pieces: list[tuple[int, int]] = []
@@ -814,23 +838,25 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                     f"outside the peer's range (it owns heads {base_r}.."
                     f"{base_r + per_slice_r * slices_r - 1})."
                 )
-            remote_region = logical_r * areas_r + slice_r * replicas_r
-            page = remote_lens[remote_region]
-            if page % per_slice_r != 0:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: peer region {remote_region} block length "
-                    f"{page}B does not split into {per_slice_r} heads."
-                )
-            # Heads are contiguous inside a block, so skipping `head_within` of
-            # them is a plain byte offset.
-            head_offset = head_within * (page // per_slice_r)
-            if sub_len + head_offset > page:
-                raise RuntimeError(
-                    f"RBLN NIXL D2D: local region {region_id} piece {j} wants "
-                    f"{sub_len}B at +{head_offset}B, past the end of the peer's "
-                    f"{page}B region {remote_region}."
-                )
-            pieces.append((remote_bases[remote_region] + head_offset, page))
+            for k in range(fanout):
+                remote_region = logical_r * areas_r + slice_r * replicas_r + k
+                page = remote_lens[remote_region]
+                if page % per_slice_r != 0:
+                    raise RuntimeError(
+                        f"RBLN NIXL D2D: peer region {remote_region} block "
+                        f"length {page}B does not split into {per_slice_r} "
+                        "heads."
+                    )
+                # Heads are contiguous inside a block, so skipping
+                # `head_within` of them is a plain byte offset.
+                head_offset = head_within * (page // per_slice_r)
+                if sub_len + head_offset > page:
+                    raise RuntimeError(
+                        f"RBLN NIXL D2D: local region {region_id} piece {j} "
+                        f"wants {sub_len}B at +{head_offset}B, past the end of "
+                        f"the peer's {page}B region {remote_region}."
+                    )
+                pieces.append((remote_bases[remote_region] + head_offset, page))
 
         for block_id in range(num_blocks):
             for base, page in pieces:
@@ -860,6 +886,22 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             nixl_agent_meta.kv_slices,
         )
         return self._head_split(per_slice_l, per_slice_r)
+
+    def _peer_replica_fanout(
+        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+    ) -> int:
+        """How many of the peer's copies of a slice one transfer must touch.
+
+        The compiler duplicates a KV head across chiplet areas when a shard
+        owns fewer heads than the device has chiplets. Reading is free to pick
+        one; writing has to fill them all, or the peer's other chiplets keep
+        serving what was there before.
+        """
+        if not self._writes_into_peer:
+            return 1
+        if not self._is_head_matched_peer(remote_tp_size):
+            return 1
+        return max(1, nixl_agent_meta.kv_areas // nixl_agent_meta.kv_slices)
 
     @staticmethod
     def _head_split(per_slice_l: int, per_slice_r: int) -> int:
@@ -1179,7 +1221,9 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         )
         base_hash = self.compat_hash
         assert base_hash is not None
-        self.compat_hash = rbln_compat_hash(base_hash)
+        self.compat_hash = rbln_compat_hash(
+            base_hash, writes_into_peer=self._writes_into_peer
+        )
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=msgspec.msgpack.Encoder().encode(pp_meta),
@@ -1328,6 +1372,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                     # carry, since the peer frees a request's blocks by it.
                     partial = len(overlap) < len(names)
                     split = self._peer_head_split(metadata, remote_tp_size)
+                    fanout = self._peer_replica_fanout(metadata, remote_tp_size)
                     fan_in = self._is_fan_in_peer(remote_tp_size)
 
                     if self._is_head_matched_peer(remote_tp_size):
@@ -1366,6 +1411,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                         ),
                         split=split,
                         remote_tp_size=remote_tp_size,
+                        replica_fanout=fanout,
                     )
                     overlapping.append(global_rank)
         # Published once, not accumulated: a handshake that raises partway
@@ -1419,6 +1465,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         peer_areas: list[int] | None = None,
         split: int = 1,
         remote_tp_size: int = 1,
+        replica_fanout: int = 1,
     ) -> None:
         # Compute the local region ids once and reuse them for the handler
         # (PP context is always the shard path: SWA + PP is rejected earlier).
@@ -1438,6 +1485,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 peer_areas=peer_areas,
                 split=split,
                 region_ids=region_ids,
+                replica_fanout=replica_fanout,
             )
         self.src_xfer_handles_by_remote[key] = handle
         n_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -1446,7 +1494,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             f"got {n_groups}"
         )
         self._shard_region_group_ids[(engine_id, global_rank)] = (0,) * len(region_ids)
-        self._shard_descs_per_block[(engine_id, global_rank)] = split
+        self._shard_descs_per_block[(engine_id, global_rank)] = split * replica_fanout
 
     def _cleanup_remote_engine(
         self, engine_id: str, *, log_eviction: bool = True
@@ -1571,6 +1619,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         peer_areas: list[int] | None = None,
         split: int = 1,
         region_ids: list[int] | None = None,
+        replica_fanout: int = 1,
     ) -> tuple[int, list[tuple[int, int, int]]]:
         assert self.transfer_topo is not None
         assert not self.transfer_topo.is_kv_layout_blocks_first, (
@@ -1602,13 +1651,17 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             sub_len = kv_block_len // split
             for block_id in range(num_blocks):
                 for j in range(split):
-                    blocks_data.append(
-                        (
-                            base_addr + block_id * stride + j * sub_len,
-                            sub_len,
-                            self.device_id,
+                    # One entry per peer copy this piece goes to: the same
+                    # bytes reach every replica (see _head_matched_desc), so
+                    # the source repeats while the destination advances.
+                    for _ in range(replica_fanout):
+                        blocks_data.append(
+                            (
+                                base_addr + block_id * stride + j * sub_len,
+                                sub_len,
+                                self.device_id,
+                            )
                         )
-                    )
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         return (
@@ -1841,11 +1894,16 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
     ) -> bytes:
         """Notification carrying how many of our ranks pair with one peer rank.
 
-        NOTE(RBLN): upstream sends its own TP size, which the peer divides by its
-        own to learn how many of us to hear from before freeing the request's
-        blocks. A finer pipeline here multiplies that, each stage pairing with
-        the same peer rank, so send it in the unit the peer already divides by:
-        ours times the peer's TP. The two agree whenever the pipelines match.
+        NOTE(RBLN): upstream sends its own tensor-parallel size, which the peer
+        divides by its own to learn how many of us to hear from before settling
+        the request -- freeing its blocks on the read path, declaring them
+        written on the write path. A finer pipeline on our side multiplies that,
+        each stage pairing with the same peer rank for its own layers, so send
+        the count in the unit the peer already divides by: ours times the peer's
+        TP. The two agree whenever the pipelines match, which is every shape
+        upstream assumes.
+
+        Direction-free -- it only asks how much finer we are cut than the peer.
         """
         remote_pp = self._remote_pp_size.get(engine_id, 1)
         local_pp = self.vllm_config.parallel_config.pipeline_parallel_size

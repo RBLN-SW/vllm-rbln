@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnector,
     NixlPullConnector,
+    NixlPushConnector,
 )
 
 import vllm_rbln.envs as envs
@@ -40,6 +41,12 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler 
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_scheduler import (
+    RblnNixlPushConnectorScheduler,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
+    RblnNixlPushConnectorWorker,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     SupportsKVCacheRegistrationFinalize,
@@ -149,5 +156,25 @@ class RblnNixlPullConnector(RblnNixlConnectorBase, NixlPullConnector):
             )
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = RblnNixlPullConnectorWorker(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+
+
+class RblnNixlPushConnector(RblnNixlConnectorBase, NixlPushConnector):
+    """Push-based (WRITE) RBLN NIXL KV transfer connector."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ) -> None:
+        super().__init__(vllm_config, role, kv_cache_config)
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector_scheduler = RblnNixlPushConnectorScheduler(
+                vllm_config, self.engine_id, kv_cache_config
+            )
+        elif role == KVConnectorRole.WORKER:
+            self.connector_worker = RblnNixlPushConnectorWorker(
                 vllm_config, self.engine_id, kv_cache_config
             )

@@ -30,10 +30,14 @@ from dataclasses import dataclass, field
 from vllm.config.utils import hash_factors
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 
-# Bump on any incompatible change to the fields below. Folded into the NIXL
-# compatibility hash so a peer speaking a different schema fails the handshake
-# instead of misreading it, the way upstream uses ``NIXL_CONNECTOR_VERSION``.
-RBLN_NIXL_CONNECTOR_VERSION: int = 2
+# Bump on any incompatible change to the RBLN metadata schema or semantics.
+# Folded into the NIXL compatibility hash so an RBLN peer speaking a different
+# schema fails the handshake cleanly (both ends are RBLN). Upstream keeps its
+# own counterpart the same way (``NIXL_CONNECTOR_VERSION``).
+#   1: pp_rank / pp_size / registered_layer_names (the layer axis)
+#   2: + kv_areas / kv_slices (the head axis: chiplet geometry)
+#   3: + the transfer direction in the hash
+RBLN_NIXL_CONNECTOR_VERSION: int = 3
 
 
 @dataclass
@@ -55,12 +59,21 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     kv_slices: int = 1
 
 
-def rbln_compat_hash(base_hash: str) -> str:
-    """Fold the RBLN schema version into the upstream NIXL compat hash.
+def rbln_compat_hash(base_hash: str, *, writes_into_peer: bool) -> str:
+    """Fold the RBLN schema version and the transfer direction into the upstream
+    NIXL compat hash.
 
     An extension rather than a change to ``compute_nixl_compatibility_hash``,
-    which stays upstream's.
+    which stays upstream's. The direction belongs in it because the read and the
+    write path move bytes by protocols that do not meet: a producer that writes
+    into a consumer expecting to read finds a peer whose every length check
+    passes. This vLLM hashes nothing that separates them -- the connector name
+    is not a factor -- so this is the only place it can be settled.
     """
     return hash_factors(
-        {"base": base_hash, "rbln_nixl_connector_version": RBLN_NIXL_CONNECTOR_VERSION}
+        {
+            "base": base_hash,
+            "rbln_nixl_connector_version": RBLN_NIXL_CONNECTOR_VERSION,
+            "rbln_writes_into_peer": writes_into_peer,
+        }
     )

@@ -339,6 +339,24 @@ class TestSwaViewDelegation:
         assert worker.register_local_xfer_handler(64) == "super"
         assert calls == [64]
 
+    def test_a_fanned_out_peer_does_not_take_the_whole_engine_path(self, monkeypatch):
+        # One handle covers every region once, which cannot express a slice the
+        # peer holds on several of its chiplets.
+        worker = _build_worker(monkeypatch)  # _sw_ratio is None
+
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker,
+            "register_local_xfer_handler",
+            lambda self, block_size: "super",
+        )
+        monkeypatch.setattr(
+            type(worker),
+            "_register_shard_local_xfer_handler",
+            lambda self, *args, **kwargs: "shard",
+        )
+
+        assert worker.register_local_xfer_handler(64, replica_fanout=2) == "shard"
+
     def test_add_remote_agent_delegates_when_no_swa(self, monkeypatch):
         worker = _build_worker(monkeypatch)  # _sw_ratio is None
         calls: list = []
