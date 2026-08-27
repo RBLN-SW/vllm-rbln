@@ -108,7 +108,6 @@ class ExecuteModelState(NamedTuple):
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
     hidden_states: torch.Tensor
-    sample_hidden_states: torch.Tensor
     is_prompt: bool
     ec_connector_output: "ECConnectorOutput | None" = None
 
@@ -417,22 +416,22 @@ class RBLNOptimumModelRunner(
                         token_count=0,
                         # the performance of sampler doesn't depend on token count
                     )
-                sample_hidden_states = hidden_states.clone()
 
             with record_function_or_nullcontext("rbln_model_runner: postprocess"):
                 if self.is_pooling_model:
                     return self._pool(
                         hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
                     )
-                # [batch_size, 1, vocab_size] -> [batch_size, vocab_size]
-                hidden_states = hidden_states.squeeze(1)
-                logits = self.model.compute_logits(hidden_states, None)
+                # A prefill graph compiled with logits_to_keep=0 returns one
+                # row per prompt position instead of one row per request, and
+                # only the last of those rows is the token being sampled.
+                # [batch_size, num_positions, vocab_size] -> [batch_size, vocab_size]
+                logits = self.model.compute_logits(hidden_states[:, -1, :], None)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits=logits,
             hidden_states=hidden_states,
-            sample_hidden_states=sample_hidden_states,
             is_prompt=model_input.is_prompt,
             ec_connector_output=ec_connector_output,
         )
@@ -1349,7 +1348,6 @@ class RBLNOptimumModelRunner(
         sampler_output: SamplerOutput,
         logits: torch.Tensor | None,
         hidden_states: torch.Tensor,
-        num_scheduled_tokens: int,
         use_padding: bool,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> tuple[
@@ -1426,8 +1424,7 @@ class RBLNOptimumModelRunner(
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
-            scheduler_output.num_scheduled_tokens,
+            hidden_states, scheduler_output
         )
 
         return (
@@ -1517,7 +1514,6 @@ class RBLNOptimumModelRunner(
             scheduler_output,
             logits,
             hidden_states,
-            sample_hidden_states,
             is_prompt,
             ec_connector_output,
         ) = self.execute_model_state
@@ -1579,7 +1575,6 @@ class RBLNOptimumModelRunner(
                 sampler_output,
                 logits,
                 hidden_states,
-                scheduler_output.total_num_scheduled_tokens,
                 use_padding,
                 spec_decode_metadata=None,
             )
@@ -1619,105 +1614,58 @@ class RBLNOptimumModelRunner(
 
     def _get_prompt_logprobs_dict(
         self,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: dict[str, int],
+        prefill_logits: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
     ) -> dict[str, LogprobsTensors | None]:
-        num_prompt_logprobs_dict = self.num_prompt_logprobs
-        if not num_prompt_logprobs_dict:
+        """Prompt logprobs for the request prefilled in this step.
+
+        Upstream indexes a flattened token batch, offsetting into it per request
+        and accumulating one chunk per step. Neither applies here. This path
+        never schedules a prefill alongside another request and submits the whole
+        prompt in one call, so one request's logits fill ``prefill_logits`` from
+        row 0 and the result is complete after a single step. A request asking
+        for prompt logprobs also never reads the prefix cache
+        (``Request.skip_reading_prefix_cache``), so row i is prompt position i.
+
+        ``prefill_logits`` carries a row per prompt position only when the model
+        was compiled with ``logits_to_keep=0``; the default of 1 returns just the
+        last position and cannot serve this at all.
+        """
+        if not self.num_prompt_logprobs:
             return {}
 
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
-
-        # Since prompt logprobs are a rare feature, prioritize simple,
-        # maintainable loop over optimal performance.
-        completed_prefill_reqs = []
-        for req_id, num_prompt_logprobs in num_prompt_logprobs_dict.items():
-            num_tokens = num_scheduled_tokens.get(req_id)
-            if num_tokens is None:
-                # This can happen if the request was preempted in prefill stage.
+        for req_id in scheduler_output.num_scheduled_tokens:
+            num_prompt_logprobs = self.num_prompt_logprobs.pop(req_id, None)
+            if num_prompt_logprobs is None:
                 continue
 
-            # Get metadata for this request.
             request = self.requests[req_id]
             if request.prompt_token_ids is None:
-                # Prompt logprobs is incompatible with prompt embeddings
+                # Prompt logprobs is incompatible with prompt embeddings.
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
-                self.device, non_blocking=True
-            )
-
-            # Set up target LogprobsTensors object.
-            logprobs_tensors = request.in_progress_prompt_logprobs_cpu
-            if logprobs_tensors is None:
-                # Create empty logprobs CPU tensors for the entire prompt.
-                # If chunked, we'll copy in slice by slice.
-                logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
+            num_positions = prefill_logits.shape[1]
+            if num_positions != num_prompt_tokens:
+                raise ValueError(
+                    "prompt_logprobs needs a logit for every prompt position, "
+                    f"but the prefill graph returned {num_positions} row(s) for "
+                    f"{num_prompt_tokens} prompt tokens. Compile the model with "
+                    "logits_to_keep=0 so it keeps all of them."
                 )
-                request.in_progress_prompt_logprobs_cpu = logprobs_tensors
 
-            # Determine number of logits to retrieve.
-            start_idx = request.num_computed_tokens
-            start_tok = start_idx + 1
-            num_remaining_tokens = num_prompt_tokens - start_tok
-            if num_tokens <= num_remaining_tokens:
-                # This is a chunk, more tokens remain.
-                # In the == case, there are no more prompt logprobs to produce
-                # but we want to defer returning them to the next step where we
-                # have new generated tokens to return.
-                num_logits = num_tokens
-            else:
-                # This is the last chunk of prompt tokens to return.
-                num_logits = num_remaining_tokens
-                completed_prefill_reqs.append(req_id)
-                prompt_logprobs_dict[req_id] = logprobs_tensors
-
-            if num_logits <= 0:
-                # This can happen for the final chunk if we prefilled exactly
-                # (num_prompt_tokens - 1) tokens for this request in the prior
-                # step. There are no more prompt logprobs to produce.
-                continue
-
-            # Get the logits corresponding to this req's prompt tokens.
-            # If this is a partial request (i.e. chunked prefill),
-            # then there is prompt logprob generated for each index.
-            req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
-
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
-
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
+            # The logit at position i predicts prompt token i + 1, so the last
+            # position has no target and the first token has no logprob.
+            logits = self.model.compute_logits(prefill_logits[0, :-1], None)
+            target_token_ids = torch.tensor(
+                request.prompt_token_ids[1:], dtype=torch.int64
+            ).to(self.device, non_blocking=True)
+            prompt_logprobs_dict[req_id] = self.sampler.gather_logprobs(
+                self.sampler.compute_logprobs(logits),
+                num_prompt_logprobs,
+                target_token_ids,
             )
-
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
-
-        # Remove requests that have completed prefill from the batch
-        # num_prompt_logprobs_dict.
-        for req_id in completed_prefill_reqs:
-            del num_prompt_logprobs_dict[req_id]
-            self.requests[req_id].in_progress_prompt_logprobs_cpu = None
-
-        # Must synchronize the non-blocking GPU->CPU transfers.
-        # if prompt_logprobs_dict:
-        #     self._sync_device()
 
         return prompt_logprobs_dict
 
