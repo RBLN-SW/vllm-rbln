@@ -303,10 +303,14 @@ class TestCompilation:
 
 
 class TestSchedulerOverrides:
-    def test_async_scheduling_is_honored(self):
+    def test_async_scheduling_is_honored(self, monkeypatch):
         # The platform used to force this off unconditionally. It now follows
         # vLLM's --async-scheduling, as long as the device-side token path is
-        # available (see below).
+        # available (see below). Both carriers are pinned on because
+        # --device-tensor 0 switches the first one off for the whole session,
+        # which would land this on the negative case below.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
         assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
 
     @pytest.mark.parametrize(
