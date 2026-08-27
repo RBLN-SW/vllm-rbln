@@ -964,16 +964,17 @@ class RBLNWorker(WorkerBase):
         kv_device_types = {kv_cache.device.type for kv_cache in mr.kv_caches}
         was_device_resident = bool(kv_device_types - {"meta", "cpu"})
 
-        # NOTE(RBLN): upstream `bind_kv_cache` asserts kv_caches starts empty,
-        # and `initialize_kv_cache_tensors` asserts kv_cache_names has equal
-        # length, so the two must be cleared together.
+        # NOTE(RBLN): the rebind (initialize_kv_cache_tensors) reassigns
+        # kv_caches and kv_cache_names from one ordered name list and rebuilds
+        # kv_cache_bases, so drop all three stale bindings together before the
+        # reallocation.
         mr.kv_caches = []
         mr.kv_cache_bases = []
         mr.kv_cache_names = []
 
-        # NOTE(RBLN): `bind_kv_cache` also parks each layer's view on the
-        # Attention module; the next bind overwrites it only *after* the new
-        # tensors exist, which is the window this closes.
+        # NOTE(RBLN): the rebind also parks each layer's view on the Attention
+        # module; the next bind overwrites it only *after* the new tensors
+        # exist, which is the window this closes.
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
         # `KVCacheTensor.shared_by` is the same list `_allocate_kv_cache_tensors`
@@ -1037,9 +1038,9 @@ class RBLNWorker(WorkerBase):
         )
         mr.kv_cache_config = new_cfg
         # Order is load-bearing: see `_release_kv_cache_tensors`. It also does
-        # the `mr.kv_caches = []` that upstream bind_kv_cache() asserts on.
+        # the `mr.kv_caches = []` that the rebind reassigns.
         self._release_kv_cache_tensors(old_cfg)
-        # Re-applies mark_dynamic and calls bind_kv_cache itself.
+        # Re-applies mark_dynamic and rebinds the KV caches itself.
         mr.initialize_kv_cache_tensors(new_cfg, mr._kernel_block_sizes)
 
         if mr.kv_cache_bases:
