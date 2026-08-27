@@ -17,6 +17,7 @@
 # test_rbln_model_runner_states / _inputs / _kv_cache.
 
 import contextlib
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -731,6 +732,48 @@ class TestAllocateKvCacheTensors:
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here
+
+
+class TestApplyPendingTokenWriteback:
+    # The async repair has to move both stores together. token_ids_cpu is rebuilt
+    # from output_token_ids when a request re-enters the batch, so writing the
+    # real token to one and not the other leaves a value that comes back wrong.
+    PROMPT_LEN = 3
+    START = PROMPT_LEN  # where staging put the placeholder
+
+    @classmethod
+    def _runner(cls, *, output_token_ids, keep_request_state=True):
+        ib = _input_batch(0)
+        state = _cached_state("r0", prompt_len=cls.PROMPT_LEN)
+        ib.add_request(state)
+        # What the async path left behind: a -1 in both stores.
+        state.output_token_ids[:] = output_token_ids
+        ib.token_ids_cpu[0, cls.START] = -1
+        runner = _make_runner_stub(
+            input_batch=ib,
+            requests={"r0": state} if keep_request_state else {},
+            _pending_token_writeback=deque([(["r0"], [[42]], {"r0": cls.START})]),
+        )
+        return runner, ib, state
+
+    def test_repairs_both_stores(self):
+        runner, ib, state = self._runner(output_token_ids=[-1])
+        runner._apply_pending_token_writeback()
+        assert state.output_token_ids == [42]
+        assert ib.token_ids_cpu[0, self.START] == 42
+
+    def test_leaves_both_stores_when_the_offset_is_out_of_bounds(self):
+        # The request rolled back past this step, so output_token_ids no longer
+        # has room for the placeholder.
+        runner, ib, state = self._runner(output_token_ids=[])
+        runner._apply_pending_token_writeback()
+        assert state.output_token_ids == []
+        assert ib.token_ids_cpu[0, self.START] == -1
+
+    def test_leaves_both_stores_when_the_request_state_is_gone(self):
+        runner, ib, _ = self._runner(output_token_ids=[-1], keep_request_state=False)
+        runner._apply_pending_token_writeback()
+        assert ib.token_ids_cpu[0, self.START] == -1
 
 
 class TestMixinConformance:
