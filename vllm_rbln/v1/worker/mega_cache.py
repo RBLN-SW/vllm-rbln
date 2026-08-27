@@ -13,8 +13,14 @@
 # limitations under the License.
 """torch.compiler mega-cache bundle helpers for the rbln model runner.
 
-Persists/restores `torch.compiler.{save,load}_cache_artifacts()` bundles as a
-per-(model, config-signature, rank) file under VLLM_CACHE_ROOT.
+Persists/restores `torch.compiler.{save,load}_cache_artifacts()` bundles under a
+per-(model, config-signature, rank) directory in VLLM_CACHE_ROOT.
+
+A bundle is a base file plus append-only increments: `mega_cache.bin`, then
+`mega_cache.inc.<n>.bin`. `save_cache_artifacts()` serializes only the artifacts
+*this* session compiled -- a loaded hit is never re-recorded -- so writing its
+output over the base would drop every graph that hit. Each save becomes a new
+part instead, and load replays them all.
 """
 
 import contextlib
@@ -29,6 +35,8 @@ import vllm.envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+_INCREMENT_RE = re.compile(r"^mega_cache\.inc\.(\d+)\.bin$")
 
 
 def _safe_name(model: str) -> str:
@@ -157,7 +165,7 @@ def config_signature(vllm_config) -> str:
 
 
 def bundle_path(model: str, sig: str) -> str:
-    """Per-(model, sig, local_rank) bundle path under VLLM_CACHE_ROOT
+    """Base part of the per-(model, sig, local_rank) bundle under VLLM_CACHE_ROOT
     (assumed node-local; override per node on a shared filesystem)."""
     raw = model or "unknown"
     suffix = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
@@ -172,75 +180,133 @@ def bundle_path(model: str, sig: str) -> str:
     )
 
 
+def _increment_path(directory: str, index: int) -> str:
+    return os.path.join(directory, f"mega_cache.inc.{index}.bin")
+
+
+def _increment_indices(directory: str) -> list[int]:
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    matches = (_INCREMENT_RE.match(name) for name in names)
+    return sorted(int(m.group(1)) for m in matches if m is not None)
+
+
+def bundle_parts(path: str) -> list[str]:
+    """Every part of the bundle at `path`, base first, then increments in order."""
+    directory = os.path.dirname(path)
+    parts = [path] if os.path.isfile(path) else []
+    parts.extend(_increment_path(directory, i) for i in _increment_indices(directory))
+    return parts
+
+
+def _next_part_path(path: str) -> str:
+    """Where this session's artifacts go: the base if it is not there yet, else
+    a fresh increment."""
+    if not os.path.isfile(path):
+        return path
+    directory = os.path.dirname(path)
+    index = max(_increment_indices(directory), default=0) + 1
+    while os.path.exists(_increment_path(directory, index)):
+        index += 1
+    return _increment_path(directory, index)
+
+
 def cache_root() -> str:
     """Directory the rbln backend should use for populate/lookup."""
     return os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
 
 
+def _artifact_count(info) -> int:
+    """Artifacts a torch CacheInfo carries; 0 if torch stops exposing them."""
+    artifacts = getattr(info, "artifacts", None)
+    if not isinstance(artifacts, dict):
+        return 0
+    return sum(len(keys) for keys in artifacts.values())
+
+
 def load(model: str, sig: str) -> None:
-    """Restore artifacts from disk so first-compile cache-hits."""
+    """Restore artifacts from every part of the bundle so first-compile
+    cache-hits."""
     if envs.VLLM_DISABLE_COMPILE_CACHE:
         return
     from rebel.core import mega_cache as rbln_mega_cache
 
     rbln_mega_cache.set_dir(cache_root())
     path = bundle_path(model, sig)
-    if not os.path.isfile(path):
+    parts = bundle_parts(path)
+    if not parts:
         return
-    try:
-        with open(path, "rb") as src:
-            info = torch.compiler.load_cache_artifacts(src.read())
+    restored = 0
+    for part in parts:
+        try:
+            with open(part, "rb") as src:
+                info = torch.compiler.load_cache_artifacts(src.read())
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning("Failed to load rbln mega-cache bundle: %s", exc)
+            continue
         if info is None:
             logger.warning(
-                "Ignored an unreadable rbln mega-cache bundle at %s; recompiling",
-                path,
+                "Ignored an unreadable rbln mega-cache part at %s; recompiling "
+                "whatever it held",
+                part,
             )
-        else:
-            logger.info("Loaded rbln mega-cache bundle from %s", path)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        logger.warning("Failed to load rbln mega-cache bundle: %s", exc)
+            continue
+        restored += _artifact_count(info)
+    logger.info(
+        "Loaded rbln mega-cache bundle from %s: %d part(s), %d artifact(s)",
+        os.path.dirname(path),
+        len(parts),
+        restored,
+    )
 
 
 def save(model: str, sig: str) -> None:
-    """Persist artifacts atomically. Call only after warm-up succeeds."""
+    """Persist this session's artifacts as a new bundle part, atomically. Call
+    only after warm-up succeeds."""
     if envs.VLLM_DISABLE_COMPILE_CACHE:
         return
     from rebel.core import mega_cache as rbln_mega_cache
 
     rbln_mega_cache.set_dir(cache_root())
     path = bundle_path(model, sig)
-    tmp_path = f"{path}.{os.getpid()}.tmp"
+    tmp_path = None
     try:
         rbln_mega_cache.flush_to_bundle()
         result = torch.compiler.save_cache_artifacts()
         if result is None:
             return
-        artifact_bytes, _ = result
+        artifact_bytes, info = result
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        target = _next_part_path(path)
+        tmp_path = f"{target}.{os.getpid()}.tmp"
         with open(tmp_path, "wb") as dst:
             dst.write(artifact_bytes)
             # Delayed allocation defers ENOSPC to flush, so a bundle could be
             # renamed into place truncated without this.
             dst.flush()
             os.fsync(dst.fileno())
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, target)
         logger.info(
-            "Saved rbln mega-cache bundle to %s (%.1f MiB)",
-            path,
+            "Saved rbln mega-cache bundle to %s (%.1f MiB, %d artifact(s))",
+            target,
             len(artifact_bytes) / (1 << 20),
+            _artifact_count(info),
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        with contextlib.suppress(OSError):
-            os.remove(tmp_path)
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
         out_of_space = isinstance(exc, OSError) and exc.errno in (
             errno.ENOSPC,
             errno.EDQUOT,
         )
         logger.error(
-            "Could not persist the rbln mega-cache bundle to %s: %s%s. The "
-            "previous bundle is left untouched, so every restart recompiles "
-            "from scratch until this is resolved.",
-            path,
+            "Could not persist the rbln mega-cache bundle under %s: %s%s. The "
+            "parts already on disk are left untouched, so the graphs this run "
+            "compiled are recompiled on every restart until this is resolved.",
+            os.path.dirname(path),
             exc,
             " (out of disk space)" if out_of_space else "",
         )

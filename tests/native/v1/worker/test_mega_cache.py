@@ -397,6 +397,10 @@ def _bundle_bytes(path: str) -> bytes:
         return f.read()
 
 
+def _parts(path: str) -> list[bytes]:
+    return [_bundle_bytes(part) for part in mega_cache.bundle_parts(path)]
+
+
 class TestSaveLoad:
     def test_round_trip(self, bundle):
         mega_cache.save(MODEL, SIG)
@@ -444,11 +448,56 @@ class TestSaveLoad:
         mega_cache.load(MODEL, SIG)
         assert bundle.loaded == []
 
-    def test_resave_replaces_in_place(self, bundle):
+    def test_resave_appends_a_part(self, bundle):
         mega_cache.save(MODEL, SIG)
         bundle.save_result = (b"second-bundle", object())
         mega_cache.save(MODEL, SIG)
-        assert _bundle_bytes(bundle.path) == b"second-bundle"
+        assert _parts(bundle.path) == [bundle.artifact, b"second-bundle"]
+
+    def test_a_hit_does_not_fall_out_of_the_bundle(self, bundle):
+        # The reported failure: save_cache_artifacts() serializes only what this
+        # session compiled, so a run that hit 6 graphs and missed 1 wrote a
+        # bundle holding just the miss -- and the next run recompiled all 7.
+        mega_cache.save(MODEL, SIG)
+        bundle.save_result = (b"one-late-graph", object())
+        mega_cache.save(MODEL, SIG)
+        mega_cache.load(MODEL, SIG)
+        assert bundle.loaded == [bundle.artifact, b"one-late-graph"]
+
+    def test_increments_live_beside_the_base(self, bundle):
+        mega_cache.save(MODEL, SIG)
+        bundle.save_result = (b"second-bundle", object())
+        mega_cache.save(MODEL, SIG)
+        directory = os.path.dirname(bundle.path)
+        assert sorted(os.listdir(directory)) == [
+            "mega_cache.bin",
+            "mega_cache.inc.1.bin",
+        ]
+
+    def test_parts_replay_in_write_order(self, bundle):
+        # Not lexicographic: inc.10 is written after inc.9, so it has to replay
+        # after it.
+        for i in range(12):
+            bundle.save_result = (f"part-{i}".encode(), object())
+            mega_cache.save(MODEL, SIG)
+        mega_cache.load(MODEL, SIG)
+        assert bundle.loaded == [f"part-{i}".encode() for i in range(12)]
+
+    def test_a_corrupt_part_does_not_hide_the_others(self, bundle, monkeypatch):
+        mega_cache.save(MODEL, SIG)
+        bundle.save_result = (b"second-bundle", object())
+        mega_cache.save(MODEL, SIG)
+        seen = []
+
+        def flaky(data):
+            seen.append(data)
+            if data == bundle.artifact:
+                raise RuntimeError("bad part")
+            return object()
+
+        monkeypatch.setattr(torch.compiler, "load_cache_artifacts", flaky)
+        mega_cache.load(MODEL, SIG)  # must not propagate
+        assert seen == [bundle.artifact, b"second-bundle"]
 
     def test_nothing_new_compiled_keeps_the_bundle(self, bundle):
         # torch returns None when the run recorded no new artifact -- i.e. every
