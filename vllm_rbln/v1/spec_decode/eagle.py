@@ -77,6 +77,8 @@ class RBLNEagleProposer(EagleProposer):
         # head shares the target vocabulary, so `propose()` maps no ids.
         self.draft_id_to_target_id: torch.Tensor | None = None
 
+        self.hidden_states: torch.Tensor = self.hidden_states.to("cpu")
+
     def propose(
         self,
         target_token_ids: torch.Tensor,
