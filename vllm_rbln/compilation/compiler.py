@@ -22,6 +22,7 @@ from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 
 from vllm_rbln import envs
 from vllm_rbln.compilation.backends import rbln_backend
+from vllm_rbln.compilation.dispatch import Dispatcher
 
 CompiledTarget = TypeVar("CompiledTarget")
 
@@ -84,7 +85,16 @@ def compile(
     use_cache: bool = True,
     cache_dir: str = "",
     use_static_output: bool = False,
+    use_direct_dispatch: bool = False,
 ) -> CompiledTarget:
+    if use_direct_dispatch and not fullgraph:
+        # A dispatched call runs one code object, so whatever Dynamo leaves
+        # outside the graph is unreachable: a graph break's resume function only
+        # runs compiled under the frame eval, and a recompile-limit bail-out adds
+        # no cache entry, so _register binds the previous call's graph to the new
+        # key. fullgraph turns both into an exception.
+        raise ValueError("use_direct_dispatch requires fullgraph=True")
+
     _ensure_torch_dynamo_configured()
 
     options = {}
@@ -100,10 +110,10 @@ def compile(
     set_option("process_group_dict", process_group_dict)
     set_option("guard_filter_fn", guard_filter_fn)
     set_option("_runtime_holder", runtime_holder)
-    if mode and isinstance(mode, str):
-        mode = [mode]
-        if envs.VLLM_RBLN_COMPILE_ONLY:
-            mode.append("compile_only")
+    if isinstance(mode, str):
+        mode = [mode] if mode else []
+    if envs.VLLM_RBLN_COMPILE_ONLY:
+        mode.append("compile_only")
     set_option("mode", mode)
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
@@ -112,13 +122,13 @@ def compile(
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
         set_option("mega_cache_only", True)
 
-    return cast(
-        CompiledTarget,
-        torch.compile(
-            target,
-            backend=backend,
-            dynamic=dynamic,
-            fullgraph=fullgraph,
-            options=options,
-        ),
+    compiled = torch.compile(
+        target,
+        backend=backend,
+        dynamic=dynamic,
+        fullgraph=fullgraph,
+        options=options,
     )
+    if use_direct_dispatch:
+        return cast(CompiledTarget, Dispatcher(target, compiled))
+    return cast(CompiledTarget, compiled)
