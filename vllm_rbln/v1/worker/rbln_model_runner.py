@@ -1312,16 +1312,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     continue
                 sampled_ids = tokens[i]
                 req_state = self.requests.get(req_id)
-                if req_state is not None:
-                    output_offset = start - req_state.num_prompt_tokens
-                    if (
-                        0
-                        <= output_offset
-                        <= len(req_state.output_token_ids) - len(sampled_ids)
-                    ):
-                        req_state.output_token_ids[
-                            output_offset : output_offset + len(sampled_ids)
-                        ] = sampled_ids
+                if req_state is None:
+                    continue
+                output_offset = start - req_state.num_prompt_tokens
+                if not (
+                    0
+                    <= output_offset
+                    <= len(req_state.output_token_ids) - len(sampled_ids)
+                ):
+                    # The request rolled back past this step, so the tokens are
+                    # stale for token_ids_cpu too: it is rebuilt from
+                    # output_token_ids whenever the request re-enters the batch.
+                    continue
+                req_state.output_token_ids[
+                    output_offset : output_offset + len(sampled_ids)
+                ] = sampled_ids
                 req_index = input_batch.req_id_to_index.get(req_id)
                 if req_index is not None:
                     input_batch.token_ids_cpu[
