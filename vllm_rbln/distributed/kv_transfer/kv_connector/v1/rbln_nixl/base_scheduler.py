@@ -22,7 +22,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorScheduler,
     NixlConnectorMetadata,
-    NixlPullConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
@@ -161,7 +160,3 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
         # before its closing chunk, so the blocks accumulated for it are stale.
         self._block_ids_need_save.pop(request.request_id, None)
         return super().request_finished(request, block_ids)
-
-
-class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorScheduler):
-    """Scheduler side of the read path."""

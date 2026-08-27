@@ -29,13 +29,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 )
 
 import vllm_rbln.envs as envs
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.scheduler import (
-    RblnNixlPullConnectorScheduler,
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
     RblnNixlSchedulerBase,
 )
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.worker import (
-    RblnNixlPullConnectorWorker,
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
+    RblnNixlPullConnectorScheduler,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
+    RblnNixlPullConnectorWorker,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     SupportsKVCacheRegistrationFinalize,
