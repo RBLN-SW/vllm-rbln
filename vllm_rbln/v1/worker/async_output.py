@@ -83,8 +83,13 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # replaced by the real tokens, but not from this thread: the main thread
         # reads token_ids_cpu in _preprocess. Queue the tokens instead and let the
         # main thread apply them at the top of its next step.
+        # Copied: the scheduler trims these lists in place when a request stops.
         self._pending_token_writeback.append(
-            (self._req_ids, valid_sampled_token_ids, self._placeholder_pos)
+            (
+                self._req_ids,
+                [list(ids) for ids in valid_sampled_token_ids],
+                self._placeholder_pos,
+            )
         )
 
         output = self._model_runner_output
