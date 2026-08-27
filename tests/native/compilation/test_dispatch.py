@@ -231,9 +231,8 @@ class TestDispatch:
         assert first.forward(x) == ("eager", 1)
 
     def test_the_dispatched_region_lands_in_a_profile(self, monkeypatch, tmp_path):
-        # Bypassing the frame eval bypasses Dynamo's own annotation, so a dispatched
-        # call is a blank in the trace unless the dispatcher names it -- and it must
-        # do so without VLLM_CUSTOM_SCOPES_FOR_PROFILING.
+        # The dispatcher must name the region without
+        # VLLM_CUSTOM_SCOPES_FOR_PROFILING.
         target, _ = make_target()
         d = Dispatcher(target, recorder([], "compiled"))
         install_entries(monkeypatch, [target.__code__])
@@ -249,9 +248,8 @@ class TestDispatch:
         assert "Dispatched Region: 0/0" in names
 
     def test_clone_differs_from_the_target_only_in_its_code(self, monkeypatch):
-        # The FunctionType constructor takes five of the function's slots; the
-        # slots are enumerated off the type so a new one fails here rather than
-        # being dropped silently by _clone.
+        # Enumerated off the type, so a slot a future Python adds fails here
+        # rather than being dropped silently by _clone.
         def target(x, y=None, *, scale=3.0):
             """docstring."""
             return "eager"
@@ -351,12 +349,10 @@ def key_of(monkeypatch, kwargs, context_key):
 class TestKeyDiscrimination:
     """The key must separate every situation that needs its own graph.
 
-    Key completeness is the one precondition Dispatcher cannot check: a key
-    coarser than Dynamo's guards serves one graph for two situations, forever
-    and unreported, and no count of compiled graphs reveals it because the
-    second graph is never requested. What this class can do is pin the
-    situations down as an explicit list and require the key to tell them apart
-    -- so a change that collapses two of them fails here instead of in a model.
+    Dispatcher cannot check key completeness, and no count of compiled graphs
+    reveals a collapsed pair because the second graph is never requested. So
+    this pins the situations down as an explicit list and requires the key to
+    tell them apart, failing here instead of in a model.
     """
 
     def test_distinct_situations_never_share_a_key(self, monkeypatch):

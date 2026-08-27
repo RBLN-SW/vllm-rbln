@@ -29,8 +29,6 @@ logger = init_logger(__name__)
 # FunctionType's constructor takes five of a function's slots and the rest have
 # to be assigned, or the clone is not the target with a different body. Keyword
 # defaults are the one that changes results rather than just introspection.
-# test_dispatch.py enumerates the slots off the type, so a Python release that
-# adds one fails the test instead of silently dropping it here.
 _COPIED_SLOTS = (
     "__kwdefaults__",
     "__qualname__",
@@ -72,13 +70,10 @@ def _forward_context_key() -> tuple[Any, ...]:
     attention metadata says prefill rather than decode, or when a KV connector
     is attached (which changes the attention wrapper's graph).
 
-    Not every dispatched target runs inside a forward context -- the model
-    forward does, the medusa drafter runs after execute_model has left it -- so
-    a missing context is a normal state and contributes nothing to the key.
-
-    A missing context, missing DP metadata and a missing pad width are states
-    that really occur. A missing attribute is not, and must not be defaulted:
-    it would drop a key component instead of failing.
+    A missing context, missing DP metadata and a missing pad width really
+    occur -- the medusa drafter runs after execute_model has left the context.
+    A missing attribute does not, and must not be defaulted: it would drop a
+    key component instead of failing.
     """
     if not is_forward_context_available():
         return (None, None, has_kv_transfer_group())
@@ -103,12 +98,10 @@ def _forward_context_key() -> tuple[Any, ...]:
 class Dispatcher:
     """Owns the graph selection that Dynamo's cache lookup normally does.
 
-    Deciding which compiled graph a call belongs to costs a frame-eval entry
-    plus a guard-tree walk every step, and the answer is something the runner
-    already knows. So this keeps the mapping itself: the first call for a key
-    goes through Dynamo (which compiles it if needed) and the transformed
-    bytecode is recorded as a clone of the target, and every later call with
-    that key runs the clone directly -- no frame eval, no guards.
+    The first call for a key goes through Dynamo (which compiles it if needed)
+    and the transformed bytecode is recorded as a clone of the target; every
+    later call with that key runs the clone directly, no frame eval and no
+    guards.
 
     A clone rather than the target with its `__code__` swapped, because a swap
     is visible to every other holder of the target for as long as it is
@@ -179,8 +172,7 @@ class Dispatcher:
         entry = entries[0]
         # Bypassing the frame eval also bypasses the profiler scope it opens, so
         # the region is invisible unless we open one. Dynamo's compile id keeps a
-        # dispatched trace comparable with one taken without the dispatcher, and
-        # this scope is gated on the profiler, not on an env var like vLLM's.
+        # dispatched trace comparable with one taken without the dispatcher.
         self._graphs[key] = (
             self._clone(entry.code),
             _RecordFunctionFast(f"Dispatched Region: {entry.compile_id}"),
