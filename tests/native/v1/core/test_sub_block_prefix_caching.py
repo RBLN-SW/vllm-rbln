@@ -158,6 +158,29 @@ class TestSubBlockVersusKVConnector:
         assert out.kv_cache_copy_ops == []
         assert out.num_scheduled_tokens["1"] == len(tokens) - BLOCK_SIZE
 
+    def test_losing_connector_is_told_the_corrected_local_count(self):
+        # A cancelled connector is re-queried with local + sub-block tokens.
+        num_shared = 3 * SUB_BLOCK_SIZE
+        sched = self._scheduler(matched_tokens=SUB_BLOCK_SIZE)
+        seen: list[int] = []
+        original = sched.connector.get_num_new_matched_tokens
+
+        def recording(request, num_computed_tokens):
+            seen.append(num_computed_tokens)
+            return original(request, num_computed_tokens)
+
+        sched.connector.get_num_new_matched_tokens = recording
+
+        self._cache_one_block(
+            sched,
+            list(range(num_shared)) + [800 + i for i in range(BLOCK_SIZE - num_shared)],
+        )
+        tokens = list(range(num_shared)) + [900 + i for i in range(BLOCK_SIZE)]
+        self._schedule_query(sched, tokens, remote_prefill=True)
+
+        # First the block-aligned fetch query, then the corrective re-query.
+        assert seen[-2:] == [0, num_shared]
+
     def test_connector_is_asked_with_a_block_aligned_count(self):
         # The connector is queried before the sub-block match, with the
         # full-block count only, or it would fetch from the wrong offset.
