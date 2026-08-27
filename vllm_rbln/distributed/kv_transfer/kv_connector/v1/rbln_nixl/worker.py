@@ -14,6 +14,7 @@
 
 import time
 from collections import defaultdict
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -33,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlAgentMetadata,
+    NixlBaseConnectorWorker,
     NixlPullConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -49,6 +51,8 @@ from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -56,7 +60,7 @@ from vllm.v1.kv_cache_interface import (
 import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RblnNixlAgentMetadata,
-    rbln_pp_compat_hash,
+    rbln_compat_hash,
 )
 from vllm_rbln.logger import init_logger
 
@@ -67,18 +71,38 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class RblnNixlConnectorWorker(NixlPullConnectorWorker):
-    """RBLN's KV connector worker.
+class RblnNixlWorkerBase(NixlBaseConnectorWorker):
+    """Everything the transfer direction does not decide: memory registration,
+    the handshake, region pairing, descriptor construction, topology guards.
+    Mixed with whichever direction class moves the bytes.
 
-    The runner filters `kv_caches` to one Full-attention canonical layer
-    per HMA pool before `register_kv_caches`, so upstream's
-    `cache.shape[0] == num_blocks` invariant holds without a bigger
-    override (see `RBLNModelRunner._select_canonical_kv_layers_per_pool`).
+    Supported prefill -> decode topologies
+    --------------------------------------
+    Peers pair by what they actually hold, on two axes that compose: KV heads
+    (`_build_head_matched_remote`) and layers (`_layer_overlap`). Any TP or PP
+    degree on either side works within these bounds. DP and EP are invisible --
+    a replica is its own engine, and EP does not shard the KV cache.
 
-    Not supported: pure-SWA single-group with `sliding_window < block_size`
-    under a KV connector — the canonical-layer fallback picks the SWA
-    layer (kernel granularity), whose `cache.shape[0]` mismatches
-    `num_blocks`. Non-disagg serving is unaffected.
+      * the two pipeline sizes must tile each other
+      * both sides pipelined requires equal TP, and a pipelined peer may not
+        have MORE TP ranks
+      * D2D only: one of OUR chiplet areas must fit inside a single peer rank's
+        band (heads per area <= total KV heads / peer TP)
+      * each side's TP degree must divide the model's KV heads; below that
+        upstream replicates one head across ranks, which no head band names
+      * D2D only: the coarser side's heads per area must be a whole multiple of
+        the finer side's, or a descriptor would carry part of a head
+
+    Not supported
+    -------------
+      * D2D only: unequal TP with MLA (`_check_mla_constraints`)
+      * unequal P/D block sizes with unequal TP or with PP; the equal-TP,
+        non-pipelined case is upstream's and unaffected
+      * sliding-window attention with any model parallelism across P/D --
+        unequal TP or PP on either side
+      * with PP: Mamba/SSM and cross-layer-blocks
+      * more than one KV-cache group on any per-shard transfer -- that is,
+        whenever a peer serves less than a whole engine
     """
 
     compat_hash: str | None
@@ -112,7 +136,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             )
         else:
             logger.info(
-                "RblnNixlConnectorWorker: nixl-rbln not available — "
+                "RBLN NIXL: nixl-rbln not available — "
                 "using upstream NIXL (UCX) on the host-bounce path."
             )
 
@@ -121,6 +145,13 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         self.use_host_buffer = self.kv_buffer_device == "cpu"
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
+
+        # --- Chiplet geometry of one KV entry (D2D only) ---
+        # Set from nixl_rbln.register_kv_regions. Host-bounce registers logical
+        # full-shape buffers and never expands per area, so the defaults below
+        # are its permanent (and correct) values.
+        self._kv_areas: int = 1
+        self._kv_slices: int = 1
 
         # --- Pipeline-parallel (PP) P/D state (empty / inert for pp_size == 1) ---
         # Per remote producer shard, the ordered KV-cache layer names it owns,
@@ -132,13 +163,19 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         # engine_id -> producer pp_size (discovered at handshake).
         self._remote_pp_size: dict[str, int] = {}
         # engine_id -> the producer stages (flat global ranks) whose layers this
-        # rank owns; drives _read_blocks_for_req.
+        # rank owns; the per-shard transfer path walks exactly these.
         self._overlapping_ranks: defaultdict[str, list[int]] = defaultdict(list)
         # Per producer shard, a local xfer dlist scoped to that shard's local
         # region subset, keyed by (engine_id, global_rank, block_size); and the
         # shard's per-region KV-group ids, keyed by (engine_id, global_rank).
         self.src_xfer_handles_by_remote: dict[tuple[str, int, int], int] = {}
+        # Which of those entries point at a handle upstream owns, so cleanup
+        # drops the entry without releasing what other peers still use.
+        self._borrowed_src_handles: set[tuple[str, int, int]] = set()
         self._shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]] = {}
+        # How many descriptors each of that shard's regions is cut into
+        # (_head_split).
+        self._shard_descs_per_block: dict[tuple[str, int], int] = {}
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.
         self.local_seen_layer_names: list[str] = []
@@ -156,12 +193,17 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         # populated prefix (kernel slot 0 is pinned at the block base). Storage and
         # host copies stay Full; _sw_ratio is None collapses to upstream Full-only.
         # See the "Hybrid Full + SWA desc layout" section below.
-        self._group_specs: list[Any] = []
+        self._group_specs: list[Any] = [
+            g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
+        ]
+        # Whether the model has a sliding window at all, which decides the model
+        # parallelism guards; `_sw_ratio` is the view-opt's desc layout and only
+        # ever set when that flag is on.
+        self._has_swa = any(
+            isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
+        )
         self._sw_ratio: int | None = None
-        if envs.VLLM_RBLN_NIXL_SWA_VIEW_OPT:
-            self._group_specs = [
-                g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
-            ]
+        if self._has_swa and envs.VLLM_RBLN_NIXL_SWA_VIEW_OPT:
             for spec in self._group_specs:
                 if not isinstance(spec, SlidingWindowSpec):
                     continue
@@ -177,6 +219,14 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                         f"across groups, got {self._sw_ratio} vs {ratio}"
                     )
             if self._sw_ratio is not None:
+                # Fail at startup rather than at the first handshake: the
+                # two-desc-range layout below and a key-only latent have not
+                # been combined.
+                if self.use_mla:
+                    raise RuntimeError(
+                        "RBLN NIXL: VLLM_RBLN_NIXL_SWA_VIEW_OPT is not "
+                        "supported with a sliding-window MLA cache."
+                    )
                 logger.info(
                     "VLLM_RBLN_NIXL_SWA_VIEW_OPT=1: trimming SWA-group "
                     "RDMA payload by 1/%d (sliding_window-sized descs "
@@ -187,15 +237,11 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Wire KV caches into NIXL.
 
-        D2D (`kv_buffer_device="rbln"`): stash and defer; backing memory
-        isn't materialized until warm-up. Backend creation happens in
-        `_register_kv_caches_impl` via `nixl_rbln.register_kv_regions`.
-
-        Host-bounce (`kv_buffer_device="cpu"`): when nixl-rbln is
-        available, create the RBLN backend on the agent so upstream's
-        `register_memory(..., backends=["RBLN"])` resolves. Otherwise
-        fall straight through to upstream's UCX-backed registration —
-        the host xfer buffers are plain DRAM in either case.
+        D2D defers: its backing memory is not materialized until warm-up, so
+        the real registration runs from `finalize_kv_cache_registration`.
+        Host-bounce buffers are plain DRAM and register now; where nixl-rbln
+        is installed the RBLN backend only has to exist first, so that
+        upstream's `register_memory(..., backends=["RBLN"])` resolves.
         """
         # Capture the ordered local layer names before any deferral so the PP
         # metadata publish (and the consumer-side name->region matching) can
@@ -204,7 +250,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         if self.kv_buffer_device == "rbln":
             self._pending_kv_caches = kv_caches
             logger.info(
-                "RblnNixlConnectorWorker (D2D): deferring registration of "
+                "RBLN NIXL (D2D): deferring registration of "
                 "%d KV cache layer(s) until after warm-up.",
                 len(kv_caches),
             )
@@ -214,13 +260,13 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
 
             nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
         super().register_kv_caches(kv_caches)
-        # Re-wrap the base-published handshake metadata with this stage's PP
+        # Re-wrap upstream's published handshake metadata with this stage's PP
         # identity + owned layer names (no-op degrade for pp_size == 1).
         if self.xfer_handshake_metadata is not None:
             base_agent_metadata = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(
                 self.xfer_handshake_metadata.agent_metadata_bytes
             )
-            self._publish_pp_handshake_metadata(base_agent_metadata, kv_caches.keys())
+            self._publish_handshake_metadata(base_agent_metadata, kv_caches.keys())
 
     def finalize_kv_cache_registration(self) -> None:
         """Run the deferred D2D registration. No-op on host-bounce and
@@ -233,7 +279,10 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Allocate one rebel-aligned host buffer per layer."""
-        assert self.kv_cache_layout == "HND", (
+        # MLA has no head axis to order, which is why upstream advertises no
+        # required layout for it and the resolved value is meaningless here.
+        # The allocator below is shape-agnostic either way.
+        assert self.use_mla or self.kv_cache_layout == "HND", (
             "RBLN NIXL Connector only supports HND layout"
         )
         xfer_buffers: dict[str, torch.Tensor] = {}
@@ -254,7 +303,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             for layer_name, kv_cache in kv_caches.items():
                 xfer_buffers[layer_name] = _aligned_like(kv_cache)
         except MemoryError as e:
-            logger.error("RblnNixlConnectorWorker gets %s", e)
+            logger.error("RBLN NIXL: %s", e)
             raise
 
         keys_preview = list(xfer_buffers.keys())
@@ -284,7 +333,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         """Direct variant of NixlConnectorWorker.register_kv_caches:
         build the upstream topology, hand the logical K/V regions to
         `nixl_rbln.register_kv_regions` (address translation, sharding,
-        MR reg), and feed the returned transfer tables into the base
+        MR reg), and feed the returned transfer tables into upstream's
         transfer state.
         """
         import nixl_rbln
@@ -310,7 +359,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         sample_kv_cache = next(iter(kv_caches.values()))
         device_id = sample_kv_cache.get_device()
         assert device_id >= 0, (
-            "RblnNixlConnectorWorker (D2D): KV cache is not an 'rbln' "
+            "RBLN NIXL (D2D): KV cache is not an 'rbln' "
             "device tensor (is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
         )
 
@@ -334,12 +383,18 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         # Logical K/V regions (entry_tensor, byte_offset, full_block_len)
         # for nixl-rbln.
         regions: list[tuple[Any, int, int]] = []
+        # REPLICATE flag per logical region, expanded to the chiplet-expanded
+        # transfer table below (see _region_is_mla).
+        logical_mla: list[bool] = []
         for layer_name, cache_or_caches in xfer_buffers.items():
             layer_spec = self._layer_specs[layer_name]
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
                 layer_spec = layer_spec.kv_cache_specs[layer_name]
             cache_list = self.transfer_topo.get_transfer_cache_regions(
                 cache_or_caches, layer_spec
+            )
+            is_mla_region = isinstance(
+                layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
             )
             physical_page_size = (
                 layer_spec.page_size_bytes
@@ -348,7 +403,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 // self._physical_blocks_per_logical_kv_block
             )
             # For when registering multiple tensors eg K/V in separate
-            # regions.
+            # regions. MLA is key-only, so `cache_list` holds one.
             physical_page_size = physical_page_size // len(cache_list)
             if self.transfer_topo._cross_layers_blocks:
                 physical_page_size = physical_page_size * len(
@@ -360,7 +415,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 else self.num_blocks
             )
             curr_tensor_size_bytes = num_blocks * physical_page_size
-            if tensor_size_bytes is None:
+            if tensor_size_bytes is None and not is_mla_region:
                 tensor_size_bytes = curr_tensor_size_bytes
 
             # Materialize the backing memory of kv_cache.
@@ -377,20 +432,24 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 else:
                     full_block_len = physical_page_size
 
+                # A pure-SWA single group with `sliding_window < block_size`
+                # trips this: the canonical-layer fallback picks the SWA layer,
+                # whose block count is not the group's. Non-disagg is unaffected.
                 assert cache.shape[0] == num_blocks, (
                     "All kv cache tensors must have the same number of blocks"
                 )
-                if not self.use_mla:
+                if not is_mla_region:
                     assert tensor_size_bytes == curr_tensor_size_bytes, (
-                        "All kv cache tensors must have the same size"
+                        "All non-MLA kv cache tensors must have the same size"
                     )
                 regions.append((cache_or_caches, region_offset, full_block_len))
+                logical_mla.append(is_mla_region)
 
         rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
 
         # Delegate sharding and MR registration to nixl-rbln. It registers
         # one whole-entry MR per shard and returns the transfer tables
-        # (base addrs + block lens), already shard-expanded so the base
+        # (base addrs + block lens), already shard-expanded so upstream's
         # connector's descriptor math is correct without this connector
         # knowing the shard count.
         xfer = nixl_rbln.register_kv_regions(
@@ -406,20 +465,42 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         self._registered_descs.append(xfer.reg_handle)
         assert len(self.block_len_per_layer) == len(xfer.base_addrs)
 
+        # Upstream keys REPLICATE vs SPLIT off this list and indexes it 1:1 with
+        # block_len_per_layer, which is chiplet-expanded here -- so the flags are
+        # too, every area of a logical region carrying the same latent.
+        areas = max(xfer.n_shards, 1)
+        self._region_is_mla = [is_mla for is_mla in logical_mla for _ in range(areas)]
+        assert len(self._region_is_mla) == len(self.block_len_per_layer), (
+            f"{len(logical_mla)} logical region(s) over {areas} area(s) do not "
+            f"account for {len(self.block_len_per_layer)} transfer region(s); "
+            "mislabelling one would silently pick the wrong descriptor layout."
+        )
+
         self.num_regions = len(xfer.base_addrs)
         if self.transfer_topo.is_kv_layout_blocks_first:
             # Blocks-first layout doubles the region count (K/V split), like the
-            # base's virtually_split_kv_in_blocks. The base's key-only MLA halving
-            # is skipped here -- _region_is_mla stays empty while add_remote_agent
-            # rejects MLA (MLA support would populate it here).
-            self.num_regions *= 2
+            # upstream's virtually_split_kv_in_blocks -- except for key-only MLA
+            # regions, which have no V half. Inert while the connector rejects
+            # blocks-first outright (FA layout only).
+            self.num_regions = sum(
+                1 if self._is_region_replicated(i) else 2
+                for i in range(len(self._region_is_mla))
+            )
         self.num_descs = self.num_regions * self.num_blocks
 
+        # Areas vs slices: see RblnNixlAgentMetadata. Held for the descriptor
+        # arithmetic and the region-pairing guard.
+        self._kv_areas = xfer.n_shards
+        self._kv_slices = xfer.slices
         logger.info(
-            "RblnNixlConnectorWorker (D2D): registered %d transfer "
-            "region(s) across %d shard(s) (K/V split).",
+            "RBLN NIXL (D2D): registered %d transfer "
+            "region(s) across %d chiplet area(s), %d logical slice(s)%s.",
             self.num_regions,
             xfer.n_shards,
+            xfer.slices,
+            " -- KV heads are replicated across chiplets"
+            if xfer.n_shards != xfer.slices
+            else "",
         )
 
         self.device_kv_caches = kv_caches
@@ -446,42 +527,48 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 self._physical_blocks_per_logical_kv_block
             ),
         )
-        # Publish the handshake metadata wrapped with this stage's PP identity
-        # and owned layer names (degrades to no-PP for pp_size == 1).
-        self._publish_pp_handshake_metadata(
-            agent_metadata, self.device_kv_caches.keys()
-        )
+        # Republish with what a peer needs to pair by content: the layer names
+        # this shard registered and the chiplet geometry they expanded into.
+        self._publish_handshake_metadata(agent_metadata, self.device_kv_caches.keys())
 
     # ------------------------------------------------------------------
     # Hybrid Full + SWA desc layout (RDMA payload only)
     # ------------------------------------------------------------------
     #
-    # Regions are Full-sized (one canonical Full layer per HMA pool). With
-    # VLLM_RBLN_NIXL_SWA_VIEW_OPT and >=1 SWA group, two desc ranges share the
-    # same base addrs: [0, N) Full-length, [N, 2N) sliding_window-length. SWA
-    # groups read only the prefix (slot 0 pinned at block base), so RDMA moves
-    # less; host h2d/d2h still copies the full block. _compute_desc_ids routes
-    # each group to its range; _sw_ratio is None collapses to Full-only.
-    #
-    # The garbage tail SWA writes back is never read (kernel reads [0, sw)), and
-    # Full/SWA block-id pools stay disjoint so the Full alias is never aliased.
+    # Regions are Full-sized. With VLLM_RBLN_NIXL_SWA_VIEW_OPT and an SWA group,
+    # two desc ranges share the base addrs: [0, N) Full-length, [N, 2N)
+    # sliding_window-length. SWA groups read only the prefix, so RDMA moves less
+    # while the host copy still moves whole blocks. _compute_desc_ids routes each
+    # group to its range; _sw_ratio None collapses to Full-only. Safe because the
+    # tail SWA writes back is never read and the Full/SWA block-id pools are
+    # disjoint.
 
     def register_local_xfer_handler(
         self,
         block_size: int,
         *,
         registered_layer_names: tuple[str, ...] | list[str] | None = None,
+        peer_areas: list[int] | None = None,
+        split: int = 1,
+        region_ids: list[int] | None = None,
     ) -> tuple[int, list[tuple[int, int, int]]]:
         if self._sw_ratio is None:
-            if registered_layer_names is None:
-                # No SWA view opt, no PP shard: upstream's Full-only layout.
+            if registered_layer_names is None and peer_areas is None and split == 1:
+                # No SWA view opt, whole-engine peer: upstream's Full-only
+                # layout, one handle covering every region.
                 return super().register_local_xfer_handler(block_size)
-            # PP shard — register only this producer stage's local regions.
+            # Per-peer shard: only the regions this peer serves, each cut into
+            # `split` pieces (_shard_local_region_ids, _head_split).
             return self._register_shard_local_xfer_handler(
-                block_size, registered_layer_names
+                block_size,
+                registered_layer_names or self.local_seen_layer_names,
+                peer_areas=peer_areas,
+                split=split,
+                region_ids=region_ids,
             )
-        assert registered_layer_names is None, (
-            "RBLN NIXL: SWA view-opt is not supported with pipeline parallelism"
+        assert registered_layer_names is None and peer_areas is None and split == 1, (
+            "RBLN NIXL: SWA view-opt is not supported with pipeline "
+            "parallelism or heterogeneous tensor parallelism"
         )
         assert self.transfer_topo is not None
         assert not self.transfer_topo.is_kv_layout_blocks_first, (
@@ -516,7 +603,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         logger.debug(
             "Created %s local blocks (%s) for engine %s rank %s",
             len(blocks_data),
-            "Full + SWA" if self._sw_ratio is not None else "Full",
+            "Full + SWA",
             self.engine_id,
             self.tp_rank,
         )
@@ -527,6 +614,361 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             blocks_data,
         )
 
+    # ------------------------------------------------------------------
+    # The head axis: which KV heads a chiplet area holds
+    # ------------------------------------------------------------------
+    #
+    # A region is one chiplet area, so region i names different heads on two
+    # peers as soon as their TP degrees differ. Everything below answers one
+    # question -- for each of our areas, where in the peer do its heads live --
+    # and an area may be a replica rather than a distinct slice, so a head width
+    # comes from slices; areas only count regions.
+
+    @staticmethod
+    def _slice_head_bounds(
+        tp_rank: int, tp_size: int, total_kv_heads: int, areas: int, slices: int
+    ) -> tuple[int, int]:
+        """(first head this shard owns, heads per logical slice).
+
+        The compiler cuts a shard's heads into ``slices`` pieces, one per
+        chiplet area -- but a shard owning fewer heads than the device has
+        chiplets gets ``areas // slices`` replicas of each, the replication
+        axis innermost (``slice_id = area // (areas // slices)``).
+        """
+        assert total_kv_heads % tp_size == 0, (
+            f"KV heads {total_kv_heads} not divisible by TP size {tp_size}"
+        )
+        heads_per_rank = total_kv_heads // tp_size
+        assert slices > 0 and heads_per_rank % slices == 0, (
+            f"{heads_per_rank} heads not divisible into {slices} slices"
+        )
+        assert areas % slices == 0, (
+            f"{areas} chiplet areas not a whole number of {slices} slices"
+        )
+        return tp_rank * heads_per_rank, heads_per_rank // slices
+
+    def _build_head_matched_remote(
+        self,
+        nixl_agent_meta: RblnNixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+        registered_layer_names: tuple[str, ...] | list[str] | None = None,
+        peer_areas: list[int] | None = None,
+    ) -> list[tuple[int, int, int]]:
+        """Remote descriptors for a peer whose TP degree differs from ours.
+
+        Emitted in LOCAL region order, so ``_compute_desc_ids``'s positional
+        pairing keeps holding. Upstream instead walks the peer's list with one
+        global ``rank_offset``, which assumes it holds our heads contiguously
+        in a single region -- false once a region is one chiplet area and heads
+        are area-major: P TP2 -> D TP4 reads local area 2 from remote area 1.
+
+        ``registered_layer_names`` narrows this to one pipeline stage, its
+        region list indexed by position within the stage; None means the peer
+        owns every layer.
+        """
+        assert self.transfer_topo is not None
+        total_heads = self.transfer_topo.total_num_kv_heads
+        areas_l, slices_l = self._kv_areas, self._kv_slices
+        areas_r = nixl_agent_meta.kv_areas
+        slices_r = nixl_agent_meta.kv_slices
+
+        base_l, per_slice_l = self._slice_head_bounds(
+            self.tp_rank, self.transfer_topo.tp_size, total_heads, areas_l, slices_l
+        )
+        base_r, per_slice_r = self._slice_head_bounds(
+            remote_tp_rank, remote_tp_size, total_heads, areas_r, slices_r
+        )
+        split = self._head_split(per_slice_l, per_slice_r)
+
+        replicas_l = areas_l // slices_l
+        replicas_r = areas_r // slices_r
+        num_blocks = nixl_agent_meta.num_blocks
+        remote_bases = nixl_agent_meta.kv_caches_base_addr
+        remote_lens = nixl_agent_meta.block_lens
+
+        # (local logical region, its position in the peer's region list); a
+        # logical region is one K or V of one layer, before chiplet expansion.
+        n_logical_l = len(self.block_len_per_layer) // areas_l
+        if registered_layer_names is None:
+            logical_pairs = [(i, i) for i in range(n_logical_l)]
+        else:
+            per_layer = self._regions_per_layer() // areas_l
+            # peer_pos indexes the peer's own list (see _layer_overlap).
+            logical_pairs = [
+                (layer_l * per_layer + c, peer_pos * per_layer + c)
+                for peer_pos, layer_l in self._layer_overlap(registered_layer_names)
+                for c in range(per_layer)
+            ]
+
+        # Which of our areas this peer holds (see _fan_in_peer_areas).
+        areas_iter = range(areas_l) if peer_areas is None else peer_areas
+
+        out: list[tuple[int, int, int]] = []
+        # Axis order is `_shard_local_region_ids`'; within a region, block-major
+        # to match _compute_desc_ids' region_id * num_blocks + b.
+        for logical_l, logical_r in logical_pairs:
+            for area_l in areas_iter:
+                out.extend(
+                    self._head_matched_desc(
+                        region_id=logical_l * areas_l + area_l,
+                        logical_r=logical_r,
+                        area_l=area_l,
+                        geom=(base_l, per_slice_l, replicas_l),
+                        peer=(base_r, per_slice_r, replicas_r, slices_r),
+                        areas_r=areas_r,
+                        remote_bases=remote_bases,
+                        remote_lens=remote_lens,
+                        device_id=nixl_agent_meta.device_id,
+                        num_blocks=num_blocks,
+                    )
+                )
+        # The same count `_register_shard_local_xfer_handler` builds locally
+        # and `_shard_descs_per_block` records.
+        assert len(out) == len(logical_pairs) * len(areas_iter) * num_blocks * split
+        return out
+
+    def _fan_in_peer_areas(
+        self, remote_tp_rank: int, remote_tp_size: int
+    ) -> list[int] | None:
+        """Which local chiplet areas live on this peer, when it has MORE TP.
+
+        ``None`` when the peer holds all of them, so callers need no branch.
+
+        Our band spreads over ``|tp_ratio|`` of its ranks, so a transfer to one
+        must carry only the areas whose heads that rank owns -- otherwise every
+        peer yields the same bytes and the last to land wins.
+        """
+        assert self.transfer_topo is not None
+        if self.use_host_buffer:
+            # Host staging registers one logical full-shape buffer per layer,
+            # so there are no chiplet areas to divide and nothing below applies.
+            return None
+        if self.transfer_topo.tp_ratio(remote_tp_size) > 0:
+            return None
+        total_heads = self.transfer_topo.total_num_kv_heads
+        base_l, per_slice_l = self._slice_head_bounds(
+            self.tp_rank,
+            self.transfer_topo.tp_size,
+            total_heads,
+            self._kv_areas,
+            self._kv_slices,
+        )
+        heads_per_remote = total_heads // remote_tp_size
+        if per_slice_l > heads_per_remote:
+            raise RuntimeError(
+                "RBLN NIXL D2D: this rank's chiplet area spans "
+                f"{per_slice_l} KV heads but each peer rank owns only "
+                f"{heads_per_remote}, so one area would straddle several "
+                "peers. Reduce the prefill tensor-parallel size (the ratio "
+                "must not exceed the smaller of the chiplet count and this "
+                "rank's head count) or use kv_buffer_device='cpu'."
+            )
+        replicas_l = self._kv_areas // self._kv_slices
+        return [
+            area_l
+            for area_l in range(self._kv_areas)
+            if (base_l + (area_l // replicas_l) * per_slice_l) // heads_per_remote
+            == remote_tp_rank
+        ]
+
+    def _head_matched_desc(
+        self,
+        *,
+        region_id: int,
+        logical_r: int,
+        area_l: int,
+        geom: tuple[int, int, int],
+        peer: tuple[int, int, int, int],
+        areas_r: int,
+        remote_bases: list[int],
+        remote_lens: list[int],
+        device_id: int,
+        num_blocks: int,
+    ) -> list[tuple[int, int, int]]:
+        """Descriptors for one local region: ``split`` (`_head_split`) per block.
+
+        Order is block-major, piece-minor, to match the local list
+        `_register_shard_local_xfer_handler` builds.
+        """
+        base_l, per_slice_l, replicas_l = geom
+        base_r, per_slice_r, replicas_r, slices_r = peer
+
+        head = base_l + (area_l // replicas_l) * per_slice_l
+        desc_len = self.get_backend_aware_kv_block_len(
+            layer_idx=region_id, first_split=True, mamba_view=False
+        )
+        split = self._head_split(per_slice_l, per_slice_r)
+        per_piece = per_slice_l // split
+        sub_len = desc_len // split
+
+        # Replicas of a slice hold identical bytes, so reading any one of them
+        # answers; take the first.
+
+        out: list[tuple[int, int, int]] = []
+        pieces: list[tuple[int, int]] = []
+        for j in range(split):
+            # The remote slice covering this piece's first head, and how far
+            # into it we start.
+            slice_r, head_within = divmod(head + j * per_piece - base_r, per_slice_r)
+            if not 0 <= slice_r < slices_r:
+                raise RuntimeError(
+                    f"RBLN NIXL D2D: local head {head + j * per_piece} is "
+                    f"outside the peer's range (it owns heads {base_r}.."
+                    f"{base_r + per_slice_r * slices_r - 1})."
+                )
+            remote_region = logical_r * areas_r + slice_r * replicas_r
+            page = remote_lens[remote_region]
+            if page % per_slice_r != 0:
+                raise RuntimeError(
+                    f"RBLN NIXL D2D: peer region {remote_region} block length "
+                    f"{page}B does not split into {per_slice_r} heads."
+                )
+            # Heads are contiguous inside a block, so skipping `head_within` of
+            # them is a plain byte offset.
+            head_offset = head_within * (page // per_slice_r)
+            if sub_len + head_offset > page:
+                raise RuntimeError(
+                    f"RBLN NIXL D2D: local region {region_id} piece {j} wants "
+                    f"{sub_len}B at +{head_offset}B, past the end of the peer's "
+                    f"{page}B region {remote_region}."
+                )
+            pieces.append((remote_bases[remote_region] + head_offset, page))
+
+        for block_id in range(num_blocks):
+            for base, page in pieces:
+                out.append((base + block_id * page, sub_len, device_id))
+        return out
+
+    def _peer_head_split(
+        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+    ) -> int:
+        """`_head_split` for a peer, from its advertised chiplet geometry."""
+        if not self._is_head_matched_peer(remote_tp_size):
+            return 1
+        assert self.transfer_topo is not None
+        total_heads = self.transfer_topo.total_num_kv_heads
+        _, per_slice_l = self._slice_head_bounds(
+            self.tp_rank,
+            self.transfer_topo.tp_size,
+            total_heads,
+            self._kv_areas,
+            self._kv_slices,
+        )
+        _, per_slice_r = self._slice_head_bounds(
+            0,
+            remote_tp_size,
+            total_heads,
+            nixl_agent_meta.kv_areas,
+            nixl_agent_meta.kv_slices,
+        )
+        return self._head_split(per_slice_l, per_slice_r)
+
+    @staticmethod
+    def _head_split(per_slice_l: int, per_slice_r: int) -> int:
+        """How many pieces one of our regions is read in.
+
+        A descriptor names one contiguous range on each side, so an area coarser
+        than the peer's slice has to be transferred in as many pieces as the
+        peer spreads its heads over.
+        """
+        if per_slice_l <= per_slice_r:
+            return 1
+        if per_slice_l % per_slice_r:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: this rank's slice spans {per_slice_l} KV heads "
+                f"and the peer's {per_slice_r}, which does not divide it; the "
+                "two sides must cut heads at commensurate granularities."
+            )
+        return per_slice_l // per_slice_r
+
+    def _register_remote_engine_prelude(
+        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
+    ) -> None:
+        """Replicate upstream ``add_remote_agent``'s prelude.
+
+        Upstream registers the remote engine in the TransferTopology and builds
+        its TPMapping before any block_size_ratio / tp_ratio / get_engine_info
+        lookup, which the callers below and ``_validate_remote_agent_handshake``
+        also make. A path that does not delegate to super() has to do this
+        itself or get_engine_info() raises KeyError.
+        """
+        assert self.transfer_topo is not None
+        self.transfer_topo.register_remote_engine(
+            nixl_agent_meta.engine_id,
+            EngineTransferInfo(
+                remote_tp_size=remote_tp_size,
+                remote_block_size=nixl_agent_meta.block_size,
+                remote_block_len=nixl_agent_meta.block_lens[0],
+                remote_physical_blocks_per_logical=(
+                    nixl_agent_meta.physical_blocks_per_logical_kv_block
+                ),
+            ),
+        )
+        self.tp_mappings[nixl_agent_meta.engine_id] = compute_tp_mapping(
+            transfer_topology=self.transfer_topo,
+            remote_tp_size=remote_tp_size,
+            group_spec_types=self._group_spec_types,
+        )
+
+    def _add_remote_agent_head_matched(
+        self,
+        nixl_agent_meta: RblnNixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+        registered_layer_names: tuple[str, ...] | list[str] | None = None,
+    ) -> str:
+        """Register a peer with a different TP degree, matching on head bands.
+
+        `registered_layer_names` narrows this to one pipeline stage's layers,
+        `_fan_in_peer_areas` to the chiplet areas a finer peer owns.
+        """
+        engine_id = nixl_agent_meta.engine_id
+        if remote_tp_rank in self._remote_agents.get(engine_id, {}):
+            return self._remote_agents[engine_id][remote_tp_rank]
+
+        self._register_remote_engine_prelude(nixl_agent_meta, remote_tp_size)
+        remote_agent_name = self.nixl_wrapper.add_remote_agent(
+            nixl_agent_meta.agent_metadata
+        )
+        if engine_id not in self.dst_num_blocks:
+            self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+        self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
+            nixl_agent_meta.kv_caches_base_addr
+        )
+        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+
+        # Under PP the caller keys shards by the flat global rank
+        # (pp_rank * tp_size + tp_rank); the head band depends only on the
+        # tp_rank part. Modulo is a no-op on the non-PP path.
+        peer_tp_rank = remote_tp_rank % remote_tp_size
+        blocks_data = self._build_head_matched_remote(
+            nixl_agent_meta,
+            peer_tp_rank,
+            remote_tp_size,
+            registered_layer_names=registered_layer_names,
+            peer_areas=self._fan_in_peer_areas(peer_tp_rank, remote_tp_size),
+        )
+        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+        )
+        logger.info(
+            "RBLN NIXL: head-matched %d remote desc(s) from "
+            "%s rank %d (peer TP %d, %d area(s)/%d slice(s); local TP %d, "
+            "%d area(s)/%d slice(s)).",
+            len(blocks_data),
+            engine_id,
+            remote_tp_rank,
+            remote_tp_size,
+            nixl_agent_meta.kv_areas,
+            nixl_agent_meta.kv_slices,
+            self.transfer_topo.tp_size,
+            self._kv_areas,
+            self._kv_slices,
+        )
+        return remote_agent_name
+
     def add_remote_agent(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -534,7 +976,16 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         remote_tp_size: int = 1,
     ) -> str:
         if self._sw_ratio is None:
-            # No SWA view opt: upstream handles Full-only remote descs.
+            assert self.transfer_topo is not None
+            if self._is_head_matched_peer(remote_tp_size):
+                # Different TP degrees, either direction: pair by head range
+                # instead of by position (_build_head_matched_remote).
+                assert isinstance(nixl_agent_meta, RblnNixlAgentMetadata)
+                return self._add_remote_agent_head_matched(
+                    nixl_agent_meta, remote_tp_rank, remote_tp_size
+                )
+            # Equal TP, or host staging's one region per layer: local region i
+            # IS remote region i, which upstream's descriptor math assumes.
             return super().add_remote_agent(
                 nixl_agent_meta, remote_tp_rank, remote_tp_size
             )
@@ -548,29 +999,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             )
             return self._remote_agents[engine_id][remote_tp_rank]
 
-        # vLLM 0.22 base.add_remote_agent registers the remote engine in the
-        # TransferTopology and builds its TPMapping BEFORE any
-        # block_size_ratio / tp_ratio / get_engine_info lookup (used below and
-        # in _validate_remote_agent_handshake). The _sw_ratio-is-None path
-        # delegates to super() which does this; the SWA-view-opt path must
-        # replicate the prelude or get_engine_info() raises KeyError.
-        assert self.transfer_topo is not None
-        self.transfer_topo.register_remote_engine(
-            engine_id,
-            EngineTransferInfo(
-                remote_tp_size=remote_tp_size,
-                remote_block_size=nixl_agent_meta.block_size,
-                remote_block_len=nixl_agent_meta.block_lens[0],
-                remote_physical_blocks_per_logical=(
-                    nixl_agent_meta.physical_blocks_per_logical_kv_block
-                ),
-            ),
-        )
-        self.tp_mappings[engine_id] = compute_tp_mapping(
-            transfer_topology=self.transfer_topo,
-            remote_tp_size=remote_tp_size,
-            group_spec_types=self._group_spec_types,
-        )
+        self._register_remote_engine_prelude(nixl_agent_meta, remote_tp_size)
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -580,7 +1009,6 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         assert not kv_topo.is_kv_layout_blocks_first, (
             "RBLN NIXL connector only supports FA layout."
         )
-        assert not self.use_mla, "RBLN NIXL connector does not support MLA."
 
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
@@ -599,12 +1027,10 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             not self.transfer_topo.is_kv_replicated(engine_id) and tp_ratio > 0
         )
 
-        # RBLN runs homogeneous TP (tp_ratio == 1) or local_tp >= remote_tp
-        # (tp_ratio > 0). The remote_tp > local_tp case (tp_ratio < 0) would
-        # need to logically split own regions; it is unsupported and untested,
-        # so reject it instead of carrying the branch.
+        # SWA view-opt never meets fan-in: unequal TP is head-matched, and
+        # _check_d2d_region_pairing rejects SWA with any of it.
         assert tp_ratio >= 0, (
-            "RBLN NIXL connector does not support remote TP > local TP "
+            "RBLN NIXL SWA view-opt does not support remote TP > local TP "
             f"(tp_ratio={tp_ratio})."
         )
 
@@ -640,7 +1066,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             "Created %s remote blocks (%s) for dst engine %s "
             "remote rank %s local rank %s",
             len(blocks_data),
-            "Full + SWA" if self._sw_ratio is not None else "Full",
+            "Full + SWA",
             engine_id,
             remote_tp_rank,
             self.tp_rank,
@@ -698,17 +1124,15 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
 
     # ------------------------------------------------------------------
-    # Pipeline-parallel (PP) P/D over NIXL
+    # The handshake, and the layer axis it establishes
     # ------------------------------------------------------------------
     #
-    # Under sync-scheduling PP the producer runs pipeline_parallel_size
-    # stages, each owning a contiguous band of layers. Every stage
-    # advertises its (pp_rank, tp_rank) shard and the KV-cache layer names
-    # it registered; the consumer matches each shard to its own local KV
-    # regions BY NAME (the owned layer range is derived locally on each
-    # side, never sent over the wire) and reads each overlapping shard with
-    # a shard-scoped local/remote descriptor pair. All of this collapses to
-    # the upstream single-stage path for pp_size == 1.
+    # A peer answers per shard: one per (pp_rank, tp_rank), advertising the layer
+    # names it registered and the chiplet geometry of its regions. We match those
+    # names against our own -- each side derives its owned range, neither sends
+    # it -- and a shard serving less than a whole engine gets its own descriptor
+    # lists, addressed by the head arithmetic above. When nothing is narrowed the
+    # transfer delegates to upstream's whole-engine handle.
 
     def _check_pp_constraints(self) -> None:
         if self.vllm_config.parallel_config.pipeline_parallel_size <= 1:
@@ -724,13 +1148,13 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 "RBLN NIXL: hybrid (Mamba/SSM) models are not supported with "
                 "pipeline_parallel_size > 1 over NIXL P/D."
             )
-        if self._sw_ratio is not None:
+        if self._has_swa:
             raise RuntimeError(
-                "RBLN NIXL: sliding-window view-opt (VLLM_RBLN_NIXL_SWA_VIEW_OPT) "
-                "is not supported with pipeline_parallel_size > 1."
+                "RBLN NIXL: sliding-window attention is not supported with "
+                "pipeline_parallel_size > 1."
             )
 
-    def _publish_pp_handshake_metadata(
+    def _publish_handshake_metadata(
         self, base_meta: NixlAgentMetadata, registered_layer_names
     ) -> None:
         self._check_pp_constraints()
@@ -753,10 +1177,12 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             pp_rank=pp_rank,
             pp_size=pp_size,
             registered_layer_names=list(registered_layer_names),
+            kv_areas=self._kv_areas,
+            kv_slices=self._kv_slices,
         )
         base_hash = self.compat_hash
         assert base_hash is not None
-        self.compat_hash = rbln_pp_compat_hash(base_hash)
+        self.compat_hash = rbln_compat_hash(base_hash)
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=msgspec.msgpack.Encoder().encode(pp_meta),
@@ -812,7 +1238,17 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         remote_tp_size: int,
         expected_engine_id: str,
     ) -> dict[int, str]:
-        # Background thread needs a device context (see base _nixl_handshake).
+        """Handshake with every shard of one peer engine.
+
+        Runs on upstream's single-worker handshake executor, outside its lock;
+        the one thing published under that lock is this method's return value,
+        which upstream's done callback assigns to ``_remote_agents[engine_id]``.
+        The read path reaches a peer only once that key exists, which is what
+        makes the per-shard state written here visible to it. So every write has
+        to land BEFORE the return -- state published after it, or from another
+        thread, would be read half-built.
+        """
+        # Background thread needs a device context (see upstream _nixl_handshake).
         if not self.use_host_buffer:
             current_platform.set_device(self.device_id)
 
@@ -820,6 +1256,7 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         p_remote_tp_ranks = self.transfer_topo.handshake_target_ranks(remote_tp_size)
         path = make_zmq_path("tcp", host, port)
         remote_rank_to_agent_name: dict[int, str] = {}
+        overlapping: list[int] = []
 
         with zmq_ctx(zmq.REQ, path) as sock:
             sock.setsockopt(zmq.RCVTIMEO, 5000)  # ms; avoid hang on dead server
@@ -831,16 +1268,43 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             }
             pp_size = metas[first_rank].pp_size
 
-            if pp_size > 1:
-                if self._sw_ratio is not None:
+            # Guard on either side's pipeline, not just the peer's: the peer
+            # runs none in the reverse shape, where ours is the finer one.
+            local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
+            if pp_size > 1 or local_pp > 1:
+                if self._has_swa:
                     raise RuntimeError(
                         "RBLN NIXL: sliding-window attention combined with "
                         "pipeline-parallel P/D is not supported."
                     )
-                if remote_tp_size > 1:
+                wide, narrow = max(pp_size, local_pp), min(pp_size, local_pp)
+                if wide % narrow:
                     raise RuntimeError(
-                        "RBLN NIXL: tensor parallelism (remote_tp_size>1) "
-                        "combined with pipeline-parallel P/D is not supported."
+                        "RBLN NIXL: pipeline-parallel P/D requires one side's "
+                        f"pipeline size to be a multiple of the other's (peer "
+                        f"{pp_size}, local {local_pp}); otherwise a stage's "
+                        "layers straddle two of ours with no whole band to pair."
+                    )
+                tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
+                if tp_ratio != 1 and pp_size > 1 and local_pp > 1:
+                    # Either axis alone is handled -- layers by name matching,
+                    # heads by _build_head_matched_remote -- but splitting both
+                    # on both sides at once has no descriptor path.
+                    raise RuntimeError(
+                        "RBLN NIXL: heterogeneous tensor parallelism "
+                        f"(tp_ratio={tp_ratio}) combined with pipeline "
+                        f"parallelism on BOTH sides (peer pp={pp_size}, local "
+                        f"pp={local_pp}) is not supported."
+                    )
+                if tp_ratio < 0 and pp_size > 1:
+                    # The peer splits layers AND holds our heads across
+                    # several of its ranks; host staging then borrows upstream's
+                    # split (_base_fan_in_handle), which asserts a full region
+                    # list a stage does not have.
+                    raise RuntimeError(
+                        "RBLN NIXL: a pipeline-parallel peer with a larger "
+                        f"tensor-parallel size (peer {remote_tp_size} > local "
+                        f"{self.transfer_topo.tp_size}) is not supported."
                     )
 
             for pp_rank in range(pp_size):
@@ -856,105 +1320,217 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                     self._remote_shard_layer_names[expected_engine_id][global_rank] = (
                         names
                     )
-                    if pp_size == 1:
-                        # No pipeline parallelism: single-stage registration,
-                        # exactly as the non-PP path (read path also delegates to
-                        # base for pp_size == 1).
-                        remote_rank_to_agent_name[global_rank] = self.add_remote_agent(
-                            metadata, global_rank, remote_tp_size
-                        )
+                    # Two overlaps, and the peer's pipeline size decides
+                    # neither: which of our layers it holds, and which of our
+                    # chiplet areas. Both narrow a whole-engine handle.
+                    overlap = self._layer_overlap(names)
+                    if not overlap:
                         continue
+                    # The peer's stage reaches past our band, so several of our
+                    # ranks pair with it -- a count the transfer path has to
+                    # carry, since the peer frees a request's blocks by it.
+                    partial = len(overlap) < len(names)
+                    split = self._peer_head_split(metadata, remote_tp_size)
+                    fan_in = self._is_fan_in_peer(remote_tp_size)
 
-                    # PP: only register producer stages whose layers this rank
-                    # owns. add_remote_agent indexes local block_len_per_layer by
-                    # the remote region position, safe only when n_remote <=
-                    # n_local (overlapping stages); a larger non-overlapping peer
-                    # would index out of range and is never read here -- skip it.
-                    indices = self._local_region_indices_for_layer_names(names)
-                    if 0 < len(indices) < len(names):
-                        raise RuntimeError(
-                            f"RBLN NIXL PP: producer stage {global_rank} "
-                            f"({len(names)} layers) partially overlaps this "
-                            f"decode rank's band ({len(indices)} owned). "
-                            "The prefill pipeline-parallel size must be >= "
-                            "the decode pipeline-parallel size and an integer "
-                            "multiple of it."
+                    if self._is_head_matched_peer(remote_tp_size):
+                        # Different TP degrees: pair by head range, over the
+                        # layers we share.
+                        remote_rank_to_agent_name[global_rank] = (
+                            self._add_remote_agent_head_matched(
+                                metadata,
+                                global_rank,
+                                remote_tp_size,
+                                registered_layer_names=names,
+                            )
                         )
-                    if not indices:
+                    else:
+                        # Equal TP delegates to upstream, which needs a wider
+                        # stage trimmed to our band (_trim_agent_meta_to_layers).
+                        remote_rank_to_agent_name[global_rank] = self.add_remote_agent(
+                            self._trim_agent_meta_to_layers(metadata, overlap)
+                            if partial
+                            else metadata,
+                            global_rank,
+                            remote_tp_size,
+                        )
+
+                    if not (pp_size > 1 or partial or fan_in or split > 1):
+                        # Nothing is narrowed: upstream's whole-engine handle
+                        # describes this peer, so the transfer path delegates.
                         continue
-                    remote_rank_to_agent_name[global_rank] = self.add_remote_agent(
-                        metadata, global_rank, remote_tp_size
-                    )
-                    self._register_shard_read_state(
+                    self._register_shard_xfer_state(
                         expected_engine_id,
                         global_rank,
                         metadata.block_size,
                         names,
+                        peer_areas=self._fan_in_peer_areas(
+                            global_rank % remote_tp_size, remote_tp_size
+                        ),
+                        split=split,
+                        remote_tp_size=remote_tp_size,
                     )
-                    self._overlapping_ranks[expected_engine_id].append(global_rank)
+                    overlapping.append(global_rank)
+        # Published once, not accumulated: a handshake that raises partway
+        # leaves no entry, so the retry that follows starts from empty instead
+        # of appending its shards a second time and reading every block twice.
+        self._overlapping_ranks[expected_engine_id] = overlapping
         self._remote_pp_size[expected_engine_id] = pp_size
         return remote_rank_to_agent_name
 
-    def _register_shard_read_state(
+    def _base_fan_in_handle(
+        self,
+        engine_id: str,
+        global_rank: int,
+        block_size: int,
+        region_ids: list[int],
+        remote_tp_size: int,
+    ) -> int | None:
+        """Upstream's own head-band split of our regions, for host staging.
+
+        Host staging registers one logical full-shape buffer per layer and has
+        no chiplet areas to select, so a shard's descriptors would cover every
+        peer's band at once and NIXL rejects the pairing on length. Upstream
+        already built that split while registering the peer -- one handle per
+        producer rank, in `all_source_ranks` order -- so borrow it. `None` when
+        nothing needs narrowing, leaving the caller on the shard handler.
+        """
+        assert self.transfer_topo is not None
+        if not self.use_host_buffer or block_size != self.block_size:
+            return None
+        tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
+        if tp_ratio >= 0:
+            return None
+        handles = self.src_xfer_handles_by_tp_ratio[tp_ratio]
+        plan = self.tp_mappings[engine_id]
+        assert region_ids == list(range(self.num_regions)), (
+            "RBLN NIXL: borrowing upstream's split needs it to describe the "
+            "same regions in the same order, but this peer narrows ours to "
+            f"{region_ids} of {self.num_regions}"
+        )
+        assert len(handles) == len(plan.all_source_ranks)
+        # A pipeline-parallel peer cannot reach here (rejected during the
+        # handshake), so the rank we hold is the peer's TP rank as planned.
+        return handles[plan.all_source_ranks.index(global_rank)]
+
+    def _register_shard_xfer_state(
         self,
         engine_id: str,
         global_rank: int,
         block_size: int,
         registered_layer_names: tuple[str, ...],
+        peer_areas: list[int] | None = None,
+        split: int = 1,
+        remote_tp_size: int = 1,
     ) -> None:
         # Compute the local region ids once and reuse them for the handler
         # (PP context is always the shard path: SWA + PP is rejected earlier).
-        region_ids = self._shard_local_region_ids(registered_layer_names)
-        handle, _ = self._register_shard_local_xfer_handler(
-            block_size, registered_layer_names, region_ids=region_ids
+        region_ids = self._shard_local_region_ids(
+            registered_layer_names, peer_areas=peer_areas
         )
-        self.src_xfer_handles_by_remote[(engine_id, global_rank, block_size)] = handle
-        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
-            "RBLN NIXL PP currently supports a single KV-cache group"
+        key = (engine_id, global_rank, block_size)
+        handle = self._base_fan_in_handle(
+            engine_id, global_rank, block_size, region_ids, remote_tp_size
+        )
+        if handle is not None:
+            self._borrowed_src_handles.add(key)
+        else:
+            handle, _ = self.register_local_xfer_handler(
+                block_size,
+                registered_layer_names=registered_layer_names,
+                peer_areas=peer_areas,
+                split=split,
+                region_ids=region_ids,
+            )
+        self.src_xfer_handles_by_remote[key] = handle
+        n_groups = len(self.kv_cache_config.kv_cache_groups)
+        assert n_groups == 1, (
+            "RBLN NIXL per-shard transfers support a single KV-cache group, "
+            f"got {n_groups}"
         )
         self._shard_region_group_ids[(engine_id, global_rank)] = (0,) * len(region_ids)
+        self._shard_descs_per_block[(engine_id, global_rank)] = split
 
     def _cleanup_remote_engine(
         self, engine_id: str, *, log_eviction: bool = True
     ) -> None:
-        """Drop this engine's per-stage PP state along with the base state.
+        """Drop this engine's per-stage PP state along with upstream's.
 
-        The base clears only what it owns (remote agents, dst dlist handles,
-        base addrs, tp mappings, topology entry). Our per-stage dicts are keyed
-        by engine id too, and `_overlapping_ranks` is a *list*: leaving entries
-        behind means a re-handshake with the same engine id appends its stages
-        again and every block is then read twice. The local dlist handles we
-        prepped per stage are ours to release as well -- `register_local_xfer_
-        handler` builds a fresh one per stage, so nothing else refers to them.
+        Leaving per-stage entries behind would let a re-handshake read from a
+        stage this engine no longer serves. The per-stage local dlist handles are
+        ours to release too, one per stage with nothing else referring to them --
+        except a borrowed one, which is upstream's (`_base_fan_in_handle`) and
+        shared across peers, so only the entry goes.
         """
         for key in [k for k in self.src_xfer_handles_by_remote if k[0] == engine_id]:
-            self.nixl_wrapper.release_dlist_handle(
-                self.src_xfer_handles_by_remote.pop(key)
-            )
+            handle = self.src_xfer_handles_by_remote.pop(key)
+            if key in self._borrowed_src_handles:
+                self._borrowed_src_handles.discard(key)
+            else:
+                self.nixl_wrapper.release_dlist_handle(handle)
         for skey in [k for k in self._shard_region_group_ids if k[0] == engine_id]:
             del self._shard_region_group_ids[skey]
+        for skey in [k for k in self._shard_descs_per_block if k[0] == engine_id]:
+            del self._shard_descs_per_block[skey]
         self._remote_shard_layer_names.pop(engine_id, None)
         self._overlapping_ranks.pop(engine_id, None)
         self._remote_pp_size.pop(engine_id, None)
         super()._cleanup_remote_engine(engine_id, log_eviction=log_eviction)
 
-    def _local_region_indices_for_layer_names(
+    def _trim_agent_meta_to_layers(
+        self, nixl_agent_meta: RblnNixlAgentMetadata, overlap: list[tuple[int, int]]
+    ) -> NixlAgentMetadata:
+        """Trim a peer stage to the layers this rank owns.
+
+        Upstream pairs remote region i with local region i, so a stage holding
+        more layers than our band has to be presented as just that band.
+
+        Every field describing the layers moves together: trimmed regions with
+        the full layer list would report the wrong regions per layer to anything
+        dividing one by the other.
+        """
+        rpl = self._regions_per_layer()
+        peer_positions = [peer_pos for peer_pos, _ in overlap]
+        start, end = peer_positions[0], peer_positions[-1] + 1
+        if peer_positions != list(range(start, end)):
+            raise RuntimeError(
+                "RBLN NIXL PP: this rank owns a non-contiguous part of producer "
+                f"stage layers {peer_positions}; the pipelines must divide the "
+                "same layer sequence."
+            )
+        lo, hi = start * rpl, end * rpl
+        trimmed: dict[str, Any] = {
+            "kv_caches_base_addr": nixl_agent_meta.kv_caches_base_addr[lo:hi],
+            "block_lens": nixl_agent_meta.block_lens[lo:hi],
+        }
+        trimmed["registered_layer_names"] = list(
+            nixl_agent_meta.registered_layer_names[start:end]
+        )
+        return replace(nixl_agent_meta, **trimmed)
+
+    def _layer_overlap(
         self, registered_layer_names: tuple[str, ...] | list[str]
-    ) -> list[int]:
+    ) -> list[tuple[int, int]]:
+        """Pair a peer stage's layers with ours: ``(peer position, local index)``.
+
+        The peer position indexes ITS OWN list, which is what addresses its
+        regions -- a stage wider than our band is read at that offset instead of
+        from its start.
+        """
         positions_by_name: dict[str, list[int]] = defaultdict(list)
         for local_idx, layer_name in enumerate(self.local_seen_layer_names):
             positions_by_name[layer_name].append(local_idx)
 
         occurrences_by_name: dict[str, int] = defaultdict(int)
-        local_indices: list[int] = []
-        for layer_name in registered_layer_names:
+        pairs: list[tuple[int, int]] = []
+        for peer_pos, layer_name in enumerate(registered_layer_names):
             occurrence = occurrences_by_name[layer_name]
             occurrences_by_name[layer_name] += 1
             matches = positions_by_name.get(layer_name, [])
             if occurrence >= len(matches):
                 continue
-            local_indices.append(matches[occurrence])
-        return local_indices
+            pairs.append((peer_pos, matches[occurrence]))
+        return pairs
 
     def _regions_per_layer(self) -> int:
         num_layers = len(self.local_seen_layer_names)
@@ -964,18 +1540,39 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         return self.num_regions // num_layers
 
     def _shard_local_region_ids(
-        self, registered_layer_names: tuple[str, ...] | list[str]
+        self,
+        registered_layer_names: tuple[str, ...] | list[str],
+        peer_areas: list[int] | None = None,
     ) -> list[int]:
+        """Our region ids that take part in a transfer with one peer.
+
+        One filter per axis a peer can be narrower on: its layers, and the
+        chiplet areas whose heads it owns. Region ids run logical-region-major,
+        area-minor (`(layer * K/V) * areas + area`), which is why the area
+        filter is a test on `k % areas`.
+
+        The order here IS the descriptor order -- the local dlist and
+        `_build_head_matched_remote` walk these axes in the same nesting.
+        """
         rpl = self._regions_per_layer()
-        layer_indices = self._local_region_indices_for_layer_names(
-            registered_layer_names
-        )
-        return [layer_idx * rpl + k for layer_idx in layer_indices for k in range(rpl)]
+        layer_indices = [
+            local for _, local in self._layer_overlap(registered_layer_names)
+        ]
+        keep: list[int]
+        if peer_areas is None:
+            keep = list(range(rpl))
+        else:
+            areas = self._kv_areas
+            wanted = set(peer_areas)
+            keep = [k for k in range(rpl) if k % areas in wanted]
+        return [layer_idx * rpl + k for layer_idx in layer_indices for k in keep]
 
     def _register_shard_local_xfer_handler(
         self,
         block_size: int,
         registered_layer_names: tuple[str, ...] | list[str],
+        peer_areas: list[int] | None = None,
+        split: int = 1,
         region_ids: list[int] | None = None,
     ) -> tuple[int, list[tuple[int, int, int]]]:
         assert self.transfer_topo is not None
@@ -989,7 +1586,9 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         num_blocks = self.num_blocks * block_size_ratio
         all_base_addrs = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
         if region_ids is None:
-            region_ids = self._shard_local_region_ids(registered_layer_names)
+            region_ids = self._shard_local_region_ids(
+                registered_layer_names, peer_areas=peer_areas
+            )
 
         blocks_data: list[tuple[int, int, int]] = []
         for region_id in region_ids:
@@ -1001,10 +1600,18 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 // block_size_ratio
             )
             stride = self.block_len_per_layer[region_id] // block_size_ratio
+            # The pieces are consecutive byte ranges on this side -- it is the
+            # REMOTE side that scatters.
+            sub_len = kv_block_len // split
             for block_id in range(num_blocks):
-                blocks_data.append(
-                    (base_addr + block_id * stride, kv_block_len, self.device_id)
-                )
+                for j in range(split):
+                    blocks_data.append(
+                        (
+                            base_addr + block_id * stride + j * sub_len,
+                            sub_len,
+                            self.device_id,
+                        )
+                    )
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         return (
@@ -1020,29 +1627,202 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         block_ids: BlockIds,
     ) -> np.ndarray:
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        per_block = self._shard_descs_per_block.get((engine_id, global_rank), 1)
+        # Converted once, not once per region: this runs per request, and every
+        # region of a layer names the same group.
+        group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
         desc_ids: list[np.ndarray] = []
         for region_id, group_id in enumerate(region_group_ids):
-            group_arr = np.asarray(block_ids[group_id], dtype=np.int64)
+            group_arr = group_arrays[group_id]
             if group_arr.size == 0:
                 continue
-            desc_ids.append(region_id * num_blocks + group_arr)
+            block_ix = region_id * num_blocks + group_arr
+            if per_block == 1:
+                desc_ids.append(block_ix)
+                continue
+            # Both dlists are laid out region-major, then block, then piece, so
+            # one block becomes `per_block` consecutive descriptors on each side.
+            desc_ids.append(
+                (
+                    block_ix[:, None] * per_block + np.arange(per_block, dtype=np.int64)
+                ).ravel()
+            )
         if not desc_ids:
             return np.empty(0, dtype=np.int64)
         return np.concatenate(desc_ids)
 
+    def _check_d2d_region_pairing(
+        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+    ) -> None:
+        """Reject D2D peers whose region lists cannot be paired.
+
+        D2D publishes one region per chiplet area, so region i is the same head
+        band only at equal TP; unequal TP pairs by head range instead
+        (``_add_remote_agent_head_matched``), which a sliding window is not
+        supported with. The other refusal compares regions per layer, not
+        totals -- a peer holding more layers is the reverse pipeline shape, and
+        upstream would catch a real mismatch at transfer time only.
+
+        Host-bounce has no per-area list, so none of it applies.
+        """
+        if self.use_host_buffer:
+            return
+        assert self.transfer_topo is not None
+        tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
+        if tp_ratio != 1 and self._has_swa:
+            raise RuntimeError(
+                "RBLN NIXL D2D: sliding-window attention is not supported with "
+                f"heterogeneous tensor parallelism (tp_ratio={tp_ratio})."
+            )
+        n_remote = len(nixl_agent_meta.kv_caches_base_addr)
+        peer_layers = len(nixl_agent_meta.registered_layer_names)
+        local_rpl = self._regions_per_layer()
+        if not peer_layers:
+            peer_layers, local_rpl = 1, len(self.block_len_per_layer)
+        if n_remote % peer_layers or n_remote // peer_layers != local_rpl:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: peer publishes {n_remote} KV regions over "
+                f"{peer_layers} layer(s) but this worker publishes {local_rpl} "
+                "per layer. Regions per layer are K/V times the chiplet count "
+                "and depend on neither parallel size, so a mismatch means the "
+                "geometry itself differs and no pairing is meaningful."
+            )
+
+    def _is_head_matched_peer(self, remote_tp_size: int) -> bool:
+        """Whether this peer is served by ``_build_head_matched_remote``.
+
+        Any unequal TP degree, in either direction, on D2D without SWA
+        view-opt. ``tp_ratio`` is pure arithmetic on the two TP sizes, so this
+        is safe to ask before the engine is registered.
+        """
+        if self.use_host_buffer or self._sw_ratio is not None:
+            return False
+        assert self.transfer_topo is not None
+        return self.transfer_topo.tp_ratio(remote_tp_size) != 1
+
+    def _is_fan_in_peer(self, remote_tp_size: int) -> bool:
+        """Whether this peer has MORE TP ranks than us, so we gather from it
+        together with its siblings."""
+        if self.use_host_buffer:
+            return False
+        assert self.transfer_topo is not None
+        return self.transfer_topo.tp_ratio(remote_tp_size) < 0
+
+    def _validate_head_matched_handshake(
+        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+    ) -> None:
+        """The byte invariant a peer with a different TP degree has to meet.
+
+        Upstream's check scales a region by the two sides' heads per RANK, which
+        holds only for its one-region-per-layer model. After chiplet expansion a
+        region is one area, so the per-area ratio is what governs -- the two
+        agree at P TP1 -> D TP2 and diverge past it. What does hold, and what the
+        descriptor arithmetic needs, is that one KV head costs the same bytes per
+        block on both sides.
+
+        Host staging reaches this too, through a pipelined peer: that path never
+        calls upstream's own check, so this is its only per-head check. The
+        arithmetic holds there because its single area is the whole shard.
+        """
+        assert self.transfer_topo is not None
+        block_size_ratio = self.transfer_topo.block_size_ratio(
+            nixl_agent_meta.block_size
+        )
+        if block_size_ratio != 1:
+            raise RuntimeError(
+                "RBLN NIXL: heterogeneous TP requires equal P/D block "
+                f"sizes (got block_size_ratio={block_size_ratio})."
+            )
+        if nixl_agent_meta.kv_cache_layout != self.kv_cache_layout:
+            raise RuntimeError(
+                "RBLN NIXL: peer KV layout "
+                f"{nixl_agent_meta.kv_cache_layout!r} != local "
+                f"{self.kv_cache_layout!r}."
+            )
+        total_heads = self.transfer_topo.total_num_kv_heads
+        _, per_slice_l = self._slice_head_bounds(
+            self.tp_rank,
+            self.transfer_topo.tp_size,
+            total_heads,
+            self._kv_areas,
+            self._kv_slices,
+        )
+        _, per_slice_r = self._slice_head_bounds(
+            0,
+            remote_tp_size,
+            total_heads,
+            nixl_agent_meta.kv_areas,
+            nixl_agent_meta.kv_slices,
+        )
+        local_len = self.block_len_per_layer[0]
+        remote_len = nixl_agent_meta.block_lens[0]
+        if local_len * per_slice_r != remote_len * per_slice_l:
+            raise RuntimeError(
+                "RBLN NIXL: a KV head occupies "
+                f"{local_len / per_slice_l:.0f}B per block here but "
+                f"{remote_len / per_slice_r:.0f}B on the peer "
+                f"(local {local_len}B over {per_slice_l} head(s), remote "
+                f"{remote_len}B over {per_slice_r}). Block size, head_dim and "
+                "dtype must match across P and D."
+            )
+
+    def _check_mla_constraints(
+        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+    ) -> None:
+        """Reject the MLA topologies whose descriptor math is not established.
+
+        MLA is REPLICATE and key-only, which upstream's positional pairing
+        already expresses. What the refusals below add is head-band matching,
+        where bands computed from the configured KV-head count give plausible
+        wrong descriptors, and a peer whose chiplet geometry differs from ours.
+        """
+        if not self.use_mla:
+            return
+        assert self.transfer_topo is not None
+        if self._is_head_matched_peer(remote_tp_size):
+            raise RuntimeError(
+                "RBLN NIXL D2D: MLA is not supported with heterogeneous tensor "
+                f"parallelism (peer TP {remote_tp_size}, local "
+                f"{self.transfer_topo.tp_size})."
+            )
+        # Positional pairing needs both sides to expand a logical region the same
+        # way; each derives it from its own device buffers, so a mismatch shifts
+        # the block stride and moves wrong bytes without failing.
+        peer_geometry = (nixl_agent_meta.kv_areas, nixl_agent_meta.kv_slices)
+        if peer_geometry != (self._kv_areas, self._kv_slices):
+            raise RuntimeError(
+                "RBLN NIXL: MLA chiplet geometry differs between P and D "
+                f"(peer {peer_geometry[0]} area(s)/{peer_geometry[1]} slice(s), "
+                f"local {self._kv_areas}/{self._kv_slices})."
+            )
+
     def _validate_remote_agent_handshake(
         self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
     ) -> None:
-        if getattr(nixl_agent_meta, "pp_size", 1) <= 1:
+        assert isinstance(nixl_agent_meta, RblnNixlAgentMetadata)
+        self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
+        self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
+        if nixl_agent_meta.pp_size <= 1:
+            if self._is_head_matched_peer(remote_tp_size):
+                self._validate_head_matched_handshake(nixl_agent_meta, remote_tp_size)
+                return
             super()._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
             return
 
         assert self.transfer_topo is not None
         remote_engine_id = nixl_agent_meta.engine_id
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
-        assert remote_info.remote_tp_size == remote_tp_size == 1, (
-            "PP over NIXL P/D requires TP=1 on both sides."
+        assert remote_info.remote_tp_size == remote_tp_size
+        # A producer with FEWER TP ranks is matched per head band; the other
+        # direction never reaches here, rejected during the handshake.
+        pp_tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
+        assert pp_tp_ratio > 0, (
+            "PP over NIXL P/D does not support a peer with a larger TP size."
         )
+        if pp_tp_ratio != 1:
+            # Same head-geometry invariant as the non-PP head-matched path; the
+            # layer axis does not change what a head costs per block.
+            self._validate_head_matched_handshake(nixl_agent_meta, remote_tp_size)
         assert self.transfer_topo.block_size_ratio(nixl_agent_meta.block_size) == 1, (
             "PP over NIXL P/D requires equal P/D block sizes."
         )
@@ -1059,26 +1839,55 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             f"regions (regions/layer={rpl})."
         )
 
+    def _xfer_notif_id(
+        self, engine_id: str, remote_request_id: str, remote_tp_size: int
+    ) -> bytes:
+        """Notification carrying how many of our ranks pair with one peer rank.
+
+        NOTE(RBLN): upstream sends its own TP size, which the peer divides by its
+        own to learn how many of us to hear from before freeing the request's
+        blocks. A finer pipeline here multiplies that, each stage pairing with
+        the same peer rank, so send it in the unit the peer already divides by:
+        ours times the peer's TP. The two agree whenever the pipelines match.
+        """
+        remote_pp = self._remote_pp_size.get(engine_id, 1)
+        local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
+        peers = max(1, self.world_size // remote_tp_size) * max(
+            1, local_pp // remote_pp
+        )
+        return f"{remote_request_id}:{peers * remote_tp_size}".encode()
+
+
+class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
+    """Reads a request's KV from the producers whose regions this rank shares.
+
+    The pairing itself lives in `RblnNixlWorkerBase`; what belongs here is the
+    read -- which peers to issue it against.
+    """
+
     def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
-        # Mark this remote as active, as the base read path does. TTL eviction
-        # (_evict_stale_engines, default engine_ttl=3600s) treats an engine whose
-        # timestamp is older than the TTL as dead and tears its state down when
-        # the next remote engine appears; a producer we keep reading from must
-        # never look idle. Cleanup runs on this (main) thread, so no race.
+        # Keep the engine off the staleness sweep: upstream does this on the
+        # read path this one replaces, and a swept producer loses the state
+        # mid-transfer.
         self._engine_last_active[engine_id] = time.perf_counter()
         pp_size = self._remote_pp_size.get(engine_id, 1)
-        if pp_size == 1:
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        # Per-shard lists exist exactly for peers serving part of what a
+        # whole-engine handle covers. Re-deriving that from the parallel sizes
+        # misses the reverse case: a producer without pipelining still serves
+        # several of our ranks when ours is the finer one.
+        if not self._overlapping_ranks.get(engine_id):
             return super()._read_blocks_for_req(req_id, meta)
 
-        remote_info = self.transfer_topo.get_engine_info(engine_id)
-        assert self.transfer_topo.tp_ratio(remote_info.remote_tp_size) == 1, (
-            "RBLN NIXL PP read path supports TP=1 only"
+        block_size_ratio = self.transfer_topo.block_size_ratio(
+            remote_info.remote_block_size
         )
-        assert (
-            self.transfer_topo.block_size_ratio(remote_info.remote_block_size) == 1
-        ), "RBLN NIXL PP read path requires equal P/D block sizes"
+        assert block_size_ratio == 1, (
+            "RBLN NIXL per-shard read path requires equal P/D block sizes "
+            f"(got block_size_ratio={block_size_ratio})"
+        )
         remote_block_size = remote_info.remote_block_size
 
         meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
@@ -1086,7 +1895,9 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
         )
         remote_block_ids = meta.remote.block_ids
         local_block_ids = meta.local_physical_block_ids
-        notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
+        notif_id = self._xfer_notif_id(
+            engine_id, meta.remote.request_id, remote_info.remote_tp_size
+        )
         prefix_hit = len(local_block_ids) == 0
         n_prompt_blocks = sum(len(g) for g in remote_block_ids)
 
@@ -1105,8 +1916,8 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
             )
 
         n_read_blocks = sum(len(g) for g in local_block_ids)
-        logger.info(
-            "PP read req %s: pp_size=%d prompt_blocks=%d read_blocks=%d "
+        logger.debug(
+            "per-shard read req %s: pp_size=%d prompt_blocks=%d read_blocks=%d "
             "prefix_skipped=%d%s",
             req_id,
             pp_size,
@@ -1127,9 +1938,9 @@ class RblnNixlConnectorWorker(NixlPullConnectorWorker):
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
                 except Exception as e:
-                    # Mirror the transfer path below: a dropped notification
-                    # leaves the remote blocks pinned until its timeout, so log
-                    # it and record the failure instead of surfacing raw.
+                    # As upstream's own notification path does: a dropped
+                    # notification leaves the remote blocks pinned until their
+                    # lease expires, which is not worth failing the step over.
                     self._log_failure(
                         failure_type="notification_failed",
                         req_id=req_id,

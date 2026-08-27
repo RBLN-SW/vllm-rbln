@@ -15,17 +15,23 @@
 """RBLN NIXL KV-cache transfer connector (mirrors vLLM's v1/nixl/ layout)."""
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
-    RblnNixlConnector,
+    RblnNixlConnectorBase,
+    RblnNixlPullConnector,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.scheduler import (
-    RblnNixlConnectorScheduler,
+    RblnNixlPullConnectorScheduler,
+    RblnNixlSchedulerBase,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.worker import (
-    RblnNixlConnectorWorker,
+    RblnNixlPullConnectorWorker,
+    RblnNixlWorkerBase,
 )
 
 __all__ = [
-    "RblnNixlConnector",
-    "RblnNixlConnectorScheduler",
-    "RblnNixlConnectorWorker",
+    "RblnNixlConnectorBase",
+    "RblnNixlPullConnector",
+    "RblnNixlPullConnectorScheduler",
+    "RblnNixlPullConnectorWorker",
+    "RblnNixlSchedulerBase",
+    "RblnNixlWorkerBase",
 ]
