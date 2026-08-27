@@ -82,7 +82,7 @@ steps:
     secrets: *secrets
     depends_on: *needs_venv
     command:
-      - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker/test_rebel_optimum_model_runner.py --durations 0"
+      - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker/test_optimum_model_runner.py --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/converter"
     if_changed: *if_changed
@@ -132,7 +132,7 @@ steps:
     command:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/models --durations 0"
 
-  - label: ":pytest: tests/optimum/v1/worker/test_sampler*.py"
+  - label: ":pytest: tests/optimum/v1/sample/test_sampler*.py"
     if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     resources:
@@ -142,9 +142,9 @@ steps:
     secrets: *secrets
     depends_on: *needs_venv
     command:
-      - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_true" tests/optimum/v1/worker/test_sampler.py --durations 0'
-      - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_false" tests/optimum/v1/worker/test_sampler.py --durations 0'
-      - 'uv run --no-sync pytest -x -vvs -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/worker/test_sampler.py tests/optimum/v1/worker/test_sampler_bucket.py --durations 0'
+      - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_true" tests/optimum/v1/sample/test_sampler.py --durations 0'
+      - 'uv run --no-sync pytest -x -vvs -n 8 -k "warm_up_false" tests/optimum/v1/sample/test_sampler.py --durations 0'
+      - 'uv run --no-sync pytest -x -vvs -n 8 -k "not warm_up_true and not warm_up_false" tests/optimum/v1/sample/test_sampler.py tests/optimum/v1/sample/test_sampler_bucket.py --durations 0'
 
   # ===========================================================================
   # Optimum smoke suites -> NPU using RSD
