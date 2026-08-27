@@ -263,22 +263,35 @@ class TestWorkerAndScheduler:
             == "pkg.mod.MyWorker"
         )
 
-    def test_scheduler_is_replaced_unconditionally(self, reconfigure):
+    def test_scheduler_is_replaced_unconditionally(self, monkeypatch, reconfigure):
         # Unlike worker_cls there is no "auto" guard: whatever was asked for is
-        # overwritten. Which of the two RBLN schedulers it lands on tracks
-        # scheduler_config.async_scheduling -- only RBLNAsyncScheduler bumps
-        # num_output_placeholders, which is what schedules ahead.
+        # overwritten. Reading the expectation back off the config under test
+        # would agree with whatever the platform decided, so the carriers are
+        # pinned off and the sync scheduler named outright.
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
         config = reconfigure(
             lambda config: setattr(
                 config.scheduler_config, "scheduler_cls", "pkg.mod.MyScheduler"
             )
         )
-        expected = (
-            "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
-            if config.scheduler_config.async_scheduling
-            else "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+        assert (
+            config.scheduler_config.scheduler_cls
+            == "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
         )
-        assert config.scheduler_config.scheduler_cls == expected
+
+    def test_a_plain_build_lands_on_the_async_scheduler(self, monkeypatch):
+        # Nobody passes --async-scheduling here: vLLM resolves the unset flag to
+        # True before this platform hook, and with both carriers on nothing
+        # refuses it, so the native path selects the async scheduler. This is
+        # what the async support changed, and it went unasserted.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        config = _build()
+        assert config.scheduler_config.async_scheduling is True
+        assert (
+            config.scheduler_config.scheduler_cls
+            == "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
+        )
 
 
 class TestCompilation:
