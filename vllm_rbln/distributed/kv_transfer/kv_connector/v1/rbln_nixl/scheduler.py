@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     yield_req_data,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlBaseConnectorScheduler,
     NixlConnectorMetadata,
     NixlPullConnectorScheduler,
 )
@@ -37,8 +38,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class RblnNixlConnectorScheduler(NixlPullConnectorScheduler):
-    """Implementation of Scheduler side methods"""
+class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
+    """Scheduler-side methods the transfer direction does not decide.
+
+    `_build_save_meta` overrides a hook upstream calls from its own
+    `build_connector_meta`, so the override belongs here, not beside a direction.
+    """
 
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
@@ -46,12 +51,41 @@ class RblnNixlConnectorScheduler(NixlPullConnectorScheduler):
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
         # NOTE(RBLN): the platform reports device_type "cpu" when device tensors
-        # are off, which the base reads as "no host staging" -- the very setup
+        # are off, which upstream reads as "no host staging" -- the very setup
         # that needs it. Decide from the requested buffer device instead.
         self.use_host_buffer = vllm_config.kv_transfer_config.kv_buffer_device == "cpu"
 
         # Blocks collected so far for a prefill that is still being chunked.
         self._block_ids_need_save: dict[ReqId, BlockIds] = {}
+
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        """Fetch only as much as leaves a prefill starting on a chunk boundary.
+
+        NOTE(RBLN): a prefill chunk must begin on a multiple of the chunk size
+        here, and upstream reports whatever the peer holds -- an arbitrary count,
+        since a decode node advertises its computed tokens unrounded. Trim to the
+        boundary below and let the rest be recomputed, the same trade upstream's
+        recompute threshold makes.
+
+        A fetch covering the whole prompt leaves nothing to prefill, so it passes
+        through; the remainder decides that, not which base branch ran.
+        """
+        count, load_async = super().get_num_new_matched_tokens(
+            request, num_computed_tokens
+        )
+        resume = num_computed_tokens + count
+        if resume >= request.num_prompt_tokens:
+            return count, load_async
+        overshoot = resume % self.vllm_config.scheduler_config.max_num_batched_tokens
+        if not overshoot:
+            return count, load_async
+        if overshoot >= count:
+            # An async load of nothing trips the scheduler's own assertion, so
+            # report no match at all rather than zero tokens to load.
+            return 0, False
+        return count - overshoot, load_async
 
     def _build_save_meta(
         self,
@@ -60,7 +94,7 @@ class RblnNixlConnectorScheduler(NixlPullConnectorScheduler):
     ) -> None:
         """Stage a prefill's blocks in one save, once every chunk has landed.
 
-        NOTE(RBLN): the base saves each step's new blocks as they arrive. The
+        NOTE(RBLN): upstream saves each step's new blocks as they arrive. The
         RBLN host copy moves whole blocks and transfers once, so blocks are
         accumulated here and handed over when the prefill completes.
         """
@@ -127,3 +161,7 @@ class RblnNixlConnectorScheduler(NixlPullConnectorScheduler):
         # before its closing chunk, so the blocks accumulated for it are stale.
         self._block_ids_need_save.pop(request.request_id, None)
         return super().request_finished(request, block_ids)
+
+
+class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorScheduler):
+    """Scheduler side of the read path."""
