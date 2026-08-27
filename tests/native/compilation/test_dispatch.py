@@ -153,6 +153,58 @@ class TestDispatch:
         d(x, gain=5.0)
         assert len(compiled_calls) == 2
 
+    def test_tensors_of_one_shape_on_two_devices_are_two_keys(self, monkeypatch):
+        # token_type_ids is built without a device, the staged buffers take the
+        # stager's, so a call's tensors are not all on one device.
+        target, _ = make_target()
+        compiled_calls: list = []
+        d = Dispatcher(target, recorder(compiled_calls, "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        d(torch.zeros(1, 4))
+        d(torch.zeros(1, 4, device="meta"))
+        assert len(compiled_calls) == 2
+
+    def test_tensors_of_one_shape_with_two_strides_are_two_keys(self, monkeypatch):
+        # Same shape and dtype either way; the strides are (4, 1) and (1, 2).
+        target, _ = make_target()
+        compiled_calls: list = []
+        d = Dispatcher(target, recorder(compiled_calls, "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        d(torch.zeros(4, 4)[:, :2])
+        d(torch.zeros(2, 4).t())
+        assert len(compiled_calls) == 2
+
+    def test_a_bool_and_the_int_it_equals_are_two_keys(self, monkeypatch):
+        target, _ = make_target()
+        compiled_calls: list = []
+        d = Dispatcher(target, recorder(compiled_calls, "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        x = torch.zeros(1, 4)
+        d(x, y=True)
+        d(x, y=1)
+        assert len(compiled_calls) == 2
+
+    def test_intermediate_tensors_are_keyed_like_the_tensors_they_hold(
+        self, monkeypatch
+    ):
+        # The one slot InputStager passes through: a warm-up run puts a view here,
+        # a real step the pipeline group's receive buffer.
+        target, _ = make_target()
+        compiled_calls: list = []
+        d = Dispatcher(target, recorder(compiled_calls, "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        x = torch.zeros(1, 4)
+        d(x, y=IntermediateTensors({"hidden_states": torch.zeros(4, 4)[:, :2]}))
+        d(x, y=IntermediateTensors({"hidden_states": torch.zeros(2, 4).t()}))
+        assert len(compiled_calls) == 2
+
+    def test_rejects_a_mapping_that_is_not_intermediate_tensors(self, monkeypatch):
+        target, _ = make_target()
+        d = Dispatcher(target, recorder([], "compiled"))
+        install_entries(monkeypatch, [target.__code__])
+        with pytest.raises(TypeError, match="cannot key a dict argument"):
+            d(torch.zeros(1, 4), y={"hidden_states": torch.zeros(1, 4)})
+
     def test_rejects_an_argument_it_cannot_key(self, monkeypatch):
         target, _ = make_target()
         d = Dispatcher(target, recorder([], "compiled"))

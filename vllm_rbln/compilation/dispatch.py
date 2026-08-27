@@ -20,6 +20,7 @@ import torch
 from torch._C._profiler import _RecordFunctionFast
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.logger import init_logger
 
@@ -42,14 +43,19 @@ _COPIED_SLOTS = (
 
 
 def _value_key(value: Any) -> Any:
-    """The part of an argument that decides which graph it belongs to."""
+    """The part of an argument that decides which graph it belongs to.
+
+    A tensor contributes the members Dynamo's TENSOR_MATCH compares, less
+    requires_grad, which the step loop's inference_mode pins.
+    """
     if isinstance(value, torch.Tensor):
-        # torch.Size is a tuple, so this stays hashable and allocation-free.
-        return value.shape, value.dtype
+        return value.shape, value.dtype, value.device, value.stride()
     if value is None or isinstance(value, (bool, int, float, str, bytes, torch.dtype)):
-        return value
-    if hasattr(value, "items"):  # IntermediateTensors and friends
-        return tuple((k, t.shape, t.dtype) for k, t in value.items())
+        # Bare, True would fold into 1 and 1 into 1.0: Python hashes them equal
+        # where Dynamo specialises them apart.
+        return type(value), value
+    if isinstance(value, IntermediateTensors):
+        return tuple((k, _value_key(t)) for k, t in value.items())
     raise TypeError(
         f"Dispatcher cannot key a {type(value).__name__} argument. Dynamo may "
         "guard on its value, and a key that does not carry it would serve the "
