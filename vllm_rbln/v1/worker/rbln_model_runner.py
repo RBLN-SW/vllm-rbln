@@ -276,9 +276,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         self.runtime_holder: list = []
 
-        # bool(), not the field: vLLM resolves an unset value before this runs,
-        # but a directly-built config (a unit test) can still carry None.
-        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
+        self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
         if envs.VLLM_RBLN_SAMPLER:

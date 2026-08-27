@@ -255,7 +255,7 @@ class RBLNOptimumModelRunner(
         )
 
         # FIXME enable async scheduling for optimum model runner
-        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
+        self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.enable_prefix_caching = cache_config.enable_prefix_caching
         self.seq_lens = np.zeros(self.max_num_reqs, dtype=np.int32)
 
