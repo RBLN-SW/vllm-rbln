@@ -576,16 +576,23 @@ class RBLNScheduler(Scheduler):
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
                     )
-                    if num_sub_block_tokens > 0 and num_external_computed_tokens > 0:
-                        # Cancel the KV connector match in favor of the sub-block
-                        # match. update_state_after_alloc(..., 0) alone can't tell
-                        # "lost the arbitration" from "no hit", so re-query with
-                        # the corrected local count or the connector's recorded
-                        # resume point goes stale and asserts on preemption resume.
+                    if num_sub_block_tokens > 0 and self.connector is not None:
+                        # The scheduler resumes at local + sub-block, but the
+                        # connector was queried with local alone and recorded that
+                        # as the resume point -- even when it offered nothing
+                        # (external == 0 also covers hit <= local).
+                        # update_state_after_alloc(..., 0) can't tell "lost the
+                        # arbitration" from "no hit", so re-query with the
+                        # corrected count or the recorded resume point goes stale
+                        # and asserts on preemption resume. The lookup is cached,
+                        # so this costs no extra remote traffic.
                         self.connector.get_num_new_matched_tokens(
                             request,
                             num_new_local_computed_tokens + num_sub_block_tokens,
                         )
+                    if num_sub_block_tokens > 0 and num_external_computed_tokens > 0:
+                        # Cancel the KV connector match in favor of the sub-block
+                        # match.
                         request.num_external_computed_tokens = 0
                         num_external_computed_tokens = 0
                         load_kv_async = False

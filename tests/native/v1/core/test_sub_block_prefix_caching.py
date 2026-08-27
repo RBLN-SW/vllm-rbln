@@ -184,6 +184,9 @@ class TestSubBlockVersusKVConnector:
     def test_connector_is_asked_with_a_block_aligned_count(self):
         # The connector is queried before the sub-block match, with the
         # full-block count only, or it would fetch from the wrong offset.
+        # Even with no external hit it is then re-queried with the corrected
+        # count: the record it wrote on the first query is the preemption
+        # resume point, and the scheduler resumes at local + sub-block.
         sched = self._scheduler(matched_tokens=0)
         seen: list[int] = []
         original = sched.connector.get_num_new_matched_tokens
@@ -200,7 +203,7 @@ class TestSubBlockVersusKVConnector:
 
         # The sub-block match did happen, so the count could have been inflated.
         assert len(out.kv_cache_copy_ops) == 1
-        assert seen[-1] == 0
+        assert seen[-2:] == [0, SUB_BLOCK_SIZE]
 
 
 class TestSubBlockPrefixHitRun:
