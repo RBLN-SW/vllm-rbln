@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+import torch.rbln
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
@@ -156,14 +157,11 @@ class _PerformanceContext:
 
     def print_stats(self) -> None:
         full = (50.0, 90.0, 99.0)
-        # MODEL ONLY is only interesting where sampling is a real fraction of the
-        # pass: on decode the (rejection) sampler is heavy, but on prefill it is
-        # sub-millisecond, so MODEL ONLY (PREFILL) just duplicates MODEL + SAMPLE.
-        # Its tail latencies add little, so it reports mean/median only.
         sections: list[tuple[str, _Metrics, tuple[float, ...]]] = []
         for label, table, phases, percentiles in (
             ("MODEL + SAMPLE", self._graph, tuple(_Phase), full),
-            ("MODEL ONLY", self._model, (_Phase.DECODE, _Phase.PADDED_DECODE), (50.0,)),
+            ("MODEL ONLY", self._model, (_Phase.DECODE, _Phase.PADDED_DECODE), full),
+            ("SAMPLE ONLY", self._sample, (_Phase.DECODE, _Phase.PADDED_DECODE), full),
             ("E2E", self._e2e, tuple(_Phase), full),
         ):
             for phase in phases:
@@ -351,8 +349,12 @@ def sample(self, *args, **kwargs):
         # Returns a placeholder without running the sampler, so there is no sampler
         # time to attribute -- only the cost of building that placeholder.
         return _sample(self, *args, **kwargs)
+    # Same async runtime as the forward: synchronize() so the timer measures the
+    # sampler's device compute, not the enqueue plus the forward's drained tail.
+    torch.rbln.synchronize()
     start = time.perf_counter()
     output = _sample(self, *args, **kwargs)
+    torch.rbln.synchronize()
     _ctx(self).add_graph_time(time.perf_counter() - start, is_sample=True)
     return output
 
@@ -367,8 +369,10 @@ def load_model(self, *args, **kwargs):
         if not ctx.in_pass:
             # Warm-up and dummy runs: skip the clock reads as well as the record.
             return executable(*call_args, **call_kwargs)
+        torch.rbln.synchronize()
         start = time.perf_counter()
         output = executable(*call_args, **call_kwargs)
+        torch.rbln.synchronize()
         ctx.add_graph_time(time.perf_counter() - start)
         return output
 
