@@ -78,6 +78,7 @@ class RBLNMedusaProposer(MedusaProposer):
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                use_direct_dispatch=True,
             )
 
     def propose(
