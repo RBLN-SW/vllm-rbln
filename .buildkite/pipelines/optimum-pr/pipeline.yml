@@ -75,6 +75,15 @@ steps:
     command:
       - "uv run --no-sync pytest -x -vvs tests/optimum/v1/core --durations 0"
 
+  - label: ":pytest: tests/optimum/v1/distributed"
+    if_changed: *if_changed
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources: *cpu-only-resources
+    secrets: *secrets
+    depends_on: *needs_venv
+    command:
+      - "uv run --no-sync pytest -x -vvs tests/optimum/v1/distributed --durations 0"
+
   - label: ":pytest: tests/optimum/v1/worker"
     if_changed: *if_changed
     image: "${DEVTOOLS_DOCKER_IMAGE}"
@@ -82,7 +91,7 @@ steps:
     secrets: *secrets
     depends_on: *needs_venv
     command:
-      - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker/test_optimum_model_runner.py --durations 0"
+      - "uv run --no-sync pytest -x -vvs tests/optimum/v1/worker --durations 0"
 
   - label: ":pytest: tests/optimum/optimum_compile/converter"
     if_changed: *if_changed
