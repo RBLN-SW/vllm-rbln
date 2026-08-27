@@ -921,6 +921,155 @@ class TestAllocateKvCacheTensors:
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here
 
 
+class TestRepairStagedInputIds:
+    # The scheduler stages -1 where this step's input token belongs; the real
+    # token is still on the device in the previous step's ring slot. The repair
+    # has to land each one on the row the request occupies *now*.
+    @staticmethod
+    def _runner(*, prev_index, prev_tokens, is_prefill=False):
+        return _make_runner_stub(
+            is_prefill=is_prefill,
+            _prev_token_host_buffer=None,
+            input_batch=SimpleNamespace(
+                prev_sampled_token_ids=(
+                    None
+                    if prev_tokens is None
+                    else torch.tensor(prev_tokens, dtype=torch.int32).unsqueeze(1)
+                ),
+                prev_req_id_to_index=prev_index,
+            ),
+        )
+
+    @staticmethod
+    def _staged(num_rows):
+        # -1 is what the scheduler left behind.
+        return SimpleNamespace(
+            input_ids=torch.full((num_rows, 1), -1, dtype=torch.int32)
+        )
+
+    def test_repairs_every_row_when_the_batch_is_unchanged(self):
+        r = self._runner(prev_index={"a": 0, "b": 1}, prev_tokens=[10, 11])
+        staged = self._staged(2)
+        r._repair_staged_input_ids(staged, ["a", "b"])
+        assert staged.input_ids[:, 0].tolist() == [10, 11]
+
+    def test_follows_the_request_when_rows_are_reordered(self):
+        r = self._runner(prev_index={"a": 0, "b": 1}, prev_tokens=[10, 11])
+        staged = self._staged(2)
+        r._repair_staged_input_ids(staged, ["b", "a"])
+        assert staged.input_ids[:, 0].tolist() == [11, 10]
+
+    def test_does_not_shift_rows_up_when_a_request_is_skipped(self):
+        # The row-crossing case: "new" has no previous row, so the requests that
+        # do have one sit at rows 1 and 2. Their previous rows are also 1 and 2,
+        # so the row lists match -- but writing contiguously would still start at
+        # row 0 and hand row 1 the token belonging to row 0.
+        r = self._runner(prev_index={"a": 0, "b": 1, "c": 2}, prev_tokens=[10, 11, 12])
+        staged = self._staged(3)
+        r._repair_staged_input_ids(staged, ["new", "b", "c"])
+        assert staged.input_ids[:, 0].tolist() == [-1, 11, 12]
+
+    def test_leaves_a_request_absent_from_the_previous_batch(self):
+        # _apply_pending_token_writeback repairs that one a step later.
+        r = self._runner(prev_index={"a": 0}, prev_tokens=[10])
+        staged = self._staged(2)
+        r._repair_staged_input_ids(staged, ["a", "new"])
+        assert staged.input_ids[:, 0].tolist() == [10, -1]
+
+    def test_does_nothing_when_no_request_carries_over(self):
+        r = self._runner(prev_index={"gone": 0}, prev_tokens=[10])
+        staged = self._staged(1)
+        r._repair_staged_input_ids(staged, ["new"])
+        assert staged.input_ids[:, 0].tolist() == [-1]
+
+    def test_does_nothing_on_a_prefill_step(self):
+        # Prefill has no previous sampled token to feed back.
+        r = self._runner(prev_index={"a": 0}, prev_tokens=[10], is_prefill=True)
+        staged = self._staged(1)
+        r._repair_staged_input_ids(staged, ["a"])
+        assert staged.input_ids[:, 0].tolist() == [-1]
+
+    def test_does_nothing_before_the_first_sampled_token_exists(self):
+        r = self._runner(prev_index={"a": 0}, prev_tokens=None)
+        staged = self._staged(1)
+        r._repair_staged_input_ids(staged, ["a"])
+        assert staged.input_ids[:, 0].tolist() == [-1]
+
+
+class TestRepairAsyncOutputTokenIds:
+    # The logits processors read output_token_ids in the same step, before
+    # _apply_pending_token_writeback runs, so the -1 tail has to go now.
+    @staticmethod
+    def _runner(*, req_ids, output_token_ids, prev_index, prev_tokens):
+        return _make_runner_stub(
+            input_batch=SimpleNamespace(
+                req_ids=req_ids,
+                sampling_metadata=SimpleNamespace(output_token_ids=output_token_ids),
+                prev_sampled_token_ids=(
+                    None
+                    if prev_tokens is None
+                    else torch.tensor(prev_tokens, dtype=torch.int32).unsqueeze(1)
+                ),
+                prev_req_id_to_index=prev_index,
+            ),
+        )
+
+    def test_replaces_the_placeholder_tail(self):
+        ids = [[7, -1], [8, -1]]
+        r = self._runner(
+            req_ids=["a", "b"],
+            output_token_ids=ids,
+            prev_index={"a": 0, "b": 1},
+            prev_tokens=[10, 11],
+        )
+        r._repair_async_output_token_ids()
+        assert ids == [[7, 10], [8, 11]]
+
+    def test_reads_the_row_the_request_had_last_step(self):
+        ids = [[7, -1], [8, -1]]
+        r = self._runner(
+            req_ids=["b", "a"],
+            output_token_ids=ids,
+            prev_index={"a": 0, "b": 1},
+            prev_tokens=[10, 11],
+        )
+        r._repair_async_output_token_ids()
+        assert ids == [[7, 11], [8, 10]]
+
+    def test_leaves_a_tail_that_is_not_a_placeholder(self):
+        ids = [[7, 9]]
+        r = self._runner(
+            req_ids=["a"],
+            output_token_ids=ids,
+            prev_index={"a": 0},
+            prev_tokens=[10],
+        )
+        r._repair_async_output_token_ids()
+        assert ids == [[7, 9]]
+
+    def test_leaves_a_request_absent_from_the_previous_batch(self):
+        ids = [[7, -1]]
+        r = self._runner(
+            req_ids=["new"],
+            output_token_ids=ids,
+            prev_index={"a": 0},
+            prev_tokens=[10],
+        )
+        r._repair_async_output_token_ids()
+        assert ids == [[7, -1]]
+
+    def test_leaves_a_request_with_no_output_yet(self):
+        ids = [[], [8, -1]]
+        r = self._runner(
+            req_ids=["a", "b"],
+            output_token_ids=ids,
+            prev_index={"a": 0, "b": 1},
+            prev_tokens=[10, 11],
+        )
+        r._repair_async_output_token_ids()
+        assert ids == [[], [8, 11]]
+
+
 class TestApplyPendingTokenWriteback:
     # The async repair has to move both stores together. token_ids_cpu is rebuilt
     # from output_token_ids when a request re-enters the batch, so writing the
