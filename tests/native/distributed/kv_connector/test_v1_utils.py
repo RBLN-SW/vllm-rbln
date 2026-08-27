@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RBLN connectors finalize part of their KV-cache registration after warm-up.
-# Under MultiConnector the hook lives on nested children, so the helpers flatten
-# the tree and finalize only those that support it.
+# RBLN connectors carry hooks upstream does not know about: finalizing KV-cache
+# registration after warm-up, and flushing a KV load held until a submission is in
+# flight. Under MultiConnector those hooks live on nested children, so the helpers
+# flatten the tree and drive each on the children that support it.
 
 import types
 
@@ -23,8 +24,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 )
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    SupportsDeferredLoad,
     SupportsKVCacheRegistrationFinalize,
     finalize_kv_cache_registrations,
+    flush_deferred_loads,
     iter_kv_connectors,
 )
 
@@ -119,3 +122,52 @@ class TestFinalizeKvCacheRegistrations:
         )
         finalize_kv_cache_registrations(tree)
         assert (deep.calls, top.calls) == (1, 1)
+
+
+class _Deferring:
+    """A connector that holds a KV load back (RBLN pull-NIXL-like)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def flush_deferred_load(self) -> None:
+        self.calls += 1
+
+
+class TestSupportsDeferredLoadProtocol:
+    def test_hook_bearing_instance_matches(self):
+        assert isinstance(_Deferring(), SupportsDeferredLoad)
+
+    def test_the_other_hook_does_not_match(self):
+        # The two hooks are separate: a connector that only finalizes
+        # registration must not be asked to flush a load it never held.
+        assert not isinstance(_Finalizable(), SupportsDeferredLoad)
+
+    def test_multiconnector_does_not_match(self):
+        assert not isinstance(_FakeMultiConnector([]), SupportsDeferredLoad)
+
+
+class TestFlushDeferredLoads:
+    def test_supporting_leaf_is_flushed(self):
+        conn = _Deferring()
+        flush_deferred_loads(conn)
+        assert conn.calls == 1
+
+    def test_hookless_leaf_is_skipped(self):
+        # _Plain has no flush_deferred_load; reaching for one would raise.
+        flush_deferred_loads(_Plain())
+
+    def test_nested_multiconnector_children_are_flushed(self):
+        # The wrapper has no hook, so a read held by a nested child is issued
+        # only if the tree is expanded -- otherwise the child waits forever.
+        a, b = _Deferring(), _Deferring()
+        flush_deferred_loads(
+            _FakeMultiConnector([_Plain(), _FakeMultiConnector([a, b])])
+        )
+        assert (a.calls, b.calls) == (1, 1)
+
+    def test_mixed_children_flush_only_the_holders(self):
+        holder, other = _Deferring(), _Finalizable()
+        flush_deferred_loads(_FakeMultiConnector([other, holder]))
+        assert holder.calls == 1
+        assert other.calls == 0
