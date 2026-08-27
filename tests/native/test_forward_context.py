@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# set_forward_context's RBLN-specific DP gating and context lifecycle. The heavy
-# plumbing is faked, but override_forward_context is real so set/restore is genuine.
+# RBLNDPMetadata.make, and set_forward_context's RBLN-specific DP gating and
+# context lifecycle. The heavy plumbing is faked for the latter, but
+# override_forward_context is real so set/restore is genuine.
 
 from types import SimpleNamespace
 
 import pytest
+import torch
 import vllm.forward_context as vfc
 
 import vllm_rbln.forward_context as fc
@@ -27,6 +29,52 @@ def _cfg(dp_size: int):
     return SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=dp_size))
 
 
+class TestMake:
+    # Which arguments belong to which parallelism, since make() asserts rather
+    # than infers: the DP-only pair is required under DP and rejected without it.
+    def test_non_dp_builds_single_slot(self):
+        parallel_config = SimpleNamespace(data_parallel_size=1)
+        meta = fc.RBLNDPMetadata.make(parallel_config, num_tokens=8)
+        assert meta.num_tokens_across_dp_cpu.cpu().tolist() == [8]
+        assert meta.max_pads_across_dp is None
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"num_tokens_across_dp": torch.tensor([8], dtype=torch.int32)},
+            {"num_padded_tokens": 16},
+        ],
+    )
+    def test_non_dp_rejects_dp_only_args(self, extra):
+        parallel_config = SimpleNamespace(data_parallel_size=1)
+        with pytest.raises(AssertionError):
+            fc.RBLNDPMetadata.make(parallel_config, num_tokens=8, **extra)
+
+    def test_dp_uses_provided_counts_and_pad_buffer(self):
+        parallel_config = SimpleNamespace(data_parallel_size=4)
+        across = torch.tensor([8, 8, 8, 8], dtype=torch.int32)
+        meta = fc.RBLNDPMetadata.make(
+            parallel_config,
+            num_tokens=8,
+            num_tokens_across_dp=across,
+            num_padded_tokens=16,
+        )
+        assert meta.num_tokens_across_dp_cpu.cpu().tolist() == [8, 8, 8, 8]
+        assert meta.max_pads_across_dp.shape == (16,)
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"num_padded_tokens": 16},  # missing num_tokens_across_dp
+            {"num_tokens_across_dp": torch.tensor([8, 8, 8, 8], dtype=torch.int32)},
+        ],
+    )
+    def test_dp_requires_both_args(self, extra):
+        parallel_config = SimpleNamespace(data_parallel_size=4)
+        with pytest.raises(AssertionError):
+            fc.RBLNDPMetadata.make(parallel_config, num_tokens=8, **extra)
+
+
 @pytest.fixture
 def captured(monkeypatch):
     """Isolate set_forward_context: fake DP-metadata build, forward-context
@@ -34,6 +82,7 @@ def captured(monkeypatch):
     stays real so the set/restore assertions test actual behavior."""
     calls: dict[str, list] = {"make": [], "additional": [], "create": []}
 
+    # make() itself runs for real in TestMake above; here only its inputs matter.
     def fake_make(parallel_config, num_tokens, num_tokens_across_dp, num_padded_tokens):
         calls["make"].append((num_tokens, num_tokens_across_dp, num_padded_tokens))
         return "DP_META"

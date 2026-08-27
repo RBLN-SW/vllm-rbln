@@ -252,7 +252,9 @@ _execute_model = RBLNModelRunner.execute_model
 _sample_tokens = RBLNModelRunner.sample_tokens
 _sample = RBLNModelRunner._sample
 _load_model = RBLNModelRunner.load_model
-_determine_batch_padding = RBLNModelRunner._determine_batch_padding
+_determine_batch_execution_and_padding = (
+    RBLNModelRunner._determine_batch_execution_and_padding
+)
 _shutdown = RBLNWorker.shutdown
 
 
@@ -305,10 +307,15 @@ def load_model(self, *args, **kwargs):
     self.model_executable = timed_executable
 
 
-@functools.wraps(_determine_batch_padding)
-def determine_batch_padding(self, *args, **kwargs):
-    result = _determine_batch_padding(self, *args, **kwargs)
-    _num_reqs_padded, num_tokens_padded, _num_tokens_across_dp = result
+@functools.wraps(_determine_batch_execution_and_padding)
+def determine_batch_execution_and_padding(self, *args, **kwargs):
+    result = _determine_batch_execution_and_padding(self, *args, **kwargs)
+    batch_desc, _route, _num_tokens_across_dp = result
+    if batch_desc is None:
+        # A drained group runs nothing, so no pass opens and there is no phase to
+        # attribute this step to.
+        return result
+    num_tokens_padded = batch_desc.num_tokens_padded
     if self.is_prefill:
         phase = _Phase.PREFILL
     elif num_tokens_padded == self.max_num_tokens:
@@ -366,10 +373,10 @@ def _register_patches() -> None:
             "attribute, so it cannot be replaced through the registry.",
         ),
         (
-            f"{_RUNNER}._determine_batch_padding",
-            determine_batch_padding,
-            "Reads the pass phase where it is decided. num_tokens_padded is a local of "
-            "execute_model and is not observable from any wrapped callable.",
+            f"{_RUNNER}._determine_batch_execution_and_padding",
+            determine_batch_execution_and_padding,
+            "Reads the pass phase where it is decided. The padded token dimension is a "
+            "local of execute_model and is not observable from any wrapped callable.",
         ),
         (
             f"{_WORKER}.shutdown",
