@@ -110,6 +110,9 @@ from vllm_rbln.compilation import (
     create_compile_context,
     set_compile_stage,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    flush_deferred_loads,
+)
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
@@ -1607,7 +1610,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
-            get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+            kv_connector = get_kv_transfer_group()
+            kv_connector.handle_preemptions(kv_connector_metadata)
+            # The dummy step a read was handed to may never have run.
+            flush_deferred_loads(kv_connector)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
@@ -1708,6 +1714,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 **staged_model_inputs.as_kwargs(),
                 **model_kwargs,
             )
+            # Submitted, not awaited: a held read now runs against an idle host.
+            if has_kv_transfer_group():
+                flush_deferred_loads(get_kv_transfer_group())
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             hidden_states, logits, combined_hidden_states = model_output
@@ -2450,6 +2459,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
         ):
             _ = self.model_executable(**staged_model_input.as_kwargs())
+            # The submission a step with no forward of its own was waiting for.
+            if not warmup and has_kv_transfer_group():
+                flush_deferred_loads(get_kv_transfer_group())
 
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
             if warmup:
