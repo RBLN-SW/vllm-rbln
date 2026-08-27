@@ -39,6 +39,7 @@ from . import (
     mla,
     models_utils,
     multi_connector,
+    ngram_proposer,
     oot,
     profiler,
     qwen2_moe,
