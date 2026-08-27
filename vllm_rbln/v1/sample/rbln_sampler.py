@@ -33,6 +33,7 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 logger = init_logger(__name__)
 
 
+# TODO(yunseong): move this to the runner
 def _stage_into(owner: Any, out: torch.Tensor) -> torch.Tensor:
     """Snapshot `out` into a buffer belonging to `owner`, alternating two slots.
 
