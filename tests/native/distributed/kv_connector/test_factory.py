@@ -18,19 +18,29 @@
 
 # Importing the factory module fires the register_connector side effects, exactly
 # as register_ops() does under VLLM_RBLN_USE_VLLM_MODEL in production.
+import pytest
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
 
 
-def test_native_backend_registers_both_connectors():
+def test_native_backend_registers_every_connector():
     registry = KVConnectorFactory._registry
-    assert "RblnNixlConnector" in registry
+    assert "RblnNixlPullConnector" in registry
     assert "RBLNLMCacheConnectorV1" in registry
 
 
-def test_nixl_connector_resolves_to_class():
+@pytest.mark.parametrize(
+    ("name", "class_name"),
+    [
+        ("RblnNixlPullConnector", "RblnNixlPullConnector"),
+        # The name the read path shipped under is what deployments carry, so it
+        # has to keep resolving -- to the class that no longer bears it.
+        ("RblnNixlConnector", "RblnNixlPullConnector"),
+    ],
+)
+def test_nixl_connector_resolves_to_class(name, class_name):
     # Calling the stored loader imports the module and pulls the class; a stale
     # module path (ImportError) or class name (AttributeError) would fail here.
-    cls = KVConnectorFactory._registry["RblnNixlConnector"]()
-    assert cls.__name__ == "RblnNixlConnector"
+    cls = KVConnectorFactory._registry[name]()
+    assert cls.__name__ == class_name

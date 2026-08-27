@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnNixlConnectorScheduler: chunked-prefill save tracking and the
-# finished-request branches, exercised through the inherited entry points.
-# Built bare with only the state those paths read.
+# RblnNixlPullConnectorScheduler: chunked-prefill save tracking, the
+# finished-request branches, and the fetch trimmed to a chunk boundary, all
+# exercised through the inherited entry points. Built bare with only the state
+# those paths read.
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -23,9 +24,9 @@ from unittest.mock import MagicMock
 import pytest
 from vllm.v1.request import RequestStatus
 
-import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.scheduler as sm
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.scheduler import (
-    RblnNixlConnectorScheduler,
+import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
+    RblnNixlPullConnectorScheduler,
 )
 
 
@@ -58,6 +59,7 @@ class _Request:
     kv_transfer_params: dict | None = field(
         default_factory=lambda: {"do_remote_decode": True}
     )
+    prompt_token_ids: list = field(default_factory=list)
 
 
 def _sched_output(req_id, block_ids, num_scheduled_tokens, *, is_new=True):
@@ -78,7 +80,7 @@ def _sched_output(req_id, block_ids, num_scheduled_tokens, *, is_new=True):
 
 
 def _scheduler(*, use_host_buffer=False):
-    sched = object.__new__(RblnNixlConnectorScheduler)
+    sched = object.__new__(RblnNixlPullConnectorScheduler)
     sched.vllm_config = MagicMock()
     sched.vllm_config.parallel_config.tensor_parallel_size = 1
     sched.block_size = 16
@@ -97,13 +99,16 @@ def _scheduler(*, use_host_buffer=False):
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._block_ids_need_save = {}
-    # Base state the inherited entry points read.
+    # Upstream state the inherited entry points read.
     sched._heartbeat_by_engine = {}
     sched._heartbeat_req_engine = {}
     sched._last_heartbeat_time = 0.0
     sched._heartbeat_interval = 5
     sched.is_bidirectional_kv_xfer_enabled = False
     sched.decoder_kv_blocks_ttl = 480
+    sched.kv_recompute_threshold = 64
+    sched._has_mamba = False
+    sched.vllm_config.scheduler_config.max_num_batched_tokens = 512
     return sched
 
 
@@ -122,8 +127,8 @@ class TestInit:
         vllm_config = SimpleNamespace(
             kv_transfer_config=SimpleNamespace(kv_buffer_device=kv_buffer_device)
         )
-        sched = object.__new__(RblnNixlConnectorScheduler)
-        RblnNixlConnectorScheduler.__init__(sched, vllm_config, "eng", {"kv": 1})
+        sched = object.__new__(RblnNixlPullConnectorScheduler)
+        RblnNixlPullConnectorScheduler.__init__(sched, vllm_config, "eng", {"kv": 1})
         assert sched.use_host_buffer is expected
         assert sched._block_ids_need_save == {}
 
@@ -164,6 +169,24 @@ class TestBuildConnectorMeta:
         assert "chunked" in meta.reqs_to_save
         assert "chunked" not in sched._block_ids_need_save
         assert "chunked" not in sched._reqs_need_save
+
+    def test_blocks_from_every_chunk_are_saved_together(self):
+        # The host copy moves whole blocks once, so a chunk that brings new
+        # blocks after the first appends to what is already held. Replacing
+        # would stage the last chunk's blocks alone and lose the prefix.
+        sched = _scheduler(use_host_buffer=True)
+        req = _Request("chunked", num_prompt_tokens=768)
+        sched._reqs_need_save["chunked"] = req
+
+        sched.build_connector_meta(_sched_output("chunked", ([1, 2],), 256))
+        req.num_computed_tokens = 256
+        sched.build_connector_meta(_sched_output("chunked", ([3],), 256, is_new=False))
+        req.num_computed_tokens = 512
+        meta = sched.build_connector_meta(
+            _sched_output("chunked", ([4],), 256, is_new=False)
+        )
+
+        assert meta.reqs_to_save["chunked"].local_block_ids == ([1, 2, 3, 4],)
 
     def test_recv_requests_added_and_tracking_cleared(self):
         # Requests awaiting a remote-KV load are emitted as recv entries, and the
@@ -281,3 +304,63 @@ class TestRequestFinished:
         assert params is not None
         assert params["do_remote_prefill"] is True
         assert "empty" not in sched._reqs_need_send
+
+
+class TestChunkAlignedFetch:
+    # A prefill has to resume on a chunk boundary, so the fetched amount is
+    # trimmed to it. The base reports the peer's computed tokens, which is an
+    # arbitrary count.
+
+    @staticmethod
+    def _reverse_req(*, prompt, remote):
+        # What the decode side reports back for a prompt it partly computed.
+        return _Request(
+            request_id="r0",
+            num_prompt_tokens=prompt,
+            kv_transfer_params={
+                "do_remote_decode": True,
+                "remote_block_ids": [[1, 2]],
+                "remote_engine_id": "eng",
+                "remote_request_id": "r0",
+                "remote_host": "h",
+                "remote_port": 1,
+                "remote_num_tokens": remote,
+            },
+        )
+
+    def test_fetch_is_trimmed_to_the_chunk_below(self):
+        # 900 tokens held remotely, 512-token chunks: fetch 512 and recompute
+        # the 388 that would have put the next chunk mid-grid.
+        sched = _scheduler()
+        assert sched.get_num_new_matched_tokens(
+            self._reverse_req(prompt=4096, remote=900), 0
+        ) == (512, True)
+
+    def test_an_already_aligned_fetch_passes_through(self):
+        # The trim is a remainder, so a peer holding a whole number of chunks
+        # needs none of it -- recomputing a chunk the transfer already carried.
+        sched = _scheduler()
+        assert sched.get_num_new_matched_tokens(
+            self._reverse_req(prompt=4096, remote=1024), 0
+        ) == (1024, True)
+
+    def test_fetch_shorter_than_one_chunk_reports_no_match(self):
+        # Trimming leaves nothing, and an async load of zero tokens trips the
+        # scheduler's own assertion, so the answer has to be a plain no-match.
+        sched = _scheduler()
+        assert sched.get_num_new_matched_tokens(
+            self._reverse_req(prompt=4096, remote=500), 0
+        ) == (0, False)
+
+    def test_whole_prompt_fetch_is_untouched(self):
+        # Guard: the ordinary prefill-to-decode direction fetches through the
+        # prompt's last token, so no chunk follows and nothing is trimmed --
+        # trimming here would recompute what the transfer already carried.
+        sched = _scheduler()
+        req = _Request(
+            request_id="r0",
+            num_prompt_tokens=900,
+            prompt_token_ids=list(range(900)),
+            kv_transfer_params={"do_remote_prefill": True},
+        )
+        assert sched.get_num_new_matched_tokens(req, 0) == (900, True)
