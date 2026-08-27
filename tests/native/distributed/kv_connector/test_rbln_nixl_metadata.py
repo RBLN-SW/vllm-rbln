@@ -107,20 +107,32 @@ class TestRblnNixlAgentMetadata:
 
 class TestRblnCompatHash:
     def test_deterministic(self):
-        assert rbln_compat_hash("BASE") == rbln_compat_hash("BASE")
+        assert rbln_compat_hash("BASE", writes_into_peer=False) == rbln_compat_hash(
+            "BASE", writes_into_peer=False
+        )
 
     def test_differs_from_base(self):
         # Folding our version in must move the hash, or a peer that speaks only
         # upstream's schema would match one that speaks ours.
-        assert rbln_compat_hash("BASE") != "BASE"
+        assert rbln_compat_hash("BASE", writes_into_peer=False) != "BASE"
+
+    def test_the_two_transfer_directions_do_not_share_a_hash(self):
+        # A producer that writes into the consumer and one the consumer reads
+        # from describe the same bytes, so every length check on the handshake
+        # passes and only this separates them.
+        assert rbln_compat_hash("BASE", writes_into_peer=True) != rbln_compat_hash(
+            "BASE", writes_into_peer=False
+        )
 
     def test_distinguishes_base_hashes(self):
-        assert rbln_compat_hash("hash-a") != rbln_compat_hash("hash-b")
+        assert rbln_compat_hash("hash-a", writes_into_peer=False) != rbln_compat_hash(
+            "hash-b", writes_into_peer=False
+        )
 
     def test_version_is_folded(self, monkeypatch):
         # Bumping RBLN_NIXL_CONNECTOR_VERSION changes the hash (gates schema drift).
-        h1 = md.rbln_compat_hash("BASE")
+        h1 = md.rbln_compat_hash("BASE", writes_into_peer=False)
         monkeypatch.setattr(
             md, "RBLN_NIXL_CONNECTOR_VERSION", RBLN_NIXL_CONNECTOR_VERSION + 1
         )
-        assert md.rbln_compat_hash("BASE") != h1
+        assert md.rbln_compat_hash("BASE", writes_into_peer=False) != h1

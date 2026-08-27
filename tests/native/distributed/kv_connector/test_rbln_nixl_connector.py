@@ -26,6 +26,7 @@ import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector as 
 import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
     RblnNixlPullConnector,
+    RblnNixlPushConnector,
 )
 
 
@@ -165,3 +166,46 @@ class TestSetXferHandshakeMetadataPpAware:
         # shard; fail loudly instead.
         with pytest.raises(ValueError, match="Duplicate handshake metadata"):
             self._flatten({(0, 1): "a", (1, 0): "b"}, tp_size=1)
+
+
+class TestConnectorWiring:
+    @pytest.fixture
+    def push_connector(self, monkeypatch):
+        monkeypatch.setattr(
+            cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None
+        )
+        monkeypatch.setattr(
+            cm, "RblnNixlPushConnectorScheduler", lambda *a, **k: "SCHEDULER"
+        )
+        monkeypatch.setattr(cm, "RblnNixlPushConnectorWorker", lambda *a, **k: "WORKER")
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", True)
+
+        def build(role, kv_buffer_device="rbln"):
+            vllm_config = SimpleNamespace(
+                kv_transfer_config=SimpleNamespace(
+                    engine_id="engine-0", kv_buffer_device=kv_buffer_device
+                )
+            )
+            connector = object.__new__(RblnNixlPushConnector)
+            RblnNixlPushConnector.__init__(
+                connector, vllm_config, role, {"kv_cache": 1}
+            )
+            return connector
+
+        return build
+
+    def test_worker_role_builds_the_push_worker(self, push_connector):
+        connector = push_connector(KVConnectorRole.WORKER)
+        assert connector.connector_worker == "WORKER"
+        assert connector.connector_scheduler is None
+
+    def test_scheduler_role_builds_the_push_scheduler(self, push_connector):
+        connector = push_connector(KVConnectorRole.SCHEDULER)
+        assert connector.connector_scheduler == "SCHEDULER"
+        assert connector.connector_worker is None
+
+    def test_shares_the_construction_guards(self, push_connector):
+        # The guards live on the shared connector base; one of them is enough to
+        # pin that this direction goes through it.
+        with pytest.raises(AssertionError, match="kv_buffer_device"):
+            push_connector(KVConnectorRole.WORKER, kv_buffer_device="gpu")
