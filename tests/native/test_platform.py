@@ -327,6 +327,11 @@ class TestSchedulerOverrides:
         sampled and returns wrong text with no error raised, so the platform
         downgrades to sync rather than run the combination.
         """
+        # Both are set before one is switched off: the gate refuses on either,
+        # so leaving the other to the lane lets --device-tensor 0 satisfy this
+        # case with the sampler still on, and the parametrization proves nothing.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
         monkeypatch.setenv(switched_off, "0")
         config = _build(async_scheduling=True)
         assert config.scheduler_config.async_scheduling is False
