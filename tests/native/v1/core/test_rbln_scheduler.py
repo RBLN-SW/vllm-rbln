@@ -573,6 +573,95 @@ class TestStrandedBlockDelta:
         assert req_a.request_id not in sched._pending_runner_block_deltas
 
 
+class TestAsyncMaxTokensSkip:
+    """The placeholder-aware max_tokens check in schedule().
+
+    Async counts tokens that have not arrived yet, so the step that reaches
+    max_tokens is in flight when the next one is being scheduled. Without the
+    check the request gets a step it does not need; with it too eager, the
+    request stops one token short. num_output_placeholders is zero under sync
+    scheduling, so the whole branch was unreachable before async landed.
+
+    Sync is the control: it decides from tokens it already has, and its step
+    count is what async has to match.
+    """
+
+    @staticmethod
+    def _drain_async(sched, token=7, max_steps=50):
+        """One output in flight, the way the engine's batch queue drives async:
+        schedule() runs a step ahead of the update_from_output() for the step
+        before it. That lag is what leaves num_output_placeholders above zero,
+        so the serial _drain never reaches the branch under test."""
+        steps = 0
+        pending = None
+        while True:
+            out = sched.schedule()
+            scheduled = bool(out.num_scheduled_tokens)
+            if scheduled:
+                steps += 1
+            if pending is not None:
+                sched.update_from_output(*pending)
+            pending = (out, make_model_runner_output(out, token)) if scheduled else None
+            if pending is None:
+                return steps
+            assert steps < max_steps, "run did not converge"
+
+    @classmethod
+    def _run(cls, async_scheduling, max_tokens):
+        sched = create_rbln_scheduler(async_scheduling=async_scheduling)
+        req = create_requests(1, num_tokens=8, max_tokens=max_tokens)[0]
+        sched.add_request(req)
+        if async_scheduling:
+            return cls._drain_async(sched), req
+        return _drain(sched, token=7), req
+
+    @pytest.mark.parametrize("max_tokens", [1, 2, 3, 4, 5])
+    def test_async_takes_the_same_steps_as_sync(self, max_tokens):
+        sync_steps, _ = self._run(False, max_tokens)
+        async_steps, _ = self._run(True, max_tokens)
+        assert async_steps == sync_steps
+
+    @pytest.mark.parametrize("max_tokens", [1, 2, 3, 4, 5])
+    def test_async_still_generates_every_token(self, max_tokens):
+        _, req = self._run(True, max_tokens)
+        assert len(req.output_token_ids) == max_tokens
+
+    @classmethod
+    def _run_batch(cls, async_scheduling, plan):
+        sched = create_rbln_scheduler(async_scheduling=async_scheduling)
+        reqs = []
+        for req_id, num_tokens, max_tokens in plan:
+            req = create_requests(
+                1, num_tokens=num_tokens, max_tokens=max_tokens, req_ids=[req_id]
+            )[0]
+            sched.add_request(req)
+            reqs.append(req)
+        if async_scheduling:
+            return cls._drain_async(sched), reqs
+        return _drain(sched, token=7), reqs
+
+    def test_a_mixed_batch_stops_each_request_at_its_own_max_tokens(self):
+        # The skip advances req_index rather than dropping the request, so the
+        # ones sitting after it in self.running still have to get their steps.
+        plan = [("a", 8, 1), ("b", 9, 3), ("c", 10, 5)]
+        sync_steps, sync_reqs = self._run_batch(False, plan)
+        async_steps, async_reqs = self._run_batch(True, plan)
+        assert async_steps == sync_steps
+        assert [len(r.output_token_ids) for r in sync_reqs] == [1, 3, 5]
+        assert [len(r.output_token_ids) for r in async_reqs] == [1, 3, 5]
+
+    def test_the_branch_is_actually_reached(self):
+        # Without placeholders above zero the two assertions above would pass
+        # against a branch that never ran.
+        sched = create_rbln_scheduler(async_scheduling=True)
+        req = create_requests(1, num_tokens=8, max_tokens=4)[0]
+        sched.add_request(req)
+        out = sched.schedule()
+        sched.schedule()  # the engine schedules ahead before the output lands
+        assert req.num_output_placeholders > 0
+        sched.update_from_output(out, make_model_runner_output(out, 7))
+
+
 class TestStopping:
     def test_eos_stops_request(self):
         # An EOS sample finishes the request and removes it from running.

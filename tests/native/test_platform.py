@@ -263,9 +263,12 @@ class TestWorkerAndScheduler:
             == "pkg.mod.MyWorker"
         )
 
-    def test_scheduler_is_replaced_unconditionally(self, reconfigure):
+    def test_scheduler_is_replaced_unconditionally(self, monkeypatch, reconfigure):
         # Unlike worker_cls there is no "auto" guard: whatever was asked for is
-        # overwritten.
+        # overwritten. Reading the expectation back off the config under test
+        # would agree with whatever the platform decided, so the carriers are
+        # pinned off and the sync scheduler named outright.
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
         config = reconfigure(
             lambda config: setattr(
                 config.scheduler_config, "scheduler_cls", "pkg.mod.MyScheduler"
@@ -274,6 +277,20 @@ class TestWorkerAndScheduler:
         assert (
             config.scheduler_config.scheduler_cls
             == "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+        )
+
+    def test_a_plain_build_lands_on_the_async_scheduler(self, monkeypatch):
+        # Nobody passes --async-scheduling here: vLLM resolves the unset flag to
+        # True before this platform hook, and with both carriers on nothing
+        # refuses it, so the native path selects the async scheduler. This is
+        # what the async support changed, and it went unasserted.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        config = _build()
+        assert config.scheduler_config.async_scheduling is True
+        assert (
+            config.scheduler_config.scheduler_cls
+            == "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
         )
 
 
@@ -299,8 +316,72 @@ class TestCompilation:
 
 
 class TestSchedulerOverrides:
-    def test_async_scheduling_is_forced_off(self):
-        assert _build(async_scheduling=True).scheduler_config.async_scheduling is False
+    def test_async_scheduling_is_honored(self, monkeypatch):
+        # The platform used to force this off unconditionally. It now follows
+        # vLLM's --async-scheduling, as long as the device-side token path is
+        # available (see below). Both carriers are pinned on because
+        # --device-tensor 0 switches the first one off for the whole session,
+        # which would land this on the negative case below.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
+
+    @pytest.mark.parametrize(
+        "switched_off", ["VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"]
+    )
+    def test_async_scheduling_needs_the_device_token_carriers(
+        self, monkeypatch, switched_off
+    ):
+        """Either env var off means async has no way to carry its in-flight tokens.
+
+        VLLM_RBLN_USE_DEVICE_TENSOR gates the feedback scatter that replaces the
+        scheduler's -1 placeholders; VLLM_RBLN_SAMPLER gates the ring the output
+        thread reads. Without them the runner decodes from a token that was never
+        sampled and returns wrong text with no error raised, so the platform
+        downgrades to sync rather than run the combination.
+        """
+        # Both are set before one is switched off: the gate refuses on either,
+        # so leaving the other to the lane lets --device-tensor 0 satisfy this
+        # case with the sampler still on, and the parametrization proves nothing.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv(switched_off, "0")
+        config = _build(async_scheduling=True)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
+
+    def test_async_scheduling_is_refused_with_speculative_decoding(self, reconfigure):
+        """The async feedback carries one sampled token per step.
+
+        _bookkeeping_sync asserts a single sampled column, which a rejection
+        sampler output of shape (batch, num_spec + 1) cannot satisfy. vLLM allows
+        async with eagle / ngram / draft_model, so without this the combination
+        reaches the runner and dies on that assert mid-decode.
+        """
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.async_scheduling = True
+            config.speculative_config = object()
+
+        config = reconfigure(mutate)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
+
+    def test_async_scheduling_is_refused_under_pipeline_parallelism(self, reconfigure):
+        """Under PP the scheduler stops shipping the sampled tokens.
+
+        It expects the runner to broadcast prev_sampled_token_ids from the last
+        stage instead, which this runner does not do, so a non-last rank reaches
+        _update_states with no token source and dies on its assert mid-decode.
+        """
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.async_scheduling = True
+            _ranks(pipeline_parallel_size=2, max_num_seqs=2)(config)
+
+        config = reconfigure(mutate)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
 
     def test_cascade_attention_is_disabled(self, configured):
         assert configured.model_config.disable_cascade_attn is True
