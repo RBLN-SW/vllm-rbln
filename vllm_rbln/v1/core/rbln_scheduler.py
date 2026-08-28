@@ -571,24 +571,23 @@ class RBLNScheduler(Scheduler):
                         connector_prefix_cache_hits = num_external_computed_tokens
 
                     # NOTE(RBLN): Arbitrate between sub-block match and KV connector.
-                    sub_block_match, num_sub_block_tokens = self._try_sub_block_match(
-                        request,
-                        num_new_local_computed_tokens,
-                        num_external_computed_tokens,
+                    # Not on a preemption resume with a connector: the connector
+                    # was queried above with the block-aligned local count and
+                    # recorded it as the resume point (LMCache asserts on it),
+                    # and the KV connector contract allows no second query to
+                    # move it. Recomputing under one block is cheaper than
+                    # tripping that assertion.
+                    resuming_with_connector = (
+                        self.connector is not None
+                        and request.status == RequestStatus.PREEMPTED
                     )
-                    if num_sub_block_tokens > 0 and self.connector is not None:
-                        # The scheduler resumes at local + sub-block, but the
-                        # connector was queried with local alone and recorded that
-                        # as the resume point -- even when it offered nothing
-                        # (external == 0 also covers hit <= local).
-                        # update_state_after_alloc(..., 0) can't tell "lost the
-                        # arbitration" from "no hit", so re-query with the
-                        # corrected count or the recorded resume point goes stale
-                        # and asserts on preemption resume. The lookup is cached,
-                        # so this costs no extra remote traffic.
-                        self.connector.get_num_new_matched_tokens(
-                            request,
-                            num_new_local_computed_tokens + num_sub_block_tokens,
+                    if not resuming_with_connector:
+                        sub_block_match, num_sub_block_tokens = (
+                            self._try_sub_block_match(
+                                request,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                            )
                         )
                     if num_sub_block_tokens > 0 and num_external_computed_tokens > 0:
                         # Cancel the KV connector match in favor of the sub-block match

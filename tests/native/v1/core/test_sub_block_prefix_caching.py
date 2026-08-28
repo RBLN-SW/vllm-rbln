@@ -16,6 +16,8 @@
 # ops into RBLNSchedulerOutput and releasing them, plus arbitration against a KV
 # connector. Matching itself is in test_rbln_kv_cache_manager.py.
 
+from vllm.v1.request import RequestStatus
+
 from tests.native.v1.core.utils import (
     MockKVConfig,
     _drain,
@@ -158,35 +160,9 @@ class TestSubBlockVersusKVConnector:
         assert out.kv_cache_copy_ops == []
         assert out.num_scheduled_tokens["1"] == len(tokens) - BLOCK_SIZE
 
-    def test_losing_connector_is_told_the_corrected_local_count(self):
-        # A cancelled connector is re-queried with local + sub-block tokens.
-        num_shared = 3 * SUB_BLOCK_SIZE
-        sched = self._scheduler(matched_tokens=SUB_BLOCK_SIZE)
-        seen: list[int] = []
-        original = sched.connector.get_num_new_matched_tokens
-
-        def recording(request, num_computed_tokens):
-            seen.append(num_computed_tokens)
-            return original(request, num_computed_tokens)
-
-        sched.connector.get_num_new_matched_tokens = recording
-
-        self._cache_one_block(
-            sched,
-            list(range(num_shared)) + [800 + i for i in range(BLOCK_SIZE - num_shared)],
-        )
-        tokens = list(range(num_shared)) + [900 + i for i in range(BLOCK_SIZE)]
-        self._schedule_query(sched, tokens, remote_prefill=True)
-
-        # First the block-aligned fetch query, then the corrective re-query.
-        assert seen[-2:] == [0, num_shared]
-
     def test_connector_is_asked_with_a_block_aligned_count(self):
         # The connector is queried before the sub-block match, with the
         # full-block count only, or it would fetch from the wrong offset.
-        # Even with no external hit it is then re-queried with the corrected
-        # count: the record it wrote on the first query is the preemption
-        # resume point, and the scheduler resumes at local + sub-block.
         sched = self._scheduler(matched_tokens=0)
         seen: list[int] = []
         original = sched.connector.get_num_new_matched_tokens
@@ -203,7 +179,30 @@ class TestSubBlockVersusKVConnector:
 
         # The sub-block match did happen, so the count could have been inflated.
         assert len(out.kv_cache_copy_ops) == 1
-        assert seen[-2:] == [0, SUB_BLOCK_SIZE]
+        assert seen[-1] == 0
+
+    def test_resume_from_preemption_skips_the_sub_block_match(self):
+        # The connector is queried once, with the block-aligned local count,
+        # and LMCache asserts on resume that the request restarts exactly
+        # there. A sub-block match would move the resume point past it, so
+        # a resuming request does not take one while a connector is present.
+        sched = self._scheduler(matched_tokens=0)
+        self._cache_one_block(sched, [0] * BLOCK_SIZE)
+
+        tokens = [0] * SUB_BLOCK_SIZE + [900 + i for i in range(SUB_BLOCK_SIZE)]
+        req = make_request("1", tokens, BLOCK_SIZE, max_tokens=4)
+        sched.add_request(req)
+        out = sched.schedule()
+        assert len(out.kv_cache_copy_ops) == 1
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+
+        sched.running.remove(req)
+        sched._preempt_request(req, 0.0)
+        assert req.status == RequestStatus.PREEMPTED
+
+        out = sched.schedule()
+        assert out.kv_cache_copy_ops == []
+        assert out.num_scheduled_tokens["1"] == req.num_tokens
 
 
 class TestSubBlockPrefixHitRun:
