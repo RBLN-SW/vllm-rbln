@@ -471,8 +471,40 @@ class TestSaveLoad:
         directory = os.path.dirname(bundle.path)
         assert sorted(os.listdir(directory)) == [
             "mega_cache.bin",
-            "mega_cache.inc.1.bin",
+            f"mega_cache.inc.1.{os.getpid()}.bin",
         ]
+
+    def test_a_concurrent_run_does_not_take_the_base_twice(self, bundle, monkeypatch):
+        # Two runs of the same config that finish together both find no base and
+        # aim at it. The other run lands while this one stages its bytes, so the
+        # name is taken by the time this one publishes: it has to go beside that
+        # part rather than replace it.
+        real_open = open
+
+        def other_run_lands_first(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            if str(path).endswith(".tmp"):
+                with real_open(bundle.path, "wb") as base:
+                    base.write(b"from-another-run")
+            return handle
+
+        with monkeypatch.context() as m:
+            m.setattr("builtins.open", other_run_lands_first)
+            mega_cache.save(MODEL, SIG)
+        assert _parts(bundle.path) == [b"from-another-run", bundle.artifact]
+
+    def test_a_concurrent_run_does_not_take_an_increment_twice(self, bundle):
+        # Same race one index along: both runs scanned before either wrote, so
+        # both want inc.1. The pid in the name keeps them apart, and load has to
+        # replay the other run's part as well as this one's.
+        mega_cache.save(MODEL, SIG)
+        directory = os.path.dirname(bundle.path)
+        with open(os.path.join(directory, "mega_cache.inc.1.999999.bin"), "wb") as f:
+            f.write(b"from-another-run")
+        bundle.save_result = (b"mine", object())
+        mega_cache.save(MODEL, SIG)
+        mega_cache.load(MODEL, SIG)
+        assert bundle.loaded == [bundle.artifact, b"from-another-run", b"mine"]
 
     def test_parts_replay_in_write_order(self, bundle):
         # Not lexicographic: inc.10 is written after inc.9, so it has to replay
@@ -552,7 +584,7 @@ class TestSaveLoad:
     def test_out_of_space_is_logged_at_error(self, bundle, monkeypatch, caplog):
         # Every restart recompiles from here on, so it cannot be a debug line.
         monkeypatch.setattr(
-            mega_cache.os, "replace", _raiser(OSError(errno.ENOSPC, "no space"))
+            mega_cache.os, "link", _raiser(OSError(errno.ENOSPC, "no space"))
         )
         with caplog.at_level(logging.ERROR, logger=mega_cache.logger.name):
             mega_cache.save(MODEL, SIG)

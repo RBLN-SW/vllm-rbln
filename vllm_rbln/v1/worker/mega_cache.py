@@ -17,10 +17,14 @@ Persists/restores `torch.compiler.{save,load}_cache_artifacts()` bundles under a
 per-(model, config-signature, rank) directory in VLLM_CACHE_ROOT.
 
 A bundle is a base file plus append-only increments: `mega_cache.bin`, then
-`mega_cache.inc.<n>.bin`. `save_cache_artifacts()` serializes only the artifacts
-*this* session compiled -- a loaded hit is never re-recorded -- so writing its
-output over the base would drop every graph that hit. Each save becomes a new
-part instead, and load replays them all.
+`mega_cache.inc.<n>.<pid>.bin`. `save_cache_artifacts()` serializes only the
+artifacts *this* session compiled -- a loaded hit is never re-recorded -- so
+writing its output over the base would drop every graph that hit. Each save
+becomes a new part instead, and load replays them all.
+
+Parts are claimed with `os.link`, which never overwrites, and an increment
+carries the writing pid: two runs of the same config finishing at once land
+beside each other instead of one silently replacing the other.
 """
 
 import contextlib
@@ -36,7 +40,7 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-_INCREMENT_RE = re.compile(r"^mega_cache\.inc\.(\d+)\.bin$")
+_INCREMENT_RE = re.compile(r"^mega_cache\.inc\.(\d+)\.(\d+)\.bin$")
 
 
 def _safe_name(model: str) -> str:
@@ -180,37 +184,54 @@ def bundle_path(model: str, sig: str) -> str:
     )
 
 
-def _increment_path(directory: str, index: int) -> str:
-    return os.path.join(directory, f"mega_cache.inc.{index}.bin")
+def _increment_path(directory: str, index: int, pid: int) -> str:
+    return os.path.join(directory, f"mega_cache.inc.{index}.{pid}.bin")
 
 
-def _increment_indices(directory: str) -> list[int]:
+def _increments(directory: str) -> list[tuple[int, int, str]]:
+    """(index, pid, path) per increment in `directory`, oldest index first."""
     try:
         names = os.listdir(directory)
     except OSError:
         return []
-    matches = (_INCREMENT_RE.match(name) for name in names)
-    return sorted(int(m.group(1)) for m in matches if m is not None)
+    found = []
+    for name in names:
+        match = _INCREMENT_RE.match(name)
+        if match is not None:
+            found.append(
+                (
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    os.path.join(directory, name),
+                )
+            )
+    return sorted(found)
 
 
 def bundle_parts(path: str) -> list[str]:
     """Every part of the bundle at `path`, base first, then increments in order."""
     directory = os.path.dirname(path)
     parts = [path] if os.path.isfile(path) else []
-    parts.extend(_increment_path(directory, i) for i in _increment_indices(directory))
+    parts.extend(part for _, _, part in _increments(directory))
     return parts
 
 
-def _next_part_path(path: str) -> str:
-    """Where this session's artifacts go: the base if it is not there yet, else
-    a fresh increment."""
-    if not os.path.isfile(path):
-        return path
-    directory = os.path.dirname(path)
-    index = max(_increment_indices(directory), default=0) + 1
-    while os.path.exists(_increment_path(directory, index)):
-        index += 1
-    return _increment_path(directory, index)
+def _claim_part(tmp_path: str, base_path: str) -> str:
+    """Link the staged bytes onto a part name nothing else holds, then drop the
+    temp. os.link refuses an existing target, so a concurrent run's part is
+    never replaced; the pid keeps the fallback name collision-free."""
+    directory = os.path.dirname(base_path)
+    index = max((i for i, _, _ in _increments(directory)), default=0)
+    target = base_path
+    while True:
+        try:
+            os.link(tmp_path, target)
+        except FileExistsError:
+            index += 1
+            target = _increment_path(directory, index, os.getpid())
+            continue
+        os.remove(tmp_path)
+        return target
 
 
 def cache_root() -> str:
@@ -271,23 +292,22 @@ def save(model: str, sig: str) -> None:
 
     rbln_mega_cache.set_dir(cache_root())
     path = bundle_path(model, sig)
-    tmp_path = None
+    directory = os.path.dirname(path)
+    tmp_path = os.path.join(directory, f"mega_cache.{os.getpid()}.tmp")
     try:
         rbln_mega_cache.flush_to_bundle()
         result = torch.compiler.save_cache_artifacts()
         if result is None:
             return
         artifact_bytes, info = result
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        target = _next_part_path(path)
-        tmp_path = f"{target}.{os.getpid()}.tmp"
+        os.makedirs(directory, exist_ok=True)
         with open(tmp_path, "wb") as dst:
             dst.write(artifact_bytes)
             # Delayed allocation defers ENOSPC to flush, so a bundle could be
-            # renamed into place truncated without this.
+            # linked into place truncated without this.
             dst.flush()
             os.fsync(dst.fileno())
-        os.replace(tmp_path, target)
+        target = _claim_part(tmp_path, path)
         logger.info(
             "Saved rbln mega-cache bundle to %s (%.1f MiB, %d artifact(s))",
             target,
@@ -295,9 +315,8 @@ def save(model: str, sig: str) -> None:
             _artifact_count(info),
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                os.remove(tmp_path)
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
         out_of_space = isinstance(exc, OSError) and exc.errno in (
             errno.ENOSPC,
             errno.EDQUOT,
