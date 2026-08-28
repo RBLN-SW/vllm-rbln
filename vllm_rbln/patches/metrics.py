@@ -14,10 +14,15 @@
 """Wall-clock metrics for the native runner, installed only under VLLM_RBLN_METRICS.
 
 Three ranges are timed with perf_counter: the pass (execute_model through
-sample_tokens), the model call, and the sampler call. The last two are reported as one
-sum, so MODEL + SAMPLE carries the same call count as E2E and the difference of the two
-means is the host overhead around the graphs. A pass is recorded only once its phase
-and its graph time are both known, which is what keeps those counts equal.
+sample_tokens), the model call, and the sampler call with the bookkeeping over its
+output. The last two are reported as one sum, so MODEL + SAMPLE carries the same call
+count as E2E and the difference of the two means is the host overhead around the
+graphs. The bookkeeping is in that sum because it holds the step's first blocking read
+of the sampler output -- the cast that used to hold it inside _sample is gone, and
+leaving the read untimed drops this section to dispatch cost while the E2E residual
+absorbs the wait. Async defers that read out of the pass, so there it is dispatch.
+A pass is recorded only once its phase and its graph time are both known, which is
+what keeps those counts equal.
 
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
@@ -255,6 +260,7 @@ _load_model = RBLNModelRunner.load_model
 _determine_batch_execution_and_padding = (
     RBLNModelRunner._determine_batch_execution_and_padding
 )
+_bookkeeping_sync = RBLNModelRunner._bookkeeping_sync
 _shutdown = RBLNWorker.shutdown
 
 
@@ -275,6 +281,15 @@ def sample_tokens(self, *args, **kwargs):
     output = _sample_tokens(self, *args, **kwargs)
     _ctx(self).end_pass()
     return output
+
+
+@functools.wraps(_bookkeeping_sync)
+def bookkeeping_sync(self, *args, **kwargs):
+    start = time.perf_counter()
+    try:
+        return _bookkeeping_sync(self, *args, **kwargs)
+    finally:
+        _ctx(self).add_graph_time(time.perf_counter() - start)
 
 
 @functools.wraps(_sample)
@@ -371,6 +386,12 @@ def _register_patches() -> None:
             load_model,
             "Wraps the compiled model_executable once it exists; it is an instance "
             "attribute, so it cannot be replaced through the registry.",
+        ),
+        (
+            f"{_RUNNER}._bookkeeping_sync",
+            bookkeeping_sync,
+            "Holds the step's first blocking read of the sampler output, which the "
+            "graph slice would otherwise miss.",
         ),
         (
             f"{_RUNNER}._determine_batch_execution_and_padding",

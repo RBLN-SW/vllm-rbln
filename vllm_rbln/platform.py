@@ -252,13 +252,6 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        if scheduler_config.async_scheduling:
-            logger.warning(
-                "Asynchronous scheduling is not supported on RBLN. "
-                "Overriding scheduler_config.async_scheduling to False."
-            )
-            scheduler_config.async_scheduling = False
-
         # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
         # that runs only inside the vLLM-native branch below, and the optimum
         # path is exactly where an unsupported flag would go unnoticed.
@@ -302,9 +295,60 @@ class RblnPlatform(Platform):
                 parallel_config.worker_cls = (
                     "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
                 )
-            scheduler_config.scheduler_cls = (
-                "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
-            )
+            # Async is decided here rather than in the prologue: this is the
+            # only reader of the flag, and on the optimum path the refusal
+            # below is the whole story.
+            if scheduler_config.async_scheduling and not (
+                envs.VLLM_RBLN_USE_DEVICE_TENSOR and envs.VLLM_RBLN_SAMPLER
+            ):
+                logger.warning(
+                    "Disabling asynchronous scheduling: it requires "
+                    "VLLM_RBLN_USE_DEVICE_TENSOR=1 (got %s), which carries the "
+                    "in-flight sampled tokens, and VLLM_RBLN_SAMPLER=1 (got %s), "
+                    "which puts the sampler on the device so those tokens never "
+                    "reach the host mid-step. Running synchronously.",
+                    int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
+                    int(envs.VLLM_RBLN_SAMPLER),
+                )
+                scheduler_config.async_scheduling = False
+
+            # TODO(yskim): Support speculative decoding on RBLN under async scheduling.
+            if (
+                scheduler_config.async_scheduling
+                and vllm_config.speculative_config is not None
+            ):
+                logger.warning(
+                    "Disabling asynchronous scheduling: speculative decoding is "
+                    "not supported on RBLN under async scheduling, because the "
+                    "async path feeds one sampled token per step back into the "
+                    "next. Running synchronously."
+                )
+                scheduler_config.async_scheduling = False
+
+            # TODO(yskim): Support PP on RBLN under async scheduling.
+            if (
+                scheduler_config.async_scheduling
+                and parallel_config.pipeline_parallel_size > 1
+            ):
+                logger.warning(
+                    "Disabling asynchronous scheduling: pipeline parallelism is "
+                    "not supported on RBLN under async scheduling. Under PP the "
+                    "scheduler stops propagating sampled tokens and expects the "
+                    "runner to broadcast prev_sampled_token_ids from the last "
+                    "stage, which this runner does not do. Running synchronously."
+                )
+                scheduler_config.async_scheduling = False
+
+            if scheduler_config.async_scheduling:
+                # Only RBLNAsyncScheduler bumps num_output_placeholders at
+                # schedule time, which is what lets the batch_queue fill.
+                scheduler_config.scheduler_cls = (
+                    "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
+                )
+            else:
+                scheduler_config.scheduler_cls = (
+                    "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+                )
 
             # Under PP the compiled per-stage decode batch is max_num_seqs // pp_size
             # (see decode_batch_size). Fail fast on an impossible config.
@@ -394,6 +438,14 @@ class RblnPlatform(Platform):
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
             )
+            # Optimum model runner doesn't support async scheduling.
+            if scheduler_config.async_scheduling:
+                logger.warning(
+                    "Disabling asynchronous scheduling: the optimum model runner "
+                    "does not support it. Running synchronously. Set "
+                    "VLLM_RBLN_USE_VLLM_MODEL=1 to use the runner that does."
+                )
+            scheduler_config.async_scheduling = False
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "

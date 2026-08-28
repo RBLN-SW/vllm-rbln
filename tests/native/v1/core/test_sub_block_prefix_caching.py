@@ -16,6 +16,7 @@
 # ops into RBLNSchedulerOutput and releasing them, plus arbitration against a KV
 # connector. Matching itself is in test_rbln_kv_cache_manager.py.
 
+import pytest
 from vllm.v1.request import RequestStatus
 
 from tests.native.v1.core.utils import (
@@ -232,3 +233,43 @@ class TestSubBlockPrefixHitRun:
         _drain(sched)
         assert req0.is_finished()
         assert req1.is_finished()
+
+
+class TestSubBlockIndexingUnderAsyncScheduling:
+    # Async scheduling runs schedule(N+1) before update_from_output(N), so a
+    # request can be scheduled twice before its pending-indexing note is
+    # drained. The second schedule's num_computed_tokens already counts the
+    # prompt: were it to replace the note, the drain would scan past the
+    # prompt's full blocks and their sub-blocks would never reach the index.
+    # The sync arm is the control.
+    @staticmethod
+    def _sharer_schedule_after_donor_prefill(async_scheduling: bool):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=128,
+            num_blocks=10000,
+            async_scheduling=async_scheduling,
+        )
+        donor = make_request("0", list(range(16)), 16, max_tokens=20)
+        sched.add_request(donor)
+        out_prefill = sched.schedule()
+        if async_scheduling:
+            # The engine's batch queue schedules the donor's first decode
+            # before the prefill's update_from_output arrives.
+            out_decode = sched.schedule()
+            assert out_decode.num_scheduled_tokens == {"0": 1}
+        sched.update_from_output(out_prefill, make_model_runner_output(out_prefill, 0))
+
+        # Shares the donor's first 8-token sub-block, then diverges mid-block:
+        # only the sub-block index can serve this prefix.
+        sharer = make_request("1", list(range(8)) + [100 + i for i in range(16)], 16)
+        sched.add_request(sharer)
+        return sched.schedule()
+
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    def test_prompt_sub_blocks_survive_the_prefill_drain(self, async_scheduling):
+        out = self._sharer_schedule_after_donor_prefill(async_scheduling)
+        assert len(out.kv_cache_copy_ops) == 1
+        assert out.kv_cache_copy_ops[0].num_tokens == 8

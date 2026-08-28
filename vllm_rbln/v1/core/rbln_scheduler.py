@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -609,7 +610,11 @@ class RBLNScheduler(Scheduler):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
+                            # Sub-block hits are local prefix cache hits: the
+                            # tokens are copied, not recomputed.
+                            num_local_cached_tokens=(
+                                num_new_local_computed_tokens + num_sub_block_tokens
+                            ),
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
                 else:
@@ -1168,3 +1173,19 @@ class RBLNScheduler(Scheduler):
         if match is not None:
             self.kv_cache_manager.release_sub_block_match(match)
         return None, 0
+
+
+class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
+    """RBLNScheduler with async-scheduling (optimistic) semantics.
+
+    Plain RBLNScheduler can't fill the engine's batch_queue: schedule(N+1)
+    sizes a running decode request as num_tokens_with_spec +
+    num_output_placeholders - num_computed_tokens, which is <= 0 until
+    update_from_output(N) appends N's real token, so step N+1 and its DP gloo
+    all_reduce only run after step N's output. AsyncScheduler fixes this by
+    bumping num_output_placeholders at schedule time.
+
+    Empty by design: RBLNScheduler defines neither _update_after_schedule nor
+    _update_request_with_output, so both resolve to AsyncScheduler via the MRO
+    RBLNAsyncScheduler -> RBLNScheduler -> AsyncScheduler -> Scheduler.
+    """
