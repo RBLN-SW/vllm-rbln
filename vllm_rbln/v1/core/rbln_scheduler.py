@@ -591,8 +591,7 @@ class RBLNScheduler(Scheduler):
                             num_new_local_computed_tokens + num_sub_block_tokens,
                         )
                     if num_sub_block_tokens > 0 and num_external_computed_tokens > 0:
-                        # Cancel the KV connector match in favor of the sub-block
-                        # match.
+                        # Cancel the KV connector match in favor of the sub-block match
                         request.num_external_computed_tokens = 0
                         num_external_computed_tokens = 0
                         load_kv_async = False
