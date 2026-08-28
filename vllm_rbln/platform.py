@@ -333,6 +333,16 @@ class RblnPlatform(Platform):
                     max_num_seqs // pp_size,
                 )
 
+            # TODO(kblee): drop when upstream stops forcing v32 MTP eager.
+            spec_config = vllm_config.speculative_config
+            if (
+                spec_config is not None
+                and spec_config.enforce_eager
+                and not model_config.enforce_eager
+                and model_config.hf_text_config.model_type == "deepseek_v32"
+            ):
+                spec_config.enforce_eager = False
+
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
                 if not USE_DEVICE_TENSOR:
