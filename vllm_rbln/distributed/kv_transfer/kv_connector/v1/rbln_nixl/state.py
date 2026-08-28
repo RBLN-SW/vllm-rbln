@@ -114,6 +114,17 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: moving bytes the other way must not pass the handshake (`rbln_compat_hash`).
     _writes_into_peer: ClassVar[bool] = False
 
+    def _writes_less_than_a_request(self) -> bool:
+        """Whether this side ever moves part of a request at a time.
+
+        A peer that narrows nothing is described by upstream's whole-engine
+        handle, and that handle's notification has no room to say which blocks
+        a transfer filled. Anything sending a request in pieces needs its own
+        descriptors for that reason alone, so it has to be asked for even when
+        the two sides are shaped identically.
+        """
+        return False
+
     # While registering one peer, the local region ids that peer's regions
     # correspond to, in ITS order -- see `_regions_viewed_as`.
     _viewed_region_ids: list[int] | None = None

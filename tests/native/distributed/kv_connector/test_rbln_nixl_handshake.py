@@ -47,6 +47,9 @@ from tests.native.distributed.kv_connector.utils import (
     mock_vllm_config,
     patched_in_package,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
+    RblnNixlWorkerBase,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
     RblnNixlAgentMetadata,
@@ -637,6 +640,23 @@ class TestPpHandshakeFanout:
         _handshake(w, _FakeSock(pp_size=1))
         assert w._overlapping_ranks["eng"] == []
         assert w._register_shard_xfer_state.call_count == 0
+
+    def test_a_side_that_moves_part_of_a_request_asks_even_a_matching_peer(
+        self, monkeypatch
+    ):
+        # The same peer as above. Nothing is narrowed, so the only reason to
+        # build per-shard state is that a transfer covering part of a request
+        # needs a notification saying which part -- which upstream's
+        # whole-engine handle has no room for.
+        monkeypatch.setattr(
+            RblnNixlWorkerBase, "_writes_less_than_a_request", lambda self: True
+        )
+        w = _make_worker()
+
+        _handshake(w, _FakeSock(pp_size=1))
+
+        assert w._overlapping_ranks["eng"] == [0]
+        assert w._register_shard_xfer_state.call_count == 1
 
     def test_a_side_that_trims_a_last_block_asks_even_a_matching_peer(self):
         # Same peer again, and the same reason in a different shape: the trim

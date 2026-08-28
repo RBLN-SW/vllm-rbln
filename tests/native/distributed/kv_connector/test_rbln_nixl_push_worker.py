@@ -21,7 +21,7 @@ import queue
 import threading
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -68,6 +68,27 @@ def fake_thread(monkeypatch):
     return created
 
 
+def _send(worker, req_id="r0", **fields):
+    """Seed the record a request being pushed in pieces would have."""
+    send = worker._streamed.setdefault(req_id, pw._StreamedSend())
+    for name, value in fields.items():
+        setattr(send, name, value)
+    return send
+
+
+@pytest.fixture(autouse=True)
+def _pp_rank_zero(monkeypatch):
+    """A pipeline rank for workers built by hand, which have no process group.
+
+    The shared helper gives every write test a pipelined producer, so the
+    writer id a coverage range carries reaches for the group this lane never
+    initialises. A test that cares which stage it is says so itself.
+    """
+    setattr_in_package(
+        monkeypatch, get_pp_group=lambda: SimpleNamespace(rank_in_group=0)
+    )
+
+
 def _push_worker():
     w = object.__new__(RblnNixlPushConnectorWorker)
     w._push_writer_thread = None
@@ -78,14 +99,21 @@ def _push_worker():
     w._sw_ratio = None
     # Off, as the environment variable is; the early-write tests turn it on.
     w._early_push_enabled = False
-    w._early_sends = set()
-    w._early_transfers = defaultdict(list)
-    w._pending_early_offers = {}
-    w._sending_transfers = defaultdict(list)
-    w._sending_transfers_lock = threading.Lock()
+    w._streamed = {}
+    w._empty_receives = set()
+    w._recving_transfers = {}
     # Off, as the environment variable is; the trim tests turn it on.
     w._chunk_mode = False
     w._valid_tokens = {}
+    w._physical_blocks_per_logical_kv_block = 1
+    w._recving_metadata = {}
+    w._writer_counts_by_req = defaultdict(int)
+    w._coverage_by_req = defaultdict(lambda: defaultdict(list))
+    w._reqs_to_send = {}
+    w._reqs_to_process = set()
+    w.consumer_notification_counts_by_req = {}
+    w._sending_transfers = defaultdict(list)
+    w._sending_transfers_lock = threading.Lock()
     # __init__ never ran, so the writer state shutdown() reaches through
     # __del__ is absent; silence it rather than leak an unraisable at GC.
     w.shutdown = lambda: None
@@ -124,13 +152,12 @@ class TestInheritance:
         )
         worker = _push_worker()
         worker.nixl_wrapper = MagicMock()
-        worker._early_sends = {"r0"}
-        worker._early_transfers = defaultdict(list, {"r0": [7, 8]})
+        _send(worker, released=True, transfers=[[7, 8]])
 
         RblnNixlPushConnectorWorker.shutdown(worker)
 
         assert worker.nixl_wrapper.release_xfer_handle.call_count == 2
-        assert worker._early_transfers == {}
+        assert worker._streamed == {}
         assert chained == [True]
 
     def test_the_read_path_does_not_leak_in(self):
@@ -330,6 +357,8 @@ class TestPerShardWrite:
         # scheduler's count there -- so the trim has to survive that hop.
         worker = self._trimming_worker()
         worker._valid_tokens = {}
+        worker._seal_at_handover = lambda metadata: None
+        worker._settle_empty_receives = lambda metadata: None
         meta = RblnNixlConnectorMetadata()
         meta.valid_tokens = {"r0": 17}
         monkeypatch.setattr(
@@ -381,18 +410,27 @@ class TestPerShardWrite:
 
         assert len(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4]) == 4
 
-    def test_a_reported_request_drops_its_token_count(self, monkeypatch):
-        # Nothing else pops it, so a count kept here would outlive its request.
+    @pytest.mark.parametrize(
+        ("stream_total", "expected_descs"),
+        # The total places the window the real `_stream_window` returns: at 3
+        # this batch is one block of a longer prompt and a trim would leave 1;
+        # at 2 it is the whole prompt and reaches the consumer's end.
+        [(3, 2), (2, 3)],
+    )
+    def test_only_the_batch_reaching_the_consumers_end_trims(
+        self, stream_total, expected_descs
+    ):
+        # A streamed batch carries a closed prefix, which never holds the
+        # request's last block.
         worker = self._trimming_worker()
-        worker._valid_tokens = {"r0": 17, "other": 9}
-        worker._writer_counts_by_req = defaultdict(int)
-        monkeypatch.setattr(
-            NixlPushConnectorWorker, "get_finished", lambda self: ({"r0"}, set())
-        )
+        worker._physical_blocks_per_logical_kv_block = 1
+        worker._recving_metadata = {}
+        _send(worker, total=stream_total)
 
-        worker.get_finished()
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2],), ([3, 4],)))
 
-        assert worker._valid_tokens == {"other": 9}
+        descs = worker.nixl_wrapper.make_prepped_xfer.call_args.args[4]
+        assert len(descs) == expected_descs
 
     def test_upstreams_own_submission_path_reaches_our_override(self):
         # Calling the override directly keeps passing if upstream renames the
@@ -443,9 +481,10 @@ class TestPerShardWrite:
             for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
         }
         # world_size 1 against a TP-1 peer: one writer, so the count divides
-        # out to one on the far side -- and our four stages stay out of it,
-        # because that far side multiplies them back in itself.
-        assert notifs == {b"r0:1"}
+        # out to one on the far side -- and our stages stay out of it, because
+        # that far side multiplies them back in itself. Ahead of it, the range
+        # of consumer blocks this write filled -- both of the two it registered.
+        assert notifs == {b"RBLNS:0:0:2:r0:1"}
 
     def test_a_partial_prefix_hit_keeps_our_matching_tail(self):
         # The consumer registered only the last block of a three-block prompt,
@@ -614,6 +653,22 @@ class TestWriterCompletionAccounting:
             set(),
             {"r0"},
         ]
+
+
+@pytest.fixture
+def handed_through(monkeypatch):
+    """What reaches upstream, in order."""
+    seen = []
+
+    def fake_base(self):
+        while True:
+            try:
+                seen.append(self._pending_completion_notifs.get_nowait())
+            except queue.Empty:
+                return set()
+
+    monkeypatch.setattr(NixlPushConnectorWorker, "_get_new_notifs", fake_base)
+    return seen
 
 
 class TestNotifIdStageFactor:
@@ -1027,7 +1082,10 @@ class TestEarlySend:
     @staticmethod
     def _worker(*, enabled=True, use_host_buffer=False):
         w = TestPerShardWrite._writing_worker(ranks=2)
-        w._early_push_enabled = enabled
+        # Derived rather than assigned: host staging is folded into the gate,
+        # so "streaming on with a host buffer" is a state __init__ cannot
+        # produce and a test must not invent.
+        w._early_push_enabled = enabled and not use_host_buffer
         w.use_host_buffer = use_host_buffer
         w._finished_blocks_inbox = queue.Queue()
         w._evict_finished_inbox = queue.Queue()
@@ -1035,11 +1093,12 @@ class TestEarlySend:
         return w
 
     @staticmethod
-    def _meta(saves=(), pushes=()):
+    def _meta(saves=(), pushes=(), recvs=None, totals=None):
         """The real metadata object, built the way the scheduler builds it.
 
-        Hand-rolling it would leave the one thing the two sides have to agree
-        on -- the shape `add_new_req_to_save` stores -- pinned on neither side.
+        Hand-rolling it here would leave the one thing the two sides have to
+        agree on -- the shape `add_new_req_to_save` stores and the total the
+        window is measured from -- pinned on neither side.
         """
         meta = RblnNixlConnectorMetadata()
         for r in saves:
@@ -1047,6 +1106,19 @@ class TestEarlySend:
                 request_id=r, local_block_ids=([1, 2],), kv_transfer_params={}
             )
         meta.push_finished_blocks = dict.fromkeys(pushes, ([1, 2],))
+        for r, blocks in (recvs or {}).items():
+            meta.add_new_req_to_recv(
+                request_id=r,
+                local_block_ids=blocks,
+                kv_transfer_params={
+                    "remote_block_ids": [0],
+                    "remote_engine_id": "eng",
+                    "remote_request_id": r,
+                    "remote_host": "h",
+                    "remote_port": 1,
+                },
+            )
+        meta.push_stream_total.update(totals or {})
         return meta
 
     def test_a_closed_prefill_is_held_rather_than_handed_over(self):
@@ -1056,9 +1128,29 @@ class TestEarlySend:
 
         worker.start_early_push(self._meta(saves=["r0"]))
 
-        assert worker._pending_early_offers == {"r0": ([1, 2],)}
+        assert worker._streamed["r0"].pending_offer == ([1, 2],)
         assert worker._finished_blocks_inbox.empty()
-        assert worker._early_sends == set()
+        assert not worker._streamed["r0"].released
+
+    def test_the_total_the_window_is_measured_from_comes_with_the_offer(self):
+        # The prefix offered mid-stream is shorter than the request's final
+        # block list, so where the consumer's window begins can only be found
+        # from the total the scheduler sends alongside it.
+        worker = self._worker()
+
+        worker.start_early_push(self._meta(saves=["r0"], totals={"r0": 7}))
+
+        assert worker._streamed["r0"].total == 7
+
+    def test_a_step_with_nothing_held_releases_nothing(self):
+        # Guard: release runs on every step, including the ones that close no
+        # block, and must not wake the writer for an empty handover.
+        worker = self._worker()
+
+        worker.release_early_offers()
+
+        assert worker._finished_blocks_inbox.empty()
+        assert not worker._push_writer_wake.is_set()
 
     def test_the_next_step_hands_it_over(self):
         worker = self._worker()
@@ -1067,8 +1159,8 @@ class TestEarlySend:
         worker.release_early_offers()
 
         assert worker._finished_blocks_inbox.get_nowait() == ("r0", ([1, 2],))
-        assert worker._early_sends == {"r0"}
-        assert worker._pending_early_offers == {}
+        assert worker._streamed["r0"].released
+        assert worker._streamed["r0"].pending_offer is None
         assert worker._push_writer_wake.is_set()
 
     def test_a_step_that_closes_nothing_still_releases_what_is_held(self):
@@ -1089,47 +1181,62 @@ class TestEarlySend:
 
         worker.start_early_push(self._meta(saves=["r0"]))
 
-        assert worker._pending_early_offers == {}
+        assert worker._streamed == {}
 
-    def test_the_gate_off_offers_nothing(self):
+    def test_the_gate_off_holds_nothing(self):
         # Guard: the direct path had no offer before this change either, so
         # what this pins is that the flag is what turns it on.
         worker = self._worker(enabled=False)
 
         worker.start_early_push(self._meta(saves=["r0"]))
 
-        assert worker._pending_early_offers == {}
+        assert worker._streamed == {}
 
     def test_an_early_write_is_kept_out_of_the_completion_accounting(self):
-        # `_sending_transfers` is what the base reports completions from, and
+        # `_sending_transfers` is what upstream reports completions from, and
         # the scheduler frees a request's blocks on that report -- this one is
         # still prefilling.
         worker = self._worker()
-        worker._early_sends = {"r0"}
+        _send(worker, released=True)
 
         worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1],), ([3],)))
 
         assert "r0" not in worker._sending_transfers
-        assert len(worker._early_transfers["r0"]) == 2
+        # One batch, one handle per overlapping peer rank.
+        assert worker._streamed["r0"].transfers == [[ANY, ANY]]
 
-    def test_the_handover_publishes_the_hold_and_drops_the_duplicate(self, monkeypatch):
-        # The request appearing here IS the engine saying it finished, which is
-        # what the report is allowed to follow. Its blocks were written
-        # already, so passing them on would send them twice.
+    def test_the_handover_is_the_last_batch_and_seals_the_count(self, monkeypatch):
+        # The request appearing here IS the engine saying it is over. It is one
+        # more batch, not a duplicate: what was streamed is the prefix a
+        # prefill closed, and a prompt's last block is closed by nothing.
         monkeypatch.setattr(
             NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
         )
         worker = self._worker()
-        worker._early_sends = {"r0"}
-        worker._early_transfers["r0"] = [7, 8]
+        _send(worker, released=True, queued=2)
         meta = self._meta(pushes=["r0"])
 
         worker.start_load_kv(meta)
 
-        assert worker._sending_transfers["r0"] == [7, 8]
-        assert worker._early_sends == set()
-        assert "r0" not in worker._early_transfers
-        assert meta.push_finished_blocks == {}
+        assert worker._streamed["r0"].expected == 3
+        assert meta.push_finished_blocks == {"r0": ([1, 2],)}
+
+    def test_the_handover_does_not_publish_what_upstream_could_report(
+        self, monkeypatch
+    ):
+        # Guard: a batch handed over on this same step has not been issued
+        # yet, and upstream reports a request the moment the handles it can
+        # see have landed. What it cannot see cannot be reported early.
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
+        )
+        worker = self._worker()
+        _send(worker, released=True, transfers=[[7, 8]])
+
+        worker.start_load_kv(self._meta(pushes=["r0"]))
+
+        assert "r0" not in worker._sending_transfers
+        assert worker._streamed["r0"].transfers == [[7, 8]]
 
     def test_a_request_written_only_at_the_handover_is_left_alone(self, monkeypatch):
         # Guard: the suppression must reach exactly the requests written
@@ -1146,10 +1253,10 @@ class TestEarlySend:
         assert meta.push_finished_blocks == {"r1": ([1, 2],)}
 
     def test_the_writer_count_is_the_one_the_handover_would_have_sent(self):
-        # Guard: one send per writer is what lets the consumer settle on the
-        # count it already knows, and block-granular sends would break it.
+        # Guard: an early write is the same one write the handover would have
+        # made, so the count the consumer settles on must not move.
         worker = self._worker()
-        worker._early_sends = {"r0"}
+        _send(worker, released=True)
 
         worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1],), ([3],)))
 
@@ -1157,11 +1264,12 @@ class TestEarlySend:
             c.kwargs["notif_msg"]
             for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
         }
-        assert notifs == {b"r0:1"}
+        assert notifs == {b"RBLNS:0:0:1:r0:1"}
 
     def test_the_delegated_route_never_carries_an_early_write(self, monkeypatch):
-        # An early write exists only above one pipeline stage, and a consumer
-        # holds every layer, so this producer is always the narrower side.
+        # That route's notification has no room for the range a write filled,
+        # so a prefix over it would settle nothing. The handshake is what keeps
+        # this unreachable -- see `_writes_less_than_a_request`.
         monkeypatch.setattr(
             NixlPushConnectorWorker,
             "_xfer_blocks_for_req",
@@ -1169,10 +1277,29 @@ class TestEarlySend:
         )
         worker = self._worker()
         worker._overlapping_ranks = {}
-        worker._early_sends = {"r0"}
+        _send(worker, released=True)
 
-        with pytest.raises(AssertionError):
+        with pytest.raises(AssertionError, match="whole-engine handle"):
             worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1],), ([3],)))
+
+    @pytest.mark.parametrize(
+        ("enabled", "host_buffer", "expected"),
+        [(True, False, True), (False, False, False), (True, True, False)],
+    )
+    def test_streaming_asks_every_peer_for_its_own_descriptors(
+        self, enabled, host_buffer, expected
+    ):
+        # The handshake reads this to decide whether a peer that narrows
+        # nothing still needs per-shard state. Host staging moves a request at
+        # a time, so it wants the ordinary route.
+        worker = self._worker(enabled=enabled, use_host_buffer=host_buffer)
+
+        assert worker._writes_less_than_a_request() is expected
+
+    def test_the_read_path_never_asks_for_its_own_descriptors(self):
+        # The predicate lives on the shared layer and the read path inherits
+        # it; answering yes there would register shards nothing reads.
+        assert RblnNixlWorkerBase._writes_less_than_a_request(object()) is False
 
 
 class TestFlushEarlySends:
@@ -1183,8 +1310,7 @@ class TestFlushEarlySends:
     @staticmethod
     def _worker(states):
         w = TestEarlySend._worker()
-        w._early_sends = {"r0"}
-        w._early_transfers["r0"] = [7]
+        _send(w, released=True, transfers=[[7]])
         w.nixl_wrapper.check_xfer_state.side_effect = states
         return w
 
@@ -1192,11 +1318,11 @@ class TestFlushEarlySends:
         # Its blocks go back to the allocator now; releasing the offer at the
         # next step would write into whatever took them.
         worker = self._worker(["DONE"])
-        worker._pending_early_offers = {"r0": ([1, 2],)}
+        _send(worker, pending_offer=([1, 2],))
 
         worker.flush_early_sends({"r0"})
 
-        assert worker._pending_early_offers == {}
+        assert worker._streamed == {}
 
     def test_an_in_flight_write_is_waited_for_and_released(self):
         worker = self._worker(["PROC", "DONE"])
@@ -1205,8 +1331,7 @@ class TestFlushEarlySends:
 
         assert worker.nixl_wrapper.check_xfer_state.call_count == 2
         worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
-        assert worker._early_sends == set()
-        assert "r0" not in worker._early_transfers
+        assert worker._streamed == {}
         # The writer holds state for a request it may never see finish.
         assert worker._evict_finished_inbox.get_nowait() == "r0"
 
@@ -1218,3 +1343,678 @@ class TestFlushEarlySends:
         worker.flush_early_sends({"r0"})
 
         worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
+
+
+class TestOutboundFailure:
+    """The write path runs upstream's completion check over its own outbound
+    handles, and upstream's failure handler is written for the read direction.
+    A failed WRITE queued as a failed receive kills the engine a step later:
+    `get_finished` asserts every request it reports as received has receive
+    metadata, and a request this rank was sending has none."""
+
+    @staticmethod
+    def _worker(*, receiving):
+        w = _push_worker()
+        w.nixl_wrapper = MagicMock()
+        w.xfer_stats = MagicMock()
+        w._failed_recv_reqs = queue.Queue()
+        w._invalid_block_ids = queue.Queue()
+        w._is_hma_required = False
+        # Upstream's structured failure log names this rank's own engine.
+        w.engine_id = "local"
+        w._recving_metadata = (
+            {"r0": MagicMock(local_block_ids=([1, 2],))} if receiving else {}
+        )
+        return w
+
+    def test_the_completion_check_is_what_routes_a_failed_write_here(self):
+        # The two above call the handler directly, which says nothing about
+        # upstream still calling it. It reaches this handler from the state
+        # check over outbound handles, and if that call site moves the engine
+        # goes back to dying a step later.
+        worker = self._worker(receiving=False)
+        worker.nixl_wrapper.check_xfer_state.return_value = "ERR"
+        sending = {"r0": [7]}
+
+        worker._pop_done_transfers(sending)
+
+        assert worker._failed_recv_reqs.empty()
+        assert worker._invalid_block_ids.empty()
+        worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
+
+    def test_a_failed_write_is_not_queued_as_a_failed_receive(self):
+        worker = self._worker(receiving=False)
+
+        worker._handle_failed_transfer("r0", 7)
+
+        assert worker._failed_recv_reqs.empty()
+        assert worker._invalid_block_ids.empty()
+        worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
+        worker.xfer_stats.record_failed_transfer.assert_called_once()
+
+    def test_a_failed_read_still_reaches_upstream(self):
+        # Guard: this engine receives as well, and that direction is the one
+        # upstream's handler was written for.
+        worker = self._worker(receiving=True)
+
+        worker._handle_failed_transfer("r0", 7)
+
+        assert worker._failed_recv_reqs.get_nowait() == "r0"
+        assert worker._invalid_block_ids.get_nowait() == {1, 2}
+
+
+class TestCoverageNotif:
+    """A completion notification names the half-open range of consumer blocks
+    the write filled, ahead of the message upstream builds. Nothing settles on
+    the range yet; what has to hold now is that the producer states it and the
+    consumer hands upstream exactly what it was handed before."""
+
+    def test_the_range_covers_every_block_the_consumer_registered(self):
+        worker = TestPerShardWrite._writing_worker(ranks=1)
+
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([1, 2, 3],), ([7, 8, 9],))
+        )
+
+        notifs = {
+            c.kwargs["notif_msg"]
+            for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
+        }
+        assert notifs == {b"RBLNS:0:0:3:r0:1"}
+
+    def test_a_pipeline_stage_names_itself(self, monkeypatch):
+        # The writer id is the flat rank the per-shard route already pairs by,
+        # so a consumer can tell one stage's ranges from another's.
+        worker = TestPerShardWrite._writing_worker(ranks=1)
+        worker.vllm_config.parallel_config.pipeline_parallel_size = 4
+        worker.world_size = 2
+        worker.tp_rank = 1
+        setattr_in_package(
+            monkeypatch, get_pp_group=lambda: SimpleNamespace(rank_in_group=3)
+        )
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1],), ([7],)))
+
+        notifs = {
+            c.kwargs["notif_msg"]
+            for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
+        }
+        # pp_rank 3 of a 2-wide tensor split, tp_rank 1 -> flat rank 7.
+        assert {n.split(b":")[1] for n in notifs} == {b"7"}
+
+    def test_several_kv_groups_leave_the_range_off(self):
+        # Guard: the groups go out together but carry their own lengths, so no
+        # single range describes the write. The consumer has to cope with the
+        # prefix being absent, which is also how the route upstream drives
+        # stays on the old wire.
+        worker = TestPerShardWrite._writing_worker(ranks=1)
+        worker._shard_region_group_ids = {("eng", 0): (0, 0)}
+
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([1], [2, 3]), ([7], [8, 9]))
+        )
+
+        notifs = {
+            c.kwargs["notif_msg"]
+            for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
+        }
+        assert notifs == {b"r0:1"}
+
+    def test_upstream_is_handed_the_message_it_had_before(self):
+        # Upstream reads a notification as `req_id:count` with rsplit, so a
+        # prefix left on would make it look up a request that does not exist.
+        assert RblnNixlPushConnectorWorker._split_coverage(b"RBLNS:2:0:5:r0:4") == (
+            2,
+            (0, 5),
+            b"r0:4",
+        )
+
+    def test_a_message_without_a_range_passes_through(self):
+        assert RblnNixlPushConnectorWorker._split_coverage(b"r0:4") == (
+            None,
+            None,
+            b"r0:4",
+        )
+
+
+class TestSettleOnCoverage:
+    """A writer that names the ranges it filled is settled on those ranges, not
+    on how many notifications it sent. That is what lets one writer's KV arrive
+    in pieces: its reports are dropped here until its ranges span every block
+    this rank registered, leaving upstream the one notification per writing
+    rank that its own count is written for."""
+
+    @staticmethod
+    def _receiving_worker():
+        w = _push_worker()
+        w.world_size = 1
+        w._coverage_by_req = defaultdict(lambda: defaultdict(list))
+        w._reqs_to_send = {}
+        w._reqs_to_process = set()
+        # Three blocks registered: what a writer's ranges have to cover.
+        w._recving_metadata = {
+            "r0": SimpleNamespace(local_physical_block_ids=([4, 5, 6],))
+        }
+        w._pending_completion_notifs = queue.Queue()
+        w.transfer_topo = MagicMock()
+        return w
+
+    @pytest.mark.parametrize(
+        "notif, reason",
+        [(b"HB:engine-1", "heartbeat"), (b"r0:1", "names no range")],
+    )
+    def test_what_upstream_owns_is_passed_straight_through(
+        self, handed_through, notif, reason
+    ):
+        # A heartbeat is not a completion at all, and a request written in one
+        # transfer names no range -- upstream counts those itself.
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(notif)
+
+        worker._get_new_notifs()
+
+        assert handed_through == [notif], reason
+
+    def test_our_own_outbound_request_is_left_to_upstream(self, handed_through):
+        # A request this rank is sending is upstream's own accounting, even
+        # though the notification looks identical to one we are receiving.
+        worker = self._receiving_worker()
+        worker._reqs_to_process = {"r0"}
+        worker._pending_completion_notifs.put(b"r0:4")
+
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:4"]
+
+    def test_a_writer_that_has_sent_part_does_not_settle_the_request(
+        self, handed_through
+    ):
+        worker = self._receiving_worker()
+        # Three blocks registered; this writer has filled the first two.
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:2:r0:1")
+
+        worker._get_new_notifs()
+
+        assert handed_through == []
+
+    def test_the_pieces_together_settle_it(self, handed_through):
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:2:r0:1")
+        worker._get_new_notifs()
+        assert handed_through == []
+
+        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:r0:1")
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:1"]
+
+    def test_each_writer_is_released_on_its_own_ranges(self, handed_through):
+        # One writer spanning the whole list says nothing about the other,
+        # whose layers are just as missing -- but it is upstream that waits for
+        # the second, counting one notification per writing rank. Handing it
+        # both is what lets that count reach its total.
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:r0:2")
+        worker._get_new_notifs()
+        assert handed_through == [b"r0:2"]
+
+        worker._pending_completion_notifs.put(b"RBLNS:1:0:3:r0:2")
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:2", b"r0:2"]
+
+    def test_one_write_for_the_whole_request_settles_at_once(self, handed_through):
+        # Guard: this is every request today, and it has to settle exactly
+        # where the count would have settled it.
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:r0:1")
+
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:1"]
+
+    def test_a_resend_does_not_stand_in_for_the_gap_it_skips(self, handed_through):
+        # A preempted request is rescheduled from the start of its block list,
+        # so a writer re-sends what it already sent. Counting blocks would
+        # reach three here with the third never written.
+        worker = self._receiving_worker()
+        for span in (b"0:1", b"0:1", b"0:1"):
+            worker._pending_completion_notifs.put(b"RBLNS:0:" + span + b":r0:1")
+
+        worker._get_new_notifs()
+
+        assert handed_through == []
+
+    def test_a_later_range_does_not_close_an_earlier_gap(self, handed_through):
+        # The ranges reach the last block while the middle one was never
+        # written. Whether a range starts past what has been covered is the
+        # only thing separating this from a complete request.
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:1:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:r0:1")
+
+        worker._get_new_notifs()
+
+        assert handed_through == []
+
+    def test_filling_the_gap_settles_it(self, handed_through):
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:1:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:r0:1")
+        worker._get_new_notifs()
+        assert handed_through == []
+
+        worker._pending_completion_notifs.put(b"RBLNS:0:1:2:r0:1")
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:1"]
+
+    def test_a_finished_request_drops_its_ranges(self, monkeypatch):
+        # A retry reuses the request id, so leftover ranges would settle it
+        # before the retry had written anything.
+        worker = self._receiving_worker()
+        worker._coverage_by_req["r0"][0].append((0, 3))
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "get_finished", lambda self: (set(), {"r0"})
+        )
+
+        worker.get_finished()
+
+        assert worker._coverage_by_req == {}
+
+    def test_a_request_written_in_one_transfer_drops_its_token_count(self, monkeypatch):
+        # `_forget_send` only runs for a request written in batches, so an
+        # ordinary push would keep its count for the life of the process.
+        worker = self._receiving_worker()
+        worker._valid_tokens = {"r0": 33, "other": 9}
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "get_finished", lambda self: ({"r0"}, set())
+        )
+
+        worker.get_finished()
+
+        assert worker._valid_tokens == {"other": 9}
+
+
+class TestABatchThatSendsNothing:
+    """A streamed request is reported when its landed batches reach the sealed
+    count, so a batch that issues no write still has to raise the count --
+    otherwise the request is one short of its seal forever and never
+    finishes."""
+
+    @staticmethod
+    def _worker():
+        w = TestPerShardWrite._writing_worker(ranks=2)
+        _send(w, released=True)
+        w.xfer_stats = MagicMock()
+        # The failure path names this rank's own engine in its log line.
+        w.engine_id = "local"
+        return w
+
+    def test_a_write_with_no_blocks_left_still_counts(self):
+        # The window can come up empty when the offer adds nothing past what
+        # the high-water mark already covers.
+        worker = self._worker()
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([],), ([],)))
+
+        assert worker._streamed["r0"].done == 1
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 0
+
+    def test_every_peer_failing_still_counts(self):
+        worker = self._worker()
+        worker.nixl_wrapper.make_prepped_xfer.side_effect = RuntimeError("boom")
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1, 2],), ([3, 4],)))
+
+        assert worker._streamed["r0"].done == 1
+        assert worker._streamed["r0"].transfers == []
+
+    def test_a_request_not_streamed_counts_nothing(self):
+        # Guard: the count only exists for requests this side seals.
+        worker = self._worker()
+        worker._streamed.clear()
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([],), ([],)))
+
+        assert worker._streamed == {}
+
+
+class TestSealedCompletion:
+    """A request written before the engine finished it is reported by this
+    side, not by upstream: it reports what it can see, and a batch parked
+    here is what keeps it from seeing a request whose next batch has not been
+    issued. So the report waits for the seal and for every batch to land."""
+
+    @staticmethod
+    def _worker(states):
+        w = _push_worker()
+        w.nixl_wrapper = MagicMock()
+        w.nixl_wrapper.check_xfer_state.side_effect = states
+        w.xfer_stats = MagicMock()
+        w._recving_metadata = {}
+        w._evict_finished_inbox = queue.Queue()
+        w._push_writer_wake = threading.Event()
+        w._writer_counts_by_req = defaultdict(int)
+        w._coverage_by_req = defaultdict(lambda: defaultdict(list))
+        _send(w, released=True)
+        return w
+
+    @staticmethod
+    def _upstream_reports_nothing(monkeypatch):
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "get_finished", lambda self: (set(), set())
+        )
+
+    def test_a_landed_batch_is_not_reported_before_the_seal(self, monkeypatch):
+        # The engine has not finished the request, so its blocks must not be
+        # freed however much of its KV is already across.
+        self._upstream_reports_nothing(monkeypatch)
+        worker = self._worker(["DONE"])
+        _send(worker, transfers=[[7]], queued=1)
+
+        done_sending, _ = worker.get_finished()
+
+        assert done_sending == set()
+
+    def test_the_seal_completes_a_request_whose_batches_already_landed(
+        self, monkeypatch
+    ):
+        self._upstream_reports_nothing(monkeypatch)
+        worker = self._worker(["DONE"])
+        _send(worker, transfers=[[7]], queued=1)
+        worker.get_finished()
+        worker._streamed["r0"].expected = 1
+
+        done_sending, _ = worker.get_finished()
+
+        assert done_sending == {"r0"}
+
+    def test_a_sealed_request_waits_for_its_last_batch(self, monkeypatch):
+        # Two batches handed over, one still going: the seal alone does not
+        # finish it.
+        self._upstream_reports_nothing(monkeypatch)
+        worker = self._worker(["DONE", "PROC", "DONE"])
+        _send(worker, transfers=[[7], [8]], queued=2, expected=2)
+
+        assert worker.get_finished()[0] == set()
+
+        assert worker.get_finished()[0] == {"r0"}
+
+    def test_a_finished_request_leaves_nothing_behind(self, monkeypatch):
+        # A retry reuses the request id, so a leftover count would report the
+        # retry finished before it had written anything.
+        self._upstream_reports_nothing(monkeypatch)
+        worker = self._worker(["DONE"])
+        _send(worker, transfers=[[7]], queued=1, expected=1)
+        worker._reqs_to_send = {"r0": 1.0}
+        worker._reqs_to_process = {"r0"}
+        worker.consumer_notification_counts_by_req = {"r0": 1}
+
+        worker.get_finished()
+
+        assert worker._streamed == {}
+        assert worker._reqs_to_send == {}
+        assert worker._reqs_to_process == set()
+        assert worker.consumer_notification_counts_by_req == {}
+
+    def test_a_request_upstream_owns_is_left_to_it(self, monkeypatch):
+        # Guard: with the flag off nothing is written early, so none of this
+        # runs and upstream reports every request as it did before.
+        self._upstream_reports_nothing(monkeypatch)
+        worker = self._worker([])
+        worker._streamed.clear()
+
+        assert worker.get_finished()[0] == set()
+        assert worker.nixl_wrapper.check_xfer_state.call_count == 0
+
+
+class TestEmptyReceive:
+    """A request turned away before it was scheduled is registered as a receive
+    of no blocks, so the producer stops holding what it pinned. Nothing is ever
+    written into no blocks, so the notification that settles a receive never
+    comes and the entry outlives the request.
+
+    This side settles it. Upstream cannot: what it does with a receive it
+    reports starts by asking which engine the blocks came from, and a request
+    turned away never made this rank handshake with one."""
+
+    @staticmethod
+    def _worker(monkeypatch):
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
+        )
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "get_finished", lambda self: (set(), set())
+        )
+        w = _push_worker()
+        w.use_host_buffer = False
+        return w
+
+    def test_a_receive_of_nothing_is_finished_on_arrival(self, monkeypatch):
+        worker = self._worker(monkeypatch)
+        worker._recving_metadata["r0"] = MagicMock()
+
+        worker.start_load_kv(TestEarlySend._meta(recvs={"r0": ()}))
+
+        assert worker.get_finished()[1] == {"r0"}
+        assert worker._recving_metadata == {}
+
+    def test_an_empty_group_counts_as_nothing(self, monkeypatch):
+        # The block ids arrive per KV cache group, so "no blocks" can be a
+        # group carrying none rather than no groups at all.
+        worker = self._worker(monkeypatch)
+
+        worker.start_load_kv(TestEarlySend._meta(recvs={"r0": ([],)}))
+
+        assert worker.get_finished()[1] == {"r0"}
+
+    def test_upstream_is_never_asked_to_finish_it(self, monkeypatch):
+        # Reported through upstream's transfer table, the request reaches the
+        # post-processing that looks up an engine this rank never met.
+        worker = self._worker(monkeypatch)
+
+        worker.start_load_kv(TestEarlySend._meta(recvs={"r0": ()}))
+
+        assert worker._recving_transfers == {}
+
+    def test_it_is_settled_once(self, monkeypatch):
+        # Its receive metadata is gone after the first report, so a second one
+        # names a request the scheduler has already released.
+        worker = self._worker(monkeypatch)
+
+        worker.start_load_kv(TestEarlySend._meta(recvs={"r0": ()}))
+        worker.get_finished()
+
+        assert worker.get_finished()[1] == set()
+
+    def test_a_receive_with_blocks_is_left_to_the_write_that_fills_it(
+        self, monkeypatch
+    ):
+        # Guard: settling this one would free blocks the producer is writing.
+        worker = self._worker(monkeypatch)
+
+        worker.start_load_kv(TestEarlySend._meta(recvs={"r0": ([1, 2],)}))
+
+        assert worker.get_finished()[1] == set()
+        assert worker._recving_transfers == {}
+
+
+class TestRegistrationOutlivesOneBatch:
+    """The consumer registers once and is written to until the request is over.
+    Taking the registration out on the first batch leaves every later one with
+    nothing to match, parked against a registration that already arrived."""
+
+    @staticmethod
+    def _worker():
+        w = _push_worker()
+        w._pending_d_registrations = {"r0": {"decode_engine_id": "eng"}}
+        return w
+
+    def test_a_second_batch_still_finds_it(self):
+        worker = self._worker()
+
+        first = worker._pop_matching_registration("r0")
+        second = worker._pop_matching_registration("r0")
+
+        assert first is not None
+        assert second is first
+
+    def test_a_retried_request_matches_on_the_id_without_its_suffix(self):
+        # A retry carries a fresh random suffix; the registration is the one
+        # the consumer sent before it.
+        worker = self._worker()
+        worker._pending_d_registrations = {"r0-aabbccdd": {"decode_engine_id": "eng"}}
+
+        assert worker._pop_matching_registration("r0-11223344") is not None
+        assert "r0-aabbccdd" in worker._pending_d_registrations
+
+    def test_a_request_with_no_registration_is_unmatched(self):
+        worker = self._worker()
+
+        assert worker._pop_matching_registration("other") is None
+
+
+class TestStreamWindow:
+    """A streamed offer is a growing prefix of the producer's blocks, and the
+    consumer registered the tail of the prompt. So each batch writes the part
+    of the consumer's list it is the first to reach, and the total is what
+    places that list inside ours."""
+
+    @staticmethod
+    def _worker(total=None):
+        w = TestPerShardWrite._writing_worker(ranks=1)
+        w._physical_blocks_per_logical_kv_block = 1
+        w._recving_metadata = {}
+        if total is not None:
+            _send(w, total=total)
+        return w
+
+    @staticmethod
+    def _sent(worker):
+        """The local block ids each WRITE was built from.
+
+        Read back off the descriptor ids: an 8-block shard with 2 regions maps
+        block b to descs b and b+8, so the low half names the blocks.
+        """
+        return [
+            sorted(d for d in c.args[2] if d < worker.num_blocks)
+            for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
+        ]
+
+    def test_the_first_batch_starts_where_the_consumer_window_does(self):
+        # Four blocks in the prompt, the consumer registered the last two: its
+        # window begins at our block 2. Two closed so far, so exactly one of
+        # them is inside it.
+        worker = self._worker(total=4)
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
+        )
+
+        assert self._sent(worker) == [[2]]
+        assert worker._streamed["r0"].issued_hwm == 1
+
+    def test_the_next_batch_starts_where_the_last_one_stopped(self):
+        worker = self._worker(total=4)
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
+        )
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        )
+
+        assert self._sent(worker) == [[2], [3]]
+        assert worker._streamed["r0"].issued_hwm == 2
+
+    def test_a_prefix_short_of_the_window_writes_nothing(self):
+        # The consumer's cache covered everything this prefix has reached.
+        worker = self._worker(total=4)
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([0, 1],), ([4, 5],)))
+
+        assert self._sent(worker) == []
+        assert worker._streamed["r0"].issued_hwm == 0
+
+    def test_the_range_says_which_blocks_the_batch_filled(self):
+        worker = self._worker(total=4)
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
+        )
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        )
+
+        notifs = [
+            c.kwargs["notif_msg"]
+            for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
+        ]
+        assert notifs == [b"RBLNS:0:0:1:r0:1", b"RBLNS:0:1:2:r0:1"]
+
+    def test_a_request_that_is_not_streamed_is_left_to_the_trim(self):
+        # Guard: with the flag off no total ever arrives, and this is every
+        # request today -- one write covering the consumer's whole list.
+        worker = self._worker()
+
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
+        )
+
+        assert self._sent(worker) == [[1, 2]]
+
+    def test_an_unequal_expansion_is_left_to_the_trim(self):
+        # Guard: past the identity the two lengths this subtracts count
+        # different things.
+        worker = self._worker(total=4)
+        worker.transfer_topo.get_engine_info.return_value = MagicMock(
+            remote_tp_size=1,
+            remote_block_size=16,
+            remote_physical_blocks_per_logical=2,
+        )
+        worker._recving_metadata = {
+            "r0": SimpleNamespace(remote=SimpleNamespace(engine_id="eng"))
+        }
+
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
+        )
+
+        assert self._sent(worker) == [[1, 2]]
+
+
+class TestRegistrationSurvivesEitherArrival:
+    """A registration reaches the writer two ways: it arrives and finds the
+    blocks already parked, or it is already held when they arrive. Only the
+    second stored it, so a request whose registration came late was written
+    once and then never again -- every batch after it parked against a
+    registration that had come and gone."""
+
+    @staticmethod
+    def _worker(monkeypatch):
+        monkeypatch.setattr(
+            NixlPushConnectorWorker,
+            "_do_start_push_kv",
+            lambda self, req_id, blocks, reg: None,
+        )
+        w = _push_worker()
+        w._pending_d_registrations = {}
+        return w
+
+    def test_a_write_leaves_the_registration_behind(self, monkeypatch):
+        worker = self._worker(monkeypatch)
+        reg = {"request_id": "r0", "decode_engine_id": "eng"}
+
+        worker._do_start_push_kv("r0", ([1],), reg)
+
+        assert worker._pending_d_registrations == {"r0": reg}
+        assert worker._pop_matching_registration("r0") is reg
+
+    def test_the_one_already_held_is_not_replaced(self, monkeypatch):
+        # Guard: upstream stores it on the other path, and that entry is the
+        # one the writer has been matching against.
+        worker = self._worker(monkeypatch)
+        held = {"request_id": "r0", "decode_engine_id": "eng"}
+        worker._pending_d_registrations["r0"] = held
+
+        worker._do_start_push_kv("r0", ([1],), dict(held))
+
+        assert worker._pending_d_registrations["r0"] is held

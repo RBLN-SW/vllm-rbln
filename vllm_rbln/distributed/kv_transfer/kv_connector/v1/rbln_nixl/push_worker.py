@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import queue
 import threading
 import time
 from collections import defaultdict
 from contextlib import AbstractContextManager, nullcontext
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -26,13 +28,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPushConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    get_base_request_id,
+)
+from vllm.distributed.parallel_state import get_pp_group
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RBLN_COVERAGE_NOTIF_PREFIX,
     RblnNixlConnectorMetadata,
-    connector_option,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_scheduler import (
+    push_stream_enabled,
 )
 from vllm_rbln.logger import init_logger
 
@@ -45,11 +54,57 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+#: Half-open range of a request's blocks, as positions in the list this rank
+#: registered.
+Span = tuple[int, int]
+
 # How long a flush waits for an early write to leave the NIC before giving up
 # on it. Bounded because it runs on the engine main thread: a wedged transfer
-# must not take the engine with it.
+# must not take the engine with it. A fault detector, not a deadline -- what a
+# healthy write of this size costs is not known here, so a smaller value would
+# start abandoning writes that were about to land.
 _EARLY_FLUSH_DRAIN_TIMEOUT_S = 1.0
 _EARLY_FLUSH_POLL_INTERVAL_S = 0.001
+
+
+@dataclass
+class _StreamedSend:
+    """What one request being pushed in pieces needs tracked between batches.
+
+    One record on the request id rather than a map per field. The fields are
+    written at different points of a single lifetime -- offered, released to
+    the writer, issued, sealed, landed -- and there is no state in which only
+    some of them should exist, which is why ending it used to mean remembering
+    to drop the request from all eight.
+
+    Reached only under `_sending_transfers_lock`, except where the maps it
+    replaces were not: `start_early_push` and `_stream_window` run on the
+    engine thread and touch nothing the writer writes.
+    """
+
+    # Blocks this rank has closed, held for the next step to hand over. None
+    # once released, or once an abort dropped the offer.
+    pending_offer: "BlockIds | None" = None
+    # Whether the writer has been told about this request at all. Not derivable
+    # from `pending_offer`: an aborted offer clears that without ever releasing.
+    released: bool = False
+    # Blocks the request will hold once its whole prompt is computed, which is
+    # what places the consumer's window inside our list.
+    total: int | None = None
+    # Handles grouped by the batch that issued them, kept out of
+    # `_sending_transfers` so upstream cannot report the request as finished:
+    # the scheduler frees a request's blocks on that report unconditionally,
+    # and this one is still prefilling.
+    transfers: list[list[int]] = field(default_factory=list)
+    # Batches handed to the writer, and batches whose writes have landed.
+    queued: int = 0
+    done: int = 0
+    # How many batches the request will have, once the engine says it is over.
+    # None until then: an unsealed request is never finished, however many of
+    # its batches have landed.
+    expected: int | None = None
+    # How many of the consumer's blocks the writer has already filled.
+    issued_hwm: int = 0
 
 
 class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
@@ -67,26 +122,28 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        # Tokens a handed-over request holds, for `_tail_chunks`.
+        # Tokens a handed-over request holds, for `_tail_chunks`. Every
+        # request has one, streamed or not, so it is not part of
+        # `_StreamedSend`.
         self._valid_tokens: dict[str, int] = {}
 
-        # A stage's write overlaps the stages that come after it, so there is
-        # nothing to overlap with when this producer is one stage.
-        self._early_push_enabled = (
-            connector_option(vllm_config, "push_stream", False)
-            and vllm_config.parallel_config.pipeline_parallel_size > 1
+        # Ranges of this request's blocks each writer has reported filling,
+        # for a peer that does name them. Kept per writer because a request
+        # settles only once every one of them has covered the whole list.
+        self._coverage_by_req: defaultdict[str, defaultdict[int, list[Span]]] = (
+            defaultdict(lambda: defaultdict(list))
         )
-        # Requests written from their closing prefill chunk, before the engine
-        # handed their blocks over. Membership survives several writes.
-        self._early_sends: set[ReqId] = set()
-        # Their handles, kept out of `_sending_transfers` so the base cannot
-        # report the request as finished_sending: the scheduler frees a
-        # request's blocks on that report unconditionally, and this one is
-        # still prefilling.
-        self._early_transfers: defaultdict[ReqId, list[int]] = defaultdict(list)
-        # Offers waiting for this rank's next step to order them (see
-        # `start_early_push`).
-        self._pending_early_offers: dict[ReqId, BlockIds] = {}
+
+        self._early_push_enabled = push_stream_enabled(
+            vllm_config,
+            is_hma_required=self._is_hma_required,
+            use_host_buffer=self.use_host_buffer,
+        )
+        # Per request, for as long as it is being pushed in pieces. Created
+        # when this rank first closes a chunk of it, dropped when the send is
+        # over -- see _StreamedSend.
+        self._streamed: dict[ReqId, _StreamedSend] = {}
+        self._empty_receives: set[ReqId] = set()
 
     def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
         """Hand this step's work to the writer, once the KV it names is settled.
@@ -99,8 +156,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         that, and if it ever stopped holding, the writer would ship a staging
         buffer still being filled -- silently, and only under host staging.
         """
-        assert isinstance(metadata, RblnNixlConnectorMetadata)
-        self._valid_tokens.update(metadata.valid_tokens)
         if self.use_host_buffer and metadata.push_finished_blocks:
             both = metadata.push_finished_blocks.keys() & metadata.reqs_to_save.keys()
             assert not both, (
@@ -108,29 +163,62 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 f"to the writer in one step: {sorted(both)}. The copy runs after "
                 "this call, so the write would read an unfilled buffer."
             )
-        self._adopt_early_sends(metadata)
+        assert isinstance(metadata, RblnNixlConnectorMetadata)
+        self._valid_tokens.update(metadata.valid_tokens)
+        self._seal_at_handover(metadata)
         super().start_load_kv(metadata)
+        self._settle_empty_receives(metadata)
 
-    def _adopt_early_sends(self, metadata: "NixlConnectorMetadata") -> None:
-        """Take a request the engine has now finished out of the early hold.
+    def _settle_empty_receives(self, metadata: "NixlConnectorMetadata") -> None:
+        """Finish a receive that has nothing to receive, on the step it arrives.
+
+        NOTE(RBLN): the serving layer can turn a request away before it was
+        ever scheduled, and upstream registers a receive of no blocks for it so
+        the producer stops holding what it pinned. Nothing is ever written into
+        no blocks, so the completion notification that would settle the request
+        never comes: it sits in the receive metadata for the life of the
+        engine, and the one place that drops an entry is the report this
+        request never reaches.
+
+        Settled here rather than through upstream's transfer table, though an
+        empty entry there would pop as done: everything upstream does with a
+        completed receive reads the blocks it landed in, starting with the
+        engine they came from. A request turned away never handshook with a
+        producer, so that lookup finds nothing and takes the engine down.
+        """
+        for req_id, meta in metadata.reqs_to_recv.items():
+            if not sum(len(group) for group in meta.local_block_ids):
+                self._empty_receives.add(req_id)
+
+    def _seal_at_handover(self, metadata: "NixlConnectorMetadata") -> None:
+        """Fix how many batches a request written early will have.
 
         Its arrival in `push_finished_blocks` IS the engine saying the request
-        finished, which is what the base's completion report is allowed to
-        follow. So publish the handles the early write left parked, and drop
-        the handover itself -- the blocks it carries are the ones already
-        written, or the ones the writer still holds unmatched.
+        is over, so nothing further will be handed to the writer for it.
+
+        The handover is one of those batches, not a duplicate of them. What was
+        streamed is the prefix of blocks a prefill CLOSED, and a prompt's last
+        block is closed by nothing -- its tokens end mid-block. The handover
+        carries the whole list, so it covers that tail, and the writer sends
+        only the part past what it already wrote.
+
+        Runs before the call that hands the same metadata to the writer, whose
+        landed count would otherwise pass a total not yet set. Sealed rather
+        than published: upstream reports a request finished once the handles it
+        can see have landed, and this step's batch is not one of them.
         """
         with self._sending_transfers_lock:
-            for req_id in list(metadata.push_finished_blocks):
-                if req_id not in self._early_sends:
+            for req_id in metadata.push_finished_blocks:
+                send = self._streamed.get(req_id)
+                if send is None or not send.released:
                     continue
-                self._early_sends.discard(req_id)
-                handles = self._early_transfers.pop(req_id, [])
-                if handles:
-                    self._sending_transfers[req_id].extend(handles)
-                del metadata.push_finished_blocks[req_id]
+                send.queued += 1
+                send.expected = send.queued
 
-    def start_early_push(self, metadata: "NixlConnectorMetadata") -> None:
+    def _writes_less_than_a_request(self) -> bool:
+        return self._early_push_enabled
+
+    def start_early_push(self, metadata: "RblnNixlConnectorMetadata") -> None:
         """Hold the prefill this stage has just closed, for the writer.
 
         NOTE(RBLN): `reqs_to_save` says a request's KV for this rank's layers
@@ -147,10 +235,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         for the step is already done: speculative decoding on the last stage
         defers `wait_for_save` past `get_finished`, which would reverse them.
         """
-        if not self._early_push_enabled or self.use_host_buffer:
+        if not self._early_push_enabled:
             return
         for req_id, meta in metadata.reqs_to_save.items():
-            self._pending_early_offers[req_id] = meta.local_block_ids
+            send = self._streamed.setdefault(req_id, _StreamedSend())
+            send.pending_offer = meta.local_block_ids
+            total = metadata.push_stream_total.get(req_id)
+            if total is not None:
+                send.total = total
 
     def release_early_offers(self) -> None:
         """Hand the previous step's held offers to the writer.
@@ -167,13 +259,19 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         held offer outliving the engine is what to suspect if a request ever
         stalls with its KV never arriving.
         """
-        if not self._pending_early_offers:
+        offers = [
+            (req_id, send, send.pending_offer)
+            for req_id, send in self._streamed.items()
+            if send.pending_offer is not None
+        ]
+        if not offers:
             return
-        offers = self._pending_early_offers
-        self._pending_early_offers = {}
         with self._sending_transfers_lock:
-            self._early_sends.update(offers)
-        for req_id, block_ids in offers.items():
+            for _, send, _ in offers:
+                send.released = True
+        for req_id, send, block_ids in offers:
+            send.pending_offer = None
+            send.queued += 1
             self._finished_blocks_inbox.put((req_id, block_ids))
         self._push_writer_wake.set()
 
@@ -190,10 +288,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         """
         drained = False
         for req_id in req_ids:
-            self._pending_early_offers.pop(req_id, None)
             with self._sending_transfers_lock:
-                self._early_sends.discard(req_id)
-                handles = self._early_transfers.pop(req_id, [])
+                send = self._streamed.get(req_id)
+                handles = [h for batch in send.transfers for h in batch] if send else []
+                self._forget_send(req_id)
             for handle in handles:
                 self._drain_early_handle(req_id, handle)
             self._evict_finished_inbox.put(req_id)
@@ -218,12 +316,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
     def shutdown(self) -> None:
         with self._sending_transfers_lock:
-            for handles in self._early_transfers.values():
-                for handle in handles:
-                    self.nixl_wrapper.release_xfer_handle(handle)
-            self._early_transfers.clear()
-            self._early_sends.clear()
-        self._pending_early_offers = {}
+            for send in self._streamed.values():
+                for handles in send.transfers:
+                    for handle in handles:
+                        self.nixl_wrapper.release_xfer_handle(handle)
+            self._streamed.clear()
+            self._valid_tokens.clear()
         super().shutdown()
 
     def finalize_kv_cache_registration(self) -> None:
@@ -253,11 +351,217 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         self._push_writer_thread.start()
         logger.info("nixl-push-writer thread started (rank=%d)", self.tp_rank)
 
+    def _get_new_notifs(self) -> set[str]:
+        """Hold a streamed writer back until it has covered the request.
+
+        NOTE(RBLN): a streamed write reports once per batch, and upstream
+        counts one report per writing rank. It would settle the request on the
+        first few batches while the rest of it is still arriving, and host
+        staging would copy a half-filled buffer to the device. Each report
+        names the range it filled, so the ones before a writer's last are
+        dropped here and upstream is handed the shape it counts.
+        """
+        for notif in self._drain_completion_notifs():
+            writer, span, notif = self._split_coverage(notif)
+            if self._writer_still_pending(notif, writer, span):
+                continue
+            self._pending_completion_notifs.put(notif)
+        return super()._get_new_notifs()
+
+    def _drain_completion_notifs(self) -> list[bytes]:
+        notifs = []
+        while True:
+            try:
+                notifs.append(self._pending_completion_notifs.get_nowait())
+            except queue.Empty:
+                return notifs
+
+    def _writer_still_pending(
+        self, notif: bytes, writer: int | None, span: "Span | None"
+    ) -> bool:
+        """Whether this notification leaves its writer short of the request.
+
+        False for anything upstream has to see itself: heartbeats, our own
+        outbound accounting, and a request we are not receiving.
+
+        A writer that names the range it filled is held until what it has
+        reported spans every block this rank registered, which is what leaves
+        upstream one notification per writing rank. A writer that names none
+        sends one already.
+
+        The block count comes from what this rank registered, not from
+        anything the peer said -- a peer that sends the wrong ranges must
+        stall the request, not settle it early.
+        """
+        msg = notif.decode("utf-8")
+        if msg.startswith("HB:"):
+            return False
+        req_id = msg.rsplit(":", 1)[0]
+        if req_id in self._reqs_to_send or req_id in self._reqs_to_process:
+            return False
+        meta = self._recving_metadata.get(req_id)
+        if meta is None:
+            return False
+        if span is None or writer is None:
+            return False
+
+        spans = self._coverage_by_req[req_id][writer]
+        spans.append(span)
+        return not self._covers(spans, len(meta.local_physical_block_ids[0]))
+
+    @staticmethod
+    def _covers(spans: list["Span"], num_blocks: int) -> bool:
+        """Whether the half-open ranges together leave no gap below num_blocks.
+
+        Ranges rather than a running total because a preempted request is
+        rescheduled from the start of its block list, so a writer re-sends what
+        it already sent. Adding those up reaches the count with a hole still in
+        the middle and settles a request whose KV is incomplete -- silently.
+        """
+        reach = 0
+        for lo, hi in sorted(spans):
+            if lo > reach:
+                return False
+            reach = max(reach, hi)
+            if reach >= num_blocks:
+                return True
+        return num_blocks == 0
+
+    def _do_start_push_kv(
+        self,
+        request_id: str,
+        local_block_ids: BlockIds,
+        registration_data: dict[str, Any],
+    ) -> None:
+        """Keep the registration this write matched, however it was matched.
+
+        NOTE(RBLN): a registration reaches the writer two ways -- it arrives
+        and finds the blocks already parked, or it is already held when the
+        blocks arrive. Upstream stores it only on the second, because on the
+        first it has just been used and, for a request written once, will not
+        be wanted again. A request written in batches wants it for every one
+        of them, and the batches that follow a registration which arrived late
+        find nothing to match: they park, and park forever, because the
+        registration that would release them came and went.
+
+        Stored here rather than where it arrives because both ways run through
+        this call, and because reading it back out of the notification would
+        mean repeating the decode and the validation upstream has already done.
+        """
+        self._pending_d_registrations.setdefault(
+            registration_data["request_id"], registration_data
+        )
+        return super()._do_start_push_kv(request_id, local_block_ids, registration_data)
+
+    def _pop_matching_registration(self, request_id: str) -> dict[str, Any] | None:
+        """Find the consumer's registration without consuming it.
+
+        NOTE(RBLN): upstream takes the registration out on the first batch it
+        matches, which is right while a request is written once. A request
+        written in several batches needs it for every one of them: the second
+        would find nothing, park, and wait for a registration that already
+        arrived and will not arrive again -- its blocks reaching the consumer
+        only when the lease gives up on them.
+
+        Kept until the request is done being written, which the eviction the
+        writer already drains does: it drops the registration for the same
+        request whose completion it drops the parked blocks for.
+        """
+        data = self._pending_d_registrations.get(request_id)
+        if data is not None:
+            return data
+        base_id = get_base_request_id(request_id)
+        for reg_id, reg_data in self._pending_d_registrations.items():
+            if get_base_request_id(reg_id) == base_id:
+                return reg_data
+        return None
+
+    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
+        """Record a failed WRITE as a failed send, not as a failed receive.
+
+        NOTE(RBLN): upstream's handler is written for the read direction --
+        it invalidates the blocks the transfer was filling and queues the
+        request as a failed receive. The write path runs the same completion
+        check over its outbound handles, where neither holds: the blocks are
+        this producer's own, and upstream's `get_finished` asserts that every
+        request it reports as received carries receive metadata, which one we
+        were sending never does. So the queued failure kills the engine a step
+        later, on the assertion rather than on the failure.
+
+        The blocks stay held until the lease expires, which is already how a
+        push that never completes is unwound.
+        """
+        if req_id not in self._recving_metadata:
+            if handle is not None:
+                self.nixl_wrapper.release_xfer_handle(handle)
+            self.xfer_stats.record_failed_transfer()
+            return
+        super()._handle_failed_transfer(req_id, handle)
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_sending, done_recving = super().get_finished()
+        while self._empty_receives:
+            req_id = self._empty_receives.pop()
+            self._recving_metadata.pop(req_id, None)
+            done_recving.add(req_id)
+        # Both completion and failure land here, and a retried request must not
+        # inherit a partial count.
+        for req_id in done_recving:
+            self._coverage_by_req.pop(req_id, None)
+        sealed_done = self._finish_sealed_requests()
+        if sealed_done:
+            # Upstream drops the writer's state for what it reports itself,
+            # and it has already been past that for this step.
+            for req_id in sealed_done:
+                self._evict_finished_inbox.put(req_id)
+            self._push_writer_wake.set()
+            done_sending |= sealed_done
+        # `_forget_send` only reaches a request written in batches; one written
+        # in a single transfer is reported here and nowhere else.
         for req_id in done_sending:
             self._valid_tokens.pop(req_id, None)
         return done_sending, done_recving
+
+    def _finish_sealed_requests(self) -> set[ReqId]:
+        """Report a request written early once every batch of it has landed.
+
+        Upstream reports what it can see, and it cannot see a batch parked
+        here, so this side owns the report for these requests -- including the
+        state upstream drops on its own reports, which the writer and the
+        lease both read.
+
+        Checked every step rather than only when a batch lands: a request
+        whose batches all landed before the engine finished it is completed by
+        the seal, not by a completion.
+        """
+        finished: set[ReqId] = set()
+        with self._sending_transfers_lock:
+            for req_id, send in self._streamed.items():
+                still_going = []
+                for handles in send.transfers:
+                    probe = {req_id: handles}
+                    if self._pop_done_transfers(probe):
+                        send.done += 1
+                    else:
+                        still_going.append(probe[req_id])
+                send.transfers = still_going
+
+            for req_id, send in list(self._streamed.items()):
+                if send.expected is None or send.done < send.expected:
+                    continue
+                finished.add(req_id)
+                self._forget_send(req_id)
+
+        for req_id in finished:
+            self._reqs_to_send.pop(req_id, None)
+            self._reqs_to_process.discard(req_id)
+            self.consumer_notification_counts_by_req.pop(req_id, None)
+        return finished
+
+    def _forget_send(self, req_id: ReqId) -> None:
+        """Drop what this side tracked for a request it is done pushing."""
+        self._streamed.pop(req_id, None)
+        self._valid_tokens.pop(req_id, None)
 
     def _xfer_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         """Write this request's blocks, one transfer per paired peer rank.
@@ -278,12 +582,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # count and the loop below describing different peers.
         peer_ranks = self._overlapping_ranks.get(engine_id)
         if not peer_ranks:
-            # An early send exists only at pipeline_parallel_size > 1, and a
-            # consumer holds every layer, so this producer's band is always a
-            # part of what the peer covers -- which is what puts it on the
-            # per-shard route. Reaching upstream's route with one means the
-            # pipeline gate leaked.
-            assert req_id not in self._early_sends
+            # Streaming asks for per-shard state from every peer it writes to,
+            # so a request written in pieces cannot arrive on this route.
+            send = self._streamed.get(req_id)
+            assert send is None or not send.released, (
+                f"RBLN NIXL push: request {req_id} was written early but is "
+                f"served by a whole-engine handle (peer {engine_id}), which "
+                "the streaming handshake asks not to be given."
+            )
             # Chunk mode asks for per-shard state, so a request written in
             # pieces cannot arrive on this route -- unless a sliding window
             # kept it here.
@@ -334,18 +640,34 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             remote_info.remote_tp_size,
             count_stages=False,
         )
-
-        # Counted before the consumer trim below, which cuts the front: the
-        # token count describes this producer's whole list, and both lists keep
-        # their tail, so the last element is still the request's last block.
+        # Both read before the window and the consumer trim reshape them: the
+        # token count describes this producer's whole list, and the request's
+        # last block is only in the write that reaches the consumer's end.
         n_prompt_blocks = sum(len(g) for g in local_block_ids)
-        tail_tokens = self._valid_tokens.get(req_id)
-        local_block_ids = self._trim_to_consumer_blocks(
-            local_block_ids, remote_block_ids, engine_id, meta.remote.request_id
+        registered = len(remote_block_ids[0]) if len(remote_block_ids) == 1 else None
+
+        window = self._stream_window(req_id, local_block_ids, remote_block_ids)
+        if window is None:
+            local_block_ids = self._trim_to_consumer_blocks(
+                local_block_ids, remote_block_ids, engine_id, meta.remote.request_id
+            )
+            span = (0, len(remote_block_ids[0])) if len(remote_block_ids) == 1 else None
+        else:
+            local_block_ids, remote_block_ids, span = window
+        notif_id = self._with_coverage(notif_id, span)
+        # Only the write that carries the request's last block may cut it.
+        tail_tokens = (
+            self._valid_tokens.get(req_id)
+            if span is not None and span[1] == registered
+            else None
         )
         n_write_blocks = sum(len(g) for g in local_block_ids)
         if not n_write_blocks:
             logger.warning("per-shard write req %s: no blocks to push", req_id)
+            with self._sending_transfers_lock:
+                send = self._streamed.get(req_id)
+                if send is not None and send.released:
+                    send.done += 1
             return
 
         logger.debug(
@@ -408,14 +730,106 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     self.nixl_wrapper.release_xfer_handle(handle)
                 self.xfer_stats.record_failed_transfer()
 
-        if handles:
-            with self._sending_transfers_lock:
-                target = (
-                    self._early_transfers
-                    if req_id in self._early_sends
-                    else self._sending_transfers
-                )
-                target[req_id].extend(handles)
+        with self._sending_transfers_lock:
+            send = self._streamed.get(req_id)
+            if send is None or not send.released:
+                self._sending_transfers[req_id].extend(handles)
+            elif handles:
+                send.transfers.append(handles)
+            else:
+                # Every peer's submission failed. The batch is over either
+                # way, and a request whose count never reaches its seal is a
+                # request that never finishes.
+                send.done += 1
+
+    def _stream_window(
+        self, req_id: str, local_block_ids: BlockIds, remote_block_ids: BlockIds
+    ) -> "tuple[BlockIds, BlockIds, Span] | None":
+        """The part of the consumer's list this batch is the first to fill.
+
+        None for a request that is not streamed, which is every request while
+        the flag is off and every one whose whole prompt is offered at once.
+        Those take the trim, and this leaves them exactly as they were.
+
+        A streamed offer is a growing prefix of the producer's blocks, and the
+        consumer registered the TAIL of the prompt -- what its own cache did
+        not cover. So the window it wants starts at `total - registered` of
+        ours, a place a prefix shorter than the whole prompt cannot be asked
+        for. The total comes over with the offer for that reason.
+
+        Only where both sides expand a logical block by the same factor: past
+        that, the two lengths this arithmetic subtracts are counted in
+        different units.
+        """
+        send = self._streamed.get(req_id)
+        total = send.total if send else None
+        if total is None or len(remote_block_ids) != 1:
+            return None
+        expand = self._physical_blocks_per_logical_kv_block
+        if expand != self._remote_expand_for(req_id):
+            return None
+
+        registered = len(remote_block_ids[0])
+        offset = total * expand - registered
+        have = len(local_block_ids[0])
+        assert send is not None
+        lo = send.issued_hwm
+        hi = max(0, min(registered, have - offset))
+        if hi <= lo:
+            return (), (), (lo, lo)
+        send.issued_hwm = hi
+        return (
+            (local_block_ids[0][offset + lo : offset + hi],),
+            (remote_block_ids[0][lo:hi],),
+            (lo, hi),
+        )
+
+    def _with_coverage(self, notif_id: bytes, span: "Span | None") -> bytes:
+        """Name the half-open range of consumer blocks this write filled.
+
+        The range is positions into the list the consumer registered. A request
+        written once covers all of it; one written in batches covers the part
+        this batch is the first to reach, which is what lets the consumer tell
+        a complete request from a partly written one.
+
+        Left off when no single range describes the write -- a request with
+        more than one KV cache group, whose groups go out together but carry
+        their own lengths. A consumer has to accept a message without the
+        prefix for that reason alone, which is also what lets the per-shard
+        route carry it while the route upstream drives does not.
+        """
+        if span is None:
+            return notif_id
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        pp_rank = get_pp_group().rank_in_group if pp_size > 1 else 0
+        writer = pp_rank * self.world_size + self.tp_rank
+        head = f"{writer}:{span[0]}:{span[1]}:".encode()
+        return RBLN_COVERAGE_NOTIF_PREFIX + head + notif_id
+
+    def _remote_expand_for(self, req_id: str) -> int:
+        """The factor the peer expands a logical block by, for this request."""
+        assert self.transfer_topo is not None
+        meta = self._recving_metadata.get(req_id)
+        engine_id = meta.remote.engine_id if meta and meta.remote else None
+        if engine_id is None:
+            return self._physical_blocks_per_logical_kv_block
+        return self.transfer_topo.get_engine_info(
+            engine_id
+        ).remote_physical_blocks_per_logical
+
+    @staticmethod
+    def _split_coverage(notif: bytes) -> "tuple[int | None, Span | None, bytes]":
+        """Take the coverage prefix off, returning what it said and what is left.
+
+        Upstream reads a completion notification as `req_id:count` with
+        `rsplit`, so it would take the whole prefixed string as the request id
+        and find no such request. What upstream is handed here is what it was
+        handed before this rank started naming ranges.
+        """
+        if not notif.startswith(RBLN_COVERAGE_NOTIF_PREFIX):
+            return None, None, notif
+        writer, lo, hi, rest = notif[len(RBLN_COVERAGE_NOTIF_PREFIX) :].split(b":", 3)
+        return int(writer), (int(lo), int(hi)), rest
 
     @staticmethod
     def _trim_to_consumer_blocks(
