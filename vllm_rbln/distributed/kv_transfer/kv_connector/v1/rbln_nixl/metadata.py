@@ -28,7 +28,11 @@ completing a handshake.
 from dataclasses import dataclass, field
 
 from vllm.config.utils import hash_factors
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlAgentMetadata,
+    NixlConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
 
 # Bump on any incompatible change to the RBLN metadata schema or semantics.
 # Folded into the NIXL compatibility hash so an RBLN peer speaking a different
@@ -57,6 +61,30 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # DISTINCT rather than replicas (see `_slice_head_bounds`).
     kv_areas: int = 1
     kv_slices: int = 1
+
+
+class RblnNixlConnectorMetadata(NixlConnectorMetadata):
+    """``NixlConnectorMetadata`` + the requests whose early write must be drained.
+
+    Promoted from the instance the base scheduler builds rather than constructed
+    in its place: ``NixlBaseConnectorScheduler.build_connector_meta`` names the
+    base type directly and offers no hook for a subclass. This struct stays
+    inside one engine -- it never reaches a peer -- so it is not part of the
+    handshake schema and does not move ``RBLN_NIXL_CONNECTOR_VERSION``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Requests whose source blocks go back to the allocator without a lease
+        # -- preempted, or finished on a non-terminal status. A write already
+        # issued for them reads memory the next forward may overwrite.
+        self.push_early_flush: set[ReqId] = set()
+
+    @classmethod
+    def promote(cls, base: NixlConnectorMetadata) -> "RblnNixlConnectorMetadata":
+        meta = cls()
+        meta.__dict__.update(base.__dict__)
+        return meta
 
 
 def rbln_compat_hash(base_hash: str, *, writes_into_peer: bool) -> str:

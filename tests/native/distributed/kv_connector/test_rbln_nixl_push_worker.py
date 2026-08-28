@@ -67,6 +67,13 @@ def _push_worker():
     # the shape the pairing predicates read before an engine is registered.
     w.use_host_buffer = False
     w._sw_ratio = None
+    # Off, as the environment variable is; the early-write tests turn it on.
+    w._early_push_enabled = False
+    w._early_sends = set()
+    w._early_transfers = defaultdict(list)
+    w._pending_early_offers = {}
+    w._sending_transfers = defaultdict(list)
+    w._sending_transfers_lock = threading.Lock()
     # __init__ never ran, so the writer state shutdown() reaches through
     # __del__ is absent; silence it rather than leak an unraisable at GC.
     w.shutdown = lambda: None
@@ -90,10 +97,26 @@ class TestInheritance:
         assert RblnNixlPushConnectorWorker._writes_into_peer is True
         assert RblnNixlWorkerBase._writes_into_peer is False
 
-    def test_teardown_reaches_the_writer_thread(self):
-        # Nothing of ours overrides shutdown, so the upstream push one runs and
-        # joins the writer; an override that forgot to chain would strand it.
-        assert RblnNixlPushConnectorWorker.shutdown is NixlPushConnectorWorker.shutdown
+    def test_teardown_releases_the_parked_handles_and_reaches_the_writer_thread(
+        self, monkeypatch
+    ):
+        # Handles held back from the completion accounting are on no other
+        # path out, and the upstream shutdown -- which joins the writer -- only
+        # runs if this override chains to it.
+        chained = []
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "shutdown", lambda self: chained.append(True)
+        )
+        worker = _push_worker()
+        worker.nixl_wrapper = MagicMock()
+        worker._early_sends = {"r0"}
+        worker._early_transfers = defaultdict(list, {"r0": [7, 8]})
+
+        RblnNixlPushConnectorWorker.shutdown(worker)
+
+        assert worker.nixl_wrapper.release_xfer_handle.call_count == 2
+        assert worker._early_transfers == {}
+        assert chained == [True]
 
     def test_the_read_path_does_not_leak_in(self):
         # The shared layer is direction-free, so nothing of the read path may
@@ -205,8 +228,6 @@ class TestPerShardWrite:
         w._shard_descs_per_block = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(ranks)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(ranks)}}
-        w._sending_transfers = defaultdict(list)
-        w._sending_transfers_lock = threading.Lock()
         topo = MagicMock()
         topo.get_engine_info.return_value = MagicMock(
             remote_tp_size=1,
@@ -835,3 +856,198 @@ class TestDelegatedRouteAlignment:
         )
 
         assert local == ([5, 6, 7],)
+
+
+class TestEarlySend:
+    """A stage offers its layers at the chunk that closes the prefill, which is
+    before the engine says the request finished. Two things follow: the write
+    has to stay invisible to the completion accounting until the handover, and
+    it cannot go out in the step that produced the KV -- that forward completes
+    asynchronously, so the offer waits for this rank's next step."""
+
+    @staticmethod
+    def _worker(*, enabled=True, use_host_buffer=False):
+        w = TestPerShardWrite._writing_worker(ranks=2)
+        w._early_push_enabled = enabled
+        w.use_host_buffer = use_host_buffer
+        w._finished_blocks_inbox = queue.Queue()
+        w._evict_finished_inbox = queue.Queue()
+        w._push_writer_wake = threading.Event()
+        return w
+
+    @staticmethod
+    def _meta(saves=(), pushes=()):
+        return SimpleNamespace(
+            reqs_to_save={r: SimpleNamespace(local_block_ids=([1, 2],)) for r in saves},
+            push_finished_blocks=dict.fromkeys(pushes, ([1, 2],)),
+        )
+
+    def test_a_closed_prefill_is_held_rather_than_handed_over(self):
+        # Handing it over in this step would let the writer read KV the
+        # forward that just returned may still be writing.
+        worker = self._worker()
+
+        worker.start_early_push(self._meta(saves=["r0"]))
+
+        assert worker._pending_early_offers == {"r0": ([1, 2],)}
+        assert worker._finished_blocks_inbox.empty()
+        assert worker._early_sends == set()
+
+    def test_the_next_step_hands_it_over(self):
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"]))
+
+        worker.release_early_offers()
+
+        assert worker._finished_blocks_inbox.get_nowait() == ("r0", ([1, 2],))
+        assert worker._early_sends == {"r0"}
+        assert worker._pending_early_offers == {}
+        assert worker._push_writer_wake.is_set()
+
+    def test_a_step_that_closes_nothing_still_releases_what_is_held(self):
+        # The release cannot wait for another closing chunk: steps that close
+        # one are not every step, and the offer would sit until one came.
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"]))
+
+        worker.start_early_push(self._meta())  # a step with nothing to offer
+        worker.release_early_offers()
+
+        assert worker._finished_blocks_inbox.get_nowait() == ("r0", ([1, 2],))
+
+    def test_host_staging_is_never_written_early(self):
+        # The copy that fills the staging buffer runs after this, so a write
+        # issued now would ship a buffer still being filled.
+        worker = self._worker(use_host_buffer=True)
+
+        worker.start_early_push(self._meta(saves=["r0"]))
+
+        assert worker._pending_early_offers == {}
+
+    def test_the_gate_off_offers_nothing(self):
+        # Guard: the direct path had no offer before this change either, so
+        # what this pins is that the flag is what turns it on.
+        worker = self._worker(enabled=False)
+
+        worker.start_early_push(self._meta(saves=["r0"]))
+
+        assert worker._pending_early_offers == {}
+
+    def test_an_early_write_is_kept_out_of_the_completion_accounting(self):
+        # `_sending_transfers` is what the base reports completions from, and
+        # the scheduler frees a request's blocks on that report -- this one is
+        # still prefilling.
+        worker = self._worker()
+        worker._early_sends = {"r0"}
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1],), ([3],)))
+
+        assert "r0" not in worker._sending_transfers
+        assert len(worker._early_transfers["r0"]) == 2
+
+    def test_the_handover_publishes_the_hold_and_drops_the_duplicate(self, monkeypatch):
+        # The request appearing here IS the engine saying it finished, which is
+        # what the report is allowed to follow. Its blocks were written
+        # already, so passing them on would send them twice.
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
+        )
+        worker = self._worker()
+        worker._early_sends = {"r0"}
+        worker._early_transfers["r0"] = [7, 8]
+        meta = self._meta(pushes=["r0"])
+
+        worker.start_load_kv(meta)
+
+        assert worker._sending_transfers["r0"] == [7, 8]
+        assert worker._early_sends == set()
+        assert "r0" not in worker._early_transfers
+        assert meta.push_finished_blocks == {}
+
+    def test_a_request_written_only_at_the_handover_is_left_alone(self, monkeypatch):
+        # Guard: the suppression must reach exactly the requests written
+        # early. Dropping the membership test would silence every handover and
+        # nothing would ever be sent.
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
+        )
+        worker = self._worker()
+        meta = self._meta(pushes=["r1"])
+
+        worker.start_load_kv(meta)
+
+        assert meta.push_finished_blocks == {"r1": ([1, 2],)}
+
+    def test_the_writer_count_is_the_one_the_handover_would_have_sent(self):
+        # Guard: one send per writer is what lets the consumer settle on the
+        # count it already knows, and block-granular sends would break it.
+        worker = self._worker()
+        worker._early_sends = {"r0"}
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1],), ([3],)))
+
+        notifs = {
+            c.kwargs["notif_msg"]
+            for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
+        }
+        assert notifs == {b"r0:1"}
+
+    def test_the_delegated_route_never_carries_an_early_write(self, monkeypatch):
+        # An early write exists only above one pipeline stage, and a consumer
+        # holds every layer, so this producer is always the narrower side.
+        monkeypatch.setattr(
+            NixlPushConnectorWorker,
+            "_xfer_blocks_for_req",
+            lambda self, req_id, meta: None,
+        )
+        worker = self._worker()
+        worker._overlapping_ranks = {}
+        worker._early_sends = {"r0"}
+
+        with pytest.raises(AssertionError):
+            worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1],), ([3],)))
+
+
+class TestFlushEarlySends:
+    """Blocks a write is reading can go back to the allocator without the lease
+    that normally protects them. The bytes on their way are correct -- the
+    prefill did finish -- so they are waited for, not cancelled."""
+
+    @staticmethod
+    def _worker(states):
+        w = TestEarlySend._worker()
+        w._early_sends = {"r0"}
+        w._early_transfers["r0"] = [7]
+        w.nixl_wrapper.check_xfer_state.side_effect = states
+        return w
+
+    def test_a_held_offer_is_dropped_rather_than_sent_later(self):
+        # Its blocks go back to the allocator now; releasing the offer at the
+        # next step would write into whatever took them.
+        worker = self._worker(["DONE"])
+        worker._pending_early_offers = {"r0": ([1, 2],)}
+
+        worker.flush_early_sends({"r0"})
+
+        assert worker._pending_early_offers == {}
+
+    def test_an_in_flight_write_is_waited_for_and_released(self):
+        worker = self._worker(["PROC", "DONE"])
+
+        worker.flush_early_sends({"r0"})
+
+        assert worker.nixl_wrapper.check_xfer_state.call_count == 2
+        worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
+        assert worker._early_sends == set()
+        assert "r0" not in worker._early_transfers
+        # The writer holds state for a request it may never see finish.
+        assert worker._evict_finished_inbox.get_nowait() == "r0"
+
+    def test_a_wedged_write_does_not_take_the_engine_with_it(self, monkeypatch):
+        # This runs on the engine main thread, ahead of the forward.
+        monkeypatch.setattr(pw, "_EARLY_FLUSH_DRAIN_TIMEOUT_S", 0.0)
+        worker = self._worker(lambda handle: "PROC")
+
+        worker.flush_early_sends({"r0"})
+
+        worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)

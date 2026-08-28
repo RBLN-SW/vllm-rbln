@@ -55,6 +55,7 @@ class _SchedOutput:
     scheduled_new_reqs: list
     scheduled_cached_reqs: _CachedReqs
     num_scheduled_tokens: dict
+    preempted_req_ids: set = field(default_factory=set)
 
 
 @dataclass
@@ -122,6 +123,9 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
         sched._push_registration_timeout = 480
         sched._finished_request_blocks = {}
         sched._newly_finished_push_blocks = {}
+        # Off by default, as the environment variable is.
+        sched._early_push_enabled = False
+        sched._early_sent = set()
     return sched
 
 
@@ -460,3 +464,130 @@ class TestRejectedBeforeScheduling:
         sched.request_finished(req, ([],))
 
         assert req.kv_transfer_params["remote_block_ids"] == ([4, 5],)
+
+
+class TestEarlyOfferOnTheWritePath:
+    """A prefill is offered to the writer at the chunk that closes it, so a
+    pipeline stage can write its layers while the later stages still run. The
+    direct path has no save of its own, so the offer is the only reader of the
+    accumulation there."""
+
+    @staticmethod
+    def _push_scheduler(*, enabled=True, use_host_buffer=False):
+        sched = _scheduler(
+            use_host_buffer=use_host_buffer, cls=RblnNixlPushConnectorScheduler
+        )
+        sched._early_push_enabled = enabled
+        return sched
+
+    def test_the_closing_chunk_offers_its_blocks(self):
+        sched = self._push_scheduler()
+        req = _Request("chunked", num_prompt_tokens=512)
+        sched._reqs_need_save["chunked"] = req
+
+        meta = sched.build_connector_meta(_sched_output("chunked", ([1, 2],), 256))
+        assert "chunked" not in meta.reqs_to_save
+        assert sched._early_sent == set()
+
+        req.num_computed_tokens = 256
+        meta = sched.build_connector_meta(
+            _sched_output("chunked", ([3],), 256, is_new=False)
+        )
+
+        assert meta.reqs_to_save["chunked"].local_block_ids == ([1, 2, 3],)
+        assert sched._early_sent == {"chunked"}
+
+    def test_the_gate_off_offers_nothing(self):
+        # Guard: the direct path had no offer before this change either, so
+        # what this pins is that the flag is what turns it on -- dropping the
+        # gate would make every direct-path run stream.
+        sched = self._push_scheduler(enabled=False)
+        sched._reqs_need_save["prefill"] = _Request("prefill", num_prompt_tokens=256)
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 256))
+
+        assert meta.reqs_to_save == {}
+        assert sched._early_sent == set()
+
+    def test_the_offer_is_the_list_the_handover_would_have_carried(self):
+        # The duplicate handover is dropped on the strength of the two lists
+        # being the same one; if they diverged, the writer would send the early
+        # list and the blocks the request actually ended with would never go.
+        sched = self._push_scheduler()
+        req = _Request("chunked", num_prompt_tokens=512)
+        sched._reqs_need_save["chunked"] = req
+        sched.build_connector_meta(_sched_output("chunked", ([1, 2],), 256))
+        req.num_computed_tokens = 256
+        meta = sched.build_connector_meta(
+            _sched_output("chunked", ([3],), 256, is_new=False)
+        )
+
+        req.status = RequestStatus.FINISHED_STOPPED
+        sched.request_finished(req, ([1, 2, 3],))
+
+        assert (
+            meta.reqs_to_save["chunked"].local_block_ids
+            == sched._newly_finished_push_blocks["chunked"]
+        )
+
+    @pytest.mark.parametrize(
+        "kind",
+        ["preempted", "not-processed"],
+    )
+    def test_blocks_going_back_without_a_lease_are_flushed(self, kind):
+        # Both hand the blocks to the allocator with a write still reading
+        # them: a preempted request re-prefills into them, and one that ended
+        # on a non-terminal status frees them outright.
+        sched = self._push_scheduler()
+        sched._early_sent = {"r0"}
+        if kind == "preempted":
+            output = _sched_output("other", ([9],), 16)
+            output.preempted_req_ids = {"r0"}
+        else:
+            output = _sched_output("other", ([9],), 16)
+            sched._reqs_not_processed = {"r0"}
+
+        meta = sched.build_connector_meta(output)
+
+        assert meta.push_early_flush == {"r0"}
+        # Cleared, so a later step does not flush the same write twice.
+        assert sched._early_sent == set()
+
+    def test_a_terminal_finish_is_not_flushed(self):
+        # The lease holds those blocks, and a flush would stall the engine on
+        # every completed prefill.
+        sched = self._push_scheduler()
+        sched._early_sent = {"r0"}
+        req = _Request(
+            "r0", num_prompt_tokens=256, status=RequestStatus.FINISHED_STOPPED
+        )
+
+        sched.request_finished(req, ([1, 2],))
+        meta = sched.build_connector_meta(_sched_output("other", ([9],), 16))
+
+        assert sched._early_sent == set()
+        assert meta.push_early_flush == set()
+
+
+class TestEarlyPushGate:
+    @pytest.mark.parametrize(
+        ("flag", "pp_size", "expected"),
+        [(True, 4, True), (True, 1, False), (False, 4, False)],
+    )
+    def test_the_gate_needs_both_the_flag_and_a_pipeline(
+        self, monkeypatch, flag, pp_size, expected
+    ):
+        # A stage's write overlaps the stages after it, so one stage has
+        # nothing to overlap with however the flag is set.
+        monkeypatch.setattr(
+            "vllm_rbln.envs.VLLM_RBLN_NIXL_PUSH_STREAM", flag, raising=False
+        )
+        monkeypatch.setattr(
+            NixlPushConnectorScheduler, "__init__", lambda self, *a, **k: None
+        )
+        config = MagicMock()
+        config.parallel_config.pipeline_parallel_size = pp_size
+
+        sched = RblnNixlPushConnectorScheduler(config, "eng", MagicMock())
+
+        assert sched._early_push_enabled is expected

@@ -96,6 +96,11 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
         NOTE(RBLN): upstream saves each step's new blocks as they arrive. The
         RBLN host copy moves whole blocks and transfers once, so blocks are
         accumulated here and handed over when the prefill completes.
+
+        What it produces reads as "this request's KV for this rank's layers is
+        complete and ready to leave", which is why the write path calls this
+        too: host staging moves it to the host buffer, and the direct path,
+        having nowhere local to move it to, writes it out.
         """
         for req_id, new_block_id_groups, resumed in yield_req_data(scheduler_output):
             req = self._reqs_need_save.get(req_id)

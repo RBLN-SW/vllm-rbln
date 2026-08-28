@@ -209,3 +209,89 @@ class TestConnectorWiring:
         # pin that this direction goes through it.
         with pytest.raises(AssertionError, match="kv_buffer_device"):
             push_connector(KVConnectorRole.WORKER, kv_buffer_device="gpu")
+
+
+class TestEarlyWriteWiring:
+    """Where the write path hooks into the step: after the host copy, and
+    ahead of the forward that reuses the blocks."""
+
+    @pytest.fixture
+    def push_worker_connector(self, monkeypatch):
+        monkeypatch.setattr(
+            cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None
+        )
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", True)
+        # The real class, with only its construction skipped: the connector
+        # narrows on the type before delegating.
+        monkeypatch.setattr(
+            cm.RblnNixlPushConnectorWorker, "__init__", lambda self, *a, **k: None
+        )
+
+        def build():
+            vllm_config = SimpleNamespace(
+                kv_transfer_config=SimpleNamespace(
+                    engine_id="engine-0", kv_buffer_device="rbln"
+                )
+            )
+            connector = object.__new__(RblnNixlPushConnector)
+            RblnNixlPushConnector.__init__(
+                connector, vllm_config, KVConnectorRole.WORKER, {"kv_cache": 1}
+            )
+            worker = connector.connector_worker
+            worker.start_early_push = MagicMock()
+            worker.flush_early_sends = MagicMock()
+            worker.release_early_offers = MagicMock()
+            # __init__ was skipped, so the state __del__ reaches is absent.
+            worker.shutdown = lambda: None
+            return connector
+
+        return build
+
+    def test_the_host_copy_runs_before_the_write_is_offered(
+        self, monkeypatch, push_worker_connector
+    ):
+        # The base does the staging copy in wait_for_save; a write offered
+        # first would read a buffer still being filled.
+        order = []
+        monkeypatch.setattr(
+            cm.NixlPushConnector, "wait_for_save", lambda self: order.append("copy")
+        )
+        connector = push_worker_connector()
+        connector.connector_worker.start_early_push.side_effect = (
+            lambda meta: order.append("offer")
+        )
+        connector._connector_metadata = cm.NixlConnectorMetadata()
+
+        connector.wait_for_save()
+
+        assert order == ["copy", "offer"]
+
+    def test_a_flush_reaches_the_worker(self, monkeypatch, push_worker_connector):
+        connector = push_worker_connector()
+        meta = cm.RblnNixlConnectorMetadata()
+        meta.push_early_flush = {"r0"}
+
+        connector.handle_preemptions(meta)
+
+        connector.connector_worker.flush_early_sends.assert_called_once_with({"r0"})
+
+    def test_the_release_precedes_this_step_s_work(
+        self, monkeypatch, push_worker_connector
+    ):
+        # The handover is adopted inside super().start_load_kv; releasing after
+        # it would drop the offer of a request whose handover lands on this
+        # same step instead of writing it.
+        order = []
+        monkeypatch.setattr(
+            cm.NixlPushConnector,
+            "start_load_kv",
+            lambda self, ctx, **kw: order.append("adopt"),
+        )
+        connector = push_worker_connector()
+        connector.connector_worker.release_early_offers.side_effect = (
+            lambda: order.append("release")
+        )
+
+        connector.start_load_kv(object())
+
+        assert order == ["release", "adopt"]

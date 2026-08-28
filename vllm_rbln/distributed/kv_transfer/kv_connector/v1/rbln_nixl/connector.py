@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -21,10 +21,12 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorHandshakeMetadata,
+    KVConnectorMetadata,
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnector,
+    NixlConnectorMetadata,
     NixlPullConnector,
     NixlPushConnector,
 )
@@ -35,6 +37,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler 
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnNixlConnectorMetadata,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
     RblnNixlPullConnectorScheduler,
@@ -54,6 +59,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.forward_context import ForwardContext
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -178,3 +184,36 @@ class RblnNixlPushConnector(RblnNixlConnectorBase, NixlPushConnector):
             self.connector_worker = RblnNixlPushConnectorWorker(
                 vllm_config, self.engine_id, kv_cache_config
             )
+
+    def wait_for_save(self) -> None:
+        """Take the closed prefill for the writer, after the host copy.
+
+        The base does the host-staging copy here; taking it first would let a
+        write read a buffer still being filled, so the order this call site
+        fixes is the invariant.
+        """
+        super().wait_for_save()
+        assert isinstance(self.connector_worker, RblnNixlPushConnectorWorker)
+        assert isinstance(self._connector_metadata, NixlConnectorMetadata)
+        self.connector_worker.start_early_push(self._connector_metadata)
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
+        """Let the previous step's offers go, then start this step's work.
+
+        Ahead of `super()`, which adopts the handover: a request whose handover
+        lands on this step has to be written by its offer rather than dropped
+        along with it.
+        """
+        assert isinstance(self.connector_worker, RblnNixlPushConnectorWorker)
+        self.connector_worker.release_early_offers()
+        super().start_load_kv(forward_context, **kwargs)
+
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        """Drain an early write whose source blocks are about to be reused.
+
+        Runs ahead of the forward that would overwrite them.
+        """
+        super().handle_preemptions(kv_connector_metadata)
+        assert isinstance(kv_connector_metadata, RblnNixlConnectorMetadata)
+        assert isinstance(self.connector_worker, RblnNixlPushConnectorWorker)
+        self.connector_worker.flush_early_sends(kv_connector_metadata.push_early_flush)

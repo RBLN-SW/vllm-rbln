@@ -25,7 +25,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPushConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
 
+import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
 )
@@ -39,6 +41,12 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+# How long a flush waits for an early write to leave the NIC before giving up
+# on it. Bounded because it runs on the engine main thread: a wedged transfer
+# must not take the engine with it.
+_EARLY_FLUSH_DRAIN_TIMEOUT_S = 1.0
+_EARLY_FLUSH_POLL_INTERVAL_S = 0.001
 
 
 class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
@@ -62,6 +70,24 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # against the number of writers the peer put in them.
         self._writer_counts_by_req: defaultdict[str, int] = defaultdict(int)
 
+        # A stage's write overlaps the stages that come after it, so there is
+        # nothing to overlap with when this producer is one stage.
+        self._early_push_enabled = (
+            envs.VLLM_RBLN_NIXL_PUSH_STREAM
+            and vllm_config.parallel_config.pipeline_parallel_size > 1
+        )
+        # Requests written from their closing prefill chunk, before the engine
+        # handed their blocks over. Membership survives several writes.
+        self._early_sends: set[ReqId] = set()
+        # Their handles, kept out of `_sending_transfers` so the base cannot
+        # report the request as finished_sending: the scheduler frees a
+        # request's blocks on that report unconditionally, and this one is
+        # still prefilling.
+        self._early_transfers: defaultdict[ReqId, list[int]] = defaultdict(list)
+        # Offers waiting for this rank's next step to order them (see
+        # `start_early_push`).
+        self._pending_early_offers: dict[ReqId, BlockIds] = {}
+
     def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
         """Hand this step's work to the writer, once the KV it names is settled.
 
@@ -80,7 +106,127 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 f"to the writer in one step: {sorted(both)}. The copy runs after "
                 "this call, so the write would read an unfilled buffer."
             )
+        self._adopt_early_sends(metadata)
         super().start_load_kv(metadata)
+
+    def _adopt_early_sends(self, metadata: "NixlConnectorMetadata") -> None:
+        """Take a request the engine has now finished out of the early hold.
+
+        Its arrival in `push_finished_blocks` IS the engine saying the request
+        finished, which is what the base's completion report is allowed to
+        follow. So publish the handles the early write left parked, and drop
+        the handover itself -- the blocks it carries are the ones already
+        written, or the ones the writer still holds unmatched.
+        """
+        with self._sending_transfers_lock:
+            for req_id in list(metadata.push_finished_blocks):
+                if req_id not in self._early_sends:
+                    continue
+                self._early_sends.discard(req_id)
+                handles = self._early_transfers.pop(req_id, [])
+                if handles:
+                    self._sending_transfers[req_id].extend(handles)
+                del metadata.push_finished_blocks[req_id]
+
+    def start_early_push(self, metadata: "NixlConnectorMetadata") -> None:
+        """Hold the prefill this stage has just closed, for the writer.
+
+        NOTE(RBLN): `reqs_to_save` says a request's KV for this rank's layers
+        is complete. Host staging reads that to fill its buffer, and this
+        reads it to write straight out of device memory, so the two never run
+        on the same request -- see the assertion in `start_load_kv`.
+
+        Held rather than handed over, because the forward that produced the KV
+        completes asynchronously: this rank's Python returning does not mean
+        its writes are visible to the NIC, and the wait the runtime exposes
+        covers pending transfers rather than compute. Writing from here reads
+        KV that is still being written, and does so silently -- the transfer
+        reports no error. `release_early_offers` lets the offer go one step of
+        this rank later, which is late enough; what makes it late enough is not
+        something this side can name, so treat the delay as load-bearing.
+
+        Called from `wait_for_save` rather than `get_finished` so the host copy
+        for the step is already done: speculative decoding on the last stage
+        defers `wait_for_save` past `get_finished`, which would reverse them.
+        """
+        if not self._early_push_enabled or self.use_host_buffer:
+            return
+        for req_id, meta in metadata.reqs_to_save.items():
+            self._pending_early_offers[req_id] = meta.local_block_ids
+
+    def release_early_offers(self) -> None:
+        """Hand the previous step's held offers to the writer.
+
+        Called at the start of a step, before the handover is adopted, so a
+        request whose handover lands on this same step is written by the offer
+        rather than dropped with it. Runs on every step -- one that closes no
+        chunk and one with no forward included -- so nothing is left held.
+
+        What guarantees a next step at all: while the request runs, it is
+        unfinished; once it ends, the scheduler keeps stepping on the
+        connector's pending-push-work hook until the send is reported. The
+        second half rests on a hook upstream documents as a placeholder, so a
+        held offer outliving the engine is what to suspect if a request ever
+        stalls with its KV never arriving.
+        """
+        if not self._pending_early_offers:
+            return
+        offers = self._pending_early_offers
+        self._pending_early_offers = {}
+        with self._sending_transfers_lock:
+            self._early_sends.update(offers)
+        for req_id, block_ids in offers.items():
+            self._finished_blocks_inbox.put((req_id, block_ids))
+        self._push_writer_wake.set()
+
+    def flush_early_sends(self, req_ids: set[ReqId]) -> None:
+        """Let an early write finish before its source blocks are reused.
+
+        The prefill did finish, so the bytes already on their way are correct
+        and complete; cancelling would leave the consumer a torn block. Wait
+        for them instead -- bounded, because this runs on the engine main
+        thread. Nothing here is reported as finished_sending: a preempted
+        request re-prefills into these blocks, and an aborted one is gone from
+        the scheduler, which asserts on a report for a request it does not
+        hold.
+        """
+        drained = False
+        for req_id in req_ids:
+            self._pending_early_offers.pop(req_id, None)
+            with self._sending_transfers_lock:
+                self._early_sends.discard(req_id)
+                handles = self._early_transfers.pop(req_id, [])
+            for handle in handles:
+                self._drain_early_handle(req_id, handle)
+            self._evict_finished_inbox.put(req_id)
+            drained = True
+        if drained:
+            self._push_writer_wake.set()
+
+    def _drain_early_handle(self, req_id: ReqId, handle: int) -> None:
+        deadline = time.perf_counter() + _EARLY_FLUSH_DRAIN_TIMEOUT_S
+        while self.nixl_wrapper.check_xfer_state(handle) == "PROC":
+            if time.perf_counter() >= deadline:
+                logger.warning(
+                    "RBLN NIXL push: early write for request %s still in "
+                    "flight after %.1fs; releasing it and letting the step "
+                    "go on. The blocks it reads are about to be reused.",
+                    req_id,
+                    _EARLY_FLUSH_DRAIN_TIMEOUT_S,
+                )
+                break
+            time.sleep(_EARLY_FLUSH_POLL_INTERVAL_S)
+        self.nixl_wrapper.release_xfer_handle(handle)
+
+    def shutdown(self) -> None:
+        with self._sending_transfers_lock:
+            for handles in self._early_transfers.values():
+                for handle in handles:
+                    self.nixl_wrapper.release_xfer_handle(handle)
+            self._early_transfers.clear()
+            self._early_sends.clear()
+        self._pending_early_offers = {}
+        super().shutdown()
 
     def finalize_kv_cache_registration(self) -> None:
         """Register the deferred D2D memory, then make sure the writer runs.
@@ -181,6 +327,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # count and the loop below describing different peers.
         peer_ranks = self._overlapping_ranks.get(engine_id)
         if not peer_ranks:
+            # An early send exists only at pipeline_parallel_size > 1, and a
+            # consumer holds every layer, so this producer's band is always a
+            # part of what the peer covers -- which is what puts it on the
+            # per-shard route. Reaching upstream's route with one means the
+            # pipeline gate leaked.
+            assert req_id not in self._early_sends
             # NOTE(RBLN): upstream aligns by truncating the longer list and
             # keeping its HEAD -- the wrong end (see _trim_to_consumer_blocks)
             # -- and the lengths match either way so nothing catches it. Trim
@@ -273,7 +425,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
         if handles:
             with self._sending_transfers_lock:
-                self._sending_transfers[req_id].extend(handles)
+                target = (
+                    self._early_transfers
+                    if req_id in self._early_sends
+                    else self._sending_transfers
+                )
+                target[req_id].extend(handles)
 
     @staticmethod
     def _trim_to_consumer_blocks(

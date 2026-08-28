@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     # --- KV CONNECTOR ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
+    VLLM_RBLN_NIXL_PUSH_STREAM: bool = False
     # --- QUANTIZATION ---
     VLLM_RBLN_USE_W8A8: bool = False
 
@@ -376,6 +377,16 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Push a pipeline stage's KV as soon as that stage computes the closing
+    # prefill chunk, instead of waiting for the request to finish. Overlaps a
+    # stage's transfer with the prefill the later stages are still running, so
+    # it does nothing at `pipeline_parallel_size` 1.
+    "VLLM_RBLN_NIXL_PUSH_STREAM": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_NIXL_PUSH_STREAM", "False").lower()
+            in ("true", "1")
+        )
+    ),
     # --- QUANTIZATION ---
     # W8A16 runs on every RBLN NPU, W8A8 only on the ones whose kernels take an
     # fp8 activation, so W8A8 is opted into rather than derived from the device.
@@ -429,6 +440,7 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_SORT_BATCH",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
         "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
+        "VLLM_RBLN_NIXL_PUSH_STREAM",
     }
 )
 

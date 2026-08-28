@@ -19,12 +19,16 @@
 # msgspec + hash), so it does not require the ``nixl-rbln`` install or a worker.
 
 import msgspec
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlAgentMetadata,
+    NixlConnectorMetadata,
+)
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RBLN_NIXL_CONNECTOR_VERSION,
     RblnNixlAgentMetadata,
+    RblnNixlConnectorMetadata,
     rbln_compat_hash,
 )
 
@@ -136,3 +140,24 @@ class TestRblnCompatHash:
             md, "RBLN_NIXL_CONNECTOR_VERSION", RBLN_NIXL_CONNECTOR_VERSION + 1
         )
         assert md.rbln_compat_hash("BASE", writes_into_peer=False) != h1
+
+
+class TestRblnNixlConnectorMetadata:
+    def test_promotion_keeps_every_field_the_base_filled(self):
+        # The base scheduler names its own type, so ours is copied from the
+        # instance it built; a field lost here is a step's transfers lost.
+        base = NixlConnectorMetadata()
+        base.reqs_to_recv = {"r0": "recv"}
+        base.reqs_to_save = {"r1": "save"}
+        base.reqs_in_batch = {"r2"}
+        base.push_finished_blocks = {"r3": ([1],)}
+
+        promoted = RblnNixlConnectorMetadata.promote(base)
+
+        assert promoted.reqs_to_recv == {"r0": "recv"}
+        assert promoted.reqs_to_save == {"r1": "save"}
+        assert promoted.reqs_in_batch == {"r2"}
+        assert promoted.push_finished_blocks == {"r3": ([1],)}
+        assert promoted.push_early_flush == set()
+        # Upstream asserts on the base type in several places.
+        assert isinstance(promoted, NixlConnectorMetadata)
