@@ -3,7 +3,7 @@
 
 # vllm_rbln
 /vllm_rbln/compilation @rebel-cjlee @rebel-minkyu
-/vllm_rbln/distributed @rebel-cjlee @rebel-minkyu
+/vllm_rbln/distributed @rebel-ykchoi @rebel-jinhwan @rebel-jongwonlee
 /vllm_rbln/distributed/ec_transfer @rebel-eunji @rebel-jonghewk
 /vllm_rbln/lora @rebel-cjlee @rebel-minkyu
 /vllm_rbln/model_executor @rebel-cjlee @rebel-minkyu
