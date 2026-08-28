@@ -15,19 +15,19 @@
 from itertools import islice
 
 import torch
-from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp import (
     MiniMaxText01RMSNormTP,
 )
-from vllm.model_executor.models.minimax_m2 import (
-    MiniMaxM2Attention,
-    MiniMaxM2Model,
-    MiniMaxM2MoE,
-)
+from vllm.model_executor.models.minimax_m2 import MiniMaxM2Attention, MiniMaxM2MoE
 from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.v1.spec_decode.eagle3_pp import (
+    AUX_SLOT,
+    aux_slots_captured,
+    aux_slots_received,
+)
 
 
 @register_patch(
@@ -115,85 +115,6 @@ def patched_minimax_m2_attention_forward(
     return output
 
 
-_AUX_SLOT = "aux_hidden_states_"
-
-# Captured at import time: the registry replaces targets outright, so wrapping
-# upstream behaviour means holding the original here.
-_orig_model_init = MiniMaxM2Model.__init__
-
-
-def _aux_slots_received(model: MiniMaxM2Model) -> tuple[int, ...]:
-    """Global aux layer indices that reach this stage from upstream stages.
-
-    A capture at index ``i`` is the input to layer ``i``, so this stage receives
-    every requested index at or before its first owned layer. On the first stage
-    the set is empty: index ``start_layer == 0`` is captured locally from the
-    embedding output.
-    """
-    if get_pp_group().is_first_rank:
-        return ()
-    return tuple(
-        sorted(i for i in model.aux_hidden_state_layers if i <= model.start_layer)
-    )
-
-
-def _aux_slots_captured(model: MiniMaxM2Model) -> tuple[int, ...]:
-    """Global aux layer indices this stage produces, in the order it produces them.
-
-    The loop captures at ``start_layer + idx + 1`` for each owned layer, so the
-    reachable indices are ``start_layer + 1 .. end_layer``; the first stage adds
-    index 0 from the embedding output. Every index is a compile-time constant, so
-    deriving the order here keeps it out of the traced graph -- the capture itself
-    appends to a list and never keys a dict inside the loop.
-
-    Together with `_aux_slots_received` this partitions the requested set: received
-    indices are at or before ``start_layer``, captured ones past it. Received then
-    captured is therefore already ascending, which is the order the drafter's `fc`
-    expects its concatenated blocks in.
-    """
-    captured = [
-        i
-        for i in sorted(model.aux_hidden_state_layers)
-        if model.start_layer < i <= model.end_layer
-    ]
-    if get_pp_group().is_first_rank and 0 in model.aux_hidden_state_layers:
-        captured.insert(0, 0)
-    return tuple(captured)
-
-
-@register_patch(
-    target="vllm.model_executor.models.minimax_m2.MiniMaxM2Model.__init__",
-    reason=(
-        "Size the pipeline handoff to carry the EAGLE3 aux hidden states. Upstream "
-        "fixes the handoff key set here, but the aux layers are only known later, "
-        "when the model runner calls set_aux_hidden_state_layers -- and rebuilding "
-        "the attribute then is too late: MiniMaxM2ForCausalLM.__init__ copies this "
-        "callable onto itself, and the runner calls that copy. Read the key set at "
-        "call time instead, so the copy stays correct. "
-        "TODO(vllm-project/vllm#50514): delete once that lands and is released."
-    ),
-)
-def patched_minimax_m2_model_init(
-    self, *, vllm_config: VllmConfig, prefix: str = ""
-) -> None:
-    _orig_model_init(self, vllm_config=vllm_config, prefix=prefix)
-
-    def make_empty_intermediate_tensors(
-        batch_size: int, dtype: torch.dtype, device: torch.device
-    ) -> IntermediateTensors:
-        keys = ["hidden_states", "residual"]
-        keys += [f"{_AUX_SLOT}{i}" for i in _aux_slots_received(self)]
-        hidden_size = self.config.hidden_size
-        return IntermediateTensors(
-            {
-                key: torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
-                for key in keys
-            }
-        )
-
-    self.make_empty_intermediate_tensors = make_empty_intermediate_tensors
-
-
 @register_patch(
     target="vllm.model_executor.models.minimax_m2.MiniMaxM2Model.forward",
     reason=(
@@ -227,7 +148,7 @@ def forward(
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
         received = [
-            intermediate_tensors[f"{_AUX_SLOT}{i}"] for i in _aux_slots_received(self)
+            intermediate_tensors[f"{AUX_SLOT}{i}"] for i in aux_slots_received(self)
         ]
 
     # Index i means "input to layer i". The pre-loop capture is first-rank only:
@@ -238,7 +159,7 @@ def forward(
     # The capture appends to a list; it must not key a dict inside the loop. Doing
     # so breaks the graph at that statement -- the backend then receives the
     # residual-stream add on its own, as two no-op bf16 casts, and rejects it while
-    # registering the module. `_aux_slots_captured` recovers which global index each
+    # registering the module. `aux_slots_captured` recovers which global index each
     # append holds, from constants, outside the graph.
     captured: list[torch.Tensor] = []
     if get_pp_group().is_first_rank and 0 in self.aux_hidden_state_layers:
@@ -250,9 +171,9 @@ def forward(
 
     if not get_pp_group().is_last_rank:
         tensors = {"hidden_states": hidden_states, "residual": residual}
-        slots = _aux_slots_received(self) + _aux_slots_captured(self)
+        slots = aux_slots_received(self) + aux_slots_captured(self)
         for index, value in zip(slots, received + captured):
-            tensors[f"{_AUX_SLOT}{index}"] = value
+            tensors[f"{AUX_SLOT}{index}"] = value
         return IntermediateTensors(tensors)
 
     hidden_states, _ = self.norm(hidden_states, residual)
@@ -264,7 +185,7 @@ def forward(
     assert len(aux) == len(self.aux_hidden_state_layers), (
         f"EAGLE3 expected {len(self.aux_hidden_state_layers)} aux hidden states for "
         f"layers {sorted(self.aux_hidden_state_layers)}, but "
-        f"{len(_aux_slots_received(self))} arrived and "
-        f"{len(_aux_slots_captured(self))} were captured"
+        f"{len(aux_slots_received(self))} arrived and "
+        f"{len(aux_slots_captured(self))} were captured"
     )
     return hidden_states, aux

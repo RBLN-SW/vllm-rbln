@@ -131,6 +131,10 @@ from vllm_rbln.v1.core.utils import (
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.spec_decode.eagle3_pp import (
+    eagle3_aux_hidden_states_enabled,
+    install_aux_handoff_slots,
+)
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
@@ -299,22 +303,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             | SuffixDecodingProposer
             | None
         ) = None
-        # Read the EAGLE3 aux-hidden-state flag from the config rather than from
-        # the drafter, which exists only on the last rank. Every stage has to know
-        # it: the aux tensors are captured across the stages and only consumed on
-        # the last one, so a non-last stage that thinks EAGLE3 is off captures
-        # nothing and the last stage comes up short.
-        if self.speculative_config and self.speculative_config.method == "eagle3":
-            eagle_config = getattr(
-                self.speculative_config.draft_model_config.hf_config,
-                "eagle_config",
-                None,
-            )
-            self.use_aux_hidden_state_outputs = (
-                True
-                if not isinstance(eagle_config, dict)
-                else eagle_config.get("use_aux_hidden_state", True)
-            )
+        self.use_aux_hidden_state_outputs = eagle3_aux_hidden_states_enabled(
+            self.speculative_config
+        )
 
         if self.speculative_config and get_pp_group().is_last_rank:
             if self.speculative_config.method == "ngram":
@@ -1819,6 +1810,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
 
             self.model.set_aux_hidden_state_layers(aux_layers)
+            # The handoff placeholder has to advertise the aux slots this stage
+            # expects, and the layers are only known here. A no-op at PP=1, where
+            # a stage receives nothing.
+            install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
 

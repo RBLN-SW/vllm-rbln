@@ -29,6 +29,7 @@ import torch
 from vllm.model_executor.models.minimax_m2 import MiniMaxM2Model
 
 import vllm_rbln.patches.minimax_m2 as patch_module
+import vllm_rbln.v1.spec_decode.eagle3_pp as eagle3_pp
 
 # The suite truncates models via VLLM_RBLN_NUM_HIDDEN_LAYERS, and the patched
 # get_pp_indices honors it. These stages are stubs, so the truncation has nothing
@@ -95,44 +96,41 @@ class _UnownedLayer(torch.nn.Module):
 
 
 def _build_stage(rank: int, pp_size: int, monkeypatch) -> MiniMaxM2Model:
-    """Build one stage through the patched __init__, stubbing out upstream's.
+    """Assemble one stage's state with stub layers, real bands.
 
-    Going through the real patch is what puts the handoff callable it installs
-    under test, rather than one the test wrote itself.
+    The band comes from the real `get_pp_indices`, so a stage that reads outside
+    its own band calls an `_UnownedLayer` rather than producing a tensor that still
+    happens to fit.
     """
-
-    def stub_init(model, *, vllm_config, prefix=""):
-        torch.nn.Module.__init__(model)
-        model.config = SimpleNamespace(hidden_size=HIDDEN, num_hidden_layers=NUM_LAYERS)
-        start, end = get_pp_indices(NUM_LAYERS, rank, pp_size)
-        model.start_layer, model.end_layer = start, end
-        model.layers = torch.nn.ModuleList(
-            [
-                _StampingLayer(i) if start <= i < end else _UnownedLayer()
-                for i in range(NUM_LAYERS)
-            ]
-        )
-        model.embed_input_ids = lambda input_ids: torch.zeros(BATCH, HIDDEN)
-        model.norm = lambda hidden, residual: (
-            hidden if residual is None else hidden + residual,
-            None,
-        )
-        model.aux_hidden_state_layers = ()
-
-    monkeypatch.setattr(patch_module, "_orig_model_init", stub_init)
-    monkeypatch.setattr(
-        patch_module, "get_pp_group", lambda rank=rank: _Group(rank, pp_size)
-    )
     model = MiniMaxM2Model.__new__(MiniMaxM2Model)
-    patch_module.patched_minimax_m2_model_init(model, vllm_config=None, prefix="")
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=HIDDEN, num_hidden_layers=NUM_LAYERS)
+    start, end = get_pp_indices(NUM_LAYERS, rank, pp_size)
+    model.start_layer, model.end_layer = start, end
+    model.layers = torch.nn.ModuleList(
+        [
+            _StampingLayer(i) if start <= i < end else _UnownedLayer()
+            for i in range(NUM_LAYERS)
+        ]
+    )
+    model.embed_input_ids = lambda input_ids: torch.zeros(BATCH, HIDDEN)
+    model.norm = lambda hidden, residual: (
+        hidden if residual is None else hidden + residual,
+        None,
+    )
+    model.aux_hidden_state_layers = ()
+
+    # The forward reads the group directly; the shared slot helpers read their own
+    # import of it.
+    group = _Group(rank, pp_size)
+    monkeypatch.setattr(patch_module, "get_pp_group", lambda: group)
+    monkeypatch.setattr(eagle3_pp, "get_pp_group", lambda: group)
     return model
 
 
 def _slot_indices(keys) -> list[int]:
     return sorted(
-        int(key.rsplit("_", 1)[1])
-        for key in keys
-        if key.startswith(patch_module._AUX_SLOT)
+        int(key.rsplit("_", 1)[1]) for key in keys if key.startswith(eagle3_pp.AUX_SLOT)
     )
 
 
@@ -188,14 +186,16 @@ def test_a_stage_owning_no_aux_layer_forwards_the_slots(monkeypatch):
 
 
 def test_the_handoff_placeholder_follows_a_later_setter_call(monkeypatch):
-    # MiniMaxM2ForCausalLM.__init__ copies this callable onto itself before the
-    # runner sets the aux layers, and the runner calls that copy. A callable that
-    # baked the key set in at construction leaves the copy a slot short, which the
-    # receiving stage only finds out about as a KeyError.
-    model = _build_stage(1, 4, monkeypatch)
-    snapshot = model.make_empty_intermediate_tensors
+    # ForCausalLM.__init__ copies this callable onto itself and the runner calls
+    # that copy, so the installer binds it on the outer object and reads the key set
+    # at call time. A callable that baked the key set in when it was bound leaves the
+    # copy a slot short, which the receiving stage only finds out about as a KeyError.
+    inner = _build_stage(1, 4, monkeypatch)
+    outer = SimpleNamespace(model=inner)
+    eagle3_pp.install_aux_handoff_slots(outer)
+    snapshot = outer.make_empty_intermediate_tensors
 
-    model._set_aux_hidden_state_layers(CHECKPOINT_AUX_LAYERS)
+    inner._set_aux_hidden_state_layers(CHECKPOINT_AUX_LAYERS)
 
     tensors = snapshot(batch_size=BATCH, dtype=torch.float32, device="cpu")
     assert _slot_indices(tensors.tensors) == [1]
@@ -235,4 +235,4 @@ def test_the_received_slot_set_follows_the_stage_band(monkeypatch):
         model = _build_stage(rank, 4, monkeypatch)
         model._set_aux_hidden_state_layers(CHECKPOINT_AUX_LAYERS)
 
-        assert patch_module._aux_slots_received(model) == want
+        assert eagle3_pp.aux_slots_received(model) == want
