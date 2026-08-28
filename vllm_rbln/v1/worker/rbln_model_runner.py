@@ -1295,12 +1295,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 **staging,
             )
         else:
-            bucket = self.max_num_reqs
+            if envs.VLLM_RBLN_SAMPLER:
+                bucket = self.bucketing_manager.max_batch_size
+                spec_decode_metadata = _pad_spec_decode_metadata(
+                    spec_decode_metadata, bucket
+                )
+                sampling_metadata = _pad_sampling_metadata(sampling_metadata, bucket)
             out = self.rejection_sampler(
-                _pad_spec_decode_metadata(spec_decode_metadata, bucket),
+                spec_decode_metadata,
                 None,  # draft_probs
                 logits,
-                _pad_sampling_metadata(sampling_metadata, bucket),
+                sampling_metadata,
             )
 
         return _depad_sampler_output(out, num_reqs)
@@ -3277,10 +3282,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         num_spec = self.num_spec_tokens
         vocab_size = self.model_config.get_vocab_size()
-        # _sample pins the request axis here, so the smaller sizes this used to walk
-        # are unreachable at serving time. Both sites must name the same bound:
-        # decode_batch_buckets is the model's and need not reach max_num_reqs.
-        batch_size = self.max_num_reqs
+        # _sample pins the request axis to the per-PP-stage decode bound.
+        batch_size = self.bucketing_manager.max_batch_size
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
@@ -3503,10 +3506,11 @@ def _pad_sampling_metadata(md: SamplingMetadata, bucket: int) -> SamplingMetadat
 def _depad_sampler_output(out: SamplerOutput, num_reqs: int) -> SamplerOutput:
     lp = out.logprobs_tensors
     if lp is not None:
+        num_logprob_rows = num_reqs * out.sampled_token_ids.shape[1]
         lp = LogprobsTensors(
-            lp.logprob_token_ids[:num_reqs],
-            lp.logprobs[:num_reqs],
-            lp.selected_token_ranks[:num_reqs],
+            lp.logprob_token_ids[:num_logprob_rows],
+            lp.logprobs[:num_logprob_rows],
+            lp.selected_token_ranks[:num_logprob_rows],
         )
     return SamplerOutput(
         sampled_token_ids=out.sampled_token_ids[:num_reqs],
