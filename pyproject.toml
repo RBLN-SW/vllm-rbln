@@ -44,7 +44,7 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln~=0.4.0 ; platform_machine == 'x86_64'",
+    "torch-rbln>=0.4.0 ; platform_machine == 'x86_64'",
     "optimum-rbln>=0.11.2",
 ]
 
@@ -191,11 +191,6 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
-name = "pypi"
-url = "https://pypi.org/simple"
-default = true
-
-[[tool.uv.index]]
 name = "rbln-nexus-nightly"
 url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/"
 
@@ -209,7 +204,6 @@ torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
 torchcodec = { index = "pytorch-cpu" }
-torch-rbln = { index = "pypi" }
 
 [tool.typos.default]
 binary = false
