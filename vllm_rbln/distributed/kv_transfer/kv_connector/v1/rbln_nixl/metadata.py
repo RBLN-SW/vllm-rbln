@@ -91,17 +91,21 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
 
 
 class RblnNixlConnectorMetadata(NixlConnectorMetadata):
-    """``NixlConnectorMetadata`` + what the trim needs to size a last block.
+    """``NixlConnectorMetadata`` + the requests whose early write must be drained.
 
-    Promoted from the instance upstream builds rather than constructed in its
-    place: ``NixlBaseConnectorScheduler.build_connector_meta`` names the
-    upstream type directly and offers no hook for a subclass. This struct stays
+    Promoted from the instance the base scheduler builds rather than constructed
+    in its place: ``NixlBaseConnectorScheduler.build_connector_meta`` names the
+    base type directly and offers no hook for a subclass. This struct stays
     inside one engine -- it never reaches a peer -- so it is not part of the
     handshake schema and does not move ``RBLN_NIXL_CONNECTOR_VERSION``.
     """
 
     def __init__(self) -> None:
         super().__init__()
+        # Requests whose source blocks go back to the allocator without a lease
+        # -- preempted, or finished on a non-terminal status. A write already
+        # issued for them reads memory the next forward may overwrite.
+        self.push_early_flush: set[ReqId] = set()
         # Tokens of KV the offered block list holds, so a last block that is not
         # full can leave the areas above its final token behind. Absent where
         # the count is unknown, which keeps the whole block.
