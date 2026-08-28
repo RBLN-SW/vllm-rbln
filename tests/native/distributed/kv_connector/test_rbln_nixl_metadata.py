@@ -19,12 +19,16 @@
 # msgspec + hash), so it does not require the ``nixl-rbln`` install or a worker.
 
 import msgspec
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlAgentMetadata,
+    NixlConnectorMetadata,
+)
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RBLN_NIXL_CONNECTOR_VERSION,
     RblnNixlAgentMetadata,
+    RblnNixlConnectorMetadata,
     rbln_compat_hash,
 )
 
@@ -136,3 +140,38 @@ class TestRblnCompatHash:
             md, "RBLN_NIXL_CONNECTOR_VERSION", RBLN_NIXL_CONNECTOR_VERSION + 1
         )
         assert md.rbln_compat_hash("BASE", writes_into_peer=False) != h1
+
+
+class TestRblnNixlConnectorMetadata:
+    def test_promotion_keeps_every_field_upstream_filled(self):
+        # Upstream scheduler names its own type, so ours is copied from the
+        # instance it built; a field lost here is a step's transfers lost.
+        base = NixlConnectorMetadata()
+        base.reqs_to_recv = {"r0": "recv"}
+        base.reqs_to_save = {"r1": "save"}
+        base.reqs_in_batch = {"r2"}
+        base.push_finished_blocks = {"r3": ([1],)}
+
+        promoted = RblnNixlConnectorMetadata.promote(base)
+
+        assert promoted.reqs_to_recv == {"r0": "recv"}
+        assert promoted.reqs_to_save == {"r1": "save"}
+        assert promoted.reqs_in_batch == {"r2"}
+        assert promoted.push_finished_blocks == {"r3": ([1],)}
+        assert promoted.push_early_flush == set()
+        assert promoted.push_stream_total == {}
+        # Upstream asserts on its own type in several places.
+        assert isinstance(promoted, NixlConnectorMetadata)
+
+    def test_the_two_added_fields_do_not_bleed_into_each_other(self):
+        # They are filled by different paths on different steps -- the flush on
+        # a preemption, the total on every streamed offer -- so a promotion
+        # that aliased them would show up as one path clearing the other.
+        meta = RblnNixlConnectorMetadata()
+        meta.push_early_flush = {"r0"}
+        meta.push_stream_total = {"r1": 4}
+
+        promoted = RblnNixlConnectorMetadata.promote(meta)
+
+        assert promoted.push_early_flush == {"r0"}
+        assert promoted.push_stream_total == {"r1": 4}

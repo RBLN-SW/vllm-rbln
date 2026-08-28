@@ -28,7 +28,11 @@ completing a handshake.
 from dataclasses import dataclass, field
 
 from vllm.config.utils import hash_factors
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlAgentMetadata,
+    NixlConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
 
 # Bump on any incompatible change to the RBLN metadata schema or semantics.
 # Folded into the NIXL compatibility hash so an RBLN peer speaking a different
@@ -37,7 +41,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 #   1: pp_rank / pp_size / registered_layer_names (the layer axis)
 #   2: + kv_areas / kv_slices (the head axis: chiplet geometry)
 #   3: + the transfer direction in the hash
-RBLN_NIXL_CONNECTOR_VERSION: int = 3
+#   4: + which consumer blocks a completion notification covered
+RBLN_NIXL_CONNECTOR_VERSION: int = 4
+
+# Prefix a push completion notification carries when it names the half-open
+# range of consumer blocks that write filled: ``RBLNS:<writer>:<lo>:<hi>:``
+# ahead of the message upstream builds. A consumer settles a request on the
+# ranges it has seen rather than on how many peers reported, which is what
+# lets one peer's KV arrive in several writes. The producer leaves it off
+# where a single range cannot describe the write, so a consumer has to accept
+# a message without it.
+RBLN_COVERAGE_NOTIF_PREFIX: bytes = b"RBLNS:"
 
 
 @dataclass
@@ -57,6 +71,35 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # DISTINCT rather than replicas (see `_slice_head_bounds`).
     kv_areas: int = 1
     kv_slices: int = 1
+
+
+class RblnNixlConnectorMetadata(NixlConnectorMetadata):
+    """``NixlConnectorMetadata`` + the requests whose early write must be drained.
+
+    Promoted from the instance upstream builds rather than constructed
+    in its place: ``NixlBaseConnectorScheduler.build_connector_meta`` names the
+    upstream type directly and offers no hook for a subclass. This struct stays
+    inside one engine -- it never reaches a peer -- so it is not part of the
+    handshake schema and does not move ``RBLN_NIXL_CONNECTOR_VERSION``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Requests whose source blocks go back to the allocator without a lease
+        # -- preempted, or finished on a non-terminal status. A write already
+        # issued for them reads memory the next forward may overwrite.
+        self.push_early_flush: set[ReqId] = set()
+        # Blocks a streamed request will hold once its whole prompt is
+        # computed. The consumer registered the tail of that, so where its
+        # window begins can only be found from the total -- and the prefix
+        # offered mid-stream is shorter than it.
+        self.push_stream_total: dict[ReqId, int] = {}
+
+    @classmethod
+    def promote(cls, base: NixlConnectorMetadata) -> "RblnNixlConnectorMetadata":
+        meta = cls()
+        meta.__dict__.update(base.__dict__)
+        return meta
 
 
 def rbln_compat_hash(base_hash: str, *, writes_into_peer: bool) -> str:

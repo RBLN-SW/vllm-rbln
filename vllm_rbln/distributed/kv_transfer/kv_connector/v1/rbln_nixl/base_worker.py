@@ -1397,7 +1397,13 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                             remote_tp_size,
                         )
 
-                    if not (pp_size > 1 or partial or fan_in or split > 1):
+                    if not (
+                        pp_size > 1
+                        or partial
+                        or fan_in
+                        or split > 1
+                        or self._writes_less_than_a_request()
+                    ):
                         # Nothing is narrowed: upstream's whole-engine handle
                         # describes this peer, so the transfer path delegates.
                         continue
@@ -1456,6 +1462,17 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # handshake), so the rank we hold is the peer's TP rank as planned.
         return handles[plan.all_source_ranks.index(global_rank)]
 
+    def _writes_less_than_a_request(self) -> bool:
+        """Whether this side ever moves part of a request at a time.
+
+        A peer that narrows nothing is described by upstream's whole-engine
+        handle, and that handle's notification has no room to say which blocks
+        a transfer filled. Anything sending a request in pieces needs its own
+        descriptors for that reason alone, so it has to be asked for here even
+        when the two sides are shaped identically.
+        """
+        return False
+
     def _register_shard_xfer_state(
         self,
         engine_id: str,
@@ -1468,7 +1485,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         replica_fanout: int = 1,
     ) -> None:
         # Compute the local region ids once and reuse them for the handler
-        # (PP context is always the shard path: SWA + PP is rejected earlier).
+        # (SWA never reaches a pipelined peer: it is rejected earlier).
         region_ids = self._shard_local_region_ids(
             registered_layer_names, peer_areas=peer_areas
         )

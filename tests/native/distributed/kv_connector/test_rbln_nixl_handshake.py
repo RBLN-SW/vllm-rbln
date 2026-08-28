@@ -345,6 +345,23 @@ class TestPpHandshakeFanout:
         assert w._overlapping_ranks["eng"] == []
         assert w._register_shard_xfer_state.call_count == 0
 
+    def test_a_side_that_moves_part_of_a_request_asks_even_a_matching_peer(
+        self, monkeypatch
+    ):
+        # The same peer as above. Nothing is narrowed, so the only reason to
+        # build per-shard state is that a transfer covering part of a request
+        # needs a notification saying which part -- which upstream's
+        # whole-engine handle has no room for.
+        monkeypatch.setattr(
+            W.RblnNixlWorkerBase, "_writes_less_than_a_request", lambda self: True
+        )
+        w = _make_worker()
+
+        _handshake(w, _FakeSock(pp_size=1))
+
+        assert w._overlapping_ranks["eng"] == [0]
+        assert w._register_shard_xfer_state.call_count == 1
+
     @pytest.mark.parametrize("sw_ratio", [0.5, None])
     def test_swa_plus_pp_raises(self, sw_ratio):
         # The consumer's own guard, hit when it discovers a PP producer while
