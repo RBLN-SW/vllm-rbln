@@ -377,10 +377,10 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # Push a pipeline stage's KV as soon as that stage computes the closing
-    # prefill chunk, instead of waiting for the request to finish. Overlaps a
-    # stage's transfer with the prefill the later stages are still running, so
-    # it does nothing at `pipeline_parallel_size` 1.
+    # Push the blocks a prefill has closed as it closes them, instead of
+    # waiting for the request to finish. What is left to move at the end is
+    # then the block a prompt ends inside rather than the whole prompt. Direct
+    # transfers of a full-attention model only.
     "VLLM_RBLN_NIXL_PUSH_STREAM": (
         lambda: (
             os.environ.get("VLLM_RBLN_NIXL_PUSH_STREAM", "False").lower()

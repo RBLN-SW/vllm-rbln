@@ -26,7 +26,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnector,
-    NixlConnectorMetadata,
     NixlPullConnector,
     NixlPushConnector,
 )
@@ -188,13 +187,13 @@ class RblnNixlPushConnector(RblnNixlConnectorBase, NixlPushConnector):
     def wait_for_save(self) -> None:
         """Take the closed prefill for the writer, after the host copy.
 
-        The base does the host-staging copy here; taking it first would let a
+        Upstream does the host-staging copy here; taking it first would let a
         write read a buffer still being filled, so the order this call site
         fixes is the invariant.
         """
         super().wait_for_save()
         assert isinstance(self.connector_worker, RblnNixlPushConnectorWorker)
-        assert isinstance(self._connector_metadata, NixlConnectorMetadata)
+        assert isinstance(self._connector_metadata, RblnNixlConnectorMetadata)
         self.connector_worker.start_early_push(self._connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:

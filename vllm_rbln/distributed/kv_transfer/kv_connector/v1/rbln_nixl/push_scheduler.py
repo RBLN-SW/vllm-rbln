@@ -16,13 +16,14 @@
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnectorMetadata,
     NixlPushConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 
 import vllm_rbln.envs as envs
@@ -43,10 +44,11 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
     """Scheduler side of the write path.
 
     Beyond binding the two bases, this offers a prefill's blocks to the worker
-    at the chunk that closes it rather than at the request's end, so a
-    pipeline stage can write its layers while the later stages still run. What
-    it offers is the same list the request's end would have offered; only the
-    step it is offered on is earlier.
+    as the chunks close them rather than at the request's end, so what a
+    prefill has finished can leave while the rest of it is still being
+    computed -- on later pipeline stages, or in this rank's own later chunks.
+    What it offers is a prefix of the list the request's end would have
+    offered; the end still carries the block that prefix never closes.
     """
 
     def __init__(
@@ -54,12 +56,22 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
-        # A stage's write overlaps the stages that come after it, so there is
-        # nothing to overlap with when the producer is one stage.
+        # What a prefill closes can leave before the request ends, whether the
+        # rest of it is still running on later pipeline stages or in this
+        # rank's own later chunks. Which peers can be written a prefix is not
+        # known until the handshake, so that part is settled per write.
+        #
+        # A hybrid model is left out because its groups do not close together:
+        # they hold different numbers of blocks for the same tokens, and the
+        # offer below advances every group by one count. Its handover clips
+        # each group to its own window from the tail, which is the end a
+        # prefix sent from the front never reaches.
         self._early_push_enabled = (
-            envs.VLLM_RBLN_NIXL_PUSH_STREAM
-            and vllm_config.parallel_config.pipeline_parallel_size > 1
+            envs.VLLM_RBLN_NIXL_PUSH_STREAM and not self._is_hma_required
         )
+        # How much of each request's prefix has already been offered, so a
+        # step that closes no new block offers nothing.
+        self._streamed_blocks: dict[str, int] = {}
         # Requests offered early, kept until either the lease takes over
         # (terminal finish) or their blocks go back to the allocator without
         # one, which the worker has to be told about (`push_early_flush`).
@@ -69,7 +81,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ) -> None:
         super().update_state_after_alloc(request, blocks, num_external_tokens)
-        # The base tracks a producer's request for the save path only under
+        # Upstream tracks a producer's request for the save path only under
         # host staging, and the accumulation that path builds is what the
         # early offer reads.
         params = request.kv_transfer_params
@@ -84,12 +96,9 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         meta = RblnNixlConnectorMetadata.promote(base_meta)
 
         if self._early_push_enabled and not self.use_host_buffer:
-            # `reqs_to_save` says a request's KV for this rank's layers is
-            # complete and ready to leave. Host staging moves it to the host
-            # buffer; the direct path has nowhere local to move it to, so the
-            # readiness itself is the whole content -- and the base only
-            # builds it for host staging.
-            self._build_save_meta(meta, scheduler_output)
+            # Upstream fills `reqs_to_save` for host staging only (see
+            # `_build_stream_meta`).
+            self._build_stream_meta(meta, scheduler_output)
             self._early_sent.update(meta.reqs_to_save)
 
         # A preempted request re-prefills into these blocks and one that
@@ -101,6 +110,69 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         meta.push_early_flush = flush
         self._early_sent -= flush
         return meta
+
+    def _build_stream_meta(
+        self, meta: RblnNixlConnectorMetadata, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Offer the prefix a prefill has closed, on every step it grows.
+
+        A prefill's blocks close one at a time and the request ends long after
+        the first of them does. Offering the closed prefix each step lets a
+        stage write a block while the chunks behind it are still running, so
+        what is left to move when the prefill ends is the last block rather
+        than the whole prompt.
+
+        The offer is the accumulated prefix, not the step's new blocks. The
+        writer parks an unmatched offer by overwriting what it held for the
+        request, so a prefix survives that overwrite and a delta is silently
+        dropped -- and an offer parked behind a late registration is exactly
+        when several of them queue up.
+
+        NOTE(RBLN): a parallel method rather than the generalisation of
+        `_build_save_meta` the plan called for. That one emits once, at the
+        closing chunk, and drops its accumulation there; this emits on every
+        step and keeps it. Folding both into one would put a mode switch in the
+        method host staging depends on, which would make that path share this
+        one's risk for nothing.
+
+        `closed` counts blocks whose tokens were computed before this step, so
+        the writer -- which takes the offer at the start of a later step -- only
+        ever reads KV a forward has already finished with.
+        """
+        for req_id, new_block_id_groups, resumed in yield_req_data(scheduler_output):
+            req = self._reqs_need_save.get(req_id)
+            if req is None:
+                continue
+            assert req.kv_transfer_params is not None
+
+            if self._accumulate_blocks_to_save(req_id, new_block_id_groups, resumed):
+                self._streamed_blocks.pop(req_id, None)
+
+            groups = self._block_ids_need_save.get(req_id)
+            # A request enters the table on the step it is admitted, which is
+            # the step it first carries blocks, so nothing reaches here with
+            # neither the accumulation nor a delta.
+            assert groups is not None, (
+                "RBLN push stream reached with no blocks: "
+                f"req_id={req_id} resumed={resumed} "
+                f"num_computed={req.num_computed_tokens} "
+                f"num_prompt={req.num_prompt_tokens}"
+            )
+            closed = min(
+                req.num_computed_tokens // self.block_size,
+                min(len(group) for group in groups),
+            )
+            if closed <= self._streamed_blocks.get(req_id, 0):
+                continue
+            self._streamed_blocks[req_id] = closed
+            meta.push_stream_total[req_id] = cdiv(
+                req.num_prompt_tokens, self.block_size
+            )
+            meta.add_new_req_to_save(
+                request_id=req_id,
+                local_block_ids=tuple(group[:closed] for group in groups),
+                kv_transfer_params=req.kv_transfer_params,
+            )
 
     def request_finished(
         self, request: "Request", block_ids: BlockIds
@@ -117,6 +189,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         and the engine dies on the missing key. The read path is unaffected:
         there the field arrives with the producer's own reply.
         """
+        self._streamed_blocks.pop(request.request_id, None)
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_prefill"):
             params.setdefault("remote_block_ids", ())

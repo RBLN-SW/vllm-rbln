@@ -250,7 +250,7 @@ class TestEarlyWriteWiring:
     def test_the_host_copy_runs_before_the_write_is_offered(
         self, monkeypatch, push_worker_connector
     ):
-        # The base does the staging copy in wait_for_save; a write offered
+        # Upstream does the staging copy in wait_for_save; a write offered
         # first would read a buffer still being filled.
         order = []
         monkeypatch.setattr(
@@ -260,7 +260,7 @@ class TestEarlyWriteWiring:
         connector.connector_worker.start_early_push.side_effect = (
             lambda meta: order.append("offer")
         )
-        connector._connector_metadata = cm.NixlConnectorMetadata()
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
 
         connector.wait_for_save()
 
