@@ -1255,7 +1255,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )[0]
         for i in discard_sampled_tokens_req_indices:
             gen = self.input_batch.generators.get(int(i))
-            if gen is not None:
+            # The rewind undoes a Philox counter advance, which only device
+            # generators have; a CPU generator raises on get/set_offset().
+            if gen is not None and gen.device.type != "cpu":
                 gen.set_offset(gen.get_offset() - 4)
 
         # Copy some objects so they don't get modified after returning.

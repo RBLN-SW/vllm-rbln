@@ -1847,6 +1847,74 @@ def test_bookkeeping_sync_discards_chunked_prefill_samples(
     assert rbln_model_runner.requests["req_1"].output_token_ids == [202]
 
 
+def test_bookkeeping_sync_discard_keeps_seeded_cpu_generator(
+    rbln_model_runner, dist_init
+):
+    """A request that carries a seed gets a per-request generator, and this
+    backend creates it on CPU. When such a request is in the discard set,
+    _bookkeeping_sync must not rewind the generator offset: a CPU generator has
+    no offset and raises RuntimeError on get_offset()/set_offset()."""
+    req_id = "req_seeded"
+
+    rbln_model_runner._update_states(
+        _schedule_new_request(req_id, sampling_params=[SamplingParams(seed=1234)])
+    )
+
+    ib = rbln_model_runner.input_batch
+    assert ib.req_id_to_index == {req_id: 0}
+
+    # The seed is what puts a generator into input_batch.generators, which is
+    # the dict the discard path reaches into.
+    generator = ib.generators[0]
+    assert generator.device.type == "cpu"
+    state_before = generator.get_state()
+
+    # Default prompt is [1, 2, 3]; the row is an intermediate chunked prefill
+    # and must discard its sample.
+    ib.num_tokens_no_spec[:1] = [3]
+    rbln_model_runner.discard_request_mask[0] = True
+
+    sampler_output = _sampler_output([[101]], device=rbln_model_runner.device)
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={req_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    hidden_states = torch.empty(
+        (1, rbln_model_runner.model_config.get_hidden_size()),
+        dtype=rbln_model_runner.dtype,
+        device=rbln_model_runner.device,
+    )
+
+    (
+        _num_nans_in_logits,
+        _logprobs_lists,
+        valid_sampled_token_ids,
+        _prompt_logprobs_dict,
+        _req_ids_output_copy,
+        _req_id_to_index_output_copy,
+    ) = rbln_model_runner._bookkeeping_sync(
+        scheduler_output=scheduler_output,
+        sampler_output=sampler_output,
+        logits=None,
+        hidden_states=hidden_states,
+        num_scheduled_tokens=1,
+    )
+
+    # The sample is still dropped, and the generator is left untouched.
+    assert valid_sampled_token_ids == [[]]
+    assert rbln_model_runner.requests[req_id].output_token_ids == []
+    assert torch.equal(generator.get_state(), state_before)
+
+
 def test_bookkeeping_sync_parses_spec_decode_output(rbln_model_runner, dist_init):
     """Speculative sampler output is parsed into accepted tokens and only those
     accepted tokens are cached in the request state."""
