@@ -32,6 +32,12 @@ import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_schedule
 from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
+    RblnNixlSchedulerBase,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
+    RblnNixlWorkerBase,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RblnNixlConnectorMetadata,
 )
@@ -40,6 +46,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler 
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_scheduler import (
     RblnNixlPushConnectorScheduler,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
+    RblnNixlPushConnectorWorker,
 )
 
 
@@ -76,10 +85,14 @@ class _Request:
     prompt_token_ids: list = field(default_factory=list)
 
 
-def _sched_output(req_id, block_ids, num_scheduled_tokens, *, is_new=True):
+def _sched_output(
+    req_id, block_ids, num_scheduled_tokens, *, is_new=True, resumed=False
+):
     """A minimal SchedulerOutput for yield_req_data: a fresh req carries its
     block_ids on scheduled_new_reqs; a resumed chunk carries them on
-    scheduled_cached_reqs (None once no new blocks are added)."""
+    scheduled_cached_reqs (None once no new blocks are added). `resumed` marks
+    a request coming back from preemption, whose block ids are its whole list
+    again rather than the step's delta."""
     if is_new:
         return _SchedOutput(
             scheduled_new_reqs=[_NewReq(req_id, block_ids)],
@@ -88,7 +101,11 @@ def _sched_output(req_id, block_ids, num_scheduled_tokens, *, is_new=True):
         )
     return _SchedOutput(
         scheduled_new_reqs=[],
-        scheduled_cached_reqs=_CachedReqs(req_ids=[req_id], new_block_ids=[block_ids]),
+        scheduled_cached_reqs=_CachedReqs(
+            req_ids=[req_id],
+            new_block_ids=[block_ids],
+            resumed_req_ids={req_id} if resumed else set(),
+        ),
         num_scheduled_tokens={req_id: num_scheduled_tokens},
     )
 
@@ -125,6 +142,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched._has_mamba = False
     sched.vllm_config.scheduler_config.max_num_batched_tokens = 512
     if cls is RblnNixlPushConnectorScheduler:
+        sched._streamed_blocks = {}
         sched._push_pending_registrations = {}
         sched._push_registration_deadlines = {}
         sched._push_registration_timeout = 480
@@ -412,6 +430,7 @@ class TestSchedulerCleanupReachesBothDirections:
         monkeypatch.setattr(direction_cls, "request_finished", record)
         scheduler = object.__new__(scheduler_cls)
         scheduler._block_ids_need_save = {"r0": ([1, 2],)}
+        scheduler._streamed_blocks = {"r0": 2}
         scheduler._valid_tokens = {}
 
         # A real Request always carries the field, even when it is None.
@@ -421,6 +440,10 @@ class TestSchedulerCleanupReachesBothDirections:
 
         assert scheduler._block_ids_need_save == {}
         assert seen == ["r0"]
+        if scheduler_cls is RblnNixlPushConnectorScheduler:
+            # The offered prefix goes with it: a retry reusing the id would
+            # otherwise be thought to have already streamed what it has not.
+            assert scheduler._streamed_blocks == {}
 
 
 class TestRejectedBeforeScheduling:
@@ -463,8 +486,8 @@ class TestRejectedBeforeScheduling:
 
 
 class TestEarlyOfferOnTheWritePath:
-    """A prefill is offered to the writer at the chunk that closes it, so a
-    pipeline stage can write its layers while the later stages still run. The
+    """A prefill is offered to the writer as its chunks close blocks, so what
+    it has finished can leave while the rest is still being computed. The
     direct path has no save of its own, so the offer is the only reader of the
     accumulation there."""
 
@@ -475,6 +498,37 @@ class TestEarlyOfferOnTheWritePath:
         )
         sched._early_push_enabled = enabled
         return sched
+
+    def test_a_producer_request_is_tracked_for_the_offer(self):
+        # The offer reads the accumulation upstream builds only under host
+        # staging, so the direct path has to enter the request itself. The
+        # in-batch set is upstream's own side effect of the same call: if it
+        # is missing, the chain to upstream did not run.
+        sched = self._push_scheduler()
+        req = _Request("prefill", num_prompt_tokens=256)
+
+        sched.update_state_after_alloc(req, MagicMock(), 0)
+
+        assert sched._reqs_need_save == {"prefill": req}
+        assert sched._reqs_in_batch == {"prefill"}
+
+    def test_a_consumer_request_is_not_tracked(self):
+        # Only the side that produces KV has anything to offer.
+        sched = self._push_scheduler()
+        req = _Request("decode", num_prompt_tokens=256)
+        req.kv_transfer_params = {"do_remote_prefill": False}
+
+        sched.update_state_after_alloc(req, MagicMock(), 0)
+
+        assert sched._reqs_need_save == {}
+
+    def test_the_gate_off_tracks_nothing(self):
+        sched = self._push_scheduler(enabled=False)
+        req = _Request("prefill", num_prompt_tokens=256)
+
+        sched.update_state_after_alloc(req, MagicMock(), 0)
+
+        assert sched._reqs_need_save == {}
 
     def test_the_closing_chunk_offers_its_blocks(self):
         sched = self._push_scheduler()
@@ -492,6 +546,43 @@ class TestEarlyOfferOnTheWritePath:
 
         assert meta.reqs_to_save["chunked"].local_block_ids == ([1, 2, 3],)
         assert sched._early_sent == {"chunked"}
+
+    def test_a_resumed_request_starts_its_offers_over(self):
+        # Both halves of the accumulation have to reset here: the old ids
+        # would offer blocks the request no longer owns, and the old count
+        # would hold each re-prefilled block under the high-water mark.
+        sched = self._push_scheduler()
+        req = _Request("preempted", num_prompt_tokens=512)
+        sched._reqs_need_save["preempted"] = req
+        req.num_computed_tokens = 64
+        sched.build_connector_meta(_sched_output("preempted", ([1, 2, 3],), 64))
+        assert sched._streamed_blocks == {"preempted": 3}
+
+        req.num_computed_tokens = 32
+        meta = sched.build_connector_meta(
+            _sched_output("preempted", ([7, 8, 9],), 32, is_new=False, resumed=True)
+        )
+
+        assert meta.reqs_to_save["preempted"].local_block_ids == ([7, 8],)
+
+    def test_the_offer_carries_the_block_count_of_the_whole_prompt(self):
+        # The consumer registered the tail of the final list, so its window is
+        # placed from the total. Mid-stream the offer is shorter than that, and
+        # a total taken from what has closed so far would put the window at the
+        # wrong end of a prompt still being computed.
+        sched = self._push_scheduler()
+        # A length that is not a whole number of blocks: the last block is part
+        # full, and rounding it away would place the window a block early.
+        req = _Request("chunked", num_prompt_tokens=50)
+        sched._reqs_need_save["chunked"] = req
+        req.num_computed_tokens = 16
+
+        meta = sched.build_connector_meta(_sched_output("chunked", ([1, 2, 3, 4],), 16))
+
+        # 50 tokens over a block size of 16 is four blocks, the last holding two
+        # tokens; one has closed.
+        assert meta.reqs_to_save["chunked"].local_block_ids == ([1],)
+        assert meta.push_stream_total == {"chunked": 4}
 
     def test_the_gate_off_offers_nothing(self):
         # Guard: the direct path had no offer before this change either, so
@@ -567,23 +658,64 @@ class TestEarlyOfferOnTheWritePath:
 
 class TestEarlyPushGate:
     @pytest.mark.parametrize(
-        ("flag", "pp_size", "expected"),
-        [(True, 4, True), (True, 1, False), (False, 4, False)],
+        ("flag", "pp_size", "hybrid", "host_buffer", "expected"),
+        [
+            (True, 4, False, False, True),
+            # One stage still closes blocks one chunk at a time, so what a
+            # prefill has finished can leave before the request does.
+            (True, 1, False, False, True),
+            (False, 4, False, False, False),
+            # A hybrid model's groups hold different numbers of blocks for the
+            # same tokens, so one closed count cannot advance them together.
+            (True, 4, True, False, False),
+            # Host staging holds no areas to write out of.
+            (True, 4, False, True, False),
+        ],
     )
-    def test_the_gate_needs_both_the_flag_and_a_pipeline(
-        self, monkeypatch, flag, pp_size, expected
+    def test_the_gate_needs_the_flag_and_one_block_scale(
+        self, monkeypatch, flag, pp_size, hybrid, host_buffer, expected
     ):
-        # A stage's write overlaps the stages after it, so one stage has
-        # nothing to overlap with however the flag is set.
-        monkeypatch.setattr(
-            NixlPushConnectorScheduler, "__init__", lambda self, *a, **k: None
-        )
+        def stub_init(self, *a, **k):
+            # Upstream sets this before our gate reads it.
+            self._is_hma_required = hybrid
+
+        monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
         config = mock_vllm_config(push_stream=flag)
         config.parallel_config.pipeline_parallel_size = pp_size
+        config.kv_transfer_config.kv_buffer_device = "cpu" if host_buffer else "rbln"
 
         sched = RblnNixlPushConnectorScheduler(config, "eng", MagicMock())
 
         assert sched._early_push_enabled is expected
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    @pytest.mark.parametrize("host_buffer", [False, True])
+    def test_both_sides_answer_the_same_for_one_config(
+        self, monkeypatch, hybrid, host_buffer
+    ):
+        """The scheduler stops building offers and the worker stops asking for
+        per-shard descriptors. A side that takes one without the other sends
+        its peers down a route nothing feeds -- and the route asserts on the
+        group count a hybrid model has."""
+
+        def stub_init(self, *a, **k):
+            # Both bases derive these identically; stub them at the same depth
+            # so the gate line is the only thing left that can differ.
+            self._is_hma_required = hybrid
+            self.use_host_buffer = host_buffer
+
+        monkeypatch.setattr(RblnNixlSchedulerBase, "__init__", stub_init)
+        monkeypatch.setattr(RblnNixlWorkerBase, "__init__", stub_init)
+        config = mock_vllm_config(push_stream=True)
+        config.parallel_config.pipeline_parallel_size = 4
+
+        sched = RblnNixlPushConnectorScheduler(config, "eng", MagicMock())
+        worker = RblnNixlPushConnectorWorker(config, "eng", MagicMock())
+        worker.shutdown = lambda: None  # the base __init__ was stubbed out
+
+        assert worker._early_push_enabled is sched._early_push_enabled
+        # The routing predicate is what carries the gate into the handshake.
+        assert worker._writes_less_than_a_request() is sched._early_push_enabled
 
 
 class TestTailTokenCountOnTheReadPath:
@@ -676,7 +808,11 @@ class TestTailTokenCountOnTheWritePath:
         monkeypatch.setattr(
             NixlPushConnectorScheduler,
             "__init__",
-            lambda self, *a, **k: None,
+            # What our `__init__` reads of upstream's, and nothing else: the
+            # point of the stub is that only our own lines run.
+            lambda self, *a, **k: self.__dict__.update(
+                _is_hma_required=False, use_host_buffer=False
+            ),
         )
         monkeypatch.setattr(
             NixlPushConnectorScheduler,

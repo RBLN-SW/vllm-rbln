@@ -43,8 +43,15 @@ if TYPE_CHECKING:
 # upstream does with ``NIXL_CONNECTOR_VERSION``. Folded into the NIXL compat
 # hash so an RBLN peer on another schema fails the handshake cleanly -- both
 # ends are RBLN; earlier bumps are `git log -L` on this line.
-#   7: swa_kernel_block, and a window range cut by it rather than by the spec
-RBLN_NIXL_CONNECTOR_VERSION: int = 7
+#   8: a completion notification names which consumer blocks the write covered
+RBLN_NIXL_CONNECTOR_VERSION: int = 8
+
+# Prefix a push completion notification carries when it names the half-open
+# range of consumer blocks this write filled: ``RBLNS:<writer>:<lo>:<hi>:``
+# ahead of the message upstream builds. A consumer settles on the ranges it
+# has seen, not on how many peers reported. Left off where no single range
+# describes the write, so a consumer must accept a bare message.
+RBLN_COVERAGE_NOTIF_PREFIX: bytes = b"RBLNS:"
 
 
 class KVSplitAxis(Enum):
@@ -93,9 +100,9 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
 class RblnNixlConnectorMetadata(NixlConnectorMetadata):
     """``NixlConnectorMetadata`` + the requests whose early write must be drained.
 
-    Promoted from the instance the base scheduler builds rather than constructed
+    Promoted from the instance upstream builds rather than constructed
     in its place: ``NixlBaseConnectorScheduler.build_connector_meta`` names the
-    base type directly and offers no hook for a subclass. This struct stays
+    upstream type directly and offers no hook for a subclass. This struct stays
     inside one engine -- it never reaches a peer -- so it is not part of the
     handshake schema and does not move ``RBLN_NIXL_CONNECTOR_VERSION``.
     """
@@ -106,6 +113,11 @@ class RblnNixlConnectorMetadata(NixlConnectorMetadata):
         # -- preempted, or finished on a non-terminal status. A write already
         # issued for them reads memory the next forward may overwrite.
         self.push_early_flush: set[ReqId] = set()
+        # Blocks a streamed request will hold once its whole prompt is
+        # computed. The consumer registered the tail of that, so where its
+        # window begins can only be found from the total -- and the prefix
+        # offered mid-stream is shorter than it.
+        self.push_stream_total: dict[ReqId, int] = {}
         # Tokens of KV the offered block list holds, so a last block that is not
         # full can leave the areas above its final token behind. Absent where
         # the count is unknown, which keeps the whole block.
