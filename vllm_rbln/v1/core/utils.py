@@ -147,8 +147,9 @@ def resolve_propagated_token_write(
     ``(committed_tip, tokens)`` to write at ``token_ids_cpu[cursor:committed_tip]``,
     or ``None`` if the cursor already reached it.
 
-    Sync-scheduling only (RBLN force-disables async); async would need the
-    prev_sampled_token_ids broadcast path, not surface here.
+    Sync-scheduling only: async under PP would need the
+    prev_sampled_token_ids broadcast path instead of this payload, which is why
+    the platform refuses that combination.
     """
     committed_tip = num_computed_tokens + base
     if committed_tip <= cursor:

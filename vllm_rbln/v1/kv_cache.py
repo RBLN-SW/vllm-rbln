@@ -68,10 +68,23 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         self.req_to_blocks[request_id].extend(new_blocks)
         return new_blocks
 
-    def allocate_new_computed_blocks(
+    def add_local_computed_blocks(
         self,
         request_id: str,
         new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        assert not list(new_computed_blocks), (
+            "RBLNSlidingWindowManager does not support prefix-cache hits "
+            "(find_longest_cache_hit returns empty)"
+        )
+        assert len(self.req_to_blocks[request_id]) == 0
+        self.num_cached_block[request_id] = 0
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
@@ -83,24 +96,11 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         through here, so without this override D over-allocates and mismatches
         the P-side single block.
         """
-        if request_id in self.num_cached_block:
-            assert len(new_computed_blocks) == 0
+        if num_external_computed_tokens <= 0:
             return
-
         req_blocks = self.req_to_blocks[request_id]
         assert len(req_blocks) == 0
-        assert not list(new_computed_blocks), (
-            "RBLNSlidingWindowManager does not support prefix-cache hits "
-            "(find_longest_cache_hit returns empty)"
-        )
-
-        # Sentinel for the base-class fast path; 0 because RBLN neither skips
-        # nor pulls from prefix cache.
-        self.num_cached_block[request_id] = 0
-
-        if num_external_computed_tokens > 0:
-            new_blocks = self.block_pool.get_new_blocks(1)
-            req_blocks.extend(new_blocks)
+        req_blocks.extend(self.block_pool.get_new_blocks(1))
 
     @classmethod
     def find_longest_cache_hit(

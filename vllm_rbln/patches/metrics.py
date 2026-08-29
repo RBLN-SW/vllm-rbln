@@ -14,10 +14,15 @@
 """Wall-clock metrics for the native runner, installed only under VLLM_RBLN_METRICS.
 
 Three ranges are timed with perf_counter: the pass (execute_model through
-sample_tokens), the model call, and the sampler call. The last two are reported as one
-sum, so MODEL + SAMPLE carries the same call count as E2E and the difference of the two
-means is the host overhead around the graphs. A pass is recorded only once its phase
-and its graph time are both known, which is what keeps those counts equal.
+sample_tokens), the model call, and the sampler call with the bookkeeping over its
+output. The last two are reported as one sum, so MODEL + SAMPLE carries the same call
+count as E2E and the difference of the two means is the host overhead around the
+graphs. The bookkeeping is in that sum because it holds the step's first blocking read
+of the sampler output -- the cast that used to hold it inside _sample is gone, and
+leaving the read untimed drops this section to dispatch cost while the E2E residual
+absorbs the wait. Async defers that read out of the pass, so there it is dispatch.
+A pass is recorded only once its phase and its graph time are both known, which is
+what keeps those counts equal.
 
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
@@ -252,7 +257,10 @@ _execute_model = RBLNModelRunner.execute_model
 _sample_tokens = RBLNModelRunner.sample_tokens
 _sample = RBLNModelRunner._sample
 _load_model = RBLNModelRunner.load_model
-_determine_batch_padding = RBLNModelRunner._determine_batch_padding
+_determine_batch_execution_and_padding = (
+    RBLNModelRunner._determine_batch_execution_and_padding
+)
+_bookkeeping_sync = RBLNModelRunner._bookkeeping_sync
 _shutdown = RBLNWorker.shutdown
 
 
@@ -273,6 +281,15 @@ def sample_tokens(self, *args, **kwargs):
     output = _sample_tokens(self, *args, **kwargs)
     _ctx(self).end_pass()
     return output
+
+
+@functools.wraps(_bookkeeping_sync)
+def bookkeeping_sync(self, *args, **kwargs):
+    start = time.perf_counter()
+    try:
+        return _bookkeeping_sync(self, *args, **kwargs)
+    finally:
+        _ctx(self).add_graph_time(time.perf_counter() - start)
 
 
 @functools.wraps(_sample)
@@ -305,10 +322,15 @@ def load_model(self, *args, **kwargs):
     self.model_executable = timed_executable
 
 
-@functools.wraps(_determine_batch_padding)
-def determine_batch_padding(self, *args, **kwargs):
-    result = _determine_batch_padding(self, *args, **kwargs)
-    _num_reqs_padded, num_tokens_padded, _num_tokens_across_dp = result
+@functools.wraps(_determine_batch_execution_and_padding)
+def determine_batch_execution_and_padding(self, *args, **kwargs):
+    result = _determine_batch_execution_and_padding(self, *args, **kwargs)
+    batch_desc, _route, _num_tokens_across_dp = result
+    if batch_desc is None:
+        # A drained group runs nothing, so no pass opens and there is no phase to
+        # attribute this step to.
+        return result
+    num_tokens_padded = batch_desc.num_tokens_padded
     if self.is_prefill:
         phase = _Phase.PREFILL
     elif num_tokens_padded == self.max_num_tokens:
@@ -366,10 +388,16 @@ def _register_patches() -> None:
             "attribute, so it cannot be replaced through the registry.",
         ),
         (
-            f"{_RUNNER}._determine_batch_padding",
-            determine_batch_padding,
-            "Reads the pass phase where it is decided. num_tokens_padded is a local of "
-            "execute_model and is not observable from any wrapped callable.",
+            f"{_RUNNER}._bookkeeping_sync",
+            bookkeeping_sync,
+            "Holds the step's first blocking read of the sampler output, which the "
+            "graph slice would otherwise miss.",
+        ),
+        (
+            f"{_RUNNER}._determine_batch_execution_and_padding",
+            determine_batch_execution_and_padding,
+            "Reads the pass phase where it is decided. The padded token dimension is a "
+            "local of execute_model and is not observable from any wrapped callable.",
         ),
         (
             f"{_WORKER}.shutdown",

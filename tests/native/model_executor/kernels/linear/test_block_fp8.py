@@ -228,16 +228,16 @@ class TestCheckShape:
 
 
 class TestCanImplement:
-    def test_w8a16_applies_only_when_use_w8a16(self, monkeypatch):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A16", True)
+    def test_w8a16_applies_unless_w8a8_requested(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A8", False)
         with _base_can_implement_ok():
             ok, _ = RBLNW8A16BlockFp8LinearKernel.can_implement(
                 _config(block_n=4, block_k=4)
             )
         assert ok is True
 
-    def test_w8a16_rejected_when_not_use_w8a16(self, monkeypatch):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A16", False)
+    def test_w8a16_rejected_when_w8a8_requested(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A8", True)
         with _base_can_implement_ok():
             ok, reason = RBLNW8A16BlockFp8LinearKernel.can_implement(
                 _config(block_n=4, block_k=4)
@@ -245,16 +245,16 @@ class TestCanImplement:
         assert ok is False
         assert reason is not None and "W8A16" in reason
 
-    def test_w8a8_applies_only_when_not_use_w8a16(self, monkeypatch):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A16", False)
+    def test_w8a8_applies_when_requested(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A8", True)
         with _base_can_implement_ok():
             ok, _ = RBLNW8A8BlockFp8LinearKernel.can_implement(
                 _config(block_n=4, block_k=4)
             )
         assert ok is True
 
-    def test_w8a8_rejected_when_use_w8a16(self, monkeypatch):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A16", True)
+    def test_w8a8_rejected_by_default(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A8", False)
         with _base_can_implement_ok():
             ok, reason = RBLNW8A8BlockFp8LinearKernel.can_implement(
                 _config(block_n=4, block_k=4)

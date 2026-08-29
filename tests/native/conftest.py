@@ -527,14 +527,3 @@ def _isolate_rbln_ctx_standalone():
     a device at all. Mirrors tests/torch_compile/conftest.py."""
     os.environ.pop("RBLN_CTX_STANDALONE", None)
     yield
-
-
-@pytest.fixture(autouse=True)
-def _reset_memoized_env_reads():
-    """Clear the one env read that sticks process-wide: get_use_w8a16() caches
-    into a module global, pinning the value session-wide otherwise."""
-    from vllm_rbln import envs
-
-    envs._USE_W8A16 = None
-    yield
-    envs._USE_W8A16 = None
