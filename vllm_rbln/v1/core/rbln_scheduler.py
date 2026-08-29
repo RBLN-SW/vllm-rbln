@@ -70,6 +70,8 @@ class RBLNScheduler(Scheduler):
     ) -> None:
         super().__init__(*args, **kwargs)
 
+        self._validate_kv_cache_capacity()
+
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
         # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
@@ -128,6 +130,35 @@ class RBLNScheduler(Scheduler):
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+
+    def _validate_kv_cache_capacity(self) -> None:
+        """Reject a max_model_len the KV cache pool can never serve.
+
+        BlockPool permanently reserves one null block, so only
+        (num_blocks - 1) blocks are allocatable. Admission checks a prompt
+        against max_model_len alone while a new prefill reserves the whole
+        sequence up front, so a prompt above the usable capacity is admitted
+        and then fails allocation on every step: it waits forever without
+        erroring and head-of-line-blocks the requests behind it. Upstream's
+        startup check sizes the pool against cdiv(max_model_len, block_size)
+        blocks, one more than are usable, so it does not cover this.
+
+        The bound assumes a single KV cache group at the scheduler's block
+        size. A hybrid layout draws from the same pool for every group and so
+        needs at least this much, which keeps the check conservative: it can
+        miss a violation, never invent one.
+        """
+        num_blocks = self.kv_cache_config.num_blocks
+        usable_tokens = (num_blocks - 1) * self.block_size
+        if self.max_model_len > usable_tokens:
+            raise ValueError(
+                f"max_model_len ({self.max_model_len}) exceeds the usable KV "
+                f"cache capacity ({usable_tokens} tokens = ({num_blocks} blocks "
+                f"- 1 reserved null block) x {self.block_size} tokens per "
+                "block). Prompts above the usable capacity would wait forever. "
+                "Raise the KV cache block count (e.g. --num-gpu-blocks-override) "
+                "or lower --max-model-len."
+            )
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.

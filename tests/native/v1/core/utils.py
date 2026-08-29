@@ -152,11 +152,21 @@ def create_rbln_scheduler(
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
-    model_config = ModelConfig(
-        model=local_model_path(model), trust_remote_code=True, dtype="float16", seed=42
-    )
     if max_model_len is None:
-        max_model_len = max_num_batched_tokens
+        # One block of the pool is BlockPool's reserved null block, and the
+        # scheduler rejects a max_model_len above the remaining capacity.
+        max_model_len = min(max_num_batched_tokens, (num_blocks - 1) * block_size)
+    model_config = ModelConfig(
+        model=local_model_path(model),
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        # The scheduler reads max_model_len from model_config, so setting it on
+        # SchedulerConfig alone would leave every test on opt-125m's native
+        # 2048; the hf override lifts that native limit out of the way.
+        max_model_len=max_model_len,
+        hf_overrides={"max_position_embeddings": max_model_len},
+    )
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
