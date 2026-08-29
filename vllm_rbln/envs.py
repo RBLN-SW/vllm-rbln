@@ -414,7 +414,6 @@ RBLN_COMPILE_ENV = frozenset(
 
 RBLN_NON_COMPILE_ENV = frozenset(
     {
-        # sampler graphs compile with use_cache=False, never enter the bundle
         "VLLM_RBLN_SAMPLER",
         "VLLM_RBLN_COMPILE_STRICT_MODE",
         "VLLM_RBLN_NUM_RAY_NODES",

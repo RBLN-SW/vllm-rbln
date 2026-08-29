@@ -86,8 +86,13 @@ from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
-from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
+from vllm_rbln.v1.sample import (
+    SAMPLER_GRAPHS_PER_BATCH_SIZE,
+    WARM_UP_CONFIGS,
+    RBLNSampler,
+)
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
+from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
@@ -1229,6 +1234,11 @@ class RBLNOptimumModelRunner(
 
                 clear_reqs(input_batch)
 
+        # On this path the model is an optimum-rbln artifact, so the bundle holds
+        # the sampler graphs alone. Save only after every config compiled, so a
+        # failed warm-up leaves no partial bundle.
+        sig = mega_cache.config_signature(self.vllm_config)
+        mega_cache.load(self.model_config.model, sig)
         for config in WARM_UP_CONFIGS:
             logger.info("Running dummy sampler config: %s", config["name"])
 
@@ -1243,6 +1253,7 @@ class RBLNOptimumModelRunner(
             )
 
             dummy_run_batches(config)
+        mega_cache.save(self.model_config.model, sig)
 
     def set_active_loras(self, input_batch: RBLNInputBatch, is_prefill: bool) -> None:
         num_reqs = self.input_batch.num_reqs
@@ -1500,8 +1511,14 @@ class RBLNOptimumModelRunner(
                     (bucket_size, self.model_config.get_vocab_size()),
                     dtype=self.model.dtype,
                 )
-        torch._dynamo.config.recompile_limit = len(self.bucket_sizes) * len(
-            WARM_UP_CONFIGS
+        # Past either limit dynamo silently falls back to eager for the frame.
+        # recompile_limit is per code object, accumulated_recompile_limit is
+        # process-wide; only raise them, other compiles share the same globals.
+        num_graphs = SAMPLER_GRAPHS_PER_BATCH_SIZE * len(self.bucket_sizes)
+        dynamo_config = torch._dynamo.config
+        dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, num_graphs)
+        dynamo_config.accumulated_recompile_limit = max(
+            dynamo_config.accumulated_recompile_limit, num_graphs
         )
 
     @torch.inference_mode

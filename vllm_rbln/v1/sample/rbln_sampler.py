@@ -471,3 +471,14 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.5,
     },
 ]
+
+# Compiled graphs per batch size. `dynamic=False` makes dynamo specialize on
+# whether `k` and `p` are None, so each row is its own graph:
+#
+#   compiled function          inputs                       warm-up config
+#   rbln_greedy_sample         logits                       no_penalty_greedy
+#   rbln_top_k_top_p_sample    logits, temperature          no_penalty_random
+#   rbln_top_k_top_p_sample    logits, temperature, p       no_penalty_topp
+#   rbln_top_k_top_p_sample    logits, temperature, k       no_penalty_topk
+#   rbln_top_k_top_p_sample    logits, temperature, k, p    no_penalty_topp_topk
+SAMPLER_GRAPHS_PER_BATCH_SIZE = 5
