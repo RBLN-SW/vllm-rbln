@@ -25,13 +25,15 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import _resolve_kv_cache
-from vllm_rbln.patches.models_utils import (
-    rbln_extract_layer_index,
-    rbln_num_attn_module,
-)
 from vllm_rbln.v1.attention.backends.mla.indexer import (
     RBLNDeepseekV32IndexerBackend,
     RBLNDeepseekV32IndexerScaleBackend,
+)
+from vllm_rbln.v1.worker.utils import (
+    num_attn_module as rbln_num_attn_module,
+)
+from vllm_rbln.v1.worker.utils import (
+    pipeline_adjusted_layer_index,
 )
 
 logger = init_logger(__name__)
@@ -154,13 +156,8 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
 
     model_config = vllm_config.model_config
     num_attn_module = rbln_num_attn_module(model_config, cache_dtype)
-    start = 0
-    if model_config is not None:
-        start, _end = model_config.get_layers_start_end_indices(
-            vllm_config.parallel_config
-        )
-    self.layer_index = (
-        rbln_extract_layer_index(self.prefix, num_attn_module) - start * num_attn_module
+    self.layer_index = pipeline_adjusted_layer_index(
+        self.prefix, model_config, vllm_config.parallel_config, num_attn_module
     )
 
     # register fp16 scale cache (2-cache spec).
@@ -175,9 +172,8 @@ def rbln_indexer_cache_init(self, *args, **kwargs) -> None:
             cache_config=self.cache_config,
         )
         scale.get_attn_backend = lambda: RBLNDeepseekV32IndexerScaleBackend
-        scale.layer_index = (
-            rbln_extract_layer_index(scale.prefix, num_attn_module)
-            - start * num_attn_module
+        scale.layer_index = pipeline_adjusted_layer_index(
+            scale.prefix, model_config, vllm_config.parallel_config, num_attn_module
         )
         self.scale_cache = scale
 

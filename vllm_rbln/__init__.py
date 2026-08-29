@@ -26,7 +26,28 @@ def register():
 
 
 def register_model():
-    pass
+    from vllm_rbln import envs
+
+    if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+        return
+
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    from vllm_rbln.patches import axk2
+    from vllm_rbln.patches.axk2.config import AXK2Config
+
+    # A.X K2 (axk2) is vendored only until upstream vLLM ships it. Once upstream
+    # registers the architecture our copy would shadow it, so fail loudly to get
+    # this vendored path removed instead of silently overriding upstream.
+    if axk2._upstream_has_axk2():
+        raise RuntimeError(
+            "upstream vLLM now ships the axk2 architecture; delete "
+            "vllm_rbln/patches/axk2/ and this registration."
+        )
+
+    _CONFIG_REGISTRY[axk2.MODEL_TYPE] = AXK2Config
+    ModelRegistry.register_model(axk2.ARCH, axk2.MODEL_CLASS_PATH)
 
 
 def register_ops():

@@ -26,6 +26,7 @@ from vllm_rbln.patches.registry import (
 # ruff: noqa: F401
 from . import (
     attention,
+    axk2,
     deepseek_mtp,
     deepseek_v2,
     distributed_utils,

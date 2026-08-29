@@ -21,6 +21,7 @@ import pytest
 import vllm_rbln.envs as envs
 import vllm_rbln.patches.metrics as pm
 from vllm_rbln.patches import registry
+from vllm_rbln.v1.worker.dp_utils import BatchDescriptor
 
 MS = 0.001
 
@@ -78,6 +79,14 @@ def run_pass(ctx, clock, *, phase, before=0.0, model=0.0, sample=None, after=0.0
         ctx.add_graph_time(sample)
     clock.advance(after)
     ctx.end_pass()
+
+
+def _desc(num_tokens_padded):
+    """The descriptor as the metrics patch reads it: only the padded token
+    dimension decides the phase."""
+    return BatchDescriptor(
+        num_reqs_padded=4, query_len=1, num_tokens_padded=num_tokens_padded
+    )
 
 
 class TestMetrics:
@@ -329,24 +338,28 @@ class TestPhase:
     def test_phase_follows_the_padded_token_count(
         self, monkeypatch, is_prefill, num_tokens_padded, expected
     ):
-        padding = (4, num_tokens_padded, None)
-        monkeypatch.setattr(pm, "_determine_batch_padding", lambda self, *a: padding)
+        padding = (_desc(num_tokens_padded), None, None)
+        monkeypatch.setattr(
+            pm, "_determine_batch_execution_and_padding", lambda self, *a: padding
+        )
         runner = _Runner(is_prefill=is_prefill, max_num_tokens=128)
         ctx = pm._ctx(runner)
         ctx.start_pass()
 
-        assert pm.determine_batch_padding(runner, 1, 1) == padding
+        assert pm.determine_batch_execution_and_padding(runner, 1, 1) == padding
         assert ctx._phase is expected
 
     def test_phase_is_not_marked_outside_a_pass(self, monkeypatch):
         # The dummy run reaches the same method with no pass open.
         monkeypatch.setattr(
-            pm, "_determine_batch_padding", lambda self, *a: (4, 128, None)
+            pm,
+            "_determine_batch_execution_and_padding",
+            lambda self, *a: (_desc(128), None, None),
         )
         runner = _Runner()
         ctx = pm._ctx(runner)
 
-        pm.determine_batch_padding(runner, 1, 1)
+        pm.determine_batch_execution_and_padding(runner, 1, 1)
         assert ctx._phase is None
 
 
@@ -371,12 +384,14 @@ class TestPassBoundary:
         monkeypatch.setattr(pm, "_sample_tokens", lambda self, *a, **k: "out")
         monkeypatch.setattr(pm, "_sample", lambda self, *a, **k: "sampled")
         monkeypatch.setattr(
-            pm, "_determine_batch_padding", lambda self, *a: (4, 64, None)
+            pm,
+            "_determine_batch_execution_and_padding",
+            lambda self, *a: (_desc(64), None, None),
         )
         runner = _Runner()
 
         pm.execute_model(runner)
-        pm.determine_batch_padding(runner, 1, 1)
+        pm.determine_batch_execution_and_padding(runner, 1, 1)
         pm.sample(runner)
         assert pm.sample_tokens(runner) == "out"
 
@@ -399,7 +414,9 @@ class TestPassBoundary:
         clock.advance(50 * MS)  # time the failed pass must not claim
         monkeypatch.setattr(pm, "_execute_model", lambda self, *a, **k: None)
         monkeypatch.setattr(
-            pm, "_determine_batch_padding", lambda self, *a: (4, 64, None)
+            pm,
+            "_determine_batch_execution_and_padding",
+            lambda self, *a: (_desc(64), None, None),
         )
         monkeypatch.setattr(pm, "_sample", lambda self, *a, **k: "sampled")
 
@@ -410,7 +427,7 @@ class TestPassBoundary:
         monkeypatch.setattr(pm, "_sample_tokens", sample_tokens)
 
         pm.execute_model(runner)
-        pm.determine_batch_padding(runner, 1, 1)
+        pm.determine_batch_execution_and_padding(runner, 1, 1)
         pm.sample(runner)
         pm.sample_tokens(runner)
 
@@ -423,7 +440,9 @@ class TestPassBoundary:
         """A pass that raised after its forward must not lend its time to the next."""
         monkeypatch.setattr(pm, "_execute_model", lambda self, *a, **k: None)
         monkeypatch.setattr(
-            pm, "_determine_batch_padding", lambda self, *a: (4, 64, None)
+            pm,
+            "_determine_batch_execution_and_padding",
+            lambda self, *a: (_desc(64), None, None),
         )
 
         def sample_for(ms):
@@ -440,7 +459,7 @@ class TestPassBoundary:
         monkeypatch.setattr(pm, "_sample_tokens", boom)
         runner = _Runner()
         pm.execute_model(runner)
-        pm.determine_batch_padding(runner, 1, 1)
+        pm.determine_batch_execution_and_padding(runner, 1, 1)
         pm.sample(runner)  # 7ms of graph time on a pass that is about to fail
         with pytest.raises(RuntimeError, match="boom"):
             pm.sample_tokens(runner)
@@ -448,7 +467,7 @@ class TestPassBoundary:
         monkeypatch.setattr(pm, "_sample", sample_for(1 * MS))
         monkeypatch.setattr(pm, "_sample_tokens", lambda self, *a, **k: "out")
         pm.execute_model(runner)
-        pm.determine_batch_padding(runner, 1, 1)
+        pm.determine_batch_execution_and_padding(runner, 1, 1)
         pm.sample(runner)
         pm.sample_tokens(runner)
 
@@ -538,7 +557,7 @@ class TestDescriptors:
             for d in registry.get_registered_patch_descriptors()
             if d.owner_module == "vllm_rbln.patches.metrics"
         ]
-        assert len(ours) == 6
+        assert len(ours) == 7
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target

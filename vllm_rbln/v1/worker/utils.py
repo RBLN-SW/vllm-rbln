@@ -81,6 +81,28 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     return base * num_attn_module + sub
 
 
+def pipeline_adjusted_layer_index(
+    layer_name: str,
+    model_config,
+    parallel_config,
+    num_attn_module: int,
+) -> int:
+    raw_layer_index = extract_layer_index(layer_name, num_attn_module)
+    if model_config is None:
+        return raw_layer_index
+
+    start, end = model_config.get_layers_start_end_indices(parallel_config)
+    total_num_hidden_layers = model_config.get_total_num_hidden_layers()
+    if raw_layer_index >= total_num_hidden_layers * num_attn_module:
+        # MTP/nextn layers are named past the target's layer count
+        # (mtp_start_layer_idx == num_hidden_layers), so their KV cache sits
+        # right after the target layers in the compacted per-rank cache list.
+        return (end - start) * num_attn_module + (
+            raw_layer_index - total_num_hidden_layers * num_attn_module
+        )
+    return raw_layer_index - start * num_attn_module
+
+
 def num_attn_module(model_config, cache_dtype) -> int:
     hf_config = model_config.hf_config
     if getattr(hf_config, "model_type", None) == "longcat_flash":

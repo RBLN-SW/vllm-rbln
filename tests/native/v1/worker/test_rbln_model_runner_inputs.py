@@ -102,7 +102,11 @@ class TestBookkeepingSyncSpecDecode:
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
         )
-        runner = make_model_runner()
+        # This class covers the synchronous bookkeeping path, and vLLM now
+        # resolves an unset --async-scheduling to enabled, so pin it -- through
+        # EngineArgs, so a rename of the runner attribute cannot silently put
+        # this back on the async path.
+        runner = make_model_runner(async_scheduling=False)
         runner._update_states(schedule_new("req_0", "req_1"))
         batch = runner.input_batch
         batch.num_tokens_no_spec[:2] = [3, 3]
@@ -120,7 +124,8 @@ class TestBookkeepingSyncSpecDecode:
             (6, runner.model_config.get_hidden_size()), dtype=runner.dtype
         )
 
-        _, _, valid_sampled_token_ids, _, _, _ = runner._bookkeeping_sync(
+        # The async path added invalid_req_indices to the tail of this tuple.
+        _, _, valid_sampled_token_ids, *_ = runner._bookkeeping_sync(
             scheduler_output=make_scheduler_output(
                 num_scheduled_tokens={"req_0": 3, "req_1": 3}
             ),

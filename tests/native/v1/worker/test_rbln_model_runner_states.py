@@ -254,7 +254,7 @@ class TestSampleTokensOnDrafterOverflow:
         monkeypatch.setattr(
             runner,
             "_bookkeeping_sync",
-            lambda *args: ({}, None, [[101]], {}, ["a"], {"a": 0}),
+            lambda *args: ({}, None, [[101]], {}, ["a"], {"a": 0}, []),
         )
 
         runner.sample_tokens(grammar_output=None)

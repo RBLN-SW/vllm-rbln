@@ -12,9 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import shutil
 from unittest.mock import patch
 
 import pytest
+import torch
+
+
+@pytest.fixture(autouse=True)
+def fresh_inductor_cache_per_test(monkeypatch):
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "root")
+    cache_dir = f"/tmp/torchinductor_{worker_id}_{os.getpid()}"
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", cache_dir)
+    torch._dynamo.reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def pin_npu_per_worker(monkeypatch):
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    idx = int(worker[2:]) if worker[2:].isdigit() else 0
+    monkeypatch.setenv("RBLN_DEVICES", str(idx))
 
 
 @pytest.fixture(autouse=True)

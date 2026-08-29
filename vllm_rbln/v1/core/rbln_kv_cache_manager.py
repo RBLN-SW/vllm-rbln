@@ -557,9 +557,13 @@ class RBLNKVCacheManager(KVCacheManager):
         num_full_blocks_before = tuple(
             request.num_computed_tokens // gi.block_size for gi in self._group_infos
         )
-        self._pending_indexing[request.request_id] = (
-            request,
-            num_full_blocks_before,
+        # setdefault, not assignment: async scheduling can schedule a request
+        # again before update_from_output drains this note, and the second call
+        # sees num_computed_tokens past the blocks the first one meant to index.
+        # The earliest note is the one that covers both.
+        self._pending_indexing.setdefault(
+            request.request_id,
+            (request, num_full_blocks_before),
         )
 
     def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
