@@ -135,30 +135,6 @@ def test_num_devices_precedence(monkeypatch, new, legacy, expected):
     assert envs.get_num_devices_per_local_rank() == expected
 
 
-@pytest.mark.parametrize(
-    ("auto_port", "device_tensor", "expected"),
-    [
-        (None, None, True),  # follows the device-tensor default, which is on
-        (None, "1", True),
-        (None, "0", False),  # the coupling: no explicit auto-port, tensors off
-        ("1", "0", True),  # explicit setting overrides the coupling
-        ("0", "1", False),
-    ],
-)
-def test_auto_port_follows_device_tensor(
-    monkeypatch, auto_port, device_tensor, expected
-):
-    for name, value in (
-        ("VLLM_RBLN_AUTO_PORT", auto_port),
-        ("VLLM_RBLN_USE_DEVICE_TENSOR", device_tensor),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
-    assert envs.use_auto_port() is expected
-
-
 # The bool lambdas come in two shapes differing only in their default; an
 # unrecognized value has opposite consequences, so one of each is covered.
 BOOL_DEFAULT_OFF = "VLLM_RBLN_METRICS"
@@ -277,9 +253,7 @@ def test_type_checking_block_lists_every_variable():
 
 @pytest.mark.parametrize("name", RBLN_KEYS)
 def test_declared_default_matches_resolved(monkeypatch, name):
-    """A clean environment resolves to the declared default. All RBLN vars are
-    cleared, since some derive from a neighbour (use_auto_port falls back to
-    VLLM_RBLN_USE_DEVICE_TENSOR) rather than a literal."""
+    """A clean environment resolves to the declared default."""
     annotation, declared_default = _declared_in_type_checking()[name]
     for key in (
         set(RBLN_KEYS) | set(ENV_SOURCE_ALIASES.values()) | {"VLLM_RBLN_TP_SIZE"}

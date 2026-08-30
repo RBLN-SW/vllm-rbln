@@ -514,7 +514,6 @@ def start_module_in_spawned_process(
     nodeids: list[str],
     *,
     nodeid_prefix: str = "",
-    device_tensor: str | None,
     model_compile: bool,
     num_hidden_layers: int,
     tb_style: str | None = None,
@@ -533,8 +532,8 @@ def start_module_in_spawned_process(
     -m/-k/--deselect mean what they say: handing over the file would run the
     deselected tests too (on the NPU, invisibly), and would re-run any unmarked
     test of a mixed file that the parent is already running in-process.
-    --device-tensor / --model-compile / --num-hidden-layers are forwarded so the
-    child's skip/run decisions and engine config match the parent's, and --tb /
+    --model-compile / --num-hidden-layers are forwarded so the child's skip/run
+    decisions and engine config match the parent's, and --tb /
     --maxfail so the reports it builds are rendered and cut off the way the
     parent was asked to.
 
@@ -570,8 +569,6 @@ def start_module_in_spawned_process(
         "no:cacheprovider",
         "-q",
     ]
-    if device_tensor is not None:
-        args += ["--device-tensor", device_tensor]
     if model_compile:
         args.append("--model-compile")
     # A flag, not env: the child scrubs every VLLM_RBLN_* it inherits.

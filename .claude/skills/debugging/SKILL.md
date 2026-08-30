@@ -16,7 +16,6 @@ Get a reproducer before changing anything, and narrow it to the smallest input a
 Check these before concluding anything, because each one makes a reproduction silently exercise something other than what you think:
 
 - **`tests/native/` scrubs `VLLM_RBLN_*`.** Exported values do not reach it; the session options are the only way in. A knob you "set" may never have applied.
-- **`--device-tensor` is session-wide.** `platform.py` resolves it at module scope, so a per-test attempt to change it does nothing and the test still passes.
 - **Marks decide the process.** `use_device` and `model_compile` items run in a spawned child. A failure that only appears in one of the two contexts is about the process, not the logic.
 
 ## 2. Make the evidence discriminate

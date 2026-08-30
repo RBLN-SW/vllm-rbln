@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Compile parity for the W8A16 block-FP8 kernel: CPU eager is the oracle, and the
-# rbln-compiled graph (plus device eager on the device lane) must agree. Inputs use
-# production-sized 128-blocks because toy shapes trip an rbln-compiler edge case.
+# rbln-compiled graph (plus device eager) must agree. Inputs use production-sized
+# 128-blocks because toy shapes trip an rbln-compiler edge case.
 
 from typing import Any
 
@@ -70,11 +70,11 @@ def _to_session_device(args):
 def _assert_parity(run_fn, *cpu_args):
     # 1. CPU eager oracle.
     ref = run_fn(*cpu_args)
-    # 2. rbln-compiled on the session's tensors (cpu lane -> cpu, device lane ->
-    #    device, matching how the backend runs the compiled graph in production).
+    # 2. rbln-compiled on the platform's device, matching how the backend runs
+    #    the compiled graph in production.
     dev_args = _to_session_device(cpu_args)
     assert _agrees(rbln_compile(run_fn, fullgraph=True)(*dev_args), ref)
-    # 3. device eager, only when device tensors are on (--device-tensor 1).
+    # 3. device eager.
     if current_platform.device_type == "rbln":
         assert _agrees(run_fn(*dev_args), ref)
 

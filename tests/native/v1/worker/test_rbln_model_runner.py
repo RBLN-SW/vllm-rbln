@@ -630,17 +630,13 @@ class TestDummyRunPadding:
 
 
 class TestProcessKvCacheCopyOps:
-    # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
-    # and VLLM_RBLN_COMPILE_MODEL. Forced deterministically via monkeypatch.
-    def test_eager_copy_non_mla(self, monkeypatch):
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)  # -> eager path
+    def test_copy_non_mla(self):
         # non-MLA layout: (2, num_blocks, heads, 1, block_tokens, dim).
         kv = torch.zeros(2, 4, 1, 1, 8, 2)
         kv[:, 1, :, :, :, :] = 5.0  # source = block 1
         r = _make_runner_stub(
             kv_caches=[kv],
-            model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
-            runtime_holder=[None],
+            model_config=SimpleNamespace(use_mla=False),
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         # First 3 token slots of dst block 2 now match src; the rest stay 0.
@@ -648,33 +644,16 @@ class TestProcessKvCacheCopyOps:
         assert (kv[:, 2, :, :, :3, :] == 5.0).all()
         assert (kv[:, 2, :, :, 3:, :] == 0.0).all()
 
-    def test_eager_copy_mla(self, monkeypatch):
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
+    def test_copy_mla(self):
         kv = torch.zeros(4, 8, 2)  # (num_blocks, block_tokens, dim)
         kv[1] = 7.0
         r = _make_runner_stub(
             kv_caches=[kv],
-            model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
-            runtime_holder=[None],
+            model_config=SimpleNamespace(use_mla=True),
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         assert (kv[2, :3, :] == 7.0).all()
         assert (kv[2, 3:, :] == 0.0).all()
-
-    def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-        calls = []
-        runtime = SimpleNamespace(
-            _copy_kv_cache=lambda src, dst, nt: calls.append((src, dst, nt))
-        )
-        r = _make_runner_stub(
-            kv_caches=[],
-            model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
-            runtime_holder=[runtime],
-        )
-        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
-        assert calls == [(5, 6, 4)]
 
 
 def _empty_cached():
@@ -879,8 +858,8 @@ class TestMayReorderBatch:
 
 
 class TestAllocateKvCacheTensors:
-    # Device selection: "cpu" if not compiling, else self.device if device-tensor,
-    # else "meta". The mapping/validation logic is exercised on CPU.
+    # Device selection: "cpu" if not compiling, else self.device. The
+    # mapping/validation logic is exercised on CPU.
     @staticmethod
     def _cfg():
         return SimpleNamespace(
@@ -908,15 +887,8 @@ class TestAllocateKvCacheTensors:
         assert raw["l0"] is raw["l1"]
         assert raw["l0"] is not raw["l2"]
 
-    def test_meta_when_compiling_without_device_tensor(self, monkeypatch):
+    def test_self_device_when_compiling(self, monkeypatch):
         monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert raw["l0"].device.type == "meta"
-
-    def test_self_device_when_compiling_with_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here
 

@@ -103,16 +103,7 @@ class TestPlatformIdentity:
             RblnPlatform.device_type,
             RblnPlatform.dist_backend,
         )
-        if platform.USE_DEVICE_TENSOR:
-            assert triple == ("rbln", "rbln", "rbln-ccl")
-        else:
-            assert triple == ("cpu", "cpu", "")
-
-    def test_device_tensor_needs_both_switches(self):
-        assert platform.USE_DEVICE_TENSOR is (
-            platform.envs.VLLM_RBLN_USE_VLLM_MODEL
-            and platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR
-        )
+        assert triple == ("rbln", "rbln", "rbln-ccl")
 
     @pytest.mark.parametrize(
         ("attribute", "expected"),
@@ -281,11 +272,10 @@ class TestWorkerAndScheduler:
 
     def test_a_plain_build_lands_on_the_async_scheduler(self, monkeypatch):
         # Nobody passes --async-scheduling here: vLLM resolves the unset flag to
-        # True before this platform hook, and with both carriers on nothing
+        # True before this platform hook, and with the device sampler on nothing
         # refuses it, so the native path selects the async scheduler. This is
         # what the async support changed, and it went unasserted.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         config = _build()
         assert config.scheduler_config.async_scheduling is True
         assert (
@@ -318,34 +308,21 @@ class TestCompilation:
 class TestSchedulerOverrides:
     def test_async_scheduling_is_honored(self, monkeypatch):
         # The platform used to force this off unconditionally. It now follows
-        # vLLM's --async-scheduling, as long as the device-side token path is
-        # available (see below). Both carriers are pinned on because
-        # --device-tensor 0 switches the first one off for the whole session,
-        # which would land this on the negative case below.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        # vLLM's --async-scheduling, as long as the device-side sampler is on
+        # (see below).
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
 
-    @pytest.mark.parametrize(
-        "switched_off", ["VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"]
-    )
-    def test_async_scheduling_needs_the_device_token_carriers(
-        self, monkeypatch, switched_off
-    ):
-        """Either env var off means async has no way to carry its in-flight tokens.
+    def test_async_scheduling_needs_the_device_sampler(self, monkeypatch):
+        """With the sampler on the host, async has no way to carry its in-flight
+        tokens.
 
-        VLLM_RBLN_USE_DEVICE_TENSOR gates the feedback scatter that replaces the
-        scheduler's -1 placeholders; VLLM_RBLN_SAMPLER gates the ring the output
-        thread reads. Without them the runner decodes from a token that was never
-        sampled and returns wrong text with no error raised, so the platform
-        downgrades to sync rather than run the combination.
+        VLLM_RBLN_SAMPLER gates the ring the output thread reads. Without it the
+        runner decodes from a token that was never sampled and returns wrong text
+        with no error raised, so the platform downgrades to sync rather than run
+        the combination.
         """
-        # Both are set before one is switched off: the gate refuses on either,
-        # so leaving the other to the lane lets --device-tensor 0 satisfy this
-        # case with the sampler still on, and the parametrization proves nothing.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
-        monkeypatch.setenv(switched_off, "0")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
         config = _build(async_scheduling=True)
         assert config.scheduler_config.async_scheduling is False
         assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
@@ -394,16 +371,11 @@ class TestSchedulerOverrides:
 
 
 class TestEnforceEager:
-    def test_outcome_follows_the_device_lane(self, reconfigure):
+    def test_dtype_is_forced_to_fp16(self, reconfigure):
         mutate = lambda config: setattr(  # noqa: E731
             config.model_config, "enforce_eager", True
         )
-        if platform.USE_DEVICE_TENSOR:
-            # Eager needs real device tensors; dtype is forced to fp16 there.
-            assert reconfigure(mutate).model_config.dtype == torch.float16
-        else:
-            with pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
-                reconfigure(mutate)
+        assert reconfigure(mutate).model_config.dtype == torch.float16
 
 
 def _selector(*, use_mla: bool = False, use_sparse: bool = False) -> SimpleNamespace:
@@ -640,13 +612,6 @@ class TestDynamicKvConfig:
             RblnPlatform._validate_dynamic_kv_config(
                 self._cfg(kv_transfer_config=SimpleNamespace())
             )
-
-    def test_device_tensor_off_is_refused(self):
-        with (
-            patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
-            pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR=1"),
-        ):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
     def test_the_hook_validates_only_under_the_flag(self, monkeypatch, reconfigure):
         seen: list = []

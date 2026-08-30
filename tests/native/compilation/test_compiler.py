@@ -12,22 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# compile()'s option-building contract (kwargs + env -> torch.compile options),
-# the RBLN dynamo settings, and conformance against rebel. The real compile needs
-# an NPU and lives in the model-compile tests.
+# compile()'s option-building contract (kwargs + env -> torch.compile options)
+# and the RBLN dynamo settings. The real compile needs an NPU and lives in the
+# model-compile tests.
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 import vllm_rbln.compilation.compiler as compiler
-from vllm_rbln.compilation import (
-    build_process_group_dict,
-    compile,
-    create_compile_context,
-)
+from vllm_rbln.compilation import build_process_group_dict, compile
 from vllm_rbln.compilation.dispatch import Dispatcher
 
 
@@ -81,9 +76,6 @@ class TestCompileOptions:
             "process_group_dict",
             "guard_filter_fn",
             "_runtime_holder",
-            "compile_context",
-            "global_device_id",
-            "use_global_ctx",
         ):
             assert key not in opts
 
@@ -243,26 +235,3 @@ class TestBuildProcessGroupDict:
             "dp_d": [2],
             "dp_c": [2],
         }
-
-
-class TestCompilerConformance:
-    def test_create_compile_context_forwards_args(self, monkeypatch):
-        # create_compile_context forwards its two flags to rebel's CompileContext.
-        captured = {}
-
-        class FakeCtx:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        monkeypatch.setattr(compiler, "CompileContext", FakeCtx)
-        create_compile_context(use_weight_sharing=True, use_global_ctx=True)
-        assert captured == {"use_weight_sharing": True, "use_global_ctx": True}
-
-    def test_rebel_compile_context_signature(self):
-        # Drift alarm against the rebel dependency: the params
-        # create_compile_context forwards must still exist on CompileContext.
-        from rebel import CompileContext
-
-        params = inspect.signature(CompileContext).parameters
-        assert "use_weight_sharing" in params
-        assert "use_global_ctx" in params

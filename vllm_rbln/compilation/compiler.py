@@ -17,7 +17,6 @@ from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
 import torch
-from rebel import CompileContext
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 
 from vllm_rbln import envs
@@ -43,14 +42,6 @@ def _ensure_torch_dynamo_configured() -> None:
     _DYNAMO_CONFIGURED = True
 
 
-def create_compile_context(
-    use_weight_sharing: bool = False, use_global_ctx: bool = False
-) -> CompileContext:
-    return CompileContext(
-        use_weight_sharing=use_weight_sharing, use_global_ctx=use_global_ctx
-    )
-
-
 def build_process_group_dict() -> dict[str, list[int]]:
     """Build process group metadata consumed by the RBLN torch.compile backend."""
     tp = get_tp_group()
@@ -73,15 +64,12 @@ def compile(
     backend: str | Callable = rbln_backend,
     dynamic: bool = False,
     fullgraph: bool = False,
-    compile_context: CompileContext | None = None,
     num_devices: int | None = None,
     model_trace_method: str = "",
     process_group_dict: dict[str, list[int]] | None = None,
     guard_filter_fn: Callable | None = None,
     runtime_holder: list | None = None,
     mode: str | list[str] = "",
-    use_global_ctx: bool | None = None,
-    global_device_id: int | None = None,
     use_cache: bool = True,
     cache_dir: str = "",
     use_static_output: bool = False,
@@ -104,7 +92,6 @@ def compile(
             return
         options[key] = value
 
-    set_option("compile_context", compile_context)
     set_option("num_devices", num_devices)
     set_option("model_trace_method", model_trace_method)
     set_option("process_group_dict", process_group_dict)
@@ -115,8 +102,6 @@ def compile(
     if envs.VLLM_RBLN_COMPILE_ONLY:
         mode.append("compile_only")
     set_option("mode", mode)
-    set_option("use_global_ctx", use_global_ctx)
-    set_option("global_device_id", global_device_id)
     set_option("use_static_output", use_static_output)
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))

@@ -116,19 +116,6 @@ def pytest_addoption(parser):
         help="run tests that compile a whole model on the NPU (minutes each)",
     )
     parser.addoption(
-        "--device-tensor",
-        choices=["0", "1"],
-        default=None,
-        help=(
-            "VLLM_RBLN_USE_DEVICE_TENSOR for the whole session. platform.py "
-            "resolves it at module scope into RblnPlatform.device_type and "
-            "friends, and seven modules copy USE_DEVICE_TENSOR into their own "
-            "namespace, so it cannot be parametrized per test -- run the suite "
-            "once per value instead. Left unset by default so the source's own "
-            "default is what gets exercised."
-        ),
-    )
-    parser.addoption(
         "--num-hidden-layers",
         type=int,
         default=None,
@@ -296,7 +283,6 @@ def _spawn_for(item) -> ModuleSpawn:
     spawn = start_module_in_spawned_process(
         nodeids or [item.nodeid],
         nodeid_prefix=item.nodeid.split("::", 1)[0],
-        device_tensor=config.getoption("--device-tensor"),
         model_compile=config.getoption("--model-compile"),
         num_hidden_layers=_session_layers(config),
         tb_style=config.getoption("tbstyle", None),
@@ -337,9 +323,8 @@ def pytest_runtest_protocol(item, nextitem):
     the whole session), and one spawn per file amortizes the interpreter + plugin
     + device init over all its tests.
 
-    @model_compile and @use_device always spawn -- they compile/run on the NPU
-    regardless of --device-tensor. @maybe_use_device spawns only when device
-    tensors are on (--device-tensor 1); under 0 its ops stay on CPU.
+    @model_compile and @use_device always spawn. @maybe_use_device spawns when
+    the platform's device_type is not "cpu".
 
     Taking over the whole protocol (rather than just the call phase) is what
     makes a batched test indistinguishable from a plain one: the child's own
@@ -398,12 +383,7 @@ def pytest_configure(config):
     _scrubbed = scrub_env()
     os.environ.update(NATIVE_ENV)
 
-    # Must land before the import below: platform.py reads this at module scope.
-    device_tensor = config.getoption("--device-tensor")
-    if device_tensor is not None:
-        os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
-
-    # Also before the import below: the get_pp_indices patch conditions on this.
+    # Must land before the import below: the get_pp_indices patch conditions on this.
     os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(_session_layers(config))
 
     # Parent only -- the child is handed the resolved value, so its own view of
@@ -441,14 +421,12 @@ def pytest_sessionfinish(session):
 
 
 def pytest_report_header(config):
-    # Imported by pytest_configure already; report the resolved value rather
-    # than the request, since that is the lane the whole session runs in.
+    # Imported by pytest_configure already.
     from vllm_rbln.platform import RblnPlatform
 
-    origin = "explicit" if config.getoption("--device-tensor") else "source default"
     header = [
         f"native: env {', '.join(f'{k}={v}' for k, v in NATIVE_ENV.items())}",
-        f"native: device_type={RblnPlatform.device_type} ({origin})",
+        f"native: device_type={RblnPlatform.device_type}",
     ]
     num_hidden_layers = _session_layers(config)
     pinnable = (

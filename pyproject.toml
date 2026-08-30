@@ -100,8 +100,8 @@ namespaces = false
 addopts = ["--strict-markers"]
 markers = [
     "model_compile: compiles a whole model on the NPU; minutes per test. Skipped unless --model-compile is passed. Tests that compile only an individual op are deliberately left unmarked so they stay in the default lane.",
-    "use_device: always touches the NPU (e.g. compiles an op via the rbln backend) regardless of --device-tensor, so it is always auto-spawned in a fresh process -- never run in the parent, which would pin the device for the rest of the session.",
-    "maybe_use_device: opens the RBLN device only when device tensors are on. Auto-spawned in a fresh process under --device-tensor 1 (never in the parent, which would pin the device for the rest of the session); runs in-process under --device-tensor 0 (cpu).",
+    "use_device: always touches the NPU (e.g. compiles an op via the rbln backend), so it is always auto-spawned in a fresh process -- never run in the parent, which would pin the device for the rest of the session.",
+    "maybe_use_device: opens the RBLN device when the platform's device_type is not cpu. Auto-spawned in a fresh process in that case (never in the parent, which would pin the device for the rest of the session); runs in-process otherwise.",
 ]
 
 # FIXME(kblee): remove when axk2 support in upstream

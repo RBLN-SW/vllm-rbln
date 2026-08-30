@@ -56,8 +56,8 @@ def _generated_token_ids(outputs) -> list[list[int]]:
 
 @pytest.mark.model_compile
 def test_sub_block_prefix_cache_matches_baseline(vllm_runner) -> None:
-    # Runs in whichever --device-tensor mode the session uses. The baseline
-    # engine is torn down before the cached one is built, so they never coexist.
+    # The baseline engine is torn down before the cached one is built, so they
+    # never coexist.
     with vllm_runner(
         MODEL, enable_prefix_caching=False, **_ENGINE_OVERRIDES
     ) as baseline:
