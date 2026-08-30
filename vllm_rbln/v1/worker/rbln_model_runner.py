@@ -22,6 +22,7 @@ from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
+import torch.rbln
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheConfig
 from vllm.distributed.kv_transfer import (
@@ -110,7 +111,6 @@ from vllm_rbln.compilation import (
 )
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import HAS_TORCH_RBLN
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -465,9 +465,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             specialized_moe_decode=self.specialized_moe_decode,
         )
 
-        self.offload_context = nullcontext
-        if HAS_TORCH_RBLN and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
-            self.offload_context = torch.rbln.offload
+        self.offload_context = (
+            nullcontext if envs.VLLM_RBLN_DISABLE_OFFLOAD else torch.rbln.offload
+        )
 
         # What this step's ranks reported. The draft decides its own shapes from
         # it rather than reducing a second time.

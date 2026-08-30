@@ -39,13 +39,6 @@ logger = init_logger(__name__)
 # any engine code reads a variable.
 envs.publish_to_vllm_envs()
 
-try:
-    import torch.rbln  # noqa: F401
-
-    HAS_TORCH_RBLN: bool = True
-except ImportError:
-    HAS_TORCH_RBLN = False
-
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 
