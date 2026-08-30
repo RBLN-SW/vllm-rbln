@@ -62,6 +62,32 @@ class TestGetTokensMask:
         assert vals[3] == float("-inf")
         assert vals[6:] == [float("-inf"), float("-inf")]
 
+    def test_dtype_defaults_to_torch_default(self, monkeypatch):
+        _fake_forward_context(monkeypatch, num_tokens_across_dp=[3, 2], max_pad_len=4)
+        assert utils.get_tokens_mask(999).dtype == torch.get_default_dtype()
+
+    def test_dtype_is_honored_so_the_product_stays_narrow(self, monkeypatch):
+        # An fp32 mask would promote the bf16 routing weights it multiplies,
+        # turning the whole [E, T] tensor into a precision island the compiler
+        # runs in dlfp16. The mask must come back in the caller's dtype.
+        _fake_forward_context(monkeypatch, num_tokens_across_dp=[3, 2], max_pad_len=4)
+        mask = utils.get_tokens_mask(999, dtype=torch.bfloat16)
+        assert mask.dtype == torch.bfloat16
+        assert mask.flatten().tolist() == [1, 1, 1, 0, 1, 1, 0, 0]
+        weights = torch.ones(2, 8, dtype=torch.bfloat16)
+        assert (weights * mask.transpose(1, 0)).dtype == torch.bfloat16
+
+    def test_dtype_is_honored_for_the_additive_logit_mask(self, monkeypatch):
+        # -inf is representable in bf16, so the (0, -inf) form narrows too.
+        _fake_forward_context(monkeypatch, num_tokens_across_dp=[3, 2], max_pad_len=4)
+        mask = utils.get_tokens_mask(
+            999, left=0.0, right=float("-inf"), dtype=torch.bfloat16
+        )
+        assert mask.dtype == torch.bfloat16
+        vals = mask.flatten().tolist()
+        assert vals[:3] == [0.0, 0.0, 0.0]
+        assert vals[3] == float("-inf")
+
     def test_missing_dp_metadata_is_rejected(self, monkeypatch):
         monkeypatch.setattr(
             utils, "get_forward_context", lambda: SimpleNamespace(dp_metadata=None)

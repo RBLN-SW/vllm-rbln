@@ -262,7 +262,9 @@ class RBLNMoERunner(MoERunner):
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(
-                    max_pad, device=masked_routing_weights.device
+                    max_pad,
+                    device=masked_routing_weights.device,
+                    dtype=masked_routing_weights.dtype,
                 ).transpose(1, 0)  # [1, R*max_pad]
                 masked_routing_weights = masked_routing_weights * tokens_mask
 
@@ -480,7 +482,9 @@ class RBLNMoERunner(MoERunner):
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(
-                num_tokens, device=masked_routing_weights.device
+                num_tokens,
+                device=masked_routing_weights.device,
+                dtype=masked_routing_weights.dtype,
             ).transpose(1, 0)  # [1, t]
 
             # [t, E] * [t, 1] (broadcast)
