@@ -388,21 +388,21 @@ class RBLNSampler(VLLMSampler):
 
 WARM_UP_CONFIGS: list[dict[str, Any]] = [
     {
-        "name": "no_penalty_greedy",
+        "name": "greedy",
         "no_penalties": True,
         "all_greedy": True,
         "all_random": False,
         "temperature": 0.0,
     },
     {
-        "name": "no_penalty_random",
+        "name": "random",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topp",
+        "name": "topp",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
@@ -410,7 +410,7 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topk",
+        "name": "topk",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
@@ -418,7 +418,7 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topp_topk",
+        "name": "topp_topk",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
