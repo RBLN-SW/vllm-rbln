@@ -395,7 +395,7 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.0,
     },
     {
-        "name": "random",
+        "name": "multinomial",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
