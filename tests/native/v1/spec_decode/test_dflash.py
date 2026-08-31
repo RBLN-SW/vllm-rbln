@@ -280,9 +280,7 @@ class TestPlatformRefusals:
 
     def test_eager_is_refused(self):
         with pytest.raises(NotImplementedError, match="cannot run eager"):
-            RBLNDFlashProposer(
-                self._config(enforce_eager=True), torch.device("cpu")
-            )
+            RBLNDFlashProposer(self._config(enforce_eager=True), torch.device("cpu"))
 
     def test_compile_disabled_is_refused(self, monkeypatch):
         monkeypatch.setattr(dflash_module.envs, "VLLM_RBLN_COMPILE_MODEL", False)
@@ -332,4 +330,3 @@ class TestDraftDpStatus:
 
     def test_no_dp_status_without_dp(self):
         assert RBLNDFlashProposer._draft_dp_status(self._self(1), 1, 8) is None
-

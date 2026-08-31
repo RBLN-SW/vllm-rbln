@@ -60,6 +60,43 @@ def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
 register_backend(name="bypass", compiler_fn=bypass_backend)
 
 
+def restore_dflash_token_budget(vllm_config: VllmConfig) -> None:
+    """Give DFlash back the token budget speculative decoding reserves.
+
+    `VllmConfig._set_max_num_scheduled_tokens` holds batch slots back for
+    drafters that append their draft tokens to the target batch. This one runs
+    its own graph over its own batch, so the reservation buys nothing and only
+    moves the prefill chunk off the KV block boundary, which the paged prefill
+    kernel cannot straddle.
+
+    This hook runs after that reservation and its validator, so the budget can
+    simply be put back. Any other value cannot be made to work -- the chunk
+    would be misaligned whatever it is -- so it is refused rather than ignored.
+    """
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.method != "dflash":
+        return
+
+    scheduler_config = vllm_config.scheduler_config
+    budget = scheduler_config.max_num_batched_tokens
+    reserved = budget - (
+        speculative_config.max_num_new_slots_for_drafting
+        * scheduler_config.max_num_seqs
+    )
+    if scheduler_config.max_num_scheduled_tokens != reserved:
+        raise ValueError(
+            "DFlash needs max_num_scheduled_tokens left auto-computed "
+            f"(expected {reserved}, got "
+            f"{scheduler_config.max_num_scheduled_tokens}): the prefill chunk "
+            f"has to stay at max_num_batched_tokens={budget} for the paged "
+            "prefill kernel, and any other budget moves it off the KV block "
+            "boundary."
+        )
+
+    logger.info("Restoring the DFlash target token budget: %d -> %d.", reserved, budget)
+    scheduler_config.max_num_scheduled_tokens = budget
+
+
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
 
@@ -349,6 +386,8 @@ class RblnPlatform(Platform):
                 scheduler_config.scheduler_cls = (
                     "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
                 )
+
+            restore_dflash_token_budget(vllm_config)
 
             # Under PP the compiled per-stage decode batch is max_num_seqs // pp_size
             # (see decode_batch_size). Fail fast on an impossible config.

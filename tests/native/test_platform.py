@@ -33,7 +33,11 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
 from tests.native.vllm_config import local_model_path
-from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_SEQS, RblnPlatform
+from vllm_rbln.platform import (
+    RBLN_DEFAULT_MAX_NUM_SEQS,
+    RblnPlatform,
+    restore_dflash_token_budget,
+)
 
 # Small, non-gated and already needed by the spec-decode tests; a config build
 # never touches the device.
@@ -403,7 +407,9 @@ class TestSchedulerOverrides:
 
         def mutate(config: VllmConfig) -> None:
             config.scheduler_config.async_scheduling = True
-            config.speculative_config = object()
+            # A method the hook reads, since it now also decides the DFlash
+            # token budget here; eagle is one vLLM does allow async with.
+            config.speculative_config = SimpleNamespace(method="eagle")
 
         config = reconfigure(mutate)
         assert config.scheduler_config.async_scheduling is False
@@ -703,3 +709,61 @@ class TestDynamicKvConfig:
             monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
             reconfigure(lambda config: None)
             assert len(seen) == 1
+
+
+class TestRestoreDflashTokenBudget:
+    """The reservation `_set_max_num_scheduled_tokens` makes for appended draft
+    tokens buys DFlash nothing and moves the prefill chunk off the KV block
+    boundary, so this hook -- which runs after that reservation and its
+    validator -- puts the budget back. No other budget can be made to align, so
+    an explicit one is refused rather than silently left in place."""
+
+    MNBT = 512
+    SLOTS = 6
+    SEQS = 1
+
+    def _config(self, method="dflash", seqs=None, scheduled=None, speculative=True):
+        seqs = seqs or self.SEQS
+        reserved = self.MNBT - self.SLOTS * seqs
+        return SimpleNamespace(
+            speculative_config=(
+                SimpleNamespace(
+                    method=method, max_num_new_slots_for_drafting=self.SLOTS
+                )
+                if speculative
+                else None
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=self.MNBT,
+                max_num_seqs=seqs,
+                max_num_scheduled_tokens=(reserved if scheduled is None else scheduled),
+            ),
+        )
+
+    def test_the_reserved_budget_is_restored(self):
+        cfg = self._config()
+        restore_dflash_token_budget(cfg)
+        assert cfg.scheduler_config.max_num_scheduled_tokens == self.MNBT
+
+    def test_the_reservation_scales_with_max_num_seqs(self):
+        cfg = self._config(seqs=4)
+        restore_dflash_token_budget(cfg)
+        assert cfg.scheduler_config.max_num_scheduled_tokens == self.MNBT
+
+    @pytest.mark.parametrize("scheduled", [1, 8, 505, 512])
+    def test_any_other_budget_is_refused(self, scheduled):
+        cfg = self._config(scheduled=scheduled)
+        with pytest.raises(ValueError, match="auto-computed"):
+            restore_dflash_token_budget(cfg)
+
+    @pytest.mark.parametrize("method", ["eagle3", "ngram", "suffix", "medusa"])
+    def test_only_dflash_is_touched(self, method):
+        cfg = self._config(method=method)
+        restore_dflash_token_budget(cfg)
+        assert cfg.scheduler_config.max_num_scheduled_tokens == self.MNBT - self.SLOTS
+
+    def test_no_speculation_is_left_alone(self):
+        cfg = self._config(speculative=False)
+        before = cfg.scheduler_config.max_num_scheduled_tokens
+        restore_dflash_token_budget(cfg)
+        assert cfg.scheduler_config.max_num_scheduled_tokens == before

@@ -746,11 +746,10 @@ class RBLNDFlashProposer(DFlashProposer):
         pool's reserved null block -- shared, and scattering a draft block's K/V
         there breaks the cache contract whatever it does downstream.
 
-        The zero case is reachable with a single request, because
-        `RBLNScheduler` zeroes the drafting lookahead while
-        `request.num_computed_tokens` is 0 and only assigns that field after
-        allocation, so a request finishing its prefill in one waiting-path chunk
-        is never given the page a crossing would move into.
+        The zero case survives only under P/D disaggregation, where upstream
+        still zeroes the drafting lookahead so the local and remote block counts
+        match. A request whose prefill finishes in one waiting-path chunk is
+        then never given the page a crossing would move into.
         """
         pages = (next_page // self.block_size).to(torch.int64)
         if int(pages.max()) >= block_table.shape[-1]:

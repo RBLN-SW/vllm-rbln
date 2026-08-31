@@ -594,4 +594,3 @@ class TestFlashImplInit:
 
     def test_is_normal_false_when_sinks_present(self, cfg_square):
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
-

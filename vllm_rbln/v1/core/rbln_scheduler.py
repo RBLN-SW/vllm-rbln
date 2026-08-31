@@ -61,39 +61,7 @@ class RBLNSchedulerOutput(SchedulerOutput):
     kv_cache_copy_ops: list[KVCacheCopyOp] = field(default_factory=list)
 
 
-def restored_dflash_token_budget(
-    scheduler_config, speculative_config, max_num_scheduled_tokens: int
-) -> int | None:
-    """The full token budget when DFlash is running under the reserved one.
-
-    `VllmConfig._set_max_num_scheduled_tokens` holds batch slots back for
-    drafters that append draft tokens to the target batch. This drafter runs its
-    own graph over its own batch, so the reservation buys nothing and only
-    shifts the prefill chunk off the KV block boundary, which the paged prefill
-    kernel cannot straddle. It is restored here rather than on the config, where
-    a validator requires the reservation to be present.
-
-    The value carries no provenance, so a user who sets
-    `max_num_scheduled_tokens` to exactly the reserved boundary is
-    indistinguishable from the auto-computed case and is restored too.
-
-    Returns None when nothing should change.
-    """
-    if speculative_config is None or speculative_config.method != "dflash":
-        return None
-    reserved = (
-        scheduler_config.max_num_batched_tokens
-        - speculative_config.max_num_new_slots_for_drafting
-        * scheduler_config.max_num_seqs
-    )
-    if max_num_scheduled_tokens != reserved:
-        return None
-    return scheduler_config.max_num_batched_tokens
-
-
 class RBLNScheduler(Scheduler):
-    max_num_scheduled_tokens: int
-
     def __init__(
         self,
         *args,
@@ -101,19 +69,6 @@ class RBLNScheduler(Scheduler):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-
-        restored = restored_dflash_token_budget(
-            self.scheduler_config,
-            self.vllm_config.speculative_config,
-            self.max_num_scheduled_tokens,
-        )
-        if restored is not None:
-            logger.info(
-                "Restoring the DFlash target token budget: %d -> %d.",
-                self.max_num_scheduled_tokens,
-                restored,
-            )
-            self.max_num_scheduled_tokens = restored
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
@@ -745,8 +700,9 @@ class RBLNScheduler(Scheduler):
                 # extra block gets allocated which
                 # creates a mismatch between the number
                 # of local and remote blocks.
+                limit_lookahead_tokens = load_kv_async and self.use_eagle
                 effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.

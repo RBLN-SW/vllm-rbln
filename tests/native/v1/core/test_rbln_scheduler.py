@@ -36,11 +36,7 @@ from tests.native.v1.core.utils import (
     prefill_request,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-from vllm_rbln.v1.core.rbln_scheduler import (
-    RBLNScheduler,
-    RBLNSchedulerOutput,
-    restored_dflash_token_budget,
-)
+from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
@@ -1374,54 +1370,60 @@ class TestDeferredBlockFree:
         assert partial_block.block_hash is not None
 
 
-class TestRestoredDflashTokenBudget:
-    """The reservation `_set_max_num_scheduled_tokens` makes for appended draft
-    tokens buys DFlash nothing and moves the prefill chunk off the KV block
-    boundary, so the scheduler puts the budget back. The value carries no
-    provenance, so an explicit budget that happens to equal the reserved one is
-    restored as well."""
+class TestDraftingLookahead:
+    """A first chunk was allocated with no drafting lookahead at all, so a
+    request whose prefill ends in a block's last slots got no page for the draft
+    block that follows it. Upstream zeroes the lookahead only to keep the local
+    and remote block counts matching under an async P/D load; that is the
+    condition here, rather than every request on its first chunk."""
 
-    MNBT = 512
-    SLOTS = 6
-    SEQS = 1
+    LOOKAHEAD = 4
 
-    def _configs(self, method="dflash", seqs=None):
-        scheduler = SimpleNamespace(
-            max_num_batched_tokens=self.MNBT, max_num_seqs=seqs or self.SEQS
+    PROMPT = 32
+
+    def _lookahead_seen(self, use_kv_connector=None, remote_prefill=False):
+        sched = create_rbln_scheduler(
+            num_speculative_tokens=3,
+            use_kv_connector=use_kv_connector,
+            enable_prefix_caching=True,
         )
-        speculative = SimpleNamespace(
-            method=method, max_num_new_slots_for_drafting=self.SLOTS
+        # ngram is what the helper builds without a draft model, so the two
+        # attributes a drafting method would set are set here instead -- they
+        # are what the branch reads.
+        sched.use_eagle = True
+        sched.num_lookahead_tokens = self.LOOKAHEAD
+
+        seen: list[int] = []
+        allocate_slots = sched.kv_cache_manager.allocate_slots
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs["num_lookahead_tokens"])
+            return allocate_slots(*args, **kwargs)
+
+        sched.kv_cache_manager.allocate_slots = spy
+
+        request = create_requests(1, num_tokens=self.PROMPT)[0]
+        if remote_prefill:
+            request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        sched.schedule()
+        return seen
+
+    def test_a_first_chunk_gets_the_drafting_lookahead(self):
+        assert self._lookahead_seen() == [self.LOOKAHEAD]
+
+    def test_a_synchronous_remote_load_keeps_it(self):
+        seen = self._lookahead_seen(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=False),
+            remote_prefill=True,
         )
-        return scheduler, speculative
+        assert seen == [self.LOOKAHEAD]
 
-    def test_reserved_budget_is_restored(self):
-        scheduler, speculative = self._configs()
-        reserved = self.MNBT - self.SLOTS * self.SEQS
-        assert (
-            restored_dflash_token_budget(scheduler, speculative, reserved) == self.MNBT
+    def test_an_async_remote_load_still_gets_none(self):
+        """The case upstream zeroes it for: an extra block here would leave the
+        local and remote block counts mismatched."""
+        seen = self._lookahead_seen(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=True),
+            remote_prefill=True,
         )
-
-    def test_reservation_scales_with_max_num_seqs(self):
-        scheduler, speculative = self._configs(seqs=4)
-        reserved = self.MNBT - self.SLOTS * 4
-        assert (
-            restored_dflash_token_budget(scheduler, speculative, reserved) == self.MNBT
-        )
-
-    def test_any_other_budget_is_left_alone(self):
-        scheduler, speculative = self._configs()
-        reserved = self.MNBT - self.SLOTS * self.SEQS
-        assert (
-            restored_dflash_token_budget(scheduler, speculative, reserved - 1) is None
-        )
-        assert restored_dflash_token_budget(scheduler, speculative, self.MNBT) is None
-
-    @pytest.mark.parametrize("method", ["eagle3", "ngram", "suffix", "medusa"])
-    def test_only_dflash_is_touched(self, method):
-        scheduler, speculative = self._configs(method=method)
-        reserved = self.MNBT - self.SLOTS * self.SEQS
-        assert restored_dflash_token_budget(scheduler, speculative, reserved) is None
-
-    def test_no_speculation_is_left_alone(self):
-        scheduler, _ = self._configs()
-        assert restored_dflash_token_budget(scheduler, None, self.MNBT) is None
+        assert seen == [0]
