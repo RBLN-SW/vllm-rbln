@@ -547,8 +547,14 @@ class RBLNScheduler(Scheduler):
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
 
-                    # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    # Get externally-cached tokens if using a KVConnector —
+                    # unless the request must see every prompt position (prompt
+                    # logprobs): a restored span is never recomputed. Local APC
+                    # and the sub-block match already honor this flag.
+                    if (
+                        self.connector is not None
+                        and not request.skip_reading_prefix_cache
+                    ):
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
