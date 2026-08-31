@@ -27,11 +27,6 @@ steps:
     command:
       - "uv tool run pre-commit run --all-files --hook-stage manual --show-diff-on-failure"
 
-  # Cheap enough to sit with the other always-on gates, and it has to be always-on:
-  # an unbounded RBLN requirement is only visible in the pyproject of the PR that
-  # introduces it, and by the time a release is published it cannot be corrected.
-  # `--no-project` keeps it off the heavy shared venv -- it reads pyproject, it does
-  # not need the project installed.
   - label: ":lock: dependency bounds"
     notify:
     - github_commit_status:
@@ -39,7 +34,7 @@ steps:
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *uv_secrets
     command:
-      - "uv run --no-project --with pytest --with packaging python -m pytest tests/test_packaging_bounds.py -q"
+      - "uv run --no-project --python 3.12 --with pytest --with packaging python -m pytest tests/test_packaging_bounds.py -q"
 
   # All gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
