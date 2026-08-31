@@ -23,12 +23,10 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
     RBLNMoERunner,
+    _routing_mask_dtype,
 )
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
     _apply_grouped_topk_torch as grouped_topk,
-)
-from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
-    _routing_mask_dtype,
 )
 
 
