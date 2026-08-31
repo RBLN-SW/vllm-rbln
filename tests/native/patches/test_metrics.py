@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import types
 from typing import Any
@@ -565,6 +566,13 @@ class TestTimedRegion:
         monkeypatch.setattr(pm, "_ACTIVE_CTX", None)
         with pm.timed_region("rbln_model_runner: postprocess"):
             clock.advance(3 * MS)
+
+    def test_the_region_literal_matches_the_runner_source(self):
+        # timed_region matches execute_model's region by its literal name, so a
+        # rename in the runner would silently drop the spec-decode device wait
+        # from the graph sum. Pin the string to the source it must match.
+        source = inspect.getsource(pm._execute_model)
+        assert f'"{pm._GRAPH_REGION}"' in source
 
 
 class TestShutdown:
