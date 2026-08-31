@@ -7,6 +7,7 @@ notify:
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
+  UV_LOCK_TIMEOUT: "1200"
   UV_INDEX_STRATEGY: "unsafe-best-match"
   UV_PROJECT_ENVIRONMENT: "/mnt/cache/venv"
   VIRTUAL_ENV: "/mnt/cache/venv"
