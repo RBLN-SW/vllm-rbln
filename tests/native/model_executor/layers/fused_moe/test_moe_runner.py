@@ -27,6 +27,9 @@ from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
     _apply_grouped_topk_torch as grouped_topk,
 )
+from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
+    _routing_mask_dtype,
+)
 
 
 class TestApplyGroupedTopkTorch:
@@ -225,6 +228,39 @@ class TestApplyGroupedTopkTorch:
         )
         assert post.sum().item() == torch.tensor(1.0).item()
         assert pre.sum().item() < 1.0
+
+
+class TestRoutingMaskDtype:
+    # The mask multiplies the routing weights AFTER the compiler has folded the
+    # routing chain into `contrib_top_k_routing`, whose output follows the wider
+    # of (scores, e_score_correction_bias). The mask has to follow the same rule
+    # or the fused multiply is a relay dtype mismatch.
+    def test_wider_bias_widens_the_mask(self):
+        weights = torch.zeros(4, 2, dtype=torch.bfloat16)
+        bias = torch.zeros(4, dtype=torch.float32)
+        assert _routing_mask_dtype(weights, bias) is torch.float32
+
+    def test_no_bias_keeps_the_weights_dtype(self):
+        weights = torch.zeros(4, 2, dtype=torch.bfloat16)
+        assert _routing_mask_dtype(weights, None) is torch.bfloat16
+
+    def test_bias_of_equal_width_keeps_the_weights_dtype(self):
+        weights = torch.zeros(4, 2, dtype=torch.bfloat16)
+        bias = torch.zeros(4, dtype=torch.bfloat16)
+        assert _routing_mask_dtype(weights, bias) is torch.bfloat16
+
+    def test_narrower_bias_does_not_narrow_the_mask(self):
+        weights = torch.zeros(4, 2, dtype=torch.float32)
+        bias = torch.zeros(4, dtype=torch.bfloat16)
+        assert _routing_mask_dtype(weights, bias) is torch.float32
+
+    def test_the_product_is_the_mask_dtype(self):
+        # What the relay type checker sees: the multiply comes out fp32, so a
+        # cast lands on the (fused, fp32) routing side and nothing mismatches.
+        weights = torch.ones(4, 2, dtype=torch.bfloat16)
+        bias = torch.zeros(4, dtype=torch.float32)
+        mask = torch.ones(1, 2, dtype=_routing_mask_dtype(weights, bias))
+        assert (weights * mask).dtype is torch.float32
 
 
 class TestRegistration:

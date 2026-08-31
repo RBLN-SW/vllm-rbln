@@ -28,6 +28,34 @@ from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
 logger = init_logger(__name__)
 
 
+def _routing_mask_dtype(routing_weights, e_score_correction_bias):
+    """The dtype the routing weights carry once the COMPILER fuses the routing.
+
+    `EarlyCanonicalizeOpsRebel` folds the topk/gather/normalize/scatter chain
+    built below into one `contrib_top_k_routing`, and that op's type relation
+    (`ContribTopKRoutingRel`, rebel_compiler `src/relay/op/rbln/transform.cc`)
+    widens its output to `e_score_correction_bias`'s dtype whenever the bias is
+    the wider of the two -- bf16 scores with an fp32 bias come back fp32, which
+    the `scatter_elements` it replaced was not.
+
+    So the mask multiplied into those weights has to be that same wider dtype.
+    Narrower is the bug this exists to avoid: the fused multiply then has an fp32
+    left operand and a bf16 right one, and relay's type checker refuses it
+    ("data types float32 and bfloat16 do not match in BroadcastRel"). Wider is
+    always safe -- torch promotes the product and the relay frontend inserts the
+    cast -- and it is also what the mask was before it took a dtype at all.
+
+    Everything else keeps the narrow mask #1027 asked for: with no bias, or a
+    bias no wider than the weights, this is the weights' own dtype.
+    """
+    dtype = routing_weights.dtype
+    if e_score_correction_bias is None:
+        return dtype
+    if e_score_correction_bias.dtype.itemsize > dtype.itemsize:
+        return e_score_correction_bias.dtype
+    return dtype
+
+
 class RBLNMoERunner(MoERunner):
     """RBLN out-of-tree MoERunner.
     (See [#41184](https://github.com/vllm-project/vllm/pull/41184).)
@@ -264,7 +292,9 @@ class RBLNMoERunner(MoERunner):
                 tokens_mask = get_tokens_mask(
                     max_pad,
                     device=masked_routing_weights.device,
-                    dtype=masked_routing_weights.dtype,
+                    dtype=_routing_mask_dtype(
+                        masked_routing_weights, e_score_correction_bias
+                    ),
                 ).transpose(1, 0)  # [1, R*max_pad]
                 masked_routing_weights = masked_routing_weights * tokens_mask
 
@@ -489,7 +519,9 @@ class RBLNMoERunner(MoERunner):
             tokens_mask = get_tokens_mask(
                 num_tokens,
                 device=masked_routing_weights.device,
-                dtype=masked_routing_weights.dtype,
+                dtype=_routing_mask_dtype(
+                    masked_routing_weights, e_score_correction_bias
+                ),
             ).transpose(1, 0)  # [1, t]
 
             # [t, E] * [t, 1] (broadcast)
