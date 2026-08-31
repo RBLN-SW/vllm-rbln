@@ -50,7 +50,11 @@ Repository-specific checks:
 - No `test_*.py` under `tests/optimum/optimum_correctness/` — those are `fire` scripts.
 - No test that is skipped as a placeholder.
 
-## 4. Report what you did not do
+## 4. State the size
+
+Report the diff as source lines and test lines. If the test diff dwarfs the source, or the source dwarfs what your one-line summary describes, cut scope before opening the PR.
+
+## 5. Report what you did not do
 
 State it explicitly, every time:
 
@@ -61,7 +65,7 @@ State it explicitly, every time:
 
 An empty list is a claim. Only write it if it is true.
 
-## 5. Write the commit and PR
+## 6. Write the commit and PR
 
 - `type(scope): summary`, matching the existing history
 - Summarise what changed in a line or two, then explain what the diff cannot show. That explanation goes in the PR description; the squash merge discards the commit body

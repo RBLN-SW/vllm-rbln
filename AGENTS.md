@@ -7,6 +7,10 @@ Two documents own their subjects; read them rather than duplicating them here:
 - Environment setup, dependency and lockfile policy: `DEVELOPMENT.md`
 - PR process and issue labels: `CONTRIBUTING.md`
 
+## Accountability
+
+A pure agent-authored change is not acceptable. Upstream vLLM states the same rule in its own `AGENTS.md`. The submitting human reads every changed line, runs the tests, and can defend the change without the agent. If you cannot say why a line is there, delete it rather than ship it.
+
 ## Commands
 
 Run everything through `uv`. Never use the system `python3` or a bare `pip`.
@@ -98,12 +102,12 @@ Upstream vLLM asks for eval results in the PR description. That convention does 
 - Do not create a helper that is called once. Inline it.
 - Do not build an abstraction for a single use. Three similar lines beat a premature abstraction.
 - Do not create a module to hold a single function. A `patches/` module is the exception: it exists for its registrations, and being imported from `patches/__init__.py` is the whole contract.
+- Before adding a file, a class, or a layer of indirection, name the second caller. If there is none, put the code where the one caller already lives.
 - Do not add error handling for states that cannot occur.
 - Do not create files nobody asked for — docs, examples, scripts, changelogs.
 - Delete the scratch files you made while iterating.
-- The diff is the smallest one that fixes the stated problem. If it grew past that, say why in the PR, in one line.
 - Prefer fixing the underlying problem over a local workaround, even when that means a larger refactor. If the refactor is out of scope, say so and ask.
-- Do not restructure code you are not fixing. A refactor that is not the fix is its own PR.
+- Do not refactor, rename, or reformat code that is not part of the fix. A refactor is its own PR.
 
 ## Failure handling
 
@@ -122,7 +126,7 @@ Code either succeeds or fails with a clear error.
 - Do not add or edit comments in code you did not otherwise change.
 - Comments are for invariants, non-obvious constraints, and why an unusual approach was taken.
 - **One place per fact.** The file carries what a reader must know to change this code safely. The PR description carries how we found out and why the shape is what it is. Do not put the second in the first.
-- **A comment block stays at or under 5 lines, a `reason=` at or under 400 characters, and a docstring's prose at or under 15 lines; `Args:` and `Returns:` blocks do not count.** Nearly all of the repository is already inside these. When you need more, the surplus belongs in the PR description: leave only the lines a future reader cannot re-derive. The squash merge stamps `(#1234)` on the subject line, so `git blame` reaches the rest on its own. Splitting one long block into two shorter ones is not a fix.
+- **A comment block stays at or under 5 lines, a `reason=` at or under 400 characters, and a docstring's text at or under 15 lines; `Args:` and `Returns:` blocks do not count.** Nearly all of the repository is already inside these. When you need more, the surplus belongs in the PR description: leave only the lines a future reader cannot re-derive. The squash merge stamps `(#1234)` on the subject line, so `git blame` reaches the rest on its own. Splitting one long block into two shorter ones is not a fix.
 - Do not move the surplus into the commit message instead. The squash merge keeps the subject line and discards the body, so a commit message does not survive the merge.
 - Assume the reader knows vLLM and RBLN hardware. The module comments in `vllm_rbln/__init__.py` and `vllm_rbln/envs.py` are the intended level.
 
