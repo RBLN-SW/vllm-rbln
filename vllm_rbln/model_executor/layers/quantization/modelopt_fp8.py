@@ -94,5 +94,10 @@ class RBLNModelOptFp8LinearMethod(ModelOptFp8LinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        weight = layer.weight.to(x.dtype) * layer.weight_scale.to(x.dtype)[:, None]
-        return torch.nn.functional.linear(x, weight, bias)
+        compute_dtype = torch.bfloat16
+        weight = (
+            layer.weight.to(compute_dtype)
+            * layer.weight_scale.to(compute_dtype)[:, None]
+        )
+        out = torch.nn.functional.linear(x.to(compute_dtype), weight, bias)
+        return out.to(x.dtype)
