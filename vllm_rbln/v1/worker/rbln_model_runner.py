@@ -1282,10 +1282,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        num_reqs = self.input_batch.num_reqs
         if spec_decode_metadata is None:
             bucket = logits.shape[0]
-            num_reqs = self.input_batch.num_reqs
-            padded_md = _pad_sampling_metadata(sampling_metadata, bucket)
             # Keyed off the installed sampler: only RBLNSampler takes the kwarg,
             # and the executor's golden validation swaps self.sampler after __init__.
             staging = (
@@ -1293,17 +1292,26 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if self.use_async_scheduling and isinstance(self.sampler, RBLNSampler)
                 else {}
             )
-            out = self.sampler(logits=logits, sampling_metadata=padded_md, **staging)
-            sampler_output = _depad_sampler_output(out, num_reqs)
+            out = self.sampler(
+                logits=logits,
+                sampling_metadata=_pad_sampling_metadata(sampling_metadata, bucket),
+                **staging,
+            )
         else:
-            sampler_output = self.rejection_sampler(
+            if envs.VLLM_RBLN_SAMPLER:
+                bucket = self.bucketing_manager.max_batch_size
+                spec_decode_metadata = _pad_spec_decode_metadata(
+                    spec_decode_metadata, bucket
+                )
+                sampling_metadata = _pad_sampling_metadata(sampling_metadata, bucket)
+            out = self.rejection_sampler(
                 spec_decode_metadata,
                 None,  # draft_probs
                 logits,
                 sampling_metadata,
             )
 
-        return sampler_output
+        return _depad_sampler_output(out, num_reqs)
 
     def _apply_pending_token_writeback(self) -> None:
         """Put the real sampled tokens where every reader can see them.
@@ -3272,7 +3280,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def _warmup_sampler_decode_batches(self) -> None:
-        """Warm the device rejection-sample op at every decode batch size."""
+        """Warm the device rejection-sample op at the decode batch size it will see."""
         if (
             self.speculative_config is None
             or self.num_spec_tokens <= 0
@@ -3283,57 +3291,54 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         num_spec = self.num_spec_tokens
         vocab_size = self.model_config.get_vocab_size()
-        max_decode_batch = self.bucketing_manager.decode_batch_buckets[-1]
-
-        for batch_size in range(1, max_decode_batch + 1):
-            num_tokens = batch_size * num_spec
-            num_draft_tokens = [num_spec] * batch_size
-            draft_token_ids = torch.zeros(
-                num_tokens, dtype=torch.int32, device=self.device
-            )
-            target_probs = torch.zeros(
-                num_tokens, vocab_size, dtype=torch.float32, device=self.device
-            )
-            cu_num_draft_tokens = torch.arange(
-                num_spec,
-                num_tokens + 1,
-                num_spec,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            bonus_token_ids = torch.zeros(
-                batch_size, 1, dtype=torch.int64, device=self.device
-            )
-            dummy_sampling_metadata = SamplingMetadata(
-                temperature=None,
-                all_greedy=True,
-                all_random=False,
-                top_p=None,
-                top_k=None,
-                generators={},
-                max_num_logprobs=None,
-                no_penalties=True,
-                prompt_token_ids=None,
-                frequency_penalties=None,
-                presence_penalties=None,
-                repetition_penalties=None,
-                output_token_ids=[],
-                allowed_token_ids_mask=None,
-                bad_words_token_ids={},
-                logitsprocs=LogitsProcessors(),
-                spec_token_ids=[[] for _ in range(batch_size)],
-            )
-            logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
-            self.rejection_sampler.impl.rejection_sample(
-                draft_token_ids,
-                num_draft_tokens,
-                num_spec,
-                cu_num_draft_tokens,
-                None,
-                target_probs,
-                bonus_token_ids,
-                dummy_sampling_metadata,
-            )
+        # _sample pins the request axis to the per-PP-stage decode bound.
+        batch_size = self.bucketing_manager.max_batch_size
+        num_tokens = batch_size * num_spec
+        num_draft_tokens = [num_spec] * batch_size
+        draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+        target_probs = torch.zeros(
+            num_tokens, vocab_size, dtype=torch.float32, device=self.device
+        )
+        cu_num_draft_tokens = torch.arange(
+            num_spec,
+            num_tokens + 1,
+            num_spec,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        bonus_token_ids = torch.zeros(
+            batch_size, 1, dtype=torch.int64, device=self.device
+        )
+        dummy_sampling_metadata = SamplingMetadata(
+            temperature=None,
+            all_greedy=True,
+            all_random=False,
+            top_p=None,
+            top_k=None,
+            generators={},
+            max_num_logprobs=None,
+            no_penalties=True,
+            prompt_token_ids=None,
+            frequency_penalties=None,
+            presence_penalties=None,
+            repetition_penalties=None,
+            output_token_ids=[],
+            allowed_token_ids_mask=None,
+            bad_words_token_ids={},
+            logitsprocs=LogitsProcessors(),
+            spec_token_ids=[[] for _ in range(batch_size)],
+        )
+        logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
+        self.rejection_sampler.impl.rejection_sample(
+            draft_token_ids,
+            num_draft_tokens,
+            num_spec,
+            cu_num_draft_tokens,
+            None,
+            target_probs,
+            bonus_token_ids,
+            dummy_sampling_metadata,
+        )
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
@@ -3458,6 +3463,30 @@ def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
     return torch.cat([t, pad], dim=0)
 
 
+def _pad_spec_decode_metadata(
+    md: SpecDecodeMetadata, bucket: int
+) -> SpecDecodeMetadata:
+    """Pin the request axis the sampler's graphs are compiled for.
+
+    The rejection-sample op sizes its buffers from `len(num_draft_tokens)` and the
+    bonus logits carry one row per request, so the per-step request count recompiles
+    those graphs as requests finish. Padded rows draft nothing, so `max_spec_len` and
+    `sum(num_draft_tokens)` are unchanged and the op's packed layout still holds --
+    which is also why `target_logits_indices` stays packed: the op requires
+    `reshaped_target_probs[:N] = target_probs` with N == sum(num_draft_tokens).
+    """
+    pad = bucket - len(md.num_draft_tokens)
+    if pad <= 0:
+        return md
+    return dataclasses.replace(
+        md,
+        num_draft_tokens=md.num_draft_tokens + [0] * pad,
+        cu_num_draft_tokens=_pad_rows(md.cu_num_draft_tokens, bucket),
+        cu_num_sampled_tokens=_pad_rows(md.cu_num_sampled_tokens, bucket),
+        bonus_logits_indices=_pad_rows(md.bonus_logits_indices, bucket),
+    )
+
+
 def _pad_sampling_metadata(md: SamplingMetadata, bucket: int) -> SamplingMetadata:
     def _pad_list(lst):
         if not lst:
@@ -3486,10 +3515,11 @@ def _pad_sampling_metadata(md: SamplingMetadata, bucket: int) -> SamplingMetadat
 def _depad_sampler_output(out: SamplerOutput, num_reqs: int) -> SamplerOutput:
     lp = out.logprobs_tensors
     if lp is not None:
+        num_logprob_rows = num_reqs * out.sampled_token_ids.shape[1]
         lp = LogprobsTensors(
-            lp.logprob_token_ids[:num_reqs],
-            lp.logprobs[:num_reqs],
-            lp.selected_token_ranks[:num_reqs],
+            lp.logprob_token_ids[:num_logprob_rows],
+            lp.logprobs[:num_logprob_rows],
+            lp.selected_token_ranks[:num_logprob_rows],
         )
     return SamplerOutput(
         sampled_token_ids=out.sampled_token_ids[:num_reqs],
