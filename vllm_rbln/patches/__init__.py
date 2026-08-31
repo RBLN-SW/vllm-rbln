@@ -38,6 +38,7 @@ from . import (
     metrics,
     minimax_m2,
     mla,
+    modelopt_mixed_config,
     models_utils,
     multi_connector,
     oot,
