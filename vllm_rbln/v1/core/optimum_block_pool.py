@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
+
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
@@ -99,3 +101,31 @@ class RBLNBlockPool(BlockPool):
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+    def refresh_cached_blocks(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Move free cached blocks to the tail of the free queue.
+
+        A cached block's hash lives only until the free queue reaches it:
+        `get_new_blocks` pops from the head and destroys the popped block's
+        hash entry. A prefix-cache hit copies the matched blocks instead of
+        referencing them, so nothing else refreshes their queue position;
+        moving them to the tail on every hit keeps a hot conversation's
+        hashes alive.
+
+        This must not raise ref_cnt. The hit does not actually reference
+        the blocks, so there is no later release to balance an increment,
+        and a block whose ref_cnt never returns to zero can never re-enter
+        the queue. Reordering the queue keeps the blocks freely reusable,
+        exactly as the copy-based design requires of its sources.
+
+        Iterated in reverse so the tail of the prefix sits nearer the head
+        and is reused before the front. Matching stops at the first missing
+        block, so the front must outlive the tail -- the same order the
+        outer copies are evicted in.
+        """
+        for block in reversed(blocks):
+            if block.ref_cnt > 0:
+                # Still referenced by a running request: not in the queue.
+                continue
+            self.free_block_queue.remove(block)
+            self.free_block_queue.append(block)

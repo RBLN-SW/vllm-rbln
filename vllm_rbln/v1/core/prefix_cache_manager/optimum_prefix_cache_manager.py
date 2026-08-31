@@ -23,7 +23,7 @@ import torch
 from vllm_rbln.logger import init_logger
 
 from .optimum_block_mapping_manager import BlockMappingManager, RBLNBlock
-from .optimum_eviction_policy import FIFOEvictionPolicy, LRUEvictionPolicy
+from .optimum_eviction_policy import LRUEvictionPolicy
 
 logger = init_logger(__name__)
 NO_MATCH_FOUND = -1
@@ -255,7 +255,7 @@ class RBLNPrefixKVCacheManager:
         self._mapping_manager = BlockMappingManager()
         self._cache_search_manager = CacheSearchManager(self._config)
         self._memory_pool_manager = MemoryPoolManager(max_model_len, ob_size)
-        self._eviction_policy = FIFOEvictionPolicy()
+        self._eviction_policy = LRUEvictionPolicy()
 
     def is_full_block_available(self) -> bool:
         blocks_per_seq = math.ceil(self._config.max_model_len / self._config.ob_size)
@@ -418,6 +418,12 @@ class RBLNPrefixKVCacheManager:
                 assert mapping is not None, "Mapping not found for block"
                 mapping.is_active = False
                 mapping.request_id = None
+        if not preemption:
+            # The blocks were registered in allocation order, which would
+            # evict the front of the prefix first. Touch in reverse so the
+            # tail is evicted before the front.
+            for block_id in reversed(outer_blocks):
+                self._eviction_policy.touch(block_id)
 
     def get_matched_outer_blocks(
         self, request_id: str, cached_blocks: list[int], num_new_computed_tokens: int
@@ -433,12 +439,10 @@ class RBLNPrefixKVCacheManager:
             "Cached outer blocks and allocated outer blocks should be disjoint"
         )
 
-        if result.has_cache_hit and isinstance(
-            self._eviction_policy, LRUEvictionPolicy
-        ):
-            # NOTE(eunji.lee):
-            # To increase the hit ratio,
-            # we need to touch the blocks in reverse order.
+        if result.has_cache_hit:
+            # Touch in reverse so the front of the prefix ends up the most
+            # recently used: matching stops at the first missing block, so
+            # the front must outlive the tail.
             for ob_id in reversed(result.cached_outer_blocks):
                 self._eviction_policy.touch(ob_id)
 

@@ -20,71 +20,16 @@ from .optimum_block_mapping_manager import BlockMappingManager
 logger = init_logger(__name__)
 
 
-class SimpleEvictionPolicy:
-    """
-    Simple eviction policy to select blocks for eviction.
-    """
-
-    def register_block(self, block_id: int) -> None:
-        """Register a new block (called when block is first allocated)"""
-        pass
-
-    def unregister_block(self, block_id: int) -> None:
-        """Unregister a block (called when block is deallocated)"""
-        pass
-
-    def select_blocks_for_eviction(
-        self, mapping_manager: BlockMappingManager, count: int
-    ) -> list[int]:
-        """Select blocks for eviction."""
-        inactive_mappings = mapping_manager.get_inactive_mappings()
-        inactive_block_ids = [m.outer_block_id for m in inactive_mappings]
-        if len(inactive_block_ids) < count:
-            return []
-
-        return inactive_block_ids[:count]
-
-
-class FIFOEvictionPolicy(SimpleEvictionPolicy):
-    """
-    FIFO (First In First Out) eviction policy implementation.
-    """
-
-    def __init__(self):
-        self._allocation_order: OrderedDict[int, bool] = OrderedDict()
-
-    def register_block(self, block_id: int) -> None:
-        assert block_id not in self._allocation_order
-        self._allocation_order[block_id] = True
-
-    def unregister_block(self, block_id: int) -> None:
-        self._allocation_order.pop(block_id, None)
-
-    def select_blocks_for_eviction(
-        self, mapping_manager: BlockMappingManager, count: int
-    ) -> list[int]:
-        # NOTE If the cached block is evicted, we should also evict its mapping
-        # How about exclude the cached blocks from eviction?
-        # AS-IS: Eviction -> Cache check -> Allocation
-        # TO-DO: Cache check -> Eviction -> Allocation (more complicated)
-        inactive_mappings = mapping_manager.get_inactive_mappings()
-        inactive_block_ids = [m.outer_block_id for m in inactive_mappings]
-
-        evictable_blocks = [
-            block_id
-            for block_id in self._allocation_order
-            if block_id in inactive_block_ids
-        ]
-
-        if len(evictable_blocks) < count:
-            return []
-
-        return evictable_blocks[:count]
-
-
-class LRUEvictionPolicy(SimpleEvictionPolicy):
+class LRUEvictionPolicy:
     """
     LRU (Least Recently Used) eviction policy implementation.
+
+    Recency comes from `touch`. The prefix cache manager touches a
+    sequence's blocks in reverse order (front of the prefix last), so
+    within one sequence the tail is always evicted before the front.
+    Matching stops at the first missing block, so evicting the front
+    would invalidate the whole cached prefix while evicting the tail
+    only shortens the hit.
     """
 
     def __init__(self):
@@ -105,22 +50,16 @@ class LRUEvictionPolicy(SimpleEvictionPolicy):
     def select_blocks_for_eviction(
         self, mapping_manager: BlockMappingManager, count: int
     ) -> list[int]:
-        inactive_mappings = mapping_manager.get_inactive_mappings()
-        inactive_block_ids = [m.outer_block_id for m in inactive_mappings]
+        inactive_block_ids = {
+            mapping.outer_block_id
+            for mapping in mapping_manager.get_inactive_mappings()
+        }
 
-        untouched_blocks = [
-            block_id
-            for block_id in inactive_block_ids
-            if block_id not in self._access_order
-        ]
-
-        touched_blocks = [
+        evictable_blocks = [
             block_id
             for block_id in self._access_order
             if block_id in inactive_block_ids
         ]
-
-        evictable_blocks = untouched_blocks + touched_blocks
         if len(evictable_blocks) < count:
             return []
         return evictable_blocks[:count]
