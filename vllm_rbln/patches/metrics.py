@@ -24,12 +24,19 @@ absorbs the wait. Async defers that read out of the pass, so there it is dispatc
 A pass is recorded only once its phase and its graph time are both known, which is
 what keeps those counts equal.
 
+Spec decode moves that first blocking read again -- into the spec-only logits gather
+in execute_model's postprocess block, and runs the drafter between _sample and
+_bookkeeping_sync. Neither is a wrappable method, so timed_region folds the runner's
+"postprocess" and "draft" profiler regions into the same graph sum; both are empty
+without spec decode.
+
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
 is reached by wrapping the callable the runner holds, and the phase, which is a local of
 execute_model, is read where the runner computes it.
 """
 
+import contextlib
 import functools
 import json
 import os
@@ -39,6 +46,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
@@ -266,7 +274,9 @@ _shutdown = RBLNWorker.shutdown
 
 @functools.wraps(_execute_model)
 def execute_model(self, *args, **kwargs):
+    global _ACTIVE_CTX
     ctx = _ctx(self)
+    _ACTIVE_CTX = ctx
     ctx.start_pass()
     output = _execute_model(self, *args, **kwargs)
     # The engine calls sample_tokens() only if execute_model() returned None, so a
@@ -357,6 +367,30 @@ def shutdown(self):
     _shutdown(self)
 
 
+_ACTIVE_CTX: _PerformanceContext | None = None
+
+# The regions that hold device wait under spec decode (see the module docstring);
+# they belong to the graph sum, and are empty without spec decode.
+_GRAPH_REGIONS = frozenset(
+    {"rbln_model_runner: postprocess", "rbln_model_runner: draft"}
+)
+
+
+@contextlib.contextmanager
+def timed_region(name: str):
+    ctx = _ACTIVE_CTX
+    if name not in _GRAPH_REGIONS or ctx is None or not ctx.in_pass:
+        with record_function_or_nullcontext(name):
+            yield
+        return
+    start = time.perf_counter()
+    try:
+        with record_function_or_nullcontext(name):
+            yield
+    finally:
+        ctx.add_graph_time(time.perf_counter() - start)
+
+
 _RUNNER = "vllm_rbln.v1.worker.rbln_model_runner.RBLNModelRunner"
 _WORKER = "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
 
@@ -404,6 +438,12 @@ def _register_patches() -> None:
             shutdown,
             "Reports the collected metrics before teardown; the worker holds the only "
             "shutdown hook that still has the runner.",
+        ),
+        (
+            "vllm_rbln.v1.worker.rbln_model_runner.record_function_or_nullcontext",
+            timed_region,
+            "Spec decode holds its device wait in the postprocess and draft "
+            "regions, which are inline blocks with no method to wrap.",
         ),
     ):
         register_patch(

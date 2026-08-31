@@ -521,6 +521,42 @@ class TestModelExecutable:
         assert calls == [{"step": 1}, {"step": 2}]
 
 
+class TestTimedRegion:
+    """Spec decode's device wait sits in the postprocess gather and the drafter,
+    which are inline regions: timed_region must fold exactly those two into the
+    graph sum, and only while a pass is open."""
+
+    def _in_pass(self, ctx, clock, monkeypatch):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        ctx.start_pass()
+
+    @pytest.mark.parametrize(
+        "region", ["rbln_model_runner: postprocess", "rbln_model_runner: draft"]
+    )
+    def test_graph_regions_add_graph_time(self, ctx, clock, monkeypatch, region):
+        self._in_pass(ctx, clock, monkeypatch)
+        with pm.timed_region(region):
+            clock.advance(3 * MS)
+        assert ctx._graph_latency == pytest.approx(3 * MS)
+
+    def test_other_regions_do_not_touch_graph_time(self, ctx, clock, monkeypatch):
+        self._in_pass(ctx, clock, monkeypatch)
+        with pm.timed_region("rbln_model_runner: preprocess"):
+            clock.advance(3 * MS)
+        assert ctx._graph_latency is None
+
+    def test_no_pass_open_is_a_no_op(self, ctx, clock, monkeypatch):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        with pm.timed_region("rbln_model_runner: postprocess"):
+            clock.advance(3 * MS)
+        assert ctx._graph_latency is None
+
+    def test_no_active_ctx_is_a_no_op(self, clock, monkeypatch):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", None)
+        with pm.timed_region("rbln_model_runner: postprocess"):
+            clock.advance(3 * MS)
+
+
 class TestShutdown:
     def test_stats_are_reported_before_teardown(self, monkeypatch):
         order: list[str] = []
@@ -557,7 +593,7 @@ class TestDescriptors:
             for d in registry.get_registered_patch_descriptors()
             if d.owner_module == "vllm_rbln.patches.metrics"
         ]
-        assert len(ours) == 7
+        assert len(ours) == 8
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target
