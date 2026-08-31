@@ -262,7 +262,9 @@ class RBLNMoERunner(MoERunner):
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(
-                    max_pad, device=masked_routing_weights.device
+                    max_pad,
+                    device=masked_routing_weights.device,
+                    dtype=masked_routing_weights.dtype,
                 ).transpose(1, 0)  # [1, R*max_pad]
                 masked_routing_weights = masked_routing_weights * tokens_mask
 
@@ -283,6 +285,11 @@ class RBLNMoERunner(MoERunner):
                     e, R * max_pad
                 )  # (e, T)
 
+                # send_mask is registered as float32, but the ccl kernels
+                # matmul it against these routing slices (send_mask @ send_rl
+                # in ccl_dispatch_send
+                send_mask = self.send_mask.to(masked_routing_weights.dtype)
+
             # --- Step 4: Dispatch tokens across DP ranks ---
             if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
                 # --- all2all dispatch path ---
@@ -292,7 +299,7 @@ class RBLNMoERunner(MoERunner):
                 send_buffer, send_sizes = torch.ops.rbln_custom_ops.ccl_dispatch_send(
                     hidden_flat,
                     send_rl,
-                    self.send_mask,
+                    send_mask,
                     self.moe_parallel_config.dp_rank,
                 )
 
@@ -349,11 +356,11 @@ class RBLNMoERunner(MoERunner):
 
                 # ccl_combine_receive: unpack + sum-reduce → (max_pad, H)
                 # send_rl (E, max_pad): this rank's full expert routing
-                # self.send_mask: reused as expert_map (same matrix)
+                # send_mask: reused as expert_map (same matrix)
                 final_hidden_states = torch.ops.rbln_custom_ops.ccl_combine_receive(
                     combine_recv_buf,
                     send_rl,
-                    self.send_mask,
+                    send_mask,
                     combine_3d[
                         self.moe_parallel_config.dp_rank
                     ],  # local rank's own contribution
@@ -480,7 +487,9 @@ class RBLNMoERunner(MoERunner):
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(
-                num_tokens, device=masked_routing_weights.device
+                num_tokens,
+                device=masked_routing_weights.device,
+                dtype=masked_routing_weights.dtype,
             ).transpose(1, 0)  # [1, t]
 
             # [t, E] * [t, 1] (broadcast)
