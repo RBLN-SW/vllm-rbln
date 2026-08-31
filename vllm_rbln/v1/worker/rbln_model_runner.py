@@ -134,6 +134,10 @@ from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.spec_decode.eagle3_pp import (
+    eagle3_aux_hidden_states_enabled,
+    install_aux_handoff_slots,
+)
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.async_output import (
@@ -312,7 +316,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
 
-        self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
         # This is not ideal if there are many layers in the draft model.
@@ -323,6 +326,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             | SuffixDecodingProposer
             | None
         ) = None
+        self.use_aux_hidden_state_outputs = eagle3_aux_hidden_states_enabled(
+            self.speculative_config
+        )
+
         if self.speculative_config and get_pp_group().is_last_rank:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
@@ -332,10 +339,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
-                if self.speculative_config.method == "eagle3":
-                    self.use_aux_hidden_state_outputs = (
-                        self.drafter.eagle3_use_aux_hidden_state
-                    )
             else:
                 raise ValueError(
                     "Unsupported speculative decoding method: "
@@ -2038,6 +2041,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
 
             self.model.set_aux_hidden_state_layers(aux_layers)
+            # The handoff placeholder has to advertise the aux slots this stage
+            # expects, and the layers are only known here. A no-op at PP=1, where
+            # a stage receives nothing.
+            install_aux_handoff_slots(self.model)
 
         self._make_weights_contiguous()
 
@@ -2061,7 +2068,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
             logits = None
-            if self.use_aux_hidden_state_outputs:
+            # Only the last stage gets the aux tensors as a second return value;
+            # earlier stages carry them inside the IntermediateTensors handoff, which
+            # is model_output itself.
+            if self.use_aux_hidden_state_outputs and get_pp_group().is_last_rank:
                 hidden_states, aux_hidden_states = model_output
             else:
                 hidden_states = model_output
@@ -2089,8 +2099,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # NOTE(RBLN): When eagle3 and aux hidden states are used,
             # fuse combine_hidden_states projection into the target graph.
             combined_hidden_states = None
-            if self.use_aux_hidden_state_outputs:
-                assert aux_hidden_states is not None
+            if aux_hidden_states is not None:
                 assert isinstance(self.drafter, RBLNEagleProposer)
                 target_hidden_states = torch.cat(
                     [h.view(-1, h.shape[-1]) for h in aux_hidden_states], dim=-1
