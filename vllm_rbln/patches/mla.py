@@ -58,7 +58,15 @@ def patched_get_and_maybe_dequant_weights(
     if isinstance(quant_method, RBLNModelOptFp8LinearMethod):
         weight = layer.weight.detach().to("cpu", torch.float32)
         scale = layer.weight_scale.detach().to("cpu", torch.float32)
-        return (weight * scale[:, None]).to(out_dtype).to(layer.weight.device)
+        # ModelOpt fp8 is per-tensor, so the scale is a 0-dim scalar (see
+        # RBLNModelOptFp8LinearMethod.process_weights_after_loading); only a
+        # fused layer whose halves disagree keeps one value per logical width,
+        # and that one has to line up with the output rows it belongs to.
+        if scale.ndim != 0:
+            scale = torch.repeat_interleave(scale, torch.tensor(layer.logical_widths))[
+                :, None
+            ]
+        return (weight * scale).to(out_dtype).to(layer.weight.device)
     return mla_attention_original_get_and_maybe_dequant_weights(layer, out_dtype)
 
 
