@@ -18,6 +18,7 @@ import rebel
 import torch
 import torch.nn as nn
 from vllm.config.model import LogprobsMode
+from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
@@ -27,14 +28,36 @@ import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
-
-# NOTE:
-# Greedy requests use a small temperature (1e-3) so softmax collapses to a near
-# one-hot at argmax. Upstream's _SAMPLING_EPS (1e-5) is too small here —
-# it pushes logits past softmax's safe exp range and overflows.
-_SAMPLING_EPS = 1e-3
+from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
+
+
+# TODO(yunseong): move this to the runner
+def _stage_into(owner: Any, out: torch.Tensor) -> torch.Tensor:
+    """Snapshot `out` into a buffer belonging to `owner`, alternating two slots.
+
+    `out` is the sampling graph's own output, which the runtime recycles on the
+    next launch. Async holds the sampled tokens past the step boundary, so it
+    gets this copy instead. Enqueued here, next to the launch, and not by the
+    caller: a non_blocking copy is only safe while the source cannot have been
+    recycled yet, and every device op between the two widens that window.
+    """
+    ring = owner._sampled_token_ring
+    if (
+        not ring
+        or ring[0].shape != out.shape
+        or ring[0].dtype != out.dtype
+        or ring[0].device != out.device
+    ):
+        ring = [torch.empty_like(out) for _ in range(2)]
+        owner._sampled_token_ring = ring
+        owner._ring_slot = 0
+    buf = ring[owner._ring_slot]
+    owner._ring_slot ^= 1
+    # non_blocking, or the copy waits on the sampling graph.
+    buf.copy_(out, non_blocking=True)
+    return buf
 
 
 def rbln_top_k_top_p_sample(
@@ -122,6 +145,7 @@ class RBLNTopKTopPSampler(nn.Module):
         temperature: torch.Tensor,
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        staging_owner: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling.
 
@@ -133,7 +157,10 @@ class RBLNTopKTopPSampler(nn.Module):
                 "per-request generators. Ignoring generators."
             )
 
-        return self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p), None
+        out = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
+        if staging_owner is not None:
+            out = _stage_into(staging_owner, out)
+        return out, None
 
 
 class RBLNSampler(VLLMSampler):
@@ -167,14 +194,18 @@ class RBLNSampler(VLLMSampler):
             rbln_greedy_sample, compile_context
         )
 
-    def greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
-        return self._compiled_greedy_sample(logits)
+    def greedy_sample(
+        self, logits: torch.Tensor, staging_owner: Any = None
+    ) -> torch.Tensor:
+        out = self._compiled_greedy_sample(logits)
+        return out if staging_owner is None else _stage_into(staging_owner, out)
 
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         logprobs_mode_override: LogprobsMode | None = None,
+        staging_owner: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sample logits based on sampling metadata.
 
@@ -184,30 +215,27 @@ class RBLNSampler(VLLMSampler):
 
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
-        if not sampling_metadata.all_greedy:
-            greedy_sampled = None
-        else:
-            # It runs only all_greedy is True
-            greedy_sampled = self.greedy_sample(logits)
-            if sampling_metadata.all_greedy:
-                processed_logprobs = None
-                if (
-                    sampling_metadata.max_num_logprobs is not None
-                    or sampling_metadata.logprob_token_ids
-                ):
-                    if logprobs_mode == "processed_logits":
-                        processed_logprobs = logits
-                    elif logprobs_mode == "processed_logprobs":
-                        processed_logprobs = self.compute_logprobs(logits)
-                return greedy_sampled, processed_logprobs
+        if sampling_metadata.all_greedy:
+            # Upstream vLLM keeps this result to merge with the random one via
+            # `torch.where`. vLLM RBLN has no merge step: a mixed batch sends its
+            # greedy rows through the random-sampling path with top_k=1, so the op
+            # can only draw their argmax.
+            processed_logprobs = None
+            if (
+                sampling_metadata.max_num_logprobs is not None
+                or sampling_metadata.logprob_token_ids
+            ):
+                if logprobs_mode == "processed_logits":
+                    processed_logprobs = logits
+                elif logprobs_mode == "processed_logprobs":
+                    processed_logprobs = self.compute_logprobs(logits)
+            return self.greedy_sample(logits, staging_owner), processed_logprobs
 
         assert sampling_metadata.temperature is not None
 
         temperature = sampling_metadata.temperature
         if not sampling_metadata.all_random:
-            temperature = torch.where(
-                temperature < _SAMPLING_EPS, _SAMPLING_EPS, temperature
-            )
+            temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
 
         argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
         # if argmax_invariant processors are active, apply temperature scaling
@@ -225,22 +253,22 @@ class RBLNSampler(VLLMSampler):
         for processor in argmax_invariant:
             logits = processor.apply(logits)
 
+        k, p = build_op_top_k_top_p(
+            sampling_metadata,
+            logits.shape[0],
+            logits.shape[-1],
+            logits.device,
+        )
         # Apply temperature and top_k and/or top_p.
         random_sampled, processed_logprobs = self.topk_topp_sampler(
             logits,
             sampling_metadata.generators,
             temperature,
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
+            k,
+            p,
+            staging_owner,
         )
 
-        assert greedy_sampled is None, (
-            "Upstream vLLM runs greedy and random sampling "
-            "separately and merges the results, "
-            "but vLLM RBLN processes greedy and random requests together: "
-            "greedy requests are routed through the random-sampling path "
-            "with a very small temperature value."
-        )
         return random_sampled, processed_logprobs
 
     def forward(
@@ -249,6 +277,7 @@ class RBLNSampler(VLLMSampler):
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
+        staging_owner: Any = None,
     ) -> SamplerOutput:
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
@@ -274,20 +303,17 @@ class RBLNSampler(VLLMSampler):
             logits, sampling_metadata, predict_bonus_token
         )
         # Sample the next token.
-        sampled, processed_logprobs = self.sample(logits, sampling_metadata)
+        sampled, processed_logprobs = self.sample(
+            logits, sampling_metadata, staging_owner=staging_owner
+        )
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
-        # Convert sampled token ids to int64 (long) type to ensure compatibility
-        # with subsequent operations that may use these values as indices.
-        # NOTE(RBLN): `rbln::top_k_top_p` and `rbln::argmax` return int32, which is
-        # the same reason upstream needs this on its FlashInfer backend.
-        sampled = sampled.long()
 
         logprob_token_ids_tensors = None
         if sampling_metadata.logprob_token_ids:
             assert raw_logprobs is not None
             logprob_token_ids_tensors = self.gather_specific_token_logprobs(
-                raw_logprobs, sampling_metadata.logprob_token_ids, sampled
+                raw_logprobs, sampling_metadata.logprob_token_ids, sampled.long()
             )
 
         if num_logprobs is None:
@@ -300,16 +326,13 @@ class RBLNSampler(VLLMSampler):
         else:
             # Gather the logprobs and ranks of the topk and sampled token.
             logprobs_tensors = self.gather_logprobs(
-                raw_logprobs, num_logprobs, token_ids=sampled
+                raw_logprobs, num_logprobs, token_ids=sampled.long()
             )
 
         # If we have both num_logprobs and logprob_token_ids, prefer
         # logprob_token_ids as it's more specific
         if logprob_token_ids_tensors is not None and num_logprobs is not None:
             logprobs_tensors = logprob_token_ids_tensors
-
-        # Use int32 to reduce the tensor size.
-        sampled = sampled.to(torch.int32)
 
         # These are GPU tensors.
         sampler_output = SamplerOutput(

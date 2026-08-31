@@ -13,6 +13,7 @@ serve:
   max_num_batched_tokens: 512
   max_num_seqs: 4
   enable_expert_parallel: true
+  enable_prefix_caching: false
 
 # One server start -- and one compile -- per entry.
 serve_params:
@@ -28,9 +29,16 @@ bench:
   num_warmups: 4
 
 bench_params:
-  c4-in50k-out1k:
+  c4-in50k-out1k-greedy:
     max_concurrency: 4
-    num_prompts: 40
+    num_prompts: 16
+    random_input_len: 51200
+    random_output_len: 1024
+    temperature: 0.0
+
+  c4-in50k-out1k-non-greedy:
+    max_concurrency: 4
+    num_prompts: 16
     random_input_len: 51200
     random_output_len: 1024
 

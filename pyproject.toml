@@ -44,8 +44,8 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln~=0.4.0rc0 ; platform_machine == 'x86_64'",
-    "optimum-rbln>=0.11.2a1",
+    "torch-rbln>=0.4.0 ; platform_machine == 'x86_64'",
+    "optimum-rbln>=0.11.2",
 ]
 
 [project.optional-dependencies]
@@ -70,7 +70,7 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler~=0.11.2.dev256",
+    "rebel-compiler~=0.11.3.dev4",
 ]
 
 
@@ -103,6 +103,14 @@ markers = [
     "use_device: always touches the NPU (e.g. compiles an op via the rbln backend) regardless of --device-tensor, so it is always auto-spawned in a fresh process -- never run in the parent, which would pin the device for the rest of the session.",
     "maybe_use_device: opens the RBLN device only when device tensors are on. Auto-spawned in a fresh process under --device-tensor 1 (never in the parent, which would pin the device for the rest of the session); runs in-process under --device-tensor 0 (cpu).",
 ]
+
+# FIXME(kblee): remove when axk2 support in upstream
+# `_skt_*.py` are byte-identical copies of SKT-AI/vllm's axk2 sources (see
+# vllm_rbln/patches/axk2/ORIGIN). Must stay above [tool.ruff.lint]: TOML cannot
+# reopen [tool.ruff] once a subtable of it has been declared.
+[tool.ruff]
+extend-exclude = ["vllm_rbln/patches/axk2/_skt_*.py"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = [
@@ -144,6 +152,17 @@ plugins = ['pydantic.mypy']
 ignore_missing_imports = true
 check_untyped_defs = true
 follow_imports = "silent"
+
+# FIXME(kblee): remove when axk2 support in upstream
+# `_skt_*.py` are byte-identical copies of SKT-AI/vllm's axk2 sources (see
+# vllm_rbln/patches/axk2/ORIGIN); they are frozen, so exclude them from
+# type-checking, mirroring the [tool.ruff] extend-exclude above.
+[[tool.mypy.overrides]]
+module = [
+    "vllm_rbln.patches.axk2._skt_model",
+    "vllm_rbln.patches.axk2._skt_config",
+]
+ignore_errors = true
 
 [tool.uv]
 # 0.11.25 changed lockfile serialization (redundant `environments` markers factored

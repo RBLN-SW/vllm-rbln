@@ -328,7 +328,7 @@ class TestDetermineAvailableMemory:
         device_name="RBLN-CA25",
         hf_config=None,
         params=None,
-        specialized_moe_decode=0,
+        specialized_moe_decode=False,
         decode_buckets=3,
         drafter=None,
         speculative_config=None,
@@ -341,8 +341,8 @@ class TestDetermineAvailableMemory:
             wm, "estimate_available_memory", lambda **kw: captured.update(kw) or 999
         )
         monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
-        if speculative_config is not None:
-            worker.speculative_config = speculative_config
+        # WorkerBase always carries the field; None is what no spec decode means.
+        worker.speculative_config = speculative_config
         worker.model_runner = SimpleNamespace(
             model=SimpleNamespace(
                 named_parameters=lambda: iter((params or _params()).items())
@@ -358,9 +358,11 @@ class TestDetermineAvailableMemory:
 
     def test_num_runtimes_from_buckets_and_moe(self, make_worker, monkeypatch):
         cap = self._capture(
-            make_worker, monkeypatch, specialized_moe_decode=2, decode_buckets=3
+            make_worker, monkeypatch, specialized_moe_decode=True, decode_buckets=3
         )
-        assert cap["num_runtimes"] == 6  # 1 + buckets(3) + moe(2)
+        # Non-spec: num_decode_query_lens == 1, so 1 + buckets(3)*1 = 4, plus
+        # the specialized-MoE-decode fallback (+1 query length) = 5.
+        assert cap["num_runtimes"] == 5
 
     def test_no_quant_counts_int_at_16bit(self, make_worker, monkeypatch):
         assert self._capture(make_worker, monkeypatch)["n_model_bytes"] == 300
@@ -433,7 +435,35 @@ class TestDetermineAvailableMemory:
         )
         assert "kernel_size" in cap
         assert "n_model_bytes" not in cap
-        assert cap["num_runtimes"] == 8  # (1+3+0) + (1+3)
+        # Spec on: target = 1 + buckets(3)*num_decode_query_lens(2) = 7 (no MoE);
+        # draft = 1 + buckets(3) = 4. Total 11.
+        assert cap["num_runtimes"] == 11
+
+    def test_draft_runtime_adds_specialized_moe_fallback(
+        self, make_worker, monkeypatch
+    ):
+        # The specialized-MoE-decode fallback re-runs the top bucket at a different
+        # num_padded_tokens, so it adds one draft graph.
+        # Target = 1 + buckets(3)*2 + (2 + 1) = 10; draft = 1 + buckets(3) + 1 = 5;
+        # total 15.
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
+            ),
+        )
+        spec = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization=None),
+            draft_parallel_config=None,
+            method="eagle",
+        )
+        cap = self._capture(
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            specialized_moe_decode=True,
+        )
+        assert cap["num_runtimes"] == 15
 
     def test_draft_quantization_rejected(self, make_worker, monkeypatch):
         drafter = SimpleNamespace(
@@ -477,8 +507,11 @@ class TestCompileOrWarmUpModel:
         compile_model=True,
         warm_up=True,
         warmup_side_effect=None,
+        data_parallel_size=1,
     ):
-        vcfg = _make_vllm_config(enforce_eager=enforce_eager)
+        vcfg = _make_vllm_config(
+            enforce_eager=enforce_eager, data_parallel_size=data_parallel_size
+        )
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_COMPILE_MODEL", compile_model)
@@ -497,6 +530,11 @@ class TestCompileOrWarmUpModel:
             calls.append("warmup")
             if warmup_side_effect is not None:
                 raise warmup_side_effect
+
+        monkeypatch.setattr(wm, "get_dp_group", lambda: SimpleNamespace(cpu_group="dp"))
+        monkeypatch.setattr(
+            wm.dist, "barrier", lambda group: calls.append(f"barrier:{group}")
+        )
 
         worker.model_runner = SimpleNamespace(
             warmup_model=warmup,
@@ -524,6 +562,28 @@ class TestCompileOrWarmUpModel:
         result = worker.compile_or_warm_up_model()
         assert calls == ["warmup"]
         assert isinstance(result, CompilationTimes)
+
+    def test_dp_ranks_rendezvous_after_warmup(self, make_worker, monkeypatch):
+        # The ranks must leave this method together: whatever skew survives it
+        # lands in the first forward's DP all-reduce, where it reads as the
+        # first request's prefill latency.
+        worker, calls = self._worker(make_worker, monkeypatch, data_parallel_size=4)
+        worker.compile_or_warm_up_model()
+        assert calls == ["warmup", "barrier:dp"]
+
+    def test_no_rendezvous_without_dp_peers(self, make_worker, monkeypatch):
+        worker, calls = self._worker(make_worker, monkeypatch, data_parallel_size=1)
+        worker.compile_or_warm_up_model()
+        assert calls == ["warmup"]
+
+    def test_no_rendezvous_when_warmup_skipped(self, make_worker, monkeypatch):
+        # Nothing compiled, so there is no skew to absorb -- and every skip
+        # reason is global config, so the ranks skip together.
+        worker, calls = self._worker(
+            make_worker, monkeypatch, warm_up=False, data_parallel_size=4
+        )
+        worker.compile_or_warm_up_model()
+        assert calls == []
 
     @pytest.mark.parametrize(
         "msg",

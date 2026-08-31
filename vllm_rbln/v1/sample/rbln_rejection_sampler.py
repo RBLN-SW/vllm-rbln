@@ -27,6 +27,10 @@ from vllm_rbln import envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.v1.sample.ops.top_k_top_p import (
+    GREEDY_TEMPERATURE,
+    build_op_top_k_top_p,
+)
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -36,7 +40,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PLACEHOLDER_TOKEN_ID = -1
-GREEDY_TEMPERATURE = 0
 
 
 # TODO(RBLN): Enable RBLNSampler for
@@ -434,8 +437,12 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             draft_per_batch[i, :n] = draft_token_ids[src_offset : src_offset + n]
             src_offset += n
 
-        # NOTE(RBLN): `sampling_metadata.top_k`/`top_p` already live on the input
-        # batch's device (== `device` here), so they feed the op as-is.
+        top_k, top_p = build_op_top_k_top_p(
+            sampling_metadata,
+            batch_size,
+            vocab_size,
+            device,
+        )
 
         # ------------------------------------------------------------------
         # 2) Call the NPU primitive.
@@ -448,8 +455,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             reshaped_draft_token_ids,
             reshaped_target_probs,
             cu_num_draft_tokens.to(device),
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
+            top_k,
+            top_p,
         )
 
         # ------------------------------------------------------------------
@@ -521,12 +528,12 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         cu_num_draft_tokens: torch.Tensor,  # [batch_size]
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        """Process logits based on sampling metadata.
+        """Scale the target logits by each request's temperature.
 
-        This function applies temperature scaling to the rows of random-sampling
-        requests. Rows of greedy requests are collapsed onto their argmax, so
-        that the caller's softmax turns them into an exact one-hot target
-        distribution. top-k and top-p are left to the rejection sampling op.
+        Every draft-token row is divided by the temperature of the request that
+        owns it, greedy rows (temperature 0) by 1. Unlike upstream vLLM, top-k and
+        top-p are not applied here; `rbln::rejection_sample` takes them as
+        per-request inputs.
 
         Args:
             logits: Input logits tensor to be processed.
@@ -535,20 +542,18 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 temperature and whether greedy sampling is used.
 
         Returns:
-            torch.Tensor: Processed logits -- the caller softmaxes the result to
-            build `target_probs`.
+            torch.Tensor: The scaled logits -- the caller softmaxes them to build
+            `target_probs`.
         """
         assert logits.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
         if sampling_metadata.all_greedy:
-            return logits_for_one_hot_probs(logits)
+            return logits
 
         num_tokens = logits.shape[0]
-        # NOTE(eunji.lee):
-        # Upstream vLLM treats any temperature below _SAMPLING_EPS as greedy,
-        # sets it to 0, and then overrides it to 1 right before the sampling op.
-        # We do the same here: greedy rows are overwritten below, so the value
-        # their logits are divided by does not matter as long as it is not 0.
+        # NOTE(eunji.lee): A greedy row's temperature is 0, which the division
+        # below cannot handle. Substituting 1 is harmless: `rbln::rejection_sample`
+        # samples those rows under top_k=1, so only their argmax can come out.
         temperature = expand_batch_to_tokens(
             sampling_metadata.temperature,
             cu_num_draft_tokens,
@@ -559,28 +564,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
         logits.div_(temperature.unsqueeze(-1))
 
-        # NOTE(eunji.lee): The NPU `rbln::rejection_sample` primitive has no
-        # greedy kernel -- every row goes through random rejection sampling. A
-        # greedy row therefore has to carry a one-hot target distribution, which
-        # makes accept-iff-draft-is-argmax the only possible outcome.
-        greedy_rows = expand_batch_to_tokens(
-            sampling_metadata.temperature == GREEDY_TEMPERATURE,
-            cu_num_draft_tokens,
-            num_tokens,
-        ).nonzero(as_tuple=True)[0]
-        if greedy_rows.numel() > 0:
-            greedy_rows = greedy_rows.to(logits.device)
-            logits[greedy_rows] = logits_for_one_hot_probs(logits[greedy_rows])
-
         # NOTE(eunji.lee): top_k & top_p are applied together during rejection sampling.
         return logits
-
-
-def logits_for_one_hot_probs(logits: torch.Tensor) -> torch.Tensor:
-    """Return -inf except 0.0 at the argmax, so that softmax gives an exact
-    one-hot."""
-    _, max_idx = logits.max(dim=-1, keepdim=True)
-    return torch.full_like(logits, float("-inf")).scatter_(-1, max_idx, 0.0)
 
 
 def rbln_rejection_sample(
