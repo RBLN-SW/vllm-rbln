@@ -41,6 +41,7 @@ import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
 from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
     ExponentialBucketingManager,
 )
@@ -260,6 +261,18 @@ class TestPadDepad:
         assert torch.equal(padded.target_logits_indices, original.target_logits_indices)
         assert torch.equal(padded.logits_indices, original.logits_indices)
 
+    def test_padded_metadata_breaks_the_eagle_reader_it_would_reach(self):
+        # Why the pad lives in _sample, not in the producer: this reader
+        # differences cu_num_draft_tokens against num_reqs-sized tensors.
+        padded = _pad_spec_decode_metadata(_spec_decode_metadata([1, 1]), 4)
+
+        with pytest.raises(RuntimeError):
+            eagle_prepare_inputs_padded(
+                padded.cu_num_draft_tokens,
+                torch.tensor([2, 2], dtype=torch.int32),
+                torch.tensor([0, 2, 4], dtype=torch.int32),
+            )
+
 
 class TestSamplePadding:
     @staticmethod
@@ -329,6 +342,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
 
     runner._warmup_sampler_decode_batches()
 
+    assert rejection_sample.call_count == 1
     assert len(rejection_sample.call_args.args[1]) == 4
 
 
