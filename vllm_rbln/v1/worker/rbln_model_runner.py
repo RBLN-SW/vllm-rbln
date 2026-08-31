@@ -2255,15 +2255,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logprobs, num_prompt_logprobs, tgt_token_ids
             )
 
-            # Transfer
+            # Transfer device->CPU. Blocking on purpose: upstream follows its
+            # non-blocking copies with a device synchronize, and this runner
+            # has no _sync_device -- an async copy here would let the CPU
+            # tensors be serialized before the data lands.
             chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(token_ids)
+            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs)
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(ranks)
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
