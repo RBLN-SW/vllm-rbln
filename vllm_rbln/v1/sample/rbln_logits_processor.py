@@ -91,9 +91,34 @@ class RBLNMinPLogitsProcessor(MinPLogitsProcessor):
     min_p: torch.Tensor
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.min_p_count and self.min_p.dtype != logits.dtype:
+        if not self.min_p_count:
+            return logits
+        if self.min_p.dtype != logits.dtype:
             self.min_p = self.min_p.to(logits.dtype)
-        return super().apply(logits)
+
+        # NOTE(RBLN): update_state sizes min_p to the live request count, but
+        # the native runner hands the sampler bucket-padded logits on decode
+        # and leading-rows-only logits on prefill -- the same row contract the
+        # runner's _pad_rows applies to temperature/top_k/top_p. Upstream's
+        # apply multiplies min_p into a logits-rows-sized tensor in place, so a
+        # row mismatch raises. Rebuild it around a row-matched view; the body
+        # below is otherwise upstream's apply. Zero pad rows are no-ops: their
+        # adjusted_min_p is 0 and no probability is below it. On the optimum
+        # path RBLNInputBatch already sizes min_p to the bucket, so the sizing
+        # branches never fire there.
+        min_p = self.min_p
+        num_rows = logits.shape[0]
+        if min_p.shape[0] > num_rows:
+            min_p = min_p[:num_rows]
+        elif min_p.shape[0] < num_rows:
+            min_p = torch.cat([min_p, min_p.new_zeros(num_rows - min_p.shape[0], 1)])
+
+        probability_values = torch.nn.functional.softmax(logits, dim=-1)
+        max_probabilities = torch.amax(probability_values, dim=-1, keepdim=True)
+        adjusted_min_p = max_probabilities.mul_(min_p)
+        invalid_token_mask = probability_values < adjusted_min_p
+        logits.masked_fill_(invalid_token_mask, -float("inf"))
+        return logits
 
 
 RBLN_BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
