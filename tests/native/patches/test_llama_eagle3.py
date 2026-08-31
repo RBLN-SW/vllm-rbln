@@ -48,7 +48,6 @@ def _vllm_config(per_rank_layers: int):
         model_config=SimpleNamespace(
             get_total_num_hidden_layers=lambda: NUM_LAYERS,
             get_num_layers=lambda parallel_config: per_rank_layers,
-            hf_text_config=SimpleNamespace(num_hidden_layers=NUM_LAYERS),
         ),
         speculative_config=SimpleNamespace(
             draft_model_config=SimpleNamespace(
