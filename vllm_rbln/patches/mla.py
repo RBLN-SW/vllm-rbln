@@ -19,6 +19,7 @@
 
 import torch
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
 from vllm_rbln.patches import register_patch
@@ -30,6 +31,35 @@ from vllm_rbln.patches.attention import (
 mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
 mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
+mla_attention_original_get_and_maybe_dequant_weights = (
+    _mla_attention_mod.get_and_maybe_dequant_weights
+)
+
+
+@register_patch(
+    target=(
+        "vllm.model_executor.layers.attention.mla_attention."
+        "get_and_maybe_dequant_weights"
+    ),
+    reason=(
+        "The MLA kv_b_proj weight-absorb dequantises eagerly at load time. For "
+        "per-tensor ModelOpt fp8 (RBLNModelOptFp8LinearMethod) upstream misses "
+        "its Fp8LinearMethod fast path"
+    ),
+)
+def patched_get_and_maybe_dequant_weights(
+    layer: torch.nn.Module, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
+        RBLNModelOptFp8LinearMethod,
+    )
+
+    quant_method = getattr(layer, "quant_method", None)
+    if isinstance(quant_method, RBLNModelOptFp8LinearMethod):
+        weight = layer.weight.detach().to("cpu", torch.float32)
+        scale = layer.weight_scale.detach().to("cpu", torch.float32)
+        return (weight * scale[:, None]).to(out_dtype)
+    return mla_attention_original_get_and_maybe_dequant_weights(layer, out_dtype)
 
 
 class _RBLNNoOpMLAPrefillBackend:
