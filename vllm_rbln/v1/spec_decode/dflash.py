@@ -30,6 +30,7 @@ from copy import copy
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -77,6 +78,14 @@ class RBLNDFlashProposer(DFlashProposer):
                 "The DFlash drafter cannot run eager on RBLN: its context K/V "
                 "write goes through an attention op that only exists as a "
                 "compiled kernel."
+            )
+        if not USE_DEVICE_TENSOR:
+            # The cache is allocated on the meta device then, and the context
+            # write is a host copy -- which meta accepts and discards.
+            raise NotImplementedError(
+                "The DFlash drafter requires VLLM_RBLN_USE_DEVICE_TENSOR=1 on "
+                "RBLN: without it the KV cache has no host-visible storage and "
+                "the drafter's context K/V write is silently dropped."
             )
         super().__init__(vllm_config=vllm_config, device=device, runner=runner)
         if self.dflash_causal:
@@ -216,6 +225,7 @@ class RBLNDFlashProposer(DFlashProposer):
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
         self._check_rope_style(target_model)
+        self._check_no_moe()
 
         # Projection inputs are padded to one of two shapes so the region
         # compiles twice: one draft block per request in decode, one prefill
@@ -325,13 +335,29 @@ class RBLNDFlashProposer(DFlashProposer):
                 "the rotation has to match or acceptance collapses silently."
             )
 
+    def _check_no_moe(self) -> None:
+        """Refuse a drafter whose forward would join the DP all-gather.
+
+        Fused MoE is the only reader of the step's padded token dimension, so a
+        draft without it runs no collective of its own -- which is what lets
+        `dummy_run` do nothing. With one, an idle rank that skipped its draft
+        would leave the busy ranks blocked inside that collective.
+        """
+        if any(isinstance(module, MoERunner) for module in self.model.modules()):
+            raise NotImplementedError(
+                "The DFlash drafter cannot contain fused MoE on RBLN: its "
+                "warmup and idle-step draft are no-ops, which would strand the "
+                "busy ranks in the draft collective."
+            )
+
     def dummy_run(self, *args, **kwargs) -> None:
-        """Skip the drafter warmup.
+        """Skip the drafter warmup and the idle-step draft.
 
         Upstream's signature takes CUDA-graph state this platform does not
         have, and the runner calls the `RBLNEagleProposer` one, so neither can
-        drive the other. The region compiles on the first real step, as
-        EAGLE's chained region does.
+        drive the other. The region compiles on the first real step, as EAGLE's
+        chained region does. Doing nothing on a DP-idle step is safe only
+        because the drafter runs no collective -- see `_check_no_moe`.
         """
         return None
 
@@ -686,12 +712,17 @@ class RBLNDFlashProposer(DFlashProposer):
             num_reqs,
             num_reqs,
         )
+        # Both travel together: `RBLNDPMetadata.make` requires them off the DP
+        # path to be None, and the MoE tokens mask routes a DP=1 step there too.
+        num_tokens_across_dp = self._draft_dp_status(num_reqs, num_query_per_req)
         with set_forward_context(
             per_layer,
             self.vllm_config,
             num_tokens=num_query_total,
-            num_tokens_across_dp=self._draft_dp_status(num_reqs, num_query_per_req),
-            num_padded_tokens=num_query_total,
+            num_tokens_across_dp=num_tokens_across_dp,
+            num_padded_tokens=(
+                num_query_total if num_tokens_across_dp is not None else None
+            ),
             **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
         ):
             return self.model_executable(

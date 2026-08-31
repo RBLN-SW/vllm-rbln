@@ -33,6 +33,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm_rbln.v1.spec_decode.dflash as dflash_module
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 
 BLOCK_SIZE = 1024
@@ -251,3 +252,84 @@ class TestRedirectTarget:
         assert self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, True])
         # the second row is the unfilled one, so vetoing depends on it crossing
         assert not self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, False])
+
+
+class TestPlatformRefusals:
+    """The three configurations DFlash cannot run on, all refused at
+    construction and all before the base class does any work, so none of them
+    reaches a device.
+
+    Each fails silently otherwise: an eager context write goes through an
+    attention op that exists only as a compiled kernel, and without device
+    tensors the cache is allocated on `meta`, which accepts a host copy and
+    discards it."""
+
+    @staticmethod
+    def _config(max_num_seqs=1, enforce_eager=False):
+        return SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+            speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
+        )
+
+    def _construct(self):
+        return RBLNDFlashProposer(self._config(), torch.device("cpu"))
+
+    def test_a_wider_batch_is_refused_at_construction(self):
+        with pytest.raises(NotImplementedError, match="max-num-seqs 1"):
+            RBLNDFlashProposer(self._config(max_num_seqs=4), torch.device("cpu"))
+
+    def test_eager_is_refused(self):
+        with pytest.raises(NotImplementedError, match="cannot run eager"):
+            RBLNDFlashProposer(
+                self._config(enforce_eager=True), torch.device("cpu")
+            )
+
+    def test_compile_disabled_is_refused(self, monkeypatch):
+        monkeypatch.setattr(dflash_module.envs, "VLLM_RBLN_COMPILE_MODEL", False)
+        with pytest.raises(NotImplementedError, match="cannot run eager"):
+            self._construct()
+
+    def test_host_visible_cache_is_required(self, monkeypatch):
+        """Without device tensors the cache is on `meta` and the context write
+        is dropped without an error."""
+        monkeypatch.setattr(dflash_module, "USE_DEVICE_TENSOR", False)
+        with pytest.raises(NotImplementedError, match="USE_DEVICE_TENSOR"):
+            self._construct()
+
+
+class TestNoMoEGuard:
+    """`dummy_run` does nothing, so a DP-idle rank contributes no draft
+    forward. That is only safe while the drafter runs no collective of its own,
+    and fused MoE is the one thing that would give it one -- a busy rank would
+    then block in a collective the idle rank never joins."""
+
+    @staticmethod
+    def _self(modules):
+        return SimpleNamespace(model=SimpleNamespace(modules=lambda: modules))
+
+    def test_a_dense_drafter_is_accepted(self):
+        RBLNDFlashProposer._check_no_moe(self._self([object(), object()]))
+
+    def test_a_moe_drafter_is_refused(self):
+        moe = object.__new__(dflash_module.MoERunner)
+        with pytest.raises(NotImplementedError, match="fused MoE"):
+            RBLNDFlashProposer._check_no_moe(self._self([object(), moe]))
+
+
+class TestDraftDpStatus:
+    """The draft pass hands `num_tokens_across_dp` and `num_padded_tokens` to
+    the forward context together, and `RBLNDPMetadata.make` requires both to be
+    None off the DP path -- which the MoE tokens mask puts a DP=1 step on. This
+    pins the None the padding keys off."""
+
+    @staticmethod
+    def _self(dp_size):
+        return SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                parallel_config=SimpleNamespace(data_parallel_size=dp_size)
+            )
+        )
+
+    def test_no_dp_status_without_dp(self):
+        assert RBLNDFlashProposer._draft_dp_status(self._self(1), 1, 8) is None
+
