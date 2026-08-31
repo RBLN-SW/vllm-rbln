@@ -323,6 +323,7 @@ class RBLNWorker(WorkerBase):
                 "gpt_oss_mxfp4",
                 "fp8",
                 "compressed-tensors",
+                "modelopt_mixed",
             )
 
             if quantization == "compressed-tensors":
@@ -360,7 +361,7 @@ class RBLNWorker(WorkerBase):
                         f"only 4-bit (int4) or 8-bit (fp8)."
                     )
 
-            if quantization == "fp8":
+            if quantization in ("fp8", "modelopt_mixed"):
                 nbits_per_param = 8
                 packed_num_elems = 1
             elif quantization == "int4":
