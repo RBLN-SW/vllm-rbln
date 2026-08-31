@@ -97,10 +97,13 @@ Upstream vLLM asks for eval results in the PR description. That convention does 
 - Look for an existing utility or mechanism before writing a significant amount of new code.
 - Do not create a helper that is called once. Inline it.
 - Do not build an abstraction for a single use. Three similar lines beat a premature abstraction.
+- Do not create a module to hold a single function. A `patches/` module is the exception: it exists for its registrations, and being imported from `patches/__init__.py` is the whole contract.
 - Do not add error handling for states that cannot occur.
 - Do not create files nobody asked for — docs, examples, scripts, changelogs.
 - Delete the scratch files you made while iterating.
+- The diff is the smallest one that fixes the stated problem. If it grew past that, say why in the PR, in one line.
 - Prefer fixing the underlying problem over a local workaround, even when that means a larger refactor. If the refactor is out of scope, say so and ask.
+- Do not restructure code you are not fixing. A refactor that is not the fix is its own PR.
 
 ## Failure handling
 
@@ -117,8 +120,11 @@ Code either succeeds or fails with a clear error.
 - Do not restate what the code says. If a comment narrates the next line, delete it and let the name carry the meaning.
 - Do not describe your changes or address the reader in a comment. The commit message and the PR body are for that.
 - Do not add or edit comments in code you did not otherwise change.
-- Comments are for invariants, non-obvious constraints, and why an unusual approach was taken. These may be long; explain them properly. The module comments in `vllm_rbln/__init__.py` and `vllm_rbln/envs.py` are the intended level.
-- Assume the reader knows vLLM and RBLN hardware.
+- Comments are for invariants, non-obvious constraints, and why an unusual approach was taken.
+- **One place per fact.** The file carries what a reader must know to change this code safely. The PR description carries how we found out and why the shape is what it is. Do not put the second in the first.
+- **A comment block stays at or under 5 lines, a `reason=` at or under 400 characters, and a docstring's prose at or under 15 lines; `Args:` and `Returns:` blocks do not count.** Nearly all of the repository is already inside these. When you need more, the surplus belongs in the PR description: leave only the lines a future reader cannot re-derive. The squash merge stamps `(#1234)` on the subject line, so `git blame` reaches the rest on its own. Splitting one long block into two shorter ones is not a fix.
+- Do not move the surplus into the commit message instead. The squash merge keeps the subject line and discards the body, so a commit message does not survive the merge.
+- Assume the reader knows vLLM and RBLN hardware. The module comments in `vllm_rbln/__init__.py` and `vllm_rbln/envs.py` are the intended level.
 
 ## Tests
 
@@ -146,6 +152,8 @@ Some of the rules above cost something to follow. When you believe a case is a r
 Follow the existing convention: `type(scope): summary`, for example `fix(mega-cache): key the bundle on the warm-up graph set`.
 
 Explain intent. Summarise what changed in a line or two, then spend the space on what the diff cannot show — the reason behind an unusual approach, a constraint that forced the shape, a tradeoff that was weighed. Do not walk through the diff file by file; that is the part a reader can already see.
+
+The two have different lifetimes. The squash merge keeps the subject line and discards the body, so a commit message is read during review and then gone, while the PR description is what `git log`'s `(#1234)` still points at. Write commit messages for the reviewer. Where both would carry the same explanation, it goes in the PR description and the commit message stays short.
 
 ## Skills
 

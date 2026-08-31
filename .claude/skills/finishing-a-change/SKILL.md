@@ -35,6 +35,7 @@ Look for each of these:
 - **Abstractions** built for one call site
 - **Comments that narrate the code**, describe your changes, or address the reader
 - **Comments added to code you did not otherwise change**
+- **Comment blocks over 5 lines, a `reason=` over 400 characters, docstring prose over 15 lines** — the surplus belongs in the PR description, not the file, and not the commit message
 - **Swallowed failures** — `except Exception`, bare `except`, `except: pass`, an unrequested fallback or default
 - **`else` branches for cases that cannot happen** — should be `assert` or `raise`
 - **Dead leftovers** — renamed `_var`, unused re-exports, `# removed` comments
@@ -63,7 +64,7 @@ An empty list is a claim. Only write it if it is true.
 ## 5. Write the commit and PR
 
 - `type(scope): summary`, matching the existing history
-- Summarise what changed in a line or two, then explain what the diff cannot show
+- Summarise what changed in a line or two, then explain what the diff cannot show. That explanation goes in the PR description; the squash merge discards the commit body
 - Say which model path or paths the change affects
 - English
 - A perf change may give a relative change, never an absolute measurement
