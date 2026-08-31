@@ -79,16 +79,14 @@ class RBLNModelOptFp8LinearMethod(ModelOptFp8LinearMethod):
             layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        device = layer.weight.device
-        logical_widths = torch.tensor(layer.logical_widths)
-        w_cpu = layer.weight.detach().to("cpu").to(torch.bfloat16)
-        row_scale = torch.repeat_interleave(
-            layer.weight_scale.detach().to("cpu").to(torch.bfloat16), logical_widths
+        logical_widths = torch.tensor(
+            layer.logical_widths, device=layer.weight_scale.device
         )
-        dequant = (w_cpu * row_scale[:, None]).contiguous().to(device)
-        layer.weight = Parameter(dequant, requires_grad=False)
-        layer.weight_scale = None
-        layer.input_scale = None
+        row_scale = torch.repeat_interleave(layer.weight_scale, logical_widths)
+        layer.weight = Parameter(layer.weight.data, requires_grad=False)
+        layer.weight_scale = Parameter(row_scale.contiguous(), requires_grad=False)
+        if getattr(layer, "input_scale", None) is not None:
+            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
 
     def apply(
         self,
@@ -96,6 +94,10 @@ class RBLNModelOptFp8LinearMethod(ModelOptFp8LinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.nn.functional.linear(
-            x.to(layer.weight.dtype), layer.weight, bias
-        ).to(x.dtype)
+        compute_dtype = torch.bfloat16
+        weight = (
+            layer.weight.to(compute_dtype)
+            * layer.weight_scale.to(compute_dtype)[:, None]
+        )
+        out = torch.nn.functional.linear(x.to(compute_dtype), weight, bias)
+        return out.to(x.dtype)
