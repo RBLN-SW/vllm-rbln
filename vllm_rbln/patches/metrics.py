@@ -26,9 +26,10 @@ what keeps those counts equal.
 
 Spec decode moves that first blocking read again -- into the spec-only logits gather
 in execute_model's postprocess block, and runs the drafter between _sample and
-_bookkeeping_sync. Neither is a wrappable method, so timed_region folds the runner's
-"postprocess" and "draft" profiler regions into the same graph sum; both are empty
-without spec decode.
+_bookkeeping_sync. The drafter is a method (propose_draft_token_ids) and is wrapped
+like the sampler; the gather is an inline block with no method to wrap, so
+timed_region folds the runner's "postprocess" profiler region into the same graph
+sum. Both are empty without spec decode.
 
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
@@ -269,6 +270,7 @@ _determine_batch_execution_and_padding = (
     RBLNModelRunner._determine_batch_execution_and_padding
 )
 _bookkeeping_sync = RBLNModelRunner._bookkeeping_sync
+_propose_draft_token_ids = RBLNModelRunner.propose_draft_token_ids
 _shutdown = RBLNWorker.shutdown
 
 
@@ -310,6 +312,14 @@ def sample(self, *args, **kwargs):
         return _sample(self, *args, **kwargs)
     start = time.perf_counter()
     output = _sample(self, *args, **kwargs)
+    _ctx(self).add_graph_time(time.perf_counter() - start)
+    return output
+
+
+@functools.wraps(_propose_draft_token_ids)
+def propose_draft_token_ids(self, *args, **kwargs):
+    start = time.perf_counter()
+    output = _propose_draft_token_ids(self, *args, **kwargs)
     _ctx(self).add_graph_time(time.perf_counter() - start)
     return output
 
@@ -369,17 +379,15 @@ def shutdown(self):
 
 _ACTIVE_CTX: _PerformanceContext | None = None
 
-# The regions that hold device wait under spec decode (see the module docstring);
-# they belong to the graph sum, and are empty without spec decode.
-_GRAPH_REGIONS = frozenset(
-    {"rbln_model_runner: postprocess", "rbln_model_runner: draft"}
-)
+# The region that holds the spec-only logits gather (see the module docstring); it
+# belongs to the graph sum, and is empty without spec decode.
+_GRAPH_REGION = "rbln_model_runner: postprocess"
 
 
 @contextlib.contextmanager
 def timed_region(name: str):
     ctx = _ACTIVE_CTX
-    if name not in _GRAPH_REGIONS or ctx is None or not ctx.in_pass:
+    if name != _GRAPH_REGION or ctx is None or not ctx.in_pass:
         with record_function_or_nullcontext(name):
             yield
         return
@@ -422,6 +430,12 @@ def _register_patches() -> None:
             "attribute, so it cannot be replaced through the registry.",
         ),
         (
+            f"{_RUNNER}.propose_draft_token_ids",
+            propose_draft_token_ids,
+            "Times the drafter, which runs between _sample and _bookkeeping_sync "
+            "and holds device wait under MTP/EAGLE spec decode.",
+        ),
+        (
             f"{_RUNNER}._bookkeeping_sync",
             bookkeeping_sync,
             "Holds the step's first blocking read of the sampler output, which the "
@@ -442,8 +456,8 @@ def _register_patches() -> None:
         (
             "vllm_rbln.v1.worker.rbln_model_runner.record_function_or_nullcontext",
             timed_region,
-            "Spec decode holds its device wait in the postprocess and draft "
-            "regions, which are inline blocks with no method to wrap.",
+            "Spec decode syncs on the forward in the spec-only logits gather, "
+            "an inline block of execute_model with no method to wrap.",
         ),
     ):
         register_patch(

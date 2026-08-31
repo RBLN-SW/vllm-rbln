@@ -496,6 +496,19 @@ class TestSamplerTiming:
         assert ctx._graph_latency is None
 
 
+class TestDrafterTiming:
+    def test_drafter_call_adds_graph_time(self, monkeypatch):
+        monkeypatch.setattr(
+            pm, "_propose_draft_token_ids", lambda self, *a, **k: "drafts"
+        )
+        runner = _Runner()
+        ctx = pm._ctx(runner)
+        ctx.start_pass()
+
+        assert pm.propose_draft_token_ids(runner) == "drafts"
+        assert ctx._graph_latency is not None
+
+
 class TestModelExecutable:
     def test_the_executable_is_timed_only_inside_a_pass(self, monkeypatch):
         calls: list[dict] = []
@@ -522,20 +535,17 @@ class TestModelExecutable:
 
 
 class TestTimedRegion:
-    """Spec decode's device wait sits in the postprocess gather and the drafter,
-    which are inline regions: timed_region must fold exactly those two into the
-    graph sum, and only while a pass is open."""
+    """Spec decode's device wait sits in the postprocess gather, an inline region:
+    timed_region must fold exactly that one into the graph sum, and only while a
+    pass is open."""
 
     def _in_pass(self, ctx, clock, monkeypatch):
         monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
         ctx.start_pass()
 
-    @pytest.mark.parametrize(
-        "region", ["rbln_model_runner: postprocess", "rbln_model_runner: draft"]
-    )
-    def test_graph_regions_add_graph_time(self, ctx, clock, monkeypatch, region):
+    def test_graph_region_adds_graph_time(self, ctx, clock, monkeypatch):
         self._in_pass(ctx, clock, monkeypatch)
-        with pm.timed_region(region):
+        with pm.timed_region("rbln_model_runner: postprocess"):
             clock.advance(3 * MS)
         assert ctx._graph_latency == pytest.approx(3 * MS)
 
@@ -593,7 +603,7 @@ class TestDescriptors:
             for d in registry.get_registered_patch_descriptors()
             if d.owner_module == "vllm_rbln.patches.metrics"
         ]
-        assert len(ours) == 8
+        assert len(ours) == 9
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target
