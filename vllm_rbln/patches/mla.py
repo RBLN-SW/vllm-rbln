@@ -58,7 +58,7 @@ def patched_get_and_maybe_dequant_weights(
     if isinstance(quant_method, RBLNModelOptFp8LinearMethod):
         weight = layer.weight.detach().to("cpu", torch.float32)
         scale = layer.weight_scale.detach().to("cpu", torch.float32)
-        return (weight * scale[:, None]).to(out_dtype)
+        return (weight * scale[:, None]).to(out_dtype).to(layer.weight.device)
     return mla_attention_original_get_and_maybe_dequant_weights(layer, out_dtype)
 
 
