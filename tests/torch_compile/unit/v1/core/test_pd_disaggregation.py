@@ -349,6 +349,42 @@ class TestPDDisaggregationScheduler:
         for d in decodes:
             assert d.request_id in ns
 
+    def test_prompt_logprobs_request_does_not_consult_the_connector(self):
+        """A restored span is never recomputed, so a request that needs every
+        prompt position must skip the connector the way it already skips the
+        local prefix cache and the sub-block match."""
+        matched = _BLOCK_SIZE
+        num_tokens = 3 * _BLOCK_SIZE
+
+        def make_scheduler():
+            return create_scheduler(
+                block_size=_BLOCK_SIZE,
+                num_blocks=_NUM_BLOCKS,
+                max_num_seqs=_MAX_NUM_SEQS,
+                use_kv_connector=MockKVConfig(matched_tokens=matched, is_async=False),
+            )
+
+        # Control: the same offer reduces a plain request's prefill, proving
+        # the connector wiring is live and the assertion below is not vacuous.
+        scheduler = make_scheduler()
+        control = _create_pd_request(num_tokens, "control")
+        scheduler.add_request(control)
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens["control"] == num_tokens - matched
+
+        scheduler = make_scheduler()
+        wants = create_requests(
+            num_requests=1,
+            num_tokens=num_tokens,
+            block_size=_BLOCK_SIZE,
+            req_ids=["wants-logprobs"],
+            prompt_logprobs=1,
+        )[0]
+        wants.kv_transfer_params = {"do_remote_prefill": True}
+        scheduler.add_request(wants)
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens["wants-logprobs"] == num_tokens
+
 
 # ===========================================================================
 # NIXL connector tests

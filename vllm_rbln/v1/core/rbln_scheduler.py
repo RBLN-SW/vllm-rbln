@@ -475,8 +475,14 @@ class RBLNScheduler(Scheduler):
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
 
-                    # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    # Get externally-cached tokens if using a KVConnector —
+                    # unless the request must see every prompt position (prompt
+                    # logprobs): a restored span is never recomputed. Local APC
+                    # and the sub-block match already honor this flag.
+                    if (
+                        self.connector is not None
+                        and not request.skip_reading_prefix_cache
+                    ):
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
@@ -498,6 +504,16 @@ class RBLNScheduler(Scheduler):
                             request.num_tokens - num_new_local_computed_tokens
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
+                    elif self.connector is not None:
+                        # Loud on purpose: on a disaggregated deployment the
+                        # prefill instance's work for this request is discarded
+                        # and the prompt is recomputed here.
+                        logger.warning_once(
+                            "prompt-logprobs requests bypass the KV connector "
+                            "(a restored span can never produce prompt "
+                            "logprobs); each such request recomputes its full "
+                            "prompt locally."
+                        )
 
                     # NOTE(RBLN): Arbitrate between sub-block match and KV connector.
                     sub_block_match, num_sub_block_tokens = self._try_sub_block_match(
