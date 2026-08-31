@@ -11,9 +11,8 @@ many blocks actually fit per chiplet, reallocates the KV tensors at that size an
 re-announces the count to the scheduler. No recompilation happens, because the
 affected dimension is already dynamic.
 
-> The dynamic path requires `VLLM_RBLN_USE_VLLM_MODEL=1` and
-> `VLLM_RBLN_USE_DEVICE_TENSOR=1`. Only `DynamoRuntime` applies adaptive buffer
-> sizes; the other runtimes ignore them silently.
+> The dynamic path requires `VLLM_RBLN_USE_VLLM_MODEL=1`. Only `DynamoRuntime`
+> applies adaptive buffer sizes; the other runtimes ignore them silently.
 
 Key components:
 
@@ -32,7 +31,6 @@ Key components:
 
 ```bash
 export VLLM_RBLN_USE_VLLM_MODEL=1
-export VLLM_RBLN_USE_DEVICE_TENSOR=1
 export VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1
 export VLLM_CACHE_ROOT=<a fresh directory>
 ```

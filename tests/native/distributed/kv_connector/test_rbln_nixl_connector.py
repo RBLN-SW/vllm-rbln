@@ -21,7 +21,6 @@ import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector as cm
-import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
     RblnNixlConnector,
 )
@@ -40,13 +39,12 @@ def _vllm_config(*, kv_buffer_device="cpu", engine_id="engine-0", has_transfer=T
 def isolated_connector(monkeypatch):
     """Construct RblnNixlConnector with the upstream base __init__ neutralized
     and the sub-connectors faked, so only the guards + wiring execute. Returns a
-    builder(vllm_config, role, use_device_tensor=True)."""
+    builder(vllm_config, role)."""
     monkeypatch.setattr(cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None)
     monkeypatch.setattr(cm, "RblnNixlConnectorScheduler", lambda *a, **k: "SCHEDULER")
     monkeypatch.setattr(cm, "RblnNixlConnectorWorker", lambda *a, **k: "WORKER")
 
-    def build(vllm_config, role=KVConnectorRole.SCHEDULER, use_device_tensor=True):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", use_device_tensor)
+    def build(vllm_config, role=KVConnectorRole.SCHEDULER):
         connector = object.__new__(RblnNixlConnector)
         RblnNixlConnector.__init__(connector, vllm_config, role, {"kv_cache": 1})
         return connector
@@ -75,10 +73,6 @@ class TestConstructionGuards:
         # all the way through to the role wiring.
         connector = isolated_connector(_vllm_config(kv_buffer_device=kv_buffer_device))
         assert connector.connector_scheduler == "SCHEDULER"
-
-    def test_requires_device_tensor(self, isolated_connector):
-        with pytest.raises(AssertionError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
-            isolated_connector(_vllm_config(), use_device_tensor=False)
 
 
 class TestRoleWiring:

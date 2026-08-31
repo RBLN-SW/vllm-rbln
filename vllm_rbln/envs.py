@@ -52,10 +52,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
-    VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
-    # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
-    # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     VLLM_RBLN_NUM_RAY_NODES: int = 1
@@ -156,18 +153,6 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
         ) from e
 
 
-def use_auto_port() -> bool:
-    raw = os.environ.get("VLLM_RBLN_AUTO_PORT")
-    if raw is not None:
-        return raw.lower() in ("true", "1")
-    # Default follows device-tensor mode: auto port is on when
-    # VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
-    return os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "True").lower() in (
-        "true",
-        "1",
-    )
-
-
 # extended environments
 environment_variables = {
     # ====================================================================
@@ -251,19 +236,9 @@ environment_variables = {
     "VLLM_RBLN_NUM_HIDDEN_LAYERS": lambda: int(
         os.environ.get("VLLM_RBLN_NUM_HIDDEN_LAYERS", 0)
     ),
-    # Use RBLN device tensors end-to-end (platform device_type="rbln",
-    # KV cache / inputs on device, CPU-first attention metadata, padded
-    # sampling metadata, no CompileContext). Enabled by default; set to False
-    # to fall back to the host-tensor path.
-    "VLLM_RBLN_USE_DEVICE_TENSOR": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_USE_DEVICE_TENSOR", "True").lower()
-            in ("true", "1")
-        )
-    ),
-    # Disable RBLN file offloading during model load / warm-up even when
-    # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;
-    # weight host backings stay resident instead of being paged to disk.
+    # Disable RBLN file offloading during model load / warm-up. Kill-switch
+    # for the offload path; weight host backings stay resident instead of
+    # being paged to disk.
     "VLLM_RBLN_DISABLE_OFFLOAD": (
         lambda: (
             os.environ.get("VLLM_RBLN_DISABLE_OFFLOAD", "False").lower()
@@ -271,7 +246,9 @@ environment_variables = {
         )
     ),
     # Auto port
-    "VLLM_RBLN_AUTO_PORT": use_auto_port,
+    "VLLM_RBLN_AUTO_PORT": (
+        lambda: os.environ.get("VLLM_RBLN_AUTO_PORT", "True").lower() in ("true", "1")
+    ),
     # enforce model data type into fp32 not model_config.dtype
     "VLLM_RBLN_ENFORCE_MODEL_FP32": (
         lambda: (
@@ -393,7 +370,6 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_COMPILE_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
-        "VLLM_RBLN_USE_DEVICE_TENSOR",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",

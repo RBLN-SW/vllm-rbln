@@ -600,14 +600,11 @@ class TestLoadModel:
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", False
         )
-        proposer.runner = SimpleNamespace(
-            compile_context=object(), runtime_holder=[None]
-        )
+        proposer.runner = SimpleNamespace(runtime_holder=[None])
 
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
         assert captured["fullgraph"] is True
-        assert "compile_context" in captured
 
     def test_eager_wrapper_composes_model_forward(self, monkeypatch):
         # The eager wrapper runs the draft model, reshapes the hidden states,

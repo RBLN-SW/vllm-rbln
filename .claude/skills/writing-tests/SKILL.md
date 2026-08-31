@@ -45,7 +45,7 @@ Marks decide whether an item runs at all and whether it runs in this process or 
 | ------------------ | ------------------------------------------------------------------------------- |
 | `model_compile`    | Whole-model compile, minutes. Skipped unless `--model-compile`. Always spawned.  |
 | `use_device`       | Always opens the NPU. Always spawned.                                            |
-| `maybe_use_device` | Opens the NPU only under device tensors. Spawned when `device_type != "cpu"`.    |
+| `maybe_use_device` | Opens the NPU when `device_type != "cpu"`, and is spawned in that case.         |
 | none               | Runs in this process.                                                            |
 
 Spawning is not an optimization. A test that opens the device in the parent process pins it for the rest of the session, so `use_device` and `maybe_use_device` exist to force a fresh process.
@@ -64,7 +64,6 @@ There is no `e2e/` directory today; four such files sit in four different subsys
 
 Read `tests/native/conftest.py` for the full text; the constraints that bite:
 
-- `--device-tensor {0,1}` is session-wide. `platform.py` resolves it at module scope and several modules copy the value into their own namespace, so it **cannot** be parametrized per test. Run the suite once per value.
 - `--num-hidden-layers N` builds only the first N decoder layers to cut compile time, and `hf_runner` truncates to the same N so comparisons stay like-for-like. Default is 3; `0` means the whole model.
 - The suite scrubs exported `VLLM_RBLN_*` variables. These options are the way in — do not read the environment directly to get around them.
 

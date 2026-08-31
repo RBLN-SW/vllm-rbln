@@ -22,10 +22,9 @@ Run `pre-commit` through `uvx`, since it is not a project dependency. Pass `--fi
 
 A new `.py` file needs the Apache header that every other file carries; `check-license-header` rejects it otherwise. Copy the header from a neighbouring file.
 
-`tests/native/` defines three session options (see its `conftest.py`):
+`tests/native/` defines two session options (see its `conftest.py`):
 
 - `--model-compile` — opt into whole-model compiles, minutes per test
-- `--device-tensor {0,1}` — session-wide, cannot be parametrized per test
 - `--num-hidden-layers N` — build only the first N decoder layers
 
 They do not exist in `tests/optimum/`.
@@ -36,7 +35,7 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 - **model path** — which model implementation runs. The two are the **optimum-rbln path** and the **vLLM-native path**; `optimum` and `native` are the short forms. Not "backend", not "mode". `torch.compile` describes how the native path works and is not its name.
 - **suite** — a top-level test tree: `tests/native/`, `tests/optimum/`.
-- **lane** — a slice of a suite selected by a flag, a mark, or the device mode: the default lane, the `--model-compile` lane, the cpu and device lanes.
+- **lane** — a slice of a suite selected by a flag, a mark, or the device mode: the default lane, the `--model-compile` lane, the spawned device lane.
 
 ## Two model paths
 

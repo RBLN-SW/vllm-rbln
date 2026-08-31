@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -72,10 +71,7 @@ def make_sampling_metadata(
 @pytest.fixture
 def impl(monkeypatch) -> RBLNRejectionSamplerImpl:
     monkeypatch.setattr(module, "compile", lambda target, **kwargs: target)
-    return RBLNRejectionSamplerImpl(
-        compile_context=Mock(),
-        num_spec_tokens=NUM_SPEC_TOKENS,
-    )
+    return RBLNRejectionSamplerImpl(num_spec_tokens=NUM_SPEC_TOKENS)
 
 
 ########################### build_op_top_k_top_p ###########################

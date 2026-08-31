@@ -16,7 +16,6 @@ import pytest
 import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-import vllm_rbln.envs as envs
 from tests.native.v1.attention.utils import (
     make_builder,
     make_common_attn_metadata,
@@ -255,10 +254,7 @@ class TestBuildPrefillNonCausal:
     def test_mask_dtype_follows_enforce_eager(
         self, cfg, monkeypatch, eager, expected_dtype
     ):
-        # float16 under enforce_eager, float32 otherwise. enforce_eager needs
-        # device tensors, so that case is skipped on the cpu lane.
-        if eager and not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-            pytest.skip("enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1")
+        # float16 under enforce_eager, float32 otherwise.
         config = (
             make_vllm_config(
                 max_model_len=MAX_LEN,

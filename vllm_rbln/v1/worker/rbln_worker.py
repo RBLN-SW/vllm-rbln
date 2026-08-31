@@ -22,16 +22,9 @@ from typing import TYPE_CHECKING, Any
 
 import numba
 import torch
-
-try:
-    import torch.rbln
-
-    has_torch_rbln = True
-except ImportError:
-    has_torch_rbln = False
-
 import torch.distributed as dist
 import torch.nn as nn
+import torch.rbln
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import (
     VllmConfig,
@@ -122,8 +115,6 @@ def empty_rbln_device_caches() -> bool:
     # NOTE(RBLN): the allocator otherwise releases cached blocks only as a retry
     # after an allocation fails, so freed bytes keep counting in sysfs
     # `dram_used`. Never raises: this runs during start-up.
-    if not has_torch_rbln:
-        return False
     try:
         # NOTE(RBLN): is_available() raises on a malformed RBLN_* config.
         if not torch.rbln.is_available():
@@ -250,7 +241,7 @@ class RBLNWorker(WorkerBase):
             selected_devices,
         )
 
-        if has_torch_rbln and num_devices > 1:
+        if num_devices > 1:
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(num_devices)
 
     @instrument(span_name="Init device")
@@ -1304,8 +1295,6 @@ class RBLNWorker(WorkerBase):
     def _release_offload_temp_storage(self) -> None:
         # The runtime drops the offload dir on teardown, but that runs last and vLLM
         # SIGKILLs a worker seconds after asking it to stop, so reclaim up front.
-        if not has_torch_rbln:
-            return
         try:
             num_removed = torch.rbln.release_offload_temp_storage()
         except Exception:
@@ -1402,14 +1391,8 @@ def init_worker_distributed_environment(
 
     new_backend = backend
     if envs.VLLM_RBLN_AUTO_PORT:
-        if has_torch_rbln:
-            new_backend = "rbln-ccl"
-            os.environ["RCCL_PORT_GEN"] = "1"
-        else:
-            logger.warning(
-                "Cannot use auto port because torch-rbln is not installed. "
-                "You may need to install torch-rbln to use auto port feature."
-            )
+        new_backend = "rbln-ccl"
+        os.environ["RCCL_PORT_GEN"] = "1"
 
     init_distributed_environment(
         world_size,

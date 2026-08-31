@@ -39,16 +39,6 @@ logger = init_logger(__name__)
 # any engine code reads a variable.
 envs.publish_to_vllm_envs()
 
-try:
-    import torch.rbln  # noqa: F401
-
-    HAS_TORCH_RBLN: bool = True
-except ImportError:
-    HAS_TORCH_RBLN = False
-
-USE_DEVICE_TENSOR: bool = (
-    envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-)
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 
@@ -68,9 +58,9 @@ class RblnPlatform(Platform):
     # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
     # observe identical values to the parent without any extra plumbing.
     plugin_name: str = "rbln"
-    device_name: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    device_type: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    dist_backend: str = "rbln-ccl" if USE_DEVICE_TENSOR else ""
+    device_name: str = "rbln" if envs.VLLM_RBLN_USE_VLLM_MODEL else "cpu"
+    device_type: str = "rbln" if envs.VLLM_RBLN_USE_VLLM_MODEL else "cpu"
+    dist_backend: str = "rbln-ccl" if envs.VLLM_RBLN_USE_VLLM_MODEL else ""
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     device_control_env_var: str = "RBLN_DEVICES"
@@ -298,16 +288,12 @@ class RblnPlatform(Platform):
             # Async is decided here rather than in the prologue: this is the
             # only reader of the flag, and on the optimum path the refusal
             # below is the whole story.
-            if scheduler_config.async_scheduling and not (
-                envs.VLLM_RBLN_USE_DEVICE_TENSOR and envs.VLLM_RBLN_SAMPLER
-            ):
+            if scheduler_config.async_scheduling and not envs.VLLM_RBLN_SAMPLER:
                 logger.warning(
                     "Disabling asynchronous scheduling: it requires "
-                    "VLLM_RBLN_USE_DEVICE_TENSOR=1 (got %s), which carries the "
-                    "in-flight sampled tokens, and VLLM_RBLN_SAMPLER=1 (got %s), "
-                    "which puts the sampler on the device so those tokens never "
-                    "reach the host mid-step. Running synchronously.",
-                    int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
+                    "VLLM_RBLN_SAMPLER=1 (got %s), which puts the sampler on the "
+                    "device so the in-flight sampled tokens never reach the host "
+                    "mid-step. Running synchronously.",
                     int(envs.VLLM_RBLN_SAMPLER),
                 )
                 scheduler_config.async_scheduling = False
@@ -381,14 +367,6 @@ class RblnPlatform(Platform):
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
-                if not USE_DEVICE_TENSOR:
-                    raise ValueError(
-                        "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
-                        "Eager mode bypasses torch.compile, so ops must dispatch "
-                        "to a real device='rbln' rather than the compile-backend "
-                        "fake-CPU tensors used by the default vLLM model path."
-                    )
-
                 hf_config = vllm_config.model_config.hf_config
                 assert not hasattr(hf_config, "sliding_window") or not getattr(
                     hf_config, "use_sliding_window", True
@@ -551,13 +529,6 @@ class RblnPlatform(Platform):
             raise ValueError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
                 "decoding; the merged profiles cannot be attributed per artifact."
-            )
-
-        if not USE_DEVICE_TENSOR:
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
-                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
-                "no dynamic KV dimension."
             )
 
         if vllm_config.kv_transfer_config is not None:
@@ -752,8 +723,7 @@ class RblnPlatform(Platform):
         # kv_buffer_device "cpu" is the host-bounce path; "rbln" is the D2D
         # path (upstream NixlConnectorWorker.__init__ rejects kv_buffer_device
         # values not listed here). Listed under both device_types because
-        # device_type is "rbln" only when VLLM_RBLN_USE_DEVICE_TENSOR and
-        # VLLM_RBLN_USE_VLLM_MODEL are both set.
+        # device_type is "rbln" only on the vLLM-native path.
         return {
             "cpu": ("cpu", "rbln"),
             "rbln": ("rbln", "cpu"),

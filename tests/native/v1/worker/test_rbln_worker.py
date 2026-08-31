@@ -116,7 +116,6 @@ def make_worker(monkeypatch):
         assigned_physical_gpu_ids=None,
         num_devices=1,
         num_ray_nodes=1,
-        has_torch_rbln=False,
         device_name="RBLN-CA25",
         vllm_config=None,
     ):
@@ -149,7 +148,6 @@ def make_worker(monkeypatch):
             wm.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", num_devices
         )
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_NUM_RAY_NODES", num_ray_nodes)
-        monkeypatch.setattr(wm, "has_torch_rbln", has_torch_rbln)
         return RBLNWorker(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -239,19 +237,12 @@ class TestInitDeviceEnv:
 
     @pytest.mark.parametrize("local_rank, expected", [(0, "0,1"), (1, "2,3")])
     def test_multi_device_slices_and_sets_npus(self, make_worker, local_rank, expected):
-        make_worker(
-            world_size=2, num_devices=2, has_torch_rbln=True, local_rank=local_rank
-        )
+        make_worker(world_size=2, num_devices=2, local_rank=local_rank)
         assert os.environ["RBLN_DEVICES"] == expected
         assert os.environ["RBLN_NPUS_PER_DEVICE"] == "2"
 
-    def test_multi_device_without_torch_rbln_skips_npus(self, make_worker):
-        make_worker(world_size=2, num_devices=2, has_torch_rbln=False)
-        assert os.environ["RBLN_DEVICES"] == "0,1"
-        assert "RBLN_NPUS_PER_DEVICE" not in os.environ
-
     def test_single_device_skips_npus(self, make_worker):
-        make_worker(world_size=1, num_devices=1, has_torch_rbln=True)
+        make_worker(world_size=1, num_devices=1)
         assert "RBLN_NPUS_PER_DEVICE" not in os.environ
 
     def test_explicit_expands_device_id_for_local_rank(self, make_worker):
@@ -669,7 +660,6 @@ class TestInitWorkerDistributedEnvironment:
         dp_rank=0,
         world_size_across_dp=1,
         auto_port=False,
-        has_torch_rbln=False,
     ):
         monkeypatch.setattr(wm, "init_distributed_environment", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -677,7 +667,6 @@ class TestInitWorkerDistributedEnvironment:
         )
         monkeypatch.setattr(wm, "set_custom_all_reduce", lambda *a, **k: None)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_AUTO_PORT", auto_port)
-        monkeypatch.setattr(wm, "has_torch_rbln", has_torch_rbln)
         vcfg = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 world_size=world_size,
@@ -715,7 +704,7 @@ class TestInitWorkerDistributedEnvironment:
         assert ws == "4"
 
     def test_auto_port_sets_rccl_env(self, monkeypatch):
-        _, _, rccl = self._run(monkeypatch, auto_port=True, has_torch_rbln=True)
+        _, _, rccl = self._run(monkeypatch, auto_port=True)
         assert rccl == "1"
 
 

@@ -14,11 +14,7 @@
 
 import os
 
-# enforce_eager bypasses torch.compile, so the model must run on real
-# device='rbln' tensors rather than the compile-backend fake-CPU tensors used
-# by the default path.
 os.environ.setdefault("VLLM_RBLN_USE_VLLM_MODEL", "1")
-os.environ.setdefault("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
