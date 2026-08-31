@@ -67,7 +67,29 @@ class RBLNDFlashProposer(DFlashProposer):
     def __init__(self, vllm_config, device: torch.device, runner=None):
         # Checked before the base class does any work.
         self._require_single_sequence(vllm_config.scheduler_config)
+        if (
+            vllm_config.speculative_config.enforce_eager
+            or not envs.VLLM_RBLN_COMPILE_MODEL
+        ):
+            # The attention ops are pattern stubs the compiler replaces, so an
+            # eager context write would silently write nothing.
+            raise NotImplementedError(
+                "The DFlash drafter cannot run eager on RBLN: its context K/V "
+                "write goes through an attention op that only exists as a "
+                "compiled kernel."
+            )
         super().__init__(vllm_config=vllm_config, device=device, runner=runner)
+        if self.dflash_causal:
+            # `_create_draft_vllm_config` turns this into
+            # `use_non_causal=False`, which resolves the drafter onto the causal
+            # kernel family -- and that family takes no mask, which is the only
+            # place the draft block and its window are expressed.
+            raise NotImplementedError(
+                "The DFlash drafter must be non-causal on RBLN: the draft pass "
+                "carries its block geometry in an explicit mask, which the "
+                "causal kernels do not take. Unset `causal` in the draft "
+                "model's dflash config."
+            )
         self.runner = runner
         # `self.arange` is on the device. The RBLN metadata builder reads
         # `query_start_loc` and `seq_lens` on the host and stages them itself.
@@ -260,18 +282,6 @@ class RBLNDFlashProposer(DFlashProposer):
             # NOTE(RBLN): the greedy pick belongs in the graph.
             return torch.ops.rbln.argmax(logits)
 
-        if (
-            self.vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
-        ):
-            # The attention ops are pattern stubs the compiler replaces, so an
-            # eager context write would silently write nothing.
-            raise NotImplementedError(
-                "The DFlash drafter cannot run eager on RBLN: its context K/V "
-                "write goes through an attention op that only exists as a "
-                "compiled kernel."
-            )
-
         compile_kwargs = dict(
             dynamic=False,
             fullgraph=True,
@@ -335,10 +345,9 @@ class RBLNDFlashProposer(DFlashProposer):
     ) -> tuple[int, torch.Tensor, torch.Tensor]:
         """What upstream's `copy_and_expand_dflash_inputs_kernel` does, in torch.
 
-        Triton has no driver here, and the work is a few gathers plus a
-        block-table lookup. The runner keeps `positions`, `query_start_loc` and
-        the block table on the host, so the arithmetic stays there and only the
-        finished buffers cross.
+        Triton has no driver here, and the work is a few gathers. The runner
+        keeps `positions` and `query_start_loc` on the host, so the arithmetic
+        stays there and only the finished buffers cross.
 
         Returns the flat context length, each request's first context position,
         and its accepted context length.
@@ -347,8 +356,6 @@ class RBLNDFlashProposer(DFlashProposer):
         qsl = cad.query_start_loc[: batch_size + 1].cpu()
         ctx_start_tok, ctx_end_tok = qsl[:-1], qsl[1:]
         target_positions = target_positions.cpu()
-        block_table = cad.block_table_tensor.cpu()
-        rows = torch.arange(batch_size)
         offsets = torch.arange(num_query_per_req)
 
         # Rejected tokens sit at the tail of the target's query, so the accepted
@@ -395,14 +402,6 @@ class RBLNDFlashProposer(DFlashProposer):
             self._context_positions_buffer.device
         )
 
-        # Query slots, block-table lookup on the host.
-        q_blocks = block_table[rows[:, None], query_pos // self.block_size]
-        self._slot_mapping_buffer[:num_query_total] = (
-            (q_blocks * self.block_size + query_pos % self.block_size)
-            .reshape(-1)
-            .to(self._slot_mapping_buffer.device)
-        )
-
         ctx_starts = target_positions[ctx_start_tok]
         return num_context, ctx_starts, valid_ctx_lens
 
@@ -424,7 +423,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 # Every mask here is replaced below, so the builder's own
                 # `max_model_len`-wide one would be host work and a staged
                 # buffer for nothing.
-                build_attn_masks=False,
+                skip_attn_masks=True,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -432,11 +431,11 @@ class RBLNDFlashProposer(DFlashProposer):
                 self.runner.kv_cache_bases,
                 self.runner.kv_cache_view_infos,
             )
-            if builder.is_causal:
-                raise RuntimeError(
-                    "the draft pass needs an explicit mask; the drafter must be "
-                    "built non-causal (attention_config.use_non_causal)"
-                )
+            # `initialize_attn_backend` builds under the draft config, so a
+            # causal builder here means that scoping came undone.
+            assert not builder.is_causal, (
+                "the draft metadata builder was built causal; it takes no mask"
+            )
             # What the builder would have produced, without producing it.
             max_seq_len = builder.model_config.max_model_len
             mask_dtype = torch.float16 if builder.enforce_eager else torch.float32
@@ -649,7 +648,7 @@ class RBLNDFlashProposer(DFlashProposer):
             max_query_len=num_query_per_req,
             max_seq_len=cad.max_seq_len + num_query_per_req,
             block_table_tensor=cad.block_table_tensor,
-            slot_mapping=self._slot_mapping_buffer[:num_query_total],
+            slot_mapping=torch.tensor(0),  # dummy
             causal=self.dflash_causal,
         )
         # The kernel takes one dynamic offset per partition and scatters the

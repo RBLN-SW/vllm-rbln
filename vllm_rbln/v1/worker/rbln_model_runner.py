@@ -133,6 +133,7 @@ from vllm_rbln.v1.core.utils import (
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
+from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
@@ -163,11 +164,6 @@ from vllm_rbln.v1.worker.utils import (
 from vllm_rbln.v1.worker.utils import (
     num_attn_module as rbln_num_attn_module,
 )
-
-# Proposers that load a draft model and run it through the RBLN compile path:
-# they own draft attention groups, a warmup, and weights the runner has to make
-# contiguous. The n-gram and suffix proposers do none of that.
-DRAFT_MODEL_PROPOSERS = (RBLNEagleProposer, RBLNDFlashProposer)
 
 logger = init_logger(__name__)
 
