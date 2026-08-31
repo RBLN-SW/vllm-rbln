@@ -1549,7 +1549,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
+            hidden_states,
             scheduler_output.num_scheduled_tokens,
         )
 
@@ -2077,10 +2077,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     # NOTE(RBLN): token_indices points to the last-token positions used
                     # for sampling. EAGLE needs the full hidden_states during prefill,
                     # so do not slice them here.
-                    if not (
-                        self.speculative_config and self.speculative_config.use_eagle()
-                    ):
-                        hidden_states = sample_hidden_states
+
                 else:
                     sample_hidden_states = hidden_states
                 logits = self.model.compute_logits(sample_hidden_states)
@@ -2237,8 +2234,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            assert hidden_states.dim() == 3 and hidden_states.shape[1] >= num_logits, (
+                "prompt logprobs need the un-collapsed prefill hidden states; "
+                f"want >= {num_logits} token rows, got "
+                f"{tuple(hidden_states.shape)}"
+            )
+            prompt_hidden_states = hidden_states[req_idx, :num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
