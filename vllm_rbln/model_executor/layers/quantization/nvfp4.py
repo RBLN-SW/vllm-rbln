@@ -24,7 +24,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4FusedMoE,
 )
 
-_PACKED_FP4_KERNEL_DTYPE = "float4_e2m1fn"
+_PACKED_FP4_WEIGHT_DTYPE = "float4_e2m1fn"
 
 
 class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
@@ -101,7 +101,7 @@ class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             gate_proj_scale_2=layer.w13_weight_scale_2[:, 0].contiguous(),
             up_proj_scale_2=layer.w13_weight_scale_2[:, 1].contiguous(),
             down_proj_scale_2=layer.w2_weight_scale_2,
-            kernel_dtype=_PACKED_FP4_KERNEL_DTYPE,
+            weight_dtype=_PACKED_FP4_WEIGHT_DTYPE,
         )
         return out.reshape(orig_shape)
 
