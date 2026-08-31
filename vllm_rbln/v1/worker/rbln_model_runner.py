@@ -1318,7 +1318,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
+            hidden_states,
             scheduler_output.num_scheduled_tokens,
         )
 
@@ -1444,7 +1444,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
-            hidden_states, aux_hidden_states, logits = model_output
+            hidden_states, sample_hidden_states, aux_hidden_states, logits = (
+                model_output
+            )
 
             if not get_pp_group().is_last_rank:
                 # Return the intermediate tensors; carry the connector output
@@ -1463,8 +1465,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     kv_connector_output,
                 )
 
-            sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
+            # The wrapper narrows it; re-deriving it from hidden_states here
+            # would hand the drafters every prefill position instead of the
+            # sampling ones.
+            assert sample_hidden_states is not None
             if not self.is_prefill and spec_decode_metadata is not None:
                 logits = logits[logits_indices]
 
@@ -1784,6 +1789,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
             logits = None
+            sample_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = model_output
             else:
@@ -1796,20 +1802,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 and self.logits_processor is not None
             ):
                 if token_indices is not None:
+                    # NOTE(RBLN): token_indices points to the last-token
+                    # positions used for sampling. Both tensors are returned
+                    # rather than collapsing one into the other: the narrow
+                    # one is what compute_logits and the drafters want, and
+                    # EAGLE and prompt logprobs need every prefill position.
+                    # Choosing between them here is not an option either --
+                    # this function is torch.compiled with
+                    # keep_tensor_guards_unsafe, so a per-request condition
+                    # would be traced once and baked in for good.
                     sample_hidden_states = hidden_states[:, token_indices]
-                    # NOTE(RBLN): token_indices points to the last-token positions used
-                    # for sampling. EAGLE needs the full hidden_states during prefill,
-                    # so do not slice them here.
-                    if not (
-                        self.speculative_config and self.speculative_config.use_eagle()
-                    ):
-                        hidden_states = sample_hidden_states
                 else:
                     sample_hidden_states = hidden_states
                 logits = self.model.compute_logits(sample_hidden_states)
                 logits = logits.view(-1, logits.size(-1))
 
-            return hidden_states, aux_hidden_states, logits
+            return hidden_states, sample_hidden_states, aux_hidden_states, logits
 
         if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
             self.model_executable = model_wrapper
@@ -1882,7 +1890,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = torch.tensor(request.prompt_token_ids)
+            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
+                self.device, non_blocking=True
+            )
 
             # Set up target LogprobsTensors object.
             logprobs_tensors = request.in_progress_prompt_logprobs_cpu
@@ -1920,8 +1930,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc.cpu[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            # The staged prefill layout gives every request its own row, so this
+            # chunk's tokens start at local index 0. Upstream's query_start_loc
+            # offset exists only to find a request inside a flat, concatenated
+            # batch, and applying it here would index the request axis.
+            # The rank alone proves nothing: collapsing narrows the token axis
+            # to 1 and keeps three dims, which would silently hand back the
+            # last position for every target.
+            assert hidden_states.dim() == 3 and hidden_states.shape[1] >= num_logits, (
+                "prompt logprobs need the un-collapsed prefill hidden states; "
+                f"want >= {num_logits} token rows, got "
+                f"{tuple(hidden_states.shape)}"
+            )
+            prompt_hidden_states = hidden_states[req_idx, :num_logits]
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
@@ -1935,15 +1956,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logprobs, num_prompt_logprobs, tgt_token_ids
             )
 
-            # Transfer
+            # Transfer device->CPU. Blocking on purpose: upstream follows its
+            # non-blocking copies with a device synchronize, and this runner
+            # has no _sync_device -- an async copy here would let the CPU
+            # tensors be serialized before the data lands.
             chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(token_ids)
+            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs)
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(ranks)
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.

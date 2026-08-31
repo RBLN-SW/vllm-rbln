@@ -321,7 +321,11 @@ def _recording_model_executable(calls, hidden_states, logits):
             token_indices=token_indices,
             kwargs=kwargs,
         )
-        return hidden_states, None, logits
+        # The wrapper returns the narrowed tensor alongside the whole one.
+        # The fake hands back the same tensor in both slots -- the fixtures
+        # here are not staged-shaped, and this is exactly what the previous
+        # contract gave the caller.
+        return hidden_states, hidden_states, None, logits
 
     return fake_model_executable
 
@@ -1976,12 +1980,10 @@ def test_get_prompt_logprobs_dict_chunked_and_final(
     monkeypatch.setattr(rbln_model_runner, "model", FakeModel(), raising=False)
     monkeypatch.setattr(rbln_model_runner, "sampler", FakeSampler())
 
-    rbln_model_runner.query_start_loc[0] = 0
-
     # First chunk: create and keep in-progress prompt logprobs.
     req_state.num_computed_tokens = 0
     hidden_states = torch.empty(
-        (2, hidden_size),
+        (1, 2, hidden_size),
         dtype=rbln_model_runner.dtype,
         device=rbln_model_runner.device,
     )
@@ -2001,7 +2003,7 @@ def test_get_prompt_logprobs_dict_chunked_and_final(
     # Final step: return accumulated logprobs and clear request-local in-progress state.
     req_state.num_computed_tokens = 2
     hidden_states = torch.empty(
-        (1, hidden_size),
+        (1, 1, hidden_size),
         dtype=rbln_model_runner.dtype,
         device=rbln_model_runner.device,
     )
@@ -2022,6 +2024,126 @@ def test_get_prompt_logprobs_dict_chunked_and_final(
 
     assert req_id not in rbln_model_runner.num_prompt_logprobs
     assert req_state.in_progress_prompt_logprobs_cpu is None
+
+
+def test_get_prompt_logprobs_dict_indexes_the_request_and_token_axes(
+    rbln_model_runner, dist_init, monkeypatch
+):
+    """The staged prefill layout is (num_reqs, query_len, hidden), so a
+    request's prompt rows live in its own row -- not at a query_start_loc
+    offset into a flat, concatenated batch. The flat offset reads other
+    requests' rows for req_idx 0 and an empty slice beyond it; the row markers
+    below are what make either visible."""
+    req_id = "req_axes"
+    prompt_token_ids = [10, 11, 12, 13]
+    vocab = 32
+    num_logits = len(prompt_token_ids) - 1
+
+    rbln_model_runner._update_states(
+        _schedule_new_request(
+            req_id,
+            prompt_token_ids=[prompt_token_ids],
+            sampling_params=[SamplingParams(prompt_logprobs=2)],
+        )
+    )
+
+    req_state = rbln_model_runner.requests[req_id]
+    hidden_size = rbln_model_runner.model_config.get_hidden_size()
+
+    class FakeModel:
+        def compute_logits(self, hidden_states):
+            # The upstream contract: (num_tokens, hidden) in, (num_tokens,
+            # vocab) out. A 3D input means the caller sliced the wrong axis.
+            assert hidden_states.dim() == 2, tuple(hidden_states.shape)
+            return hidden_states[:, :1].expand(-1, vocab).contiguous()
+
+    class FakeSampler:
+        def compute_logprobs(self, logits):
+            return logits
+
+        def gather_logprobs(self, logprobs, num_logprobs, tgt_token_ids):
+            assert logprobs.shape == (tgt_token_ids.numel(), vocab), (
+                f"expected ({tgt_token_ids.numel()}, {vocab}), got "
+                f"{tuple(logprobs.shape)}"
+            )
+            # Derived from the logits, not the targets, so a wrong row reaches
+            # the assertions instead of being masked.
+            marks = logprobs[:, 0].to(torch.int32)
+            token_ids = torch.stack([marks, marks + 100, marks + 200], dim=1)
+            out = torch.zeros_like(token_ids, dtype=torch.float32)
+            ranks = torch.arange(
+                1, marks.numel() + 1, dtype=torch.int32, device=marks.device
+            )
+            return token_ids, out, ranks, None
+
+    monkeypatch.setattr(rbln_model_runner, "model", FakeModel(), raising=False)
+    monkeypatch.setattr(rbln_model_runner, "sampler", FakeSampler())
+
+    # Three request rows, each token row tagged 1000*req + token, so reading
+    # the request axis lands on 0/1000/2000 rather than 0/1/2.
+    hidden_states = torch.zeros(
+        (3, len(prompt_token_ids), hidden_size),
+        dtype=torch.float32,
+        device=rbln_model_runner.device,
+    )
+    for r in range(3):
+        for j in range(len(prompt_token_ids)):
+            hidden_states[r, j, :] = 1000 * r + j
+
+    req_state.num_computed_tokens = 0
+
+    out = rbln_model_runner._get_prompt_logprobs_dict(
+        hidden_states=hidden_states,
+        num_scheduled_tokens={req_id: len(prompt_token_ids)},
+    )
+
+    assert list(out) == [req_id]
+    assert out[req_id].logprob_token_ids[:num_logits].tolist() == [
+        [j, j + 100, j + 200] for j in range(num_logits)
+    ]
+
+
+def test_get_prompt_logprobs_dict_refuses_collapsed_hidden_states(
+    rbln_model_runner, dist_init, monkeypatch
+):
+    """If the prefill collapse is not skipped, what arrives here holds one row
+    per request instead of one per token. That has to fail loudly rather than
+    read the last prompt position for every target."""
+    req_id = "req_collapsed"
+    rbln_model_runner._update_states(
+        _schedule_new_request(
+            req_id,
+            prompt_token_ids=[[10, 11, 12, 13]],
+            sampling_params=[SamplingParams(prompt_logprobs=2)],
+        )
+    )
+    rbln_model_runner.requests[req_id].num_computed_tokens = 0
+    hidden_size = rbln_model_runner.model_config.get_hidden_size()
+
+    collapsed = torch.zeros(
+        (1, hidden_size),
+        dtype=torch.float32,
+        device=rbln_model_runner.device,
+    )
+    with pytest.raises(AssertionError, match="un-collapsed"):
+        rbln_model_runner._get_prompt_logprobs_dict(
+            hidden_states=collapsed,
+            num_scheduled_tokens={req_id: 4},
+        )
+
+    # Rank 3 with the token axis narrowed to 1 is what the collapse actually
+    # produces, and it must fail too -- otherwise the last position is handed
+    # back for every target.
+    narrowed = torch.zeros(
+        (1, 1, hidden_size),
+        dtype=torch.float32,
+        device=rbln_model_runner.device,
+    )
+    with pytest.raises(AssertionError, match="token rows"):
+        rbln_model_runner._get_prompt_logprobs_dict(
+            hidden_states=narrowed,
+            num_scheduled_tokens={req_id: 4},
+        )
 
 
 def test_get_nans_in_logits_when_enabled(rbln_model_runner, dist_init, monkeypatch):
