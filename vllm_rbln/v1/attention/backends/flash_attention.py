@@ -67,16 +67,12 @@ logger = init_logger(__name__)
 def _resolve_is_causal(vllm_config: VllmConfig) -> bool:
     """Per-model causality instead of one process-wide switch.
 
-    `VLLM_RBLN_FLASH_CAUSAL_ATTN` cannot express "this model is non-causal": a
-    cross-attention drafter needs the drafter non-causal while the target stays
-    causal in the same process. DFlash asks for exactly that -- upstream's
-    `_create_draft_vllm_config` sets `attention_config.use_non_causal` on the
-    draft config only -- and each model's attention layers are constructed under
-    their own config, so reading the field here scopes causality to the model
-    that requested it.
-
-    Falls back to the env flag when the field is absent, so target models,
-    EAGLE3, medusa and ngram are unchanged.
+    `VLLM_RBLN_FLASH_CAUSAL_ATTN` alone cannot keep a drafter non-causal while
+    the target stays causal in the same process, which is what DFlash needs.
+    Each model builds its attention under its own config, so reading
+    `attention_config.use_non_causal` -- which upstream sets on the draft config
+    only -- scopes causality to the model that asked for it. Absent the field
+    the env flag still decides, leaving every other model unchanged.
     """
     if not envs.VLLM_RBLN_FLASH_CAUSAL_ATTN:
         return False
@@ -238,12 +234,6 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prefill: bool,
         build_attn_masks: bool = True,
     ) -> RBLNFlashAttentionMetadata:
-        """`build_attn_masks=False` skips the non-causal mask.
-
-        The mask is built on the host at `max_model_len` width every step and
-        staged to the device. A caller that replaces it -- the DFlash draft pass
-        builds its own block mask -- otherwise pays for one it throws away.
-        """
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.
@@ -285,6 +275,8 @@ class RBLNFlashAttentionMetadataBuilder(
         else:
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
+            # Host-built at `max_model_len` width and staged every step, so a
+            # caller that replaces this mask opts out instead.
             if not self.is_causal and build_attn_masks:
                 decode_attention_mask = torch.zeros(
                     batch_pad,

@@ -67,21 +67,15 @@ def restored_dflash_token_budget(
     """The full token budget when DFlash is running under the reserved one.
 
     `VllmConfig._set_max_num_scheduled_tokens` holds batch slots back for
-    drafters that append their draft tokens to the target batch. This drafter
-    runs its own graph over its own batch, so the reservation buys nothing and
-    only shifts the prefill chunk off the KV block boundary, which the paged
-    prefill attention kernel cannot straddle. EAGLE3 never sees it: its net new
-    slots per request is zero, so its budget is left whole.
+    drafters that append draft tokens to the target batch. This drafter runs its
+    own graph over its own batch, so the reservation buys nothing and only
+    shifts the prefill chunk off the KV block boundary, which the paged prefill
+    kernel cannot straddle. It is restored here rather than on the config, where
+    a validator requires the reservation to be present.
 
-    It has to be restored on the scheduler rather than on the config, which a
-    validator rejects: `max_num_scheduled_tokens` is required to carry the
-    reservation.
-
-    The equality test only recognises the reserved value, so it leaves any other
-    budget alone -- but the value carries no provenance. A user who sets
+    The value carries no provenance, so a user who sets
     `max_num_scheduled_tokens` to exactly the reserved boundary is
-    indistinguishable from the auto-computed case and gets restored too; that
-    boundary is treated as auto-computed.
+    indistinguishable from the auto-computed case and is restored too.
 
     Returns None when nothing should change.
     """
@@ -98,8 +92,6 @@ def restored_dflash_token_budget(
 
 
 class RBLNScheduler(Scheduler):
-    # Restoring the DFlash budget assigns to this inherited attribute, which
-    # leaves mypy unable to infer its type.
     max_num_scheduled_tokens: int
 
     def __init__(

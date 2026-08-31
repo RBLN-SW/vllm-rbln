@@ -48,8 +48,6 @@ from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 
 
 class RBLNDFlashProposer(DFlashProposer):
-    # `initialize_attn_backend` swaps this for the draft config, and assigning to
-    # an inherited attribute leaves mypy unable to infer its type.
     vllm_config: VllmConfig
 
     prepare_next_token_ids_padded = RBLNEagleProposer.prepare_next_token_ids_padded
@@ -57,24 +55,8 @@ class RBLNDFlashProposer(DFlashProposer):
 
     @staticmethod
     def _require_single_sequence(scheduler_config) -> None:
-        """DFlash measurably loses acceptance on a wider decode batch."""
+        """DFlash loses acceptance on a wider decode batch. Cause unidentified."""
         if scheduler_config.max_num_seqs > 1:
-            # Measured with `max_num_seqs` as the only variable: acceptance
-            # falls to roughly a third of its single-sequence value, which is
-            # slower than running with no speculation at all. Every request
-            # still returns and the output stays coherent, so it fails quietly
-            # -- hence an error rather than a warning.
-            #
-            # The cause is not identified. What is ruled out: the scheduler's
-            # token-budget restore (it fires at every `max_num_seqs`), a step
-            # mixing prefill with decode (one request in flight reproduces it),
-            # the padded hidden-state layout (padding lands in the tail rows,
-            # which `valid_ctx_lens` never reads), and corrupt target hidden
-            # states (the degenerate rows are the padded slots that low
-            # acceptance leaves behind -- a symptom, not the cause). The drafts
-            # on the prefill step, which is not batch-padded, are bit-identical
-            # between the two configurations, so the divergence begins with the
-            # first padded decode step.
             raise NotImplementedError(
                 "DFlash speculative decoding requires --max-num-seqs 1; got "
                 f"{scheduler_config.max_num_seqs}. A wider decode batch "
@@ -91,12 +73,9 @@ class RBLNDFlashProposer(DFlashProposer):
         # `query_start_loc` and `seq_lens` on the host and stages them itself.
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
 
-        # The drafter is a mixed stack: four sliding-window layers then one
-        # full attention layer. `DFlashQwen3Attention` never reads
-        # `layer_types`, so vLLM builds every layer as full attention and the
-        # sliding ones would attend far past the window they were trained
-        # with. The mask restores it without a separate kernel or cache
-        # geometry.
+        # The drafter is a mixed stack: sliding-window layers then one full
+        # attention layer. The window is carried by the mask alone -- see
+        # `_build_draft_attn_metadata`.
         hf_config = vllm_config.speculative_config.draft_model_config.hf_config
         layer_types = getattr(hf_config, "layer_types", None) or []
         self.sliding_window = (
@@ -123,13 +102,10 @@ class RBLNDFlashProposer(DFlashProposer):
     ) -> torch.Tensor | list[list[int]]:
         """Draft `num_speculative_tokens` tokens in one forward.
 
-        Upstream's `propose` cannot drive this platform. It coordinates the
-        draft batch across DP ranks with its own all-reduce, but the runner has
-        already synchronized this step (`runner.dp_status`) and a second
-        collective leaves the ranks one call apart -- the gloo read error that
-        surfaces is the symptom. It also enters `vllm.forward_context`, which
-        carries neither the padded token count nor the KV cache bases that RBLN
-        attention layers resolve their caches from.
+        Overrides upstream's `propose`, which cannot run here: it opens a second
+        DP all-reduce over a step the runner has already synchronized, and it
+        enters `vllm.forward_context`, which carries neither the padded token
+        count nor the KV cache bases RBLN attention resolves its caches from.
         """
         assert self.runner is not None
         assert not self.supports_mm_inputs
@@ -202,10 +178,10 @@ class RBLNDFlashProposer(DFlashProposer):
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
         """Build the draft metadata builders under the draft config.
 
-        Upstream builds them with the target's `vllm_config`, so the impl comes
-        out non-causal (it reads `attention_config.use_non_causal`) while its
-        builder stays causal and emits no mask -- for a kernel that requires
-        one. Both sides have to read the same config.
+        Impl and builder both read causality from the config they are built
+        under, so they have to be built under the same one. Upstream uses the
+        target's `vllm_config` here, which leaves the drafter's impl non-causal
+        and its builder causal -- emitting no mask, for a kernel that needs one.
         """
         draft_vllm_config = self._create_draft_vllm_config()
         with set_current_vllm_config(draft_vllm_config):
@@ -357,7 +333,7 @@ class RBLNDFlashProposer(DFlashProposer):
         num_rejected_tokens: torch.Tensor | None,
         num_query_per_req: int,
     ) -> tuple[int, torch.Tensor, torch.Tensor]:
-        """What `copy_and_expand_dflash_inputs_kernel` does, in torch.
+        """What upstream's `copy_and_expand_dflash_inputs_kernel` does, in torch.
 
         Triton has no driver here, and the work is a few gathers plus a
         block-table lookup. The runner keeps `positions`, `query_start_loc` and
@@ -402,12 +378,8 @@ class RBLNDFlashProposer(DFlashProposer):
             self.input_ids.device
         )
 
-        # One padded row per request. Padding repeats the last accepted token so
-        # the gather stays in bounds; the rows it writes are discarded -- see
-        # `_write_context_kv`.
-        # Rejected tokens sit at the tail of each request's query, so the
-        # accepted context is not contiguous in the target's token order and has
-        # to be compacted before it is projected.
+        # Compact the accepted context: the rejected tail leaves it
+        # non-contiguous in the target's token order.
         ctx_gather = torch.cat(
             [
                 torch.arange(int(start), int(start) + int(count))
@@ -487,13 +459,14 @@ class RBLNDFlashProposer(DFlashProposer):
                 per_layer[layer_name] = full_metadata
             if not sliding:
                 continue
-            # The window is expressed in the mask alone. Giving the sliding
-            # layers their own `seq_lens` and block table would put a second
-            # dynamic index on partitions the full-attention layer already
-            # indexed, and the compiler allows only one per partition
-            # (ControlAnalysis.cpp, "Input index and constBuf key should be
-            # consitent for a batch index and partition id"). It arrives as a
-            # segfault, not a diagnostic.
+            # The window travels in `attn_masks`, not `swa_attn_masks`:
+            # `DFlashQwen3Attention` never declares `layer_types`, so vLLM gives
+            # every draft layer a `FullAttentionSpec` and the full-attention
+            # kernel, which never reads the SWA fields. Per-layer `seq_lens` and
+            # block tables are not an option either -- a second dynamic index on
+            # a partition the full layer already indexed is one more than the
+            # compiler allows (ControlAnalysis.cpp), and it arrives as a
+            # segfault rather than a diagnostic.
             window_metadata = copy(attn_metadata)
             window_metadata.attn_masks = (
                 self._draft_block_mask(
@@ -535,10 +508,8 @@ class RBLNDFlashProposer(DFlashProposer):
         """A mask for a whole draft block, optionally bounded by the window.
 
         Full layers see the whole context plus the block's own keys; sliding
-        layers see the window ending at their own position. The mask is the only
-        place that bound can be expressed -- `DFlashQwen3Attention` never reads
-        `layer_types`, so vLLM builds every draft layer as full attention. Built
-        on the host: each eager device op here would compile its own graph.
+        layers see the window ending at their own position. Built on the host:
+        each eager device op here would compile its own graph.
         """
         num_query_per_req = 1 + self.num_speculative_tokens
         key_pos = torch.arange(max_seq_len)
@@ -740,21 +711,16 @@ class RBLNDFlashProposer(DFlashProposer):
     ) -> bool:
         """Would a crossing row's redirect land outside what it was given?
 
-        Two ways it can. Past the end of the table is the context ceiling.
-        Inside the table but holding 0 is a slot the allocator never filled, and
-        block 0 is the pool's reserved null block -- shared, with a refcount it
-        does not maintain. Scattering a draft block's K/V there breaks the cache
-        contract whatever it does downstream.
+        Past the end of the table is the context ceiling. Inside the table but
+        holding 0 is a slot the allocator never filled, and block 0 is the
+        pool's reserved null block -- shared, and scattering a draft block's K/V
+        there breaks the cache contract whatever it does downstream.
 
-        The second case is reachable with a single request. Upstream reserves
-        the lookahead block a crossing needs, but `RBLNScheduler` zeroes the
-        lookahead while `request.num_computed_tokens` is 0 and that field is
-        only assigned after allocation. A request whose prefix-cache hit leaves
-        one waiting-path chunk therefore gets none, and if that chunk ends in
-        the last `num_speculative_tokens` offsets of a page there is no next
-        page to move into. Restricting the zeroing to P/D disaggregation -- what
-        it exists for -- would close that path but leave the P/D configuration
-        itself open, so the check belongs here too.
+        The zero case is reachable with a single request, because
+        `RBLNScheduler` zeroes the drafting lookahead while
+        `request.num_computed_tokens` is 0 and only assigns that field after
+        allocation, so a request finishing its prefill in one waiting-path chunk
+        is never given the page a crossing would move into.
         """
         pages = (next_page // self.block_size).to(torch.int64)
         if int(pages.max()) >= block_table.shape[-1]:

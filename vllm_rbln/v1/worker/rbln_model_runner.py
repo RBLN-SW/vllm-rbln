@@ -346,9 +346,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
-                # Upstream turns this on unconditionally for DFlash: the drafter
-                # consumes the target's aux states through
-                # `precompute_and_store_context_kv`, not through a projection.
+                # Upstream turns this on unconditionally for DFlash: the
+                # drafter reduces the target's aux states through its own
+                # projection, as eagle3 does.
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
@@ -2110,10 +2110,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits = logits.view(-1, logits.size(-1))
 
             # NOTE(RBLN): fuse the drafter's combine_hidden_states projection
-            # into the target graph. Both drafters that consume aux states
-            # reduce them the same way -- eagle3 through its own projection,
-            # DFlash through `self.model.fc` -- so neither proposer projects
-            # again.
+            # into the target graph, so neither proposer projects again.
             combined_hidden_states = None
             if aux_hidden_states is not None:
                 combined_hidden_states = torch.cat(
