@@ -285,6 +285,11 @@ class RBLNMoERunner(MoERunner):
                     e, R * max_pad
                 )  # (e, T)
 
+                # send_mask is registered as float32, but the ccl kernels
+                # matmul it against these routing slices (send_mask @ send_rl
+                # in ccl_dispatch_send
+                send_mask = self.send_mask.to(masked_routing_weights.dtype)
+
             # --- Step 4: Dispatch tokens across DP ranks ---
             if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
                 # --- all2all dispatch path ---
@@ -294,7 +299,7 @@ class RBLNMoERunner(MoERunner):
                 send_buffer, send_sizes = torch.ops.rbln_custom_ops.ccl_dispatch_send(
                     hidden_flat,
                     send_rl,
-                    self.send_mask,
+                    send_mask,
                     self.moe_parallel_config.dp_rank,
                 )
 
@@ -351,11 +356,11 @@ class RBLNMoERunner(MoERunner):
 
                 # ccl_combine_receive: unpack + sum-reduce → (max_pad, H)
                 # send_rl (E, max_pad): this rank's full expert routing
-                # self.send_mask: reused as expert_map (same matrix)
+                # send_mask: reused as expert_map (same matrix)
                 final_hidden_states = torch.ops.rbln_custom_ops.ccl_combine_receive(
                     combine_recv_buf,
                     send_rl,
-                    self.send_mask,
+                    send_mask,
                     combine_3d[
                         self.moe_parallel_config.dp_rank
                     ],  # local rank's own contribution
