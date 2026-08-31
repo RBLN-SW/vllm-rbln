@@ -229,7 +229,14 @@ class TestApplyGroupedTopkTorch:
         assert pre.sum().item() < 1.0
 
 
-def _routed_logits_dtype(monkeypatch, *, logits_dtype, bias_dtype):
+def _routed_logits_dtype(
+    monkeypatch,
+    *,
+    logits_dtype,
+    bias_dtype,
+    scoring_func="sigmoid",
+    num_expert_group=2,
+):
     """Dtype of the weights ``forward`` hands the quant method, mask included.
 
     Building a real RBLNMoERunner needs a MoEConfig, a quant method and an
@@ -261,11 +268,11 @@ def _routed_logits_dtype(monkeypatch, *, logits_dtype, bias_dtype):
     runner.top_k = 2
     runner.moe_parallel_config = SimpleNamespace(dp_size=1, dp_rank=0)
     runner.router = SimpleNamespace(
-        scoring_func="sigmoid",
+        scoring_func=scoring_func,
         renormalize=False,
         e_score_correction_bias=torch.zeros(4, dtype=bias_dtype),
-        num_expert_group=2,
-        topk_group=2,
+        num_expert_group=num_expert_group,
+        topk_group=num_expert_group,
     )
 
     logits = torch.randn(1, 3, 4, dtype=logits_dtype)
@@ -294,6 +301,20 @@ class TestRoutingMaskDtype:
         assert (
             _routed_logits_dtype(
                 monkeypatch, logits_dtype=torch.bfloat16, bias_dtype=torch.bfloat16
+            )
+            is torch.bfloat16
+        )
+
+    def test_a_bias_the_routing_never_adds_does_not_widen(self, monkeypatch):
+        # Non-grouped softmax scores without the bias, so the fused routing stays
+        # bf16 and widening the mask would promote the table for nothing.
+        assert (
+            _routed_logits_dtype(
+                monkeypatch,
+                logits_dtype=torch.bfloat16,
+                bias_dtype=torch.float32,
+                scoring_func="softmax",
+                num_expert_group=None,
             )
             is torch.bfloat16
         )

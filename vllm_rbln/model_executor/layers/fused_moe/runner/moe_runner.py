@@ -28,7 +28,9 @@ from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
 logger = init_logger(__name__)
 
 
-def _routing_mask_dtype(routing_weights, e_score_correction_bias):
+def _routing_mask_dtype(
+    routing_weights, e_score_correction_bias, *, scoring_func, use_grouped_topk
+):
     # The compiler folds the routing chain built below into a single fused
     # routing op, and that op's output follows the wider of (scores,
     # e_score_correction_bias) -- bf16 scores with an fp32 bias come back fp32.
@@ -36,8 +38,14 @@ def _routing_mask_dtype(routing_weights, e_score_correction_bias):
     # narrower mask makes the fused multiply a dtype mismatch the compiler
     # rejects, while a wider one is always safe because torch promotes the
     # product.
+    #
+    # Only the branches that add the bias to the scores put it in that chain.
+    # The non-grouped softmax and plain-topk branches score without it, so the
+    # fused op keeps the weights' own dtype there and a widened mask would just
+    # promote the whole [E, t] table for nothing.
     dtype = routing_weights.dtype
-    if e_score_correction_bias is None:
+    bias_is_routed = use_grouped_topk or scoring_func == "sigmoid"
+    if e_score_correction_bias is None or not bias_is_routed:
         return dtype
     if e_score_correction_bias.dtype.itemsize > dtype.itemsize:
         return e_score_correction_bias.dtype
@@ -281,7 +289,10 @@ class RBLNMoERunner(MoERunner):
                     max_pad,
                     device=masked_routing_weights.device,
                     dtype=_routing_mask_dtype(
-                        masked_routing_weights, e_score_correction_bias
+                        masked_routing_weights,
+                        e_score_correction_bias,
+                        scoring_func=scoring_func,
+                        use_grouped_topk=use_grouped_topk,
                     ),
                 ).transpose(1, 0)  # [1, R*max_pad]
                 masked_routing_weights = masked_routing_weights * tokens_mask
@@ -508,7 +519,10 @@ class RBLNMoERunner(MoERunner):
                 num_tokens,
                 device=masked_routing_weights.device,
                 dtype=_routing_mask_dtype(
-                    masked_routing_weights, e_score_correction_bias
+                    masked_routing_weights,
+                    e_score_correction_bias,
+                    scoring_func=scoring_func,
+                    use_grouped_topk=use_grouped_topk,
                 ),
             ).transpose(1, 0)  # [1, t]
 
