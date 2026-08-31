@@ -292,7 +292,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
 
-        self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): We put the entire draft model on the last PP rank.
         # This is not ideal if there are many layers in the draft model.
