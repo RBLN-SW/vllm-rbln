@@ -770,6 +770,23 @@ class TestDetermineDraftBatch:
         )
         assert across.tolist() == [4, 1]
 
+    def test_parallel_drafting_scales_the_counts_by_the_query_length(self):
+        # Parallel drafting stages `1 + num_speculative_tokens` queries per
+        # request rather than one, so both the per-rank counts and the vector
+        # the forward context consumes carry that factor.
+        desc, across = self._determine(
+            _status(num_tokens=[16, 512], num_reqs=[4, 1], is_prefill=[0, 1]),
+            num_reqs=4,
+            num_tokens=32,
+            first_pass=False,
+        )
+        assert (desc.num_reqs_padded, desc.query_len, desc.num_tokens_padded) == (
+            4,
+            8,
+            32,
+        )
+        assert across.tolist() == [32, 8]
+
     def test_an_idle_rank_may_run_a_length_it_did_not_report(self):
         # An idle rank reported the minimal entry so it would not drive the
         # decision, then runs the warmed decode length. Its own token count is the

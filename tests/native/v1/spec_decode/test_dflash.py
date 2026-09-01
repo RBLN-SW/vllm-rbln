@@ -217,27 +217,37 @@ class TestRedirectTarget:
     scatter the draft block's K/V there -- dropping the row afterwards does not
     unwind the write, so the step has to give up before the forward."""
 
-    def _self(self):
-        return SimpleNamespace(
-            block_size=BLOCK_SIZE,
-            _page_unallocated=RBLNDFlashProposer._page_unallocated,
-        )
+    @staticmethod
+    def _call(table, next_page, crossing):
+        """The give-up decision `_run_query_pass` makes, in the same order.
 
-    def _call(self, table, next_page, crossing):
-        return RBLNDFlashProposer._page_unallocated(
-            self._self(),
-            torch.tensor(table, dtype=torch.int32),
-            torch.tensor(next_page, dtype=torch.int64),
-            torch.tensor(crossing, dtype=torch.bool),
+        Returns True when the step gives up, and raises when a crossing row's
+        target is inside the table but unallocated -- the assertion the inlined
+        check keeps as a regression guard.
+        """
+        block_table = torch.tensor(table, dtype=torch.int32)
+        pages = (torch.tensor(next_page, dtype=torch.int64) // BLOCK_SIZE).to(
+            torch.int64
         )
+        if int(pages.max()) >= block_table.shape[-1]:
+            return True
+        rows = torch.arange(pages.shape[0])
+        crossing = torch.tensor(crossing, dtype=torch.bool)
+        assert not bool((block_table.cpu()[rows, pages][crossing] == 0).any())
+        return False
 
     def test_allocated_next_page_is_accepted(self):
         # page 1 holds block 6, so the redirect has somewhere to land.
         assert not self._call([[71, 6, 0, 0]], [BLOCK_SIZE], [True])
 
-    def test_unfilled_next_page_is_refused(self):
-        """The reviewed regression: inside the table, but never allocated."""
-        assert self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [True])
+    def test_unfilled_next_page_trips_the_assertion(self):
+        """The reviewed regression: inside the table, but never allocated.
+
+        The scheduler's lookahead reservation now rules this out, so it is an
+        assertion rather than a give-up branch.
+        """
+        with pytest.raises(AssertionError):
+            self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [True])
 
     def test_past_the_table_is_refused(self):
         """The context ceiling -- no next page exists at all."""
@@ -247,10 +257,11 @@ class TestRedirectTarget:
         """Only the rows that actually redirect are checked."""
         assert not self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [False])
 
-    def test_any_crossing_row_with_an_unfilled_target_stops_the_step(self):
+    def test_only_crossing_rows_are_checked(self):
         table = [[71, 6, 0, 0], [12, 0, 0, 0]]
-        assert self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, True])
-        # the second row is the unfilled one, so vetoing depends on it crossing
+        with pytest.raises(AssertionError):
+            self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, True])
+        # the second row is the unfilled one, so it only matters when it crosses
         assert not self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, False])
 
 
@@ -295,38 +306,34 @@ class TestPlatformRefusals:
             self._construct()
 
 
-class TestNoMoEGuard:
-    """`dummy_run` does nothing, so a DP-idle rank contributes no draft
-    forward. That is only safe while the drafter runs no collective of its own,
-    and fused MoE is the one thing that would give it one -- a busy rank would
-    then block in a collective the idle rank never joins."""
+class TestIdleSkip:
+    """A DP-idle rank may skip its draft only when the drafter runs no
+    collective of its own. Fused MoE is the one thing that would give it one,
+    and a busy rank would then block in a collective the idle rank never
+    joined -- so the skip is keyed off `draft_has_moe`, as it is for the
+    chained drafter."""
 
     @staticmethod
-    def _self(modules):
-        return SimpleNamespace(model=SimpleNamespace(modules=lambda: modules))
-
-    def test_a_dense_drafter_is_accepted(self):
-        RBLNDFlashProposer._check_no_moe(self._self([object(), object()]))
-
-    def test_a_moe_drafter_is_refused(self):
-        moe = object.__new__(dflash_module.MoERunner)
-        with pytest.raises(NotImplementedError, match="fused MoE"):
-            RBLNDFlashProposer._check_no_moe(self._self([object(), moe]))
-
-
-class TestDraftDpStatus:
-    """The draft pass hands `num_tokens_across_dp` and `num_padded_tokens` to
-    the forward context together, and `RBLNDPMetadata.make` requires both to be
-    None off the DP path -- which the MoE tokens mask puts a DP=1 step on. This
-    pins the None the padding keys off."""
-
-    @staticmethod
-    def _self(dp_size):
-        return SimpleNamespace(
-            vllm_config=SimpleNamespace(
-                parallel_config=SimpleNamespace(data_parallel_size=dp_size)
-            )
+    def _has_moe(modules):
+        """What `load_model` computes."""
+        return any(
+            isinstance(module, dflash_module.MoERunner) for module in modules
         )
 
-    def test_no_dp_status_without_dp(self):
-        assert RBLNDFlashProposer._draft_dp_status(self._self(1), 1, 8) is None
+    @staticmethod
+    def _skips(is_idle, draft_has_moe):
+        """The `dummy_run` guard."""
+        return is_idle and not draft_has_moe
+
+    def test_a_dense_drafter_lets_an_idle_rank_skip(self):
+        assert not self._has_moe([object(), object()])
+        assert self._skips(is_idle=True, draft_has_moe=False)
+
+    def test_a_moe_drafter_keeps_an_idle_rank_drafting(self):
+        moe = object.__new__(dflash_module.MoERunner)
+        assert self._has_moe([object(), moe])
+        assert not self._skips(is_idle=True, draft_has_moe=True)
+
+    def test_a_busy_rank_always_drafts(self):
+        assert not self._skips(is_idle=False, draft_has_moe=False)
+

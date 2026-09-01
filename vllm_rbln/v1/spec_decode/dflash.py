@@ -27,6 +27,8 @@ so the window lives in the mask.
 
 from copy import copy
 
+from itertools import chain
+
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -53,6 +55,9 @@ class RBLNDFlashProposer(DFlashProposer):
 
     prepare_next_token_ids_padded = RBLNEagleProposer.prepare_next_token_ids_padded
     prepare_inputs_padded = RBLNEagleProposer.prepare_inputs_padded
+    _determine_batch_execution_and_padding = (
+        RBLNEagleProposer._determine_batch_execution_and_padding
+    )
 
     @staticmethod
     def _require_single_sequence(scheduler_config) -> None:
@@ -177,6 +182,11 @@ class RBLNDFlashProposer(DFlashProposer):
         draft_ids = draft_ids[: num_reqs * self.num_speculative_tokens].view(
             num_reqs, self.num_speculative_tokens
         )
+        # `d2t` holds offsets, not absolute ids, so the target id is
+        # `draft_id + d2t[draft_id]`. Outside the graph on purpose: the index is
+        # the argmax result, which the compiled subgraph above cannot const-fold.
+        if (d2t := self.model.draft_id_to_target_id) is not None:
+            draft_ids = draft_ids + d2t[draft_ids]
         if bool(self._dropped_rows.any()):
             # An empty list, never zeros: the scheduler reads zeros as real
             # token ids. The target-only step still advances the request to the
@@ -186,25 +196,6 @@ class RBLNDFlashProposer(DFlashProposer):
                 [] if bool(self._dropped_rows[i]) else rows[i] for i in range(num_reqs)
             ]
         return draft_ids
-
-    def _draft_dp_status(self, num_reqs: int, tokens_per_req: int):
-        """Per-rank draft token counts, without a new collective.
-
-        `RBLNEagleProposer._reuse_dp_status` covers one token per request
-        (chained drafting) and the full target batch (the first pass). Parallel
-        drafting is neither: every request contributes exactly
-        `1 + num_speculative_tokens` query tokens, so the vector follows from
-        the request counts the runner already synchronized.
-        """
-        if self.vllm_config.parallel_config.data_parallel_size == 1:
-            return None
-        dp_status = self.runner.dp_status
-        assert dp_status is not None, (
-            "dp_status is not saved from _determine_batch_padding"
-        )
-        _, num_reqs_across_dp, _ = dp_status
-        assert int(num_reqs_across_dp[self.dp_rank]) == num_reqs
-        return num_reqs_across_dp * tokens_per_req
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
         """Build the draft metadata builders under the draft config.
@@ -225,7 +216,6 @@ class RBLNDFlashProposer(DFlashProposer):
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
         self._check_rope_style(target_model)
-        self._check_no_moe()
 
         # Projection inputs are padded to one of two shapes so the region
         # compiles twice: one draft block per request in decode, one prefill
@@ -288,7 +278,17 @@ class RBLNDFlashProposer(DFlashProposer):
             hidden_states = hidden_states.view(-1, self.hidden_size)[
                 token_indices_to_sample
             ]
-            logits = self.model.compute_logits(hidden_states)
+            if self.model.draft_id_to_target_id is not None:
+                # Upstream widens the draft logits to the target vocabulary
+                # by scattering at `arange(draft_vocab) + d2t`. That index is
+                # input-independent, so it const-folds to an anonymous constant
+                # weight-free apply cannot fill, and the write goes out of
+                # bounds. Stay in draft-vocab space and map after the argmax.
+                logits = self.model.logits_processor(
+                    self.model.lm_head, hidden_states
+                )
+            else:
+                logits = self.model.compute_logits(hidden_states)
             # NOTE(RBLN): the greedy pick belongs in the graph.
             return torch.ops.rbln.argmax(logits)
 
@@ -306,6 +306,11 @@ class RBLNDFlashProposer(DFlashProposer):
         )
         self.model_executable = compile(model_wrapper, **compile_kwargs)
         self._project_context_kv = compile(project_context_kv, **compile_kwargs)
+        # Whether a draft forward joins the DP all-gather; an idle rank may only
+        # skip drafting when it does not.
+        self.draft_has_moe = any(
+            isinstance(module, MoERunner) for module in self.model.modules()
+        )
 
     def _check_rope_style(self, target_model) -> None:
         """Refuse a drafter whose RoPE style differs from the target's.
@@ -335,31 +340,58 @@ class RBLNDFlashProposer(DFlashProposer):
                 "the rotation has to match or acceptance collapses silently."
             )
 
-    def _check_no_moe(self) -> None:
-        """Refuse a drafter whose forward would join the DP all-gather.
+    _build_dummy_attn_metadata = RBLNEagleProposer._build_dummy_attn_metadata
 
-        Fused MoE is the only reader of the step's padded token dimension, so a
-        draft without it runs no collective of its own -- which is what lets
-        `dummy_run` do nothing. With one, an idle rank that skipped its draft
-        would leave the busy ranks blocked inside that collective.
+    @torch.inference_mode()
+    def dummy_run(
+        self,
+        num_reqs: int,
+        num_tokens_per_req: int,
+        is_prefill: bool = False,
+        *,
+        num_padded_tokens: int | None = None,
+    ) -> None:
+        """Compile every drafter graph here, not on the first real step.
+
+        `is_prefill` is unused: the projection's shape comes from its bucket and
+        the query pass always runs one draft block per request.
         """
-        if any(isinstance(module, MoERunner) for module in self.model.modules()):
-            raise NotImplementedError(
-                "The DFlash drafter cannot contain fused MoE on RBLN: its "
-                "warmup and idle-step draft are no-ops, which would strand the "
-                "busy ranks in the draft collective."
+        status = self.runner.dp_status
+        if (
+            status is not None
+            and status.is_idle[self.dp_rank]
+            and not self.draft_has_moe
+        ):
+            # Same condition as the chained drafter: what this pass produces is
+            # discarded, and without fused MoE no busy rank waits on it.
+            return
+
+        # 1) The projection. Both buckets, straight from the staging buffers --
+        # a pure region, so no metadata and no cache write.
+        for bucket in self._proj_buckets:
+            self._project_context_kv(
+                self._proj_states[:bucket], self._proj_positions[:, :bucket]
             )
 
-    def dummy_run(self, *args, **kwargs) -> None:
-        """Skip the drafter warmup and the idle-step draft.
-
-        Upstream's signature takes CUDA-graph state this platform does not
-        have, and the runner calls the `RBLNEagleProposer` one, so neither can
-        drive the other. The region compiles on the first real step, as EAGLE's
-        chained region does. Doing nothing on a DP-idle step is safe only
-        because the drafter runs no collective -- see `_check_no_moe`.
-        """
-        return None
+        # 2) The query pass, at the only shape it ever runs: one draft block
+        # (`1 + num_speculative_tokens` queries) per request.
+        num_query_per_req = 1 + self.num_speculative_tokens
+        num_query_total = num_reqs * num_query_per_req
+        if num_query_total > self.max_num_tokens:
+            return
+        cad = self._build_dummy_attn_metadata(num_reqs, num_query_per_req)
+        # Start every request at block 0 so no row crosses a page and the
+        # redirect path stays out of the warmup.
+        ctx_starts = torch.zeros(num_reqs, dtype=torch.int32)
+        valid_ctx_lens = torch.zeros(num_reqs, dtype=torch.int32)
+        self._run_query_pass(
+            cad,
+            num_reqs,
+            num_query_per_req,
+            num_query_total,
+            ctx_starts,
+            valid_ctx_lens,
+        )
 
     def _fill_first_pass_inputs(
         self,
@@ -485,13 +517,11 @@ class RBLNDFlashProposer(DFlashProposer):
             if not sliding:
                 continue
             # The window travels in `attn_masks`, not `swa_attn_masks`:
-            # `DFlashQwen3Attention` never declares `layer_types`, so vLLM gives
-            # every draft layer a `FullAttentionSpec` and the full-attention
-            # kernel, which never reads the SWA fields. Per-layer `seq_lens` and
-            # block tables are not an option either -- a second dynamic index on
-            # a partition the full layer already indexed is one more than the
-            # compiler allows (ControlAnalysis.cpp), and it arrives as a
-            # segfault rather than a diagnostic.
+            # `DFlashQwen3Attention` never declares `layer_types`, so every
+            # draft layer gets a `FullAttentionSpec` and a kernel that ignores
+            # the SWA fields. Per-layer `seq_lens` would need a second dynamic
+            # index on an already-indexed partition, which the compiler
+            # refuses with a segfault rather than a diagnostic.
             window_metadata = copy(attn_metadata)
             window_metadata.attn_masks = (
                 self._draft_block_mask(
@@ -628,23 +658,26 @@ class RBLNDFlashProposer(DFlashProposer):
         keys = keys[:, :, :num_context]
         values = values[:, :, :num_context]
 
-        # One copy per layer and head. Taking all heads at once is contiguous
-        # on neither side, and the runtime stages a strided pair through host
-        # memory -- slower, and the staging buffer's recycled address faults
-        # as `rbln_memcpy_v2h failed`.
-        num_kv_heads = keys.shape[1]
+        # One copy per layer and head: all heads at once is contiguous on
+        # neither side, and the runtime stages that strided pair through host
+        # memory, which faults as `rbln_memcpy_v2h failed`. `unbind` builds the
+        # same views in one call per layer instead of one index at a time.
         destinations: list[torch.Tensor] = []
         sources: list[torch.Tensor] = []
         for layer_index, layer in enumerate(model.layers):
             cache = layer.self_attn.attn.kv_cache
+            k_layer = keys[layer_index]
+            v_layer = values[layer_index]
             for token_start, count, block, offset in runs:
                 token_slice = slice(token_start, token_start + count)
                 cache_slice = slice(offset, offset + count)
-                for head in range(num_kv_heads):
-                    destinations.append(cache[0, block, head, 0, cache_slice, :])
-                    destinations.append(cache[1, block, head, 0, cache_slice, :])
-                    sources.append(keys[layer_index, head, token_slice, :])
-                    sources.append(values[layer_index, head, token_slice, :])
+                dst_k = cache[0, block, :, 0, cache_slice, :].unbind(0)
+                dst_v = cache[1, block, :, 0, cache_slice, :].unbind(0)
+                src_k = k_layer[:, token_slice, :].unbind(0)
+                src_v = v_layer[:, token_slice, :].unbind(0)
+                # Interleave key/value per head to keep the original order.
+                destinations.extend(chain.from_iterable(zip(dst_k, dst_v)))
+                sources.extend(chain.from_iterable(zip(src_k, src_v)))
         torch._foreach_copy_(destinations, sources)
 
     def _run_query_pass(
@@ -677,21 +710,24 @@ class RBLNDFlashProposer(DFlashProposer):
             slot_mapping=torch.tensor(0),  # dummy
             causal=self.dflash_causal,
         )
-        # The kernel takes one dynamic offset per partition and scatters the
-        # whole block there, so it cannot split a block across two pages: the
-        # last `num_query_per_req - 1` offsets of a page are unrepresentable
-        # and would scatter past the page, into a block owned by another
-        # request. Redirect those rows' writes to their next page start and drop
-        # their drafts. Model-input positions stay true, so RoPE is unaffected.
+        # One dynamic offset per partition scatters the whole block, so a block
+        # cannot straddle two pages -- the last `num_query_per_req - 1` offsets
+        # would write into another request's. Redirect those rows to their next
+        # page start and drop their drafts; model-input positions stay true.
         crossing = (seq_lens % self.block_size) + num_query_per_req > self.block_size
         if bool(crossing.any()):
             next_page = (seq_lens // self.block_size + 1) * self.block_size
-            if self._page_unallocated(cad.block_table_tensor, next_page, crossing):
-                # Nothing to redirect into, so the whole step gives up its
+            pages = (next_page // self.block_size).to(torch.int64)
+            if int(pages.max()) >= cad.block_table_tensor.shape[-1]:
+                # Past the context ceiling, so the whole step gives up its
                 # drafts: returning here is what keeps the query graph -- and
                 # its scatter -- from running at all.
                 self._dropped_rows = torch.ones_like(crossing)
                 return self.positions.new_zeros(num_query_total)
+            rows = torch.arange(pages.shape[0])
+            assert not bool(
+                (cad.block_table_tensor.cpu()[rows, pages][crossing] == 0).any()
+            ), "the scheduler's lookahead reservation left a crossing row on block 0"
             seq_lens = torch.where(crossing, next_page, seq_lens)
         self._dropped_rows = crossing
 
@@ -712,9 +748,10 @@ class RBLNDFlashProposer(DFlashProposer):
             num_reqs,
             num_reqs,
         )
-        # Both travel together: `RBLNDPMetadata.make` requires them off the DP
-        # path to be None, and the MoE tokens mask routes a DP=1 step there too.
-        num_tokens_across_dp = self._draft_dp_status(num_reqs, num_query_per_req)
+        # `RBLNDPMetadata.make` requires this to be None off the DP path.
+        _, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs, num_query_total, False, first_pass=False
+        )
         with set_forward_context(
             per_layer,
             self.vllm_config,
@@ -732,30 +769,6 @@ class RBLNDFlashProposer(DFlashProposer):
                     num_reqs, num_query_per_req
                 ),
             )
-
-    def _page_unallocated(
-        self,
-        block_table: torch.Tensor,
-        next_page: torch.Tensor,
-        crossing: torch.Tensor,
-    ) -> bool:
-        """Would a crossing row's redirect land outside what it was given?
-
-        Past the end of the table is the context ceiling. Inside the table but
-        holding 0 is a slot the allocator never filled, and block 0 is the
-        pool's reserved null block -- shared, and scattering a draft block's K/V
-        there breaks the cache contract whatever it does downstream.
-
-        The zero case survives only under P/D disaggregation, where upstream
-        still zeroes the drafting lookahead so the local and remote block counts
-        match. A request whose prefill finishes in one waiting-path chunk is
-        then never given the page a crossing would move into.
-        """
-        pages = (next_page // self.block_size).to(torch.int64)
-        if int(pages.max()) >= block_table.shape[-1]:
-            return True
-        rows = torch.arange(pages.shape[0])
-        return bool((block_table.cpu()[rows, pages][crossing] == 0).any())
 
     def _sample_indices(self, num_reqs: int, num_query_per_req: int) -> torch.Tensor:
         """The mask positions -- the ones the target verifies."""

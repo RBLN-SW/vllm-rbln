@@ -69,9 +69,8 @@ def restore_dflash_token_budget(vllm_config: VllmConfig) -> None:
     moves the prefill chunk off the KV block boundary, which the paged prefill
     kernel cannot straddle.
 
-    This hook runs after that reservation and its validator, so the budget can
-    simply be put back. Any other value cannot be made to work -- the chunk
-    would be misaligned whatever it is -- so it is refused rather than ignored.
+    An explicit budget is refused rather than left in place: the chunk would be
+    misaligned whatever it is.
     """
     speculative_config = vllm_config.speculative_config
     if speculative_config is None or speculative_config.method != "dflash":
@@ -93,8 +92,19 @@ def restore_dflash_token_budget(vllm_config: VllmConfig) -> None:
             "boundary."
         )
 
+    # The config is validated again in every worker, where
+    # `_set_max_num_scheduled_tokens` refuses
+    # `max_num_batched_tokens < max_num_scheduled_tokens + delta`. Restoring the
+    # budget alone therefore fails that check and no worker starts. Give the
+    # validator its headroom instead: the prefill chunk follows
+    # `max_num_scheduled_tokens`, which still lands on `budget`.
+    if getattr(scheduler_config, "_rbln_dflash_budget_restored", False):
+        return
+    delta = budget - reserved
     logger.info("Restoring the DFlash target token budget: %d -> %d.", reserved, budget)
     scheduler_config.max_num_scheduled_tokens = budget
+    scheduler_config.max_num_batched_tokens = budget + delta
+    scheduler_config._rbln_dflash_budget_restored = True
 
 
 class RblnPlatform(Platform):
