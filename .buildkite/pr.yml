@@ -27,7 +27,16 @@ steps:
     command:
       - "uv tool run pre-commit run --all-files --hook-stage manual --show-diff-on-failure"
 
-  # Both gates must pass before the heavy test pipelines are even uploaded.
+  - label: ":lock: dependency bounds"
+    notify:
+    - github_commit_status:
+        context: "[OB] dependency bounds"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *uv_secrets
+    command:
+      - "uv run --no-project --python 3.12 --with pytest --with packaging python -m pytest tests/test_packaging_bounds.py -q"
+
+  # All gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
 
   - group: ":gear: vllm-rbln optimum tests"
