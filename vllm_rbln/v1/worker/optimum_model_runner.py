@@ -306,11 +306,11 @@ class RBLNOptimumModelRunner(
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
-        # The converter keeps model_config.dtype in sync with the compiled
-        # artefact, so the runner reads self.dtype everywhere; catch drift here.
         assert self.model.dtype == self.dtype, (
-            f"model_config.dtype ({self.dtype}) does not match the compiled "
-            f"artefact's dtype ({self.model.dtype})"
+            "Internal dtype mismatch: "
+            f"runner dtype is {self.dtype!r}, but the compiled model dtype is "
+            f"{self.model.dtype!r}. model_config.dtype may not have been synchronized "
+            "during model conversion."
         )
         self.use_optimum_lora = getattr(self.model.model.rbln_config, "use_lora", None)
         if self.lora_config and not self.use_optimum_lora:
