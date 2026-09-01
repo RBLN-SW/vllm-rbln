@@ -143,27 +143,20 @@ class RBLNRejectionSampler(RejectionSampler):
         raw_target_logits = logits[target_logits_indices]
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
+        # [num_tokens, vocab_size]
         target_logits = self.apply_logits_processors(
             raw_target_logits, sampling_metadata, metadata
         )
-        # [num_tokens, vocab_size]
-        # NOTE(woosuk): `target_logits` can be updated in place inside the
-        # `apply_sampling_constraints` function.
-        target_logits = self.impl.apply_sampling_constraints(
-            target_logits,
-            metadata.cu_num_draft_tokens,
-            sampling_metadata,
-        )
-        # Compute probability distribution from target logits.
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
+        # NOTE(RBLN): `apply_sampling_constraints` and the softmax now live
+        # inside `rejection_sample`, so both impls take raw logits.
         output_token_ids = self.impl.rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
             metadata.max_spec_len,
             metadata.cu_num_draft_tokens,
             draft_probs,
-            target_probs,
+            target_logits,
             bonus_token_ids,
             sampling_metadata,
             synthetic_mode=self.synthetic_mode,
@@ -199,7 +192,7 @@ class RejectionSamplerImpl:
         max_spec_len: int,
         cu_num_draft_tokens: torch.Tensor,
         draft_probs: torch.Tensor | None,
-        target_probs: torch.Tensor,
+        target_logits: torch.Tensor,
         bonus_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         synthetic_mode: bool = False,
@@ -226,12 +219,21 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
         max_spec_len: int,
         cu_num_draft_tokens: torch.Tensor,
         draft_probs: torch.Tensor | None,
-        target_probs: torch.Tensor,
+        target_logits: torch.Tensor,
         bonus_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # NOTE(RBLN): the caller hands over raw logits; the torch path applies
+        # the sampling constraints and the softmax itself.
+        target_logits = self.apply_sampling_constraints(
+            target_logits,
+            cu_num_draft_tokens,
+            sampling_metadata,
+        )
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+
         return torch_rejection_sample(
             draft_token_ids,
             num_draft_tokens,
@@ -346,12 +348,21 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         max_spec_len: int,
         cu_num_draft_tokens: torch.Tensor,
         draft_probs: torch.Tensor | None,
-        target_probs: torch.Tensor,
+        target_logits: torch.Tensor,
         bonus_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # NOTE(RBLN): the caller hands over raw logits; the NPU path applies the
+        # sampling constraints and the softmax itself.
+        target_logits = self.apply_sampling_constraints(
+            target_logits,
+            cu_num_draft_tokens,
+            sampling_metadata,
+        )
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+
         assert draft_token_ids.ndim == 1
         assert draft_probs is None or draft_probs.ndim == 2
         assert cu_num_draft_tokens.ndim == 1

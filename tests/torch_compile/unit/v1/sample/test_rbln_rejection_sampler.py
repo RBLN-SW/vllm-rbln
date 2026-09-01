@@ -394,7 +394,10 @@ def run_rejection_sample(
             torch.tensor(num_draft_tokens, dtype=torch.int32), dim=0
         ),
         draft_probs=None,
-        target_probs=make_target_probs(target_argmax_token_ids),
+        # `rejection_sample` takes raw logits and softmaxes them inside, so feed
+        # log-probs: softmax(log(p)) == p, which keeps the 0.4-peaked
+        # distribution the assertions below rely on.
+        target_logits=make_target_probs(target_argmax_token_ids).log(),
         bonus_token_ids=torch.tensor(bonus_token_ids, dtype=torch.int64).unsqueeze(-1),
         sampling_metadata=metadata,
     )
