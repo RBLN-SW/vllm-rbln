@@ -242,7 +242,10 @@ class RBLNOptimumModelBase(nn.Module):
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
             model = spec.model_cls.from_pretrained(
-                self.model_config.model, rbln_config=spec.rbln_config, config=hf_config
+                self.model_config.model,
+                rbln_config=spec.rbln_config,
+                config=hf_config,
+                dtype=self.model_config.dtype,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
@@ -408,6 +411,23 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             "cache_position": cache_position,
         }
         return kwargs
+
+    @staticmethod
+    def pad_cache_slot_ids(
+        cache_slot_ids: torch.Tensor,
+        padded_batch_size: int,
+    ) -> torch.Tensor:
+        """Pad the decode cache slot ids to [padded_batch_size, 1].
+
+        Padding rows must not alias a scheduled request's row in the
+        per-sequence cache, so the pad value is the lowest id no scheduled
+        request owns (0 when the batch is full and no padding row exists).
+        """
+        used_ids = set(cache_slot_ids.tolist())
+        pad_value = next((i for i in range(padded_batch_size) if i not in used_ids), 0)
+        padded = torch.full((padded_batch_size, 1), pad_value, dtype=torch.int16)
+        padded[: cache_slot_ids.shape[0], 0] = cache_slot_ids
+        return padded
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder
@@ -602,9 +622,7 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
             return inputs_embeds
 
         # Flatten per-item embeddings into (num_mm_tokens, hidden_size).
-        mm_embeds = torch.cat(list(multimodal_embeddings)).to(
-            inputs_embeds.device, inputs_embeds.dtype
-        )
+        mm_embeds = torch.cat(list(multimodal_embeddings))
         self._assert_mm_tokens_match(int(is_multimodal.sum()), mm_embeds.shape[0])
         scatter_mask = is_multimodal.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(scatter_mask, mm_embeds)
