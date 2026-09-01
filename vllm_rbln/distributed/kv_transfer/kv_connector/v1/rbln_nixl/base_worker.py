@@ -623,7 +623,13 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
 
     @staticmethod
     def _slice_head_bounds(
-        tp_rank: int, tp_size: int, total_kv_heads: int, areas: int, slices: int
+        tp_rank: int,
+        tp_size: int,
+        total_kv_heads: int,
+        areas: int,
+        slices: int,
+        *,
+        side: str,
     ) -> tuple[int, int]:
         """(first head this shard owns, heads per logical slice).
 
@@ -631,17 +637,32 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         chiplet area -- but a shard owning fewer heads than the device has
         chiplets gets ``areas // slices`` replicas of each, the replication
         axis innermost (``slice_id = area // (areas // slices)``).
+
+        Callers pass a peer's advertised geometry as well as this rank's, so
+        the three below refuse a pairing rather than assert an invariant;
+        ``side`` says whose numbers failed.
         """
-        assert total_kv_heads % tp_size == 0, (
-            f"KV heads {total_kv_heads} not divisible by TP size {tp_size}"
-        )
+        if total_kv_heads % tp_size:
+            raise RuntimeError(
+                f"RBLN NIXL: the {side} tensor-parallel size {tp_size} does not "
+                f"divide the model's {total_kv_heads} KV heads; upstream then "
+                "replicates one head across ranks and a head band would be a "
+                "fraction of a head, which no descriptor names."
+            )
         heads_per_rank = total_kv_heads // tp_size
-        assert slices > 0 and heads_per_rank % slices == 0, (
-            f"{heads_per_rank} heads not divisible into {slices} slices"
-        )
-        assert areas % slices == 0, (
-            f"{areas} chiplet areas not a whole number of {slices} slices"
-        )
+        if slices <= 0 or heads_per_rank % slices:
+            raise RuntimeError(
+                f"RBLN NIXL: the {side} shard owns {heads_per_rank} KV heads cut "
+                f"into {slices} logical slice(s), which does not divide them; the "
+                "compiler gives every slice the same head count."
+            )
+        if areas % slices:
+            raise RuntimeError(
+                f"RBLN NIXL: the {side} shard reports {areas} chiplet area(s) over "
+                f"{slices} logical slice(s), which does not divide them; areas "
+                "carry whole slices, replicated when a shard owns fewer heads "
+                "than the device has chiplets."
+            )
         return tp_rank * heads_per_rank, heads_per_rank // slices
 
     def _build_head_matched_remote(
@@ -671,10 +692,20 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         slices_r = nixl_agent_meta.kv_slices
 
         base_l, per_slice_l = self._slice_head_bounds(
-            self.tp_rank, self.transfer_topo.tp_size, total_heads, areas_l, slices_l
+            self.tp_rank,
+            self.transfer_topo.tp_size,
+            total_heads,
+            areas_l,
+            slices_l,
+            side="local",
         )
         base_r, per_slice_r = self._slice_head_bounds(
-            remote_tp_rank, remote_tp_size, total_heads, areas_r, slices_r
+            remote_tp_rank,
+            remote_tp_size,
+            total_heads,
+            areas_r,
+            slices_r,
+            side="peer",
         )
         split = self._head_split(per_slice_l, per_slice_r)
 
@@ -750,6 +781,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             total_heads,
             self._kv_areas,
             self._kv_slices,
+            side="local",
         )
         heads_per_remote = total_heads // remote_tp_size
         if per_slice_l > heads_per_remote:
@@ -851,6 +883,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             total_heads,
             self._kv_areas,
             self._kv_slices,
+            side="local",
         )
         _, per_slice_r = self._slice_head_bounds(
             0,
@@ -858,6 +891,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             total_heads,
             nixl_agent_meta.kv_areas,
             nixl_agent_meta.kv_slices,
+            side="peer",
         )
         return self._head_split(per_slice_l, per_slice_r)
 
@@ -1743,6 +1777,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             total_heads,
             self._kv_areas,
             self._kv_slices,
+            side="local",
         )
         _, per_slice_r = self._slice_head_bounds(
             0,
@@ -1750,6 +1785,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             total_heads,
             nixl_agent_meta.kv_areas,
             nixl_agent_meta.kv_slices,
+            side="peer",
         )
         local_len = self.block_len_per_layer[0]
         remote_len = nixl_agent_meta.block_lens[0]

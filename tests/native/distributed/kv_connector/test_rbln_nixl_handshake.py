@@ -1012,20 +1012,36 @@ class TestHeadBandMatching:
     def test_slice_head_bounds(self):
         # 8 KV heads on 4 chiplets. TP1: 2 heads per area, no replication.
         # TP4: 2 heads per rank -> 1 per area, each held by 2 areas.
-        f = RblnNixlPullConnectorWorker._slice_head_bounds
+        def f(*args):
+            return RblnNixlPullConnectorWorker._slice_head_bounds(*args, side="local")
+
         assert f(0, 1, 8, 4, 4) == (0, 2)
         assert f(0, 2, 8, 4, 4) == (0, 1)
         assert f(1, 2, 8, 4, 4) == (4, 1)
         assert f(0, 4, 8, 4, 2) == (0, 1)
         assert f(2, 4, 8, 4, 2) == (4, 1)
 
-    def test_a_tp_degree_below_the_kv_heads_is_refused(self):
-        # Guard: upstream serves TP > num_kv_heads by replicating one head
-        # across ranks (tp_mapping's `tp_size > total_num_kv_heads` branch). A
-        # band is then a fraction of a head, which no descriptor names, so the
-        # class docstring lists this as a bound -- keep it refused, not rounded.
-        with pytest.raises(AssertionError, match="not divisible by TP size"):
-            RblnNixlPullConnectorWorker._slice_head_bounds(0, 8, 4, 4, 4)
+    @pytest.mark.parametrize(
+        "args,side,message",
+        [
+            # Upstream serves TP > num_kv_heads by replicating one head across
+            # ranks (tp_mapping's `tp_size > total_num_kv_heads` branch); a band
+            # is then a fraction of a head, which no descriptor names.
+            ((0, 8, 4, 4, 4), "peer", "does not divide the model's 4 KV heads"),
+            ((0, 2, 8, 4, 3), "local", "cut into 3 logical slice"),
+            ((0, 2, 8, 6, 4), "peer", "6 chiplet area"),
+            # A peer that advertises no slices at all: without the `slices <= 0`
+            # half of that guard the modulo beside it divides by zero.
+            ((0, 2, 8, 4, 0), "peer", "cut into 0 logical slice"),
+        ],
+    )
+    def test_a_geometry_that_cannot_be_banded_is_refused(self, args, side, message):
+        # The three refusals run on a peer's advertised numbers as well as our
+        # own, so they refuse a pairing across the handshake rather than assert
+        # an invariant -- and the message has to name whose numbers failed.
+        with pytest.raises(RuntimeError, match=message) as e:
+            RblnNixlPullConnectorWorker._slice_head_bounds(*args, side=side)
+        assert side in str(e.value)
 
     def test_offset_into_coarser_remote_area(self):
         """P TP1 -> D TP4: the peer's area holds 2 heads, we want one of them,
@@ -1828,6 +1844,33 @@ class TestHeadMatchedHandshakeChecks:
             w._validate_head_matched_handshake(
                 self._meta(remote_len=300), remote_tp_size=1
             )
+
+    def test_a_peer_geometry_is_reported_as_the_peer_s(self):
+        # `_slice_head_bounds` sees one side's numbers at a time and is told
+        # which; a call site labelling the peer's geometry as ours would send an
+        # operator to the wrong engine.
+        w = self._worker()
+        meta = _agent_meta(
+            block_size=16,
+            kv_cache_layout="NHD",
+            kv_areas=4,
+            kv_slices=4,
+            block_lens=[256],
+        )
+        with pytest.raises(RuntimeError, match="peer tensor-parallel size 16") as e:
+            w._validate_head_matched_handshake(meta, remote_tp_size=16)
+        assert "local" not in str(e.value)
+
+    def test_our_own_geometry_is_reported_as_ours(self):
+        # The mirror of the case above: this rank's numbers are read first, so a
+        # local call site wearing the peer's label would blame the wrong engine.
+        w = self._worker()
+        w.transfer_topo.tp_size = 16
+        with pytest.raises(RuntimeError, match="local tensor-parallel size 16") as e:
+            w._validate_head_matched_handshake(
+                self._meta(remote_len=256), remote_tp_size=1
+            )
+        assert "peer" not in str(e.value)
 
     def test_unequal_block_size_raises(self):
         w = self._worker(block_size_ratio=2)
