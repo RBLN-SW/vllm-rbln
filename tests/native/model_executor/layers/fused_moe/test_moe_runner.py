@@ -17,13 +17,15 @@
 # expert without one), keep the top `topk_group` groups, then pick `top_k`
 # within them. Pure torch, hand-verifiable inputs.
 
+from types import SimpleNamespace
+
 import torch
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
-from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
-    RBLNMoERunner,
-)
+import vllm_rbln.model_executor.layers.fused_moe.utils as fused_moe_utils
+from vllm_rbln.model_executor.layers.fused_moe.runner import moe_runner
+from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import RBLNMoERunner
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
     _apply_grouped_topk_torch as grouped_topk,
 )
@@ -225,6 +227,97 @@ class TestApplyGroupedTopkTorch:
         )
         assert post.sum().item() == torch.tensor(1.0).item()
         assert pre.sum().item() < 1.0
+
+
+def _routed_logits_dtype(
+    monkeypatch,
+    *,
+    logits_dtype,
+    bias_dtype,
+    scoring_func="sigmoid",
+    num_expert_group=2,
+):
+    """Dtype of the weights ``forward`` hands the quant method, mask included.
+
+    Building a real RBLNMoERunner needs a MoEConfig, a quant method and an
+    initialized DP group, so the instance is assembled by hand -- but ``forward``
+    itself is the real one, which is what the mask dtype has to come out of.
+    """
+    monkeypatch.setattr(moe_runner.envs, "VLLM_RBLN_USE_MOE_TOKENS_MASK", True)
+    monkeypatch.setattr(
+        fused_moe_utils,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            dp_metadata=SimpleNamespace(
+                num_tokens_across_dp_cpu=torch.tensor([3]),
+                max_pads_across_dp=None,  # DP=1
+            )
+        ),
+    )
+
+    routed: dict[str, torch.dtype] = {}
+
+    class _CaptureQuantMethod:
+        def apply(self, layer, x, router_logits):
+            routed["dtype"] = router_logits.dtype
+            return x
+
+    runner = object.__new__(RBLNMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace(quant_method=_CaptureQuantMethod())
+    runner.top_k = 2
+    runner.moe_parallel_config = SimpleNamespace(dp_size=1, dp_rank=0)
+    runner.router = SimpleNamespace(
+        scoring_func=scoring_func,
+        renormalize=False,
+        e_score_correction_bias=torch.zeros(4, dtype=bias_dtype),
+        num_expert_group=num_expert_group,
+        topk_group=num_expert_group,
+    )
+
+    logits = torch.randn(1, 3, 4, dtype=logits_dtype)
+    RBLNMoERunner.forward(
+        runner, torch.zeros(1, 3, 8, dtype=logits_dtype), lambda _: logits
+    )
+    return routed["dtype"]
+
+
+class TestRoutingMaskDtype:
+    # The mask multiplies the routing weights AFTER the compiler has folded the
+    # routing chain into one fused routing op, whose output follows the wider of
+    # (scores, e_score_correction_bias). The mask has to follow the same rule or
+    # the fused multiply is a dtype mismatch the compiler rejects.
+    def test_an_fp32_bias_widens_the_masked_weights(self, monkeypatch):
+        # A bf16 mask here is the reported failure: the multiply stays bf16 while
+        # the fused routing it feeds is fp32.
+        assert (
+            _routed_logits_dtype(
+                monkeypatch, logits_dtype=torch.bfloat16, bias_dtype=torch.float32
+            )
+            is torch.float32
+        )
+
+    def test_a_bias_of_equal_width_keeps_the_narrow_weights(self, monkeypatch):
+        assert (
+            _routed_logits_dtype(
+                monkeypatch, logits_dtype=torch.bfloat16, bias_dtype=torch.bfloat16
+            )
+            is torch.bfloat16
+        )
+
+    def test_a_bias_the_routing_never_adds_does_not_widen(self, monkeypatch):
+        # Non-grouped softmax scores without the bias, so the fused routing stays
+        # bf16 and widening the mask would promote the table for nothing.
+        assert (
+            _routed_logits_dtype(
+                monkeypatch,
+                logits_dtype=torch.bfloat16,
+                bias_dtype=torch.float32,
+                scoring_func="softmax",
+                num_expert_group=None,
+            )
+            is torch.bfloat16
+        )
 
 
 class TestRegistration:

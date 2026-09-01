@@ -572,11 +572,22 @@ class RBLNScheduler(Scheduler):
                         connector_prefix_cache_hits = num_external_computed_tokens
 
                     # NOTE(RBLN): Arbitrate between sub-block match and KV connector.
-                    sub_block_match, num_sub_block_tokens = self._try_sub_block_match(
-                        request,
-                        num_new_local_computed_tokens,
-                        num_external_computed_tokens,
+                    # Skipped on a preemption resume: the query above fixed the
+                    # resume point at the block-aligned local count (LMCache
+                    # asserts on it) and the connector contract allows no second
+                    # query to move it.
+                    resuming_with_connector = (
+                        self.connector is not None
+                        and request.status == RequestStatus.PREEMPTED
                     )
+                    if not resuming_with_connector:
+                        sub_block_match, num_sub_block_tokens = (
+                            self._try_sub_block_match(
+                                request,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                            )
+                        )
                     if num_sub_block_tokens > 0 and num_external_computed_tokens > 0:
                         # Cancel the KV connector match in favor of the sub-block match
                         request.num_external_computed_tokens = 0
