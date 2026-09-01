@@ -25,11 +25,13 @@ A pass is recorded only once its phase and its graph time are both known, which 
 what keeps those counts equal.
 
 Spec decode moves that first blocking read again -- into the spec-only logits gather
-in execute_model's postprocess block, and runs the drafter between _sample and
-_bookkeeping_sync. The drafter is a method (propose_draft_token_ids) and is wrapped
-like the sampler; the gather is an inline block with no method to wrap, so
-timed_region folds the runner's "postprocess" profiler region into the same graph
-sum. Both are empty without spec decode.
+in execute_model's postprocess block, which syncs on the target forward. The gather
+is an inline block with no method to wrap, so timed_region folds the runner's
+"postprocess" profiler region into the graph sum; it is empty without spec decode.
+The drafter, which runs between _sample and _bookkeeping_sync, is deliberately not
+folded: MODEL + SAMPLE stays the main-graph number, and the drafter's time -- under
+EAGLE/MTP a draft-model forward, plus any sampler wait its first read absorbs --
+shows up in the E2E residual.
 
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
@@ -270,7 +272,6 @@ _determine_batch_execution_and_padding = (
     RBLNModelRunner._determine_batch_execution_and_padding
 )
 _bookkeeping_sync = RBLNModelRunner._bookkeeping_sync
-_propose_draft_token_ids = RBLNModelRunner.propose_draft_token_ids
 _shutdown = RBLNWorker.shutdown
 
 
@@ -312,14 +313,6 @@ def sample(self, *args, **kwargs):
         return _sample(self, *args, **kwargs)
     start = time.perf_counter()
     output = _sample(self, *args, **kwargs)
-    _ctx(self).add_graph_time(time.perf_counter() - start)
-    return output
-
-
-@functools.wraps(_propose_draft_token_ids)
-def propose_draft_token_ids(self, *args, **kwargs):
-    start = time.perf_counter()
-    output = _propose_draft_token_ids(self, *args, **kwargs)
     _ctx(self).add_graph_time(time.perf_counter() - start)
     return output
 
@@ -428,12 +421,6 @@ def _register_patches() -> None:
             load_model,
             "Wraps the compiled model_executable once it exists; it is an instance "
             "attribute, so it cannot be replaced through the registry.",
-        ),
-        (
-            f"{_RUNNER}.propose_draft_token_ids",
-            propose_draft_token_ids,
-            "Times the drafter, which runs between _sample and _bookkeeping_sync "
-            "and holds device wait under MTP/EAGLE spec decode.",
         ),
         (
             f"{_RUNNER}._bookkeeping_sync",

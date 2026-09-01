@@ -497,19 +497,6 @@ class TestSamplerTiming:
         assert ctx._graph_latency is None
 
 
-class TestDrafterTiming:
-    def test_drafter_call_adds_graph_time(self, monkeypatch):
-        monkeypatch.setattr(
-            pm, "_propose_draft_token_ids", lambda self, *a, **k: "drafts"
-        )
-        runner = _Runner()
-        ctx = pm._ctx(runner)
-        ctx.start_pass()
-
-        assert pm.propose_draft_token_ids(runner) == "drafts"
-        assert ctx._graph_latency is not None
-
-
 class TestModelExecutable:
     def test_the_executable_is_timed_only_inside_a_pass(self, monkeypatch):
         calls: list[dict] = []
@@ -611,7 +598,7 @@ class TestDescriptors:
             for d in registry.get_registered_patch_descriptors()
             if d.owner_module == "vllm_rbln.patches.metrics"
         ]
-        assert len(ours) == 9
+        assert len(ours) == 8
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target
