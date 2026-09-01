@@ -51,7 +51,10 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm_rbln.v1.worker.rbln_model_runner as rbln_model_runner_module
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
-from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
+from vllm_rbln.v1.worker.rbln_model_runner import (
+    RBLNModelRunner,
+    _prompt_logprobs_row_bucket,
+)
 from vllm_rbln.v1.worker.utils import reorder_input_batch
 
 BLOCK_SIZE = 1024
@@ -2101,6 +2104,99 @@ def test_get_prompt_logprobs_dict_indexes_the_request_and_token_axes(
     assert out[req_id].logprob_token_ids[:num_logits].tolist() == [
         [j, j + 100, j + 200] for j in range(num_logits)
     ]
+
+
+def test_prompt_logprobs_row_bucket_collapses_lengths_to_a_short_ladder():
+    """Each distinct row count costs one dynamo cache entry on the RBLN op
+    wrappers, and the recompile past the limit dies in create_runtime. The
+    ladder has to stay short no matter how many prompt lengths are served."""
+    cap = 512
+    lengths = range(1, cap + 1)
+    assert {_prompt_logprobs_row_bucket(n, cap) for n in lengths} == {
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+    }
+    assert all(_prompt_logprobs_row_bucket(n, cap) >= n for n in lengths)
+    # Capped by the staged token axis -- never ask for rows that do not exist.
+    assert _prompt_logprobs_row_bucket(300, 400) == 400
+
+
+def test_get_prompt_logprobs_dict_pads_the_row_count_to_a_bucket(
+    rbln_model_runner, dist_init, monkeypatch
+):
+    """Padding must not move the answers: the recorded rows are still the
+    unpadded ones, and what reaches compute_logits is a bucket."""
+    vocab = 32
+    query_len = 16
+    prompt_lens = [3, 6, 10, 13]
+    req_ids = [f"req_bucket_{n}" for n in prompt_lens]
+    seen_rows: list[int] = []
+
+    class FakeModel:
+        def compute_logits(self, hidden_states):
+            seen_rows.append(hidden_states.shape[0])
+            return hidden_states[:, :1].expand(-1, vocab).contiguous()
+
+    class FakeSampler:
+        def compute_logprobs(self, logits):
+            return logits
+
+        def gather_logprobs(self, logprobs, num_logprobs, tgt_token_ids):
+            assert logprobs.shape[0] == tgt_token_ids.numel(), (
+                f"{logprobs.shape[0]} rows vs {tgt_token_ids.numel()} targets"
+            )
+            marks = logprobs[:, 0].to(torch.int32)
+            token_ids = torch.stack([marks, marks + 100], dim=1)
+            out = torch.zeros_like(token_ids, dtype=torch.float32)
+            ranks = torch.arange(
+                1, marks.numel() + 1, dtype=torch.int32, device=marks.device
+            )
+            return token_ids, out, ranks, None
+
+    monkeypatch.setattr(rbln_model_runner, "model", FakeModel(), raising=False)
+    monkeypatch.setattr(rbln_model_runner, "sampler", FakeSampler())
+
+    rbln_model_runner._update_states(
+        _schedule_new_request(
+            *req_ids,
+            prompt_token_ids=[list(range(10, 10 + n)) for n in prompt_lens],
+            sampling_params=[SamplingParams(prompt_logprobs=1)] * len(prompt_lens),
+        )
+    )
+    for req_id in req_ids:
+        rbln_model_runner.requests[req_id].num_computed_tokens = 0
+
+    hidden_size = rbln_model_runner.model_config.get_hidden_size()
+    # Every request row carries the same per-token marker, so a correct read
+    # is j regardless of which row the request landed on.
+    hidden_states = torch.zeros(
+        (len(prompt_lens), query_len, hidden_size),
+        dtype=torch.float32,
+        device=rbln_model_runner.device,
+    )
+    for j in range(query_len):
+        hidden_states[:, j, :] = j
+
+    out = rbln_model_runner._get_prompt_logprobs_dict(
+        hidden_states=hidden_states,
+        num_scheduled_tokens=dict(zip(req_ids, prompt_lens)),
+    )
+
+    for req_id, prompt_len in zip(req_ids, prompt_lens):
+        num_logits = prompt_len - 1
+        assert out[req_id].logprob_token_ids.tolist() == [
+            [j, j + 100] for j in range(num_logits)
+        ], req_id
+    # 2, 5, 9, 12 rows unpadded -> the ladder, capped at the token axis.
+    assert seen_rows == [2, 8, 16, 16], seen_rows
 
 
 def test_get_prompt_logprobs_dict_refuses_collapsed_hidden_states(

@@ -1890,9 +1890,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
-                self.device, non_blocking=True
-            )
 
             # Set up target LogprobsTensors object.
             logprobs_tensors = request.in_progress_prompt_logprobs_cpu
@@ -1942,13 +1939,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 f"want >= {num_logits} token rows, got "
                 f"{tuple(hidden_states.shape)}"
             )
-            prompt_hidden_states = hidden_states[req_idx, :num_logits]
+            # Row count padded to a ladder: every distinct one costs a dynamo
+            # cache entry on the RBLN op wrappers, and the recompile past the
+            # limit dies in create_runtime and takes the engine with it.
+            num_rows = _prompt_logprobs_row_bucket(num_logits, hidden_states.shape[1])
+            prompt_hidden_states = hidden_states[req_idx, :num_rows]
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            # to gather the logprob for. Padded on the host -- a device-side
+            # pad would be one more shape that varies with the prompt.
+            tgt = list(request.prompt_token_ids[start_tok : start_tok + num_logits])
+            tgt.extend([tgt[-1]] * (num_rows - num_logits))
+            tgt_token_ids = torch.tensor(tgt, dtype=torch.int64, device=self.device)
 
             # Compute prompt logprobs.
             logprobs = self.sampler.compute_logprobs(logits)
@@ -1956,14 +1960,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logprobs, num_prompt_logprobs, tgt_token_ids
             )
 
-            # Transfer device->CPU. Blocking on purpose: upstream follows its
-            # non-blocking copies with a device synchronize, and this runner
-            # has no _sync_device -- an async copy here would let the CPU
-            # tensors be serialized before the data lands.
+            # Transfer device->CPU, then drop the padding rows. Blocking on
+            # purpose: upstream follows its non-blocking copies with a device
+            # synchronize, and this runner has no _sync_device. Trimming after
+            # the copy keeps the varying shape off the device.
             chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(token_ids)
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(ranks)
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                token_ids.cpu()[:num_logits]
+            )
+            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs.cpu()[:num_logits])
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                ranks.cpu()[:num_logits]
+            )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
@@ -2950,6 +2958,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     dst = op.dst_block_id
                     nt = op.num_tokens
                     kv_cache[:, dst, :, :, :nt, :] = kv_cache[:, src, :, :, :nt, :]
+
+
+def _prompt_logprobs_row_bucket(num_logits: int, cap: int) -> int:
+    """Round a prompt-logprobs row count up to a power of two, capped by the
+    staged token axis so the slice stays in bounds."""
+    return min(cap, 1 << (num_logits - 1).bit_length())
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
