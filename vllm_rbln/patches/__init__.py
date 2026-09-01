@@ -34,6 +34,7 @@ from . import (
     fp8_moe_method,
     gpt_oss,
     gpt_oss_mxfp4_config,
+    llama_eagle3,
     metrics,
     minimax_m2,
     mla,
@@ -44,6 +45,7 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
+    speculative_config,
 )
 
 __all__ = (

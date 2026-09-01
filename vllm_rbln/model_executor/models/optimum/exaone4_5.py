@@ -253,9 +253,7 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             ).logits
         else:
             self.model.decoder = self.model.decoders[padded_batch_size]
-            inputs_embeds = self.model.embed_tokens(input_ids).to(
-                self.model.rbln_config.dtype
-            )
+            inputs_embeds = self.model.embed_tokens(input_ids)
             logits = self.model.decoder(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,

@@ -162,7 +162,9 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             # `image_token_id`. Subclasses override `_image_token_id()` accordingly.
             token_type_ids[input_ids == self._image_token_id()] = 1
 
-            attention_mask = (input_ids != PAD_TOKEN_ID).to(torch.int64).squeeze(0)
+            # Not an input of the compiled graph: optimum-rbln only uses this
+            # mask to drop padding from the prefill inputs.
+            attention_mask = (input_ids != PAD_TOKEN_ID).squeeze(0)
             inputs_embeds = model_input.inputs_embeds
             if self.model.language_model.prefill_decoder is None:
                 raise version_error

@@ -69,11 +69,9 @@ class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
 
 
 class RBLNLogitBiasLogitsProcessor(LogitBiasLogitsProcessor):
-    # bias_tensor is rebuilt as float32 on every state change, so it is
-    # synced to the incoming logits dtype per apply() call. The logits
-    # dtype cannot be read from model_config: the optimum path forces
-    # model_config.dtype to float32 while the compiled model can still
-    # emit bfloat16 logits.
+    # bias_tensor is rebuilt as float32 on every state change, so a one-time
+    # cast would not stick: it is synced to the incoming logits dtype on each
+    # apply() call.
     bias_tensor: torch.Tensor
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
@@ -85,9 +83,7 @@ class RBLNLogitBiasLogitsProcessor(LogitBiasLogitsProcessor):
 class RBLNMinPLogitsProcessor(MinPLogitsProcessor):
     # min_p is re-sliced from the float32 buffer on state changes and
     # multiplied in place into model-dtype probabilities, so it is synced
-    # to the incoming logits dtype per apply() call (see
-    # RBLNLogitBiasLogitsProcessor for why model_config.dtype is not
-    # usable here).
+    # to the incoming logits dtype on each apply() call.
     min_p: torch.Tensor
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:

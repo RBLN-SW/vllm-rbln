@@ -175,6 +175,24 @@ class TestRejectedConfigs:
                 )
             )
 
+    def test_eagle3_under_pp_needs_a_patched_target(self, reconfigure):
+        # The default model is a plain LlamaForCausalLM, whose forward still
+        # collects aux hidden states with a stage-local index. Asserting through
+        # the hook rather than on the validator directly is the point: it is what
+        # shows the guard is reached at all.
+        with pytest.raises(ValueError, match="EAGLE3 with pipeline_parallel_size"):
+            reconfigure(_eagle3_under_pp())
+
+    def test_eagle3_under_pp_accepts_a_patched_target(self, reconfigure):
+        reconfigure(_eagle3_under_pp(arch="MiniMaxM2ForCausalLM"))
+
+    def test_eagle3_under_pp_accepts_a_draft_with_aux_off(self, reconfigure):
+        # Nothing is captured anywhere then, so upstream's forward is harmless.
+        reconfigure(_eagle3_under_pp(eagle_config={"use_aux_hidden_state": False}))
+
+    def test_eagle3_at_pp1_is_not_gated(self, reconfigure):
+        reconfigure(_eagle3_under_pp(pp_size=1))
+
     def test_dp_needs_a_divisible_token_budget(self, reconfigure):
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
@@ -194,6 +212,30 @@ class TestRejectedConfigs:
     def test_moe_tokens_mask_defaults_on(self):
         # The error above calls 1 the default; a flipped default breaks DP.
         assert platform.envs.VLLM_RBLN_USE_MOE_TOKENS_MASK is True
+
+
+def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int = 2):
+    """A mutator that puts an EAGLE3 draft on a pipeline-parallel target.
+
+    EngineArgs would have to resolve a real draft checkpoint to build this, so the
+    speculative config is a stand-in shaped like the fields the guard reads.
+    """
+
+    def mutate(config: VllmConfig) -> None:
+        config.parallel_config.pipeline_parallel_size = pp_size
+        # The guard runs after the per-stage decode batch check, which would
+        # otherwise raise first and mask it.
+        config.scheduler_config.max_num_seqs = pp_size * 2
+        if arch is not None:
+            config.model_config.hf_config.architectures = [arch]
+        config.speculative_config = SimpleNamespace(
+            method="eagle3",
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(eagle_config=eagle_config)
+            ),
+        )
+
+    return mutate
 
 
 def _ranks(*, ep: bool = False, max_num_seqs: int | None = None, **parallel):

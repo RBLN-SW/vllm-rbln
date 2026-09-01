@@ -85,6 +85,7 @@ class RBLNParams:
     kvcache_block_size: int | None = None
     prefill_chunk_size: int = 128
     num_devices: int = 1
+    dtype: str | None = None
     # Image-prefill buckets for multimodal models (gemma3: single value;
     # gemma4: descending list of 128-multiples). None for non-multimodal models.
     image_prefill_chunk_size: list[int] | None = None
@@ -107,6 +108,7 @@ class RBLNParams:
             params = cls._parse_decoder(rbln_config)
 
         params.num_devices = _resolve_num_devices(rbln_config)
+        params.dtype = _cfg_get(rbln_config, "dtype")
         return params
 
     @classmethod
