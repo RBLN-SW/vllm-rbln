@@ -334,6 +334,9 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
             global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+            # Built only under VLLM_RBLN_SAMPLER, so a bundle saved with the
+            # sampler off misses this op and forces a partial compile.
+            use_cache=False,
         )
 
     def rejection_sample(
