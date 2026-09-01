@@ -3497,6 +3497,7 @@ def _pad_sampling_metadata(md: SamplingMetadata, bucket: int) -> SamplingMetadat
         temperature=_pad_rows(md.temperature, bucket),
         top_p=_pad_rows(md.top_p, bucket),
         top_k=_pad_rows(md.top_k, bucket),
+        allowed_token_ids_mask=_pad_rows(md.allowed_token_ids_mask, bucket),
     )
     if not md.no_penalties:
         kwargs.update(
