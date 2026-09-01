@@ -34,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as W
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
@@ -475,6 +476,122 @@ class TestPpHandshakeFanout:
         sock = _FakeSock(pp_size=1, engine_id="other")
         with pytest.raises(RuntimeError, match="engine ID"):
             _handshake(w, sock, engine_id="eng")
+
+
+class TestPeerRegionView:
+    # Runs the real upstream loop, so a release that stops reading a region length
+    # through `get_backend_aware_kv_block_len` shows up here as wrong lengths.
+
+    # A consumer holding every layer, the last of which is a speculative draft
+    # whose KV region is 6x the target's. rpl = 2 (K/V), so region 2L..2L+1
+    # belong to layer L, and the draft's are the last two.
+    N_LAYERS = 7
+    RPL = 2
+    TARGET_LEN = 2048
+    DRAFT_LEN = TARGET_LEN * 6
+
+    @classmethod
+    def _consumer(cls):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.local_seen_layer_names = [f"l{i}" for i in range(cls.N_LAYERS)]
+        w.num_regions = cls.N_LAYERS * cls.RPL
+        w.block_len_per_layer = [cls.TARGET_LEN] * (w.num_regions - cls.RPL) + [
+            cls.DRAFT_LEN
+        ] * cls.RPL
+        w._region_is_mla = [False] * w.num_regions
+        w._kv_areas = 1
+        w.device_id = 0
+        w.transfer_topo = MagicMock()
+        w.transfer_topo.virtually_split_kv_in_blocks = False
+        w._mamba_ssm_size = (0, 0)
+        w._group_spec_types = [FullAttentionSpec]
+        return w
+
+    @classmethod
+    def _peer(cls, *, layer_names, block_lens, num_blocks=2, base=0x10000):
+        n = len(block_lens)
+        return _agent_meta(
+            engine_id="p",
+            # Distinct, easily-read bases: region i starts at base * (i + 1).
+            kv_caches_base_addr=[base * (i + 1) for i in range(n)],
+            block_lens=list(block_lens),
+            num_blocks=num_blocks,
+            registered_layer_names=list(layer_names),
+            pp_size=4,
+        )
+
+    @staticmethod
+    def _plan():
+        plan = MagicMock()
+        plan.source_ranks_per_group = [(0,)]  # one source rank -> num_reads 1
+        plan.rank_offset_factor = 0
+        return plan
+
+    def test_a_stage_holding_our_tail_reads_its_own_lengths(self):
+        # The failing shape: the peer is the LAST pipeline stage, so its region
+        # positions are 0..3 while ours are 10..13. Untranslated, our layers 0-1
+        # lengths land on the peer's draft regions -- the length mismatch NIXL
+        # rejects at transfer setup.
+        w = self._consumer()
+        peer = self._peer(
+            layer_names=["l5", "l6"],
+            block_lens=[self.TARGET_LEN] * 2 + [self.DRAFT_LEN] * 2,
+        )
+
+        out = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
+
+        # 4 regions x 2 blocks, region-major.
+        assert [ln for _, ln, _ in out] == [
+            self.TARGET_LEN,
+            self.TARGET_LEN,  # peer region 0 = our region 10 (layer 5, K)
+            self.TARGET_LEN,
+            self.TARGET_LEN,  # region 1 = our 11 (layer 5, V)
+            self.DRAFT_LEN,
+            self.DRAFT_LEN,  # region 2 = our 12 (draft, K)
+            self.DRAFT_LEN,
+            self.DRAFT_LEN,  # region 3 = our 13 (draft, V)
+        ]
+
+    def test_without_the_view_the_tail_stage_reads_the_wrong_lengths(self):
+        # The translation suppressed -- what upstream does on its own. Kept so the
+        # fix cannot regress into a no-op: the draft regions come back target-sized.
+        w = self._consumer()
+        peer = self._peer(
+            layer_names=["l5", "l6"],
+            block_lens=[self.TARGET_LEN] * 2 + [self.DRAFT_LEN] * 2,
+        )
+
+        with patch.object(
+            RblnNixlPullConnectorWorker, "_peer_region_ids", return_value=None
+        ):
+            out = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
+
+        assert [ln for _, ln, _ in out] == [self.TARGET_LEN] * 8
+
+    def test_a_stage_starting_at_our_first_layer_needs_no_translation(self):
+        # The first stage's positions already are our region ids, which is why a
+        # pipelined consumer never hit this: its band always starts at 0.
+        w = self._consumer()
+        peer = self._peer(layer_names=["l0", "l1"], block_lens=[self.TARGET_LEN] * 4)
+
+        assert w._peer_region_ids(peer) is None
+
+    def test_a_peer_that_advertises_no_layers_is_left_positional(self):
+        # Nothing to match on, so the positions stay upstream's -- which is what
+        # every peer that does not publish its layers gets.
+        w = self._consumer()
+        peer = self._peer(layer_names=[], block_lens=[self.TARGET_LEN] * 4)
+
+        assert w._peer_region_ids(peer) is None
+
+    def test_a_peer_publishing_other_regions_than_we_own_is_refused(self):
+        # A peer whose region count disagrees would pair by position and differ
+        # in length.
+        w = self._consumer()
+        peer = self._peer(layer_names=["l5", "l6"], block_lens=[self.TARGET_LEN] * 3)
+
+        with pytest.raises(RuntimeError, match="the peer publishes"):
+            w._peer_region_ids(peer)
 
 
 class TestLayerOverlap:

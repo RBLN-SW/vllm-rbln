@@ -14,6 +14,7 @@
 
 from collections import defaultdict
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -42,6 +43,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+    TPMapping,
     compute_tp_mapping,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
@@ -106,6 +108,10 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
       * more than one KV-cache group on any per-shard transfer -- that is,
         whenever a peer serves less than a whole engine
     """
+
+    # While registering one peer, the local region ids that peer's regions
+    # correspond to, in ITS order -- see `_regions_viewed_as`.
+    _viewed_region_ids: list[int] | None = None
 
     compat_hash: str | None
     xfer_handshake_metadata: NixlHandshakePayload | None
@@ -1801,6 +1807,85 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         )
         return self.num_regions // num_layers
 
+    def _peer_region_ids(
+        self, nixl_agent_meta: RblnNixlAgentMetadata
+    ) -> list[int] | None:
+        """Our region ids for a peer's regions, in the peer's order, or None.
+
+        None where there is nothing to translate: a peer that advertises no layer
+        names (nothing to match on), or one whose regions already line up with
+        ours one for one from position 0. Refused where the two lists cannot
+        describe the same regions, which upstream's positional pairing assumes.
+        """
+        names = nixl_agent_meta.registered_layer_names
+        if not names or not self.local_seen_layer_names:
+            return None
+        region_ids = self._shard_local_region_ids(names)
+        n_peer = len(nixl_agent_meta.kv_caches_base_addr)
+        if len(region_ids) != n_peer:
+            raise RuntimeError(
+                f"RBLN NIXL: this rank owns {len(region_ids)} region(s) of the "
+                f"{n_peer} the peer publishes over {len(names)} layer(s); "
+                "upstream pairs remote region i with local region i, so the two "
+                "lists have to describe the same regions. Regions per layer is "
+                f"{self._regions_per_layer()} here."
+            )
+        if region_ids == list(range(n_peer)):
+            return None
+        return region_ids
+
+    @contextmanager
+    def _regions_viewed_as(self, region_ids: list[int] | None):
+        """Make our per-region arrays answer to a peer's region positions.
+
+        Upstream's remote descriptor builder feeds the PEER's region position into
+        `get_backend_aware_kv_block_len` and `_is_region_replicated`, which index
+        OUR arrays. That only means our region while our band starts at our
+        region 0 -- true for a pipeline stage, false for a consumer holding every
+        layer while the producer is pipelined, where **the length read belongs to
+        a different layer than the address it is paired with**.
+
+        A plain attribute suffices: upstream reaches those two methods only from
+        registration and from a handshake, and runs handshakes one at a time on a
+        single-worker executor, so no second view is ever live.
+        """
+        prev = self._viewed_region_ids
+        self._viewed_region_ids = region_ids
+        try:
+            yield
+        finally:
+            self._viewed_region_ids = prev
+
+    def _viewed_region(self, position: int) -> int:
+        """Our region id for a position in the peer's region list."""
+        ids = self._viewed_region_ids
+        return position if ids is None else ids[position]
+
+    def get_backend_aware_kv_block_len(
+        self, layer_idx: int, first_split: bool = True, mamba_view: bool = False
+    ) -> int:
+        return super().get_backend_aware_kv_block_len(
+            layer_idx=self._viewed_region(layer_idx),
+            first_split=first_split,
+            mamba_view=mamba_view,
+        )
+
+    def _is_region_replicated(self, region_idx: int) -> bool:
+        return super()._is_region_replicated(self._viewed_region(region_idx))
+
+    def _build_fa_remote(
+        self,
+        plan: TPMapping,
+        nixl_agent_meta: NixlAgentMetadata,
+        block_size_ratio: int,
+    ) -> list[tuple[int, int, int]]:
+        # The one upstream loop that walks the peer's regions while reading ours.
+        # Scoped to this call rather than to `add_remote_agent`, which also builds
+        # local dlists from our own region ids and must not be translated.
+        assert isinstance(nixl_agent_meta, RblnNixlAgentMetadata)
+        with self._regions_viewed_as(self._peer_region_ids(nixl_agent_meta)):
+            return super()._build_fa_remote(plan, nixl_agent_meta, block_size_ratio)
+
     def _shard_local_region_ids(
         self,
         registered_layer_names: tuple[str, ...] | list[str],
@@ -2156,6 +2241,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             "PP over NIXL P/D does not support a peer with a larger TP size."
         )
         if pp_tp_ratio != 1:
+            # The layer axis does not change what a head costs per block.
             self._validate_head_matched_handshake(
                 nixl_agent_meta,
                 remote_tp_size,
