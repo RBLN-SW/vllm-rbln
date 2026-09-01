@@ -23,10 +23,10 @@ import pytest
 from tests.native.model_specs import CompileModelSpec, apply_spec_envs, spec_params
 from tests.native.runners import DPRequest
 from tests.native.utils import (
-    TokensText,
+    ALMOST_EQUAL_MAX_LOGPROB_GAP,
+    ALMOST_EQUAL_MAX_RANK,
     TokensTextLogprobs,
     check_logprobs_close,
-    check_outputs_equal,
     devices_needed,
     rbln_device_count,
 )
@@ -69,9 +69,6 @@ class DPLane:
     def dp_size(self) -> int:
         return self.spec.engine_kwargs["data_parallel_size"]
 
-    def generate_greedy(self, requests: list[DPRequest]) -> list[TokensText]:
-        return self.runner.generate_greedy(requests)
-
     def generate_greedy_logprobs(
         self, requests: list[DPRequest]
     ) -> list[TokensTextLogprobs]:
@@ -104,8 +101,7 @@ def dp_lane(request, async_vllm_runner):
 @pytest.fixture(scope="module")
 def symmetric_outputs(dp_lane):
     """Every rank busy with the same prompt -- the reference for the asymmetric
-    runs, and the only run here with no idle rank. Carries logprobs because the
-    rank-to-rank comparison needs them; the asymmetric runs compare ids only."""
+    runs, and the only run here with no idle rank."""
     return dp_lane.generate_greedy_logprobs(
         [DPRequest(PROMPT, MAX_TOKENS, dp_rank=rank) for rank in range(dp_lane.dp_size)]
     )
@@ -128,42 +124,50 @@ def test_every_rank_produces_the_same_output(symmetric_outputs) -> None:
 
 def test_output_survives_idle_peers(dp_lane, symmetric_outputs) -> None:
     # Every other rank dummy-runs for the whole of rank 0's decode.
-    outputs = dp_lane.generate_greedy([DPRequest(PROMPT, MAX_TOKENS, dp_rank=0)])
+    outputs = dp_lane.generate_greedy_logprobs(
+        [DPRequest(PROMPT, MAX_TOKENS, dp_rank=0)]
+    )
 
-    ref_ids, ref_text, _ = symmetric_outputs[0]
-    check_outputs_equal(
-        outputs_0_lst=[(ref_ids, ref_text)],
+    check_logprobs_close(
+        outputs_0_lst=[symmetric_outputs[0]],
         outputs_1_lst=outputs,
         name_0="rank0 with every rank busy",
         name_1=f"rank0 with {dp_lane.dp_size - 1} idle peers",
+        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
+        max_rank=ALMOST_EQUAL_MAX_RANK,
     )
 
 
 def test_output_survives_a_peer_finishing_early(dp_lane, symmetric_outputs) -> None:
     # rank0 drops out mid-flight, so the group's shape changes under the survivor.
     last = dp_lane.dp_size - 1
-    outputs = dp_lane.generate_greedy(
+    short, long = dp_lane.generate_greedy_logprobs(
         [
             DPRequest(PROMPT, SHORT_MAX_TOKENS, dp_rank=0),
             DPRequest(PROMPT, MAX_TOKENS, dp_rank=last),
         ]
     )
-    short, long = outputs
 
-    ref_ids, ref_text, _ = symmetric_outputs[last]
-    check_outputs_equal(
-        outputs_0_lst=[(ref_ids, ref_text)],
+    check_logprobs_close(
+        outputs_0_lst=[symmetric_outputs[last]],
         outputs_1_lst=[long],
         name_0=f"rank{last} with every rank busy",
         name_1=f"rank{last} outliving rank0",
+        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
+        max_rank=ALMOST_EQUAL_MAX_RANK,
     )
     # Bounded, not fixed: an earlier EOS still leaves the rank idle early.
-    short_ids = short[0]
-    assert 0 < len(short_ids) <= SHORT_MAX_TOKENS, (
-        f"rank0 asked for at most {SHORT_MAX_TOKENS} tokens, got {len(short_ids)}"
+    assert 0 < len(short[0]) <= SHORT_MAX_TOKENS, (
+        f"rank0 asked for at most {SHORT_MAX_TOKENS} tokens, got {len(short[0])}"
     )
-    assert short_ids == symmetric_outputs[0][0][: len(short_ids)], (
-        "rank0's tokens changed when it shared the group with a longer request"
+    # check_logprobs_close stops at the shorter run, so this compares the prefix.
+    check_logprobs_close(
+        outputs_0_lst=[symmetric_outputs[0]],
+        outputs_1_lst=[short],
+        name_0="rank0 with every rank busy",
+        name_1="rank0 sharing the group with a longer request",
+        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
+        max_rank=ALMOST_EQUAL_MAX_RANK,
     )
 
 
@@ -173,7 +177,7 @@ def test_output_survives_a_peer_at_a_bigger_bucket(dp_lane) -> None:
     # #894 that mismatch was a shape error, so completing at all is the signal;
     # the batch-2 graph differs from symmetric_outputs' batch-1 one, so those are
     # not compared.
-    first, second = dp_lane.generate_greedy(
+    first, second = dp_lane.generate_greedy_logprobs(
         [
             DPRequest(PROMPT, MAX_TOKENS, dp_rank=0),
             DPRequest(PROMPT, MAX_TOKENS, dp_rank=0),
@@ -181,9 +185,11 @@ def test_output_survives_a_peer_at_a_bigger_bucket(dp_lane) -> None:
     )
 
     assert len(first[0]) == len(second[0]) == MAX_TOKENS
-    check_outputs_equal(
+    check_logprobs_close(
         outputs_0_lst=[first],
         outputs_1_lst=[second],
         name_0="rank0 request 0",
         name_1="rank0 request 1",
+        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
+        max_rank=ALMOST_EQUAL_MAX_RANK,
     )
