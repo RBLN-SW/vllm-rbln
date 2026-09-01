@@ -31,13 +31,6 @@ from .model_base import (
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
 )
-from .optimum_attention import (
-    AttentionManager,
-    InnerAttentionEntry,
-    InnerAttentionStrategy,
-    InnerR1,
-    InnerR2,
-)
 
 logger = init_logger(__name__)
 
@@ -71,10 +64,6 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
-        self.strategy = InnerAttentionStrategy()
-        self.attention_manager: AttentionManager[
-            InnerAttentionStrategy, InnerAttentionEntry, InnerR1, InnerR2
-        ] = AttentionManager(self.strategy)
         self.is_hybrid = getattr(self.model.rbln_config, "cache_impl", None) == "hybrid"
 
     def preprocess_prefill(self, input_ids, attention_mask, image_input, video_input):
@@ -190,8 +179,9 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         # NOTE: this guard is currently unreachable — init_model() only enables
         # the EC path for "RBLNQwen3VLForConditionalGeneration", so EXAONE-4.5
         # never enters here today. It documents the contract for when EC is
-        # extended: the sliding-window/hybrid-cache prefill needs the
-        # attention_manager state that build_prefill_inputs does not yet provide.
+        # extended: the sliding-window/hybrid-cache prefill needs the cache
+        # slot ids from ModelInputForRBLN, which build_prefill_inputs does
+        # not receive.
         raise NotImplementedError(
             "EC disaggregation is not implemented for EXAONE-4.5."
         )
@@ -237,67 +227,42 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         input_ids = model_input.input_tokens
         cache_position = model_input.input_positions
         block_tables = model_input.block_tables
+        cache_slot_ids = model_input.cache_slot_ids
+        assert cache_slot_ids is not None
 
         request_nums = input_ids.shape[0]
-        finished_requests_ids = model_input.finished_requests_ids
-        running_requests_ids = model_input.running_requests_ids
         is_prompt = model_input.is_prompt
-
-        # In prefill phase, the length of list must be 1
-        sliding_window_table_ids = self.attention_manager.get(
-            is_prompt,
-            self.decoder_batch_size,
-            running_requests_ids,
-            finished_requests_ids,
-        )
 
         kwargs = self.preprocess_for_decoder(
             is_prompt, block_tables, input_ids, cache_position
         )
 
         padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-
-        # [prefill] the length of the padded cache is calculated
-        # during the forward pass and stored in self.sliding_window_table.
-        # [decode] `cache_position` and `position_ids` are distinguished
-        # due to the padding space reserved for the sliding window.
         cache_position = kwargs.pop("cache_position")
         input_ids = kwargs.pop("input_ids")
         block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
             inputs_embeds = model_input.inputs_embeds
-            prefill_batch_idx = sliding_window_table_ids[0]
-            local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
             logits = self.model.prefill_decoder(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
-                local_block_tables=local_block_table_id,
+                local_block_tables=cache_slot_ids,
                 block_tables=block_tables if self.is_hybrid else None,
             ).logits
-            assert len(running_requests_ids) == 1
-            self.attention_manager.add(
-                running_requests_id=running_requests_ids[0],
-                local_table_id=prefill_batch_idx,
-            )
         else:
             self.model.decoder = self.model.decoders[padded_batch_size]
             inputs_embeds = self.model.embed_tokens(input_ids)
-            local_block_table_id, cache_position = self.attention_manager.preprocess(
-                sliding_window_table_ids,
-                cache_position,
-                request_nums,
-                padded_batch_size,
-            )
             logits = self.model.decoder(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
-                local_block_tables=local_block_table_id,
+                local_block_tables=self.pad_cache_slot_ids(
+                    cache_slot_ids, padded_batch_size
+                ),
                 block_tables=block_tables if self.is_hybrid else None,
             ).logits
-        if not is_prompt:
             logits = logits[:request_nums]
         return logits
 

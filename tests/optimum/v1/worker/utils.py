@@ -141,4 +141,5 @@ def _schedule_new_request(
         cached_block_table=[],
         cached_length=[],
         dummy_block=None,
+        cache_slot_id_dict={req_id: i for i, req_id in enumerate(req_ids)},
     )

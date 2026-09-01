@@ -46,10 +46,14 @@ class ModelInputForRBLN:
     input_positions: torch.Tensor
     block_tables: torch.Tensor
     running_requests_ids: list[str]
-    finished_requests_ids: list[str]
     is_prompt: bool = False
     multi_modal_kwargs: BatchedTensorInputs | None = None
     dummy_block: int | None = None  # for prefix caching
+    # Cache slot ids of the running requests, in running order
+    # ([1] for prefill, [num_reqs] for decode). Scheduler-allocated rows of
+    # the per-sequence on-device caches (sliding-window KV, linear-attention
+    # state); models without such caches ignore it.
+    cache_slot_ids: torch.Tensor | None = None
     inputs_embeds: torch.Tensor | None = None
     position_embed: torch.Tensor | None = None
     # Qwen3-VL / Qwen3-VL-Moe prefill extras: visual token position mask and
