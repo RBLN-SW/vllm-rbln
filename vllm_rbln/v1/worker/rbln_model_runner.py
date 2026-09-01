@@ -131,7 +131,10 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
 )
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
-from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
+from vllm_rbln.v1.sample.rbln_rejection_sampler import (
+    RBLNRejectionSampler,
+    spec_logits_target_first,
+)
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
@@ -1073,6 +1076,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
+        # Compute the draft token ids.
+        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        # NOTE(RBLN): host gather (`self.input_ids` lives on the host) that also
+        # needs the *interleaved* order, where a target row's draft token sits at
+        # the next sampled position (`+ 1`). So it runs before the reordering.
+        draft_token_ids = self.input_ids[torch.from_numpy(logits_indices)]
+        draft_token_ids = draft_token_ids[
+            torch.from_numpy(target_logits_indices) + 1
+        ].to(self.device)
+
+        # NOTE(RBLN): the two index arrays partition the gathered rows, so this
+        # permutation puts the target rows up front for the sampler to slice.
+        # Only `logits_indices` moves -- the index arrays stay interleaved, which
+        # is what `_get_logprobs_tensors` indexes by.
+        if spec_logits_target_first(self.speculative_config):
+            order = np.concatenate([target_logits_indices, bonus_logits_indices])
+            logits_indices = logits_indices[order]
+
         # Make tensors.
         cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens)
         cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens)
@@ -1080,19 +1101,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         target_logits_indices = torch.from_numpy(target_logits_indices)
         bonus_logits_indices = torch.from_numpy(bonus_logits_indices)
 
-        # Compute the draft token ids.
-        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = self.input_ids[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1].to(self.device)
-
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
-            cu_num_draft_tokens=cu_num_draft_tokens,
-            cu_num_sampled_tokens=cu_num_sampled_tokens,
-            target_logits_indices=target_logits_indices,
-            bonus_logits_indices=bonus_logits_indices,
-            logits_indices=logits_indices,
+            cu_num_draft_tokens=cu_num_draft_tokens.to(self.device, non_blocking=True),
+            cu_num_sampled_tokens=cu_num_sampled_tokens.to(
+                self.device, non_blocking=True
+            ),
+            target_logits_indices=target_logits_indices.to(
+                self.device, non_blocking=True
+            ),
+            bonus_logits_indices=bonus_logits_indices.to(
+                self.device, non_blocking=True
+            ),
+            logits_indices=logits_indices.to(self.device, non_blocking=True),
         )
 
     def _prepare_kv_sharing_fast_prefill(
