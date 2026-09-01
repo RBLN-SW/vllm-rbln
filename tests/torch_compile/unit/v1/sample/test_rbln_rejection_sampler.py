@@ -338,12 +338,7 @@ def test_apply_sampling_constraints_leaves_all_greedy_logits_untouched(impl):
 
 
 def test_apply_sampling_constraints_leaves_mixed_batch_logits_untouched(impl):
-    """Mixed batches are not scaled here either.
-
-    Temperature scaling moved into `rbln_rejection_sample`: `rejection_sample`
-    builds a `[B*K]` temperature vector (greedy rows pinned to 1) and the
-    compiled graph divides by it. Nothing is left for the host to do.
-    """
+    """Mixed batches are not scaled here either -- the NPU impl is a no-op."""
     logits = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
     metadata = make_sampling_metadata(
         temperature=torch.tensor([0.0, 2.0]),
@@ -397,10 +392,7 @@ def run_rejection_sample(
             torch.tensor(num_draft_tokens, dtype=torch.int32), dim=0
         ),
         draft_probs=None,
-        # `rejection_sample` takes raw logits and softmaxes them inside the
-        # compiled graph, so feed log-probs: softmax(log(p)) == p, which keeps
-        # the 0.4-peaked distribution the assertions below rely on.
-        target_logits=make_target_probs(target_argmax_token_ids).log(),
+        target_logits=make_target_probs(target_argmax_token_ids),
         bonus_token_ids=torch.tensor(bonus_token_ids, dtype=torch.int64).unsqueeze(-1),
         sampling_metadata=metadata,
     )

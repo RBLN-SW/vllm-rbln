@@ -1043,6 +1043,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         #                            206, 207, 208]
         # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
         # bonus_logits_indices:     [  3,   4,   7,   8,  10]
+        # Token-only spec methods permute these to target-first; see below.
 
         # Compute the logits indices.
         # [4, 1, 3, 1, 2]
@@ -1078,9 +1079,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        # NOTE(RBLN): host gather (`self.input_ids` lives on the host) that also
-        # needs the *interleaved* order, where a target row's draft token sits at
-        # the next sampled position (`+ 1`). So it runs before the reordering.
+        # NOTE(RBLN): needs the *interleaved* order, so it precedes the reorder.
         draft_token_ids = self.input_ids[torch.from_numpy(logits_indices)]
         draft_token_ids = draft_token_ids[
             torch.from_numpy(target_logits_indices) + 1
@@ -3318,9 +3317,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
-        # NOTE(RBLN): the compiled graph is guarded on the input dtype, so
-        # warming it up with anything but the model dtype makes the first real
-        # decode step recompile instead of hitting the warm graph.
         target_logits = torch.zeros(
             num_tokens, vocab_size, dtype=self.dtype, device=self.device
         )

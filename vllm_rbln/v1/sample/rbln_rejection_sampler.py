@@ -41,18 +41,14 @@ logger = init_logger(__name__)
 
 PLACEHOLDER_TOKEN_ID = -1
 
-# Spec methods that draft from token ids alone. They never read
-# `sample_hidden_states`, which the model gathers in `logits_indices` order, so
-# reordering those rows is safe. eagle/medusa do read it, hence the allowlist.
-_TOKEN_ONLY_SPEC_METHODS = ("ngram", "suffix")
-
 
 def spec_logits_target_first(spec_config: "SpeculativeConfig | None") -> bool:
     """Whether the gathered logits arrive as [target rows ..., bonus rows ...].
 
-    The runner lays them out and the sampler slices them, so both ask here.
+    Only methods that draft from token ids alone qualify: they never read
+    `sample_hidden_states`, which the model gathers in the same order.
     """
-    return spec_config is not None and spec_config.method in _TOKEN_ONLY_SPEC_METHODS
+    return spec_config is not None and spec_config.method in ("ngram", "suffix")
 
 
 # TODO(RBLN): Enable RBLNSampler for
@@ -136,11 +132,9 @@ class RBLNRejectionSampler(RejectionSampler):
         # won't affect the original logits tensor.
         assert logits is not None
         if self.target_first_layout:
-            # NOTE(RBLN): the runner permuted `logits` alone -- the index arrays
-            # stay interleaved because `_get_logprobs_tensors` scatters by them.
-            # Target rows are therefore the front slice, no second `[rows, vocab]`
-            # gather, and bonus row r follows at `num_target + r`. The clamp
-            # mirrors the repeat-last padding of `bonus_logits_indices`.
+            # NOTE(RBLN): the runner permuted `logits` alone, so target rows are
+            # the front slice and bonus row r follows at `num_target + r`. The
+            # clamp mirrors the repeat-last padding of `bonus_logits_indices`.
             num_target = target_logits_indices.shape[0]
             raw_target_logits = logits[:num_target]
             bonus_rows = (
@@ -173,9 +167,6 @@ class RBLNRejectionSampler(RejectionSampler):
             raw_target_logits, sampling_metadata, metadata
         )
 
-        # NOTE(RBLN): `apply_sampling_constraints` and the softmax now live
-        # inside `rejection_sample` -- the NPU impl folds the softmax into its
-        # compiled graph, the torch impl does it eagerly. Both take raw logits.
         output_token_ids = self.impl.rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -251,8 +242,6 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # NOTE(RBLN): the caller hands over raw logits; the torch path applies
-        # the sampling constraints and the softmax itself.
         target_logits = self.apply_sampling_constraints(
             target_logits,
             cu_num_draft_tokens,
@@ -380,10 +369,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # NOTE(RBLN): the caller hands over raw logits. Temperature scaling and
-        # the softmax both live in the compiled graph below, and greedy rows are
-        # encoded as `top_k == 1`, so this is a no-op on the NPU path -- kept so
-        # both impls take the same shape.
         target_logits = self.apply_sampling_constraints(
             target_logits,
             cu_num_draft_tokens,
@@ -478,9 +463,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         #   num_accepted       : (B,)   int32 — per-batch number of accepted draft
         #                                       tokens (in [0, num_draft_tokens[i]]).
         # ------------------------------------------------------------------
-        # NOTE(RBLN): [B*K] temperature for the divide inside
-        # `rbln_rejection_sample`. Padding and greedy rows must carry 1.0 -- a 0
-        # would divide by zero.
+        # NOTE(RBLN): [B*K] temperature for the divide inside the graph. Padding
+        # and greedy rows must carry 1.0 -- a 0 would divide by zero.
         reshaped_temperature = torch.ones(
             padded_len,
             dtype=target_logits.dtype,
@@ -489,20 +473,14 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         temperature = sampling_metadata.temperature
         if not sampling_metadata.all_greedy and temperature is not None:
             if not sampling_metadata.all_random:
-                # A greedy request's temperature is 0. Substituting 1 is harmless:
-                # `rbln::rejection_sample` samples those rows under top_k == 1.
                 temperature = torch.where(
                     temperature == GREEDY_TEMPERATURE,
                     temperature.new_ones(()),
                     temperature,
                 )
             if padded_len == N:
-                # Every request proposed the full K drafts, so the packed rows are
-                # exactly the [B, K] grid (request r's draft c sits at
-                # cu[r - 1] + c == r * K + c) and a per-request temperature
-                # broadcasts along K. That replaces `expand_batch_to_tokens` --
-                # whose `repeat_interleave` alone costs ~200 us -- with one copy.
-                # The graph input has to stay a directly allocated tensor: an
+                # Full K drafts everywhere, so request r's draft c sits at
+                # r * K + c. The input must stay directly allocated: an
                 # `expand(...).reshape(-1)` view is rejected in `prepare_inputs`.
                 reshaped_temperature.view(batch_size, max_spec_len).copy_(
                     temperature.unsqueeze(1)
@@ -515,10 +493,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         num_draft_tokens_t = torch.tensor(
             num_draft_tokens, dtype=torch.int32, device=device
         )
-        # The graph composes the output too (sections 3 and 4 used to run here on
-        # the host): every step of it is a comparison against an `arange` plus a
-        # `where` on fixed shapes, so it costs nothing to fold in and it takes
-        # ~120 eager device ops off the post-graph critical path.
         return self._compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_logits,
@@ -537,15 +511,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         cu_num_draft_tokens: torch.Tensor,  # [batch_size]
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        """Return the target logits unchanged.
-
-        Nothing is left for the host here: `rejection_sample` builds the `[B*K]`
-        temperature vector and `rbln_rejection_sample` divides by it inside the
-        compiled graph, greedy rows are encoded as `top_k == 1` (#915) rather
-        than as a one-hot distribution, and top-k/top-p have always been
-        per-request inputs of the op. Kept because the torch impl's counterpart
-        does real work.
-        """
+        """Return the target logits unchanged -- the graph does all of it."""
         assert logits.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
         return logits
@@ -562,8 +528,7 @@ def rbln_rejection_sample(
     bonus_token_ids: torch.Tensor,
     counts: torch.Tensor,
 ) -> torch.Tensor:
-    # Temperature and softmax run inside the graph so the host never touches the
-    # `[B*K, vocab]` logits; the caller hands over raw logits.
+    # No eager op walks the `[B*K, vocab]` logits: the caller hands over raw logits.
     target_logits = target_logits / temperature.unsqueeze(-1)
     target_probs = target_logits.softmax(dim=-1)
     recovered_token_ids, num_accepted = torch.ops.rbln.rejection_sample(
@@ -574,16 +539,13 @@ def rbln_rejection_sample(
         top_p,
     )
 
-    # ---- Compose the output (was host-side sections 3 and 4) ----
-    # Every construct here is fixed shape: comparisons of an `arange` against a
-    # `[B, 1]` broadcast, then `where`. No index is computed and gathered, which
-    # is the pattern `RblnTensor pass` rejects.
+    # ---- Compose the [B, K+1] output ----
+    # Fixed shapes only -- no index is computed and gathered here, which is the
+    # pattern `RblnTensor pass` rejects.
     batch_size, max_spec_len = draft_per_batch.shape
     num_accepted = num_accepted.reshape(batch_size)
-    # `all_accepted` is True for inactive rows too (0 == 0), which is exactly
-    # what the bonus placement below wants: an inactive row's bonus column is
-    # `counts == 0`. The recovery mask instead needs the rows that accepted
-    # *some but not all* of their own drafts, hence `counts > 0` there.
+    # `all_accepted` is True for inactive rows too (0 == 0), which is what the
+    # bonus placement wants; recovery needs `counts > 0` to exclude them.
     all_accepted = num_accepted == counts
     partially_accepted = (counts > 0) & (num_accepted != counts)
 
