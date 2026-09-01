@@ -423,21 +423,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
 
         device = target_logits.device
 
-        # Output buffer (batch space). Unwritten slots stay as PLACEHOLDER.
-        output_token_ids = torch.full(
-            (batch_size, max_spec_len + 1),
-            PLACEHOLDER_TOKEN_ID,
-            dtype=torch.int32,
-            device=device,
-        )
-
-        # `active_mask` is in batch space: True for rows with any draft.
-        active_mask = torch.tensor(
-            [n > 0 for n in num_draft_tokens],
-            device=device,
-            dtype=torch.bool,
-        )  # [batch_size]
-
         # ------------------------------------------------------------------
         # 1) Build NPU primitive inputs (packed-then-padded layout).
         # NPU expects the first N = sum(num_draft_tokens) rows to be the
@@ -469,7 +454,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         draft_per_batch = torch.full(
             (batch_size, max_spec_len),
             PLACEHOLDER_TOKEN_ID,
-            dtype=output_token_ids.dtype,
+            dtype=torch.int32,
             device=device,
         )
         src_offset = 0
@@ -527,77 +512,24 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                     temperature, cu_num_draft_tokens, num_tokens
                 )
 
-        recovered_token_ids, num_accepted = self._compiled_rejection_sample(
+        num_draft_tokens_t = torch.tensor(
+            num_draft_tokens, dtype=torch.int32, device=device
+        )
+        # The graph composes the output too (sections 3 and 4 used to run here on
+        # the host): every step of it is a comparison against an `arange` plus a
+        # `where` on fixed shapes, so it costs nothing to fold in and it takes
+        # ~120 eager device ops off the post-graph critical path.
+        return self._compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_logits,
             cu_num_draft_tokens.to(device),
             top_k,
             top_p,
             reshaped_temperature,
-        )
-
-        # ------------------------------------------------------------------
-        # 3) Compose per-position output for the first K columns:
-        #      j < num_accepted[i]          -> draft token (accepted as-is)
-        #      j == num_accepted[i] (active) -> NPU-recovered token from target
-        #      j > num_accepted[i]          -> PLACEHOLDER (left untouched)
-        # ------------------------------------------------------------------
-        num_accepted_per_batch = num_accepted.reshape(batch_size)
-        num_draft_tokens_t = torch.tensor(
-            num_draft_tokens,
-            dtype=num_accepted_per_batch.dtype,
-            device=device,
-        )
-        positions = torch.arange(
-            max_spec_len,
-            device=device,
-        ).unsqueeze(0)  # (1, K)
-        # NOTE: all-accept is per-row: a row accepted ALL of ITS OWN drafts
-        # (num_draft_tokens[i], which may be < max_spec_len).
-        all_accepted_active = (
-            num_accepted_per_batch == num_draft_tokens_t
-        ) & active_mask
-
-        # 3a) Accepted positions: write the draft token unchanged.
-        accepted_pos_mask = positions < num_accepted_per_batch.unsqueeze(1)  # (B, K)
-        output_token_ids[:, :max_spec_len] = torch.where(
-            accepted_pos_mask,
             draft_per_batch,
-            output_token_ids[:, :max_spec_len],
+            bonus_token_ids,
+            num_draft_tokens_t,
         )
-
-        # 3b) First-reject position: write the NPU-recovered token.
-        recovered_pos_mask = (
-            (positions == num_accepted_per_batch.unsqueeze(1))
-            & active_mask.unsqueeze(1)  # To skip inactive row (num_draft_tokens == 0)
-            & ~all_accepted_active.unsqueeze(1)  # all-accept -> no recovery
-        )  # (B, K)
-        output_token_ids[:, :max_spec_len] = torch.where(
-            recovered_pos_mask,
-            recovered_token_ids,
-            output_token_ids[:, :max_spec_len],
-        )
-
-        # ------------------------------------------------------------------
-        # 4) Scatter the bonus token into `output_token_ids`.
-        # ------------------------------------------------------------------
-        # [batch_size, 1] -> [batch_size]
-        # NOTE: boolean-mask index_put below requires dtype match (it does NOT
-        # cast like basic-slice assignment), so cast to output_token_ids dtype.
-        bonus = bonus_token_ids.squeeze(-1).to(dtype=output_token_ids.dtype)
-
-        # 4a) Fully-accepted active rows: emit the bonus token right after the
-        # row's own last draft (column num_draft_tokens[i], == max_spec_len
-        # only for full rows) — mirrors the upstream Triton kernel.
-        batch_idx = torch.arange(batch_size, device=device)
-        output_token_ids[
-            batch_idx[all_accepted_active],
-            num_draft_tokens_t[all_accepted_active],
-        ] = bonus[all_accepted_active]
-        # 4b) Inactive rows (no drafts): only the bonus token at col 0.
-        output_token_ids[~active_mask, 0] = bonus[~active_mask]
-
-        return output_token_ids
 
     def apply_sampling_constraints(
         self,
@@ -626,18 +558,56 @@ def rbln_rejection_sample(
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
     temperature: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    draft_per_batch: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    counts: torch.Tensor,
+) -> torch.Tensor:
     # Temperature and softmax run inside the graph so the host never touches the
     # `[B*K, vocab]` logits; the caller hands over raw logits.
     target_logits = target_logits / temperature.unsqueeze(-1)
     target_probs = target_logits.softmax(dim=-1)
-    return torch.ops.rbln.rejection_sample(
+    recovered_token_ids, num_accepted = torch.ops.rbln.rejection_sample(
         draft_token_ids,
         target_probs,
         cu_num_draft_tokens,
         top_k,
         top_p,
     )
+
+    # ---- Compose the output (was host-side sections 3 and 4) ----
+    # Every construct here is fixed shape: comparisons of an `arange` against a
+    # `[B, 1]` broadcast, then `where`. No index is computed and gathered, which
+    # is the pattern `RblnTensor pass` rejects.
+    batch_size, max_spec_len = draft_per_batch.shape
+    num_accepted = num_accepted.reshape(batch_size)
+    # `all_accepted` is True for inactive rows too (0 == 0), which is exactly
+    # what the bonus placement below wants: an inactive row's bonus column is
+    # `counts == 0`. The recovery mask instead needs the rows that accepted
+    # *some but not all* of their own drafts, hence `counts > 0` there.
+    all_accepted = num_accepted == counts
+    partially_accepted = (counts > 0) & (num_accepted != counts)
+
+    positions_k1 = torch.arange(
+        max_spec_len + 1,
+        dtype=num_accepted.dtype,
+        device=num_accepted.device,
+    ).unsqueeze(0)
+    positions = positions_k1[:, :max_spec_len]
+
+    out = draft_per_batch.new_full((batch_size, max_spec_len + 1), PLACEHOLDER_TOKEN_ID)
+    head = torch.where(
+        positions < num_accepted.unsqueeze(1), draft_per_batch, out[:, :max_spec_len]
+    )
+    head = torch.where(
+        (positions == num_accepted.unsqueeze(1)) & partially_accepted.unsqueeze(1),
+        recovered_token_ids,
+        head,
+    )
+    out = torch.cat([head, out[:, max_spec_len:]], dim=1)
+
+    bonus = bonus_token_ids.squeeze(-1).to(dtype=out.dtype)
+    bonus_mask = all_accepted.unsqueeze(1) & (positions_k1 == counts.unsqueeze(1))
+    return torch.where(bonus_mask, bonus.unsqueeze(1), out)
 
 
 def torch_rejection_sample(
