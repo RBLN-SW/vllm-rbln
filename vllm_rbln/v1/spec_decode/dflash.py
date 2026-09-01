@@ -26,7 +26,6 @@ so the window lives in the mask.
 """
 
 from copy import copy
-
 from itertools import chain
 
 import torch
@@ -284,9 +283,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 # input-independent, so it const-folds to an anonymous constant
                 # weight-free apply cannot fill, and the write goes out of
                 # bounds. Stay in draft-vocab space and map after the argmax.
-                logits = self.model.logits_processor(
-                    self.model.lm_head, hidden_states
-                )
+                logits = self.model.logits_processor(self.model.lm_head, hidden_states)
             else:
                 logits = self.model.compute_logits(hidden_states)
             # NOTE(RBLN): the greedy pick belongs in the graph.

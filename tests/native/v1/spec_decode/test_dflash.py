@@ -316,9 +316,7 @@ class TestIdleSkip:
     @staticmethod
     def _has_moe(modules):
         """What `load_model` computes."""
-        return any(
-            isinstance(module, dflash_module.MoERunner) for module in modules
-        )
+        return any(isinstance(module, dflash_module.MoERunner) for module in modules)
 
     @staticmethod
     def _skips(is_idle, draft_has_moe):
@@ -336,4 +334,3 @@ class TestIdleSkip:
 
     def test_a_busy_rank_always_drafts(self):
         assert not self._skips(is_idle=False, draft_has_moe=False)
-
