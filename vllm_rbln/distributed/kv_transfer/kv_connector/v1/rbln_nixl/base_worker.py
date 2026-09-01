@@ -48,6 +48,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -57,6 +58,7 @@ from vllm.v1.kv_cache_interface import (
 
 import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    KVSplitAxis,
     RblnNixlAgentMetadata,
     rbln_compat_hash,
 )
@@ -75,11 +77,6 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
 
     Supported prefill -> decode topologies
     --------------------------------------
-    Peers pair by what they actually hold, on two axes that compose: KV heads
-    (`_build_head_matched_remote`) and layers (`_layer_overlap`). Any TP or PP
-    degree on either side works within these bounds. DP and EP are invisible --
-    a replica is its own engine, and EP does not shard the KV cache.
-
       * the two pipeline sizes must tile each other
       * both sides pipelined requires equal TP, and a pipelined peer may not
         have MORE TP ranks
@@ -93,6 +90,8 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
     Not supported
     -------------
       * D2D only: unequal TP with MLA (`_check_mla_constraints`)
+      * D2D only: a context-cut KV cache across unequal TP, or a peer that cut
+        it on a different axis (`_check_split_axis_constraints`)
       * unequal P/D block sizes with unequal TP or with PP; the equal-TP,
         non-pipelined case is upstream's and unaffected
       * sliding-window attention with any model parallelism across P/D --
@@ -155,6 +154,8 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # are its permanent (and correct) values.
         self._kv_areas: int = 1
         self._kv_slices: int = 1
+        # And which axis they came from -- the two counts alone do not say.
+        self._kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
 
         # --- Pipeline-parallel (PP) P/D state (empty / inert for pp_size == 1) ---
         # Per remote producer shard, the ordered KV-cache layer names it owns,
@@ -389,6 +390,9 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # REPLICATE flag per logical region, expanded to the chiplet-expanded
         # transfer table below (see _region_is_mla).
         logical_mla: list[bool] = []
+        # None where a region has no head axis to compare against, which the
+        # derivation below can never read as a non-head cut.
+        logical_kv_heads: list[int | None] = []
         for layer_name, cache_or_caches in xfer_buffers.items():
             layer_spec = self._layer_specs[layer_name]
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
@@ -447,6 +451,11 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                     )
                 regions.append((cache_or_caches, region_offset, full_block_len))
                 logical_mla.append(is_mla_region)
+                logical_kv_heads.append(
+                    layer_spec.num_kv_heads
+                    if isinstance(layer_spec, AttentionSpec)
+                    else None
+                )
 
         rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
 
@@ -495,12 +504,31 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # arithmetic and the region-pairing guard.
         self._kv_areas = xfer.n_shards
         self._kv_slices = xfer.slices
+
+        # A head axis of extent one cannot be cut, so the compiler replicates
+        # instead and more than one slice there has no other explanation. Above
+        # one head both axes fit the same count, so an axis that is not derived
+        # stays HEAD rather than guessed.
+        region_non_head = {
+            heads == 1 and len(set(xfer.slice_ids[r * areas : (r + 1) * areas])) > 1
+            for r, heads in enumerate(logical_kv_heads)
+        }
+        if len(region_non_head) > 1:
+            raise RuntimeError(
+                "RBLN NIXL (D2D): this engine's KV regions were not all cut on "
+                "the same axis, which one advertised geometry cannot describe. "
+                f"Head counts per logical region: {logical_kv_heads}."
+            )
+        self._kv_split_axis = (
+            KVSplitAxis.NON_HEAD if region_non_head == {True} else KVSplitAxis.HEAD
+        )
         logger.info(
-            "RBLN NIXL (D2D): registered %d transfer "
-            "region(s) across %d chiplet area(s), %d logical slice(s)%s.",
+            "RBLN NIXL (D2D): registered %d transfer region(s) across %d chiplet "
+            "area(s), %d logical slice(s), cut on the %s axis%s.",
             self.num_regions,
             xfer.n_shards,
             xfer.slices,
+            self._kv_split_axis.name,
             " -- KV heads are replicated across chiplets"
             if xfer.n_shards != xfer.slices
             else "",
@@ -1252,6 +1280,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             registered_layer_names=list(registered_layer_names),
             kv_areas=self._kv_areas,
             kv_slices=self._kv_slices,
+            kv_split_axis=self._kv_split_axis,
         )
         base_hash = self.compat_hash
         assert base_hash is not None
@@ -1852,6 +1881,41 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 "dtype must match across P and D."
             )
 
+    def _check_split_axis_constraints(
+        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+    ) -> None:
+        """Reject peers whose chiplet areas do not mean what head bands assume.
+
+        Head bands only make sense over a ``HEAD`` cut; against a context cut a
+        band names a range no area holds, while the byte counts stay right and
+        the handshake passes. Equal TP is exempt: bands are not consulted, area
+        k pairs with area k, and both sides cut the same way.
+
+        Host-bounce has no areas, so its permanent HEAD default is correct.
+        """
+        if self.use_host_buffer:
+            return
+        assert self.transfer_topo is not None
+        peer_axis = nixl_agent_meta.kv_split_axis
+        if peer_axis != self._kv_split_axis:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: peer cut its KV cache on the {peer_axis.name} "
+                f"axis but this worker cut it on {self._kv_split_axis.name}. "
+                "The area counts can agree while an area means something else "
+                "on each side, so no pairing is meaningful."
+            )
+        if self._kv_split_axis is KVSplitAxis.NON_HEAD and self._is_head_matched_peer(
+            remote_tp_size
+        ):
+            raise RuntimeError(
+                "RBLN NIXL D2D: a context-cut KV cache is not supported with "
+                f"heterogeneous tensor parallelism (peer TP {remote_tp_size}, "
+                f"local {self.transfer_topo.tp_size}). Bands computed from the "
+                "configured KV-head count would give plausible wrong "
+                "descriptors. Use equal TP on both sides, or "
+                "kv_buffer_device='cpu'."
+            )
+
     def _check_mla_constraints(
         self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
     ) -> None:
@@ -1886,6 +1950,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
     ) -> None:
         assert isinstance(nixl_agent_meta, RblnNixlAgentMetadata)
+        self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
         self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
         self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
         if nixl_agent_meta.pp_size <= 1:
