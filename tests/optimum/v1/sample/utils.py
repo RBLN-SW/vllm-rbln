@@ -280,7 +280,7 @@ def create_model_runner(
             1,
         )
     runner = RBLNOptimumModelRunner(vllm_config, DEVICE)
-    fake_load_model(runner, decoder_batch_sizes, model_dtype=dtype)
+    fake_load_model(runner, decoder_batch_sizes)
     return runner
 
 

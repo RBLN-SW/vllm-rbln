@@ -283,9 +283,7 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             )
         else:
             self.model.decoder = self.model.decoders[padded_batch_size]
-            inputs_embeds = self.model.embed_tokens(input_ids).to(
-                self.model.rbln_config.dtype
-            )
+            inputs_embeds = self.model.embed_tokens(input_ids)
             local_block_table_id, cache_position = self.attention_manager.preprocess(
                 sliding_window_table_ids,
                 cache_position,
