@@ -18,7 +18,7 @@ serve:
 # One server start -- and one compile -- per entry.
 serve_params:
   tp4ep: {tensor_parallel_size: 4, num_gpu_blocks_override: 82}
-  pp4ep: {pipeline_parallel_size: 4}
+  pp4: {pipeline_parallel_size: 4}
   dp4ep: {data_parallel_size: 4, max_num_seqs: 1}
 
 bench:
