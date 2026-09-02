@@ -24,8 +24,8 @@ surfaced:
     reduced acceptance compared with leaving it open
   - one seq_idx and one block table for the whole drafter, because a second
     dynamic index on a partition is a compiler error that arrives as a segfault
-  - the context write is contiguous on both sides, because a strided pair is
-    staged through host memory and that staging buffer faults
+  - context K/V writes are grouped across heads, because the current runtime
+    executes that strided region on device and avoids hundreds of submissions
 """
 
 from contextlib import contextmanager
@@ -150,38 +150,62 @@ class TestPageCrossing:
         assert not self._crossing([int(redirected[0])]).any()
 
 
-class TestContextWriteContiguity:
-    """A strided copy pair is staged through host memory, and that staging
-    buffer's recycled address is what faulted mid-run. Both sides have to be
-    contiguous, which is only true one layer and head at a time."""
+class TestContextWriteGrouping:
+    NUM_LAYERS = 2
+    NUM_KV_HEADS = 3
+    NUM_TOKENS = 5
+    HEAD_DIM = 4
+    CACHE_BLOCK_SIZE = 16
 
-    NUM_KV_HEADS = 8
-    HEAD_DIM = 128
+    def _model(self):
+        layers = []
+        for _ in range(self.NUM_LAYERS):
+            cache = torch.zeros(
+                2,
+                4,
+                self.NUM_KV_HEADS,
+                1,
+                self.CACHE_BLOCK_SIZE,
+                self.HEAD_DIM,
+                dtype=torch.bfloat16,
+            )
+            layers.append(
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(attn=SimpleNamespace(kv_cache=cache))
+                )
+            )
+        return SimpleNamespace(layers=layers)
 
-    def _cache(self):
-        return torch.zeros(
-            2,
-            4,
-            self.NUM_KV_HEADS,
-            1,
-            BLOCK_SIZE,
-            self.HEAD_DIM,
+    def test_groups_each_layer_and_run_across_all_heads(self):
+        model = self._model()
+        keys = torch.arange(
+            self.NUM_LAYERS * self.NUM_KV_HEADS * self.NUM_TOKENS * self.HEAD_DIM,
             dtype=torch.bfloat16,
+        ).view(
+            self.NUM_LAYERS,
+            self.NUM_KV_HEADS,
+            self.NUM_TOKENS,
+            self.HEAD_DIM,
+        )
+        values = keys + 1000
+        runs = [(0, 2, 1, 3), (2, 3, 2, 4)]
+
+        destinations, sources = RBLNDFlashProposer._context_kv_copy_pairs(
+            model, keys, values, runs
         )
 
-    def test_all_heads_at_once_is_strided_on_both_sides(self):
-        cache = self._cache()
-        source = torch.zeros(6, self.NUM_KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
-        assert not cache[0, 1, :, 0, 3:9, :].is_contiguous()
-        assert not source[0:6].transpose(0, 1).is_contiguous()
+        assert len(destinations) == self.NUM_LAYERS * len(runs) * 2
+        assert len(sources) == len(destinations)
+        assert all(pair.shape[0] == self.NUM_KV_HEADS for pair in destinations)
+        assert all(not pair.is_contiguous() for pair in destinations)
 
-    def test_per_head_is_contiguous_on_both_sides(self):
-        cache = self._cache()
-        # Head-major, which is the layout the compiled projection now emits.
-        source = torch.zeros(self.NUM_KV_HEADS, 6, self.HEAD_DIM, dtype=torch.bfloat16)
-        for head in range(self.NUM_KV_HEADS):
-            assert cache[0, 1, head, 0, 3:9, :].is_contiguous()
-            assert source[head, 0:6, :].is_contiguous()
+        torch._foreach_copy_(destinations, sources)
+        for layer_index, layer in enumerate(model.layers):
+            cache = layer.self_attn.attn.kv_cache
+            assert torch.equal(cache[0, 1, :, 0, 3:5, :], keys[layer_index, :, :2])
+            assert torch.equal(cache[1, 1, :, 0, 3:5, :], values[layer_index, :, :2])
+            assert torch.equal(cache[0, 2, :, 0, 4:7, :], keys[layer_index, :, 2:])
+            assert torch.equal(cache[1, 2, :, 0, 4:7, :], values[layer_index, :, 2:])
 
     def test_a_write_run_never_leaves_its_block(self):
         """Runs are cut at block boundaries, which is what makes the
@@ -191,6 +215,124 @@ class TestContextWriteContiguity:
         assert blocks == [0, 0, 0, 0, 1, 1]
         offsets = (positions % BLOCK_SIZE).tolist()
         assert offsets == [1020, 1021, 1022, 1023, 0, 1]
+
+
+class TestWarmup:
+    """Warmup only queues the drafter's shapes; `finish_dummy_run` executes
+    them once every target runtime exists. After warmup `dummy_run` is the
+    DP-idle path and drafts at once."""
+
+    @staticmethod
+    def _proposer(*, warmup_pending=True, dp_status=None, draft_has_moe=False):
+        calls = SimpleNamespace(projections=[], queries=[], decisions=[])
+        cad = object()
+        runner = SimpleNamespace(is_prefill=None, dp_status=dp_status)
+
+        def decide(num_reqs, num_tokens):
+            calls.decisions.append((num_reqs, num_tokens, runner.is_prefill))
+
+        runner._determine_batch_execution_and_padding = decide
+        proposer = SimpleNamespace(
+            num_speculative_tokens=NUM_SPEC,
+            max_num_tokens=512,
+            dp_rank=0,
+            draft_has_moe=draft_has_moe,
+            _proj_states=torch.zeros(512, 3),
+            _proj_positions=torch.zeros(1, 512, dtype=torch.int64),
+            _warmup_projection_buckets=set(),
+            _warmup_query_batch_sizes=set(),
+            _warmup_pending=warmup_pending,
+            runner=runner,
+        )
+
+        def project(states, positions):
+            calls.projections.append((tuple(states.shape), tuple(positions.shape)))
+
+        proposer._project_context_kv = project
+        proposer._build_dummy_attn_metadata = lambda num_reqs, num_query_per_req: cad
+        proposer._run_query_pass = lambda *args: calls.queries.append(args)
+        proposer._run_dummy_query_pass = (
+            lambda num_reqs,
+            num_query_per_req: RBLNDFlashProposer._run_dummy_query_pass(
+                proposer, num_reqs, num_query_per_req
+            )
+        )
+        return proposer, cad, calls
+
+    def test_prefill_warms_the_large_projection_bucket_only(self):
+        proposer, _, calls = self._proposer()
+
+        RBLNDFlashProposer.dummy_run(proposer, 1, 512, True)
+
+        assert calls.projections == []
+        RBLNDFlashProposer.finish_dummy_run(proposer)
+
+        assert calls.projections == [((512, 3), (1, 512))]
+        assert calls.queries == []
+        assert calls.decisions == []
+
+    def test_spec_decode_warms_projection_and_query_graphs(self):
+        proposer, cad, calls = self._proposer()
+
+        RBLNDFlashProposer.dummy_run(proposer, 2, QUERY_LEN, False)
+
+        assert calls.projections == []
+        assert calls.queries == []
+        RBLNDFlashProposer.finish_dummy_run(proposer)
+
+        assert calls.projections == [((QUERY_LEN, 3), (1, QUERY_LEN))]
+        # The batch's own status is published before the pass reads it.
+        assert calls.decisions == [(2, 2 * QUERY_LEN, False)]
+        assert len(calls.queries) == 1
+        assert calls.queries[0][0] is cad
+        assert calls.queries[0][1:4] == (2, QUERY_LEN, 2 * QUERY_LEN)
+        assert torch.equal(calls.queries[0][4], torch.zeros(2, dtype=torch.int32))
+        assert torch.equal(calls.queries[0][5], torch.zeros(2, dtype=torch.int32))
+        assert proposer._warmup_pending is False
+
+    def test_target_decode_shape_does_not_duplicate_drafter_warmup(self):
+        proposer, _, calls = self._proposer()
+
+        RBLNDFlashProposer.dummy_run(proposer, 1, 1, False)
+        RBLNDFlashProposer.finish_dummy_run(proposer)
+
+        assert calls.projections == []
+        assert calls.queries == []
+        assert calls.decisions == []
+
+    def test_each_bucket_is_warmed_once(self):
+        proposer, _, calls = self._proposer()
+
+        for num_reqs in (1, 2, 4, 4, 2):
+            RBLNDFlashProposer.dummy_run(proposer, num_reqs, QUERY_LEN, False)
+        RBLNDFlashProposer.finish_dummy_run(proposer)
+
+        assert [call[1] for call in calls.queries] == [1, 2, 4]
+        assert calls.projections == [((QUERY_LEN, 3), (1, QUERY_LEN))]
+
+    def test_after_warmup_an_idle_rank_drafts_at_once(self):
+        proposer, cad, calls = self._proposer(warmup_pending=False)
+
+        RBLNDFlashProposer.dummy_run(proposer, 1, QUERY_LEN, False)
+
+        # No projection and no new status: the step already published one.
+        assert calls.projections == []
+        assert calls.decisions == []
+        assert len(calls.queries) == 1
+        assert calls.queries[0][0] is cad
+        assert calls.queries[0][1:4] == (1, QUERY_LEN, QUERY_LEN)
+
+    @pytest.mark.parametrize("draft_has_moe", [False, True])
+    def test_an_idle_rank_skips_only_without_moe(self, draft_has_moe):
+        proposer, _, calls = self._proposer(
+            warmup_pending=False,
+            dp_status=SimpleNamespace(is_idle=[True]),
+            draft_has_moe=draft_has_moe,
+        )
+
+        RBLNDFlashProposer.dummy_run(proposer, 1, QUERY_LEN, False)
+
+        assert len(calls.queries) == (1 if draft_has_moe else 0)
 
 
 class TestSchedulerCapacity:
@@ -224,6 +366,68 @@ class TestSchedulerCapacity:
 
         assert proposer.runner is None
         assert proposer.arange_cpu.shape == (NUM_SPEC + 1,)
+
+
+class TestDraftVocabularyMapping:
+    class _FakeMappedDraft:
+        def __init__(self, d2t):
+            self.draft_id_to_target_id = d2t
+            self.lm_head = object()
+            self.compute_logits_calls = 0
+            self.logits_processor_calls = []
+
+        def compute_logits(self, hidden_states):
+            self.compute_logits_calls += 1
+            return hidden_states + 100
+
+        def logits_processor(self, lm_head, hidden_states):
+            self.logits_processor_calls.append((lm_head, hidden_states.clone()))
+            return hidden_states + 1
+
+    @staticmethod
+    def _proposer(model):
+        proposer = object.__new__(RBLNDFlashProposer)
+        proposer.model = model
+        proposer.draft_id_to_target_id = model.draft_id_to_target_id
+        return proposer
+
+    def test_mapped_logits_skip_the_full_vocab_scatter(self):
+        """Mapped models stay in draft-vocabulary space until after argmax."""
+        model = self._FakeMappedDraft(torch.tensor([0, 2, 3], dtype=torch.long))
+        proposer = self._proposer(model)
+        hidden = torch.arange(6, dtype=torch.float32).view(2, 3)
+
+        logits = proposer._compute_draft_logits(hidden)
+
+        assert model.compute_logits_calls == 0
+        assert len(model.logits_processor_calls) == 1
+        lm_head_arg, hidden_arg = model.logits_processor_calls[0]
+        assert lm_head_arg is model.lm_head
+        assert torch.equal(hidden_arg, hidden)
+        assert torch.equal(logits, hidden + 1)
+
+    def test_argmax_then_map_matches_full_vocab_scatter(self):
+        target_vocab_size = 20
+        d2t = torch.tensor([0, 2, 3, 5, 8, 11], dtype=torch.long)
+        target_ids = torch.arange(d2t.shape[0], dtype=torch.long) + d2t
+        assert bool((target_ids.diff() > 0).all())
+        assert int(target_ids.max()) < target_vocab_size
+        draft_logits = torch.tensor(
+            [
+                [0.0, 9.0, 1.0, 2.0, 3.0, 4.0],
+                [5.0, 1.0, 0.0, 0.0, 7.0, 2.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 8.0],
+            ]
+        )
+        full_logits = torch.full(
+            (draft_logits.shape[0], target_vocab_size), float("-inf")
+        )
+        full_logits[:, target_ids] = draft_logits
+        proposer = self._proposer(self._FakeMappedDraft(d2t))
+
+        out = proposer._to_target_token_ids(draft_logits.argmax(dim=-1))
+
+        assert out.tolist() == full_logits.argmax(dim=-1).tolist()
 
 
 class TestRedirectTarget:
@@ -475,7 +679,7 @@ class TestQueryPassBatch:
         proposer, calls = self._proposer(monkeypatch, num_reqs=3)
         proposer.supports_mm_inputs = False
         proposer.hidden_size = 16
-        proposer.model = SimpleNamespace(draft_id_to_target_id=None)
+        proposer.draft_id_to_target_id = None
         proposer._fill_first_pass_inputs = lambda *args: (
             0,
             torch.zeros(3, dtype=torch.int32),

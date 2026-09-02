@@ -26,7 +26,6 @@ so the window lives in the mask.
 """
 
 from copy import copy
-from itertools import chain
 
 import torch
 import torch.nn.functional as F
@@ -57,6 +56,7 @@ class RBLNDFlashProposer(DFlashProposer):
     _determine_batch_execution_and_padding = (
         RBLNEagleProposer._determine_batch_execution_and_padding
     )
+    _to_target_token_ids = RBLNEagleProposer._to_target_token_ids
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
         if (
@@ -91,6 +91,7 @@ class RBLNDFlashProposer(DFlashProposer):
                 "model's dflash config."
             )
         self.runner = runner
+        self.draft_id_to_target_id: torch.Tensor | None = None
         # `self.arange` is on the device. The RBLN metadata builder reads
         # `query_start_loc` and `seq_lens` on the host and stages them itself.
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
@@ -169,11 +170,10 @@ class RBLNDFlashProposer(DFlashProposer):
         draft_ids = draft_ids[: num_reqs * self.num_speculative_tokens].view(
             num_reqs, self.num_speculative_tokens
         )
-        # `d2t` holds offsets, not absolute ids, so the target id is
-        # `draft_id + d2t[draft_id]`. Outside the graph on purpose: the index is
-        # the argmax result, which the compiled subgraph above cannot const-fold.
-        if (d2t := self.model.draft_id_to_target_id) is not None:
-            draft_ids = draft_ids + d2t[draft_ids]
+        # Outside the graph on purpose, as the chained drafter does it: the
+        # index is the argmax result, which the compiled subgraph above cannot
+        # const-fold.
+        draft_ids = self._to_target_token_ids(draft_ids)
         if bool(self._dropped_rows.any()):
             # An empty list, never zeros: the scheduler reads zeros as real
             # token ids. The target-only step still advances the request to the
@@ -202,12 +202,16 @@ class RBLNDFlashProposer(DFlashProposer):
 
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
+        self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
         self._check_rope_style(target_model)
 
         # Projection inputs are padded to one of two shapes so the region
         # compiles twice: one draft block per request in decode, one prefill
         # chunk otherwise.
         self._proj_buckets = (1 + self.num_speculative_tokens, self.max_num_tokens)
+        self._warmup_projection_buckets: set[int] = set()
+        self._warmup_query_batch_sizes: set[int] = set()
+        self._warmup_pending = True
         self._proj_states = torch.zeros(
             self.max_num_tokens,
             self.hidden_size,
@@ -243,8 +247,8 @@ class RBLNDFlashProposer(DFlashProposer):
                 ).view(k_shape)
                 flat = key.view(1, num_tokens, -1)
                 key, _ = self_attn.rotary_emb(positions, flat, flat)
-                # Head-major: the cache write below is a copy per layer and
-                # head, and only that slice is contiguous on both sides.
+                # Head-major keeps the token/head-dimension region contiguous
+                # while the grouped cache write strides across heads.
                 keys.append(key.view(num_tokens, -1, head_dim).transpose(0, 1))
                 values.append(value.view(num_tokens, -1, head_dim).transpose(0, 1))
             return (
@@ -265,17 +269,10 @@ class RBLNDFlashProposer(DFlashProposer):
             hidden_states = hidden_states.view(-1, self.hidden_size)[
                 token_indices_to_sample
             ]
-            if self.model.draft_id_to_target_id is not None:
-                # Upstream widens the draft logits to the target vocabulary
-                # by scattering at `arange(draft_vocab) + d2t`. That index is
-                # input-independent, so it const-folds to an anonymous constant
-                # weight-free apply cannot fill, and the write goes out of
-                # bounds. Stay in draft-vocab space and map after the argmax.
-                logits = self.model.logits_processor(self.model.lm_head, hidden_states)
-            else:
-                logits = self.model.compute_logits(hidden_states)
+            logits = self._compute_draft_logits(hidden_states)
             # NOTE(RBLN): the greedy pick belongs in the graph.
-            return torch.ops.rbln.argmax(logits)
+            draft_ids = torch.ops.rbln.argmax(logits)
+            return self._to_target_token_ids(draft_ids)
 
         compile_kwargs = dict(
             dynamic=False,
@@ -296,6 +293,24 @@ class RBLNDFlashProposer(DFlashProposer):
         self.draft_has_moe = any(
             isinstance(module, MoERunner) for module in self.model.modules()
         )
+
+    def _compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Keep a mapped head's logits in draft-vocabulary space.
+
+        Upstream widens them to the target vocabulary by scattering at
+        `arange(draft_vocab) + d2t`. That index is input-independent, so it
+        const-folds to an anonymous constant weight-free apply cannot fill and
+        the write goes out of bounds; on the MiniMax-M2.7 q8 graph the scatter
+        also lowers to a generated host op that faults. The mapping is
+        monotonic, so mapping the argmax instead is equivalent (see
+        `_to_target_token_ids`) and does no work proportional to the
+        vocabulary.
+        """
+        if self.draft_id_to_target_id is None:
+            logits = self.model.compute_logits(hidden_states)
+            assert logits is not None
+            return logits
+        return self.model.logits_processor(self.model.lm_head, hidden_states)
 
     def _check_rope_style(self, target_model) -> None:
         """Refuse a drafter whose RoPE style differs from the target's.
@@ -336,11 +351,20 @@ class RBLNDFlashProposer(DFlashProposer):
         *,
         num_padded_tokens: int | None = None,
     ) -> None:
-        """Compile every drafter graph here, not on the first real step.
+        """Warm the drafter's graphs, or stand in for a DP-idle rank's draft.
 
-        `is_prefill` is unused: the projection's shape comes from its bucket and
+        During warmup the shapes are only queued and `finish_dummy_run` runs
+        them once the target's warmup and mega-cache save are done. Compiling
+        them inline, between the target's warmup signatures, instantiated draft
+        runtimes while the target still had runtimes to create, and the
+        specialized padded-decode variants then failed with `INIT_INTERNAL`.
+
+        After warmup this is the DP-idle path and drafts at once, so a drafter
+        whose forward joins a DP all-gather stays in step with the busy ranks.
+        `is_prefill` and `num_padded_tokens` only pick the projection bucket:
         the query pass always runs one draft block per request.
         """
+        del num_padded_tokens
         status = self.runner.dp_status
         if (
             status is not None
@@ -351,16 +375,54 @@ class RBLNDFlashProposer(DFlashProposer):
             # discarded, and without fused MoE no busy rank waits on it.
             return
 
-        # 1) The projection. Both buckets, straight from the staging buffers --
-        # a pure region, so no metadata and no cache write.
-        for bucket in self._proj_buckets:
+        num_query_per_req = 1 + self.num_speculative_tokens
+        if not self._warmup_pending:
+            # The projection is a pure region with no collective to join, so an
+            # idle rank only has to run the query pass.
+            self._run_dummy_query_pass(num_reqs, num_query_per_req)
+            return
+
+        if is_prefill:
+            self._warmup_projection_buckets.add(self.max_num_tokens)
+            return
+        if num_tokens_per_req != num_query_per_req:
+            # The target's plain decode shape has no drafter counterpart; the
+            # speculative shape at the same bucket covers it.
+            return
+        self._warmup_projection_buckets.add(num_query_per_req)
+        self._warmup_query_batch_sizes.add(num_reqs)
+
+    @torch.inference_mode()
+    def finish_dummy_run(self) -> None:
+        """Run the queued warmups, now that every target runtime exists."""
+        # 1) The projection. Straight from the staging buffers -- a pure
+        # region, so no metadata and no cache write.
+        for bucket in sorted(self._warmup_projection_buckets):
             self._project_context_kv(
                 self._proj_states[:bucket], self._proj_positions[:, :bucket]
             )
 
-        # 2) The query pass, at the only shape it ever runs: one draft block
-        # (`1 + num_speculative_tokens` queries) per request.
+        # 2) The query pass, once per queued decode bucket.
         num_query_per_req = 1 + self.num_speculative_tokens
+        for num_reqs in sorted(self._warmup_query_batch_sizes):
+            # The pass decides its bucket from the status the step published
+            # (see `_run_query_pass`), and the target's last warmup signature
+            # was some other shape: publish this batch's own, as the target
+            # would have on a real step. Symmetric across ranks, so under DP
+            # every rank reaches the collective with the same queue.
+            self.runner.is_prefill = False
+            self.runner._determine_batch_execution_and_padding(
+                num_reqs, num_reqs * num_query_per_req
+            )
+            self._run_dummy_query_pass(num_reqs, num_query_per_req)
+
+        self._warmup_projection_buckets.clear()
+        self._warmup_query_batch_sizes.clear()
+        self._warmup_pending = False
+
+    def _run_dummy_query_pass(self, num_reqs: int, num_query_per_req: int) -> None:
+        """The query pass at the only shape it ever runs: one draft block
+        (`1 + num_speculative_tokens` queries) per request."""
         num_query_total = num_reqs * num_query_per_req
         if num_query_total > self.max_num_tokens:
             return
@@ -642,28 +704,48 @@ class RBLNDFlashProposer(DFlashProposer):
         )
         keys = keys[:, :, :num_context]
         values = values[:, :, :num_context]
+        destinations, sources = self._context_kv_copy_pairs(model, keys, values, runs)
+        torch._foreach_copy_(destinations, sources)
 
-        # One copy per layer and head: all heads at once is contiguous on
-        # neither side, and the runtime stages that strided pair through host
-        # memory, which faults as `rbln_memcpy_v2h failed`. `unbind` builds the
-        # same views in one call per layer instead of one index at a time.
+    @staticmethod
+    def _context_kv_copy_pairs(
+        model,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        runs: list[tuple[int, int, int, int]],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Group each layer/run copy across its KV heads.
+
+        The copy used to be one pair per layer and head: an older runtime
+        staged a pair that was strided on both sides through host memory, and
+        that staging buffer faulted as `rbln_memcpy_v2h failed`. The current
+        torch-rbln foreach path lowers matching strided regions to one batched
+        device-to-device submission instead, and keeping every head separate
+        creates hundreds of pairs and makes the backend's cross-pair alias
+        check quadratic. The innermost token/head-dimension region stays
+        contiguous; only the head stride differs between the projected output
+        and the paged cache.
+        """
         destinations: list[torch.Tensor] = []
         sources: list[torch.Tensor] = []
         for layer_index, layer in enumerate(model.layers):
             cache = layer.self_attn.attn.kv_cache
-            k_layer = keys[layer_index]
-            v_layer = values[layer_index]
             for token_start, count, block, offset in runs:
                 token_slice = slice(token_start, token_start + count)
                 cache_slice = slice(offset, offset + count)
-                dst_k = cache[0, block, :, 0, cache_slice, :].unbind(0)
-                dst_v = cache[1, block, :, 0, cache_slice, :].unbind(0)
-                src_k = k_layer[:, token_slice, :].unbind(0)
-                src_v = v_layer[:, token_slice, :].unbind(0)
-                # Interleave key/value per head to keep the original order.
-                destinations.extend(chain.from_iterable(zip(dst_k, dst_v)))
-                sources.extend(chain.from_iterable(zip(src_k, src_v)))
-        torch._foreach_copy_(destinations, sources)
+                destinations.extend(
+                    (
+                        cache[0, block, :, 0, cache_slice, :],
+                        cache[1, block, :, 0, cache_slice, :],
+                    )
+                )
+                sources.extend(
+                    (
+                        keys[layer_index, :, token_slice, :],
+                        values[layer_index, :, token_slice, :],
+                    )
+                )
+        return destinations, sources
 
     def _run_query_pass(
         self,

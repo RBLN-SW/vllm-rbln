@@ -594,6 +594,15 @@ class TestWarmupWiring:
             calls.runner.warmup_model()
         assert [step[0] for step in calls.steps] == ["load"]
 
+    def test_dflash_warmup_runs_after_target_bundle_save(self, calls):
+        drafter = object.__new__(rbln_model_runner.RBLNDFlashProposer)
+        drafter.finish_dummy_run = lambda: calls.steps.append(("dflash",))
+        calls.runner.drafter = drafter
+
+        calls.runner.warmup_model()
+
+        assert [step[0] for step in calls.steps][-2:] == ["save", "dflash"]
+
 
 class TestConformance:
     """Drift alarms: the save/load path is stubbed everywhere above, so nothing

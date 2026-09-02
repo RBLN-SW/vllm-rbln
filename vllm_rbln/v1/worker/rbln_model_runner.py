@@ -3457,6 +3457,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter.dummy_run()
 
         mega_cache.save(self.model_config.model, sig)
+        if isinstance(self.drafter, RBLNDFlashProposer):
+            # DFlash regions are intentionally instantiated only after every
+            # target warmup signature and the target mega-cache save. Creating
+            # them inline between target signatures can exhaust runtime slots
+            # before specialized padded-decode runtimes are available.
+            with set_compile_stage("warmup"):
+                self.drafter.finish_dummy_run()
 
     def _process_kv_cache_copy_ops(
         self,
