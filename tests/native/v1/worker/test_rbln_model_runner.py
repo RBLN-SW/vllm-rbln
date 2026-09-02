@@ -371,6 +371,62 @@ class TestPredicates:
         assert not _make_runner_stub(is_pooling_model=True).use_wrapped_compute_logits
 
 
+class TestDecodeBatchBucketLimit:
+    @staticmethod
+    def _buckets(max_batch_size: int) -> list[int]:
+        limit = mr._decode_batch_bucket_limit(
+            configured_limit=1,
+            max_batch_size=max_batch_size,
+            strategy="exponential",
+            speculative_method="dflash",
+        )
+        return ExponentialBucketingManager(
+            max_batch_size=max_batch_size,
+            min_batch_size=1,
+            limit=limit,
+            step=2,
+        ).decode_batch_buckets
+
+    def test_dflash_keeps_the_full_exponential_decode_ladder(self):
+        assert self._buckets(1) == [1]
+        assert self._buckets(2) == [1, 2]
+        assert self._buckets(4) == [1, 2, 4]
+        assert self._buckets(16) == [1, 2, 4, 8, 16]
+
+    def test_other_speculative_methods_keep_the_configured_limit(self):
+        assert (
+            mr._decode_batch_bucket_limit(
+                configured_limit=1,
+                max_batch_size=16,
+                strategy="exponential",
+                speculative_method="eagle3",
+            )
+            == 1
+        )
+
+    def test_non_exponential_strategies_keep_their_configured_limit(self):
+        assert (
+            mr._decode_batch_bucket_limit(
+                configured_limit=1,
+                max_batch_size=16,
+                strategy="manual",
+                speculative_method="dflash",
+            )
+            == 1
+        )
+
+    def test_explicitly_wider_limit_is_never_reduced(self):
+        assert (
+            mr._decode_batch_bucket_limit(
+                configured_limit=8,
+                max_batch_size=4,
+                strategy="exponential",
+                speculative_method="dflash",
+            )
+            == 8
+        )
+
+
 class TestExecuteModelState:
     def test_field_names(self):
         assert ExecuteModelState._fields == (
