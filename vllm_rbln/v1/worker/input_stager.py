@@ -60,6 +60,24 @@ class StagedModelInputs:
         }
 
 
+def _pad_region(buf: torch.Tensor, layout: InputLayout, value: float) -> None:
+    """Give the pad value to just the part of `buf` the caller's copy misses.
+
+    `buf` is indexed `[num_reqs_padded, query_len_padded, ...]` and the caller
+    overwrites `[:num_reqs, :query_len]` immediately after, so the rows past
+    `num_reqs` and the tail of the live rows are the only ones that carry the
+    pad value. When the live block covers the buffer -- the common case, since a
+    batch that lands on its decode bucket has `num_reqs == num_reqs_padded` --
+    this issues no op at all. A buffer is `torch.empty`, so the first use with a
+    short batch still fills the uninitialised remainder; only a full-width batch
+    skips, and a full-width batch has no remainder.
+    """
+    if layout.num_reqs < layout.num_reqs_padded:
+        buf[layout.num_reqs :].fill_(value)
+    if layout.query_len < layout.query_len_padded:
+        buf[: layout.num_reqs, layout.query_len :].fill_(value)
+
+
 class InputStager:
     def __init__(self, device: torch.device):
         self.device = device
@@ -81,13 +99,13 @@ class InputStager:
         buf = self._get_or_create_buffer(layout, input_ids, positions)
 
         assert buf.input_ids.shape == layout.shape
-        buf.input_ids.fill_(layout.input_pad_value)
+        _pad_region(buf.input_ids, layout, layout.input_pad_value)
         buf.input_ids[: layout.num_reqs, : layout.query_len].copy_(
             input_ids,
             non_blocking=True,
         )
 
-        buf.positions.fill_(layout.position_pad_value)
+        _pad_region(buf.positions, layout, layout.position_pad_value)
         buf.positions[: layout.num_reqs, : layout.query_len].copy_(
             positions,
             non_blocking=True,
@@ -148,8 +166,7 @@ class InputStager:
             )
             self._hidden_state_buffers[key] = buf
 
-        buf[layout.num_reqs :].fill_(layout.hidden_state_pad_value)
-        buf[: layout.num_reqs, layout.query_len :].fill_(layout.hidden_state_pad_value)
+        _pad_region(buf, layout, layout.hidden_state_pad_value)
         buf[: layout.num_reqs, : layout.query_len].copy_(
             hidden_states,
             non_blocking=True,
@@ -176,6 +193,7 @@ class InputStager:
             )
             self._token_indices_buffers[key] = buf
 
-        buf.fill_(layout.token_index_pad_value)
+        if num_indices < layout.num_reqs_padded:
+            buf[num_indices:].fill_(layout.token_index_pad_value)
         buf[:num_indices].copy_(token_indices, non_blocking=True)
         return buf

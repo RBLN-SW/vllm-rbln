@@ -213,19 +213,33 @@ class RBLNEagleProposer(EagleProposer):
         )
         num_reqs_padded = batch_desc.num_reqs_padded
         num_padded_tokens = batch_desc.num_tokens_padded
-        for token_index in range(self.num_speculative_tokens - 1):
-            self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
-            positions = positions.view(-1) + 1
-
-            exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
+        # Every draft step's positions and sequence lengths are known before the
+        # loop runs: positions advance by exactly one per step and seq_lens with
+        # them, clamped at max_model_len. Nothing in the loop feeds back into
+        # them -- only the token ids and hidden states depend on the previous
+        # forward. So the whole metadata build comes out of the loop and is done
+        # once, up front, for all steps.
+        #
+        # This is what vllm-ascend does (it fills `seq_lens_group[draft_index]`
+        # and `query_start_loc_group[draft_index]` for every step before running
+        # any of them, then indexes the list). Upstream CUDA instead keeps the
+        # build in the loop but collapses it into one fused kernel per step
+        # (`eagle_step_slot_mapping_metadata_kernel`); on RBLN that kernel would
+        # have to be a host op, and not rebuilding at all is strictly less work.
+        draft_steps: list[tuple[torch.Tensor, dict[str, object]]] = []
+        step_positions = positions.view(-1)
+        for step in range(self.num_speculative_tokens - 1):
+            step_positions = step_positions + 1
+            exceeds_max_model_len = step_positions[:num_reqs] >= self.max_model_len
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            per_layer_attn_metadata.clear()
+            step_metadata: dict[str, object] = {}
             for attn_group in self.draft_attn_groups:
                 attn_metadata = attn_group.get_metadata_builder().build(
+                    draft_index=step + 1,
                     common_attn_metadata=common_attn_metadata,
-                    positions=positions,
+                    positions=step_positions,
                     is_prefill=False,
                     batch_pad=num_reqs_padded,
                 )
@@ -236,14 +250,19 @@ class RBLNEagleProposer(EagleProposer):
                     self.runner.kv_cache_view_infos,
                 )
                 for layer_name in attn_group.layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
+                    step_metadata[layer_name] = attn_metadata
+            draft_steps.append((step_positions, step_metadata))
+
+        for token_index in range(self.num_speculative_tokens - 1):
+            step_positions, step_attn_metadata = draft_steps[token_index]
+            self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
 
             staged_input_ids, staged_positions, staged_hidden_states, _ = (
                 self._preprocess(
                     num_reqs,
                     num_reqs_padded,
                     num_reqs,
-                    positions[:num_reqs],
+                    step_positions[:num_reqs],
                     hidden_states[:num_reqs],
                     is_prefill=False,
                 )
@@ -251,7 +270,7 @@ class RBLNEagleProposer(EagleProposer):
 
             # Run the model.
             with set_forward_context(
-                per_layer_attn_metadata,
+                step_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_reqs,
                 num_tokens_across_dp=num_tokens_across_dp,
@@ -287,7 +306,8 @@ class RBLNEagleProposer(EagleProposer):
         d2t = self.draft_id_to_target_id
         if d2t is None:
             return draft_token_ids.long().clone()
-        return draft_token_ids + d2t[draft_token_ids]
+        ids = draft_token_ids.cpu().long()
+        return ids + d2t[ids]
 
     def prepare_next_token_ids_padded(
         self,
@@ -307,17 +327,17 @@ class RBLNEagleProposer(EagleProposer):
             ],
             dtype=np.int32,
         )
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        backup_tokens_gpu = self.backup_next_token_ids.gpu
+        # Filled on the host just above, and its only consumer reads it there.
+        backup_tokens = self.backup_next_token_ids.cpu
 
         assert discard_request_mask.dtype == torch.bool
-        assert backup_tokens_gpu.dtype == torch.int32
+        assert backup_tokens.dtype == torch.int32
 
         batch_size = sampled_token_ids.shape[0]
         return eagle_prepare_next_token_padded(
             sampled_token_ids,
             discard_request_mask[:batch_size],
-            backup_tokens_gpu[:batch_size],
+            backup_tokens[:batch_size],
             gpu_input_batch.vocab_size,
         )
 
@@ -368,7 +388,14 @@ class RBLNEagleProposer(EagleProposer):
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
 
-        self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
+        d2t = getattr(self.model, "draft_id_to_target_id", None)
+        # Held on the host, not wherever the draft model put it. `d2t[ids]` is
+        # an integer gather, which the eager device path does not take (its dtype
+        # set is fp16/bf16), so a device-resident table falls back to CPU -- and
+        # a fallback that has to *read* copies the whole table host-ward on every
+        # call, to look up one offset per request. The table is constant, so one
+        # copy at load time replaces that traffic with a copy of the ids.
+        self.draft_id_to_target_id = None if d2t is None else d2t.cpu()
 
         # Fused MoE is the only reader of the step's padded token dimension, so a
         # draft without it runs no collective of its own -- which is what lets an
