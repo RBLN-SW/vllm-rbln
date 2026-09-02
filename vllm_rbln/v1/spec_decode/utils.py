@@ -25,10 +25,17 @@ import torch
 # batch sizes a decode bucket gives us. Measured against the op chain they
 # replace, they lose; numpy wins at every bucket we compile for.
 #
-# The inputs are already on the host: `cu_num_draft_tokens` comes from
-# `torch.from_numpy`, `query_start_loc` is the runner's numpy-backed int32
-# buffer, and only `sampled_token_ids` needs a crossing, being the sampler's
-# output. Both results are consumed on the host too.
+# In the drafter's own call path most of these are already host-resident --
+# `cu_num_draft_tokens` comes from `torch.from_numpy` and `query_start_loc` is
+# the runner's numpy-backed int32 buffer -- so the only crossing that path pays
+# is the sampler's output. Both results are consumed on the host too.
+
+
+def _host(t: torch.Tensor) -> "np.ndarray":
+    """numpy needs host memory, and a caller may hold any of these on either
+    side: the sampler's output is device-resident, the rest are the runner's
+    numpy-backed buffers."""
+    return t.numpy() if t.device.type == "cpu" else t.cpu().numpy()
 
 
 def eagle_prepare_next_token_padded(
@@ -46,9 +53,9 @@ def eagle_prepare_next_token_padded(
     This is the "last accepted token" from the sampled tokens, or the backup token if no
     tokens were accepted or if the request is marked as discarded.
     """
-    sampled = sampled_token_ids.cpu().numpy()
-    discard = discard_request_mask.numpy()
-    backup = backup_next_token_ids.numpy()
+    sampled = _host(sampled_token_ids)
+    discard = _host(discard_request_mask)
+    backup = _host(backup_next_token_ids)
     num_reqs, num_tokens = sampled.shape
 
     is_valid = (sampled != -1) & (sampled < vocab_size)
@@ -89,9 +96,9 @@ def eagle_prepare_inputs_padded(
     number of rejected tokens for each request to match upstream's padded EAGLE
     input preparation contract.
     """
-    cu_draft = cu_num_draft_tokens.numpy()
-    valid = valid_sampled_tokens_count.numpy()
-    qsl = query_start_loc.numpy()
+    cu_draft = _host(cu_num_draft_tokens)
+    valid = _host(valid_sampled_tokens_count)
+    qsl = _host(query_start_loc)
 
     # `cu_num_draft_tokens` is an inclusive cumulative sum, so the per-request
     # count is its first difference. Widen first: the difference is taken in
