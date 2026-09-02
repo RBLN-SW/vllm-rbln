@@ -37,7 +37,6 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer
 
 import vllm_rbln.envs as envs
-import vllm_rbln.utils as rbln_utils
 from vllm_rbln.compilation import build_process_group_dict, compile
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.platform import USE_DEVICE_TENSOR
@@ -556,9 +555,13 @@ class RBLNDFlashProposer(DFlashProposer):
             full_metadata = copy(attn_metadata)
             full_metadata.attn_masks = (
                 self._draft_block_mask(
-                    cad.seq_lens, num_reqs, num_reqs_padded, max_seq_len, None
+                    cad.seq_lens,
+                    num_reqs,
+                    num_reqs_padded,
+                    max_seq_len,
+                    None,
+                    mask_dtype,
                 )
-                .to(mask_dtype)
                 .contiguous()
                 .to(mask_device)
             )
@@ -580,8 +583,8 @@ class RBLNDFlashProposer(DFlashProposer):
                     num_reqs_padded,
                     max_seq_len,
                     self.sliding_window,
+                    mask_dtype,
                 )
-                .to(mask_dtype)
                 .contiguous()
                 .to(mask_device)
             )
@@ -609,6 +612,7 @@ class RBLNDFlashProposer(DFlashProposer):
         num_reqs_padded: int,
         max_seq_len: int,
         sliding_window: int | None,
+        dtype: torch.dtype = torch.bool,
     ) -> torch.Tensor:
         """A mask for a whole draft block, optionally bounded by the window.
 
@@ -617,33 +621,33 @@ class RBLNDFlashProposer(DFlashProposer):
         each eager device op here would compile its own graph.
         """
         num_query_per_req = 1 + self.num_speculative_tokens
-        key_pos = torch.arange(max_seq_len)
-        query_pos = seq_lens[:num_reqs].view(-1, 1) + torch.arange(
-            num_query_per_req
-        ).view(1, -1)
+        mask = torch.zeros(
+            num_reqs_padded,
+            1,
+            1,
+            num_query_per_req,
+            max_seq_len,
+            dtype=dtype,
+        )
+        seq_lens_list = seq_lens[:num_reqs].tolist()
         if sliding_window is None:
-            # Every query in the block sees the same keys, so one row is built
-            # and expanded rather than repeated per query.
-            key_end = query_pos.max(dim=1, keepdim=True).values
-            valid = key_pos.view(1, -1) <= key_end
-            mask = valid.view(num_reqs, 1, 1, 1, max_seq_len).expand(
-                num_reqs, 1, 1, num_query_per_req, max_seq_len
-            )
+            for req_index, seq_len in enumerate(seq_lens_list):
+                key_end = min(seq_len + num_query_per_req, max_seq_len)
+                mask[req_index, :, :, :, :key_end] = 1
         else:
             # Causal against the context, but not inside the draft block:
             # every mask slot sees every other one. A block that only looked
             # backwards is what `flash_causal_attention_naive_*` already
             # gives, and this model would not need the mask-taking family at
             # all.
-            distance = query_pos.unsqueeze(-1) - key_pos.view(1, 1, -1)
-            block_start = seq_lens[:num_reqs].view(-1, 1, 1)
-            in_block = (key_pos.view(1, 1, -1) >= block_start) & (
-                key_pos.view(1, 1, -1) < block_start + num_query_per_req
-            )
-            valid = ((distance >= 0) | in_block) & (distance < sliding_window)
-            mask = valid.view(num_reqs, 1, 1, num_query_per_req, max_seq_len)
-        if num_reqs_padded > num_reqs:
-            mask = rbln_utils.pad(mask, 0, num_reqs_padded)
+            for req_index, seq_len in enumerate(seq_lens_list):
+                key_end = min(seq_len + num_query_per_req, max_seq_len)
+                for query_index in range(num_query_per_req):
+                    key_start = max(
+                        seq_len + query_index - sliding_window + 1,
+                        0,
+                    )
+                    mask[req_index, :, :, query_index, key_start:key_end] = 1
         return mask
 
     def _write_context_kv(

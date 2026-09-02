@@ -69,6 +69,19 @@ def _mask(seq_lens, sliding_window, num_reqs=None, max_seq_len=MAX_SEQ):
 
 
 class TestDraftBlockMask:
+    @pytest.mark.parametrize("window", [None, WINDOW])
+    def test_builds_the_requested_dtype_directly(self, window):
+        mask = RBLNDFlashProposer._draft_block_mask(
+            _mask_self(window),
+            torch.tensor([4000], dtype=torch.int64),
+            1,
+            1,
+            MAX_SEQ,
+            window,
+            torch.float32,
+        )
+        assert mask.dtype == torch.float32
+
     def test_shape_is_one_row_per_query_slot(self):
         for window in (None, WINDOW):
             mask = _mask([4000], window)

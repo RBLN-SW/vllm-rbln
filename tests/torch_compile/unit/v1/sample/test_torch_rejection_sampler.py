@@ -116,6 +116,38 @@ def create_logits_tensor(
     return logits
 
 
+def create_logits_and_metadata_with_bonus(
+    spec_tokens: list[list[int]],
+    output_token_ids: list[list[int]],
+    vocab_size: int = 100,
+) -> tuple[torch.Tensor, SpecDecodeMetadata]:
+    """Create the target-row/bonus-row layout used by production."""
+    row_token_ids: list[int] = []
+    target_logits_indices: list[int] = []
+    bonus_logits_indices: list[int] = []
+    row_index = 0
+    for drafts, outputs in zip(spec_tokens, output_token_ids):
+        assert len(outputs) == len(drafts) + 1
+        row_token_ids.extend(outputs)
+        target_logits_indices.extend(range(row_index, row_index + len(drafts)))
+        row_index += len(drafts)
+        bonus_logits_indices.append(row_index)
+        row_index += 1
+
+    logits = torch.full((len(row_token_ids), vocab_size), -100.0, device=DEVICE)
+    for index, token_id in enumerate(row_token_ids):
+        logits[index, token_id] = 100.0
+
+    metadata = SpecDecodeMetadata.make_dummy(spec_tokens, device=logits.device)
+    metadata.target_logits_indices = torch.tensor(
+        target_logits_indices, dtype=torch.int32, device=logits.device
+    )
+    metadata.bonus_logits_indices = torch.tensor(
+        bonus_logits_indices, dtype=torch.int32, device=logits.device
+    )
+    return logits, metadata
+
+
 def create_sampling_metadata(
     all_greedy: bool,
     output_token_ids: list[list[int]] | None = None,
@@ -224,6 +256,72 @@ def test_all_greedy_skips_target_softmax(rejection_sampler, monkeypatch):
     )
     expected = torch.tensor([[1, 2, 3, 4]], dtype=torch.int, device=logits.device)
     assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_all_greedy_uses_one_full_logits_argmax(rejection_sampler, monkeypatch):
+    spec_tokens = [[1, 2], [3]]
+    output_tokens = [[1, 2, 5], [3, 4]]
+    logits, spec_decode_metadata = create_logits_and_metadata_with_bonus(
+        spec_tokens, output_tokens
+    )
+    metadata = create_sampling_metadata(all_greedy=True)
+    inactive_min_tokens = object.__new__(RBLNMinTokensLogitsProcessor)
+    inactive_min_tokens.min_toks = {}
+    metadata.logitsprocs.non_argmax_invariant.append(inactive_min_tokens)
+    mock_sampler_output(
+        rejection_sampler,
+        torch.tensor([5, 4], dtype=torch.int64, device=logits.device),
+    )
+
+    argmax_shapes = []
+    original_argmax = torch.Tensor.argmax
+
+    def record_argmax(tensor, *args, **kwargs):
+        argmax_shapes.append(tuple(tensor.shape))
+        return original_argmax(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "argmax", record_argmax)
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+
+    expected = torch.tensor(
+        [[1, 2, 5], [3, 4, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+    rejection_sampler.sampler.assert_not_called()
+    assert argmax_shapes == [tuple(logits.shape)]
+
+
+def test_compact_greedy_falls_back_when_logits_need_processing(rejection_sampler):
+    spec_tokens = [[1, 2, 3]]
+    output_tokens = [[1, 2, 3, 4]]
+    logits, spec_decode_metadata = create_logits_and_metadata_with_bonus(
+        spec_tokens, output_tokens
+    )
+    metadata = create_sampling_metadata(all_greedy=True)
+    metadata.no_penalties = False
+    mock_sampler_output(
+        rejection_sampler,
+        torch.tensor([4], dtype=torch.int64, device=logits.device),
+    )
+    rejection_sampler.apply_logits_processors = lambda target_logits, *_: target_logits
+
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+
+    expected = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
+    assert torch.equal(output.sampled_token_ids, expected)
+    rejection_sampler.sampler.assert_called_once()
 
 
 def test_early_mismatch(rejection_sampler):

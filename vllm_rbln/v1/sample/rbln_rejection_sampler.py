@@ -31,6 +31,7 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TEMPERATURE,
     build_op_top_k_top_p,
 )
+from vllm_rbln.v1.sample.rbln_logits_processor import RBLNMinTokensLogitsProcessor
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -116,11 +117,44 @@ class RBLNRejectionSampler(RejectionSampler):
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
+        assert logits is not None
+        holder = sampling_metadata.thinking_budget_state_holder
+        use_compact_greedy = (
+            sampling_metadata.all_greedy
+            and isinstance(self.impl, TorchRejectionSamplerImpl)
+            and not self.synthetic_mode
+            and metadata.bonus_logits_indices.numel() == len(metadata.num_draft_tokens)
+            and sampling_metadata.max_num_logprobs is None
+            and sampling_metadata.no_penalties
+            and sampling_metadata.allowed_token_ids_mask is None
+            and not sampling_metadata.bad_words_token_ids
+            and (holder is None or not holder.has_tracked_requests())
+            and all(
+                isinstance(processor, RBLNMinTokensLogitsProcessor)
+                and not processor.min_toks
+                for processor in sampling_metadata.logitsprocs.all
+            )
+        )
+        if use_compact_greedy:
+            greedy_token_ids = logits.argmax(dim=-1)
+            output_token_ids = torch_rejection_greedy_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                greedy_token_ids[target_logits_indices],
+                greedy_token_ids[bonus_logits_indices],
+                logits.shape[-1],
+            )
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
+
         # When indexing with a tensor (bonus_logits_indices), PyTorch
         # creates a new tensor with separate storage from the original
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
-        assert logits is not None
         bonus_logits = logits[bonus_logits_indices]
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
@@ -593,6 +627,37 @@ def rbln_rejection_sample(
     )
 
 
+def torch_rejection_greedy_sample(
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: list[int],
+    max_spec_len: int,
+    cu_num_draft_tokens: torch.Tensor,
+    target_argmax: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    batch_size = len(num_draft_tokens)
+    device = target_argmax.device
+    output_token_ids = torch.full(
+        (batch_size, max_spec_len + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+    torch_rejection_greedy_sample_kernel(
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        target_argmax,
+        bonus_token_ids,
+        None,
+        batch_size,
+        device,
+        vocab_size,
+    )
+    return output_token_ids
+
+
 def torch_rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -625,6 +690,17 @@ def torch_rejection_sample(
     assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_probs.shape == (num_tokens, vocab_size)
+
+    if sampling_metadata.all_greedy and not synthetic_mode:
+        return torch_rejection_greedy_sample(
+            draft_token_ids,
+            num_draft_tokens,
+            max_spec_len,
+            cu_num_draft_tokens,
+            target_probs.argmax(dim=-1),
+            bonus_token_ids,
+            vocab_size,
+        )
 
     # Create output buffer.
     output_token_ids = torch.full(
