@@ -1172,6 +1172,11 @@ class RBLNWorker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _send_handoff(self, tensors: dict) -> None:
+        """Hand this stage's output on; a seam the metrics patch wraps."""
+        # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
+        get_pp_group().send_tensor_dict(tensors)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1197,8 +1202,7 @@ class RBLNWorker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # NOTE(RBLN): DO NOT all_gather_group for RBLN pp
-        get_pp_group().send_tensor_dict(output.tensors)
+        self._send_handoff(output.tensors)
 
         # Non-last PP rank: the model runner already surfaces this rank's
         # KV-connector output through the two-phase sample_tokens() path

@@ -18,6 +18,7 @@ import types
 from typing import Any
 
 import pytest
+from vllm.sequence import IntermediateTensors
 
 import vllm_rbln.envs as envs
 import vllm_rbln.patches.metrics as pm
@@ -380,6 +381,41 @@ class TestPassBoundary:
         assert pm.execute_model(runner) == "output"
         assert not pm._ctx(runner).in_pass
 
+    def test_hand_off_output_leaves_the_pass_open(self, monkeypatch):
+        # The hand-off follows, so the pass stays open for its wall.
+        monkeypatch.setattr(
+            pm, "_execute_model", lambda self, *a, **k: IntermediateTensors({})
+        )
+        runner = _Runner()
+
+        out = pm.execute_model(runner)
+
+        assert isinstance(out, IntermediateTensors)
+        assert pm._ctx(runner).in_pass
+
+    def test_hand_off_folds_the_send_into_the_pass(self, monkeypatch, clock):
+        def fake_forward(self, *a, **k):
+            ctx = pm._ctx(self)
+            ctx.mark_phase(pm._Phase.DECODE)
+            clock.advance(1 * MS)  # dispatch cost
+            ctx.add_graph_time(1 * MS)
+            return IntermediateTensors({})
+
+        monkeypatch.setattr(pm, "_execute_model", fake_forward)
+        monkeypatch.setattr(
+            pm, "_send_handoff", lambda self, *a, **k: clock.advance(4 * MS)
+        )
+        runner = _Runner()
+        worker = types.SimpleNamespace(model_runner=runner)
+
+        pm.execute_model(runner)
+        pm.send_handoff(worker, {})
+
+        ctx = pm._ctx(runner)
+        assert not ctx.in_pass
+        assert ctx._graph[pm._Phase.DECODE].latencies == pytest.approx([5 * MS])
+        assert ctx._e2e[pm._Phase.DECODE].latencies == pytest.approx([5 * MS])
+
     def test_whole_pass_records_one_sample_per_section(self, monkeypatch):
         monkeypatch.setattr(pm, "_execute_model", lambda self, *a, **k: None)
         monkeypatch.setattr(pm, "_sample_tokens", lambda self, *a, **k: "out")
@@ -598,7 +634,7 @@ class TestDescriptors:
             for d in registry.get_registered_patch_descriptors()
             if d.owner_module == "vllm_rbln.patches.metrics"
         ]
-        assert len(ours) == 8
+        assert len(ours) == 9
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target
