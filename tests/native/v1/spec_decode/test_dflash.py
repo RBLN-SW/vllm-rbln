@@ -398,7 +398,7 @@ class TestDraftOutputOwnership:
         )
         proposer._write_context_kv = lambda *args: None
 
-        static_output = torch.empty(3, dtype=torch.int64)
+        static_output = torch.empty(3, dtype=torch.int32)
         call_index = 0
 
         def run_query(*args):
@@ -407,7 +407,7 @@ class TestDraftOutputOwnership:
             static_output.copy_(
                 torch.tensor(
                     [10 * call_index + offset for offset in range(3)],
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                 )
             )
             proposer._dropped_rows = torch.tensor([False])
@@ -494,6 +494,18 @@ class TestDraftVocabularyMapping:
         out = proposer._to_target_token_ids(draft_logits.argmax(dim=-1))
 
         assert out.tolist() == full_logits.argmax(dim=-1).tolist()
+
+    @pytest.mark.parametrize("mapped", [True, False])
+    def test_the_map_takes_the_graphs_int32_ids(self, mapped):
+        """The query graph narrows its argmax to int32; the host-side map
+        indexes with that and still hands the scheduler int64 ids."""
+        d2t = torch.tensor([0, 2, 3, 5, 8, 11], dtype=torch.long) if mapped else None
+        proposer = self._proposer(self._FakeMappedDraft(d2t))
+
+        out = proposer._to_target_token_ids(torch.tensor([0, 1, 5], dtype=torch.int32))
+
+        assert out.dtype == torch.int64
+        assert out.tolist() == ([0, 3, 16] if mapped else [0, 1, 5])
 
 
 class TestRedirectTarget:

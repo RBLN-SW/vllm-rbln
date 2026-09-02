@@ -272,9 +272,12 @@ class RBLNDFlashProposer(DFlashProposer):
                 token_indices_to_sample
             ]
             logits = self._compute_draft_logits(hidden_states)
-            # NOTE(RBLN): the greedy pick belongs in the graph.
-            draft_ids = torch.ops.rbln.argmax(logits)
-            return self._to_target_token_ids(draft_ids)
+            # NOTE(RBLN): the greedy pick belongs in the graph, and so does
+            # narrowing it. The target vocabulary fits in int32; an int64
+            # result is two words across the runtime ABI and has intermittently
+            # come back with mismatched halves, an invalid id the runner's
+            # int32 token buffer then failed on. `propose` maps the narrow ids.
+            return torch.ops.rbln.argmax(logits).to(torch.int32)
 
         compile_kwargs = dict(
             dynamic=False,
