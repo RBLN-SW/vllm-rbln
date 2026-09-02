@@ -14,7 +14,7 @@
 
 from collections import defaultdict
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 import numpy as np
@@ -629,7 +629,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         areas: int,
         slices: int,
         *,
-        side: str,
+        side: Literal["local", "peer"],
     ) -> tuple[int, int]:
         """(first head this shard owns, heads per logical slice).
 
