@@ -170,6 +170,9 @@ class RBLNDFlashProposer(DFlashProposer):
         draft_ids = draft_ids[: num_reqs * self.num_speculative_tokens].view(
             num_reqs, self.num_speculative_tokens
         )
+        # The query graph uses a reusable static output buffer. Own this
+        # request's ids before the next invocation can overwrite that storage.
+        draft_ids = draft_ids.clone()
         # Outside the graph on purpose, as the chained drafter does it: the
         # index is the argmax result, which the compiled subgraph above cannot
         # const-fold.

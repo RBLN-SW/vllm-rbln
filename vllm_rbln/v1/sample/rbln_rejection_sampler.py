@@ -154,8 +154,14 @@ class RBLNRejectionSampler(RejectionSampler):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
-        # Compute probability distribution from target logits.
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        # Greedy rejection uses only argmax, which is invariant under softmax.
+        # The RBLN implementation still requires probabilities as its ABI.
+        if sampling_metadata.all_greedy and isinstance(
+            self.impl, TorchRejectionSamplerImpl
+        ):
+            target_probs = target_logits
+        else:
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
         output_token_ids = self.impl.rejection_sample(
             metadata.draft_token_ids,

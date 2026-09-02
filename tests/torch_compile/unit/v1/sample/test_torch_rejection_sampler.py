@@ -200,6 +200,32 @@ def test_perfect_match(rejection_sampler):
     assert torch.equal(output.sampled_token_ids, expected)
 
 
+def test_all_greedy_skips_target_softmax(rejection_sampler, monkeypatch):
+    """Greedy rejection only needs the target argmax, not probabilities."""
+    spec_tokens = [[1, 2, 3]]
+    output_tokens = [[1, 2, 3, 4]]
+
+    metadata = create_sampling_metadata(all_greedy=True)
+    logits = create_logits_tensor(output_tokens)
+    bonus_token_tensor = torch.tensor([output_tokens[0][-1]], device=logits.device)
+    spec_decode_metadata = create_spec_decode_metadata(spec_tokens, logits)
+    mock_sampler_output(rejection_sampler, bonus_token_tensor)
+
+    def fail_softmax(*args, **kwargs):
+        raise AssertionError("all-greedy rejection must not compute target softmax")
+
+    monkeypatch.setattr(torch.Tensor, "softmax", fail_softmax)
+
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+    expected = torch.tensor([[1, 2, 3, 4]], dtype=torch.int, device=logits.device)
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
 def test_early_mismatch(rejection_sampler):
     """Test when there's an early mismatch in tokens"""
     spec_tokens = [[1, 2, 3]]

@@ -368,6 +368,59 @@ class TestSchedulerCapacity:
         assert proposer.arange_cpu.shape == (NUM_SPEC + 1,)
 
 
+class TestDraftOutputOwnership:
+    def test_propose_snapshots_reused_static_query_output(self):
+        proposer = object.__new__(RBLNDFlashProposer)
+        proposer.runner = SimpleNamespace(
+            input_batch=SimpleNamespace(num_reqs=1),
+        )
+        proposer.supports_mm_inputs = False
+        proposer.num_speculative_tokens = 3
+        proposer.hidden_size = 4
+        proposer.draft_id_to_target_id = None
+        proposer._fill_first_pass_inputs = lambda *args: (
+            0,
+            torch.zeros(1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+        )
+        proposer._write_context_kv = lambda *args: None
+
+        static_output = torch.empty(3, dtype=torch.int64)
+        call_index = 0
+
+        def run_query(*args):
+            nonlocal call_index
+            call_index += 1
+            static_output.copy_(
+                torch.tensor(
+                    [10 * call_index + offset for offset in range(3)],
+                    dtype=torch.int64,
+                )
+            )
+            proposer._dropped_rows = torch.tensor([False])
+            return static_output
+
+        proposer._run_query_pass = run_query
+
+        def propose():
+            return RBLNDFlashProposer.propose(
+                proposer,
+                target_token_ids=torch.zeros(1, dtype=torch.int32),
+                target_positions=torch.zeros(1, dtype=torch.int64),
+                target_hidden_states=torch.zeros(1, proposer.hidden_size),
+                next_token_ids=torch.zeros(1, dtype=torch.int32),
+                token_indices_to_sample=None,
+                common_attn_metadata=object(),
+            )
+
+        first = propose()
+        expected_first = first.clone()
+        second = propose()
+
+        assert first.tolist() == expected_first.tolist()
+        assert second.tolist() == [[20, 21, 22]]
+
+
 class TestDraftVocabularyMapping:
     class _FakeMappedDraft:
         def __init__(self, d2t):
