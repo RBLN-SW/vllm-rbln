@@ -163,8 +163,9 @@ class RBLNDFlashProposer(DFlashProposer):
             ctx_starts,
             valid_ctx_lens,
         )
-        # One draft id per mask position, so the flat result holds
-        # `num_reqs * num_speculative_tokens` ids -- not one per request.
+        # One draft id per mask position: the flat result holds
+        # `num_reqs_padded * num_speculative_tokens` ids, real rows first, so
+        # the leading `num_reqs * num_speculative_tokens` are the drafts.
         draft_ids = draft_ids[: num_reqs * self.num_speculative_tokens].view(
             num_reqs, self.num_speculative_tokens
         )
@@ -726,31 +727,57 @@ class RBLNDFlashProposer(DFlashProposer):
             torch.int64
         )
 
+        # The draft batch is the decode bucket the target verifies at, not the
+        # live request count. The runner pads the target to its smallest fitting
+        # bucket, and a drafter that stayed at the live count ran a batch shape
+        # the target never did -- one warmup never compiled, and the batch
+        # asymmetry behind the acceptance collapse under padded verification.
+        # Real rows lead; the caller discards the padded tail.
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs, num_query_total, False, first_pass=False
+        )
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_query_total_padded = num_reqs_padded * num_query_per_req
+        assert num_query_total_padded <= self.max_num_tokens, (
+            f"the {num_reqs_padded}-request decode bucket needs "
+            f"{num_query_total_padded} draft query tokens, more than the "
+            f"{self.max_num_tokens}-token buffers: every decode bucket times "
+            f"{num_query_per_req} has to fit max_num_batched_tokens"
+        )
+        if num_query_total_padded > num_query_total:
+            # Padded rows hold whatever the previous step left in the buffers.
+            # They attend to nothing and their drafts are dropped, but define
+            # them anyway so the padded graph's inputs are reproducible.
+            self.input_ids[num_query_total:num_query_total_padded] = (
+                self.parallel_drafting_token_id
+            )
+            self.positions[num_query_total:num_query_total_padded] = 0
+
         per_layer = self._build_draft_attn_metadata(
             query_cad,
             block_starts,
             num_reqs,
-            num_reqs,
-        )
-        # `RBLNDPMetadata.make` requires this to be None off the DP path.
-        _, num_tokens_across_dp = self._determine_batch_execution_and_padding(
-            num_reqs, num_query_total, False, first_pass=False
+            num_reqs_padded,
         )
         with set_forward_context(
             per_layer,
             self.vllm_config,
             num_tokens=num_query_total,
             num_tokens_across_dp=num_tokens_across_dp,
-            num_padded_tokens=(
-                num_query_total if num_tokens_across_dp is not None else None
-            ),
+            # None off the DP path, which `RBLNDPMetadata.make` requires; the
+            # token dimension the step settled on otherwise.
+            num_padded_tokens=batch_desc.num_tokens_padded,
             **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
         ):
             return self.model_executable(
-                input_ids=self.input_ids[:num_query_total].view(num_reqs, -1),
-                positions=self.positions[:num_query_total].view(num_reqs, -1),
+                input_ids=self.input_ids[:num_query_total_padded].view(
+                    num_reqs_padded, -1
+                ),
+                positions=self.positions[:num_query_total_padded].view(
+                    num_reqs_padded, -1
+                ),
                 token_indices_to_sample=self._sample_indices(
-                    num_reqs, num_query_per_req
+                    num_reqs_padded, num_query_per_req
                 ),
             )
 
