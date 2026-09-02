@@ -28,6 +28,30 @@ from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
 logger = init_logger(__name__)
 
 
+def _routing_mask_dtype(
+    routing_weights, e_score_correction_bias, *, scoring_func, use_grouped_topk
+):
+    # The compiler folds the routing chain built below into a single fused
+    # routing op, and that op's output follows the wider of (scores,
+    # e_score_correction_bias) -- bf16 scores with an fp32 bias come back fp32.
+    # The mask multiplied into those weights has to follow the same rule: a
+    # narrower mask makes the fused multiply a dtype mismatch the compiler
+    # rejects, while a wider one is always safe because torch promotes the
+    # product.
+    #
+    # Only the branches that add the bias to the scores put it in that chain.
+    # The non-grouped softmax and plain-topk branches score without it, so the
+    # fused op keeps the weights' own dtype there and a widened mask would just
+    # promote the whole [E, t] table for nothing.
+    dtype = routing_weights.dtype
+    bias_is_routed = use_grouped_topk or scoring_func == "sigmoid"
+    if e_score_correction_bias is None or not bias_is_routed:
+        return dtype
+    if e_score_correction_bias.dtype.itemsize > dtype.itemsize:
+        return e_score_correction_bias.dtype
+    return dtype
+
+
 class RBLNMoERunner(MoERunner):
     """RBLN out-of-tree MoERunner.
     (See [#41184](https://github.com/vllm-project/vllm/pull/41184).)
@@ -262,7 +286,14 @@ class RBLNMoERunner(MoERunner):
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(
-                    max_pad, device=masked_routing_weights.device
+                    max_pad,
+                    device=masked_routing_weights.device,
+                    dtype=_routing_mask_dtype(
+                        masked_routing_weights,
+                        e_score_correction_bias,
+                        scoring_func=scoring_func,
+                        use_grouped_topk=use_grouped_topk,
+                    ),
                 ).transpose(1, 0)  # [1, R*max_pad]
                 masked_routing_weights = masked_routing_weights * tokens_mask
 
@@ -283,6 +314,11 @@ class RBLNMoERunner(MoERunner):
                     e, R * max_pad
                 )  # (e, T)
 
+                # send_mask is registered as float32, but the ccl kernels
+                # matmul it against these routing slices (send_mask @ send_rl
+                # in ccl_dispatch_send
+                send_mask = self.send_mask.to(masked_routing_weights.dtype)
+
             # --- Step 4: Dispatch tokens across DP ranks ---
             if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
                 # --- all2all dispatch path ---
@@ -292,7 +328,7 @@ class RBLNMoERunner(MoERunner):
                 send_buffer, send_sizes = torch.ops.rbln_custom_ops.ccl_dispatch_send(
                     hidden_flat,
                     send_rl,
-                    self.send_mask,
+                    send_mask,
                     self.moe_parallel_config.dp_rank,
                 )
 
@@ -349,11 +385,11 @@ class RBLNMoERunner(MoERunner):
 
                 # ccl_combine_receive: unpack + sum-reduce → (max_pad, H)
                 # send_rl (E, max_pad): this rank's full expert routing
-                # self.send_mask: reused as expert_map (same matrix)
+                # send_mask: reused as expert_map (same matrix)
                 final_hidden_states = torch.ops.rbln_custom_ops.ccl_combine_receive(
                     combine_recv_buf,
                     send_rl,
-                    self.send_mask,
+                    send_mask,
                     combine_3d[
                         self.moe_parallel_config.dp_rank
                     ],  # local rank's own contribution
@@ -480,7 +516,14 @@ class RBLNMoERunner(MoERunner):
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(
-                num_tokens, device=masked_routing_weights.device
+                num_tokens,
+                device=masked_routing_weights.device,
+                dtype=_routing_mask_dtype(
+                    masked_routing_weights,
+                    e_score_correction_bias,
+                    scoring_func=scoring_func,
+                    use_grouped_topk=use_grouped_topk,
+                ),
             ).transpose(1, 0)  # [1, t]
 
             # [t, E] * [t, 1] (broadcast)

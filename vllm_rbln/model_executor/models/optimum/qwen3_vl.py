@@ -15,14 +15,12 @@ from dataclasses import replace
 from typing import Any
 
 import torch
-from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
 
 from .base import ModelInputForRBLN
-from .optimum_attention import AttentionManager, LinearAttentionStrategy
 from .qwen2_vl import MODALITIES, RBLNOptimumQwen2_5_VLForConditionalGeneration
 
 logger = init_logger(__name__)
@@ -277,7 +275,7 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
                 return None
             num_layers = len(present[0][key])
             return [
-                torch.cat([c[key][layer].to(self.dtype) for c in present], dim=0)
+                torch.cat([c[key][layer] for c in present], dim=0)
                 for layer in range(num_layers)
             ]
 
@@ -358,29 +356,14 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     single tensor). It inherits the multimodal prefill path from Qwen2.5-VL.
     """
 
-    def __init__(self, vllm_config: VllmConfig) -> None:
-        super().__init__(vllm_config=vllm_config)
-        # Per-request (batch_idx) into the [max_num_seqs] conv/recurrent state cache.
-        self.attention_manager: AttentionManager = AttentionManager(
-            LinearAttentionStrategy()
-        )
-
     def _decode_batch_indices(self, model_input: ModelInputForRBLN) -> torch.Tensor:
         """The state-cache row (batch_idx) of each running request, in running
         order, as a tensor. This is only the index: the actual row placement is
         done by the scatter (input_block_ids in forward / compute_decode_position_embed)
         and undone by the logits gather (batch_indices in forward).
         """
-        running = model_input.running_requests_ids
-        table_ids = self.attention_manager.get(
-            False, self.decoder_batch_size, running, []
-        )
-        return self.attention_manager.preprocess(
-            table_ids,
-            model_input.input_positions,
-            len(running),
-            self.decoder_batch_size,
-        )
+        assert model_input.cache_slot_ids is not None
+        return model_input.cache_slot_ids.to(torch.long)
 
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
         pass
@@ -434,11 +417,8 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         block_tables = model_input.block_tables
 
         if model_input.is_prompt:
-            req_id = model_input.running_requests_ids[0]
-            batch_idx = self.attention_manager.get(
-                True, self.decoder_batch_size, [req_id], []
-            )[0]
-            self.attention_manager.add(req_id, batch_idx)
+            assert model_input.cache_slot_ids is not None
+            batch_idx = int(model_input.cache_slot_ids[0])
             kw = self.preprocess_for_decoder(
                 True, block_tables, input_ids, cache_position
             )
@@ -460,7 +440,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
             input_block_ids=batch_indices,
         )
         input_ids = kw.pop("input_ids")
-        inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+        inputs_embeds = self.model.embed_tokens(input_ids)
         self.model.decoder = self.model.decoders[self.decoder_batch_size]
         logits = self.model.decoder(
             inputs_embeds=inputs_embeds,

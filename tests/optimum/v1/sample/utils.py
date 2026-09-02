@@ -208,6 +208,7 @@ def _schedule_new_request_from_request(
         cached_block_table=[],
         cached_length=[],
         dummy_block=None,
+        cache_slot_id_dict={req.request_id: 0},
     )
 
 
@@ -257,6 +258,7 @@ def _schedule_cached_reqs(
         cached_block_table=[],
         cached_length=[],
         dummy_block=None,
+        cache_slot_id_dict={req.request_id: i for i, req in enumerate(reqs)},
     )
 
 
@@ -280,7 +282,7 @@ def create_model_runner(
             1,
         )
     runner = RBLNOptimumModelRunner(vllm_config, DEVICE)
-    fake_load_model(runner, decoder_batch_sizes, model_dtype=dtype)
+    fake_load_model(runner, decoder_batch_sizes)
     return runner
 
 

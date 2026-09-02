@@ -265,4 +265,4 @@ class TestCompilerConformance:
 
         params = inspect.signature(CompileContext).parameters
         assert "use_weight_sharing" in params
-        assert "use_global_ctx" in params
+        assert "use_global_ctx" not in params  # deprecated kwargs

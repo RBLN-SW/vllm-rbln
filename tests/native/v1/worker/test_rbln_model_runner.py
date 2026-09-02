@@ -29,8 +29,9 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.outputs import SamplerOutput
+from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
@@ -40,6 +41,7 @@ import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
 from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
     ExponentialBucketingManager,
 )
@@ -55,6 +57,7 @@ from vllm_rbln.v1.worker.rbln_model_runner import (
     _depad_sampler_output,
     _pad_rows,
     _pad_sampling_metadata,
+    _pad_spec_decode_metadata,
 )
 
 
@@ -85,7 +88,9 @@ def _make_runner_stub(**attrs):
     return runner
 
 
-def _sampling_metadata(n, *, no_penalties=True, spec_token_ids=None):
+def _sampling_metadata(
+    n, *, no_penalties=True, spec_token_ids=None, allowed_token_ids_mask=None
+):
     return SamplingMetadata(
         temperature=torch.ones(n),
         all_greedy=False,
@@ -100,12 +105,28 @@ def _sampling_metadata(n, *, no_penalties=True, spec_token_ids=None):
         presence_penalties=torch.zeros(n),
         repetition_penalties=torch.ones(n),
         output_token_ids=[[] for _ in range(n)],
-        allowed_token_ids_mask=None,
+        allowed_token_ids_mask=allowed_token_ids_mask,
         bad_words_token_ids={},
         logitsprocs=None,
         logprob_token_ids=None,
         spec_token_ids=spec_token_ids,
         thinking_budget_state_holder=None,
+    )
+
+
+def _spec_decode_metadata(num_draft_tokens: list[int]) -> SpecDecodeMetadata:
+    num_sampled_tokens = [n + 1 for n in num_draft_tokens]
+    cu_sampled = torch.tensor(num_sampled_tokens, dtype=torch.int32).cumsum(0)
+    cu_draft = torch.tensor(num_draft_tokens, dtype=torch.int32).cumsum(0)
+    total_draft = int(cu_draft[-1])
+    return SpecDecodeMetadata(
+        draft_token_ids=torch.zeros(total_draft, dtype=torch.int32),
+        num_draft_tokens=list(num_draft_tokens),
+        cu_num_draft_tokens=cu_draft,
+        cu_num_sampled_tokens=cu_sampled,
+        target_logits_indices=torch.arange(total_draft, dtype=torch.int32),
+        bonus_logits_indices=cu_sampled - 1,
+        logits_indices=torch.arange(int(cu_sampled[-1]), dtype=torch.int32),
     )
 
 
@@ -203,11 +224,137 @@ class TestPadDepad:
         assert len(p.output_token_ids) == 4
         assert p.output_token_ids[2] == []
 
+    def test_pad_sampling_metadata_pads_allowed_token_ids_mask(self):
+        mask = torch.zeros(2, 10, dtype=torch.bool)
+        mask[0, 3] = True
+        p = _pad_sampling_metadata(
+            _sampling_metadata(2, allowed_token_ids_mask=mask), 4
+        )
+        assert p.allowed_token_ids_mask.shape == (4, 10)
+        assert torch.equal(p.allowed_token_ids_mask[:2], mask)
+
     def test_depad_sampler_output_trims_to_num_reqs(self):
         out = SamplerOutput(
             sampled_token_ids=torch.arange(4).reshape(4, 1), logprobs_tensors=None
         )
         assert _depad_sampler_output(out, 2).sampled_token_ids.shape == (2, 1)
+
+    def test_depad_sampler_output_keeps_every_speculative_logprob_position(self):
+        batch_size = 4
+        output_width = 3
+        out = SamplerOutput(
+            sampled_token_ids=torch.zeros(
+                (batch_size, output_width), dtype=torch.int32
+            ),
+            logprobs_tensors=LogprobsTensors(
+                torch.zeros((batch_size * output_width, 2), dtype=torch.int32),
+                torch.zeros((batch_size * output_width, 2)),
+                torch.zeros(batch_size * output_width, dtype=torch.int32),
+            ),
+        )
+
+        depadded = _depad_sampler_output(out, 2)
+
+        assert depadded.sampled_token_ids.shape == (2, output_width)
+        assert depadded.logprobs_tensors is not None
+        assert depadded.logprobs_tensors.logprobs.shape[0] == 2 * output_width
+
+    def test_pad_spec_decode_metadata_preserves_packed_token_axes(self):
+        original = _spec_decode_metadata([1, 1])
+
+        padded = _pad_spec_decode_metadata(original, 4)
+
+        assert padded.num_draft_tokens == [1, 1, 0, 0]
+        assert padded.cu_num_draft_tokens.shape[0] == 4
+        assert padded.cu_num_sampled_tokens.shape[0] == 4
+        assert padded.bonus_logits_indices.shape[0] == 4
+        assert padded.max_spec_len == original.max_spec_len
+        assert torch.equal(padded.target_logits_indices, original.target_logits_indices)
+        assert torch.equal(padded.logits_indices, original.logits_indices)
+
+    def test_padded_metadata_breaks_the_eagle_reader_it_would_reach(self):
+        # Why the pad lives in _sample, not in the producer: this reader
+        # differences cu_num_draft_tokens against num_reqs-sized tensors.
+        padded = _pad_spec_decode_metadata(_spec_decode_metadata([1, 1]), 4)
+
+        with pytest.raises(RuntimeError):
+            eagle_prepare_inputs_padded(
+                padded.cu_num_draft_tokens,
+                torch.tensor([2, 2], dtype=torch.int32),
+                torch.tensor([0, 2, 4], dtype=torch.int32),
+            )
+
+
+class TestSamplePadding:
+    @staticmethod
+    def _runner(rejection_output: SamplerOutput):
+        rejection_sampler = MagicMock(return_value=rejection_output)
+        runner = _make_runner_stub(
+            _is_prefill_step=False,
+            use_async_scheduling=False,
+            input_batch=SimpleNamespace(
+                num_reqs=2,
+                sampling_metadata=_sampling_metadata(2, spec_token_ids=[[], []]),
+            ),
+            bucketing_manager=SimpleNamespace(
+                decode_batch_buckets=[2, 4], max_batch_size=4
+            ),
+            max_num_reqs=8,
+            rejection_sampler=rejection_sampler,
+        )
+        return runner, rejection_sampler
+
+    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self, monkeypatch):
+        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", True)
+        output = SamplerOutput(
+            sampled_token_ids=torch.zeros((4, 3), dtype=torch.int32),
+            logprobs_tensors=None,
+        )
+        runner, rejection_sampler = self._runner(output)
+
+        runner._sample(torch.zeros((4, 10)), _spec_decode_metadata([1, 1]))
+
+        padded_metadata = rejection_sampler.call_args.args[0]
+        assert len(padded_metadata.num_draft_tokens) == 4
+
+    def test_torch_rejection_sampler_keeps_live_batch_metadata(self, monkeypatch):
+        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", False)
+        output = SamplerOutput(
+            sampled_token_ids=torch.zeros((2, 3), dtype=torch.int32),
+            logprobs_tensors=None,
+        )
+        runner, rejection_sampler = self._runner(output)
+        spec_decode_metadata = _spec_decode_metadata([1, 1])
+        sampling_metadata = runner.input_batch.sampling_metadata
+
+        runner._sample(torch.zeros((4, 10)), spec_decode_metadata)
+
+        assert rejection_sampler.call_args.args[0] is spec_decode_metadata
+        assert rejection_sampler.call_args.args[3] is sampling_metadata
+
+
+def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
+    monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", True)
+    rejection_sample = MagicMock()
+    runner = _make_runner_stub(
+        speculative_config=object(),
+        num_spec_tokens=2,
+        is_pooling_model=False,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 10),
+        device=torch.device("cpu"),
+        bucketing_manager=SimpleNamespace(
+            decode_batch_buckets=[2, 4], max_batch_size=4
+        ),
+        max_num_reqs=8,
+        rejection_sampler=SimpleNamespace(
+            impl=SimpleNamespace(rejection_sample=rejection_sample)
+        ),
+    )
+
+    runner._warmup_sampler_decode_batches()
+
+    assert rejection_sample.call_count == 1
+    assert len(rejection_sample.call_args.args[1]) == 4
 
 
 class TestPredicates:

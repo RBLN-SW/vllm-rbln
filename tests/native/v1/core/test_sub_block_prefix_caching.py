@@ -17,6 +17,7 @@
 # connector. Matching itself is in test_rbln_kv_cache_manager.py.
 
 import pytest
+from vllm.v1.request import RequestStatus
 
 from tests.native.v1.core.utils import (
     MockKVConfig,
@@ -180,6 +181,29 @@ class TestSubBlockVersusKVConnector:
         # The sub-block match did happen, so the count could have been inflated.
         assert len(out.kv_cache_copy_ops) == 1
         assert seen[-1] == 0
+
+    def test_resume_from_preemption_skips_the_sub_block_match(self):
+        # The connector is queried once, with the block-aligned local count,
+        # and LMCache asserts on resume that the request restarts exactly
+        # there. A sub-block match would move the resume point past it, so
+        # a resuming request does not take one while a connector is present.
+        sched = self._scheduler(matched_tokens=0)
+        self._cache_one_block(sched, [0] * BLOCK_SIZE)
+
+        tokens = [0] * SUB_BLOCK_SIZE + [900 + i for i in range(SUB_BLOCK_SIZE)]
+        req = make_request("1", tokens, BLOCK_SIZE, max_tokens=4)
+        sched.add_request(req)
+        out = sched.schedule()
+        assert len(out.kv_cache_copy_ops) == 1
+        sched.update_from_output(out, make_model_runner_output(out, 0))
+
+        sched.running.remove(req)
+        sched._preempt_request(req, 0.0)
+        assert req.status == RequestStatus.PREEMPTED
+
+        out = sched.schedule()
+        assert out.kv_cache_copy_ops == []
+        assert out.num_scheduled_tokens["1"] == req.num_tokens
 
 
 class TestSubBlockPrefixHitRun:

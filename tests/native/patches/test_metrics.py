@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import types
 from typing import Any
@@ -521,6 +522,46 @@ class TestModelExecutable:
         assert calls == [{"step": 1}, {"step": 2}]
 
 
+class TestTimedRegion:
+    """Spec decode's device wait sits in the postprocess gather, an inline region:
+    timed_region must fold exactly that one into the graph sum, and only while a
+    pass is open."""
+
+    def _in_pass(self, ctx, clock, monkeypatch):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        ctx.start_pass()
+
+    def test_graph_region_adds_graph_time(self, ctx, clock, monkeypatch):
+        self._in_pass(ctx, clock, monkeypatch)
+        with pm.timed_region("rbln_model_runner: postprocess"):
+            clock.advance(3 * MS)
+        assert ctx._graph_latency == pytest.approx(3 * MS)
+
+    def test_other_regions_do_not_touch_graph_time(self, ctx, clock, monkeypatch):
+        self._in_pass(ctx, clock, monkeypatch)
+        with pm.timed_region("rbln_model_runner: preprocess"):
+            clock.advance(3 * MS)
+        assert ctx._graph_latency is None
+
+    def test_no_pass_open_is_a_no_op(self, ctx, clock, monkeypatch):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        with pm.timed_region("rbln_model_runner: postprocess"):
+            clock.advance(3 * MS)
+        assert ctx._graph_latency is None
+
+    def test_no_active_ctx_is_a_no_op(self, clock, monkeypatch):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", None)
+        with pm.timed_region("rbln_model_runner: postprocess"):
+            clock.advance(3 * MS)
+
+    def test_the_region_literal_matches_the_runner_source(self):
+        # timed_region matches execute_model's region by its literal name, so a
+        # rename in the runner would silently drop the spec-decode device wait
+        # from the graph sum. Pin the string to the source it must match.
+        source = inspect.getsource(pm._execute_model)
+        assert f'"{pm._GRAPH_REGION}"' in source
+
+
 class TestShutdown:
     def test_stats_are_reported_before_teardown(self, monkeypatch):
         order: list[str] = []
@@ -557,7 +598,7 @@ class TestDescriptors:
             for d in registry.get_registered_patch_descriptors()
             if d.owner_module == "vllm_rbln.patches.metrics"
         ]
-        assert len(ours) == 7
+        assert len(ours) == 8
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target
