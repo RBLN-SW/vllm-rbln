@@ -172,6 +172,8 @@ def _make_worker(
     w.transfer_topo.tp_size = 1
     w.vllm_config = MagicMock()
     w.vllm_config.parallel_config.pipeline_parallel_size = 1
+    # No speculative decoding: the compat hash then folds what it always did.
+    w.vllm_config.speculative_config = None
     w.compat_hash = compat
     w.enforce_compat_hash = True
     w._sw_ratio = sw_ratio
@@ -738,6 +740,7 @@ class TestValidateRemoteAgentHandshake:
         w.dst_num_blocks = {"eng": dst_num_blocks}
         w.vllm_config = MagicMock()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
+        w.vllm_config.speculative_config = None
         w._kv_areas = 1
         w._kv_slices = 1
         w._kv_split_axis = KVSplitAxis.HEAD
@@ -1003,22 +1006,37 @@ class TestHeadBandMatching:
     """
 
     @staticmethod
-    def _worker(*, tp_rank, tp_size, areas, slices, n_logical, block_len):
+    def _worker(*, tp_rank, tp_size, areas, slices, n_logical, block_len, kv_heads=8):
+        # `block_len` and `kv_heads` take a list to give each logical region its
+        # own geometry; a scalar applies to every region.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.tp_rank = tp_rank
         w._kv_areas = areas
         w._kv_slices = slices
-        w.block_len_per_layer = [block_len] * (n_logical * areas)
+        block_lens = (
+            list(block_len) if isinstance(block_len, list) else [block_len] * n_logical
+        )
+        w.block_len_per_layer = [ln for ln in block_lens for _ in range(areas)]
+        w._logical_region_kv_heads = (
+            list(kv_heads) if isinstance(kv_heads, list) else [kv_heads] * n_logical
+        )
         topo = MagicMock()
         topo.tp_size = tp_size
-        topo.total_num_kv_heads = 8
+        topo.total_num_kv_heads = w._logical_region_kv_heads[0]
         w.transfer_topo = topo
-        w.get_backend_aware_kv_block_len = lambda layer_idx, **_: block_len
+        w.get_backend_aware_kv_block_len = lambda layer_idx, **_: w.block_len_per_layer[
+            layer_idx
+        ]
         return w
 
     @staticmethod
     def _meta(*, areas, slices, n_logical, block_len, num_blocks=2, base=1000):
         n = n_logical * areas
+        block_lens = (
+            [ln for ln in block_len for _ in range(areas)]
+            if isinstance(block_len, list)
+            else [block_len] * n
+        )
         return _agent_meta(
             kv_areas=areas,
             kv_slices=slices,
@@ -1026,7 +1044,7 @@ class TestHeadBandMatching:
             device_id=0,
             # Distinct, easily-read bases: region i starts at base * (i + 1).
             kv_caches_base_addr=[base * (i + 1) for i in range(n)],
-            block_lens=[block_len] * n,
+            block_lens=block_lens,
         )
 
     def test_slice_head_bounds(self):
@@ -1174,6 +1192,26 @@ class TestHeadBandMatching:
             4256,  # area 1
         ]
 
+    def test_a_draft_region_is_banded_by_its_own_head_count(self):
+        # The target's 8 heads cut cleanly over TP2 x 4 areas while the draft's 4
+        # do not, so the draft's region has no band and the divisibility guard is
+        # what has to say so. A model-config count takes the target's for both
+        # and computes one anyway.
+        w = self._worker(
+            tp_rank=0,
+            tp_size=2,
+            areas=4,
+            slices=4,
+            n_logical=2,
+            block_len=[256, 128],
+            kv_heads=[8, 4],
+        )
+        meta = self._meta(
+            areas=4, slices=4, n_logical=2, block_len=[512, 256], num_blocks=2
+        )
+        with pytest.raises(RuntimeError, match="cut into 4 logical slice"):
+            w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
+
     def test_a_replicating_peer_is_read_past_its_replica_areas(self):
         """P TP4 -> D TP1: the peer's rank holds 2 of the 8 heads and repeats
         each over 2 of its 4 areas, so its second head begins at its area 2.
@@ -1253,17 +1291,18 @@ class TestHeadBandMatching:
         assert [a for a, _, _ in out] == [500, 600, 700, 800]
 
     def test_incommensurate_slices_raise(self):
-        # 3 heads per area against 2 does not divide; refuse rather than
-        # transfer a partial head.
+        # The peer cuts its heads 3 ways against our 2, so its slice is not a
+        # whole fraction of ours; refuse rather than transfer a partial head.
         with pytest.raises(RuntimeError, match="does not divide it"):
-            RblnNixlPullConnectorWorker._head_split(3, 2)
+            RblnNixlPullConnectorWorker._head_split(2, 3)
 
     def test_head_split_is_one_unless_we_are_coarser(self):
+        # More cuts means a finer slice; our area splits only when the peer is finer.
         f = RblnNixlPullConnectorWorker._head_split
         assert f(1, 1) == 1  # equal granularity
-        assert f(1, 2) == 1  # peer coarser -> offset, not split
-        assert f(2, 1) == 2  # we are coarser -> two pieces
-        assert f(4, 1) == 4
+        assert f(2, 1) == 1  # peer coarser -> offset, not split
+        assert f(1, 2) == 2  # peer finer -> two pieces
+        assert f(1, 4) == 4
 
     @pytest.mark.parametrize(
         ("tp_size", "local", "peer", "remote_tp_size", "tp_ratio", "expected"),
@@ -1586,6 +1625,7 @@ class TestPpConstraints:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.vllm_config = MagicMock()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
+        w.vllm_config.speculative_config = None
         w.transfer_topo = MagicMock()
         w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
@@ -1665,6 +1705,7 @@ class TestPublishHandshakeMetadata:
         # _check_pp_constraints reads these; a plain PP producer passes.
         w.vllm_config = MagicMock()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
+        w.vllm_config.speculative_config = None
         w.transfer_topo = MagicMock()
         w.transfer_topo.cross_layers_blocks = False
         w._has_mamba = False
@@ -1751,6 +1792,19 @@ class TestPublishHandshakeMetadata:
         )
         w._publish_handshake_metadata = MagicMock()
         kv_caches = {"l0": MagicMock(), "l1": MagicMock()}
+        # Registration reads the layer specs and the transfer table upstream
+        # fills, to record each region's head count.
+        w._layer_specs = {
+            name: MagicMock(page_size_bytes=4096, num_kv_heads=8) for name in kv_caches
+        }
+        w.block_len_per_layer = [2048, 2048, 2048, 2048]
+        w.world_size = 1
+        # A layer's head count is accepted only if a model in this engine has it:
+        # the target's, or a speculative draft's where there is one.
+        w.model_config = MagicMock()
+        w.model_config.get_total_num_kv_heads.return_value = 8
+        w.vllm_config = MagicMock()
+        w.vllm_config.speculative_config = None
 
         with patch.object(NixlBaseConnectorWorker, "register_kv_caches"):
             w.register_kv_caches(kv_caches)
@@ -1865,16 +1919,22 @@ class TestHeadMatchedHandshakeChecks:
     # over host-bounce, so this branch is unreachable from them.
 
     @staticmethod
-    def _worker(*, local_len=128, block_size_ratio=1, layout="NHD"):
+    def _worker(*, local_len=128, block_size_ratio=1, layout="NHD", kv_heads=8):
+        # `local_len` and `kv_heads` take a list for one entry per logical region;
+        # the transfer table repeats each across the 4 chiplet areas.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.tp_rank = 1
         w.kv_cache_layout = layout
-        w.block_len_per_layer = [local_len]
+        lens = list(local_len) if isinstance(local_len, list) else [local_len]
         # 8 heads over TP4 is 2 per rank, cut into 2 slices -> 1 head per area.
         w._kv_areas, w._kv_slices = 4, 2
+        w.block_len_per_layer = [ln for ln in lens for _ in range(w._kv_areas)]
+        w._logical_region_kv_heads = (
+            list(kv_heads) if isinstance(kv_heads, list) else [kv_heads] * len(lens)
+        )
         topo = MagicMock()
         topo.tp_size = 4
-        topo.total_num_kv_heads = 8
+        topo.total_num_kv_heads = w._logical_region_kv_heads[0]
         topo.block_size_ratio.return_value = block_size_ratio
         w.transfer_topo = topo
         return w
@@ -1884,12 +1944,13 @@ class TestHeadMatchedHandshakeChecks:
         # A TP1 peer keeps all 8 heads, cut into 4 slices -> 2 heads per area,
         # so its per-area block length must be twice ours for a head to cost the
         # same on both sides.
+        lens = list(remote_len) if isinstance(remote_len, list) else [remote_len]
         return _agent_meta(
             block_size=16,
             kv_cache_layout=layout,
             kv_areas=4,
             kv_slices=4,
-            block_lens=[remote_len],
+            block_lens=[ln for ln in lens for _ in range(4)],
         )
 
     def test_equal_bytes_per_head_passes(self):
@@ -1935,6 +1996,36 @@ class TestHeadMatchedHandshakeChecks:
             )
         assert "peer" not in str(e.value)
 
+    def test_a_draft_region_with_the_wrong_bytes_per_head_is_rejected(self):
+        # Region 0 is consistent (128 x 2 == 256 x 1) while the peer's draft
+        # region is 2048B where a head costing the same demands 1024B -- a peer
+        # compiled against a different draft. The descriptors land inside the
+        # wrong bytes without failing.
+        w = self._worker(local_len=[128, 512], kv_heads=[8, 32])
+        with pytest.raises(RuntimeError, match="logical region 1"):
+            w._validate_head_matched_handshake(
+                self._meta(remote_len=[256, 2048]), remote_tp_size=1
+            )
+
+    def test_a_consistent_heterogeneous_pair_passes(self):
+        # The same two regions with the draft's peer width corrected: a head costs
+        # 128B per block on both sides in both regions.
+        w = self._worker(local_len=[128, 512], kv_heads=[8, 32])
+        w._validate_head_matched_handshake(
+            self._meta(remote_len=[256, 1024]), remote_tp_size=1
+        )  # no raise
+
+    def test_a_draft_region_that_cannot_be_banded_is_refused(self):
+        # Our shard cuts the draft's 4 heads into 2 slices, which does not divide,
+        # while the target's 8 do -- and a model-config count reports the
+        # target's for both. The byte invariant cannot say so.
+        w = self._worker(local_len=[128, 64], kv_heads=[8, 4])
+
+        with pytest.raises(RuntimeError, match="cut into 2 logical slice"):
+            w._validate_head_matched_handshake(
+                self._meta(remote_len=[256, 128]), remote_tp_size=1
+            )
+
     def test_unequal_block_size_raises(self):
         w = self._worker(block_size_ratio=2)
         with pytest.raises(RuntimeError, match="equal P/D block sizes"):
@@ -1968,6 +2059,8 @@ class TestHeadMatchedAgentRegistration:
         w.dst_xfer_side_handles = {"eng": {}}
         w.nixl_memory_type = "VRAM"
         w._kv_areas, w._kv_slices = 4, 2
+        w._logical_region_slices = [2, 2]
+        w._logical_region_kv_heads = [8, 8]
         w.transfer_topo = MagicMock()
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.add_remote_agent.return_value = "agent"
@@ -2010,6 +2103,52 @@ class TestHeadMatchedAgentRegistration:
 
         assert w._add_remote_agent_head_matched(meta, 3, 2) == "already"
         w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    @staticmethod
+    def _slice_worker(*, slices, kv_heads):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._remote_agents = {}
+        w.nixl_wrapper = MagicMock()
+        w._logical_region_slices = list(slices)
+        w._logical_region_kv_heads = list(kv_heads)
+        return w
+
+    def test_uneven_region_slice_counts_are_refused_before_an_agent_is_added(self):
+        # Silent without the refusal: the smaller count divides the larger side's
+        # heads per rank, so a wrong band transfers with nothing objecting.
+        w = self._slice_worker(slices=[4, 4, 2, 2], kv_heads=[8, 8, 32, 32])
+        meta = MagicMock()
+        meta.engine_id = "eng"
+
+        with pytest.raises(RuntimeError, match="different numbers of chiplet"):
+            w._add_remote_agent_head_matched(meta, 1, 2)
+
+        # Refused at the entry, so no peer state was taken on.
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    def test_the_loud_direction_is_refused_by_the_same_check(self):
+        # The mirror case already fails, but inside `_slice_head_bounds` as
+        # "owns 2 KV heads cut into 4 logical slice(s)" -- which names the
+        # arithmetic rather than the cause. One condition covers both directions.
+        w = self._slice_worker(slices=[2, 2, 4, 4], kv_heads=[8, 8, 32, 32])
+
+        with pytest.raises(RuntimeError, match=r"chiplet slices \[2, 4\]"):
+            w._reject_uneven_region_slices(2)
+
+    def test_uniform_slice_counts_are_not_refused(self):
+        # A differing KV geometry is supported; only a differing chiplet CUT is
+        # not. Refusing this would close the case the head bands exist for.
+        w = self._slice_worker(slices=[4, 4, 4, 4], kv_heads=[8, 8, 32, 32])
+
+        w._reject_uneven_region_slices(2)
+
+    def test_a_region_without_a_head_axis_is_not_counted(self):
+        # An SSM state is not cut by KV heads, so its slice count says nothing
+        # about the head bands -- and the refusal that does name Mamba sits
+        # further in, past this one.
+        w = self._slice_worker(slices=[4, 4, 1, 1], kv_heads=[8, 8, None, None])
+
+        w._reject_uneven_region_slices(2)
 
     def test_a_peer_with_a_different_tp_degree_is_routed_to_head_matching(self):
         # The fork every head-matched path hangs off: unequal TP means position
