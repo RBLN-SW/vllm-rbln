@@ -42,15 +42,6 @@ logger = init_logger(__name__)
 PLACEHOLDER_TOKEN_ID = -1
 
 
-def spec_logits_target_first(spec_config: "SpeculativeConfig | None") -> bool:
-    """Whether the gathered logits arrive as [target rows ..., bonus rows ...].
-
-    Only methods that draft from token ids alone qualify: they never read
-    `sample_hidden_states`, which the model gathers in the same order.
-    """
-    return spec_config is not None and spec_config.method in ("ngram", "suffix")
-
-
 # TODO(RBLN): Enable RBLNSampler for
 # - apply_bad_words_with_drafts
 # - apply_all_penalties
@@ -88,7 +79,6 @@ class RBLNRejectionSampler(RejectionSampler):
             if envs.VLLM_RBLN_SAMPLER
             else TorchRejectionSamplerImpl()
         )
-        self.target_first_layout = spec_logits_target_first(spec_config)
 
     def forward(
         self,
@@ -131,21 +121,8 @@ class RBLNRejectionSampler(RejectionSampler):
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
         assert logits is not None
-        if self.target_first_layout:
-            # NOTE(RBLN): the runner permuted `logits` alone, so target rows are
-            # the front slice and bonus row r follows at `num_target + r`. The
-            # clamp mirrors the repeat-last padding of `bonus_logits_indices`.
-            num_target = target_logits_indices.shape[0]
-            raw_target_logits = logits[:num_target]
-            bonus_rows = (
-                torch.arange(bonus_logits_indices.shape[0], device=logits.device)
-                .add_(num_target)
-                .clamp_(max=logits.shape[0] - 1)
-            )
-            bonus_logits = logits[bonus_rows]
-        else:
-            bonus_logits = logits[bonus_logits_indices]
-            raw_target_logits = logits[target_logits_indices]
+        bonus_logits = logits[bonus_logits_indices]
+        raw_target_logits = logits[target_logits_indices]
 
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,

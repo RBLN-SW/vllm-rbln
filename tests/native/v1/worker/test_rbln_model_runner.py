@@ -952,8 +952,6 @@ class TestCalcSpecDecodeMetadata:
             arange_np=np.arange(512),
             input_ids=torch.arange(512),
             device=torch.device("cpu"),
-            # eagle reads sample_hidden_states, so the rows stay interleaved.
-            speculative_config=SimpleNamespace(method="eagle"),
         )
 
     def test_logits_indices_layout(self):
