@@ -60,53 +60,6 @@ def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
 register_backend(name="bypass", compiler_fn=bypass_backend)
 
 
-def restore_dflash_token_budget(vllm_config: VllmConfig) -> None:
-    """Give DFlash back the token budget speculative decoding reserves.
-
-    `VllmConfig._set_max_num_scheduled_tokens` holds batch slots back for
-    drafters that append their draft tokens to the target batch. This one runs
-    its own graph over its own batch, so the reservation buys nothing and only
-    moves the prefill chunk off the KV block boundary, which the paged prefill
-    kernel cannot straddle.
-
-    An explicit budget is refused rather than left in place: the chunk would be
-    misaligned whatever it is.
-    """
-    speculative_config = vllm_config.speculative_config
-    if speculative_config is None or speculative_config.method != "dflash":
-        return
-
-    scheduler_config = vllm_config.scheduler_config
-    budget = scheduler_config.max_num_batched_tokens
-    reserved = budget - (
-        speculative_config.max_num_new_slots_for_drafting
-        * scheduler_config.max_num_seqs
-    )
-    if scheduler_config.max_num_scheduled_tokens != reserved:
-        raise ValueError(
-            "DFlash needs max_num_scheduled_tokens left auto-computed "
-            f"(expected {reserved}, got "
-            f"{scheduler_config.max_num_scheduled_tokens}): the prefill chunk "
-            f"has to stay at max_num_batched_tokens={budget} for the paged "
-            "prefill kernel, and any other budget moves it off the KV block "
-            "boundary."
-        )
-
-    # The config is validated again in every worker, where
-    # `_set_max_num_scheduled_tokens` refuses
-    # `max_num_batched_tokens < max_num_scheduled_tokens + delta`. Restoring the
-    # budget alone therefore fails that check and no worker starts. Give the
-    # validator its headroom instead: the prefill chunk follows
-    # `max_num_scheduled_tokens`, which still lands on `budget`.
-    if getattr(scheduler_config, "_rbln_dflash_budget_restored", False):
-        return
-    delta = budget - reserved
-    logger.info("Restoring the DFlash target token budget: %d -> %d.", reserved, budget)
-    scheduler_config.max_num_scheduled_tokens = budget
-    scheduler_config.max_num_batched_tokens = budget + delta
-    scheduler_config._rbln_dflash_budget_restored = True
-
-
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
 
@@ -397,7 +350,23 @@ class RblnPlatform(Platform):
                     "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
                 )
 
-            restore_dflash_token_budget(vllm_config)
+            if (
+                vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.method == "dflash"
+                and scheduler_config.max_num_scheduled_tokens
+                != scheduler_config.max_num_batched_tokens
+            ):
+                # DFlash reserves no slots (see patches/speculative_config.py),
+                # so the auto-computed budget is the whole of
+                # max_num_batched_tokens and any other value was set explicitly.
+                raise ValueError(
+                    "DFlash needs max_num_scheduled_tokens left auto-computed "
+                    f"(expected {scheduler_config.max_num_batched_tokens}, got "
+                    f"{scheduler_config.max_num_scheduled_tokens}): the prefill "
+                    "chunk has to stay at max_num_batched_tokens, which is also "
+                    "the compiled prefill length and the sub-block cache's "
+                    "granularity."
+                )
 
             # Under PP the compiled per-stage decode batch is max_num_seqs // pp_size
             # (see decode_batch_size). Fail fast on an impossible config.
