@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import random
 import time
 
@@ -20,6 +21,32 @@ from vllm import LLM, SamplingParams
 
 # NOTE: This is just a running example. For benchmarking purpose,
 # please see benchmarks/benchmark_prefix_caching.py
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "0"
+os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
+
+BLOCK_SIZE = 1024
+MAX_BATCHED = 512
+
+# The multi-block store path runs only when the first recomputed chunk crosses a
+# block boundary:
+#
+#     (hit % BLOCK_SIZE) + min(MAX_BATCHED, n_prompt - hit) > BLOCK_SIZE
+#
+# `hit` is always a multiple of the sub-block size, so the region a prompt has to
+# recompute must be longer than the space left in the block the hit ends in.  The
+# prompts below therefore need two things the original ones lacked: a shared
+# prefix long enough that the hit lands late inside a block (raising off0), and a
+# per-prompt tail long enough that recomputing it reaches into the next block.
+# Without both, every request stays inside one block and the path never runs.
+PREFIX_PAD = (
+    "Our faculty handbook also records the following standing guidance for panel "
+    "interviews, which every interviewer is expected to have read in advance. "
+) * 32  # ~736 tokens, lifting the shared prefix past 896 so off0 becomes 896
+
+TAIL_PAD = (
+    "Please answer at length, and justify each point with a concrete example "
+    "drawn from the material above. "
+) * 30  # ~600 tokens of recompute, more than the space left in either block
 
 
 # Common prefix.
@@ -37,7 +64,7 @@ def get_system_prompted_questions():
         "over 5 years of professional experience, having served as an assistant teacher "
         "in a large, co-educational public school, with substantial background in "
         "curriculum design, classroom leadership, and instructional strategies for "
-        "middle school mathematics students."
+        "middle school mathematics students." + PREFIX_PAD
     )
     # Sample prompts.
     prompts = [
@@ -52,11 +79,14 @@ def get_system_prompted_questions():
         "The Pythagorean theorem states that",
         "The chemical symbol for gold is",
     ]
-    return [prefix + prompt for prompt in prompts]
+    return [prefix + prompt + TAIL_PAD for prompt in prompts]
 
 
 def get_wiki_based_questions():
     wikipedia.set_lang("en")
+    wikipedia.set_user_agent(
+        "vllm-rbln-examples/0.1 (https://github.com/rebellions-sw/vllm-rbln)"
+    )
     template = """
     DOCUMENT:
     {document}
@@ -68,20 +98,49 @@ def get_wiki_based_questions():
     Answer the users QUESTION using the DOCUMENT text above.
     Keep your answer ground in the facts of the DOCUMENT.
     If the DOCUMENT doesn’t contain the facts to answer the QUESTION return NONE.
+    {tail}
 
     ANSWER:
     """
-    doc = wikipedia.page("Artificial intelligence").content[:3000]
+    doc = wikipedia.page("Artificial intelligence").content[:20000]
     questions = [
         "When is the AI winter?",
         "Who is the father of AI?",
         "What is the Turing Test?",
     ]
-    return [template.format(document=doc, question=question) for question in questions]
+    return [
+        template.format(document=doc, question=question, tail=TAIL_PAD)
+        for question in questions
+    ]
+
+
+def report_geometry(label, outputs):
+    """Per-request cache-hit geometry, and whether the chunk crossed a block."""
+    print(f"\n{label}")
+    print("    #  n_prompt     hit   off0   chunk  spill")
+    spilled = 0
+    for i, out in enumerate(outputs):
+        n = len(out.prompt_token_ids)
+        hit = getattr(out, "num_cached_tokens", 0) or 0
+        off0 = hit % BLOCK_SIZE
+        chunk = min(MAX_BATCHED, n - hit)
+        spill = off0 + chunk > BLOCK_SIZE
+        spilled += spill
+        print(
+            f"  {i:3d}  {n:8d}  {hit:6d}  {off0:5d}  {chunk:6d}  "
+            f"{'yes' if spill else ' no'}"
+        )
+    print(f"  spill {spilled}/{len(outputs)}")
+    if not spilled:
+        print(
+            "  WARNING: no request crossed a block boundary -- the multi-block "
+            "store path never ran.  Lengthen PREFIX_PAD / TAIL_PAD."
+        )
+    return spilled
 
 
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=0.0)
+sampling_params = SamplingParams(temperature=0.0, max_tokens=256)
 MODEL = "meta-llama/Llama-3.2-1B"
 
 
@@ -93,10 +152,12 @@ def main():
 
     regular_llm = LLM(
         model=MODEL,
-        block_size=4096,
+        block_size=BLOCK_SIZE,
+        max_num_batched_tokens=MAX_BATCHED,
         max_model_len=8192,
         max_num_seqs=3,
         enable_prefix_caching=False,
+        tensor_parallel_size=4,
     )
 
     print("Results without `enable_prefix_caching`")
@@ -126,10 +187,12 @@ def main():
     # Create an LLM with prefix caching enabled.
     prefix_cached_llm = LLM(
         model=MODEL,
-        block_size=4096,
+        block_size=BLOCK_SIZE,
+        max_num_batched_tokens=MAX_BATCHED,
         max_model_len=8192,
         max_num_seqs=3,
         enable_prefix_caching=True,
+        tensor_parallel_size=4,
     )
 
     # Warmup so that the shared prompt's KV cache is computed.
@@ -159,7 +222,8 @@ def main():
             for i in range(len(prompts))
         ]
     )
-    print(f"Generated answers are the same: {generated_same}")
+    report_geometry("cache-hit geometry (with `enable_prefix_caching`)", outputs)
+    print(f"\nGenerated answers are the same: {generated_same}")
     print(f"Time without prefix caching: {wo_prefix_time} sec")
     print(f"Time with prefix caching: {w_prefix_time} sec")
 

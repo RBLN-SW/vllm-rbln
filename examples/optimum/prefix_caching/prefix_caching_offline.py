@@ -12,8 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 import time
+
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "0"
+os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
 
 from vllm import LLM, SamplingParams
 
@@ -62,9 +65,11 @@ def main():
     # Create an LLM without prefix caching as a baseline.
     regular_llm = LLM(
         model=MODEL,
-        block_size=4096,
+        block_size=1024,
+        max_num_batched_tokens=1024,
         max_model_len=8192,
         max_num_seqs=3,
+        tensor_parallel_size=1,
         enable_prefix_caching=False,
     )
 
@@ -95,9 +100,11 @@ def main():
     # Create an LLM with prefix caching enabled.
     prefix_cached_llm = LLM(
         model=MODEL,
-        block_size=4096,
+        block_size=1024,
+        max_num_batched_tokens=1024,
         max_model_len=8192,
         max_num_seqs=3,
+        tensor_parallel_size=1,
         enable_prefix_caching=True,
     )
 

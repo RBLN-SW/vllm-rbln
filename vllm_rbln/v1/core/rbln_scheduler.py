@@ -72,10 +72,10 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
-        # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
-        # so that each prefill does not span multiple blocks.
         if sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
-            sub_block_size = self.scheduler_config.max_num_batched_tokens
+            chunk_size = self.scheduler_config.max_num_batched_tokens
+            configured = envs.VLLM_RBLN_SUB_BLOCK_SIZE
+            sub_block_size = configured if configured > 0 else chunk_size
         if (
             self.cache_config.enable_prefix_caching
             and sub_block_size
@@ -83,6 +83,17 @@ class RBLNScheduler(Scheduler):
                 self.kv_cache_config, sub_block_size
             )
         ):
+            max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
+            if not (self.block_size >= max_num_batched_tokens >= sub_block_size):
+                raise ValueError(
+                    "RBLN sub-block prefix caching requires block_size >= "
+                    "max_num_batched_tokens >= sub_block_size, but got "
+                    f"block_size={self.block_size}, "
+                    f"max_num_batched_tokens={max_num_batched_tokens}, "
+                    f"sub_block_size={sub_block_size}. Set --max-num-batched-tokens "
+                    "to a value between sub_block_size and block_size (inclusive), "
+                    "or raise --block-size."
+                )
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
             init_none_hash(hash_fn)
 
