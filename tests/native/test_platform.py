@@ -33,7 +33,10 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
 from tests.native.vllm_config import local_model_path
-from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_SEQS, RblnPlatform
+from vllm_rbln.platform import (
+    RBLN_DEFAULT_MAX_NUM_SEQS,
+    RblnPlatform,
+)
 
 # Small, non-gated and already needed by the spec-decode tests; a config build
 # never touches the device.
@@ -403,7 +406,8 @@ class TestSchedulerOverrides:
 
         def mutate(config: VllmConfig) -> None:
             config.scheduler_config.async_scheduling = True
-            config.speculative_config = object()
+            # eagle is a method vLLM does allow async scheduling with.
+            config.speculative_config = SimpleNamespace(method="eagle")
 
         config = reconfigure(mutate)
         assert config.scheduler_config.async_scheduling is False
@@ -703,3 +707,34 @@ class TestDynamicKvConfig:
             monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
             reconfigure(lambda config: None)
             assert len(seen) == 1
+
+
+class TestDflashTokenBudget:
+    """DFlash reserves no drafting slots, so the auto-computed budget is the
+    whole of `max_num_batched_tokens`; anything else was set explicitly, and no
+    other prefill chunk lands on a KV block boundary."""
+
+    def _mutate(self, scheduled):
+        def mutate(config: VllmConfig) -> None:
+            config.speculative_config = SimpleNamespace(method="dflash")
+            config.scheduler_config.max_num_scheduled_tokens = scheduled
+
+        return mutate
+
+    def test_the_auto_computed_budget_is_accepted(self, reconfigure, configured):
+        budget = configured.scheduler_config.max_num_batched_tokens
+        config = reconfigure(self._mutate(budget))
+        assert config.scheduler_config.max_num_scheduled_tokens == budget
+
+    @pytest.mark.parametrize("delta", [-1, -8, 1])
+    def test_any_other_budget_is_refused(self, reconfigure, configured, delta):
+        budget = configured.scheduler_config.max_num_batched_tokens
+        with pytest.raises(ValueError, match="auto-computed"):
+            reconfigure(self._mutate(budget + delta))
+
+    def test_only_dflash_is_gated(self, reconfigure, configured):
+        def mutate(config: VllmConfig) -> None:
+            config.speculative_config = SimpleNamespace(method="eagle3")
+            config.scheduler_config.max_num_scheduled_tokens = 8
+
+        assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8

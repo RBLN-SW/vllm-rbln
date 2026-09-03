@@ -1368,3 +1368,62 @@ class TestDeferredBlockFree:
         assert request.request_id not in manager._req_sub_hashes
         assert request.request_id not in manager._pending_indexing
         assert partial_block.block_hash is not None
+
+
+class TestDraftingLookahead:
+    """A first chunk was allocated with no drafting lookahead at all, so a
+    request whose prefill ends in a block's last slots got no page for the draft
+    block that follows it. Upstream zeroes the lookahead only to keep the local
+    and remote block counts matching under an async P/D load; that is the
+    condition here, rather than every request on its first chunk."""
+
+    LOOKAHEAD = 4
+
+    PROMPT = 32
+
+    def _lookahead_seen(self, use_kv_connector=None, remote_prefill=False):
+        sched = create_rbln_scheduler(
+            num_speculative_tokens=3,
+            use_kv_connector=use_kv_connector,
+            enable_prefix_caching=True,
+        )
+        # ngram is what the helper builds without a draft model, so the two
+        # attributes a drafting method would set are set here instead -- they
+        # are what the branch reads.
+        sched.use_eagle = True
+        sched.num_lookahead_tokens = self.LOOKAHEAD
+
+        seen: list[int] = []
+        allocate_slots = sched.kv_cache_manager.allocate_slots
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs["num_lookahead_tokens"])
+            return allocate_slots(*args, **kwargs)
+
+        sched.kv_cache_manager.allocate_slots = spy
+
+        request = create_requests(1, num_tokens=self.PROMPT)[0]
+        if remote_prefill:
+            request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        sched.schedule()
+        return seen
+
+    def test_a_first_chunk_gets_the_drafting_lookahead(self):
+        assert self._lookahead_seen() == [self.LOOKAHEAD]
+
+    def test_a_synchronous_remote_load_keeps_it(self):
+        seen = self._lookahead_seen(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=False),
+            remote_prefill=True,
+        )
+        assert seen == [self.LOOKAHEAD]
+
+    def test_an_async_remote_load_still_gets_none(self):
+        """The case upstream zeroes it for: an extra block here would leave the
+        local and remote block counts mismatched."""
+        seen = self._lookahead_seen(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=True),
+            remote_prefill=True,
+        )
+        assert seen == [0]

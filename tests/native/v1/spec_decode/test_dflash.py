@@ -1,0 +1,326 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for RBLNDFlashProposer's draft-block geometry and cache write.
+
+Every case here pins something a run measured rather than something the code
+merely does, because each was a regression that only a full measurement run
+surfaced:
+
+  - the mask's query positions must name the block's real slots; naming the
+    slots one block further on admitted the previous step's rejected draft K/V
+  - the block is open within itself, not causal; closing it within itself
+    reduced acceptance compared with leaving it open
+  - one seq_idx and one block table for the whole drafter, because a second
+    dynamic index on a partition is a compiler error that arrives as a segfault
+  - the context write is contiguous on both sides, because a strided pair is
+    staged through host memory and that staging buffer faults
+"""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import vllm_rbln.v1.spec_decode.dflash as dflash_module
+from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
+
+BLOCK_SIZE = 1024
+WINDOW = 2048
+NUM_SPEC = 7
+QUERY_LEN = 1 + NUM_SPEC
+MAX_SEQ = 8192
+
+
+def _mask_self(sliding_window=WINDOW):
+    """The attributes `_draft_block_mask` reads, and nothing else."""
+    return SimpleNamespace(
+        num_speculative_tokens=NUM_SPEC,
+        sliding_window=sliding_window,
+        block_size=BLOCK_SIZE,
+    )
+
+
+def _mask(seq_lens, sliding_window, num_reqs=None, max_seq_len=MAX_SEQ):
+    lens = torch.tensor(seq_lens, dtype=torch.int64)
+    num_reqs = num_reqs if num_reqs is not None else len(seq_lens)
+    return RBLNDFlashProposer._draft_block_mask(
+        _mask_self(sliding_window),
+        lens,
+        num_reqs,
+        num_reqs,
+        max_seq_len,
+        sliding_window,
+    )
+
+
+class TestDraftBlockMask:
+    def test_shape_is_one_row_per_query_slot(self):
+        for window in (None, WINDOW):
+            mask = _mask([4000], window)
+            assert tuple(mask.shape) == (1, 1, 1, QUERY_LEN, MAX_SEQ)
+
+    @pytest.mark.parametrize("window", [None, WINDOW])
+    def test_admits_nothing_past_the_block(self, window):
+        """The regression that cost the most: a mask built from a length that
+        counted the query block in sat eight slots further on, so every draft
+        query admitted eight slots holding the previous step's rejected K/V."""
+        seq_len = 4000
+        mask = _mask([seq_len], window)[0, 0, 0]
+        assert mask[:, seq_len + QUERY_LEN :].sum() == 0
+        # ...and the block's own slots are all real keys, so they are admitted.
+        assert mask[-1, seq_len : seq_len + QUERY_LEN].all()
+
+    def test_block_is_open_within_itself(self):
+        """Not causal: a block that only looked backwards is what the causal
+        kernel family already gives, and this model would not need the
+        mask-taking one at all."""
+        seq_len = 4000
+        mask = _mask([seq_len], WINDOW)[0, 0, 0]
+        block = mask[:, seq_len : seq_len + QUERY_LEN]
+        assert block.all(), "every query slot must see every other one"
+
+    def test_sliding_row_sees_exactly_the_window(self):
+        seq_len = 4000
+        mask = _mask([seq_len], WINDOW)[0, 0, 0]
+        context = mask[:, :seq_len]
+        for row in range(QUERY_LEN):
+            # The window is measured back from the row's own position, so the
+            # rows nearest the block trade context slots for block slots.
+            # The row's own slot is inside the block, so the context holds
+            # one fewer than the window and slides forward with the row.
+            assert int(context[row].sum()) == WINDOW - 1 - row
+            first = int(context[row].nonzero()[0])
+            assert first == seq_len - WINDOW + 1 + row
+
+    def test_full_layer_sees_the_whole_context(self):
+        seq_len = 4000
+        mask = _mask([seq_len], None)[0, 0, 0]
+        assert mask[:, : seq_len + QUERY_LEN].all()
+
+    def test_rows_are_padded_with_zeros_not_dropped(self):
+        mask = RBLNDFlashProposer._draft_block_mask(
+            _mask_self(WINDOW),
+            torch.tensor([4000, 3000], dtype=torch.int64),
+            2,
+            4,
+            MAX_SEQ,
+            WINDOW,
+        )
+        assert mask.shape[0] == 4
+        assert mask[2:].sum() == 0
+
+
+class TestPageCrossing:
+    """The kernel scatters the whole query block at one offset per partition,
+    so the last QUERY_LEN - 1 offsets of a page are unrepresentable."""
+
+    @staticmethod
+    def _crossing(seq_lens):
+        lens = torch.tensor(seq_lens, dtype=torch.int64)
+        return (lens % BLOCK_SIZE) + QUERY_LEN > BLOCK_SIZE
+
+    def test_only_the_last_offsets_of_a_page_cross(self):
+        crossing = self._crossing(list(range(BLOCK_SIZE)))
+        assert int(crossing.sum()) == QUERY_LEN - 1
+        assert crossing[BLOCK_SIZE - QUERY_LEN + 1 :].all()
+        assert not crossing[: BLOCK_SIZE - QUERY_LEN + 1].any()
+
+    def test_a_block_start_never_crosses(self):
+        assert not self._crossing([0, BLOCK_SIZE, 4 * BLOCK_SIZE]).any()
+
+    def test_redirect_lands_on_the_next_page_start(self):
+        lens = torch.tensor([BLOCK_SIZE - 3], dtype=torch.int64)
+        redirected = (lens // BLOCK_SIZE + 1) * BLOCK_SIZE
+        assert int(redirected[0]) == BLOCK_SIZE
+        assert not self._crossing([int(redirected[0])]).any()
+
+
+class TestContextWriteContiguity:
+    """A strided copy pair is staged through host memory, and that staging
+    buffer's recycled address is what faulted mid-run. Both sides have to be
+    contiguous, which is only true one layer and head at a time."""
+
+    NUM_KV_HEADS = 8
+    HEAD_DIM = 128
+
+    def _cache(self):
+        return torch.zeros(
+            2,
+            4,
+            self.NUM_KV_HEADS,
+            1,
+            BLOCK_SIZE,
+            self.HEAD_DIM,
+            dtype=torch.bfloat16,
+        )
+
+    def test_all_heads_at_once_is_strided_on_both_sides(self):
+        cache = self._cache()
+        source = torch.zeros(6, self.NUM_KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
+        assert not cache[0, 1, :, 0, 3:9, :].is_contiguous()
+        assert not source[0:6].transpose(0, 1).is_contiguous()
+
+    def test_per_head_is_contiguous_on_both_sides(self):
+        cache = self._cache()
+        # Head-major, which is the layout the compiled projection now emits.
+        source = torch.zeros(self.NUM_KV_HEADS, 6, self.HEAD_DIM, dtype=torch.bfloat16)
+        for head in range(self.NUM_KV_HEADS):
+            assert cache[0, 1, head, 0, 3:9, :].is_contiguous()
+            assert source[head, 0:6, :].is_contiguous()
+
+    def test_a_write_run_never_leaves_its_block(self):
+        """Runs are cut at block boundaries, which is what makes the
+        destination a single contiguous span."""
+        positions = torch.tensor([1020, 1021, 1022, 1023, 1024, 1025])
+        blocks = (positions // BLOCK_SIZE).tolist()
+        assert blocks == [0, 0, 0, 0, 1, 1]
+        offsets = (positions % BLOCK_SIZE).tolist()
+        assert offsets == [1020, 1021, 1022, 1023, 0, 1]
+
+
+class TestSingleSequenceGuard:
+    """`--max-num-seqs > 1` costs no errors and no output damage, only
+    acceptance, which drops below the no-speculation baseline on the same
+    prompts. The cause is not identified; the point here is that it fails
+    loudly rather than quietly."""
+
+    def test_one_sequence_is_allowed(self):
+        RBLNDFlashProposer._require_single_sequence(SimpleNamespace(max_num_seqs=1))
+
+    @pytest.mark.parametrize("max_num_seqs", [2, 4, 16])
+    def test_a_wider_batch_is_refused(self, max_num_seqs):
+        with pytest.raises(NotImplementedError, match="max-num-seqs 1"):
+            RBLNDFlashProposer._require_single_sequence(
+                SimpleNamespace(max_num_seqs=max_num_seqs)
+            )
+
+
+class TestRedirectTarget:
+    """A crossing row is redirected to its next page, which the scheduler is
+    supposed to have allocated. It does not always: the lookahead is zeroed
+    while `num_computed_tokens` is 0, and that field is assigned only after
+    allocation, so a prefix-cache hit that leaves one waiting-path chunk can end
+    in a page's last slots with nothing reserved beyond it. An unfilled slot
+    reads 0, which is the pool's shared null block, and the query graph would
+    scatter the draft block's K/V there -- dropping the row afterwards does not
+    unwind the write, so the step has to give up before the forward."""
+
+    @staticmethod
+    def _call(table, next_page, crossing):
+        """The give-up decision `_run_query_pass` makes, in the same order.
+
+        Returns True when the step gives up, and raises when a crossing row's
+        target is inside the table but unallocated -- the assertion the inlined
+        check keeps as a regression guard.
+        """
+        block_table = torch.tensor(table, dtype=torch.int32)
+        pages = (torch.tensor(next_page, dtype=torch.int64) // BLOCK_SIZE).to(
+            torch.int64
+        )
+        if int(pages.max()) >= block_table.shape[-1]:
+            return True
+        rows = torch.arange(pages.shape[0])
+        crossing = torch.tensor(crossing, dtype=torch.bool)
+        assert not bool((block_table.cpu()[rows, pages][crossing] == 0).any())
+        return False
+
+    def test_allocated_next_page_is_accepted(self):
+        # page 1 holds block 6, so the redirect has somewhere to land.
+        assert not self._call([[71, 6, 0, 0]], [BLOCK_SIZE], [True])
+
+    def test_unfilled_next_page_trips_the_assertion(self):
+        """The reviewed regression: inside the table, but never allocated.
+
+        The scheduler's lookahead reservation now rules this out, so it is an
+        assertion rather than a give-up branch.
+        """
+        with pytest.raises(AssertionError):
+            self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [True])
+
+    def test_past_the_table_is_refused(self):
+        """The context ceiling -- no next page exists at all."""
+        assert self._call([[71, 6]], [2 * BLOCK_SIZE], [True])
+
+    def test_a_non_crossing_row_does_not_veto_the_step(self):
+        """Only the rows that actually redirect are checked."""
+        assert not self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [False])
+
+    def test_only_crossing_rows_are_checked(self):
+        table = [[71, 6, 0, 0], [12, 0, 0, 0]]
+        with pytest.raises(AssertionError):
+            self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, True])
+        # the second row is the unfilled one, so it only matters when it crosses
+        assert not self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, False])
+
+
+class TestPlatformRefusals:
+    """The three configurations DFlash cannot run on, all refused at
+    construction and all before the base class does any work, so none of them
+    reaches a device.
+
+    Each fails silently otherwise: an eager context write goes through an
+    attention op that exists only as a compiled kernel, and without device
+    tensors the cache is allocated on `meta`, which accepts a host copy and
+    discards it."""
+
+    @staticmethod
+    def _config(max_num_seqs=1, enforce_eager=False):
+        return SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+            speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
+        )
+
+    def _construct(self):
+        return RBLNDFlashProposer(self._config(), torch.device("cpu"))
+
+    def test_a_wider_batch_is_refused_at_construction(self):
+        with pytest.raises(NotImplementedError, match="max-num-seqs 1"):
+            RBLNDFlashProposer(self._config(max_num_seqs=4), torch.device("cpu"))
+
+    def test_eager_is_refused(self):
+        with pytest.raises(NotImplementedError, match="cannot run eager"):
+            RBLNDFlashProposer(self._config(enforce_eager=True), torch.device("cpu"))
+
+    def test_compile_disabled_is_refused(self, monkeypatch):
+        monkeypatch.setattr(dflash_module.envs, "VLLM_RBLN_COMPILE_MODEL", False)
+        with pytest.raises(NotImplementedError, match="cannot run eager"):
+            self._construct()
+
+    def test_host_visible_cache_is_required(self, monkeypatch):
+        """Without device tensors the cache is on `meta` and the context write
+        is dropped without an error."""
+        monkeypatch.setattr(dflash_module, "USE_DEVICE_TENSOR", False)
+        with pytest.raises(NotImplementedError, match="USE_DEVICE_TENSOR"):
+            self._construct()
+
+
+class TestDenseDrafterGuard:
+    """A fused-MoE drafter is refused rather than run. The draft pass keeps only
+    `num_tokens_across_dp` and drops the padded batch the ranks agreed on, so
+    its expert dimension would not match its peers' and the group would hang --
+    a silent stall, not an error. With MoE refused, a DP-idle rank may skip its
+    draft unconditionally: the drafter runs no collective of its own."""
+
+    @staticmethod
+    def _model(*modules):
+        return SimpleNamespace(modules=lambda: modules)
+
+    def test_a_dense_drafter_is_allowed(self):
+        RBLNDFlashProposer._require_dense_drafter(self._model(object(), object()))
+
+    def test_a_moe_drafter_is_refused(self):
+        moe = object.__new__(dflash_module.MoERunner)
+        with pytest.raises(NotImplementedError, match="fused MoE"):
+            RBLNDFlashProposer._require_dense_drafter(self._model(object(), moe))
