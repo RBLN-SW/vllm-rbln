@@ -18,6 +18,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.native.v1.worker.utils import (
@@ -207,3 +208,60 @@ class TestSampleTokensWithoutPendingState:
         # Consumed, so a second call does not re-report it.
         assert runner.kv_connector_output is None
         assert runner.sample_tokens(grammar_output=None).kv_connector_output is None
+
+
+class TestSampleTokensOnDrafterOverflow:
+    def test_zeroes_the_drafts_instead_of_leaving_them_none(
+        self, make_model_runner, monkeypatch
+    ):
+        # A step whose next speculative token would overrun the drafter's context
+        # skips proposal, which leaves _draft_token_ids at the None sample_tokens
+        # resets it to. take_draft_token_ids would then ship
+        # DraftTokenIds(req_ids, None) and the scheduler zips over that None.
+        _last_rank(monkeypatch)
+        runner = make_model_runner(
+            speculative_config={
+                "method": "ngram",
+                "num_speculative_tokens": 3,
+                "prompt_lookup_max": 4,
+            }
+        )
+        scheduler_output = schedule_new("a")
+        runner._update_states(scheduler_output)
+        # 10 + 3 > 12, so this step cannot propose.
+        monkeypatch.setattr(runner, "effective_drafter_max_model_len", 12)
+        runner.execute_model_state = mr.ExecuteModelState(
+            scheduler_output=scheduler_output,
+            logits=torch.zeros((1, 8)),
+            spec_decode_metadata=None,
+            spec_decode_common_attn_metadata=SimpleNamespace(max_seq_len=10),
+            hidden_states=torch.zeros((1, 4)),
+            sample_hidden_states=torch.zeros((1, 4)),
+            combined_hidden_states=None,
+        )
+
+        def unexpected_propose(*args, **kwargs):
+            raise AssertionError("the drafter must not run when the input overflows")
+
+        monkeypatch.setattr(runner, "propose_draft_token_ids", unexpected_propose)
+        monkeypatch.setattr(
+            runner,
+            "_sample",
+            lambda logits, spec_decode_metadata: SimpleNamespace(
+                sampled_token_ids=torch.tensor([[101]], dtype=torch.int32)
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_bookkeeping_sync",
+            lambda *args: ({}, None, [[101]], {}, ["a"], {"a": 0}, []),
+        )
+
+        runner.sample_tokens(grammar_output=None)
+
+        drafts = runner._draft_token_ids
+        assert isinstance(drafts, torch.Tensor)
+        assert drafts.shape == (1, 3)  # one request, num_speculative_tokens
+        # What the scheduler actually receives. .tolist() is also the only read of
+        # the expanded (non-contiguous) view the runner builds.
+        assert runner.take_draft_token_ids().draft_token_ids == [[0, 0, 0]]

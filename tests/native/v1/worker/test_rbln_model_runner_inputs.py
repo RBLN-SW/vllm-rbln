@@ -30,8 +30,9 @@ pytestmark = pytest.mark.maybe_use_device
 
 
 def _decode_ready(runner, monkeypatch, *, num_spec_tokens: int) -> None:
-    """One request past its prompt, so is_prefill is False and the spec branch
-    is reachable."""
+    """One request past its prompt in the decode phase, so the spec branch is
+    reachable. The phase comes from the scheduler output, so it is set through
+    _is_prefill_step rather than derived from input_batch."""
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     runner._update_states(schedule_new("a"))
     runner.input_batch.num_computed_tokens_cpu[0] = 3
@@ -39,6 +40,7 @@ def _decode_ready(runner, monkeypatch, *, num_spec_tokens: int) -> None:
     # Patched rather than configured: a real speculative_config would pull in a
     # drafter, and none of the arithmetic under test depends on one.
     monkeypatch.setattr(runner, "num_spec_tokens", num_spec_tokens)
+    runner._is_prefill_step = False
     assert runner.is_prefill is False
 
 
@@ -100,7 +102,11 @@ class TestBookkeepingSyncSpecDecode:
         monkeypatch.setattr(
             mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
         )
-        runner = make_model_runner()
+        # This class covers the synchronous bookkeeping path, and vLLM now
+        # resolves an unset --async-scheduling to enabled, so pin it -- through
+        # EngineArgs, so a rename of the runner attribute cannot silently put
+        # this back on the async path.
+        runner = make_model_runner(async_scheduling=False)
         runner._update_states(schedule_new("req_0", "req_1"))
         batch = runner.input_batch
         batch.num_tokens_no_spec[:2] = [3, 3]
@@ -118,7 +124,8 @@ class TestBookkeepingSyncSpecDecode:
             (6, runner.model_config.get_hidden_size()), dtype=runner.dtype
         )
 
-        _, _, valid_sampled_token_ids, _, _, _ = runner._bookkeeping_sync(
+        # The async path added invalid_req_indices to the tail of this tuple.
+        _, _, valid_sampled_token_ids, *_ = runner._bookkeeping_sync(
             scheduler_output=make_scheduler_output(
                 num_scheduled_tokens={"req_0": 3, "req_1": 3}
             ),

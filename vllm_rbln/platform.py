@@ -98,7 +98,8 @@ class RblnPlatform(Platform):
             AttentionBackendEnum.FLASH_ATTN_MLA,
         ):
             raise ValueError(f"Cannot use {selected_backend} backend on RBLN.")
-        if attn_selector_config.use_sparse:
+
+        if attn_selector_config.use_sparse and not attn_selector_config.use_mla:
             raise NotImplementedError("Sparse Attention is not supported on RBLN.")
 
         logger.info("Using %s Backend", selected_backend)
@@ -240,6 +241,7 @@ class RblnPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
+        from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
         from vllm_rbln.utils.optimum.registry import is_pooling_arch
 
         if envs.VLLM_USE_V2_MODEL_RUNNER:
@@ -251,12 +253,11 @@ class RblnPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
-        if scheduler_config.async_scheduling:
-            logger.warning(
-                "Asynchronous scheduling is not supported on RBLN. "
-                "Overriding scheduler_config.async_scheduling to False."
-            )
-            scheduler_config.async_scheduling = False
+        # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
+        # that runs only inside the vLLM-native branch below, and the optimum
+        # path is exactly where an unsupported flag would go unnoticed.
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            cls._validate_dynamic_kv_config(vllm_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             if vllm_config.lora_config is not None:
@@ -295,9 +296,89 @@ class RblnPlatform(Platform):
                 parallel_config.worker_cls = (
                     "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
                 )
-            scheduler_config.scheduler_cls = (
-                "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
-            )
+            # Async is decided here rather than in the prologue: this is the
+            # only reader of the flag, and on the optimum path the refusal
+            # below is the whole story.
+            if scheduler_config.async_scheduling and not (
+                envs.VLLM_RBLN_USE_DEVICE_TENSOR and envs.VLLM_RBLN_SAMPLER
+            ):
+                logger.warning(
+                    "Disabling asynchronous scheduling: it requires "
+                    "VLLM_RBLN_USE_DEVICE_TENSOR=1 (got %s), which carries the "
+                    "in-flight sampled tokens, and VLLM_RBLN_SAMPLER=1 (got %s), "
+                    "which puts the sampler on the device so those tokens never "
+                    "reach the host mid-step. Running synchronously.",
+                    int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
+                    int(envs.VLLM_RBLN_SAMPLER),
+                )
+                scheduler_config.async_scheduling = False
+
+            # TODO(yskim): Support speculative decoding on RBLN under async scheduling.
+            if (
+                scheduler_config.async_scheduling
+                and vllm_config.speculative_config is not None
+            ):
+                logger.warning(
+                    "Disabling asynchronous scheduling: speculative decoding is "
+                    "not supported on RBLN under async scheduling, because the "
+                    "async path feeds one sampled token per step back into the "
+                    "next. Running synchronously."
+                )
+                scheduler_config.async_scheduling = False
+
+            # TODO(yskim): Support PP on RBLN under async scheduling.
+            if (
+                scheduler_config.async_scheduling
+                and parallel_config.pipeline_parallel_size > 1
+            ):
+                logger.warning(
+                    "Disabling asynchronous scheduling: pipeline parallelism is "
+                    "not supported on RBLN under async scheduling. Under PP the "
+                    "scheduler stops propagating sampled tokens and expects the "
+                    "runner to broadcast prev_sampled_token_ids from the last "
+                    "stage, which this runner does not do. Running synchronously."
+                )
+                scheduler_config.async_scheduling = False
+
+            if scheduler_config.async_scheduling:
+                # Only RBLNAsyncScheduler bumps num_output_placeholders at
+                # schedule time, which is what lets the batch_queue fill.
+                scheduler_config.scheduler_cls = (
+                    "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
+                )
+            else:
+                scheduler_config.scheduler_cls = (
+                    "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+                )
+
+            # Under PP the compiled per-stage decode batch is max_num_seqs // pp_size
+            # (see decode_batch_size). Fail fast on an impossible config.
+            pp_size = parallel_config.pipeline_parallel_size
+            if pp_size > 1:
+                max_num_seqs = scheduler_config.max_num_seqs
+                if max_num_seqs < pp_size:
+                    raise ValueError(
+                        f"pipeline_parallel_size={pp_size} requires "
+                        f"max_num_seqs >= {pp_size} (got {max_num_seqs}); "
+                        f"per-stage decode batch would floor to 0."
+                    )
+                if max_num_seqs % pp_size != 0:
+                    logger.warning(
+                        "max_num_seqs=%d is not a multiple of "
+                        "pipeline_parallel_size=%d; %d decode slot(s) will be unused.",
+                        max_num_seqs,
+                        pp_size,
+                        max_num_seqs % pp_size,
+                    )
+                logger.info_once(
+                    "pipeline_parallel_size=%d, max_num_seqs=%d -> "
+                    "per-stage decode batch=%d.",
+                    pp_size,
+                    max_num_seqs,
+                    max_num_seqs // pp_size,
+                )
+
+                cls._validate_eagle3_pp_config(vllm_config)
 
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
@@ -346,12 +427,8 @@ class RblnPlatform(Platform):
                 model_config.disable_cascade_attn = True
 
         else:
-            # NOTE(eunji.lee):
-            # It is for multimodal models
-            # to generate inputs as fp32, not bfloat16
-            # even though the model is compiled with bfloat16
-            model_config.dtype = torch.float
-            assert model_config.dtype == torch.float
+            if forces_fp32_dtype(vllm_config.model_config):
+                model_config.dtype = torch.float32
 
             if parallel_config.worker_cls == "auto":
                 parallel_config.worker_cls = (
@@ -360,6 +437,14 @@ class RblnPlatform(Platform):
             scheduler_config.scheduler_cls = (
                 "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
             )
+            # Optimum model runner doesn't support async scheduling.
+            if scheduler_config.async_scheduling:
+                logger.warning(
+                    "Disabling asynchronous scheduling: the optimum model runner "
+                    "does not support it. Running synchronously. Set "
+                    "VLLM_RBLN_USE_VLLM_MODEL=1 to use the runner that does."
+                )
+            scheduler_config.async_scheduling = False
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
@@ -400,6 +485,82 @@ class RblnPlatform(Platform):
                     "distributed executor backend."
                 ),
                 parallel_config.distributed_executor_backend,
+            )
+
+    @staticmethod
+    def _validate_eagle3_pp_config(vllm_config: VllmConfig) -> None:
+        """Reject an EAGLE3 target whose aux collection is not pipeline-aware.
+
+        Called only when `pipeline_parallel_size > 1`. Upstream's model `forward`
+        indexes the aux capture with a stage-local `enumerate` and drops the list
+        on every non-last stage, so a target outside `EAGLE3_PP_TARGET_ARCHS`
+        harvests the wrong layers and reaches the drafter short. That surfaces as a
+        shape mismatch mid-compile, or -- where the counts happen to line up -- not
+        at all, as a silently worse draft.
+
+        TODO(vllm-project/vllm#50514): delete once that lands and is released.
+        """
+        from vllm_rbln.v1.spec_decode.eagle3_pp import (
+            EAGLE3_PP_TARGET_ARCHS,
+            eagle3_aux_hidden_states_enabled,
+        )
+
+        # A draft with `use_aux_hidden_state` off captures nothing, so upstream's
+        # forward is harmless and the split is fine.
+        if not eagle3_aux_hidden_states_enabled(vllm_config.speculative_config):
+            return
+
+        architectures = vllm_config.model_config.hf_config.architectures or []
+        if set(architectures) & EAGLE3_PP_TARGET_ARCHS:
+            return
+
+        raise ValueError(
+            "EAGLE3 with pipeline_parallel_size="
+            f"{vllm_config.parallel_config.pipeline_parallel_size} is supported on "
+            f"RBLN only for target architectures "
+            f"{sorted(EAGLE3_PP_TARGET_ARCHS)}, but got {list(architectures)}. "
+            "Collecting the target's auxiliary hidden states across pipeline "
+            "stages needs a per-architecture patch that this target does not have "
+            "yet. Run this target with pipeline_parallel_size=1, or with a draft "
+            "whose eagle_config sets use_aux_hidden_state=false."
+        )
+
+    @staticmethod
+    def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
+        """Reject configurations the dynamic-KV path cannot size.
+
+        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
+        Configurations".
+        """
+        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
+                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
+            )
+
+        if vllm_config.model_config.use_mla:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
+                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
+            )
+
+        if vllm_config.speculative_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
+                "decoding; the merged profiles cannot be attributed per artifact."
+            )
+
+        if not USE_DEVICE_TENSOR:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
+                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
+                "no dynamic KV dimension."
+            )
+
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
+                "transfer connector; the resize invalidates its registrations."
             )
 
     @classmethod
@@ -532,7 +693,10 @@ class RblnPlatform(Platform):
 
     @classmethod
     def disable_unsupported_prefix_caching(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.utils.optimum.predicates import is_qwen3_pooling
+        from vllm_rbln.utils.optimum.predicates import (
+            is_qwen3_embedding,
+            is_qwen3_reranker,
+        )
         from vllm_rbln.utils.optimum.registry import (
             is_enc_dec_arch,
             is_pooling_arch,
@@ -557,7 +721,8 @@ class RblnPlatform(Platform):
 
         else:
             # Prefix caching is supported only for decoder-only models for now.
-            if is_qwen3_pooling(vllm_config.model_config):
+            model_config = vllm_config.model_config
+            if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
                 # Qwen3 pooling model does not support prefix caching for now.
                 cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
             elif is_enc_dec_arch(hf_config):

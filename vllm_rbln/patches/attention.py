@@ -20,7 +20,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
@@ -31,6 +30,12 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.worker.utils import (
+    num_attn_module as rbln_num_attn_module,
+)
+from vllm_rbln.v1.worker.utils import (
+    pipeline_adjusted_layer_index,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -40,22 +45,19 @@ attention_original_forward = Attention.forward
 
 
 def _record_pipeline_layer_index(self: "Attention | MLAAttention") -> None:
-    """Record a pipeline-adjusted layer index on an attention layer.
-
-    RBLN resolves each layer's KV cache from attention metadata (a graph
-    input) by index; that index must be relative to the layers that live on
-    this pipeline-parallel rank, so subtract the rank's starting layer.
-    """
-    self.layer_index = extract_layer_index(self.layer_name)
-
-    # NOTE(RBLN): Consider PP
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
-    if model_config is not None:
-        start, _ = model_config.get_layers_start_end_indices(
-            vllm_config.parallel_config
-        )
-        self.layer_index -= start
+    num_attn_module = (
+        rbln_num_attn_module(model_config, vllm_config.cache_config.cache_dtype)
+        if model_config is not None
+        else 1
+    )
+    self.layer_index = pipeline_adjusted_layer_index(
+        self.layer_name,
+        model_config,
+        vllm_config.parallel_config,
+        num_attn_module,
+    )
 
 
 # NOTE(RBLN) - To represent kv cache as model input,

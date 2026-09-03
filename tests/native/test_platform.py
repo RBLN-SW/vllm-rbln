@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -31,10 +32,11 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
+from tests.native.vllm_config import local_model_path
 from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_SEQS, RblnPlatform
 
 # Small, non-gated and already needed by the spec-decode tests; a config build
-# costs ~1s and never touches the device.
+# never touches the device.
 _MODEL = "JackFram/llama-68m"
 _ENGINE_ARGS = dict(
     max_model_len=2048,
@@ -56,7 +58,7 @@ def _build(**engine_kwargs) -> VllmConfig:
     needs unset to observe the RBLN default.
     """
     return EngineArgs(
-        model=_MODEL, **{**_ENGINE_ARGS, **engine_kwargs}
+        model=local_model_path(_MODEL), **{**_ENGINE_ARGS, **engine_kwargs}
     ).create_engine_config()
 
 
@@ -173,6 +175,24 @@ class TestRejectedConfigs:
                 )
             )
 
+    def test_eagle3_under_pp_needs_a_patched_target(self, reconfigure):
+        # The default model is a plain LlamaForCausalLM, whose forward still
+        # collects aux hidden states with a stage-local index. Asserting through
+        # the hook rather than on the validator directly is the point: it is what
+        # shows the guard is reached at all.
+        with pytest.raises(ValueError, match="EAGLE3 with pipeline_parallel_size"):
+            reconfigure(_eagle3_under_pp())
+
+    def test_eagle3_under_pp_accepts_a_patched_target(self, reconfigure):
+        reconfigure(_eagle3_under_pp(arch="MiniMaxM2ForCausalLM"))
+
+    def test_eagle3_under_pp_accepts_a_draft_with_aux_off(self, reconfigure):
+        # Nothing is captured anywhere then, so upstream's forward is harmless.
+        reconfigure(_eagle3_under_pp(eagle_config={"use_aux_hidden_state": False}))
+
+    def test_eagle3_at_pp1_is_not_gated(self, reconfigure):
+        reconfigure(_eagle3_under_pp(pp_size=1))
+
     def test_dp_needs_a_divisible_token_budget(self, reconfigure):
         with pytest.raises(ValueError, match="divisible"):
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
@@ -192,6 +212,30 @@ class TestRejectedConfigs:
     def test_moe_tokens_mask_defaults_on(self):
         # The error above calls 1 the default; a flipped default breaks DP.
         assert platform.envs.VLLM_RBLN_USE_MOE_TOKENS_MASK is True
+
+
+def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int = 2):
+    """A mutator that puts an EAGLE3 draft on a pipeline-parallel target.
+
+    EngineArgs would have to resolve a real draft checkpoint to build this, so the
+    speculative config is a stand-in shaped like the fields the guard reads.
+    """
+
+    def mutate(config: VllmConfig) -> None:
+        config.parallel_config.pipeline_parallel_size = pp_size
+        # The guard runs after the per-stage decode batch check, which would
+        # otherwise raise first and mask it.
+        config.scheduler_config.max_num_seqs = pp_size * 2
+        if arch is not None:
+            config.model_config.hf_config.architectures = [arch]
+        config.speculative_config = SimpleNamespace(
+            method="eagle3",
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(eagle_config=eagle_config)
+            ),
+        )
+
+    return mutate
 
 
 def _ranks(*, ep: bool = False, max_num_seqs: int | None = None, **parallel):
@@ -214,7 +258,9 @@ class TestModelParallelSideEffect:
         [
             dict(data_parallel_size=2),
             dict(tensor_parallel_size=2),
-            dict(pipeline_parallel_size=2),
+            # PP compiles max_num_seqs // pp_size decode slots per stage, so the
+            # budget must be >= pp_size (the default of 1 would floor to 0).
+            dict(pipeline_parallel_size=2, max_num_seqs=2),
             dict(ep=True),
         ],
         ids=["dp", "tp", "pp", "ep"],
@@ -259,9 +305,12 @@ class TestWorkerAndScheduler:
             == "pkg.mod.MyWorker"
         )
 
-    def test_scheduler_is_replaced_unconditionally(self, reconfigure):
+    def test_scheduler_is_replaced_unconditionally(self, monkeypatch, reconfigure):
         # Unlike worker_cls there is no "auto" guard: whatever was asked for is
-        # overwritten.
+        # overwritten. Reading the expectation back off the config under test
+        # would agree with whatever the platform decided, so the carriers are
+        # pinned off and the sync scheduler named outright.
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
         config = reconfigure(
             lambda config: setattr(
                 config.scheduler_config, "scheduler_cls", "pkg.mod.MyScheduler"
@@ -270,6 +319,20 @@ class TestWorkerAndScheduler:
         assert (
             config.scheduler_config.scheduler_cls
             == "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
+        )
+
+    def test_a_plain_build_lands_on_the_async_scheduler(self, monkeypatch):
+        # Nobody passes --async-scheduling here: vLLM resolves the unset flag to
+        # True before this platform hook, and with both carriers on nothing
+        # refuses it, so the native path selects the async scheduler. This is
+        # what the async support changed, and it went unasserted.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        config = _build()
+        assert config.scheduler_config.async_scheduling is True
+        assert (
+            config.scheduler_config.scheduler_cls
+            == "vllm_rbln.v1.core.rbln_scheduler.RBLNAsyncScheduler"
         )
 
 
@@ -295,8 +358,72 @@ class TestCompilation:
 
 
 class TestSchedulerOverrides:
-    def test_async_scheduling_is_forced_off(self):
-        assert _build(async_scheduling=True).scheduler_config.async_scheduling is False
+    def test_async_scheduling_is_honored(self, monkeypatch):
+        # The platform used to force this off unconditionally. It now follows
+        # vLLM's --async-scheduling, as long as the device-side token path is
+        # available (see below). Both carriers are pinned on because
+        # --device-tensor 0 switches the first one off for the whole session,
+        # which would land this on the negative case below.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
+
+    @pytest.mark.parametrize(
+        "switched_off", ["VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"]
+    )
+    def test_async_scheduling_needs_the_device_token_carriers(
+        self, monkeypatch, switched_off
+    ):
+        """Either env var off means async has no way to carry its in-flight tokens.
+
+        VLLM_RBLN_USE_DEVICE_TENSOR gates the feedback scatter that replaces the
+        scheduler's -1 placeholders; VLLM_RBLN_SAMPLER gates the ring the output
+        thread reads. Without them the runner decodes from a token that was never
+        sampled and returns wrong text with no error raised, so the platform
+        downgrades to sync rather than run the combination.
+        """
+        # Both are set before one is switched off: the gate refuses on either,
+        # so leaving the other to the lane lets --device-tensor 0 satisfy this
+        # case with the sampler still on, and the parametrization proves nothing.
+        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
+            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv(switched_off, "0")
+        config = _build(async_scheduling=True)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
+
+    def test_async_scheduling_is_refused_with_speculative_decoding(self, reconfigure):
+        """The async feedback carries one sampled token per step.
+
+        _bookkeeping_sync asserts a single sampled column, which a rejection
+        sampler output of shape (batch, num_spec + 1) cannot satisfy. vLLM allows
+        async with eagle / ngram / draft_model, so without this the combination
+        reaches the runner and dies on that assert mid-decode.
+        """
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.async_scheduling = True
+            config.speculative_config = object()
+
+        config = reconfigure(mutate)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
+
+    def test_async_scheduling_is_refused_under_pipeline_parallelism(self, reconfigure):
+        """Under PP the scheduler stops shipping the sampled tokens.
+
+        It expects the runner to broadcast prev_sampled_token_ids from the last
+        stage instead, which this runner does not do, so a non-last rank reaches
+        _update_states with no token source and dies on its assert mid-decode.
+        """
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.async_scheduling = True
+            _ranks(pipeline_parallel_size=2, max_num_seqs=2)(config)
+
+        config = reconfigure(mutate)
+        assert config.scheduler_config.async_scheduling is False
+        assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
 
     def test_cascade_attention_is_disabled(self, configured):
         assert configured.model_config.disable_cascade_attn is True
@@ -513,3 +640,66 @@ class TestKnownGaps:
         # default for world_size 1 is "uni" -- so it fires on every single-process
         # run and Executor.get_class still builds a UniProcExecutor.
         assert configured.parallel_config.distributed_executor_backend == "uni"
+
+
+class TestDynamicKvConfig:
+    """VLLM_RBLN_USE_DYNAMIC_KV_CACHE is validated at config time, before the
+    model loads; the worker keeps only the checks that read runtime state."""
+
+    @staticmethod
+    def _cfg(use_mla=False, speculative_config=None, kv_transfer_config=None):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(use_mla=use_mla),
+            speculative_config=speculative_config,
+            kv_transfer_config=kv_transfer_config,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _native_lane(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
+        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
+
+    def test_a_clean_config_passes(self):
+        RblnPlatform._validate_dynamic_kv_config(self._cfg())
+
+    def test_needs_the_vllm_model_path(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
+        with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL=1"):
+            RblnPlatform._validate_dynamic_kv_config(self._cfg())
+
+    def test_mla_is_rejected(self):
+        with pytest.raises(ValueError, match="MLA"):
+            RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
+
+    def test_speculative_decoding_is_rejected(self):
+        with pytest.raises(ValueError, match="speculative"):
+            RblnPlatform._validate_dynamic_kv_config(
+                self._cfg(speculative_config=SimpleNamespace())
+            )
+
+    def test_a_kv_transfer_connector_is_rejected(self):
+        with pytest.raises(ValueError, match="KV transfer"):
+            RblnPlatform._validate_dynamic_kv_config(
+                self._cfg(kv_transfer_config=SimpleNamespace())
+            )
+
+    def test_device_tensor_off_is_refused(self):
+        with (
+            patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
+            pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR=1"),
+        ):
+            RblnPlatform._validate_dynamic_kv_config(self._cfg())
+
+    def test_the_hook_validates_only_under_the_flag(self, monkeypatch, reconfigure):
+        seen: list = []
+        with patch.object(
+            RblnPlatform,
+            "_validate_dynamic_kv_config",
+            side_effect=lambda cfg: seen.append(cfg),
+        ):
+            monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0")
+            reconfigure(lambda config: None)
+            assert seen == []
+            monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
+            reconfigure(lambda config: None)
+            assert len(seen) == 1

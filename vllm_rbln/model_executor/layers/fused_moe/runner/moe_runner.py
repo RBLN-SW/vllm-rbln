@@ -28,6 +28,30 @@ from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
 logger = init_logger(__name__)
 
 
+def _routing_mask_dtype(
+    routing_weights, e_score_correction_bias, *, scoring_func, use_grouped_topk
+):
+    # The compiler folds the routing chain built below into a single fused
+    # routing op, and that op's output follows the wider of (scores,
+    # e_score_correction_bias) -- bf16 scores with an fp32 bias come back fp32.
+    # The mask multiplied into those weights has to follow the same rule: a
+    # narrower mask makes the fused multiply a dtype mismatch the compiler
+    # rejects, while a wider one is always safe because torch promotes the
+    # product.
+    #
+    # Only the branches that add the bias to the scores put it in that chain.
+    # The non-grouped softmax and plain-topk branches score without it, so the
+    # fused op keeps the weights' own dtype there and a widened mask would just
+    # promote the whole [E, t] table for nothing.
+    dtype = routing_weights.dtype
+    bias_is_routed = use_grouped_topk or scoring_func == "sigmoid"
+    if e_score_correction_bias is None or not bias_is_routed:
+        return dtype
+    if e_score_correction_bias.dtype.itemsize > dtype.itemsize:
+        return e_score_correction_bias.dtype
+    return dtype
+
+
 class RBLNMoERunner(MoERunner):
     """RBLN out-of-tree MoERunner.
     (See [#41184](https://github.com/vllm-project/vllm/pull/41184).)
@@ -262,7 +286,14 @@ class RBLNMoERunner(MoERunner):
             use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
             if use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(
-                    max_pad, device=masked_routing_weights.device
+                    max_pad,
+                    device=masked_routing_weights.device,
+                    dtype=_routing_mask_dtype(
+                        masked_routing_weights,
+                        e_score_correction_bias,
+                        scoring_func=scoring_func,
+                        use_grouped_topk=use_grouped_topk,
+                    ),
                 ).transpose(1, 0)  # [1, R*max_pad]
                 masked_routing_weights = masked_routing_weights * tokens_mask
 
@@ -283,6 +314,11 @@ class RBLNMoERunner(MoERunner):
                     e, R * max_pad
                 )  # (e, T)
 
+                # send_mask is registered as float32, but the ccl kernels
+                # matmul it against these routing slices (send_mask @ send_rl
+                # in ccl_dispatch_send
+                send_mask = self.send_mask.to(masked_routing_weights.dtype)
+
             # --- Step 4: Dispatch tokens across DP ranks ---
             if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
                 # --- all2all dispatch path ---
@@ -292,7 +328,7 @@ class RBLNMoERunner(MoERunner):
                 send_buffer, send_sizes = torch.ops.rbln_custom_ops.ccl_dispatch_send(
                     hidden_flat,
                     send_rl,
-                    self.send_mask,
+                    send_mask,
                     self.moe_parallel_config.dp_rank,
                 )
 
@@ -349,11 +385,11 @@ class RBLNMoERunner(MoERunner):
 
                 # ccl_combine_receive: unpack + sum-reduce → (max_pad, H)
                 # send_rl (E, max_pad): this rank's full expert routing
-                # self.send_mask: reused as expert_map (same matrix)
+                # send_mask: reused as expert_map (same matrix)
                 final_hidden_states = torch.ops.rbln_custom_ops.ccl_combine_receive(
                     combine_recv_buf,
                     send_rl,
-                    self.send_mask,
+                    send_mask,
                     combine_3d[
                         self.moe_parallel_config.dp_rank
                     ],  # local rank's own contribution
@@ -480,7 +516,14 @@ class RBLNMoERunner(MoERunner):
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(
-                num_tokens, device=masked_routing_weights.device
+                num_tokens,
+                device=masked_routing_weights.device,
+                dtype=_routing_mask_dtype(
+                    masked_routing_weights,
+                    e_score_correction_bias,
+                    scoring_func=scoring_func,
+                    use_grouped_topk=use_grouped_topk,
+                ),
             ).transpose(1, 0)  # [1, t]
 
             # [t, E] * [t, 1] (broadcast)
@@ -526,11 +569,20 @@ def _apply_grouped_topk_torch(
     # Step 1: Apply scoring function & reshape to groups [T, G, E/G]
     if scoring_func == "sigmoid":
         router_logits_2d = torch.sigmoid(router_logits_2d)
+    elif scoring_func == "softmax" and (
+        e_score_correction_bias is not None or not renormalize
+    ):
+        router_logits_2d = F.softmax(router_logits_2d, dim=-1)
     grouped = router_logits_2d.reshape(T, G, epg)
 
-    # Step 2: Score each group by sum of top-2 expert values
-    group_top2_values, _ = torch.topk(grouped, 2, dim=2)  # [T, G, 2]
-    group_scores = group_top2_values.sum(dim=2)  # [T, G]
+    if e_score_correction_bias is not None:
+        biased = (router_logits_2d + e_score_correction_bias.unsqueeze(0)).reshape(
+            T, G, epg
+        )
+        group_top2_values, _ = torch.topk(biased, 2, dim=2)  # [T, G, 2]
+        group_scores = group_top2_values.sum(dim=2)  # [T, G]
+    else:
+        group_scores = grouped.max(dim=2).values  # [T, G]
 
     # Step 3: Select top topk_group groups per token
     _, selected_group_idx = torch.topk(
@@ -554,12 +606,9 @@ def _apply_grouped_topk_torch(
         grouped_masked = minus_inf.scatter(1, idx_expanded, gathered)  # [T, G, epg]
         # [T, G, epg] -> [G, epg, T] -> [E, T]
         scores_t = grouped_masked.permute(1, 2, 0).reshape(E, T)
-
         scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)
         _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
         topk_weights = scores_t.gather(0, selected_experts)
-        if scoring_func == "softmax":
-            topk_weights = F.softmax(topk_weights, dim=0)
         if renormalize:
             topk_weights = topk_weights / topk_weights.sum(
                 dim=0, keepdim=True
@@ -570,18 +619,15 @@ def _apply_grouped_topk_torch(
         return result  # [E, T]
 
     # --- no-bias branch ---
-    # Flatten gathered groups to [topk_group*epg, T] and run topk routing there.
+    # Flatten the selected groups to [topk_group*epg, T] and run topk there.
     gathered_flat = gathered.permute(1, 2, 0).reshape(-1, T)  # [topk_group*epg, T]
 
     if scoring_func == "softmax":
+        topk_weights, selected_experts = torch.topk(gathered_flat, k=top_k, dim=0)
         if renormalize:
-            # post_norm: topk first, then softmax on selected values
-            topk_weights, selected_experts = torch.topk(gathered_flat, k=top_k, dim=0)
+            # post_norm: topk first, then softmax over the selected values;
+            # pre_norm is already normalized over all experts (step 1).
             topk_weights = F.softmax(topk_weights, dim=0)
-        else:
-            # pre_norm: softmax first, then topk
-            sw = F.softmax(gathered_flat, dim=0)
-            topk_weights, selected_experts = torch.topk(sw, k=top_k, dim=0)
     else:
         topk_weights, selected_experts = torch.topk(gathered_flat, k=top_k, dim=0)
         if renormalize:

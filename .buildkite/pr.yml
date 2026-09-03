@@ -27,7 +27,16 @@ steps:
     command:
       - "uv tool run pre-commit run --all-files --hook-stage manual --show-diff-on-failure"
 
-  # Both gates must pass before the heavy test pipelines are even uploaded.
+  - label: ":lock: dependency bounds"
+    notify:
+    - github_commit_status:
+        context: "[OB] dependency bounds"
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    secrets: *uv_secrets
+    command:
+      - "uv run --no-project --python 3.12 --with pytest --with packaging python -m pytest tests/test_packaging_bounds.py -q"
+
+  # All gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
 
   - group: ":gear: vllm-rbln optimum tests"
@@ -38,14 +47,20 @@ steps:
           sparse:
             paths:
               - .buildkite
-        command: "buildkite-agent pipeline upload .buildkite/pipelines/optimum-pr/pipeline.yml"
+        command: |
+          TARGET_BRANCH=$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-dev}
+          git fetch origin $$TARGET_BRANCH
+          buildkite-agent pipeline upload .buildkite/pipelines/optimum-pr/pipeline.yml --git-diff-base origin/$$TARGET_BRANCH
 
   - group: ":snake: vllm-rbln tests"
-    key: "vlln-rbln"
+    key: "vllm-rbln"
     steps:
-      - label: ":sparkles: upload vlln-rbln-pr"
+      - label: ":sparkles: upload vllm-rbln-pr"
         checkout:
           sparse:
             paths:
               - .buildkite
-        command: "buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln-pr/pipeline.yml"
+        command: |
+          TARGET_BRANCH=$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-dev}
+          git fetch origin $$TARGET_BRANCH
+          buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pr.yml --git-diff-base origin/$$TARGET_BRANCH

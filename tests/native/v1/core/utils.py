@@ -53,8 +53,9 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
+from tests.native.vllm_config import local_model_path
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager, SubBlockIndex
-from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler
+from vllm_rbln.v1.core.rbln_scheduler import RBLNAsyncScheduler, RBLNScheduler
 
 EOS_TOKEN_ID = 50256
 
@@ -147,11 +148,12 @@ def create_rbln_scheduler(
     sub_block_size: int | None = None,
     policy: str = "fcfs",
     use_kv_connector: MockKVConfig | None = None,
+    async_scheduling: bool = False,
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
     model_config = ModelConfig(
-        model=model, trust_remote_code=True, dtype="float16", seed=42
+        model=local_model_path(model), trust_remote_code=True, dtype="float16", seed=42
     )
     if max_model_len is None:
         max_model_len = max_num_batched_tokens
@@ -161,7 +163,7 @@ def create_rbln_scheduler(
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
         enable_chunked_prefill=enable_chunked_prefill,
-        async_scheduling=False,
+        async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy=policy,
     )
@@ -200,7 +202,8 @@ def create_rbln_scheduler(
         kv_cache_groups=[KVCacheGroupSpec(["layer"], full_attention_spec(block_size))],
     )
     cache_config.num_gpu_blocks = num_blocks
-    return RBLNScheduler(
+    scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
+    return scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=block_size,

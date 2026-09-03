@@ -355,9 +355,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             caches = [c for c in cached_mm_outputs if spec.embeds_key in c]
             if not caches:
                 continue
-            mm[spec.embeds_key] = torch.cat(
-                [c[spec.embeds_key].to(self.dtype) for c in caches], dim=0
-            )
+            mm[spec.embeds_key] = torch.cat([c[spec.embeds_key] for c in caches], dim=0)
             mm[spec.grid_key] = torch.cat(
                 [c[spec.grid_key].to(torch.int64) for c in caches], dim=0
             )
@@ -400,9 +398,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """Embed the text tokens, then scatter each modality's features over
         its placeholder positions.
         """
-        inputs_embeds = self.model.embed_tokens(input_ids).to(
-            self.model.rbln_config.dtype
-        )
+        inputs_embeds = self.model.embed_tokens(input_ids)
         if not isinstance(multimodal_embeddings, dict) or not multimodal_embeddings:
             return inputs_embeds
         config = self.model.config
@@ -570,7 +566,7 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
             self.model.decoder = self.model.decoders[padded_batch_size]
             input_ids = kwargs.pop("input_ids")
-            inputs_embeds = self.model.embed_tokens(input_ids).to(self.dtype)
+            inputs_embeds = self.model.embed_tokens(input_ids)
             logits = self.model.decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,

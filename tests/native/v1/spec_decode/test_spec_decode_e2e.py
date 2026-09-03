@@ -25,6 +25,7 @@ from tests.native.v1.spec_decode.utils import (
     MEDUSA_TARGET,
     TARGET_MODEL,
 )
+from tests.native.vllm_config import local_weights_path
 
 # A small, compilable target for the draft-free methods; ngram/suffix speculate
 # by matching repeats, so the prompt is deliberately repetitive.
@@ -79,7 +80,6 @@ _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3"}
 _XFAIL_REASON = {
     "eagle3": "RBLNCompileError: RblnTensorAllocateDevTensorKey pass fails on the "
     "eagle3 aux-hidden-state graph",
-    "suffix": "Temporarily disabled: suffix decoding requires an extra package",
 }
 
 
@@ -103,6 +103,8 @@ def test_speculative_decoding_matches_reference(
     vllm_runner, method: str, whole_model: bool
 ) -> None:
     target, extra_kwargs, spec_config = SPEC_METHODS[method]
+    if draft := spec_config.get("model"):
+        spec_config = {**spec_config, "model": local_weights_path(draft)}
 
     with vllm_runner(target, **extra_kwargs) as ref_model:
         ref_outputs = ref_model.generate_greedy_logprobs(

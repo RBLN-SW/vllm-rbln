@@ -12,14 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from itertools import islice
+
 import torch
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp import (
     MiniMaxText01RMSNormTP,
 )
 from vllm.model_executor.models.minimax_m2 import MiniMaxM2Attention, MiniMaxM2MoE
+from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.v1.spec_decode.eagle3_pp import (
+    AUX_SLOT,
+    aux_slots_captured,
+    aux_slots_received,
+)
 
 
 @register_patch(
@@ -45,7 +53,7 @@ def patched_minimax_m2_moe_forward(
     if self.tp_size > 1:
         final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-    return final_hidden_states
+    return final_hidden_states.to(hidden_states.dtype)
 
 
 def _forward_qk(
@@ -105,3 +113,79 @@ def patched_minimax_m2_attention_forward(
     attn_output = self.attn(q, k, v)
     output, _ = self.o_proj(attn_output)
     return output
+
+
+@register_patch(
+    target="vllm.model_executor.models.minimax_m2.MiniMaxM2Model.forward",
+    reason=(
+        "Collect EAGLE3 aux hidden states correctly under pipeline parallelism. "
+        "Upstream indexes the capture with `enumerate(islice(...))`, which restarts "
+        "at zero on every stage, so a non-first stage matches a requested global "
+        "layer index against a stage-local one and harvests the wrong layer. It "
+        "then drops `aux_hidden_states` entirely on non-last stages, while the "
+        "drafter runs on the last one. Carry them in the existing IntermediateTensors "
+        "handoff under global-index slots and reassemble in layer order; no new "
+        "collective is introduced. "
+        "TODO(vllm-project/vllm#50514): delete once that lands and is released."
+    ),
+)
+def forward(
+    self,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None,
+    inputs_embeds: torch.Tensor | None = None,
+) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+    received: list[torch.Tensor] = []
+    if get_pp_group().is_first_rank:
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_input_ids(input_ids)
+        residual = None
+    else:
+        assert intermediate_tensors is not None
+        hidden_states = intermediate_tensors["hidden_states"]
+        residual = intermediate_tensors["residual"]
+        received = [
+            intermediate_tensors[f"{AUX_SLOT}{i}"] for i in aux_slots_received(self)
+        ]
+
+    # Index i means "input to layer i". The pre-loop capture is first-rank only:
+    # for a later stage that index is the previous stage's final capture, and
+    # taking it again would duplicate a boundary layer. Layer 31 of the 62-layer
+    # [15,16,16,15] split is exactly such a boundary.
+    #
+    # The capture appends to a list; it must not key a dict inside the loop. Doing
+    # so breaks the graph at that statement -- the backend then receives the
+    # residual-stream add on its own, as two no-op bf16 casts, and rejects it while
+    # registering the module. `aux_slots_captured` recovers which global index each
+    # append holds, from constants, outside the graph.
+    captured: list[torch.Tensor] = []
+    if get_pp_group().is_first_rank and 0 in self.aux_hidden_state_layers:
+        captured.append(hidden_states)
+    for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+        hidden_states, residual = layer(positions, hidden_states, residual)
+        if self.start_layer + idx + 1 in self.aux_hidden_state_layers:
+            captured.append(hidden_states + residual)
+
+    if not get_pp_group().is_last_rank:
+        tensors = {"hidden_states": hidden_states, "residual": residual}
+        slots = aux_slots_received(self) + aux_slots_captured(self)
+        for index, value in zip(slots, received + captured):
+            tensors[f"{AUX_SLOT}{index}"] = value
+        return IntermediateTensors(tensors)
+
+    hidden_states, _ = self.norm(hidden_states, residual)
+
+    if not self.aux_hidden_state_layers:
+        return hidden_states
+
+    aux = received + captured
+    assert len(aux) == len(self.aux_hidden_state_layers), (
+        f"EAGLE3 expected {len(self.aux_hidden_state_layers)} aux hidden states for "
+        f"layers {sorted(self.aux_hidden_state_layers)}, but "
+        f"{len(aux_slots_received(self))} arrived and "
+        f"{len(aux_slots_captured(self))} were captured"
+    )
+    return hidden_states, aux

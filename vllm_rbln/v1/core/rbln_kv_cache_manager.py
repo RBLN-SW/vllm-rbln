@@ -557,9 +557,13 @@ class RBLNKVCacheManager(KVCacheManager):
         num_full_blocks_before = tuple(
             request.num_computed_tokens // gi.block_size for gi in self._group_infos
         )
-        self._pending_indexing[request.request_id] = (
-            request,
-            num_full_blocks_before,
+        # setdefault, not assignment: async scheduling can schedule a request
+        # again before update_from_output drains this note, and the second call
+        # sees num_computed_tokens past the blocks the first one meant to index.
+        # The earliest note is the one that covers both.
+        self._pending_indexing.setdefault(
+            request.request_id,
+            (request, num_full_blocks_before),
         )
 
     def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
@@ -592,9 +596,12 @@ class RBLNKVCacheManager(KVCacheManager):
             self._index_partial_block(request, False)
         self._pending_indexing.clear()
 
-    def free(self, request: Request) -> None:
-        """Index any not-yet-indexed sub-blocks, free blocks, and clean up
-        sub-block state for the request."""
+    def _finalize_sub_block_state(self, request: Request) -> None:
+        """Index what this request still owes, then drop its per-request state.
+
+        Runs before the blocks leave this manager, since indexing reads them
+        through the coordinator.
+        """
         # Consume this request's pending indexing entry and index all blocks
         # (full + partial) before releasing them.
         pending = self._pending_indexing.pop(request.request_id, None)
@@ -605,7 +612,24 @@ class RBLNKVCacheManager(KVCacheManager):
 
         # Clean up request states
         del self._req_sub_hashes[request.request_id]
+
+    def free(self, request: Request) -> None:
+        """Index any not-yet-indexed sub-blocks, free blocks, and clean up
+        sub-block state for the request."""
+        self._finalize_sub_block_state(request)
         super().free(request)
+
+    def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
+        """Same finalization as ``free()`` on the deferred path.
+
+        The scheduler takes this one when an in-flight step may still write the
+        blocks, so it holds them and returns them to the pool later. What settles
+        here is tied to the blocks leaving, not to the request ending: a preempted
+        request comes through too and goes back on the waiting queue, where the
+        state it needs is rebuilt from its tokens on resume.
+        """
+        self._finalize_sub_block_state(request)
+        return super().pop_blocks_for_free(request)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache including all per-group sub-block indices."""

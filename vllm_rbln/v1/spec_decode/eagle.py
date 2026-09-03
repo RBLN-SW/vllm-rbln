@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -29,10 +30,9 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
 )
-from vllm_rbln.forward_context import RBLNDPMetadata, set_forward_context
+from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import USE_DEVICE_TENSOR
-from vllm_rbln.utils import pad
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -41,6 +41,11 @@ from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_inputs_padded,
     eagle_prepare_next_token_padded,
 )
+from vllm_rbln.v1.worker.dp_utils import (
+    BatchDescriptor,
+    determine_draft_batch_execution_and_padding,
+)
+from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager
 
 if TYPE_CHECKING:
     from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
@@ -59,9 +64,25 @@ class RBLNEagleProposer(EagleProposer):
 
         if self.supports_mm_inputs:
             raise NotImplementedError
+        if self.needs_extra_input_slots:
+            raise NotImplementedError(
+                "vllm-rbln does not support EAGLE extra input slots required for "
+                "parallel drafting or draft-model speculative decoding yet."
+            )
+        draft_sample_method = self.speculative_config.draft_sample_method
+        if draft_sample_method != "greedy":
+            raise NotImplementedError(
+                f"draft_sample_method={draft_sample_method!r} is not implemented yet."
+            )
 
         self.runner = runner
         self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
+        self.input_stager = InputStager(device)
+        # Populated from the draft model in `load_model`. None means the draft
+        # head shares the target vocabulary, so `propose()` maps no ids.
+        self.draft_id_to_target_id: torch.Tensor | None = None
+        # Whether a draft forward joins the DP all-gather; see `load_model`.
+        self.draft_has_moe = False
 
     def propose(
         self,
@@ -74,32 +95,24 @@ class RBLNEagleProposer(EagleProposer):
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.method == "eagle3":
-            assert isinstance(
-                self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
-            )
-            target_hidden_states = self.model.combine_hidden_states(
-                target_hidden_states
-            )
-            assert target_hidden_states.shape[-1] == self.hidden_size
+        # NOTE(RBLN): combine_hidden_states in eagle3 is fused
+        # into the target model graph.
+        assert target_hidden_states.shape[-1] == self.hidden_size
 
-        num_tokens, token_indices_to_sample = self.set_inputs_first_pass(
-            target_token_ids=target_token_ids,
-            next_token_ids=next_token_ids,
-            target_positions=target_positions,
-            target_hidden_states=target_hidden_states,
-            token_indices_to_sample=token_indices_to_sample,
-            cad=common_attn_metadata,
-        )
+        num_tokens = target_token_ids.shape[0]
 
         assert self.runner is not None
         is_prefill = self.runner.is_prefill
 
         # Build attention metadata
         num_reqs = self.runner.input_batch.num_reqs
-        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_tokens,
+            is_prefill,
         )
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -122,8 +135,13 @@ class RBLNEagleProposer(EagleProposer):
                 num_reqs,
                 num_reqs_padded,
                 num_tokens,
-                token_indices_to_sample,
-                is_prefill,
+                target_positions,
+                target_hidden_states,
+                is_prefill=is_prefill,
+                token_indices_to_sample=token_indices_to_sample,
+                target_token_ids=target_token_ids,
+                next_token_ids=next_token_ids,
+                cad=common_attn_metadata,
             )
         )
         inputs_embeds = None
@@ -136,7 +154,7 @@ class RBLNEagleProposer(EagleProposer):
             num_padded_tokens=num_padded_tokens,
             **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
         ):
-            hidden_states, logits = self.model_executable(
+            hidden_states, draft_ids = self.model_executable(
                 input_ids=input_ids,
                 positions=positions,
                 hidden_states=hidden_states,
@@ -146,7 +164,7 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_tokens_ids = logits[:num_reqs].argmax(dim=-1)
+            draft_tokens_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
 
         assert token_indices_to_sample_padded is not None
@@ -154,7 +172,11 @@ class RBLNEagleProposer(EagleProposer):
             token_indices_to_sample_padded.to(target_positions.device)
         ]
 
-        draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+        # `hidden_states` is deliberately not gathered here -- #821 moved
+        # that gather inside `model_wrapper`. Doing it again would index an
+        # already (num_reqs_padded, hidden_size) tensor with token-space
+        # indices and raise on the first decode.
+        draft_token_ids = self._to_target_token_ids(draft_ids[:num_reqs])
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -183,23 +205,22 @@ class RBLNEagleProposer(EagleProposer):
         if self.num_speculative_tokens > 1 and num_rejected_tokens is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens
 
-        num_reqs_padded, num_padded_tokens, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_reqs, False)
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_reqs,
+            False,
+            first_pass=False,
         )
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         for token_index in range(self.num_speculative_tokens - 1):
-            # Update the inputs
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax returns int64 by default.
             self.input_ids[:num_reqs] = draft_token_ids_list[-1].int()
             positions = positions.view(-1) + 1
-            self.positions[:num_reqs] = positions[:num_reqs]
-            self.hidden_states[: hidden_states.shape[0]] = hidden_states
 
             exceeds_max_model_len = positions[:num_reqs] >= self.max_model_len
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            # Rebuild attention metadata
             per_layer_attn_metadata.clear()
             for attn_group in self.draft_attn_groups:
                 attn_metadata = attn_group.get_metadata_builder().build(
@@ -217,8 +238,15 @@ class RBLNEagleProposer(EagleProposer):
                 for layer_name in attn_group.layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
-            input_ids, positions, hidden_states, _ = self._preprocess(
-                num_reqs, num_reqs_padded, num_reqs, None, False
+            staged_input_ids, staged_positions, staged_hidden_states, _ = (
+                self._preprocess(
+                    num_reqs,
+                    num_reqs_padded,
+                    num_reqs,
+                    positions[:num_reqs],
+                    hidden_states[:num_reqs],
+                    is_prefill=False,
+                )
             )
 
             # Run the model.
@@ -230,50 +258,36 @@ class RBLNEagleProposer(EagleProposer):
                 num_padded_tokens=num_padded_tokens,
                 **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
             ):
-                hidden_states, logits = self.model_executable(
-                    input_ids=input_ids,
-                    positions=positions,
-                    hidden_states=hidden_states,
+                hidden_states, draft_ids = self.model_executable(
+                    input_ids=staged_input_ids,
+                    positions=staged_positions,
+                    hidden_states=staged_hidden_states,
                     inputs_embeds=inputs_embeds,
                     token_indices_to_sample=None,
                 )
-            draft_token_ids = logits[:num_reqs].argmax(dim=-1)
+            # Mapped before the feed-back above: the draft head's input
+            # embedding is in target space even when its output head is not.
+            draft_token_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
 
-    def set_inputs_first_pass(
-        self,
-        target_token_ids: torch.Tensor,
-        next_token_ids: torch.Tensor,
-        target_positions: torch.Tensor,
-        target_hidden_states: torch.Tensor,
-        token_indices_to_sample: torch.Tensor | None,
-        cad: CommonAttentionMetadata,
-    ) -> tuple[int, torch.Tensor]:
-        if self.needs_extra_input_slots:
-            raise NotImplementedError(
-                "vllm-rbln does not support EAGLE extra input slots required for "
-                "parallel drafting or draft-model speculative decoding yet."
-            )
+    def _to_target_token_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+        """Map draft-vocabulary ids to target-vocabulary ids.
 
-        if token_indices_to_sample is None:
-            token_indices_to_sample = cad.query_start_loc[1:] - 1
-        token_indices_to_sample = token_indices_to_sample.to(self.device)
+        `d2t` holds offsets, not absolute ids -- upstream scatters at
+        `arange(draft_vocab_size) + d2t` -- hence `id + d2t[id]`. None means the
+        draft head already predicts the target vocabulary, so ids pass through.
 
-        num_tokens = target_token_ids.shape[0]
-        self.input_ids[: num_tokens - 1] = target_token_ids[1:]
-        self.input_ids[token_indices_to_sample] = next_token_ids
-
-        self._set_positions(num_tokens, target_positions)
-
-        self.hidden_states[:num_tokens] = target_hidden_states.view(
-            -1, self.hidden_size
-        )[:num_tokens]
-
-        return num_tokens, token_indices_to_sample
+        Equivalent to upstream's scatter-then-argmax for a monotonic mapping:
+        both pick the same winner, and on an exact tie both pick the lowest id.
+        """
+        d2t = self.draft_id_to_target_id
+        if d2t is None:
+            return draft_token_ids.long().clone()
+        return draft_token_ids + d2t[draft_token_ids]
 
     def prepare_next_token_ids_padded(
         self,
@@ -354,6 +368,15 @@ class RBLNEagleProposer(EagleProposer):
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
 
+        self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
+
+        # Fused MoE is the only reader of the step's padded token dimension, so a
+        # draft without it runs no collective of its own -- which is what lets an
+        # idle rank skip drafting entirely rather than draft a discarded result.
+        self.draft_has_moe = any(
+            isinstance(module, MoERunner) for module in self.model.modules()
+        )
+
         def model_wrapper(
             input_ids: torch.Tensor,
             positions: torch.Tensor,
@@ -380,9 +403,28 @@ class RBLNEagleProposer(EagleProposer):
                 hidden_states = hidden_states[token_indices_to_sample]
                 sample_hidden_states = sample_hidden_states[token_indices_to_sample]
 
-            logits = self.model.compute_logits(sample_hidden_states)
+            if self.draft_id_to_target_id is not None:
+                # NOTE(RBLN): upstream's `compute_logits` widens draft-vocab
+                # logits to the target vocabulary by scattering into an `-inf`
+                # row. Its index is input-independent, so the subgraph folds
+                # into an anonymous constant that weight-free apply cannot
+                # resolve by name; it then executes on placeholder indices and
+                # that out-of-bounds write is the SIGSEGV in KV warmup. Stay in
+                # draft-vocab space and map after the argmax instead
+                # (`_to_target_token_ids`) -- no per-model patch needed.
+                assert isinstance(
+                    self.model, (Eagle3LlamaForCausalLM, Eagle3DeepseekV2ForCausalLM)
+                )
+                logits = self.model.logits_processor(
+                    self.model.lm_head, sample_hidden_states
+                )
+            else:
+                logits = self.model.compute_logits(sample_hidden_states)
 
-            return hidden_states, logits
+            # NOTE(RBLN): the greedy pick belongs in the graph.
+            # To support probabilistic sampling, we need to return
+            # the logits too.
+            return hidden_states, torch.ops.rbln.argmax(logits)
 
         if (
             self.vllm_config.speculative_config.enforce_eager
@@ -399,7 +441,10 @@ class RBLNEagleProposer(EagleProposer):
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                runtime_holder=self.runner.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                use_static_output=True,
+                use_direct_dispatch=True,
             )
 
     def _build_dummy_attn_metadata(
@@ -441,6 +486,17 @@ class RBLNEagleProposer(EagleProposer):
         *,
         num_padded_tokens: int | None = None,
     ) -> None:
+        status = self.runner.dp_status
+        if (
+            status is not None
+            and status.is_idle[self.dp_rank]
+            and not self.draft_has_moe
+        ):
+            # This rank has no work, so what a draft pass produces here is
+            # discarded, and without fused MoE no busy rank is waiting inside a
+            # collective for it.
+            return
+
         num_tokens = num_tokens_per_req * num_reqs
         assert num_tokens <= self.max_num_tokens
         override_padded = num_padded_tokens
@@ -448,10 +504,14 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata = self._build_dummy_attn_metadata(
             num_reqs, num_tokens_per_req
         )
-        num_reqs_padded, dp_padded, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_tokens, is_prefill)
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_tokens,
+            is_prefill,
+            pinned_num_tokens_padded=override_padded,
         )
-        num_padded_tokens = override_padded or dp_padded
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
 
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -479,8 +539,10 @@ class RBLNEagleProposer(EagleProposer):
                 num_reqs,
                 num_reqs_padded,
                 num_tokens,
-                token_indices_to_sample,
-                is_prefill,
+                self.positions[:num_tokens],
+                self.hidden_states[:num_tokens],
+                is_prefill=is_prefill,
+                token_indices_to_sample=token_indices_to_sample,
             )
         )
         inputs_embeds = None
@@ -510,10 +572,15 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
         common_attn_metadata.seq_lens += 1
 
-        num_reqs_padded, dp_padded, num_tokens_across_dp = (
-            self._determine_draft_batch_padding(num_reqs, num_reqs, False)
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs,
+            num_reqs,
+            False,
+            first_pass=False,
+            pinned_num_tokens_padded=override_padded,
         )
-        num_padded_tokens = override_padded or dp_padded
+        num_reqs_padded = batch_desc.num_reqs_padded
+        num_padded_tokens = batch_desc.num_tokens_padded
         per_layer_attn_metadata.clear()
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
@@ -532,7 +599,12 @@ class RBLNEagleProposer(EagleProposer):
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
         input_ids, positions, hidden_states, _ = self._preprocess(
-            num_reqs, num_reqs_padded, num_reqs, None, False
+            num_reqs,
+            num_reqs_padded,
+            num_reqs,
+            self.positions[:num_reqs],
+            self.hidden_states[:num_reqs],
+            is_prefill=False,
         )
 
         for _ in range(self.num_speculative_tokens - 1):
@@ -552,76 +624,90 @@ class RBLNEagleProposer(EagleProposer):
                     token_indices_to_sample=None,
                 )
 
+    def _determine_batch_execution_and_padding(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        is_prefill: bool,
+        *,
+        first_pass: bool = True,
+        pinned_num_tokens_padded: int | None = None,
+    ) -> tuple[BatchDescriptor, torch.Tensor | None]:
+        """This pass's padded batch (see v1/worker/dp_utils.py).
+
+        Under DP the draft decides from the status the step published, so a step
+        that has not published one is a caller in the wrong place rather than a
+        rank on its own; on a single rank there is no group to read.
+        """
+        if self.vllm_config.parallel_config.data_parallel_size == 1:
+            status = None
+        else:
+            status = self.runner.dp_status
+            assert status is not None, (
+                "the step published no status for the draft to decide from"
+            )
+        return determine_draft_batch_execution_and_padding(
+            cfg=self.runner.shape_config,
+            status=status,
+            dp_rank=self.dp_rank,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            is_prefill=is_prefill,
+            draft_has_moe=self.draft_has_moe,
+            first_pass=first_pass,
+            pinned_num_tokens_padded=pinned_num_tokens_padded,
+        )
+
     def _preprocess(
         self,
         num_reqs: int,
         num_reqs_padded: int,
         num_input_tokens: int,
-        token_indices_to_sample: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        *,
         is_prefill: bool,
+        token_indices_to_sample: torch.Tensor | None = None,
+        target_token_ids: torch.Tensor | None = None,
+        next_token_ids: torch.Tensor | None = None,
+        cad: CommonAttentionMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        if is_prefill:
-            input_ids = self.input_ids.view(num_reqs, -1)
-            positions = self.positions.view(num_reqs, -1)
-            target_hidden_states = self.hidden_states
-        else:
-            input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
-            positions = self.positions[:num_input_tokens].view(num_reqs, -1)
-            target_hidden_states = self.hidden_states[:num_input_tokens].view(
-                num_reqs, -1, self.hidden_size
-            )
-            input_ids = pad(input_ids, 0, num_reqs_padded)
-            positions = pad(positions, 0, num_reqs_padded)
-            target_hidden_states = pad(target_hidden_states, 0, num_reqs_padded)
+        if target_token_ids is not None:
+            assert next_token_ids is not None
+            assert num_input_tokens == target_token_ids.shape[0]
 
-        target_hidden_states = target_hidden_states.view(
-            *input_ids.shape, -1
-        )  # [B, L, H]
-        token_indices_to_sample_padded = (
-            pad(token_indices_to_sample, 0, num_reqs_padded)
-            if token_indices_to_sample is not None
-            else None
+            if token_indices_to_sample is None:
+                assert cad is not None
+                token_indices_to_sample = cad.query_start_loc[1:] - 1
+            token_indices_to_sample = token_indices_to_sample.to(self.device)
+
+            self.input_ids[: num_input_tokens - 1] = target_token_ids[1:]
+            self.input_ids[token_indices_to_sample] = next_token_ids
+
+        input_ids = self.input_ids[:num_input_tokens].view(num_reqs, -1)
+        positions = positions.view(-1)[:num_input_tokens].view(num_reqs, -1)
+        hidden_states = hidden_states.view(-1, self.hidden_size)[
+            :num_input_tokens
+        ].view(num_reqs, -1, self.hidden_size)
+
+        layout = InputLayout(
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs if is_prefill else num_reqs_padded,
+            query_len=input_ids.shape[1],
+            query_len_padded=self.max_num_tokens if is_prefill else input_ids.shape[1],
         )
+        staged = self.input_stager.stage(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=hidden_states,
+            token_indices=token_indices_to_sample,
+            layout=layout,
+        )
+        assert staged.hidden_states is not None
 
         return (
-            input_ids,
-            positions,
-            target_hidden_states,
-            token_indices_to_sample_padded,
+            staged.input_ids,
+            staged.positions,
+            staged.hidden_states,
+            staged.token_indices,
         )
-
-    def _determine_draft_batch_padding(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        is_prefill: bool,
-    ) -> tuple[int, int | None, torch.Tensor | None]:
-        num_reqs_padded = (
-            self.runner.bucketing_manager.find_decode_batch_bucket(num_reqs)
-            if not is_prefill
-            else num_reqs
-        )
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-        if dp_size == 1:
-            return num_reqs_padded, None, None
-
-        num_tokens_across_dp, num_reqs_across_dp = (
-            RBLNDPMetadata.num_tokens_and_reqs_across_dp(
-                num_tokens, num_reqs, dp_size, self.dp_rank, is_prefill
-            )
-        )
-        num_tokens_padded = self.max_num_tokens
-        if self.runner.specialized_moe_decode and not is_prefill:
-            if num_reqs_across_dp is None:
-                num_reqs_padded = self.runner.bucketing_manager.decode_batch_buckets[-1]
-            else:
-                num_reqs_padded = (
-                    self.runner.bucketing_manager.find_decode_batch_bucket(
-                        int(num_reqs_across_dp.max())
-                    )
-                )
-                max_tokens_per_req = int(
-                    (num_tokens_across_dp // num_reqs_across_dp).max()
-                )
-                num_tokens_padded = num_reqs_padded * max_tokens_per_req
-        return num_reqs_padded, num_tokens_padded, num_tokens_across_dp

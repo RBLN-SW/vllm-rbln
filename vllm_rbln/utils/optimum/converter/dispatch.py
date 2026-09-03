@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.utils.optimum.paths import is_compiled_dir
 
 from .common import get_user_max_num_batched_tokens
 from .from_optimum import sync_from_optimum
@@ -80,6 +81,7 @@ def _generate_model_path_name(
         "block_size": block_size,
         "max_model_len": max_model_len,
         "num_devices": num_devices,
+        "dtype": str(vllm_config.model_config.dtype),
         "max_num_batched_tokens": user_max_num_batched_tokens,
         "memory_budget": memory_budget,
     }
@@ -116,7 +118,7 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
         _generate_model_path_name(vllm_config=vllm_config),
     )
     vllm_config.additional_config["cached_model_path"] = cached_model_path
-    if os.path.exists(os.path.join(cached_model_path, "rbln_config.json")):
+    if is_compiled_dir(cached_model_path):
         logger.info("Found cached compiled model at %s", cached_model_path)
         vllm_config.model_config.model = cached_model_path
         return load_compiled_rbln_config(vllm_config)

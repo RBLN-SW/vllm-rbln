@@ -14,7 +14,13 @@
 
 """Tests for RBLNEagleProposer methods (spec_decode/eagle.py), built through its
 real constructor from upstream's eagle model pair with the compiled model left
-unset; scenarios mirror upstream's tests/v1/spec_decode/test_eagle.py."""
+unset; scenarios mirror upstream's tests/v1/spec_decode/test_eagle.py.
+
+The draft->target id mapping (`_to_target_token_ids`, and the `logits_processor`
+branch in the load_model wrapper) has no upstream counterpart -- upstream widens
+the draft logits inside compute_logits, which this platform cannot compile.
+Those tests pin the RBLN detour, so do not resolve a divergence from upstream by
+deleting them."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -27,8 +33,20 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from tests.native.v1.spec_decode.utils import make_cad, make_eagle_proposer
+from vllm_rbln.v1.worker.dp_utils import DPStatus, ShapeConfig
 
 pytestmark = pytest.mark.maybe_use_device
+
+
+def _shape_config(*, specialized=False, max_num_tokens=64):
+    """Identity bucketing, so a padded count that differs from num_reqs is the
+    rule's doing and not the fixture's."""
+    return ShapeConfig(
+        decode_batch_buckets=[1, 2, 4, 8],
+        find_bucket=lambda n: n,
+        max_num_tokens=max_num_tokens,
+        specialized_moe_decode=specialized,
+    )
 
 
 def _neutralize(monkeypatch):
@@ -43,14 +61,16 @@ def _neutralize(monkeypatch):
     )
 
 
-def _wire_runner(proposer, *, num_reqs, is_prefill):
+def _wire_runner(proposer, *, num_reqs):
     proposer.runner = SimpleNamespace(
+        # propose runs in the decode phase, which is the step phase it reads.
+        is_prefill=False,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
-        is_prefill=is_prefill,
         kv_caches=[],
         kv_cache_bases=[],
         kv_cache_view_infos=[],
-        bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
+        shape_config=_shape_config(),
+        dp_status=None,
     )
     proposer.draft_attn_groups = [
         SimpleNamespace(
@@ -60,67 +80,77 @@ def _wire_runner(proposer, *, num_reqs, is_prefill):
     ]
 
 
-def _fake_model_exec(argmax_tokens, hidden_size):
-    # The load_model wrapper contract: (hidden [n, H], logits) with a
-    # controllable per-row argmax, reshaped so the multi-step loop can feed it back.
+def _fake_model_exec(draft_tokens, hidden_size):
+    # The load_model wrapper contract: (hidden [n, H], in-graph argmax ids),
+    # reshaped so the multi-step loop can feed the hidden states back.
     def executable(
         *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
     ):
-        logits = torch.full((8, 128), -10.0)
-        for i, tok in enumerate(argmax_tokens):
-            logits[i, tok] = 10.0
-        return hidden_states.reshape(-1, hidden_size), logits
+        ids = torch.zeros(8, dtype=torch.int64)
+        ids[: len(draft_tokens)] = torch.tensor(draft_tokens, dtype=torch.int64)
+        # Filled on the host but returned on the device the real executable
+        # returns, so the d2t gather runs where production runs it. The argmax
+        # itself is no longer here: it moved inside the compiled wrapper.
+        return hidden_states.reshape(-1, hidden_size), ids.to(hidden_states.device)
 
     return executable
 
 
 def _echo_model_exec(hidden_size):
-    # argmax = first input id + 1, so consecutive columns are the observable
-    # signature that the loop feeds each step's output forward.
+    # Draft id = first input id + 1, so consecutive columns are the observable
+    # signature that the loop feeds each step's output forward. The ids tensor is
+    # reused across calls like the compiled graph's static output, so a draft kept
+    # by reference would collapse every column into the last step's.
+    draft_ids = torch.zeros(8, dtype=torch.int64)
+
     def executable(
         *, input_ids, positions, hidden_states, inputs_embeds, token_indices_to_sample
     ):
-        rows = input_ids.reshape(input_ids.shape[0], -1)[:, 0].tolist()
-        logits = torch.full((8, 128), -10.0)
-        for i, val in enumerate(rows):
-            logits[i, (int(val) + 1) % 128] = 10.0
-        return hidden_states.reshape(-1, hidden_size), logits
+        rows = input_ids.reshape(input_ids.shape[0], -1)[:, 0]
+        draft_ids[: rows.shape[0]] = (rows.long() + 1) % 128
+        return hidden_states.reshape(-1, hidden_size), draft_ids
 
     return executable
 
 
-def _call_propose(proposer):
+def _call_propose(proposer, target_hidden_states=None):
     return proposer.propose(
         target_token_ids=torch.arange(4, dtype=torch.int32),
         target_positions=torch.arange(4, dtype=torch.int64),
-        target_hidden_states=torch.zeros(4, proposer.hidden_size),
+        target_hidden_states=torch.zeros(4, proposer.hidden_size)
+        if target_hidden_states is None
+        else target_hidden_states,
         next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
         token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
         common_attn_metadata=make_cad([0, 2, 4], [10, 11]),
     )
 
 
-class TestSetInputsFirstPass:
-    def test_default_eagle_shifts_tokens_and_inserts_next(self):
+class TestPreprocess:
+    # _preprocess also builds the first-pass draft input ids (formerly
+    # set_inputs_first_pass) whenever target_token_ids is passed.
+    @staticmethod
+    def _first_pass(proposer, token_indices_to_sample):
+        return proposer._preprocess(
+            3,
+            3,
+            9,
+            torch.arange(9, dtype=torch.int64),
+            torch.zeros(9, proposer.hidden_size),
+            is_prefill=False,
+            token_indices_to_sample=token_indices_to_sample,
+            target_token_ids=torch.arange(11, 20, dtype=torch.int32),
+            next_token_ids=torch.tensor([100, 200, 300], dtype=torch.int32),
+            cad=make_cad([0, 3, 5, 9], [3, 5, 4]),
+        )
+
+    def test_first_pass_shifts_tokens_and_inserts_next(self):
         # Three requests, query_lens [3, 2, 4]. The target ids shift left by one
         # (drop the first) and each request's next token lands at its last slot.
         proposer = make_eagle_proposer()
-        cad = make_cad([0, 3, 5, 9], [3, 5, 4])
-        target_token_ids = torch.arange(11, 20, dtype=torch.int32)  # 9 tokens
-        next_token_ids = torch.tensor([100, 200, 300], dtype=torch.int32)
-        positions = torch.arange(9, dtype=torch.int64)
-        hidden = torch.zeros(9, proposer.hidden_size)
-
-        num_tokens, token_indices = proposer.set_inputs_first_pass(
-            target_token_ids=target_token_ids,
-            next_token_ids=next_token_ids,
-            target_positions=positions,
-            target_hidden_states=hidden,
-            token_indices_to_sample=None,  # defaults to query_start_loc[1:] - 1
-            cad=cad,
-        )
-        assert num_tokens == 9
-        assert token_indices.cpu().tolist() == [2, 4, 8]
+        # None token indices default to query_start_loc[1:] - 1.
+        _, _, _, tip = self._first_pass(proposer, None)
+        assert tip.cpu().tolist() == [2, 4, 8]
         # shifted target [12..19] with next tokens overwritten at [2, 4, 8].
         assert proposer.input_ids[:9].cpu().tolist() == [
             12,
@@ -133,22 +163,15 @@ class TestSetInputsFirstPass:
             19,
             300,
         ]
-        assert proposer.positions[:9].cpu().tolist() == list(range(9))
 
-    def test_uses_explicit_token_indices_verbatim(self):
-        # A given token_indices_to_sample is used as-is (not recomputed from
+    def test_first_pass_uses_explicit_token_indices_verbatim(self):
+        # Given token indices are used as-is (not recomputed from
         # query_start_loc); the next tokens land at exactly those slots.
         proposer = make_eagle_proposer()
-        num_tokens, token_indices = proposer.set_inputs_first_pass(
-            target_token_ids=torch.arange(11, 20, dtype=torch.int32),
-            next_token_ids=torch.tensor([100, 200, 300], dtype=torch.int32),
-            target_positions=torch.arange(9, dtype=torch.int64),
-            target_hidden_states=torch.zeros(9, proposer.hidden_size),
-            token_indices_to_sample=torch.tensor([0, 3, 8], dtype=torch.int64),
-            cad=make_cad([0, 3, 5, 9], [3, 5, 4]),
+        _, _, _, tip = self._first_pass(
+            proposer, torch.tensor([0, 3, 8], dtype=torch.int64)
         )
-        assert num_tokens == 9
-        assert token_indices.cpu().tolist() == [0, 3, 8]
+        assert tip.cpu().tolist() == [0, 3, 8]
         assert proposer.input_ids[:9].cpu().tolist() == [
             100,
             13,
@@ -161,51 +184,56 @@ class TestSetInputsFirstPass:
             300,
         ]
 
-    def test_rejects_extra_input_slots(self):
-        # Draft-model / parallel-drafting / dflash paths (needs_extra_input_slots)
-        # are unsupported; this guard trips when one is later enabled.
-        proposer = make_eagle_proposer()
-        proposer.needs_extra_input_slots = True
-        with pytest.raises(NotImplementedError):
-            proposer.set_inputs_first_pass(
-                target_token_ids=torch.arange(4, dtype=torch.int32),
-                next_token_ids=torch.tensor([1], dtype=torch.int32),
-                target_positions=torch.arange(4, dtype=torch.int64),
-                target_hidden_states=torch.zeros(4, proposer.hidden_size),
-                token_indices_to_sample=None,
-                cad=make_cad([0, 4], [4]),
-            )
-
-
-class TestPreprocess:
-    def test_prefill_views_full_buffers(self):
-        # Prefill reshapes the whole (max_num_tokens,) buffer to [num_reqs, -1];
-        # token indices pass through unpadded (num_reqs already the padded width).
+    def test_prefill_pads_query_dim_to_max_tokens(self):
+        # Prefill stages the request into the full (1, max_num_tokens) graph
+        # shape, zeroing everything past the scheduled tokens.
         proposer = make_eagle_proposer()
         n = proposer.max_num_tokens
-        proposer.input_ids[:] = torch.arange(n, dtype=torch.int32)
-        token_indices = torch.tensor([0, 32, 64, 96], dtype=torch.int32)
+        proposer.input_ids[:] = -1
+        proposer.input_ids[:4] = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
 
         input_ids, positions, hidden, tip = proposer._preprocess(
-            4, 4, n, token_indices, True
+            1,
+            1,
+            4,
+            proposer.positions[:4],
+            proposer.hidden_states[:4],
+            is_prefill=True,
+            token_indices_to_sample=torch.tensor([3], dtype=torch.int32),
         )
-        assert input_ids.shape == (4, n // 4)
-        assert positions.shape == (4, n // 4)
-        assert hidden.shape == (4, n // 4, proposer.hidden_size)
-        assert tip.cpu().tolist() == [0, 32, 64, 96]
+        assert input_ids.shape == (1, n)
+        assert positions.shape == (1, n)
+        assert hidden.shape == (1, n, proposer.hidden_size)
+        assert input_ids[0, :4].cpu().tolist() == [10, 11, 12, 13]
+        assert not input_ids[0, 4:].cpu().any()
+        assert tip.cpu().tolist() == [3]
 
     def test_decode_slices_and_pads_to_bucket(self):
         # Decode slices the used tokens, reshapes to [num_reqs, -1], then pads
         # rows and token indices up to the padded batch (here 2 -> 4) with zeros.
+        # positions and hidden states come from the caller (the target's), never
+        # from the drafter's own buffers, so they carry distinct values here.
         proposer = make_eagle_proposer()
         proposer.input_ids[:] = -1
         proposer.input_ids[:4] = torch.tensor([10, 11, 20, 21], dtype=torch.int32)
+        target_hidden = torch.full(
+            (4, proposer.hidden_size), 3.0, dtype=proposer.hidden_states.dtype
+        )
 
-        input_ids, _, hidden, tip = proposer._preprocess(
-            2, 4, 4, torch.tensor([1, 3], dtype=torch.int32), False
+        input_ids, positions, hidden, tip = proposer._preprocess(
+            2,
+            4,
+            4,
+            torch.tensor([7, 8, 9, 10], dtype=torch.int64),
+            target_hidden,
+            is_prefill=False,
+            token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
         )
         assert input_ids.cpu().tolist() == [[10, 11], [20, 21], [0, 0], [0, 0]]
+        assert positions.cpu().tolist() == [[7, 8], [9, 10], [0, 0], [0, 0]]
         assert hidden.shape == (4, 2, proposer.hidden_size)
+        assert hidden[:2].cpu().eq(3.0).all()
+        assert not hidden[2:].cpu().any()
         assert tip.cpu().tolist() == [1, 3, 0, 0]
 
 
@@ -260,73 +288,6 @@ class TestPrepareNextTokenIdsPadded:
         assert valid_count.cpu().tolist() == [1, 0, 0]
 
 
-class TestDetermineDraftBatchPadding:
-    def test_dp1_prefill_keeps_num_reqs_decode_buckets(self):
-        # With data_parallel_size == 1 the dp fields stay None; prefill keeps the
-        # request count, decode rounds up to the runner's decode bucket.
-        proposer = make_eagle_proposer()
-        proposer.runner = SimpleNamespace(
-            bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: 8),
-            specialized_moe_decode=False,
-        )
-        assert proposer._determine_draft_batch_padding(3, 10, True) == (3, None, None)
-        assert proposer._determine_draft_batch_padding(3, 3, False) == (8, None, None)
-
-    def test_dp_greater_than_one_specialized_moe(self, monkeypatch):
-        # The per-DP counts drive the padding: batch bucket from max reqs across
-        # DP, token pad from bucket * max tokens-per-req.
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.parallel_config, "data_parallel_size", 2
-        )
-        proposer.dp_rank = 0
-        proposer.runner = SimpleNamespace(
-            specialized_moe_decode=True,
-            bucketing_manager=SimpleNamespace(
-                find_decode_batch_bucket=lambda n: 8,
-                decode_batch_buckets=[1, 2, 4, 8],
-            ),
-        )
-        monkeypatch.setattr(
-            eagle_module.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(lambda *a: (torch.tensor([16, 16]), torch.tensor([4, 2]))),
-        )
-        num_reqs_padded, num_tokens_padded, across = (
-            proposer._determine_draft_batch_padding(3, 6, False)
-        )
-        # bucket(max(4, 2)) = 8; max(16//4, 16//2) = 8; tokens = 8 * 8 = 64.
-        assert num_reqs_padded == 8
-        assert num_tokens_padded == 64
-        assert across.cpu().tolist() == [16, 16]
-
-    def test_dp_greater_than_one_without_per_rank_counts(self, monkeypatch):
-        # When the per-rank req counts are absent, padding falls back to the
-        # largest decode bucket and the full token budget.
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
-        monkeypatch.setattr(
-            proposer.vllm_config.parallel_config, "data_parallel_size", 2
-        )
-        proposer.dp_rank = 0
-        proposer.runner = SimpleNamespace(
-            specialized_moe_decode=True,
-            bucketing_manager=SimpleNamespace(
-                find_decode_batch_bucket=lambda n: 8,
-                decode_batch_buckets=[1, 2, 4, 8],
-            ),
-        )
-        monkeypatch.setattr(
-            eagle_module.RBLNDPMetadata,
-            "num_tokens_and_reqs_across_dp",
-            staticmethod(lambda *a: (torch.tensor([16, 16]), None)),
-        )
-        num_reqs_padded, num_tokens_padded, _ = proposer._determine_draft_batch_padding(
-            3, 6, False
-        )
-        assert num_reqs_padded == 8  # decode_batch_buckets[-1]
-        assert num_tokens_padded == proposer.max_num_tokens
-
-
 class TestInitGuards:
     def test_rejects_multimodal_inputs(self, monkeypatch):
         # Multimodal targets are unsupported; the guard trips at construction.
@@ -338,14 +299,87 @@ class TestInitGuards:
         with pytest.raises(NotImplementedError):
             make_eagle_proposer()
 
+    def test_rejects_extra_input_slots(self, monkeypatch):
+        # Parallel drafting / draft-model spec decode needs input slots the
+        # staged drafter inputs have no room for; construction, not the first
+        # propose, must be where that trips.
+        from vllm.v1.spec_decode.eagle import EagleProposer
+
+        base_init = EagleProposer.__init__
+
+        def init_with_extra_slots(self, *args, **kwargs):
+            base_init(self, *args, **kwargs)
+            self.needs_extra_input_slots = True
+
+        monkeypatch.setattr(EagleProposer, "__init__", init_with_extra_slots)
+        with pytest.raises(NotImplementedError, match="extra input slots"):
+            make_eagle_proposer()
+
+    def test_rejects_non_greedy_draft_sampling(self, monkeypatch):
+        # The greedy pick happens inside the draft graph, which returns ids and
+        # not logits, so a probabilistic sampler would be silently ignored.
+        spec_config = make_eagle_proposer().vllm_config.speculative_config
+        monkeypatch.setattr(spec_config, "draft_sample_method", "probabilistic")
+        with pytest.raises(NotImplementedError, match="draft_sample_method"):
+            make_eagle_proposer()
+
+
+class TestToTargetTokenIds:
+    def test_applies_d2t_as_an_offset(self):
+        # d2t holds offsets, not absolute target ids: id -> id + d2t[id]. Both
+        # operands sit on the proposer's device, so this is the gather production
+        # runs -- the reason the mapping moved out of the compiled graph.
+        proposer = make_eagle_proposer()
+        proposer.draft_id_to_target_id = torch.tensor(
+            [0, 2, 3, 5, 8], dtype=torch.long, device=proposer.device
+        )
+        draft_ids = torch.tensor(
+            [0, 1, 4, 2], dtype=torch.int64, device=proposer.device
+        )
+
+        out = proposer._to_target_token_ids(draft_ids)
+
+        assert out.cpu().tolist() == [0, 3, 12, 5]
+
+    def test_matches_full_vocab_scatter_then_argmax(self):
+        # Upstream widens the draft logits into the target vocabulary and
+        # argmaxes there. Dropping that scatter is only safe because
+        # argmax-then-map picks the same id for a monotonic mapping.
+        target_vocab_size = 20
+        d2t = torch.tensor([0, 2, 3, 5, 8, 11], dtype=torch.long)
+        target_ids = torch.arange(d2t.shape[0], dtype=torch.long) + d2t
+        # The two premises of that equivalence; without them the reference below
+        # would agree only by accident.
+        assert bool((target_ids.diff() > 0).all())
+        assert int(target_ids.max()) < target_vocab_size
+        draft_logits = torch.tensor(
+            [
+                [0.0, 9.0, 1.0, 2.0, 3.0, 4.0],
+                [5.0, 1.0, 0.0, 0.0, 7.0, 2.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 8.0],
+            ]
+        )
+        full_logits = torch.full(
+            (draft_logits.shape[0], target_vocab_size), float("-inf")
+        )
+        full_logits[:, target_ids] = draft_logits
+        proposer = make_eagle_proposer()
+        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+
+        out = proposer._to_target_token_ids(
+            draft_logits.argmax(dim=-1).to(proposer.device)
+        )
+
+        assert out.cpu().tolist() == full_logits.argmax(dim=-1).tolist()
+
 
 class TestPropose:
-    def test_single_step_early_exit_argmaxes_once(self, monkeypatch):
+    def test_single_step_early_exit_takes_ids_once(self, monkeypatch):
         # num_speculative_tokens == 1 takes the early-exit branch: one model pass,
-        # per-request argmax, shaped [num_reqs, 1].
+        # the graph's ids sliced per request, shaped [num_reqs, 1].
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=1)
-        _wire_runner(proposer, num_reqs=2, is_prefill=True)
+        _wire_runner(proposer, num_reqs=2)
         proposer.model_executable = _fake_model_exec([42, 60], proposer.hidden_size)
 
         out = _call_propose(proposer)
@@ -357,7 +391,7 @@ class TestPropose:
         # columns prove the loop feeds outputs forward (a broken one repeats).
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)
-        _wire_runner(proposer, num_reqs=2, is_prefill=True)
+        _wire_runner(proposer, num_reqs=2)
         proposer.model_executable = _echo_model_exec(proposer.hidden_size)
 
         out = proposer.propose(
@@ -378,7 +412,7 @@ class TestPropose:
         # still running and feeding drafts forward is observable here.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=2)
-        _wire_runner(proposer, num_reqs=1, is_prefill=False)
+        _wire_runner(proposer, num_reqs=1)
         proposer.max_model_len = 3  # positions hit the cap on the second step
         proposer.model_executable = _echo_model_exec(proposer.hidden_size)
 
@@ -394,37 +428,154 @@ class TestPropose:
         assert out.shape == (1, 2)
         assert torch.equal(out.cpu()[:, 1:], out.cpu()[:, :-1] + 1)
 
-    def test_eagle3_rejects_wrong_combined_hidden_size(self, monkeypatch):
-        # eagle3 combines the target hidden states first and asserts the width;
-        # a mismatch fails before any draft pass.
+    def test_eagle3_rejects_uncombined_hidden_states(self, monkeypatch):
+        # eagle3's combine_hidden_states now runs in the target graph, so propose
+        # is handed already-combined states; raw aux-width ones must not pass.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle3", num_speculative_tokens=1)
-        _wire_runner(proposer, num_reqs=2, is_prefill=True)
-
-        class _FakeEagle3(Eagle3LlamaForCausalLM):
-            def __init__(self, combined):
-                self.combined = combined
-
-            def combine_hidden_states(self, target_hidden_states):
-                return self.combined
-
-        proposer.model = _FakeEagle3(torch.zeros((4, proposer.hidden_size + 1)))
+        _wire_runner(proposer, num_reqs=2)
         with pytest.raises(AssertionError):
-            _call_propose(proposer)
+            _call_propose(proposer, torch.zeros(4, proposer.hidden_size * 3))
+
+    def test_single_step_maps_draft_ids_into_target_space(self, monkeypatch):
+        # The early-exit branch maps too; an unmapped draft id names a different
+        # token in the target vocabulary.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=1)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.model_executable = _fake_model_exec([42, 60], proposer.hidden_size)
+        d2t = torch.zeros(128, dtype=torch.long)
+        d2t[42], d2t[60] = 5, 7
+        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+
+        out = _call_propose(proposer)
+
+        assert out.cpu().tolist() == [[47], [67]]
+
+    def test_multi_step_feeds_the_mapped_id_forward(self, monkeypatch):
+        # Each draft is mapped before it becomes the next step's input: the draft
+        # head's input embedding is in target space even when its output head is
+        # not.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=2)
+        _wire_runner(proposer, num_reqs=2)
+        d2t = torch.zeros(128, dtype=torch.long)
+        d2t[1], d2t[2], d2t[3], d2t[4] = 2, 3, 5, 8
+        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        argmax_per_call = [[1, 3], [2, 4]]
+        seen: list[torch.Tensor] = []
+
+        def executable(
+            *,
+            input_ids,
+            positions,
+            hidden_states,
+            inputs_embeds,
+            token_indices_to_sample,
+        ):
+            ids = torch.zeros(8, dtype=torch.int64)
+            for row, tok in enumerate(argmax_per_call[len(seen)]):
+                ids[row] = tok
+            seen.append(input_ids.clone())
+            return (
+                hidden_states.reshape(-1, proposer.hidden_size),
+                ids.to(hidden_states.device),
+            )
+
+        proposer.model_executable = executable
+
+        out = proposer.propose(
+            target_token_ids=torch.tensor([10, 11, 20, 21], dtype=torch.int32),
+            target_positions=torch.tensor([4, 5, 6, 7], dtype=torch.int64),
+            target_hidden_states=torch.zeros(4, proposer.hidden_size),
+            next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
+            token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
+            common_attn_metadata=make_cad([0, 2, 4], [10, 11]),
+        )
+
+        # step 1 argmax [1, 3] -> [3, 8], which is what step 2 must be fed.
+        assert seen[1][:, 0].cpu().tolist() == [3, 8]
+        # step 2 argmax [2, 4] -> [5, 12].
+        assert out.cpu().tolist() == [[3, 5], [8, 12]]
 
 
 class TestLoadModel:
+    class _FakeMappedDraft(Eagle3LlamaForCausalLM):
+        """An EAGLE3 draft head whose output stays in draft-vocab space: it
+        carries a d2t mapping and a logits_processor. compute_logits only counts
+        calls -- reaching its full-vocab scatter is the defect under test."""
+
+        def __init__(self, d2t):
+            # Not super().__init__(): that builds the real head. Only the module
+            # bookkeeping is needed, so that load_model can walk modules().
+            torch.nn.Module.__init__(self)
+            self.draft_id_to_target_id = d2t
+            self.lm_head = object()
+            self.logits_processor_calls: list[tuple[object, torch.Tensor]] = []
+            self.compute_logits_calls = 0
+
+        def __call__(self, *, input_ids, positions, hidden_states, inputs_embeds):
+            return hidden_states + 1000, hidden_states + 2000
+
+        def logits_processor(self, lm_head, hidden_states):
+            self.logits_processor_calls.append((lm_head, hidden_states.clone()))
+            return hidden_states + 1
+
+        def compute_logits(self, sample_hidden_states):
+            self.compute_logits_calls += 1
+            return sample_hidden_states + 1
+
     @staticmethod
-    def _stub_super_load_model(monkeypatch):
+    def _stub_super_load_model(monkeypatch, model=None, modules=()):
         from vllm.v1.spec_decode.eagle import EagleProposer
 
+        if model is None:
+            model = SimpleNamespace(
+                compute_logits=lambda h: h, modules=lambda: iter(modules)
+            )
         monkeypatch.setattr(
             EagleProposer,
             "load_model",
-            lambda self, target_model: setattr(
-                self, "model", SimpleNamespace(compute_logits=lambda h: h)
-            ),
+            lambda self, target_model: setattr(self, "model", model),
         )
+
+    def test_the_detection_rests_on_the_runner_being_a_submodule(self):
+        # The two cases below stub modules() and mock the runner, so neither walks a
+        # real module tree. What they cannot see is the structure the detection needs:
+        # the runner has to be a module for modules() to reach it, and RBLN's has to
+        # be the class the check names. If upstream ever breaks either, a fused-MoE
+        # draft reads as dense, an idle rank skips it, and the busy ranks wait on a
+        # collective it never joins.
+        from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
+            RBLNMoERunner,
+        )
+
+        assert issubclass(eagle_module.MoERunner, torch.nn.Module)
+        assert issubclass(RBLNMoERunner, eagle_module.MoERunner)
+
+    def test_a_dense_draft_reports_no_moe(self, monkeypatch):
+        # Nothing in a dense draft reads the step's padded token dimension, which
+        # is what lets an idle rank skip drafting altogether.
+        self._stub_super_load_model(monkeypatch)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        proposer.load_model(target_model=object())
+        assert proposer.draft_has_moe is False
+
+    def test_a_moe_draft_is_detected(self, monkeypatch):
+        # An MTP draft shares the target checkpoint, so its layer can be a fused
+        # MoE -- then its forward joins the DP all-gather and an idle rank has to
+        # run it to stay in step.
+        moe = mock.Mock(spec=eagle_module.MoERunner)
+        self._stub_super_load_model(monkeypatch, modules=(object(), moe))
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        proposer.load_model(target_model=object())
+        assert proposer.draft_has_moe is True
 
     def test_eager_wrapper_when_enforce_eager(self, monkeypatch):
         self._stub_super_load_model(monkeypatch)
@@ -449,7 +600,9 @@ class TestLoadModel:
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", False
         )
-        proposer.runner = SimpleNamespace(compile_context=object())
+        proposer.runner = SimpleNamespace(
+            compile_context=object(), runtime_holder=[None]
+        )
 
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
@@ -458,7 +611,7 @@ class TestLoadModel:
 
     def test_eager_wrapper_composes_model_forward(self, monkeypatch):
         # The eager wrapper runs the draft model, reshapes the hidden states,
-        # keeps the sampled positions, and returns (hidden, compute_logits).
+        # keeps the sampled positions, and returns (hidden, in-graph argmax).
         from vllm.v1.spec_decode.eagle import EagleProposer
 
         class _FakeModel:
@@ -466,7 +619,10 @@ class TestLoadModel:
                 return hidden_states  # a single tensor -> model_returns_tuple False
 
             def compute_logits(self, sample_hidden_states):
-                return sample_hidden_states + 1
+                return sample_hidden_states
+
+            def modules(self):
+                return iter(())
 
         monkeypatch.setattr(
             EagleProposer,
@@ -481,26 +637,77 @@ class TestLoadModel:
         proposer.load_model(target_model=object())
 
         h = proposer.hidden_size
-        hidden = torch.arange(4, dtype=torch.float32).reshape(4, 1).repeat(1, h)
-        out_hidden, out_logits = proposer.model_executable(
+        # Row i peaks at column i + 1, so the ids identify the rows kept.
+        hidden = torch.zeros(4, h)
+        hidden[torch.arange(4), torch.arange(4) + 1] = 1.0
+        out_hidden, draft_ids = proposer.model_executable(
             input_ids=torch.zeros(4, dtype=torch.int32),
             positions=torch.zeros(4, dtype=torch.int64),
             hidden_states=hidden,
             token_indices_to_sample=torch.tensor([0, 2], dtype=torch.int64),
         )
-        # rows 0 and 2 survive the index_select; compute_logits adds one.
+        # rows 0 and 2 survive the index_select; the argmax is taken in-graph.
         assert out_hidden.shape == (2, h)
-        assert out_hidden[:, 0].cpu().tolist() == [0.0, 2.0]
-        assert out_logits[:, 0].cpu().tolist() == [1.0, 3.0]
+        assert draft_ids.cpu().tolist() == [1, 3]
+
+    def test_mapped_wrapper_skips_the_full_vocab_scatter(self, monkeypatch):
+        # A mapped head must reach logits_processor instead: compute_logits
+        # scatters into an -inf target-vocab row, and that index is
+        # input-independent, so it folds into a constant whose out-of-bounds
+        # write is the SIGSEGV in KV warm-up. What is checked here is the branch
+        # selection -- only a real compile on the device reaches the SIGSEGV, so
+        # this guards against someone routing back through compute_logits.
+        d2t = torch.tensor([0, 2, 3], dtype=torch.long)
+        model = self._FakeMappedDraft(d2t)
+        self._stub_super_load_model(monkeypatch, model)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+        proposer.load_model(target_model=object())
+
+        # Taking that branch at all depends on load_model lifting d2t off the
+        # draft model, so this covers the capture too.
+        assert proposer.draft_id_to_target_id is d2t
+
+        h = proposer.hidden_size
+        hidden = torch.arange(2 * 3 * h, dtype=torch.float32).view(2, 3, h)
+        _, draft_ids = proposer.model_executable(
+            input_ids=torch.zeros((2, 3), dtype=torch.int32),
+            positions=torch.zeros((2, 3), dtype=torch.int64),
+            hidden_states=hidden,
+            token_indices_to_sample=None,
+        )
+
+        assert model.compute_logits_calls == 0
+        assert len(model.logits_processor_calls) == 1
+        lm_head_arg, hidden_arg = model.logits_processor_calls[0]
+        assert lm_head_arg is model.lm_head
+        # model_returns_tuple() is True for eagle, so the wrapper samples from
+        # the first stream.
+        expected_sample = (hidden + 1000).view(-1, h)
+        assert torch.equal(hidden_arg, expected_sample)
+        # The wrapper argmaxes in the graph and returns draft-vocab ids, so the
+        # observable is the pick over logits_processor's output, not the logits.
+        expected_ids = (expected_sample + 1).argmax(dim=-1)
+        assert draft_ids.cpu().tolist() == expected_ids.tolist()
 
 
 class TestDummyRun:
-    def test_runs_and_invokes_model(self, monkeypatch):
-        # dummy_run is a warm-up: it drives the same orchestration and returns
-        # nothing, invoking the model at least once.
+    @staticmethod
+    def _proposer(
+        monkeypatch, *, num_spec, dp_status=None, draft_has_moe=True, specialized=False
+    ):
         _neutralize(monkeypatch)
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        proposer = make_eagle_proposer(num_speculative_tokens=num_spec)
+        proposer.draft_has_moe = draft_has_moe
+        if dp_status is not None:
+            # A status is a DP fact: the draft reads one only when there is a group.
+            monkeypatch.setattr(
+                proposer.vllm_config.parallel_config, "data_parallel_size", 2
+            )
         proposer.runner = SimpleNamespace(
+            is_prefill=False,
             input_batch=SimpleNamespace(
                 num_reqs=2,
                 block_table=[
@@ -512,17 +719,23 @@ class TestDummyRun:
             kv_caches=[],
             kv_cache_bases=[],
             kv_cache_view_infos=[],
-            bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
+            shape_config=_shape_config(specialized=specialized),
+            dp_status=dp_status,
             _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
                 np.cumsum(nt, dtype=cumsum_dtype),
                 None,
             ),
         )
+        # The batch the draft runs on reaches the attention builder as batch_pad.
+        builds: list[dict] = []
+
+        def build_metadata(**kwargs):
+            builds.append(kwargs)
+            return object()
+
         proposer.draft_attn_groups = [
             SimpleNamespace(
-                get_metadata_builder=lambda: SimpleNamespace(
-                    build=lambda **k: object()
-                ),
+                get_metadata_builder=lambda: SimpleNamespace(build=build_metadata),
                 layer_names=["draft.layer"],
             )
         ]
@@ -532,10 +745,30 @@ class TestDummyRun:
             calls.append(1)
             return kwargs["hidden_states"].reshape(
                 -1, proposer.hidden_size
-            ), torch.zeros((8, 128))
+            ), torch.zeros(8, dtype=torch.int64)
 
         proposer.model_executable = executable
+        proposer.builds = builds
+        return proposer, calls
 
+    @staticmethod
+    def _status(*, idle):
+        # Two ranks, this one first. idle=True is the rank that drained while the
+        # peer keeps decoding, so it published the minimal entry rather than the
+        # three tokens per request the pass below actually runs.
+        local_tokens = 1 if idle else 3
+        return DPStatus(
+            num_tokens=(local_tokens, 8),
+            num_reqs=(1, 2),
+            is_prefill=(False, False),
+            is_idle=(idle, False),
+            num_tokens_across_dp=torch.tensor([local_tokens, 8], dtype=torch.int32),
+        )
+
+    def test_runs_and_invokes_model(self, monkeypatch):
+        # dummy_run is a warm-up: it drives the same orchestration and returns
+        # nothing, invoking the model at least once.
+        proposer, calls = self._proposer(monkeypatch, num_spec=1)
         assert (
             proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
             is None
@@ -545,45 +778,73 @@ class TestDummyRun:
     def test_multi_step_runs_second_loop(self, monkeypatch):
         # num_speculative_tokens > 1 warms up the extra draft loop too, so the
         # model runs once for the first pass plus once per extra step.
-        _neutralize(monkeypatch)
-        proposer = make_eagle_proposer(num_speculative_tokens=2)
-        proposer.runner = SimpleNamespace(
-            input_batch=SimpleNamespace(
-                num_reqs=2,
-                block_table=[
-                    SimpleNamespace(
-                        get_cpu_tensor=lambda: torch.zeros((8, 4), dtype=torch.int32)
-                    )
-                ],
-            ),
-            kv_caches=[],
-            kv_cache_bases=[],
-            kv_cache_view_infos=[],
-            bucketing_manager=SimpleNamespace(find_decode_batch_bucket=lambda n: n),
-            _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
-                np.cumsum(nt, dtype=cumsum_dtype),
-                None,
-            ),
-        )
-        proposer.draft_attn_groups = [
-            SimpleNamespace(
-                get_metadata_builder=lambda: SimpleNamespace(
-                    build=lambda **k: object()
-                ),
-                layer_names=["draft.layer"],
-            )
-        ]
-        calls = []
-
-        def executable(**kwargs):
-            calls.append(1)
-            return kwargs["hidden_states"].reshape(
-                -1, proposer.hidden_size
-            ), torch.zeros((8, 128))
-
-        proposer.model_executable = executable
+        proposer, calls = self._proposer(monkeypatch, num_spec=2)
         proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
         # first pass (1) + one extra draft step (num_speculative_tokens - 1 = 1).
+        assert len(calls) == 2
+
+    @pytest.mark.parametrize("idle,passes", [(True, 0), (False, 2)])
+    def test_a_dense_draft_runs_unless_this_rank_is_idle(
+        self, monkeypatch, idle, passes
+    ):
+        # An idle rank's passes are discarded and, with no fused MoE, no peer waits
+        # inside a collective for them, so the chain is skipped. A busy rank's are
+        # the drafts of the step and always run.
+        proposer, calls = self._proposer(
+            monkeypatch,
+            num_spec=2,
+            dp_status=self._status(idle=idle),
+            draft_has_moe=False,
+        )
+        proposer.dummy_run(num_reqs=1, num_tokens_per_req=3, is_prefill=False)
+        assert len(calls) == passes
+
+    @pytest.mark.parametrize("has_moe,batch_pad", [(True, 8), (False, 2)])
+    def test_only_a_moe_draft_takes_the_peers_batch(
+        self, monkeypatch, has_moe, batch_pad
+    ):
+        # A peer reading a prompt forces the top bucket on whoever reads the token
+        # dimension it dictates. A dense draft does not, so it keeps its own two
+        # requests instead of padding to the top bucket's eight.
+        prefilling_peer = DPStatus(
+            num_tokens=(2, 512),
+            num_reqs=(2, 1),
+            is_prefill=(False, True),
+            is_idle=(False, False),
+            num_tokens_across_dp=torch.tensor([2, 512], dtype=torch.int32),
+        )
+        proposer, _ = self._proposer(
+            monkeypatch,
+            num_spec=1,
+            dp_status=prefilling_peer,
+            draft_has_moe=has_moe,
+            specialized=True,
+        )
+        proposer.dummy_run(num_reqs=2, num_tokens_per_req=1, is_prefill=False)
+        assert [b["batch_pad"] for b in proposer.builds] == [batch_pad]
+
+    def test_a_dp_pass_without_a_published_status_fails_here(self, monkeypatch):
+        # The draft decides from what the step published, so a pass reaching it with
+        # nothing published is a caller in the wrong place. Left to the rule it
+        # would look like a single rank and quietly size the pass for one.
+        proposer, _ = self._proposer(monkeypatch, num_spec=1)
+        monkeypatch.setattr(
+            proposer.vllm_config.parallel_config, "data_parallel_size", 2
+        )
+        with pytest.raises(AssertionError, match="published no status"):
+            proposer.dummy_run(num_reqs=2, num_tokens_per_req=1, is_prefill=False)
+
+    def test_an_idle_rank_runs_an_moe_draft(self, monkeypatch):
+        # A fused-MoE draft all-gathers across DP inside its forward, so the busy
+        # ranks are waiting on this rank's passes even though its output is
+        # discarded.
+        proposer, calls = self._proposer(
+            monkeypatch,
+            num_spec=2,
+            dp_status=self._status(idle=True),
+            draft_has_moe=True,
+        )
+        proposer.dummy_run(num_reqs=1, num_tokens_per_req=3, is_prefill=False)
         assert len(calls) == 2
 
 
@@ -591,6 +852,7 @@ class TestBuildDummyAttnMetadata:
     def test_computes_cumsum_and_shapes(self):
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         proposer.runner = SimpleNamespace(
+            is_prefill=False,
             input_batch=SimpleNamespace(
                 block_table=[
                     SimpleNamespace(

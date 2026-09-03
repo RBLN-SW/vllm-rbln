@@ -31,7 +31,7 @@ import pytest
 import torch
 
 from tests.native.vllm_config import make_vllm_config
-from vllm_rbln.v1.worker import mega_cache
+from vllm_rbln.v1.worker import mega_cache, rbln_model_runner
 
 MODEL = "meta-llama/Llama-3"
 SIG = "sig"
@@ -93,7 +93,7 @@ class TestSignatureComposition:
 # survive is the round trip through normalize_value()/hash_factors().
 GRAPH_ENV = [
     ("VLLM_RBLN_NUM_HIDDEN_LAYERS", "0", "4"),  # int
-    ("VLLM_RBLN_USE_W8A16", "0", "1"),  # bool
+    ("VLLM_RBLN_USE_W8A8", "0", "1"),  # bool
     ("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "exponential", "linear"),  # str
     ("VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS", "1,2,4", "1,2,4,8"),  # list
 ]
@@ -553,6 +553,13 @@ class TestWarmupWiring:
         runner = make_model_runner()
         steps: list[tuple] = []
 
+        # The sampling-side warm-up is gated on the last PP rank; nothing here
+        # initializes a distributed group.
+        monkeypatch.setattr(
+            rbln_model_runner,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_last_rank=True),
+        )
         monkeypatch.setattr(runner, "offload_context", contextlib.nullcontext)
         monkeypatch.setattr(
             runner, "_dummy_run", lambda *a, **kw: steps.append(("compile",))

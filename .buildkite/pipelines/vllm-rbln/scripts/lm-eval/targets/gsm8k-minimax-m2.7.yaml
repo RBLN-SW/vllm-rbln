@@ -1,0 +1,33 @@
+chips: [RBLN-CR03, RBLN-CR13]
+model: MiniMaxAI/MiniMax-M2.7
+
+env:
+  VLLM_DISABLE_COMPILE_CACHE: "1"
+  VLLM_RBLN_USE_VLLM_MODEL: "1"
+  VLLM_RBLN_BATCH_ATTN_OPT: "1"
+  VLLM_RBLN_SORT_BATCH: "1"
+
+serve:
+  max_model_len: 16384
+  block_size: 8192
+  max_num_batched_tokens: 1024
+  max_num_seqs: 8
+  kv_cache_dtype: fp8
+
+serve_params:
+  tp4ep: {tensor_parallel_size: 4, enable_expert_parallel: true, num_gpu_blocks_override: 82}
+  pp4: {pipeline_parallel_size: 4}
+  dp4ep: {data_parallel_size: 4, enable_expert_parallel: true, max_num_seqs: 1}
+
+eval:
+  tasks: [gsm8k]
+  num_fewshot: 5
+  limit: 200
+  filter: exact_match,strict-match
+  # Keep every question and answer: a score this far below the published one has
+  # to be explained before it can become an expected value.
+  log_samples: true
+  # No expected values yet
+  expected: {}
+
+server_ready_timeout: 3600
