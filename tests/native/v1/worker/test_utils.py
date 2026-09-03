@@ -41,6 +41,7 @@ from vllm_rbln.v1.worker.utils import (
     REBEL_DRAM_NBYTES,
     chiplet_replication_factor,
     compute_rbln_local_omp_cpuid,
+    copy_host_device_kv_blocks,
     divide_by_chiplet_replication,
     estimate_available_memory,
     estimate_model_kernel_size,
@@ -1254,3 +1255,50 @@ class TestRblnSysfsReaders:
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):
             assert read_rbln_card_dram_total_bytes() == expected
+
+
+class TestCopyHostDeviceKvBlocks:
+    # The host-bounce staging copy. Only the listed block ids move, and MLA's
+    # 3D latent cache has no K/V axis to split first.
+    def test_copies_only_the_listed_blocks_non_mla(self):
+        src = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+        # Compared against a snapshot, and dst filled with a sentinel: a copy
+        # running the other way would make src equal dst and read as a hit.
+        expected = src.clone()
+        dst = torch.full_like(src, -1.0)
+        copy_host_device_kv_blocks(
+            {"l0": src}, {"l0": dst}, [1, 3], [1, 3], "h2d", use_mla=False
+        )
+        for block in (1, 3):
+            assert torch.equal(dst[:, block], expected[:, block])
+        for block in (0, 2):
+            assert (dst[:, block] == -1.0).all()
+
+    def test_copies_by_block_for_mla(self):
+        # Dim 0 is the block axis here; treating it as K/V would copy the wrong
+        # slices and index a token row by a block id.
+        src = torch.arange(4 * 8 * 2, dtype=torch.float32).reshape(4, 8, 2)
+        expected = src.clone()
+        dst = torch.full_like(src, -1.0)
+        copy_host_device_kv_blocks(
+            {"l0": src}, {"l0": dst}, [2], [2], "d2h", use_mla=True
+        )
+        assert torch.equal(dst[2], expected[2])
+        assert (dst[[0, 1, 3]] == -1.0).all()
+
+    def test_empty_ids_is_a_noop(self):
+        dst = torch.zeros(2, 4, 3)
+        copy_host_device_kv_blocks(
+            {"l0": torch.ones(2, 4, 3)}, {"l0": dst}, [], [], "h2d"
+        )
+        assert (dst == 0.0).all()
+
+    def test_mismatched_block_ids_are_rejected(self):
+        with pytest.raises(AssertionError, match="must be the same"):
+            copy_host_device_kv_blocks(
+                {"l0": torch.ones(2, 4, 3)},
+                {"l0": torch.zeros(2, 4, 3)},
+                [0],
+                [1],
+                "h2d",
+            )

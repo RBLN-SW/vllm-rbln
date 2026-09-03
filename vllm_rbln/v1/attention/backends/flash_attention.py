@@ -180,7 +180,14 @@ class RBLNFlashAttentionMetadataBuilder(
         self.block_size = kv_cache_spec.block_size
         self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        # Causality is per model, not per process: each model builds its
+        # attention under its own config, and upstream sets `use_non_causal` on
+        # the draft config only, so a non-causal drafter and a causal target
+        # coexist in one process.
+        self.is_causal = (
+            envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+            and not vllm_config.attention_config.use_non_causal
+        )
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
@@ -216,6 +223,7 @@ class RBLNFlashAttentionMetadataBuilder(
         positions: torch.Tensor,
         batch_pad: int,
         is_prefill: bool,
+        skip_attn_masks: bool = False,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
@@ -230,11 +238,13 @@ class RBLNFlashAttentionMetadataBuilder(
         seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
         max_seq_len = self.model_config.max_model_len
 
+        # Masks are host-built at `max_model_len` width and staged every step,
+        # so a caller that replaces them opts out with `skip_attn_masks`.
         attn_masks = None
         if is_prefill:
             # NOTE(RBLN): block_tables_tensor for prefill must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
-            if not self.is_causal:
+            if not self.is_causal and not skip_attn_masks:
                 prefill_chunk_size = self.chunked_prefill_size
                 chunked_attention_mask = torch.zeros(
                     1,
@@ -258,7 +268,7 @@ class RBLNFlashAttentionMetadataBuilder(
         else:
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
-            if not self.is_causal:
+            if not self.is_causal and not skip_attn_masks:
                 decode_attention_mask = torch.zeros(
                     batch_pad,
                     1,
@@ -388,7 +398,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if len(self.sinks.size()) == 1:
                 self.sinks = self.sinks[:, None]
 
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        self.is_causal = (
+            envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+            and not vllm_config.attention_config.use_non_causal
+        )
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None

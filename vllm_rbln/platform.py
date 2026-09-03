@@ -351,6 +351,24 @@ class RblnPlatform(Platform):
                     "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
                 )
 
+            if (
+                vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.method == "dflash"
+                and scheduler_config.max_num_scheduled_tokens
+                != scheduler_config.max_num_batched_tokens
+            ):
+                # DFlash reserves no slots (see patches/speculative_config.py),
+                # so the auto-computed budget is the whole of
+                # max_num_batched_tokens and any other value was set explicitly.
+                raise ValueError(
+                    "DFlash needs max_num_scheduled_tokens left auto-computed "
+                    f"(expected {scheduler_config.max_num_batched_tokens}, got "
+                    f"{scheduler_config.max_num_scheduled_tokens}): the prefill "
+                    "chunk has to stay at max_num_batched_tokens, which is also "
+                    "the compiled prefill length and the sub-block cache's "
+                    "granularity."
+                )
+
             # Under PP the compiled per-stage decode batch is max_num_seqs // pp_size
             # (see decode_batch_size). Fail fast on an impossible config.
             pp_size = parallel_config.pipeline_parallel_size

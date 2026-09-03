@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Unit coverage for the RBLN NIXL PP metadata extension.
+# Unit coverage for the RBLN NIXL metadata extension: the layer axis and the
+# chiplet geometry a shard advertises.
 #
 # Self-contained: exercises only ``rbln_nixl.metadata`` (base vLLM NIXL +
 # msgspec + hash), so it does not require the ``nixl-rbln`` install or a worker.
@@ -20,10 +21,11 @@
 import msgspec
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    RBLN_NIXL_PP_VERSION,
+    RBLN_NIXL_CONNECTOR_VERSION,
     RblnNixlAgentMetadata,
-    rbln_pp_compat_hash,
+    rbln_compat_hash,
 )
 
 _BASE_FIELDS = dict(
@@ -47,10 +49,12 @@ def _make(**pp):
 
 class TestRblnNixlAgentMetadata:
     def test_defaults_are_single_stage(self):
-        # Omitting PP fields yields the pp_size==1 (no-PP) values.
+        # Omitting the new fields yields the single-shard, single-area values a
+        # blob from an older schema decodes to.
         m = _make()
         assert (m.pp_rank, m.pp_size) == (0, 1)
         assert m.registered_layer_names == []
+        assert (m.kv_areas, m.kv_slices) == (1, 1)
 
     def test_roundtrip_preserves_pp_fields(self):
         # msgspec encode→decode with the RBLN type preserves PP descriptors.
@@ -69,15 +73,28 @@ class TestRblnNixlAgentMetadata:
             "model.layers.15",
         ]
 
-    def test_base_consumer_ignores_pp_fields(self):
-        # A blob encoded with the RBLN type decodes cleanly as the base
+    def test_upstream_consumer_ignores_pp_fields(self):
+        # A blob encoded with the RBLN type decodes cleanly as upstream's
         # ``NixlAgentMetadata`` (PP fields ignored) — backward compatible.
-        enc = msgspec.msgpack.Encoder().encode(_make(pp_rank=1, pp_size=2))
+        enc = msgspec.msgpack.Encoder().encode(
+            _make(pp_rank=1, pp_size=2, kv_areas=4, kv_slices=2)
+        )
         base = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(enc)
         assert base.engine_id == "engine-0"
         assert base.num_blocks == 64
         assert base.block_lens == [8192, 8192]
         assert not hasattr(base, "pp_rank")
+        assert not hasattr(base, "kv_areas")
+
+    def test_roundtrip_preserves_chiplet_geometry(self):
+        # The head axis rides the same blob as the layer axis. Replication is the
+        # case that matters: areas > slices has to survive, or the peer reads the
+        # byte arithmetic off the wrong divisor.
+        m = _make(kv_areas=4, kv_slices=2)
+        back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            msgspec.msgpack.Encoder().encode(m)
+        )
+        assert (back.kv_areas, back.kv_slices) == (4, 2)
 
     def test_registered_layer_names_order_preserved(self):
         names = [f"model.layers.{i}" for i in range(14, 28)]
@@ -88,24 +105,34 @@ class TestRblnNixlAgentMetadata:
         assert back.registered_layer_names == names
 
 
-class TestRblnPpCompatHash:
+class TestRblnCompatHash:
     def test_deterministic(self):
-        assert rbln_pp_compat_hash("BASE") == rbln_pp_compat_hash("BASE")
-
-    def test_differs_from_base(self):
-        # Folding the PP version must change the hash, so a PP-aware producer
-        # and a PP-unaware peer (base hash) do not match.
-        assert rbln_pp_compat_hash("BASE") != "BASE"
-
-    def test_distinguishes_base_hashes(self):
-        assert rbln_pp_compat_hash("hash-a") != rbln_pp_compat_hash("hash-b")
-
-    def test_version_is_folded(self, monkeypatch):
-        # Bumping RBLN_NIXL_PP_VERSION changes the hash (gates schema drift).
-        from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
-            metadata as md,
+        assert rbln_compat_hash("BASE", writes_into_peer=False) == rbln_compat_hash(
+            "BASE", writes_into_peer=False
         )
 
-        h1 = md.rbln_pp_compat_hash("BASE")
-        monkeypatch.setattr(md, "RBLN_NIXL_PP_VERSION", RBLN_NIXL_PP_VERSION + 1)
-        assert md.rbln_pp_compat_hash("BASE") != h1
+    def test_differs_from_base(self):
+        # Folding our version in must move the hash, or a peer that speaks only
+        # upstream's schema would match one that speaks ours.
+        assert rbln_compat_hash("BASE", writes_into_peer=False) != "BASE"
+
+    def test_the_two_transfer_directions_do_not_share_a_hash(self):
+        # A producer that writes into the consumer and one the consumer reads
+        # from describe the same bytes, so every length check on the handshake
+        # passes and only this separates them.
+        assert rbln_compat_hash("BASE", writes_into_peer=True) != rbln_compat_hash(
+            "BASE", writes_into_peer=False
+        )
+
+    def test_distinguishes_base_hashes(self):
+        assert rbln_compat_hash("hash-a", writes_into_peer=False) != rbln_compat_hash(
+            "hash-b", writes_into_peer=False
+        )
+
+    def test_version_is_folded(self, monkeypatch):
+        # Bumping RBLN_NIXL_CONNECTOR_VERSION changes the hash (gates schema drift).
+        h1 = md.rbln_compat_hash("BASE", writes_into_peer=False)
+        monkeypatch.setattr(
+            md, "RBLN_NIXL_CONNECTOR_VERSION", RBLN_NIXL_CONNECTOR_VERSION + 1
+        )
+        assert md.rbln_compat_hash("BASE", writes_into_peer=False) != h1

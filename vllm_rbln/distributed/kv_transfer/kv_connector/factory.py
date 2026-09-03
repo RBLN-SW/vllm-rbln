@@ -15,9 +15,21 @@
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
 KVConnectorFactory.register_connector(
+    "RblnNixlPullConnector",
+    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl",
+    "RblnNixlPullConnector",
+)
+# The name the read path shipped under, kept because it is what deployments
+# put in kv_transfer_config.
+KVConnectorFactory.register_connector(
     "RblnNixlConnector",
     "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl",
-    "RblnNixlConnector",
+    "RblnNixlPullConnector",
+)
+KVConnectorFactory.register_connector(
+    "RblnNixlPushConnector",
+    "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl",
+    "RblnNixlPushConnector",
 )
 KVConnectorFactory.register_connector(
     "RBLNLMCacheConnectorV1",

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnNixlConnectorWorker built through its real __init__ with the upstream base
+# RblnNixlPullConnectorWorker built through its real __init__ with the upstream base
 # and the external NIXL calls faked, so assertions land on the RBLN bookkeeping
 # around them rather than on the faked returns.
 
@@ -26,13 +26,19 @@ import pytest
 import torch
 from vllm.config import CacheConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlConnectorWorker
-from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 
-import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.worker as wm
+import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as wm
 import vllm_rbln.envs as envs
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.worker import (
-    RblnNixlConnectorWorker,
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
+    RblnNixlPullConnectorWorker,
 )
 
 
@@ -52,9 +58,10 @@ def _build_worker(
     specs=None,
     nixl_available=True,
     swa_view_opt=False,
+    use_mla=False,
 ):
-    """The worker via its real __init__, with the base stubbed to set only what the
-    RBLN overrides read and `nixl_rbln` faked present or absent."""
+    """The worker via its real __init__, with upstream's stubbed to set only what
+    the RBLN overrides read and `nixl_rbln` faked present or absent."""
     module = types.ModuleType("nixl_rbln") if nixl_available else None
     monkeypatch.setitem(sys.modules, "nixl_rbln", module)
     monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_SWA_VIEW_OPT", swa_view_opt)
@@ -64,12 +71,17 @@ def _build_worker(
         self.engine_id = engine_id
         self.kv_cache_config = kv_cache_config
         self.kv_buffer_device = kv_buffer_device
+        self.use_mla = use_mla
         self._block_size = {}
-        # The real NixlPullConnectorWorker.__init__ sets this to None;
+        # Upstream's own __init__ sets this to None;
         # register_kv_caches reads it after super().register_kv_caches().
         self.xfer_handshake_metadata = None
+        # add_remote_agent asks for tp_ratio before deciding whether upstream's
+        # positional pairing applies; 1 keeps these cases homogeneous.
+        self.transfer_topo = MagicMock()
+        self.transfer_topo.tp_ratio.return_value = 1
 
-    monkeypatch.setattr(NixlConnectorWorker, "__init__", fake_super_init)
+    monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
     vllm_config = MagicMock()
     vllm_config.cache_config = CacheConfig(block_size=block_size)
@@ -81,7 +93,7 @@ def _build_worker(
     kv_cache_config.kv_cache_groups = [
         MagicMock(kv_cache_spec=spec) for spec in (specs or [])
     ]
-    return RblnNixlConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+    return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)
 
 
 class TestBackendSelection:
@@ -133,7 +145,9 @@ class TestSwaViewRatio:
             specs=[_sliding_window_spec(block_size=64, sliding_window=16)],
         )
         assert worker._sw_ratio is None
-        assert worker._group_specs == []
+        # The window is still detected -- it gates the model parallelism guards
+        # whether or not the view-opt is on.
+        assert worker._has_swa
 
     def test_pure_full_attention_keeps_ratio_none(self, monkeypatch):
         # A non-sliding-window group contributes no ratio.
@@ -156,6 +170,16 @@ class TestSwaViewRatio:
             specs=[_sliding_window_spec(block_size=64, sliding_window=64)],
         )
         assert worker._sw_ratio is None
+
+    def test_full_attention_groups_are_skipped(self, monkeypatch):
+        # The hybrid shape: a model interleaves full-attention and sliding-window
+        # layers, so the ratio has to come from the windowed groups alone.
+        worker = _build_worker(
+            monkeypatch,
+            swa_view_opt=True,
+            specs=[MagicMock(), _sliding_window_spec(block_size=64, sliding_window=16)],
+        )
+        assert worker._sw_ratio == 4
 
     def test_consistent_ratio_across_groups(self, monkeypatch):
         worker = _build_worker(
@@ -187,6 +211,17 @@ class TestSwaViewRatio:
                 specs=[_sliding_window_spec(block_size=64, sliding_window=15)],
             )
 
+    def test_mla_with_view_opt_is_rejected_at_startup(self, monkeypatch):
+        # The dual desc range and a key-only latent have not been combined,
+        # so fail at construction rather than at the first handshake.
+        with pytest.raises(RuntimeError, match="SWA_VIEW_OPT"):
+            _build_worker(
+                monkeypatch,
+                swa_view_opt=True,
+                use_mla=True,
+                specs=[_sliding_window_spec(block_size=64, sliding_window=16)],
+            )
+
 
 class TestRegisterKvCaches:
     def test_d2d_stashes_and_defers(self, monkeypatch):
@@ -209,7 +244,7 @@ class TestRegisterKvCaches:
         )
         delegated = []
         monkeypatch.setattr(
-            NixlConnectorWorker,
+            NixlBaseConnectorWorker,
             "register_kv_caches",
             lambda self, kv: delegated.append(kv),
         )
@@ -265,6 +300,17 @@ class TestInitializeHostXferBuffer:
                 {"l0": torch.zeros(2, 4, dtype=torch.float16)}
             )
 
+    def test_mla_accepts_any_layout(self, monkeypatch):
+        # MLA has no head axis to order, so upstream advertises no required
+        # layout and the resolved value is whatever the fallback picked. The
+        # 3D latent shape must survive unchanged.
+        worker = _build_worker(monkeypatch, kv_buffer_device="cpu", use_mla=True)
+        worker.kv_cache_layout = "NHD"
+        worker.initialize_host_xfer_buffer(
+            {"l0": torch.zeros(4, 64, 576, dtype=torch.float16)}
+        )
+        assert worker.host_xfer_buffers["l0"].shape == (4, 64, 576)
+
     def test_rejects_odd_byte_footprint(self, monkeypatch):
         # The page-aligned host buffer is backed by an fp16 (2-byte) allocation,
         # so a cache whose byte footprint is odd cannot be tiled.
@@ -288,10 +334,28 @@ class TestSwaViewDelegation:
             return "super"
 
         monkeypatch.setattr(
-            NixlConnectorWorker, "register_local_xfer_handler", super_handler
+            NixlBaseConnectorWorker, "register_local_xfer_handler", super_handler
         )
         assert worker.register_local_xfer_handler(64) == "super"
         assert calls == [64]
+
+    def test_a_fanned_out_peer_does_not_take_the_whole_engine_path(self, monkeypatch):
+        # One handle covers every region once, which cannot express a slice the
+        # peer holds on several of its chiplets.
+        worker = _build_worker(monkeypatch)  # _sw_ratio is None
+
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker,
+            "register_local_xfer_handler",
+            lambda self, block_size: "super",
+        )
+        monkeypatch.setattr(
+            type(worker),
+            "_register_shard_local_xfer_handler",
+            lambda self, *args, **kwargs: "shard",
+        )
+
+        assert worker.register_local_xfer_handler(64, replica_fanout=2) == "shard"
 
     def test_add_remote_agent_delegates_when_no_swa(self, monkeypatch):
         worker = _build_worker(monkeypatch)  # _sw_ratio is None
@@ -301,7 +365,7 @@ class TestSwaViewDelegation:
             calls.append((rank, size))
             return "agent"
 
-        monkeypatch.setattr(NixlConnectorWorker, "add_remote_agent", super_agent)
+        monkeypatch.setattr(NixlBaseConnectorWorker, "add_remote_agent", super_agent)
         assert worker.add_remote_agent(MagicMock(engine_id="peer"), 2, 4) == "agent"
         assert calls == [(2, 4)]
 
@@ -316,7 +380,7 @@ class TestSwaViewDelegation:
         worker._remote_agents = {"peer": {0: "cached-name"}}
         super_calls = []
         monkeypatch.setattr(
-            NixlConnectorWorker,
+            NixlBaseConnectorWorker,
             "add_remote_agent",
             lambda self, *a, **k: super_calls.append(1),
         )
@@ -392,6 +456,19 @@ def _impl_kv_caches(num_blocks=128, base_ptr=0x10000):
     return kv
 
 
+def _mla_kv_caches(num_blocks=128, base_ptr=0x10000):
+    # Two MLA layers: a 3D latent cache, block axis first, no K/V split.
+    kv = {}
+    for i, name in enumerate(("l0", "l1")):
+        t = MagicMock()
+        t.shape = (num_blocks, 64, 576)
+        t.data_ptr.return_value = base_ptr + i * 0x10000
+        t.get_device.return_value = 0
+        t.zero_ = MagicMock()
+        kv[name] = t
+    return kv
+
+
 def _split_kv(num_blocks):
     # Fake TransferTopology.get_transfer_cache_regions: K and V as two region
     # tensors, each with shape[0] == num_blocks.
@@ -407,21 +484,34 @@ def _split_kv(num_blocks):
     return _split
 
 
-def _patch_worker_nixl_symbols(topo):
+def _patch_worker_nixl_symbols(topo, *, mamba_spec=None, uniform_spec=None):
     # Patch the directly-imported NIXL/spec symbols so the impl runs without the
-    # real nixl package; real dummy classes stand in for the isinstance() targets.
+    # real nixl package. The isinstance() targets get a dummy class, which the
+    # Full-attention specs cannot match; a test that wants one of those branches
+    # passes the real class instead and builds a spec against it.
     msgspec_mock = MagicMock()
     msgspec_mock.msgpack.Encoder.return_value.encode.return_value = b"meta"
     return patch.multiple(
         wm,
         TransferTopology=MagicMock(return_value=topo),
         compute_nixl_compatibility_hash=MagicMock(return_value="hash"),
-        MambaSpec=type("MambaSpec", (), {}),
-        UniformTypeKVCacheSpecs=type("UniformTypeKVCacheSpecs", (), {}),
+        MambaSpec=mamba_spec or type("MambaSpec", (), {}),
+        UniformTypeKVCacheSpecs=uniform_spec or type("UniformTypeKVCacheSpecs", (), {}),
         NixlAgentMetadata=MagicMock(),
         NixlHandshakePayload=MagicMock(),
         msgspec=msgspec_mock,
     )
+
+
+def _impl_xfer_result(
+    base_addrs=(0x20000, 0x20100, 0x30000, 0x30100), block_lens=(256, 256, 256, 256)
+):
+    xfer = MagicMock()
+    xfer.base_addrs = list(base_addrs)
+    xfer.block_lens = list(block_lens)
+    xfer.reg_handle = "reg-handle"
+    xfer.n_shards = 1
+    return xfer
 
 
 def _fake_nixl_rbln(xfer_result):
@@ -441,8 +531,10 @@ class TestRegisterKvCachesImpl:
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         xfer_result = MagicMock()
-        xfer_result.base_addrs = [0x20000, 0x20100]
-        xfer_result.block_lens = [256, 256]
+        # One transfer region per (logical region x chiplet area): two layers
+        # split into K/V, one area.
+        xfer_result.base_addrs = [0x20000, 0x20100, 0x30000, 0x30100]
+        xfer_result.block_lens = [256, 256, 256, 256]
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = 1
         fake = _fake_nixl_rbln(xfer_result)
@@ -478,15 +570,22 @@ class TestRegisterKvCachesImpl:
 
         # Returned transfer tables absorbed into worker state.
         assert worker.device_id == 0
-        assert worker.block_len_per_layer == [256, 256]
-        assert worker.kv_caches_base_addr[worker.engine_id][0] == [0x20000, 0x20100]
+        assert worker.block_len_per_layer == [256, 256, 256, 256]
+        assert worker.kv_caches_base_addr[worker.engine_id][0] == [
+            0x20000,
+            0x20100,
+            0x30000,
+            0x30100,
+        ]
         assert worker._registered_descs == ["reg-handle"]
 
-        # 2 regions (K/V split), layout-blocks-first=False so no x2.
-        assert worker.num_regions == 2
-        assert worker.num_descs == 2 * worker.num_blocks
+        # 4 regions (2 layers x K/V), layout-blocks-first=False so no x2.
+        assert worker.num_regions == 4
+        assert worker.num_descs == 4 * worker.num_blocks
+        # Full attention is head-sharded, so no region transfers REPLICATE.
+        assert worker._region_is_mla == [False] * 4
 
-        # Final hand-offs into the base transfer state.
+        # Final hand-offs into upstream's transfer state.
         assert worker.device_kv_caches is kv_caches
         assert worker.dst_num_blocks[worker.engine_id] == worker.num_blocks
         assert (
@@ -502,8 +601,8 @@ class TestRegisterKvCachesImpl:
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         xfer_result = MagicMock()
-        xfer_result.base_addrs = [0x20000, 0x20100]
-        xfer_result.block_lens = [256, 256]
+        xfer_result.base_addrs = [0x20000, 0x20100, 0x30000, 0x30100]
+        xfer_result.block_lens = [256, 256, 256, 256]
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = 1
         fake = _fake_nixl_rbln(xfer_result)
@@ -524,8 +623,88 @@ class TestRegisterKvCachesImpl:
             mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
-        assert worker.num_regions == 4  # 2 base addrs x 2 (blocks-first)
-        assert worker.num_descs == 4 * worker.num_blocks
+        assert worker.num_regions == 8  # 4 base addrs x 2 (blocks-first)
+        assert worker.num_descs == 8 * worker.num_blocks
+
+    def test_mla_registers_one_replicated_region_per_layer_and_area(self, monkeypatch):
+        # MLA is key-only, so a layer contributes one logical region rather than
+        # two, and every chiplet area of it carries the same latent -> REPLICATE.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.use_mla = True
+        spec = MagicMock(spec=MLAAttentionSpec)
+        spec.page_size_bytes = 4096
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _mla_kv_caches(num_blocks=worker.num_blocks)
+
+        areas = 4
+        xfer_result = MagicMock()
+        # 2 layers x 1 region x 4 areas, each area a full-length replica (g=1).
+        xfer_result.base_addrs = [0x20000 + 0x1000 * i for i in range(2 * areas)]
+        xfer_result.block_lens = [4096] * (2 * areas)
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = areas
+        xfer_result.slices = 1
+        xfer_result.slice_ids = [0] * areas
+        fake = _fake_nixl_rbln(xfer_result)
+
+        topo = MagicMock(
+            is_kv_layout_blocks_first=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        # split_k_and_v is False for MLA upstream, so one region per layer.
+        topo.get_transfer_cache_regions.side_effect = lambda cache, _spec: [cache]
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel") as mock_rebel,
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert len(fake.register_kv_regions.call_args.args[1]) == 2  # logical regions
+        assert worker._region_is_mla == [True] * (2 * areas)
+        assert worker.num_regions == 2 * areas
+        assert worker.num_descs == 2 * areas * worker.num_blocks
+        assert (worker._kv_areas, worker._kv_slices) == (areas, 1)
+
+    def test_region_flags_must_cover_every_transfer_region(self, monkeypatch):
+        # A logical region count that does not account for the returned table
+        # would mislabel regions, so it fails rather than guesses.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.use_mla = True
+        spec = MagicMock(spec=MLAAttentionSpec)
+        spec.page_size_bytes = 4096
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _mla_kv_caches(num_blocks=worker.num_blocks)
+
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000, 0x21000, 0x22000]  # not 2 x n_shards
+        xfer_result.block_lens = [4096] * 3
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = 4
+        xfer_result.slices = 1
+        xfer_result.slice_ids = [0] * 4
+        fake = _fake_nixl_rbln(xfer_result)
+
+        topo = MagicMock(
+            is_kv_layout_blocks_first=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = lambda cache, _spec: [cache]
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel") as mock_rebel,
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+            pytest.raises(AssertionError, match="transfer region"),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
 
     def test_constructs_transfer_topology_with_expected_kwargs(self, monkeypatch):
         # The happy-path test fully fakes TransferTopology, so a wrong ctor kwarg
@@ -536,8 +715,8 @@ class TestRegisterKvCachesImpl:
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         xfer_result = MagicMock()
-        xfer_result.base_addrs = [0x20000, 0x20100]
-        xfer_result.block_lens = [256, 256]
+        xfer_result.base_addrs = [0x20000, 0x20100, 0x30000, 0x30100]
+        xfer_result.block_lens = [256, 256, 256, 256]
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = 1
         fake = _fake_nixl_rbln(xfer_result)
@@ -568,6 +747,96 @@ class TestRegisterKvCachesImpl:
                 tensor_shape=(2, 128, 8, 1, 64, 64),
                 is_mamba=False,
             )
+
+    # The three shape branches below all decide `full_block_len`, the per-block
+    # stride handed to nixl-rbln. Baseline for comparison is the first test in
+    # this class: a 4096B page over two K/V regions is 2048B per block.
+
+    def test_a_group_spec_is_unwrapped_to_this_layer_s_spec(self, monkeypatch):
+        # A uniform-type group publishes one spec object for every layer of the
+        # group; the geometry lives on the member spec, and the group has no page
+        # size of its own to read.
+        worker = _prep_impl_worker(monkeypatch)
+        member = _impl_layer_spec(page_size_bytes=4096)
+        group = MagicMock(spec=UniformTypeKVCacheSpecs)
+        group.kv_cache_specs = {"l0": member, "l1": member}
+        worker._layer_specs = {"l0": group, "l1": group}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        fake = _fake_nixl_rbln(_impl_xfer_result())
+        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=False)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo, uniform_spec=UniformTypeKVCacheSpecs),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        regions = fake.register_kv_regions.call_args.args[1]
+        assert [block_len for _, _, block_len in regions] == [2048] * 4
+
+    def test_cross_layer_blocks_scale_the_page_by_the_tensor_count(self, monkeypatch):
+        # One tensor holds every layer's blocks, so a layer's page covers the
+        # whole set and the stride from one block to the next is that much wider.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec(page_size_bytes=4096)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        worker.kv_cache_config = MagicMock(kv_cache_tensors=[object(), object()])
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        fake = _fake_nixl_rbln(_impl_xfer_result())
+        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=True)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        regions = fake.register_kv_regions.call_args.args[1]
+        assert [block_len for _, _, block_len in regions] == [2048 * 2] * 4
+
+    def test_a_mamba_state_is_strided_by_the_logical_block(self, monkeypatch):
+        # An SSM state has no K/V split and is counted in logical blocks, so its
+        # page already covers every physical block one logical block expands to
+        # -- unlike attention, where the page is one physical block.
+        worker = _prep_impl_worker(monkeypatch)
+        worker._has_mamba = True
+        worker._logical_num_blocks = 8
+        worker._physical_blocks_per_logical_kv_block = 2
+        spec = MagicMock(spec=MambaSpec)
+        spec.page_size_bytes = 4096
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        def _one_region(cache, _spec):
+            region = MagicMock()
+            region.shape = (worker._logical_num_blocks, 4)
+            region.data_ptr.return_value = cache.data_ptr()
+            return [region]
+
+        fake = _fake_nixl_rbln(
+            _impl_xfer_result(base_addrs=[0x20000, 0x30000], block_lens=[4096, 4096])
+        )
+        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=False)
+        topo.get_transfer_cache_regions.side_effect = _one_region
+
+        with (
+            _patch_worker_nixl_symbols(topo, mamba_spec=MambaSpec),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        regions = fake.register_kv_regions.call_args.args[1]
+        assert [block_len for _, _, block_len in regions] == [2048, 2048]
 
 
 class TestRegisterLocalXferHandlerSwa:
@@ -682,6 +951,59 @@ class TestAddRemoteAgentSwa:
 
         assert out == "remote-agent-name"
 
+    def test_a_smaller_remote_block_shortens_descs_and_adds_a_local_handle(
+        self, monkeypatch
+    ):
+        # A peer with a smaller block holds less per block than we do, so a desc
+        # can only span the peer's block length -- on both sides, which is why a
+        # second local handler keyed by the peer's block size is registered.
+        worker = _build_worker(monkeypatch, num_blocks=4, block_size=64)
+        worker._sw_ratio = 2
+        worker._has_mamba = False
+        worker.use_mla = False
+        worker.tp_rank = 0
+        worker._group_spec_types = ()
+        worker.nixl_memory_type = "DRAM"
+
+        topo = MagicMock(is_kv_layout_blocks_first=False)
+        topo.block_size_ratio.return_value = 2
+        topo.tp_ratio.return_value = 1
+        topo.is_kv_replicated.return_value = True
+        worker.transfer_topo = topo
+
+        worker.tp_mappings = {}
+        worker.dst_num_blocks = {}
+        worker._remote_agents = {}
+        worker.kv_caches_base_addr = collections.defaultdict(dict)
+        worker.dst_xfer_side_handles = collections.defaultdict(dict)
+        worker.src_xfer_handles_by_block_size = {}
+        worker.src_blocks_data = []
+        worker.nixl_wrapper = MagicMock()
+        worker.nixl_wrapper.add_remote_agent.return_value = "remote-agent-name"
+
+        meta = _remote_agent_meta()
+        meta.block_size = 32  # half of ours, hence the ratio of 2
+
+        with (
+            patch.object(wm, "compute_tp_mapping", return_value=MagicMock()),
+            patch.object(worker, "_validate_remote_agent_handshake"),
+            patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
+            patch.object(
+                worker,
+                "register_local_xfer_handler",
+                return_value=("peer-sized-handle", []),
+            ) as local,
+        ):
+            worker.add_remote_agent(meta, 0, 1)
+
+        # Full pass then SWA pass: the peer's 128B block, then half of it.
+        blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args.args[0]
+        assert {desc_len for _, desc_len, _ in blocks_data} == {128, 64}
+        # Keyed by the PEER's block size, not ours: the read path picks the
+        # handler by what the peer advertised.
+        assert worker.src_xfer_handles_by_block_size == {32: "peer-sized-handle"}
+        assert local.call_args.args == (32,)
+
 
 class TestComputeDescIds:
     # Routes block ids into the Full range (offset 0) or the SWA range (offset
@@ -694,7 +1016,7 @@ class TestComputeDescIds:
             captured.append((block_ids, dst, ratio, phys))
             return "super"
 
-        monkeypatch.setattr(NixlConnectorWorker, "_compute_desc_ids", super_impl)
+        monkeypatch.setattr(NixlBaseConnectorWorker, "_compute_desc_ids", super_impl)
         out = worker._compute_desc_ids([[0]], 4, None, 1)
         assert out == "super"
         assert captured == [([[0]], 4, None, 1)]
