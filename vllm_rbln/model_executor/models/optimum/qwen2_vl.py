@@ -32,8 +32,6 @@ from vllm.model_executor.models.qwen2_vl import (
     Qwen2VLVideoPixelInputs,
 )
 
-from vllm_rbln.utils.optimum.bucket import select_bucket_size
-
 from .base import ModelInputForRBLN
 from .model_base import (
     RBLNOptimumDecoderMixin,
@@ -105,7 +103,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
     def get_prefill_decoder(self):
@@ -501,21 +498,27 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         mrope_position_deltas: dict[str, float],
     ) -> torch.Tensor:
         """Decode-step MRoPE: advance each request's position from its stored
-        delta (``cache_position + mrope_position_delta``) and return the padded
-        position embeddings (cos/sin). Mirrors upstream vLLM's
+        delta (``cache_position + mrope_position_delta``) and return the position
+        embeddings (cos/sin) laid out like the decode batch: each request at its
+        row, zeros in the padding rows. Mirrors upstream vLLM's
         ``get_next_input_positions_tensor``.
         """
         cache_position = model_input.input_positions
         running_requests_ids = model_input.running_requests_ids
-        padded_batch_size = self.decoder_batch_size
-        if self.use_multiple_decoder:
-            padded_batch_size = select_bucket_size(
-                len(running_requests_ids), self.decoder_batch_sizes
-            )
+        rows: torch.Tensor | slice = (
+            slice(0, len(running_requests_ids))
+            if model_input.batch_rows is None
+            else model_input.batch_rows
+        )
+        row_ids = (
+            range(len(running_requests_ids))
+            if model_input.batch_rows is None
+            else model_input.batch_rows.tolist()
+        )
 
         position_embeds = []
-        for b_id, request_id in enumerate(running_requests_ids):
-            delta = cache_position[b_id] + mrope_position_deltas[request_id]
+        for row, request_id in zip(row_ids, running_requests_ids):
+            delta = cache_position[row] + mrope_position_deltas[request_id]
             position_ids = torch.arange(1).view(1, -1)
             position_ids = position_ids.add(delta)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -523,43 +526,31 @@ class RBLNOptimumQwenVLForConditionalGeneration(
                 torch.zeros(1, dtype=self.dtype), position_ids
             )
             position_embeds.append(position_embed)
+        embeds = torch.cat(position_embeds, dim=1)
 
-        for _ in range(padded_batch_size - len(running_requests_ids)):
-            position_embeds.append(torch.zeros_like(position_embeds[0]))
-
-        return torch.cat(position_embeds, dim=1)
+        shape = list(embeds.shape)
+        shape[1] = model_input.padded_batch_size
+        out = embeds.new_zeros(shape)
+        out[:, rows] = embeds
+        return out
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        request_nums = model_input.input_tokens.shape[0]
-
-        # FIXME This should be removed in the future
-        # by moving the padding logic into model runner.
-        assert len(model_input.running_requests_ids) == request_nums, (
-            f"The number of running requests is "
-            f"{len(model_input.running_requests_ids)}, "
-            f"but the shape of input_ids is {model_input.input_tokens.shape}"
-        )
-
         if model_input.is_prompt:
-            prefill_inputs = self.prepare_prefill_inputs(model_input)
-            logits = self.model.prefill_decoder(
+            return self.model.prefill_decoder(
                 inputs_embeds=model_input.inputs_embeds,
                 position_embed=model_input.position_embed,
-                block_tables=prefill_inputs.block_tables,
-                cache_position=prefill_inputs.cache_position,
+                block_tables=model_input.block_tables,
+                cache_position=model_input.input_positions,
             ).logits
-        else:
-            decode_inputs = self.prepare_decode_inputs(model_input)
-            self.model.decoder = self.model.decoders[decode_inputs.padded_batch_size]
-            inputs_embeds = self.model.embed_tokens(decode_inputs.input_ids)
-            logits = self.model.decoder(
-                inputs_embeds=inputs_embeds,
-                cache_position=decode_inputs.cache_position,
-                position_embed=model_input.position_embed,
-                block_tables=decode_inputs.block_tables,
-            ).logits
-            logits = logits[:request_nums]
-        return logits
+
+        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
+        logits = self.model.decoder(
+            inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
+            cache_position=model_input.input_positions,
+            position_embed=model_input.position_embed,
+            block_tables=model_input.block_tables,
+        ).logits
+        return logits[: len(model_input.running_requests_ids)]
 
 
 class RBLNOptimumQwen2_5_VLForConditionalGeneration(

@@ -179,7 +179,7 @@ def _schedule_new_request_from_request(
     total_num_scheduled_tokens = 0
     if token_ids is None:
         token_ids = [1, 2, 3]
-    outer_block_ids = torch.tensor([outer_block_ids])
+    outer_block_ids = torch.tensor(outer_block_ids)
     new_reqs.append(
         NewRequestData(
             req_id=req.request_id,
@@ -226,7 +226,7 @@ def _schedule_cached_reqs(
     num_output_tokens = []
 
     for outer_block_id, req in enumerate(reqs):
-        block_table_dict[req.request_id] = torch.tensor([[outer_block_id]])
+        block_table_dict[req.request_id] = torch.tensor([outer_block_id])
         num_computed_tokens = req.num_computed_tokens
         req_ids.append(req.request_id)
         arr_num_computed_tokens.append(num_computed_tokens)

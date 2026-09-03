@@ -62,7 +62,6 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
         self.is_hybrid = getattr(self.model.rbln_config, "cache_impl", None) == "hybrid"
 
@@ -227,32 +226,26 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         cache_slot_ids = model_input.cache_slot_ids
         assert cache_slot_ids is not None
-        request_nums = model_input.input_tokens.shape[0]
+        block_tables = model_input.block_tables if self.is_hybrid else None
 
         if model_input.is_prompt:
-            prefill_inputs = self.prepare_prefill_inputs(model_input)
-            logits = self.model.prefill_decoder(
-                input_ids=prefill_inputs.input_ids,
+            return self.model.prefill_decoder(
+                input_ids=model_input.input_tokens,
                 inputs_embeds=model_input.inputs_embeds,
-                cache_position=prefill_inputs.cache_position,
+                cache_position=model_input.input_positions,
                 local_block_tables=cache_slot_ids,
-                block_tables=prefill_inputs.block_tables if self.is_hybrid else None,
+                block_tables=block_tables,
             ).logits
-        else:
-            decode_inputs = self.prepare_decode_inputs(
-                model_input, cache_slot_ids=cache_slot_ids
-            )
-            self.model.decoder = self.model.decoders[decode_inputs.padded_batch_size]
-            inputs_embeds = self.model.embed_tokens(decode_inputs.input_ids)
-            logits = self.model.decoder(
-                input_ids=decode_inputs.input_ids,
-                inputs_embeds=inputs_embeds,
-                cache_position=decode_inputs.cache_position,
-                local_block_tables=decode_inputs.local_block_tables,
-                block_tables=decode_inputs.block_tables if self.is_hybrid else None,
-            ).logits
-            logits = logits[:request_nums]
-        return logits
+
+        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
+        logits = self.model.decoder(
+            input_ids=model_input.input_tokens,
+            inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
+            cache_position=model_input.input_positions,
+            local_block_tables=cache_slot_ids,
+            block_tables=block_tables,
+        ).logits
+        return logits[: len(model_input.running_requests_ids)]
 
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Any | None:
         pixel_values = kwargs.pop("pixel_values", None)

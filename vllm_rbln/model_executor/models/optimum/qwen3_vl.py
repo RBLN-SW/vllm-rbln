@@ -311,18 +311,11 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         if not model_input.is_prompt:
             return super().forward(model_input, **kwargs)
 
-        request_nums = model_input.input_tokens.shape[0]
-        assert len(model_input.running_requests_ids) == request_nums, (
-            f"The number of running requests is "
-            f"{len(model_input.running_requests_ids)}, "
-            f"but the shape of input_ids is {model_input.input_tokens.shape}"
-        )
-        prefill_inputs = self.prepare_prefill_inputs(model_input)
         prefill_kwargs = {
             "inputs_embeds": model_input.inputs_embeds,
             "position_embed": model_input.position_embed,
-            "block_tables": prefill_inputs.block_tables,
-            "cache_position": prefill_inputs.cache_position,
+            "block_tables": model_input.block_tables,
+            "cache_position": model_input.input_positions,
         }
         if model_input.visual_pos_mask is not None:
             prefill_kwargs["visual_pos_mask"] = model_input.visual_pos_mask
@@ -353,14 +346,13 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     single tensor). It inherits the multimodal prefill path from Qwen2.5-VL.
     """
 
-    def _decode_batch_indices(self, model_input: ModelInputForRBLN) -> torch.Tensor:
-        """The state-cache row (batch_idx) of each running request, in running
-        order, as a tensor. This is only the index: the actual row placement is
-        done by the scatter (input_block_ids in forward / compute_decode_position_embed)
-        and undone by the logits gather (batch_indices in forward).
-        """
-        assert model_input.cache_slot_ids is not None
-        return model_input.cache_slot_ids.to(torch.long)
+    def decode_batch_rows(
+        self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
+    ) -> torch.Tensor:
+        # The GatedDeltaNet linear_attention conv/recurrent state is a fixed
+        # [max_num_seqs] on-device cache indexed by batch row, so each request
+        # is pinned to its scheduler-assigned cache slot for its lifetime.
+        return cache_slot_ids.to(torch.long)
 
     def _add_model_specific_args(self, preprocess_args: dict, video_input: Any):
         pass
@@ -383,53 +375,26 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         # image_token_index as the mixin default assumes.
         return self.model.config.image_token_id
 
-    def compute_decode_position_embed(
-        self, model_input: ModelInputForRBLN, mrope_position_deltas: dict[str, float]
-    ) -> torch.Tensor:
-        # The base builds [2, max_num_seqs, ...] with the running requests at
-        # rows [0, n). Re-place each at its stable batch_idx row so the whole
-        # decode batch (position_embed / inputs_embeds / block_tables) is laid out
-        # by batch index, matching the [max_num_seqs] recurrent-state cache the
-        # graph indexes by row. forward lays out ids/embeds the same way.
-        position_embed = super().compute_decode_position_embed(
-            model_input, mrope_position_deltas
-        )
-        batch_indices = self._decode_batch_indices(model_input)
-        out = torch.zeros_like(position_embed)
-        out[:, batch_indices] = position_embed[:, : batch_indices.shape[0]]
-        return out
-
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        """Qwen3.5 must place each request at its linear-attention batch_idx row.
-
-        The GatedDeltaNet linear_attention conv/recurrent state is a fixed
-        [max_num_seqs] on-device cache indexed by batch row. prefill writes
-        one row; decode reads/writes every row. So each request is pinned
-        to a stable batch_idx. prefill passes its batch_idx and decode lays
-        the batch out with the request at row == batch_idx, then gathers
-        logits back to running order.
-        """
+        """Prefill writes one state row, named by ``batch_idx``; decode arrives
+        laid out by row (see decode_batch_rows) and the logits are gathered
+        back to running order."""
         if model_input.is_prompt:
             assert model_input.cache_slot_ids is not None
-            prefill_inputs = self.prepare_prefill_inputs(model_input)
             return self.model.prefill_decoder(
                 inputs_embeds=model_input.inputs_embeds,
                 position_embed=model_input.position_embed,
-                block_tables=prefill_inputs.block_tables,
-                cache_position=prefill_inputs.cache_position,
+                block_tables=model_input.block_tables,
+                cache_position=model_input.input_positions,
                 batch_idx=int(model_input.cache_slot_ids[0]),
             ).logits
 
-        batch_indices = self._decode_batch_indices(model_input)
-        decode_inputs = self.prepare_decode_inputs(
-            model_input, input_block_ids=batch_indices
-        )
-        inputs_embeds = self.model.embed_tokens(decode_inputs.input_ids)
-        self.model.decoder = self.model.decoders[decode_inputs.padded_batch_size]
+        assert model_input.batch_rows is not None
+        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
         logits = self.model.decoder(
-            inputs_embeds=inputs_embeds,
-            cache_position=decode_inputs.cache_position,
+            inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
+            cache_position=model_input.input_positions,
             position_embed=model_input.position_embed,
-            block_tables=decode_inputs.block_tables,
+            block_tables=model_input.block_tables,
         ).logits
-        return logits[batch_indices]
+        return logits[model_input.batch_rows]

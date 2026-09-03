@@ -15,7 +15,7 @@ import json
 import math
 import os
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -280,25 +280,6 @@ class RBLNOptimumModelBase(nn.Module):
         return self.model.rbln_config.dtype
 
 
-class PrefillInputs(NamedTuple):
-    """Inputs of the compiled prefill graph, one request."""
-
-    input_ids: torch.Tensor  # [1, seq_len] int64
-    cache_position: torch.Tensor  # [1, seq_len] int32
-    block_tables: torch.Tensor  # [num_blocks] int16
-
-
-class DecodeInputs(NamedTuple):
-    """Inputs of the compiled decode graph, padded to ``padded_batch_size``."""
-
-    input_ids: torch.Tensor  # [padded_batch_size, 1] int64
-    cache_position: torch.Tensor  # [padded_batch_size, 1] int32
-    block_tables: torch.Tensor  # [padded_batch_size, num_blocks] int16
-    # Padded cache slot ids, None unless ``cache_slot_ids`` was given.
-    local_block_tables: torch.Tensor | None  # [padded_batch_size, 1] int16
-    padded_batch_size: int
-
-
 class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
     attn_impl: str | None
 
@@ -309,7 +290,6 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         use_multiple_decoder: bool,
         default_batch_size: int,
         decoder_batch_sizes: list[int],
-        num_blocks: int,
     ):
         self.attn_impl = attn_impl
         self.use_multiple_decoder = use_multiple_decoder
@@ -319,91 +299,23 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             self.decoder_batch_sizes = tuple(reversed(decoder_batch_sizes))
 
         self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
-        self.available_blocks = torch.arange(
-            0,
-            num_blocks,
-            dtype=torch.int16,
-        )
 
-    def prepare_prefill_inputs(self, model_input: ModelInputForRBLN) -> PrefillInputs:
-        return PrefillInputs(
-            input_ids=model_input.input_tokens.to(torch.int64),
-            cache_position=model_input.input_positions.to(torch.int32),
-            block_tables=model_input.block_tables.squeeze(0).to(torch.int16),
-        )
+    def decode_batch_rows(
+        self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Row of each running request in the padded decode batch, or None to
+        lay the requests out in running order at rows [0, num_reqs).
 
-    def prepare_decode_inputs(
-        self,
-        model_input: ModelInputForRBLN,
-        *,
-        cache_slot_ids: torch.Tensor | None = None,
-        input_block_ids: torch.Tensor | None = None,
-        dummy_block: int | None = None,
-    ) -> DecodeInputs:
-        """Pad the decode batch to the decoder's batch size.
-
-        Requests occupy rows [0, num_reqs) unless ``input_block_ids`` names each
-        request's row. Padding rows point at ``dummy_block``, or at a block no
-        request in this batch uses. ``cache_slot_ids`` is padded with the lowest
-        slot no scheduled request owns, so a padding row never aliases a real
-        row of the per-sequence cache.
+        A model whose graph keeps per-row on-device state overrides this to pin
+        each request to its row; the runner then pads to the decoder's full
+        batch and scatters the inputs to those rows.
         """
-        input_ids = model_input.input_tokens
-        block_tables = model_input.block_tables
-        assert input_ids.shape[1] == 1
-        num_reqs = input_ids.shape[0]
+        return None
 
-        rows: torch.Tensor | slice
-        if input_block_ids is not None:
-            padded_batch_size = self.decoder_batch_size
-            rows = input_block_ids
-        else:
-            padded_batch_size = (
-                select_bucket_size(num_reqs, self.decoder_batch_sizes)
-                if self.use_multiple_decoder
-                else self.decoder_batch_size
-            )
-            rows = slice(0, num_reqs)
-
-        num_blocks = block_tables.shape[1]
-        if padded_batch_size > num_reqs:
-            if dummy_block is None:
-                dummy_block = int(
-                    self.available_blocks[
-                        ~torch.isin(self.available_blocks, block_tables.flatten())
-                    ][0]
-                )
-            padded_block_tables = torch.full(
-                (padded_batch_size, num_blocks), dummy_block, dtype=torch.int16
-            )
-        else:
-            padded_block_tables = torch.empty(
-                (padded_batch_size, num_blocks), dtype=torch.int16
-            )
-        padded_input_ids = torch.zeros(padded_batch_size, 1, dtype=torch.int64)
-        padded_cache_position = torch.zeros(padded_batch_size, 1, dtype=torch.int32)
-        padded_input_ids[rows] = input_ids.to(torch.int64)
-        padded_cache_position[rows] = model_input.input_positions.to(torch.int32)
-        padded_block_tables[rows] = block_tables.to(torch.int16)
-
-        local_block_tables = None
-        if cache_slot_ids is not None:
-            used_slots = set(cache_slot_ids.tolist())
-            pad_slot = next(
-                (i for i in range(padded_batch_size) if i not in used_slots), 0
-            )
-            local_block_tables = torch.full(
-                (padded_batch_size, 1), pad_slot, dtype=torch.int16
-            )
-            local_block_tables[rows] = cache_slot_ids.unsqueeze(1)
-
-        return DecodeInputs(
-            input_ids=padded_input_ids,
-            cache_position=padded_cache_position,
-            block_tables=padded_block_tables,
-            local_block_tables=local_block_tables,
-            padded_batch_size=padded_batch_size,
-        )
+    def decode_padded_batch_size(self, num_reqs: int) -> int:
+        if self.use_multiple_decoder:
+            return select_bucket_size(num_reqs, self.decoder_batch_sizes)
+        return self.decoder_batch_size
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder
@@ -423,7 +335,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         Args:
             cached_block_tables: Source block IDs to copy from.
             cached_lengths: Cached length for each source block.
-            block_tables: Tensor whose first row holds the destination block IDs.
+            block_tables: Destination block IDs of the request.
         """
         if not cached_block_tables:
             return
@@ -437,7 +349,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
 
         prefill_decoder = self.get_prefill_decoder()
         # Convert to list once for efficiency
-        dst_blocks = block_tables[0].tolist()
+        dst_blocks = block_tables.tolist()
 
         for block_idx, (src_block, dst_block) in enumerate(
             zip(cached_block_tables, dst_blocks)
@@ -502,8 +414,9 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         multimodal_embeddings = self.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
         )
-        input_ids = model_input.input_tokens.to(torch.int64)
-        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
+        inputs_embeds = self.embed_input_ids(
+            model_input.input_tokens, multimodal_embeddings
+        )
         return replace(model_input, inputs_embeds=inputs_embeds)
 
     def _build_partial_prefill_forward_inputs(
@@ -518,8 +431,9 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         multimodal_embeddings = self._build_partial_mm_embeds(
             model_input.partial_prefix, multimodal_embeddings
         )
-        input_ids = model_input.input_tokens.to(torch.int64)
-        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
+        inputs_embeds = self.embed_input_ids(
+            model_input.input_tokens, multimodal_embeddings
+        )
         return replace(model_input, inputs_embeds=inputs_embeds)
 
     def compute_decode_position_embed(

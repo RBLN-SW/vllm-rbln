@@ -56,34 +56,28 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.text_model.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
     def get_prefill_decoder(self):
         return self.model.text_model.prefill_decoder
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        request_nums = model_input.input_tokens.shape[0]
-
         if model_input.is_prompt:
-            prefill_inputs = self.prepare_prefill_inputs(model_input)
-            logits = self.model.text_model.prefill_decoder(
+            return self.model.text_model.prefill_decoder(
                 inputs_embeds=model_input.inputs_embeds,
-                cache_position=prefill_inputs.cache_position,
-                block_tables=prefill_inputs.block_tables,
+                cache_position=model_input.input_positions,
+                block_tables=model_input.block_tables,
             ).logits
-        else:
-            decode_inputs = self.prepare_decode_inputs(model_input)
-            self.model.text_model.decoder = self.model.text_model.decoders[
-                decode_inputs.padded_batch_size
-            ]
-            logits = self.model.text_model.decoder(
-                input_ids=decode_inputs.input_ids,
-                cache_position=decode_inputs.cache_position,
-                block_tables=decode_inputs.block_tables,
-            ).logits
-            logits = logits[:request_nums]
-        return logits
+
+        self.model.text_model.decoder = self.model.text_model.decoders[
+            model_input.padded_batch_size
+        ]
+        logits = self.model.text_model.decoder(
+            input_ids=model_input.input_tokens,
+            cache_position=model_input.input_positions,
+            block_tables=model_input.block_tables,
+        ).logits
+        return logits[: len(model_input.running_requests_ids)]
 
     def get_language_model(self):
         return self.model.text_model

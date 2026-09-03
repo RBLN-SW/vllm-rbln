@@ -40,33 +40,22 @@ class RBLNOptimumForCausalLM(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        request_nums = model_input.input_tokens.shape[0]
-
         if model_input.is_prompt:
             if self.model.prefill_decoder is None:
                 raise version_error
-            prefill_inputs = self.prepare_prefill_inputs(model_input)
             return self.model.prefill_decoder(
-                input_ids=prefill_inputs.input_ids,
-                cache_position=prefill_inputs.cache_position,
-                block_tables=prefill_inputs.block_tables,
+                input_ids=model_input.input_tokens,
+                cache_position=model_input.input_positions,
+                block_tables=model_input.block_tables,
             ).logits
-        else:
-            decode_inputs = self.prepare_decode_inputs(
-                model_input, dummy_block=model_input.dummy_block
-            )
-            self.model.decoder = self.model.decoders[decode_inputs.padded_batch_size]
 
-            logits = self.model.decoder(
-                input_ids=decode_inputs.input_ids,
-                cache_position=decode_inputs.cache_position,
-                block_tables=decode_inputs.block_tables,
-            ).logits
-            if self.attn_impl != "flash_attn":
-                return logits[:request_nums]
-
-            return logits[: model_input.block_tables.shape[0]]
+        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
+        logits = self.model.decoder(
+            input_ids=model_input.input_tokens,
+            cache_position=model_input.input_positions,
+            block_tables=model_input.block_tables,
+        ).logits
+        return logits[: len(model_input.running_requests_ids)]

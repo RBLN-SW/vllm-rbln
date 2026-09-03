@@ -23,8 +23,6 @@ from vllm.model_executor.models.llava_next import (
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import (
-    DecodeInputs,
-    PrefillInputs,
     RBLNOptimumDecoderMixin,
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
@@ -57,7 +55,6 @@ class RBLNOptimumLlavaNextForConditionalGeneration(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
     def _forward(
@@ -94,27 +91,21 @@ class RBLNOptimumLlavaNextForConditionalGeneration(
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         is_prompt = model_input.is_prompt
-        request_nums = model_input.input_tokens.shape[0]
-
-        inputs: PrefillInputs | DecodeInputs
-        if is_prompt:
-            inputs = self.prepare_prefill_inputs(model_input)
-        else:
-            inputs = self.prepare_decode_inputs(model_input)
+        if not is_prompt:
             self.model.language_model.decoder = self.model.language_model.decoders[
-                inputs.padded_batch_size
+                model_input.padded_batch_size
             ]
 
         logits = self._forward(
             is_prefill=is_prompt,
-            block_tables=inputs.block_tables,
-            input_ids=inputs.input_ids,
+            block_tables=model_input.block_tables,
+            input_ids=model_input.input_tokens,
             inputs_embeds=model_input.inputs_embeds if is_prompt else None,
-            cache_position=inputs.cache_position,
+            cache_position=model_input.input_positions,
         )
 
         if not is_prompt:
-            logits = logits[:request_nums]
+            logits = logits[: len(model_input.running_requests_ids)]
         return logits
 
     def get_language_model(self):
