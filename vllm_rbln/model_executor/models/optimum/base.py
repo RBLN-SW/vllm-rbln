@@ -22,10 +22,10 @@ class PartialPrefixInfo:
     """Inputs to rebuild the uncached tail of a partial prefix-cache hit
     (boundary may end inside an image).
 
-    - ``full_input_tokens``: untrimmed prompt (MRoPE positions computed over it).
-    - ``num_cached_tokens``: cache boundary in tokens (= tail start).
-    - ``mrope_mm_kwargs``: every item's grid (incl. cached) for get_rope_index.
-    - ``mm_embed_tail_starts``: per kept item, first uncached feature index.
+    - `full_input_tokens`: untrimmed prompt (MRoPE positions computed over it).
+    - `num_cached_tokens`: cache boundary in tokens (= tail start).
+    - `mrope_mm_kwargs`: every item's grid (incl. cached) for get_rope_index.
+    - `mm_embed_tail_starts`: per kept item, first uncached feature index.
     """
 
     full_input_tokens: torch.Tensor
@@ -40,11 +40,11 @@ class PartialPrefixInfo:
 class ModelInputForRBLN:
     """Inputs of one optimum-rbln forward, laid out for the compiled graphs.
 
-    Prefill carries one request: ``input_tokens`` / ``input_positions`` are
-    ``[1, seq_len]`` and ``block_tables`` is ``[num_blocks]``. Decode carries
-    the running requests padded to ``padded_batch_size`` rows:
-    ``[padded_batch_size, 1]`` tokens and positions,
-    ``[padded_batch_size, num_blocks]`` block tables. Tokens are int64,
+    Prefill carries one request: `input_tokens` / `input_positions` are
+    `[1, seq_len]` and `block_tables` is `[num_blocks]`. Decode carries
+    the running requests padded to `padded_batch_size` rows:
+    `[padded_batch_size, 1]` tokens and positions,
+    `[padded_batch_size, num_blocks]` block tables. Tokens are int64,
     positions int32, block tables and cache slot ids int16.
     """
 
@@ -56,8 +56,9 @@ class ModelInputForRBLN:
     padded_batch_size: int
     is_prompt: bool = False
     multi_modal_kwargs: BatchedTensorInputs | None = None
-    # Scratch block the scheduler reserved for padding rows; None when it
-    # reserves none.
+    # Block the scheduler set aside as scratch space for padding rows. None
+    # when the scheduler did not set one aside; the runner then picks a block
+    # no running request uses.
     dummy_block: int | None = None
     # Row of each running request in the padded decode batch, in running
     # order. None when the rows are simply [0, num_reqs): only models that pin
