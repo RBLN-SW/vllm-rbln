@@ -703,6 +703,8 @@ class TestReplicaFanOut:
             remote_lens=meta.block_lens,
             device_id=0,
             num_blocks=1,
+            # Both sides cut heads the same number of ways here, so one piece.
+            split=1,
         )
 
         assert [addr for addr, _len, _dev in descs] == expected_regions
@@ -732,6 +734,8 @@ class TestTheThreeListsAgree:
         w._has_mamba = False
         w.num_regions = regions
         w.block_len_per_layer = [512] * regions
+        # Two logical regions (K and V of the one layer), both the target's width.
+        w._logical_region_kv_heads = [8, 8]
         w.local_seen_layer_names = ["l0"]
         w.kv_caches_base_addr = {
             "eng-local": {0: [10_000 * (i + 1) for i in range(regions)]}

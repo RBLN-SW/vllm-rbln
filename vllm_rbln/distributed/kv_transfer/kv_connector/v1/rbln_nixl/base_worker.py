@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -86,12 +87,17 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         upstream replicates one head across ranks, which no head band names
       * D2D only: the coarser side's heads per area must be a whole multiple of
         the finer side's, or a descriptor would carry part of a head
+      * per-layer KV geometry may differ; head bands are per region
 
     Not supported
     -------------
+      * D2D only: unequal TP with uneven region slices
+        (`_reject_uneven_region_slices`)
       * D2D only: unequal TP with MLA (`_check_mla_constraints`)
       * D2D only: a context-cut KV cache across unequal TP, or a peer that cut
         it on a different axis (`_check_split_axis_constraints`)
+      * MLA and non-MLA KV caches in one engine -- the K/V split is engine-wide
+      * cross-layer blocks where per-layer sizes differ
       * unequal P/D block sizes with unequal TP or with PP; the equal-TP,
         non-pipelined case is upstream's and unaffected
       * sliding-window attention with any model parallelism across P/D --
@@ -156,6 +162,14 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         self._kv_slices: int = 1
         # And which axis they came from -- the two counts alone do not say.
         self._kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
+
+        # Model-wide counts, not this rank's share. None where the layer has
+        # no head band (`_layer_kv_heads`).
+        self._logical_region_kv_heads: list[int | None] = []
+
+        # `_kv_slices` above is only the LAST region's, which describes every
+        # region until a speculative draft gives them different geometries.
+        self._logical_region_slices: list[int] = []
 
         # --- Pipeline-parallel (PP) P/D state (empty / inert for pp_size == 1) ---
         # Per remote producer shard, the ordered KV-cache layer names it owns,
@@ -263,7 +277,32 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             import nixl_rbln
 
             nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
+        page_sizes = self._layer_page_sizes(kv_caches)
+        if len(page_sizes) > 1:
+            # TODO(RBLN): delete once the pinned vLLM drops that assert --
+            # upstream already did, while standardising the KV-cache layout.
+            raise RuntimeError(
+                "RBLN NIXL: host staging cannot register KV caches whose "
+                f"per-layer size differs (got {sorted(page_sizes)}), which is "
+                "what a speculative draft model with its own "
+                "num_key_value_heads produces. Upstream's "
+                "`register_kv_caches` asserts one size for every non-MLA "
+                "tensor and this path delegates to it. Use "
+                "kv_buffer_device='rbln'."
+            )
         super().register_kv_caches(kv_caches)
+        # Every layer contributes the same number of regions (its K/V halves), so
+        # the count follows from the transfer table upstream just filled. The D2D
+        # path collects the list while it builds the regions instead.
+        names = list(kv_caches.keys())
+        per_layer, remainder = divmod(len(self.block_len_per_layer), len(names))
+        assert remainder == 0, (
+            f"{len(self.block_len_per_layer)} transfer region(s) do not divide "
+            f"among {len(names)} layer(s)"
+        )
+        self._logical_region_kv_heads = [
+            self._layer_kv_heads(name) for name in names for _ in range(per_layer)
+        ]
         # Re-wrap upstream's published handshake metadata with this stage's PP
         # identity + owned layer names (no-op degrade for pp_size == 1).
         if self.xfer_handshake_metadata is not None:
@@ -280,6 +319,59 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         pending = self._pending_kv_caches
         self._pending_kv_caches = None
         self._register_kv_caches_impl(pending)
+
+    def _unwrapped_layer_spec(self, layer_name: str) -> Any:
+        """This layer's own spec.
+
+        Layers sharing an attention type but not a size arrive as one
+        `UniformTypeKVCacheSpecs`, whose page size is the SUM over the group.
+        """
+        layer_spec = self._layer_specs[layer_name]
+        if isinstance(layer_spec, UniformTypeKVCacheSpecs):
+            return layer_spec.kv_cache_specs[layer_name]
+        return layer_spec
+
+    def _layer_page_sizes(self, layer_names: Iterable[str]) -> set[int]:
+        """The distinct per-layer page sizes among these layers."""
+        return {
+            self._unwrapped_layer_spec(name).page_size_bytes for name in layer_names
+        }
+
+    def _layer_kv_heads(self, layer_name: str) -> int | None:
+        """Model-wide KV heads of one layer, or None where no head band names it.
+
+        Upstream floors the per-rank share at 1 (`max(1, total // tp)`), so below
+        one head per rank the product overstates the model AND satisfies the
+        divisibility guard meant to refuse the layout: 4 heads at TP 8 report 1
+        per rank, the product reads 8, and `8 % 8 == 0` passes where `4 % 8`
+        would not. A product no model here has is that case -- replicated heads.
+        """
+        layer_spec = self._unwrapped_layer_spec(layer_name)
+        if isinstance(layer_spec, MambaSpec):
+            return None
+        total = layer_spec.num_kv_heads * self.world_size
+        # One count per model that contributes attention layers: the target, and
+        # a speculative draft where there is one.
+        known = {self.model_config.get_total_num_kv_heads()}
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is not None:
+            draft_model_config = speculative_config.draft_model_config
+            if draft_model_config is not None:
+                known.add(draft_model_config.get_total_num_kv_heads())
+        if total not in known:
+            return None
+        return total
+
+    def _region_kv_heads(self, logical_region: int) -> int:
+        """Model-wide KV heads of the layer one logical region belongs to."""
+        heads = self._logical_region_kv_heads[logical_region]
+        assert heads is not None, (
+            f"logical region {logical_region} has no head band: its layer either "
+            "has no head axis at all, or holds fewer KV heads than this rank's TP "
+            "degree and has them replicated across ranks. Pairing by head range "
+            "cannot describe either (see the class docstring's bounds)."
+        )
+        return heads
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Allocate one rebel-aligned host buffer per layer."""
@@ -383,7 +475,31 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             device_id,
         )
 
-        tensor_size_bytes = None
+        page_sizes = self._layer_page_sizes(xfer_buffers)
+        mla_layers = {
+            name
+            for name in xfer_buffers
+            if isinstance(
+                self._unwrapped_layer_spec(name),
+                (MLAAttentionSpec, SlidingWindowMLASpec),
+            )
+        }
+        if mla_layers and len(mla_layers) != len(xfer_buffers):
+            # Refused here rather than as a block-count mismatch far from its cause.
+            raise RuntimeError(
+                "RBLN NIXL: KV caches mix MLA and non-MLA layers "
+                f"({sorted(mla_layers)} against the rest), which the region "
+                "layout cannot express -- the K/V split is chosen once for the "
+                "whole engine."
+            )
+        if self.transfer_topo.cross_layers_blocks and len(page_sizes) > 1:
+            # The page is scaled by the KV-cache tensor count, so with sizes that
+            # differ the product describes no layer.
+            raise RuntimeError(
+                "RBLN NIXL: cross-layer blocks require one page size for every "
+                f"layer, got {sorted(page_sizes)}."
+            )
+
         # Logical K/V regions (entry_tensor, byte_offset, full_block_len)
         # for nixl-rbln.
         regions: list[tuple[Any, int, int]] = []
@@ -393,10 +509,11 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # None where a region has no head axis to compare against, which the
         # derivation below can never read as a non-head cut.
         logical_kv_heads: list[int | None] = []
+        # None here means something else than for `logical_kv_heads` above:
+        # not "no head axis" but "no head band names it" (`_layer_kv_heads`).
+        logical_total_kv_heads: list[int | None] = []
         for layer_name, cache_or_caches in xfer_buffers.items():
-            layer_spec = self._layer_specs[layer_name]
-            if isinstance(layer_spec, UniformTypeKVCacheSpecs):
-                layer_spec = layer_spec.kv_cache_specs[layer_name]
+            layer_spec = self._unwrapped_layer_spec(layer_name)
             cache_list = self.transfer_topo.get_transfer_cache_regions(
                 cache_or_caches, layer_spec
             )
@@ -412,7 +529,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             # For when registering multiple tensors eg K/V in separate
             # regions. MLA is key-only, so `cache_list` holds one.
             physical_page_size = physical_page_size // len(cache_list)
-            if self.transfer_topo._cross_layers_blocks:
+            if self.transfer_topo.cross_layers_blocks:
                 physical_page_size = physical_page_size * len(
                     self.kv_cache_config.kv_cache_tensors
                 )
@@ -421,10 +538,6 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 if isinstance(layer_spec, MambaSpec)
                 else self.num_blocks
             )
-            curr_tensor_size_bytes = num_blocks * physical_page_size
-            if tensor_size_bytes is None and not is_mla_region:
-                tensor_size_bytes = curr_tensor_size_bytes
-
             # Materialize the backing memory of kv_cache.
             cache_or_caches.zero_()
 
@@ -445,9 +558,16 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 assert cache.shape[0] == num_blocks, (
                     "All kv cache tensors must have the same number of blocks"
                 )
-                if not is_mla_region:
-                    assert tensor_size_bytes == curr_tensor_size_bytes, (
-                        "All non-MLA kv cache tensors must have the same size"
+                # Replaces upstream's equal-size check: a spec disagreeing with
+                # what was allocated fails here instead of shifting every
+                # descriptor past block 0.
+                if not isinstance(layer_spec, MambaSpec) and not (
+                    self.transfer_topo.cross_layers_blocks
+                ):
+                    region_bytes = cache.numel() * cache.element_size()
+                    assert region_bytes == num_blocks * full_block_len, (
+                        f"layer {layer_name} region of {region_bytes}B is not "
+                        f"{num_blocks} blocks of {full_block_len}B"
                     )
                 regions.append((cache_or_caches, region_offset, full_block_len))
                 logical_mla.append(is_mla_region)
@@ -456,6 +576,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                     if isinstance(layer_spec, AttentionSpec)
                     else None
                 )
+                logical_total_kv_heads.append(self._layer_kv_heads(layer_name))
 
         rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
 
@@ -487,6 +608,13 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             f"account for {len(self.block_len_per_layer)} transfer region(s); "
             "mislabelling one would silently pick the wrong descriptor layout."
         )
+        self._logical_region_kv_heads = logical_total_kv_heads
+        # `slice_ids` is per area, and replicas of one slice share an id, so
+        # the DISTINCT ids over a region's areas are its own slice count.
+        self._logical_region_slices = [
+            len(set(xfer.slice_ids[r * areas : (r + 1) * areas]))
+            for r in range(len(logical_mla))
+        ]
 
         self.num_regions = len(xfer.base_addrs)
         if self.transfer_topo.is_kv_layout_blocks_first:
@@ -510,7 +638,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # one head both axes fit the same count, so an axis that is not derived
         # stays HEAD rather than guessed.
         region_non_head = {
-            heads == 1 and len(set(xfer.slice_ids[r * areas : (r + 1) * areas])) > 1
+            heads == 1 and self._logical_region_slices[r] > 1
             for r, heads in enumerate(logical_kv_heads)
         }
         if len(region_non_head) > 1:
@@ -732,28 +860,13 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         owns every layer.
         """
         assert self.transfer_topo is not None
-        total_heads = self.transfer_topo.total_num_kv_heads
         areas_l, slices_l = self._kv_areas, self._kv_slices
         areas_r = nixl_agent_meta.kv_areas
         slices_r = nixl_agent_meta.kv_slices
 
-        base_l, per_slice_l = self._slice_head_bounds(
-            self.tp_rank,
-            self.transfer_topo.tp_size,
-            total_heads,
-            areas_l,
-            slices_l,
-            side="local",
+        split = self._head_split(
+            self.transfer_topo.tp_size * slices_l, remote_tp_size * slices_r
         )
-        base_r, per_slice_r = self._slice_head_bounds(
-            remote_tp_rank,
-            remote_tp_size,
-            total_heads,
-            areas_r,
-            slices_r,
-            side="peer",
-        )
-        split = self._head_split(per_slice_l, per_slice_r)
 
         replicas_l = areas_l // slices_l
         replicas_r = areas_r // slices_r
@@ -761,19 +874,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         remote_bases = nixl_agent_meta.kv_caches_base_addr
         remote_lens = nixl_agent_meta.block_lens
 
-        # (local logical region, its position in the peer's region list); a
-        # logical region is one K or V of one layer, before chiplet expansion.
-        n_logical_l = len(self.block_len_per_layer) // areas_l
-        if registered_layer_names is None:
-            logical_pairs = [(i, i) for i in range(n_logical_l)]
-        else:
-            per_layer = self._regions_per_layer() // areas_l
-            # peer_pos indexes the peer's own list (see _layer_overlap).
-            logical_pairs = [
-                (layer_l * per_layer + c, peer_pos * per_layer + c)
-                for peer_pos, layer_l in self._layer_overlap(registered_layer_names)
-                for c in range(per_layer)
-            ]
+        logical_pairs = self._logical_region_pairs(registered_layer_names)
 
         # Which of our areas this peer holds (see _fan_in_peer_areas).
         areas_iter = range(areas_l) if peer_areas is None else peer_areas
@@ -782,6 +883,27 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # Axis order is `_shard_local_region_ids`'; within a region, block-major
         # to match _compute_desc_ids' region_id * num_blocks + b.
         for logical_l, logical_r in logical_pairs:
+            # A model-config count describes the target's layers, and on a
+            # draft's it lands a plausible offset inside the wrong bytes. The
+            # peer's region holds the same layer, so one count answers for both
+            # sides (the handshake verifies it).
+            total_heads = self._region_kv_heads(logical_l)
+            base_l, per_slice_l = self._slice_head_bounds(
+                self.tp_rank,
+                self.transfer_topo.tp_size,
+                total_heads,
+                areas_l,
+                slices_l,
+                side="local",
+            )
+            base_r, per_slice_r = self._slice_head_bounds(
+                remote_tp_rank,
+                remote_tp_size,
+                total_heads,
+                areas_r,
+                slices_r,
+                side="peer",
+            )
             for area_l in areas_iter:
                 out.extend(
                     self._head_matched_desc(
@@ -795,6 +917,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                         remote_lens=remote_lens,
                         device_id=nixl_agent_meta.device_id,
                         num_blocks=num_blocks,
+                        split=split,
                     )
                 )
         # Per block, a region becomes one descriptor per head piece per peer
@@ -824,6 +947,8 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             return None
         if self.transfer_topo.tp_ratio(remote_tp_size) > 0:
             return None
+        # Model-level is right for every region here: both the area set and
+        # the guard below reduce to cut-count ratios (`_head_split`).
         total_heads = self.transfer_topo.total_num_kv_heads
         base_l, per_slice_l = self._slice_head_bounds(
             self.tp_rank,
@@ -864,8 +989,12 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         remote_lens: list[int],
         device_id: int,
         num_blocks: int,
+        split: int,
     ) -> list[tuple[int, int, int]]:
         """Descriptors for one local region: ``split`` (`_head_split`) per block.
+
+        The split is the caller's, one value for the whole transfer; the head
+        bands in ``geom``/``peer`` are this region's.
 
         Order is block-major, piece-minor, to match the local list
         `_register_shard_local_xfer_handler` builds.
@@ -877,7 +1006,6 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         desc_len = self.get_backend_aware_kv_block_len(
             layer_idx=region_id, first_split=True, mamba_view=False
         )
-        split = self._head_split(per_slice_l, per_slice_r)
         per_piece = per_slice_l // split
         sub_len = desc_len // split
 
@@ -926,28 +1054,18 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
     def _peer_head_split(
         self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
     ) -> int:
-        """`_head_split` for a peer, from its advertised chiplet geometry."""
+        """`_head_split` for a peer, from its advertised chiplet geometry.
+
+        Reads no head count, so it runs before any per-region band exists -- a
+        transfer is set up ahead of the handshake check on a layer's width.
+        """
         if not self._is_head_matched_peer(remote_tp_size):
             return 1
         assert self.transfer_topo is not None
-        total_heads = self.transfer_topo.total_num_kv_heads
-        _, per_slice_l = self._slice_head_bounds(
-            self.tp_rank,
-            self.transfer_topo.tp_size,
-            total_heads,
-            self._kv_areas,
-            self._kv_slices,
-            side="local",
+        return self._head_split(
+            self.transfer_topo.tp_size * self._kv_slices,
+            remote_tp_size * nixl_agent_meta.kv_slices,
         )
-        _, per_slice_r = self._slice_head_bounds(
-            0,
-            remote_tp_size,
-            total_heads,
-            nixl_agent_meta.kv_areas,
-            nixl_agent_meta.kv_slices,
-            side="peer",
-        )
-        return self._head_split(per_slice_l, per_slice_r)
 
     def _peer_replica_fanout(
         self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
@@ -965,23 +1083,56 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             return 1
         return max(1, nixl_agent_meta.kv_areas // nixl_agent_meta.kv_slices)
 
+    def _reject_uneven_region_slices(self, remote_tp_size: int) -> None:
+        """Refuse a head-banded peer whose regions disagree on their slice count.
+
+        `_build_head_matched_remote` bands every region with the engine-wide
+        `_kv_slices`, which describes the LAST region -- a draft's, named past the
+        target's depth. **Divisibility does not catch that**: a slice count divides
+        the chiplet count, so the smaller divides the larger side's heads per rank
+        and every check in `_slice_head_bounds` passes.
+
+        Per peer, not at registration: symmetric TP does not band by head at all,
+        so refusing the same engine there would reject deployments that work.
+        Regions without a band are skipped -- one has its own refusal further in.
+        """
+        distinct = {
+            slices
+            for slices, heads in zip(
+                self._logical_region_slices, self._logical_region_kv_heads
+            )
+            if heads is not None
+        }
+        if len(distinct) <= 1:
+            return
+        raise RuntimeError(
+            "RBLN NIXL D2D: this engine's KV cache entries are cut into "
+            f"different numbers of chiplet slices {sorted(distinct)}, so no one "
+            "count bands every region. Head-band pairing with a peer at TP "
+            f"{remote_tp_size} needs one (see the class docstring's bounds)."
+        )
+
     @staticmethod
-    def _head_split(per_slice_l: int, per_slice_r: int) -> int:
+    def _head_split(cuts_l: int, cuts_r: int) -> int:
         """How many pieces one of our regions is read in.
 
-        A descriptor names one contiguous range on each side, so an area coarser
-        than the peer's slice has to be transferred in as many pieces as the
-        peer spreads its heads over.
+        A descriptor names one contiguous range per side, so an area coarser than
+        the peer's slice needs as many pieces as the peer spreads its heads over.
+
+        Cuts (TP degree x slices per shard), not heads per slice: a slice holds
+        `T / cuts`, so the width ratio is `cuts_r / cuts_l` for any `T`. **One
+        split therefore serves every region even when they hold different
+        numbers of heads.**
         """
-        if per_slice_l <= per_slice_r:
+        if cuts_r <= cuts_l:
             return 1
-        if per_slice_l % per_slice_r:
+        if cuts_r % cuts_l:
             raise RuntimeError(
-                f"RBLN NIXL D2D: this rank's slice spans {per_slice_l} KV heads "
-                f"and the peer's {per_slice_r}, which does not divide it; the "
-                "two sides must cut heads at commensurate granularities."
+                f"RBLN NIXL D2D: the peer cuts KV heads {cuts_r} ways and this "
+                f"rank {cuts_l}, which does not divide it; the two sides must "
+                "cut heads at commensurate granularities."
             )
-        return per_slice_l // per_slice_r
+        return cuts_r // cuts_l
 
     def _register_remote_engine_prelude(
         self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
@@ -1028,6 +1179,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         if remote_tp_rank in self._remote_agents.get(engine_id, {}):
             return self._remote_agents[engine_id][remote_tp_rank]
 
+        self._reject_uneven_region_slices(remote_tp_size)
         self._register_remote_engine_prelude(nixl_agent_meta, remote_tp_size)
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -1285,7 +1437,9 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         base_hash = self.compat_hash
         assert base_hash is not None
         self.compat_hash = rbln_compat_hash(
-            base_hash, writes_into_peer=self._writes_into_peer
+            base_hash,
+            writes_into_peer=self._writes_into_peer,
+            speculative_config=self.vllm_config.speculative_config,
         )
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
@@ -1821,21 +1975,43 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         assert self.transfer_topo is not None
         return self.transfer_topo.tp_ratio(remote_tp_size) < 0
 
+    def _logical_region_pairs(
+        self, registered_layer_names: tuple[str, ...] | list[str] | None
+    ) -> list[tuple[int, int]]:
+        """(our logical region, its position in the peer's region list).
+
+        A logical region is one K or V of one layer, before chiplet expansion.
+        None means the peer owns every layer, so the two lists coincide;
+        otherwise a peer position indexes ITS OWN list (see `_layer_overlap`).
+        """
+        areas = self._kv_areas
+        if registered_layer_names is None:
+            return [(i, i) for i in range(len(self.block_len_per_layer) // areas)]
+        per_layer = self._regions_per_layer() // areas
+        return [
+            (layer_l * per_layer + c, peer_pos * per_layer + c)
+            for peer_pos, layer_l in self._layer_overlap(registered_layer_names)
+            for c in range(per_layer)
+        ]
+
     def _validate_head_matched_handshake(
-        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+        self,
+        nixl_agent_meta: RblnNixlAgentMetadata,
+        remote_tp_size: int,
+        registered_layer_names: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         """The byte invariant a peer with a different TP degree has to meet.
 
-        Upstream's check scales a region by the two sides' heads per RANK, which
-        holds only for its one-region-per-layer model. After chiplet expansion a
-        region is one area, so the per-area ratio is what governs -- the two
-        agree at P TP1 -> D TP2 and diverge past it. What does hold, and what the
-        descriptor arithmetic needs, is that one KV head costs the same bytes per
-        block on both sides.
+        Upstream scales a region by heads per RANK, which holds only for its
+        one-region-per-layer model; after chiplet expansion a region is one area,
+        so the per-area ratio governs. **The two agree at P TP1 -> D TP2 and
+        diverge past it**, so the simplest asymmetric pair does not exercise this.
 
-        Host staging reaches this too, through a pipelined peer: that path never
-        calls upstream's own check, so this is its only per-head check. The
-        arithmetic holds there because its single area is the whole shard.
+        Region 0 is always a target layer, so sampling it says nothing about a
+        draft region -- exactly where the widths can disagree.
+
+        Host staging reaches this through a pipelined peer and never calls
+        upstream's own check, so this is its only per-head check.
         """
         assert self.transfer_topo is not None
         block_size_ratio = self.transfer_topo.block_size_ratio(
@@ -1852,34 +2028,39 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 f"{nixl_agent_meta.kv_cache_layout!r} != local "
                 f"{self.kv_cache_layout!r}."
             )
-        total_heads = self.transfer_topo.total_num_kv_heads
-        _, per_slice_l = self._slice_head_bounds(
-            self.tp_rank,
-            self.transfer_topo.tp_size,
-            total_heads,
-            self._kv_areas,
-            self._kv_slices,
-            side="local",
-        )
-        _, per_slice_r = self._slice_head_bounds(
-            0,
-            remote_tp_size,
-            total_heads,
-            nixl_agent_meta.kv_areas,
-            nixl_agent_meta.kv_slices,
-            side="peer",
-        )
-        local_len = self.block_len_per_layer[0]
-        remote_len = nixl_agent_meta.block_lens[0]
-        if local_len * per_slice_r != remote_len * per_slice_l:
-            raise RuntimeError(
-                "RBLN NIXL: a KV head occupies "
-                f"{local_len / per_slice_l:.0f}B per block here but "
-                f"{remote_len / per_slice_r:.0f}B on the peer "
-                f"(local {local_len}B over {per_slice_l} head(s), remote "
-                f"{remote_len}B over {per_slice_r}). Block size, head_dim and "
-                "dtype must match across P and D."
+        for logical_l, logical_r in self._logical_region_pairs(registered_layer_names):
+            total_heads = self._region_kv_heads(logical_l)
+            _, per_slice_l = self._slice_head_bounds(
+                self.tp_rank,
+                self.transfer_topo.tp_size,
+                total_heads,
+                self._kv_areas,
+                self._kv_slices,
+                side="local",
             )
+            _, per_slice_r = self._slice_head_bounds(
+                0,
+                remote_tp_size,
+                total_heads,
+                nixl_agent_meta.kv_areas,
+                nixl_agent_meta.kv_slices,
+                side="peer",
+            )
+            local_len = self.block_len_per_layer[logical_l * self._kv_areas]
+            remote_len = nixl_agent_meta.block_lens[
+                logical_r * nixl_agent_meta.kv_areas
+            ]
+            if local_len * per_slice_r != remote_len * per_slice_l:
+                raise RuntimeError(
+                    f"RBLN NIXL: for logical region {logical_l} (the peer's "
+                    f"{logical_r}) a KV head occupies "
+                    f"{local_len / per_slice_l:.0f}B per block here but "
+                    f"{remote_len / per_slice_r:.0f}B on the peer "
+                    f"(local {local_len}B over {per_slice_l} head(s), remote "
+                    f"{remote_len}B over {per_slice_r}). Block size, head_dim, "
+                    "dtype and the layer's KV head count must match across P "
+                    "and D."
+                )
 
     def _check_split_axis_constraints(
         self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
@@ -1955,7 +2136,11 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
         if nixl_agent_meta.pp_size <= 1:
             if self._is_head_matched_peer(remote_tp_size):
-                self._validate_head_matched_handshake(nixl_agent_meta, remote_tp_size)
+                self._validate_head_matched_handshake(
+                    nixl_agent_meta,
+                    remote_tp_size,
+                    nixl_agent_meta.registered_layer_names or None,
+                )
                 return
             super()._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
             return
@@ -1971,9 +2156,11 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             "PP over NIXL P/D does not support a peer with a larger TP size."
         )
         if pp_tp_ratio != 1:
-            # Same head-geometry invariant as the non-PP head-matched path; the
-            # layer axis does not change what a head costs per block.
-            self._validate_head_matched_handshake(nixl_agent_meta, remote_tp_size)
+            self._validate_head_matched_handshake(
+                nixl_agent_meta,
+                remote_tp_size,
+                nixl_agent_meta.registered_layer_names or None,
+            )
         assert self.transfer_topo.block_size_ratio(nixl_agent_meta.block_size) == 1, (
             "PP over NIXL P/D requires equal P/D block sizes."
         )
