@@ -34,7 +34,7 @@ def fresh_inductor_cache_per_test(monkeypatch):
 def pin_npu_per_worker(monkeypatch):
     worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
     idx = int(worker[2:]) if worker[2:].isdigit() else 0
-    monkeypatch.setenv("RBLN_DEVICES", str(idx))
+    monkeypatch.setenv("RBLN_VISIBLE_DEVICES", str(idx))
 
 
 @pytest.fixture(autouse=True)

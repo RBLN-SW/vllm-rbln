@@ -30,6 +30,7 @@ _RSD_ENV = "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"
 _PARALLEL_KEYS = (
     "tensor_parallel_size",
     "pipeline_parallel_size",
+    "prefill_context_parallel_size",
     "data_parallel_size",
 )
 
@@ -49,15 +50,18 @@ def host_chip() -> str | None:
 
 
 def device_count() -> int:
-    """NPUs this run may use. RBLN_DEVICES wins when set, since a job may be
-    given some of them."""
-    visible = [d for d in os.environ.get("RBLN_DEVICES", "").split(",") if d.strip()]
+    """NPUs this run may use. The visible list wins when set, since a job may be
+    given some of them. Both spellings are read because this runs before the
+    platform plugin folds the deprecated one into the other."""
+    visible_list = os.environ.get("RBLN_VISIBLE_DEVICES", "")
+    raw = visible_list or os.environ.get("RBLN_DEVICES", "")
+    visible = [d for d in raw.split(",") if d.strip()]
     return len(visible) or len(glob.glob("/dev/rbln*"))
 
 
 def devices_needed(serve: dict[str, Any], env: dict[str, str]) -> int:
-    """Mirrors RBLNWorker._init_device_env: DP ranks do not share, and every
-    (tp x pp) rank takes VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK devices."""
+    """Mirrors RBLNWorker._init_device_env: DP ranks do not share, and every rank
+    of vLLM's world size takes VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK devices."""
     needed = int(env.get(_RSD_ENV, 1))
     for key in _PARALLEL_KEYS:
         needed *= int(serve.get(key, 1))

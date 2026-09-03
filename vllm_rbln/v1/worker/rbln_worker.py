@@ -187,9 +187,10 @@ class RBLNWorker(WorkerBase):
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             self._foreign_dram_used_bytes = read_rbln_card_dram_used_bytes()
             logger.debug(
-                "foreign device DRAM at worker init: %d bytes (RBLN_DEVICES=%s)",
+                "foreign device DRAM at worker init: %d bytes "
+                "(RBLN_VISIBLE_DEVICES=%s)",
                 self._foreign_dram_used_bytes,
-                os.environ.get("RBLN_DEVICES", ""),
+                os.environ.get("RBLN_VISIBLE_DEVICES", ""),
             )
 
         self.profiler: Any | None = None

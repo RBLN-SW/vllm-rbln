@@ -123,7 +123,7 @@ class TestPlatformIdentity:
             # Ops dispatch on CPU even when tensors live on the device.
             ("dispatch_key", "CPU"),
             # RBLNWorker._init_device_env narrows this var per rank.
-            ("device_control_env_var", "RBLN_DEVICES"),
+            ("device_control_env_var", "RBLN_VISIBLE_DEVICES"),
             ("simple_compile_backend", "bypass"),
         ],
     )
@@ -560,6 +560,46 @@ class TestPreRegisterAndUpdate:
         before = EngineArgs.get_batch_defaults.__func__
         RblnPlatform.pre_register_and_update()
         assert EngineArgs.get_batch_defaults.__func__ is before
+
+
+class TestDeprecatedDeviceControlEnvVar:
+    """``RBLN_DEVICES`` is folded into ``device_control_env_var`` and unset.
+
+    Unsetting is the point: the runtime takes both names but prefers the
+    deprecated one, so one left behind would override the pool a worker
+    narrows itself to.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_env(self):
+        # patch.dict, not monkeypatch.delenv: the code under test creates the
+        # current name, and a key a test never held is not restored.
+        with patch.dict(os.environ):
+            os.environ.pop("RBLN_DEVICES", None)
+            os.environ.pop(RblnPlatform.device_control_env_var, None)
+            yield
+
+    def test_legacy_value_carries_over_and_the_name_goes(self):
+        os.environ["RBLN_DEVICES"] = "4,5"
+
+        RblnPlatform.pre_register_and_update()
+
+        assert os.environ[RblnPlatform.device_control_env_var] == "4,5"
+        assert "RBLN_DEVICES" not in os.environ
+
+    def test_the_current_name_wins_when_both_are_set(self):
+        os.environ["RBLN_DEVICES"] = "4,5"
+        os.environ[RblnPlatform.device_control_env_var] = "6,7"
+
+        RblnPlatform.pre_register_and_update()
+
+        assert os.environ[RblnPlatform.device_control_env_var] == "6,7"
+        assert "RBLN_DEVICES" not in os.environ
+
+    def test_nothing_is_invented_when_neither_is_set(self):
+        RblnPlatform.pre_register_and_update()
+
+        assert RblnPlatform.device_control_env_var not in os.environ
 
 
 class TestCustomKvCacheSpecs:

@@ -92,7 +92,7 @@ def _env_cleanup(monkeypatch):
     monkeypatch.setattr(platform_interface, "_assigned_physical_gpu_ids", None)
     # Save/restore the process env vars the worker touches.
     keys = [
-        "RBLN_DEVICES",
+        "RBLN_VISIBLE_DEVICES",
         "RBLN_NPUS_PER_DEVICE",
         "LOCAL_RANK",
         "WORLD_SIZE",
@@ -145,7 +145,9 @@ def make_worker(monkeypatch):
             "current_platform",
             SimpleNamespace(
                 device_type="cpu",
-                device_control_env_var="RBLN_DEVICES",
+                # Not a literal: device_id_to_physical_device_id below reads it
+                # off RblnPlatform, so the two must not drift apart.
+                device_control_env_var=RblnPlatform.device_control_env_var,
                 dist_backend="gloo",
                 get_device_name=lambda: device_name,
                 # The real mapping: the pool semantics under test are upstream's.
@@ -233,51 +235,51 @@ class TestInitDeviceEnv:
 
     def test_unset_pool_is_the_whole_host(self, make_worker):
         make_worker(world_size=1)
-        assert os.environ["RBLN_DEVICES"] == "0"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "0"
 
     @pytest.mark.parametrize("local_rank, expected", [(0, "0"), (1, "1")])
     def test_unset_pool_indexes_by_local_rank(self, make_worker, local_rank, expected):
         make_worker(world_size=4, local_rank=local_rank)
-        assert os.environ["RBLN_DEVICES"] == expected
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
 
     def test_dp_rank_alone_does_not_offset(self, make_worker):
         # data_parallel_rank is reset to 0 for non-MoE DP, so deriving the
         # offset from it put every replica on the same NPU.
         make_worker(world_size=1, data_parallel_size=4, data_parallel_rank=3)
-        assert os.environ["RBLN_DEVICES"] == "0"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "0"
 
     def test_pool_indexes_by_local_rank(self, make_worker):
-        os.environ["RBLN_DEVICES"] = "4,5,6,7"
+        os.environ["RBLN_VISIBLE_DEVICES"] = "4,5,6,7"
         make_worker(world_size=4, local_rank=1)
-        assert os.environ["RBLN_DEVICES"] == "5"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "5"
 
     def test_pool_larger_than_needed_is_allowed(self, make_worker):
-        os.environ["RBLN_DEVICES"] = "0,1,2,3"
+        os.environ["RBLN_VISIBLE_DEVICES"] = "0,1,2,3"
         make_worker(world_size=2, local_rank=1)
-        assert os.environ["RBLN_DEVICES"] == "1"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "1"
 
     def test_exported_but_empty_pool_means_no_restriction(self, make_worker):
-        os.environ["RBLN_DEVICES"] = ""
+        os.environ["RBLN_VISIBLE_DEVICES"] = ""
         make_worker(world_size=2, local_rank=1)
-        assert os.environ["RBLN_DEVICES"] == "1"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "1"
 
     def test_trailing_separator_tolerated(self, make_worker):
-        os.environ["RBLN_DEVICES"] = "3,"
+        os.environ["RBLN_VISIBLE_DEVICES"] = "3,"
         make_worker(world_size=1)
-        assert os.environ["RBLN_DEVICES"] == "3"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "3"
 
     def test_pool_too_small_names_the_pool(self, make_worker):
-        os.environ["RBLN_DEVICES"] = "0,1"
-        with pytest.raises(ValueError, match="RBLN_DEVICES='0,1'"):
+        os.environ["RBLN_VISIBLE_DEVICES"] = "0,1"
+        with pytest.raises(ValueError, match="RBLN_VISIBLE_DEVICES='0,1'"):
             make_worker(world_size=4, local_rank=2)
 
     def test_ray_nodes_divide_what_this_node_must_cover(self, make_worker):
-        os.environ["RBLN_DEVICES"] = "0,1"
+        os.environ["RBLN_VISIBLE_DEVICES"] = "0,1"
         make_worker(world_size=4, num_ray_nodes=2, local_rank=1)
-        assert os.environ["RBLN_DEVICES"] == "1"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "1"
 
     def test_non_integer_entry_raises(self, make_worker):
-        os.environ["RBLN_DEVICES"] = "a,b,c,d"
+        os.environ["RBLN_VISIBLE_DEVICES"] = "a,b,c,d"
         with pytest.raises(ValueError):
             make_worker(world_size=4, local_rank=0)
 
@@ -295,23 +297,23 @@ class TestInitDeviceEnv:
     ):
         # A rank's group is enumerated, not derived by multiplying its entry,
         # which reached past the pool the job was given.
-        os.environ["RBLN_DEVICES"] = pool
+        os.environ["RBLN_VISIBLE_DEVICES"] = pool
         make_worker(
             world_size=world_size, num_devices=num_devices, local_rank=local_rank
         )
-        assert os.environ["RBLN_DEVICES"] == expected
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
 
     @pytest.mark.parametrize("local_rank, expected", [(0, "0,1"), (1, "2,3")])
     def test_unset_pool_with_rsd(self, make_worker, local_rank, expected):
         make_worker(
             world_size=2, num_devices=2, has_torch_rbln=True, local_rank=local_rank
         )
-        assert os.environ["RBLN_DEVICES"] == expected
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
         assert os.environ["RBLN_NPUS_PER_DEVICE"] == "2"
 
     def test_multi_device_without_torch_rbln_skips_npus(self, make_worker):
         make_worker(world_size=2, num_devices=2, has_torch_rbln=False)
-        assert os.environ["RBLN_DEVICES"] == "0,1"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "0,1"
         assert "RBLN_NPUS_PER_DEVICE" not in os.environ
 
     def test_single_device_skips_npus(self, make_worker):
@@ -325,17 +327,17 @@ class TestInitDeviceEnv:
             data_parallel_rank=3,
             assigned_physical_gpu_ids=[3],
         )
-        assert os.environ["RBLN_DEVICES"] == "3"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "3"
 
     def test_dp_mapping_wins_over_pool_position(self, make_worker):
-        os.environ["RBLN_DEVICES"] = "4,5,6,7"
+        os.environ["RBLN_VISIBLE_DEVICES"] = "4,5,6,7"
         make_worker(world_size=1, data_parallel_size=4, assigned_physical_gpu_ids=[6])
-        assert os.environ["RBLN_DEVICES"] == "6"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "6"
 
     def test_dp_mapping_with_rsd_raises(self, make_worker):
         # vLLM's slicer has no notion of rsd, so it hands over one entry per
         # rank where this rank needs num_devices of them.
-        os.environ["RBLN_DEVICES"] = "0,1,2,3"
+        os.environ["RBLN_VISIBLE_DEVICES"] = "0,1,2,3"
         with pytest.raises(ValueError, match="needs 2 NPU"):
             make_worker(
                 world_size=1,

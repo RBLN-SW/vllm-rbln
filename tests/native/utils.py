@@ -228,23 +228,24 @@ _RBLN_DEVICE_NODES = "/dev/rbln*"
 
 
 def rbln_device_count() -> int:
-    """How many NPUs this session may use. ``RBLN_DEVICES`` wins when set, since a
-    job may be given two of eight. Otherwise the device nodes are counted rather
+    """How many NPUs this session may use. The visible list wins when set, since
+    a job may be given two of eight. Otherwise the device nodes are counted rather
     than asking the driver: this runs in the parent pytest process, which must not
-    open the device (that would pin it for the whole session)."""
-    visible = [
-        entry
-        for entry in os.environ.get("RBLN_DEVICES", "").split(",")
-        if entry.strip()
-    ]
+    open the device (that would pin it for the whole session).
+
+    Both spellings are read because this runs before the platform plugin folds
+    the deprecated one into the other."""
+    visible_list = os.environ.get("RBLN_VISIBLE_DEVICES", "")
+    raw = visible_list or os.environ.get("RBLN_DEVICES", "")
+    visible = [entry for entry in raw.split(",") if entry.strip()]
     # Exported but empty means "no restriction", not "no devices".
     return len(visible) or len(glob.glob(_RBLN_DEVICE_NODES))
 
 
 def devices_needed(engine_kwargs: dict, rsd: int = 1) -> int:
     """NPUs an engine built with ``engine_kwargs`` will occupy. Mirrors
-    RBLNWorker._init_device_env: DP ranks do not share, and every (tp x pp) rank
-    takes ``rsd`` devices.
+    RBLNWorker._init_device_env: DP ranks do not share, and every rank of
+    vLLM's world size takes ``rsd`` devices.
 
     ``rsd`` is a spec's ``CompileModelSpec.rsd``, i.e. the
     VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK the engine will run with. It is an
@@ -255,6 +256,7 @@ def devices_needed(engine_kwargs: dict, rsd: int = 1) -> int:
     return (
         engine_kwargs.get("tensor_parallel_size", 1)
         * engine_kwargs.get("pipeline_parallel_size", 1)
+        * engine_kwargs.get("prefill_context_parallel_size", 1)
         * engine_kwargs.get("data_parallel_size", 1)
         * rsd
     )
