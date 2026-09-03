@@ -21,7 +21,6 @@ from types import NoneType
 from typing import TYPE_CHECKING, Any
 
 import numba
-import rebel.flags
 import torch
 
 try:
@@ -1225,7 +1224,7 @@ class RBLNWorker(WorkerBase):
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
         if self.profiler_config is None or (
-            self.profiler_config.profiler is None and not rebel.flags.RBLN_PROFILER
+            self.profiler_config.profiler is None and not rbln_profiler.is_enabled()
         ):
             raise RuntimeError(
                 "Profiling is not enabled. Please set --profiler-config to enable "
