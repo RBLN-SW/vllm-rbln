@@ -77,19 +77,6 @@ SPEC_METHODS = {
 # medusa is excluded: its only small ungated checkpoint is random-init, so
 # acceptance there would measure model quality, not the code path.
 _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3"}
-_XFAIL_REASON = {
-    "eagle3": "RBLNCompileError: RblnTensorAllocateDevTensorKey pass fails on the "
-    "eagle3 aux-hidden-state graph",
-}
-
-
-def _method_param(method: str):
-    if method in _XFAIL_REASON:
-        return pytest.param(
-            method,
-            marks=pytest.mark.xfail(reason=_XFAIL_REASON[method], run=False),
-        )
-    return method
 
 
 @pytest.fixture(autouse=True)
@@ -98,7 +85,7 @@ def _use_reference_sampler(monkeypatch):
 
 
 @pytest.mark.model_compile
-@pytest.mark.parametrize("method", [_method_param(m) for m in SPEC_METHODS])
+@pytest.mark.parametrize("method", SPEC_METHODS)
 def test_speculative_decoding_matches_reference(
     vllm_runner, method: str, whole_model: bool
 ) -> None:
