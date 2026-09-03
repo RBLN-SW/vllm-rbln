@@ -416,6 +416,28 @@ class TestPassBoundary:
         assert ctx._graph[pm._Phase.DECODE].latencies == pytest.approx([5 * MS])
         assert ctx._e2e[pm._Phase.DECODE].latencies == pytest.approx([5 * MS])
 
+    def test_raising_hand_off_records_nothing(self, monkeypatch, clock):
+        def fake_forward(self, *a, **k):
+            ctx = pm._ctx(self)
+            ctx.mark_phase(pm._Phase.DECODE)
+            ctx.add_graph_time(1 * MS)
+            return IntermediateTensors({})
+
+        def boom(self, *a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(pm, "_execute_model", fake_forward)
+        monkeypatch.setattr(pm, "_send_handoff", boom)
+        runner = _Runner()
+
+        pm.execute_model(runner)
+        with pytest.raises(RuntimeError, match="boom"):
+            pm.send_handoff(types.SimpleNamespace(model_runner=runner), {})
+
+        ctx = pm._ctx(runner)
+        assert ctx.in_pass  # left open, like any raising pass
+        assert not ctx._e2e and not ctx._graph
+
     def test_whole_pass_records_one_sample_per_section(self, monkeypatch):
         monkeypatch.setattr(pm, "_execute_model", lambda self, *a, **k: None)
         monkeypatch.setattr(pm, "_sample_tokens", lambda self, *a, **k: "out")

@@ -366,13 +366,13 @@ _send_handoff = RBLNWorker._send_handoff
 @functools.wraps(_send_handoff)
 def send_handoff(self, *args, **kwargs):
     # The send waits on this stage's compute, so its wall carries the stage's time.
+    # No try/finally: a raising hand-off leaves the pass open, like any raising pass.
     ctx = _ctx(self.model_runner)
     start = time.perf_counter()
-    try:
-        return _send_handoff(self, *args, **kwargs)
-    finally:
-        ctx.add_graph_time(time.perf_counter() - start)
-        ctx.end_pass()
+    output = _send_handoff(self, *args, **kwargs)
+    ctx.add_graph_time(time.perf_counter() - start)
+    ctx.end_pass()
+    return output
 
 
 @functools.wraps(_shutdown)
