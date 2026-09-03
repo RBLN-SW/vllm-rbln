@@ -62,10 +62,10 @@ class TestDecodeLayoutWiring:
         assert rows.tolist() == [1, 0]
 
     def test_forward_decode_pairs_each_request_with_its_own_row(self):
-        # The scheduler pinned A to row 0 and B to row 1; this decode step's
-        # running order is the REVERSE [B, A]. The runner already laid the
-        # batch out by row; forward feeds it as-is and gathers the logits
-        # back to running order.
+        # A owns row 0 and B owns row 1, but this step runs them as [B, A].
+        # The runner has already placed each request on its own row, so
+        # forward must pass the batch through untouched and return the logits
+        # in running order, B first.
         obj = self._bare_qwen3_5(max_batch_size=2)
 
         recorded = {}
