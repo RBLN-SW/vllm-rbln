@@ -23,7 +23,6 @@ import pytest
 from tests.native.model_specs import CompileModelSpec, apply_spec_envs, spec_params
 from tests.native.runners import DPRequest
 from tests.native.utils import (
-    ALMOST_EQUAL_MAX_LOGPROB_GAP,
     ALMOST_EQUAL_MAX_RANK,
     TokensTextLogprobs,
     check_logprobs_close,
@@ -133,7 +132,6 @@ def test_output_survives_idle_peers(dp_lane, symmetric_outputs) -> None:
         outputs_1_lst=outputs,
         name_0="rank0 with every rank busy",
         name_1=f"rank0 with {dp_lane.dp_size - 1} idle peers",
-        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
         max_rank=ALMOST_EQUAL_MAX_RANK,
     )
 
@@ -153,7 +151,6 @@ def test_output_survives_a_peer_finishing_early(dp_lane, symmetric_outputs) -> N
         outputs_1_lst=[long],
         name_0=f"rank{last} with every rank busy",
         name_1=f"rank{last} outliving rank0",
-        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
         max_rank=ALMOST_EQUAL_MAX_RANK,
     )
     # Bounded, not fixed: an earlier EOS still leaves the rank idle early.
@@ -166,7 +163,6 @@ def test_output_survives_a_peer_finishing_early(dp_lane, symmetric_outputs) -> N
         outputs_1_lst=[short],
         name_0="rank0 with every rank busy",
         name_1="rank0 sharing the group with a longer request",
-        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
         max_rank=ALMOST_EQUAL_MAX_RANK,
     )
 
@@ -190,6 +186,5 @@ def test_output_survives_a_peer_at_a_bigger_bucket(dp_lane) -> None:
         outputs_1_lst=[second],
         name_0="rank0 request 0",
         name_1="rank0 request 1",
-        max_logprob_gap=ALMOST_EQUAL_MAX_LOGPROB_GAP,
         max_rank=ALMOST_EQUAL_MAX_RANK,
     )

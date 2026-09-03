@@ -12,23 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .optimum_attention_manager import AttentionManager, HybridAttentionImageManager
-from .optimum_attention_strategy import (
-    HybridAttentionImageStrategy,
-    InnerAttentionEntry,
-    InnerAttentionStrategy,
-    InnerR1,
-    InnerR2,
-    LinearAttentionStrategy,
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlPullConnectorScheduler,
 )
 
-__all__ = [
-    "AttentionManager",
-    "InnerAttentionEntry",
-    "InnerAttentionStrategy",
-    "InnerR1",
-    "InnerR2",
-    "LinearAttentionStrategy",
-    "HybridAttentionImageManager",
-    "HybridAttentionImageStrategy",
-]
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
+    RblnNixlSchedulerBase,
+)
+
+
+class RblnNixlPullConnectorScheduler(RblnNixlSchedulerBase, NixlPullConnectorScheduler):
+    """Scheduler side of the read path."""

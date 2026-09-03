@@ -88,7 +88,9 @@ def _make_runner_stub(**attrs):
     return runner
 
 
-def _sampling_metadata(n, *, no_penalties=True, spec_token_ids=None):
+def _sampling_metadata(
+    n, *, no_penalties=True, spec_token_ids=None, allowed_token_ids_mask=None
+):
     return SamplingMetadata(
         temperature=torch.ones(n),
         all_greedy=False,
@@ -103,7 +105,7 @@ def _sampling_metadata(n, *, no_penalties=True, spec_token_ids=None):
         presence_penalties=torch.zeros(n),
         repetition_penalties=torch.ones(n),
         output_token_ids=[[] for _ in range(n)],
-        allowed_token_ids_mask=None,
+        allowed_token_ids_mask=allowed_token_ids_mask,
         bad_words_token_ids={},
         logitsprocs=None,
         logprob_token_ids=None,
@@ -221,6 +223,15 @@ class TestPadDepad:
         assert p.frequency_penalties.shape[0] == 4
         assert len(p.output_token_ids) == 4
         assert p.output_token_ids[2] == []
+
+    def test_pad_sampling_metadata_pads_allowed_token_ids_mask(self):
+        mask = torch.zeros(2, 10, dtype=torch.bool)
+        mask[0, 3] = True
+        p = _pad_sampling_metadata(
+            _sampling_metadata(2, allowed_token_ids_mask=mask), 4
+        )
+        assert p.allowed_token_ids_mask.shape == (4, 10)
+        assert torch.equal(p.allowed_token_ids_mask[:2], mask)
 
     def test_depad_sampler_output_trims_to_num_reqs(self):
         out = SamplerOutput(

@@ -18,7 +18,8 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
-from typing import Any, Literal, NamedTuple, TypeAlias, cast
+from functools import partial
+from typing import Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -157,6 +158,7 @@ from vllm_rbln.v1.worker.dp_utils import (
 )
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
+    copy_host_device_kv_blocks,
     get_kv_cache_names,
     prepare_kernel_block_sizes,
     reorder_input_batch,
@@ -3054,41 +3056,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 }
                 kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
-            def rbln_copy_kv_blocks(
-                src_kv_caches: dict[str, torch.Tensor],
-                dst_kv_caches: dict[str, torch.Tensor],
-                src_block_ids: list[int],
-                dst_block_ids: list[int],
-                direction: Literal["h2d", "d2h"],
-            ) -> None:
-                """Copy KV blocks between the host xfer buffer and the device KV
-                cache. Splits K/V (dim 0) first so each per-block view is
-                contiguous, hitting `_copy_from_rbln`'s direct-DMA fast path.
-                Requires VLLM_RBLN_USE_DEVICE_TENSOR=1."""
-                if (
-                    not src_kv_caches
-                    or not dst_kv_caches
-                    or not src_block_ids
-                    or not dst_block_ids
-                ):
-                    return
-                assert src_block_ids == dst_block_ids, (
-                    "src_block_ids and dst_block_ids must be the same: "
-                    f"src_block_ids={src_block_ids} dst_block_ids={dst_block_ids}"
+            kv_transfer_group.set_host_xfer_buffer_ops(
+                partial(
+                    copy_host_device_kv_blocks,
+                    use_mla=self.model_config.use_mla,
                 )
-                # P/D uses identical block ids on both sides (asserted above), so
-                # the copy indexes by src_block_ids; it is symmetric, so the
-                # direction arg (part of the fixed CopyBlocksOp signature) is
-                # unused.
-                for layer_name, dst_cache in dst_kv_caches.items():
-                    src_cache = src_kv_caches[layer_name]
-                    for kv in range(dst_cache.shape[0]):
-                        dst_kv = dst_cache[kv]
-                        src_kv = src_cache[kv]
-                        for idx in src_block_ids:
-                            dst_kv[idx].copy_(src_kv[idx])
-
-            kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
+            )
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3506,6 +3479,7 @@ def _pad_sampling_metadata(md: SamplingMetadata, bucket: int) -> SamplingMetadat
         temperature=_pad_rows(md.temperature, bucket),
         top_p=_pad_rows(md.top_p, bucket),
         top_k=_pad_rows(md.top_k, bucket),
+        allowed_token_ids_mask=_pad_rows(md.allowed_token_ids_mask, bucket),
     )
     if not md.no_penalties:
         kwargs.update(
