@@ -23,6 +23,8 @@ from vllm.model_executor.models.llava_next import (
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import (
+    DecodeInputs,
+    PrefillInputs,
     RBLNOptimumDecoderMixin,
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
@@ -91,34 +93,24 @@ class RBLNOptimumLlavaNextForConditionalGeneration(
         return logits
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
-
         is_prompt = model_input.is_prompt
+        request_nums = model_input.input_tokens.shape[0]
 
-        request_nums = input_ids.shape[0]
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-        input_ids = kwargs.pop("input_ids")
-        cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
-        if not is_prompt:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
+        inputs: PrefillInputs | DecodeInputs
+        if is_prompt:
+            inputs = self.prepare_prefill_inputs(model_input)
+        else:
+            inputs = self.prepare_decode_inputs(model_input)
             self.model.language_model.decoder = self.model.language_model.decoders[
-                padded_batch_size
+                inputs.padded_batch_size
             ]
-
-        inputs_embeds = model_input.inputs_embeds if is_prompt else None
 
         logits = self._forward(
             is_prefill=is_prompt,
-            block_tables=block_tables,
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
+            block_tables=inputs.block_tables,
+            input_ids=inputs.input_ids,
+            inputs_embeds=model_input.inputs_embeds if is_prompt else None,
+            cache_position=inputs.cache_position,
         )
 
         if not is_prompt:

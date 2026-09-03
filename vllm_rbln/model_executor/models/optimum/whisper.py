@@ -212,7 +212,6 @@ class RBLNOptimumWhisperForConditionalGeneration(
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
         block_tables = model_input.block_tables
-        request_nums = input_ids.shape[0]
         is_prompt = model_input.is_prompt
         valid_block_ids = block_tables.flatten().to(torch.int32)
 
@@ -280,19 +279,15 @@ class RBLNOptimumWhisperForConditionalGeneration(
             self.dec_lengths[batch_idx] = len(token_sequence)
 
         else:
-            cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
-            kwargs = self.preprocess_for_decoder(
-                is_prompt=False,
-                block_tables=block_tables,
-                input_ids=input_ids,
-                cache_position=cache_position,
+            decode_inputs = self.prepare_decode_inputs(
+                model_input,
                 input_block_ids=valid_block_ids,
                 dummy_block=model_input.dummy_block,
             )
-            decoder_cache_position = kwargs.pop("cache_position")
-            decoder_block_tables = kwargs.pop("block_tables")
-            decoder_input_ids = kwargs.pop("input_ids")
-            # Generate cache_position using dec_lengths
+            # Whisper tracks decoder positions itself in dec_lengths.
+            decoder_cache_position = torch.zeros(
+                decode_inputs.padded_batch_size, 1, dtype=torch.int32
+            )
             for batch_idx in valid_block_ids:
                 decoder_cache_position[batch_idx] = self.dec_lengths[batch_idx]
                 decoder_attention_mask[
@@ -300,10 +295,10 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 ] = 1
                 self.dec_lengths[batch_idx] += 1
             decoder_output = self.model.decoder(
-                decoder_input_ids=decoder_input_ids.contiguous(),
+                decoder_input_ids=decode_inputs.input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
                 cache_position=decoder_cache_position,
-                block_tables=decoder_block_tables,
+                block_tables=decode_inputs.block_tables,
             )
 
         lm_logits = decoder_output.logits

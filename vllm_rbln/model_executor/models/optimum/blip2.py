@@ -60,36 +60,25 @@ class RBLNOptimumBlip2ForConditionalGeneration(
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
+        request_nums = model_input.input_tokens.shape[0]
 
-        is_prompt = model_input.is_prompt
-
-        request_nums = input_ids.shape[0]
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-
-        if is_prompt:
-            block_tables = kwargs.pop("block_tables")
-            cache_position = kwargs.pop("cache_position")
-
-            inputs_embeds = model_input.inputs_embeds
+        if model_input.is_prompt:
+            prefill_inputs = self.prepare_prefill_inputs(model_input)
             logits = self.model.language_model.prefill_decoder(
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                block_tables=block_tables,
+                inputs_embeds=model_input.inputs_embeds,
+                cache_position=prefill_inputs.cache_position,
+                block_tables=prefill_inputs.block_tables,
             ).logits
         else:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
+            decode_inputs = self.prepare_decode_inputs(model_input)
             self.model.language_model.decoder = self.model.language_model.decoders[
-                padded_batch_size
+                decode_inputs.padded_batch_size
             ]
-
-            logits = self.model.language_model.decoder(**kwargs).logits
-        if not is_prompt:
+            logits = self.model.language_model.decoder(
+                input_ids=decode_inputs.input_ids,
+                cache_position=decode_inputs.cache_position,
+                block_tables=decode_inputs.block_tables,
+            ).logits
             logits = logits[:request_nums]
         return logits
 

@@ -311,21 +311,18 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
         if not model_input.is_prompt:
             return super().forward(model_input, **kwargs)
 
-        input_ids = model_input.input_tokens
-        request_nums = input_ids.shape[0]
+        request_nums = model_input.input_tokens.shape[0]
         assert len(model_input.running_requests_ids) == request_nums, (
             f"The number of running requests is "
             f"{len(model_input.running_requests_ids)}, "
-            f"but the shape of input_ids is {input_ids.shape}"
+            f"but the shape of input_ids is {model_input.input_tokens.shape}"
         )
-        decoder_kwargs = self.preprocess_for_decoder(
-            True, model_input.block_tables, input_ids, model_input.input_positions
-        )
+        prefill_inputs = self.prepare_prefill_inputs(model_input)
         prefill_kwargs = {
             "inputs_embeds": model_input.inputs_embeds,
             "position_embed": model_input.position_embed,
-            "block_tables": decoder_kwargs.pop("block_tables"),
-            "cache_position": decoder_kwargs.pop("cache_position"),
+            "block_tables": prefill_inputs.block_tables,
+            "cache_position": prefill_inputs.cache_position,
         }
         if model_input.visual_pos_mask is not None:
             prefill_kwargs["visual_pos_mask"] = model_input.visual_pos_mask
@@ -412,40 +409,27 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
         the batch out with the request at row == batch_idx, then gathers
         logits back to running order.
         """
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
-
         if model_input.is_prompt:
             assert model_input.cache_slot_ids is not None
-            batch_idx = int(model_input.cache_slot_ids[0])
-            kw = self.preprocess_for_decoder(
-                True, block_tables, input_ids, cache_position
-            )
-            prefill_kwargs = {
-                "inputs_embeds": model_input.inputs_embeds,
-                "position_embed": model_input.position_embed,
-                "block_tables": kw.pop("block_tables"),
-                "cache_position": kw.pop("cache_position"),
-                "batch_idx": batch_idx,
-            }
-            return self.model.prefill_decoder(**prefill_kwargs).logits
+            prefill_inputs = self.prepare_prefill_inputs(model_input)
+            return self.model.prefill_decoder(
+                inputs_embeds=model_input.inputs_embeds,
+                position_embed=model_input.position_embed,
+                block_tables=prefill_inputs.block_tables,
+                cache_position=prefill_inputs.cache_position,
+                batch_idx=int(model_input.cache_slot_ids[0]),
+            ).logits
 
         batch_indices = self._decode_batch_indices(model_input)
-        kw = self.preprocess_for_decoder(
-            False,
-            block_tables,
-            input_ids,
-            cache_position,
-            input_block_ids=batch_indices,
+        decode_inputs = self.prepare_decode_inputs(
+            model_input, input_block_ids=batch_indices
         )
-        input_ids = kw.pop("input_ids")
-        inputs_embeds = self.model.embed_tokens(input_ids)
-        self.model.decoder = self.model.decoders[self.decoder_batch_size]
+        inputs_embeds = self.model.embed_tokens(decode_inputs.input_ids)
+        self.model.decoder = self.model.decoders[decode_inputs.padded_batch_size]
         logits = self.model.decoder(
             inputs_embeds=inputs_embeds,
-            cache_position=kw.pop("cache_position"),
+            cache_position=decode_inputs.cache_position,
             position_embed=model_input.position_embed,
-            block_tables=kw.pop("block_tables"),
+            block_tables=decode_inputs.block_tables,
         ).logits
         return logits[batch_indices]

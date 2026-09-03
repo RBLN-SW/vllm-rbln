@@ -49,19 +49,24 @@ class TestDecodeLayoutWiring:
         obj.available_blocks = torch.arange(50, 60, dtype=torch.int16)
         return obj
 
-    def test_pad_decoder_items_scatters_to_batch_idx_rows(self):
+    def test_prepare_decode_inputs_scatters_to_batch_idx_rows(self):
         # Running order [B, A]; B's row is 1, A's row is 0. The real
-        # pad_decoder_items must land B (running idx 0) on row 1 and A on row 0.
+        # prepare_decode_inputs must land B (running idx 0) on row 1 and A on row 0.
         obj = self._bare_qwen3_5(max_batch_size=4)
-        input_ids = torch.tensor([[201], [200]])  # running order: B=201, A=200
-        positions = torch.tensor([[5], [7]])
-        block_tables = torch.tensor([[10], [11]], dtype=torch.int16)
+        model_input = types.SimpleNamespace(
+            input_tokens=torch.tensor([[201], [200]]),  # running order: B=201, A=200
+            input_positions=torch.tensor([[5], [7]]),
+            block_tables=torch.tensor([[10], [11]], dtype=torch.int16),
+        )
         batch_indices = torch.tensor([1, 0])  # rows of [B, A]
 
-        padded_ids, padded_pos, padded_bt = obj.pad_decoder_items(
-            input_ids, positions, block_tables, input_block_ids=batch_indices
+        decode_inputs = obj.prepare_decode_inputs(
+            model_input, input_block_ids=batch_indices
         )
 
+        padded_ids = decode_inputs.input_ids
+        padded_pos = decode_inputs.cache_position
+        padded_bt = decode_inputs.block_tables
         assert padded_ids[1, 0] == 201 and padded_ids[0, 0] == 200  # B->1, A->0
         assert padded_pos[1, 0] == 5 and padded_pos[0, 0] == 7
         assert padded_bt[1, 0] == 10 and padded_bt[0, 0] == 11

@@ -15,7 +15,7 @@ import json
 import math
 import os
 from dataclasses import replace
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -280,6 +280,25 @@ class RBLNOptimumModelBase(nn.Module):
         return self.model.rbln_config.dtype
 
 
+class PrefillInputs(NamedTuple):
+    """Inputs of the compiled prefill graph, one request."""
+
+    input_ids: torch.Tensor  # [1, seq_len] int64
+    cache_position: torch.Tensor  # [1, seq_len] int32
+    block_tables: torch.Tensor  # [num_blocks] int16
+
+
+class DecodeInputs(NamedTuple):
+    """Inputs of the compiled decode graph, padded to ``padded_batch_size``."""
+
+    input_ids: torch.Tensor  # [padded_batch_size, 1] int64
+    cache_position: torch.Tensor  # [padded_batch_size, 1] int32
+    block_tables: torch.Tensor  # [padded_batch_size, num_blocks] int16
+    # Padded cache slot ids, None unless ``cache_slot_ids`` was given.
+    local_block_tables: torch.Tensor | None  # [padded_batch_size, 1] int16
+    padded_batch_size: int
+
+
 class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
     attn_impl: str | None
 
@@ -306,128 +325,85 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             dtype=torch.int16,
         )
 
-    def pad_decoder_items(
+    def prepare_prefill_inputs(self, model_input: ModelInputForRBLN) -> PrefillInputs:
+        return PrefillInputs(
+            input_ids=model_input.input_tokens.to(torch.int64),
+            cache_position=model_input.input_positions.to(torch.int32),
+            block_tables=model_input.block_tables.squeeze(0).to(torch.int16),
+        )
+
+    def prepare_decode_inputs(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        block_tables: torch.Tensor,
+        model_input: ModelInputForRBLN,
+        *,
+        cache_slot_ids: torch.Tensor | None = None,
         input_block_ids: torch.Tensor | None = None,
-        padded_batch_size: int | None = None,
         dummy_block: int | None = None,
-    ):
-        assert input_ids.shape[1] == 1
-        if input_block_ids is None and padded_batch_size is None:
-            raise ValueError(
-                "Either input_block_ids or padded_batch_size must be provided."
-            )
-        elif input_block_ids is not None and padded_batch_size is not None:
-            raise ValueError(
-                "Cannot provide both input_block_ids and padded_batch_size."
-            )
+    ) -> DecodeInputs:
+        """Pad the decode batch to the decoder's batch size.
 
-        if padded_batch_size is None:
-            padded_batch_size = self.decoder_batch_size
-
-        original_batch_size = input_ids.shape[0]
-
-        padded_input_ids = torch.zeros(padded_batch_size, 1, dtype=input_ids.dtype)
-        padded_position_ids = torch.zeros(padded_batch_size, 1, dtype=positions.dtype)
-        padded_block_tables = torch.zeros(
-            padded_batch_size, block_tables.shape[1], dtype=block_tables.dtype
-        ).fill_(-1)
-
-        mask = torch.ones_like(
-            padded_block_tables,
-            dtype=torch.bool,
-            device=block_tables.device,
-        )
-
-        if input_block_ids is None:
-            padded_input_ids[:original_batch_size] = input_ids
-            padded_position_ids[:original_batch_size] = positions
-            padded_block_tables[:original_batch_size] = block_tables
-            mask[:original_batch_size, :] = False
-        else:
-            padded_input_ids[input_block_ids] = input_ids
-            padded_position_ids[input_block_ids] = positions
-            padded_block_tables[input_block_ids] = block_tables
-            mask[input_block_ids, :] = False
-
-        if torch.any(mask):
-            if dummy_block is not None:
-                padding_blocks = torch.tensor([dummy_block], dtype=block_tables.dtype)
-            else:
-                padding_blocks = self.available_blocks[
-                    ~torch.isin(self.available_blocks, block_tables.flatten())
-                ]
-            padded_block_tables[mask] = padding_blocks[0]
-        return padded_input_ids, padded_position_ids, padded_block_tables
-
-    def preprocess_for_decoder(
-        self,
-        is_prompt: bool,
-        block_tables: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        cache_position: torch.Tensor | None = None,
-        input_block_ids: list[int] | None = None,
-        dummy_block: int | None = None,
-    ):
-        padded_batch_size = None
-        # 1. Set the type
-        # TODO: Does it require changing the dtype dynamically?
-        input_ids = input_ids.to(torch.int64) if input_ids is not None else None
-        cache_position = (
-            cache_position.to(torch.int32) if cache_position is not None else None
-        )
-        block_tables = block_tables.to(torch.int16)
-
-        # 2. Adjust the shape of tensors by squeezing and padding
-        if is_prompt:
-            block_tables = block_tables.squeeze(0)
-            padded_batch_size = 1
-        else:
-            if input_block_ids is None:
-                padded_batch_size = self.decoder_batch_size
-                if input_ids is not None:
-                    request_nums = input_ids.shape[0]
-                # Select lower-bounded batch size in case of multiple decoders
-                if self.use_multiple_decoder:
-                    padded_batch_size = select_bucket_size(
-                        request_nums, self.decoder_batch_sizes
-                    )
-
-            input_ids, cache_position, block_tables = self.pad_decoder_items(
-                input_ids,
-                cache_position,
-                block_tables,
-                input_block_ids=input_block_ids,
-                padded_batch_size=padded_batch_size,
-                dummy_block=dummy_block,
-            )
-        kwargs = {
-            "block_tables": block_tables,
-            "padded_batch_size": padded_batch_size,
-            "input_ids": input_ids,
-            "cache_position": cache_position,
-        }
-        return kwargs
-
-    @staticmethod
-    def pad_cache_slot_ids(
-        cache_slot_ids: torch.Tensor,
-        padded_batch_size: int,
-    ) -> torch.Tensor:
-        """Pad the decode cache slot ids to [padded_batch_size, 1].
-
-        Padding rows must not alias a scheduled request's row in the
-        per-sequence cache, so the pad value is the lowest id no scheduled
-        request owns (0 when the batch is full and no padding row exists).
+        Requests occupy rows [0, num_reqs) unless ``input_block_ids`` names each
+        request's row. Padding rows point at ``dummy_block``, or at a block no
+        request in this batch uses. ``cache_slot_ids`` is padded with the lowest
+        slot no scheduled request owns, so a padding row never aliases a real
+        row of the per-sequence cache.
         """
-        used_ids = set(cache_slot_ids.tolist())
-        pad_value = next((i for i in range(padded_batch_size) if i not in used_ids), 0)
-        padded = torch.full((padded_batch_size, 1), pad_value, dtype=torch.int16)
-        padded[: cache_slot_ids.shape[0], 0] = cache_slot_ids
-        return padded
+        input_ids = model_input.input_tokens
+        block_tables = model_input.block_tables
+        assert input_ids.shape[1] == 1
+        num_reqs = input_ids.shape[0]
+
+        rows: torch.Tensor | slice
+        if input_block_ids is not None:
+            padded_batch_size = self.decoder_batch_size
+            rows = input_block_ids
+        else:
+            padded_batch_size = (
+                select_bucket_size(num_reqs, self.decoder_batch_sizes)
+                if self.use_multiple_decoder
+                else self.decoder_batch_size
+            )
+            rows = slice(0, num_reqs)
+
+        num_blocks = block_tables.shape[1]
+        if padded_batch_size > num_reqs:
+            if dummy_block is None:
+                dummy_block = int(
+                    self.available_blocks[
+                        ~torch.isin(self.available_blocks, block_tables.flatten())
+                    ][0]
+                )
+            padded_block_tables = torch.full(
+                (padded_batch_size, num_blocks), dummy_block, dtype=torch.int16
+            )
+        else:
+            padded_block_tables = torch.empty(
+                (padded_batch_size, num_blocks), dtype=torch.int16
+            )
+        padded_input_ids = torch.zeros(padded_batch_size, 1, dtype=torch.int64)
+        padded_cache_position = torch.zeros(padded_batch_size, 1, dtype=torch.int32)
+        padded_input_ids[rows] = input_ids.to(torch.int64)
+        padded_cache_position[rows] = model_input.input_positions.to(torch.int32)
+        padded_block_tables[rows] = block_tables.to(torch.int16)
+
+        local_block_tables = None
+        if cache_slot_ids is not None:
+            used_slots = set(cache_slot_ids.tolist())
+            pad_slot = next(
+                (i for i in range(padded_batch_size) if i not in used_slots), 0
+            )
+            local_block_tables = torch.full(
+                (padded_batch_size, 1), pad_slot, dtype=torch.int16
+            )
+            local_block_tables[rows] = cache_slot_ids.unsqueeze(1)
+
+        return DecodeInputs(
+            input_ids=padded_input_ids,
+            cache_position=padded_cache_position,
+            block_tables=padded_block_tables,
+            local_block_tables=local_block_tables,
+            padded_batch_size=padded_batch_size,
+        )
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder

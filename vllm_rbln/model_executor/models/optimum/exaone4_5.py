@@ -168,20 +168,21 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         result.update(self._process_video_input(video_input))
         return result
 
-    def build_prefill_inputs(
+    def build_prefill_inputs_from_cache(
         self,
         input_ids: torch.Tensor,
         cached_mm_outputs: list,
         *,
         cache_position: torch.Tensor | None = None,
         running_requests_ids: list[str] | None = None,
+        mrope_position_deltas: dict[str, float] | None = None,
     ) -> dict:
         # NOTE: this guard is currently unreachable — init_model() only enables
         # the EC path for "RBLNQwen3VLForConditionalGeneration", so EXAONE-4.5
         # never enters here today. It documents the contract for when EC is
         # extended: the sliding-window/hybrid-cache prefill needs the cache
-        # slot ids from ModelInputForRBLN, which build_prefill_inputs does
-        # not receive.
+        # slot ids from ModelInputForRBLN, which build_prefill_inputs_from_cache
+        # does not receive.
         raise NotImplementedError(
             "EC disaggregation is not implemented for EXAONE-4.5."
         )
@@ -224,44 +225,31 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
         cache_slot_ids = model_input.cache_slot_ids
         assert cache_slot_ids is not None
+        request_nums = model_input.input_tokens.shape[0]
 
-        request_nums = input_ids.shape[0]
-        is_prompt = model_input.is_prompt
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-
-        padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-        cache_position = kwargs.pop("cache_position")
-        input_ids = kwargs.pop("input_ids")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
-            inputs_embeds = model_input.inputs_embeds
+        if model_input.is_prompt:
+            prefill_inputs = self.prepare_prefill_inputs(model_input)
             logits = self.model.prefill_decoder(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
+                input_ids=prefill_inputs.input_ids,
+                inputs_embeds=model_input.inputs_embeds,
+                cache_position=prefill_inputs.cache_position,
                 local_block_tables=cache_slot_ids,
-                block_tables=block_tables if self.is_hybrid else None,
+                block_tables=prefill_inputs.block_tables if self.is_hybrid else None,
             ).logits
         else:
-            self.model.decoder = self.model.decoders[padded_batch_size]
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            decode_inputs = self.prepare_decode_inputs(
+                model_input, cache_slot_ids=cache_slot_ids
+            )
+            self.model.decoder = self.model.decoders[decode_inputs.padded_batch_size]
+            inputs_embeds = self.model.embed_tokens(decode_inputs.input_ids)
             logits = self.model.decoder(
-                input_ids=input_ids,
+                input_ids=decode_inputs.input_ids,
                 inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                local_block_tables=self.pad_cache_slot_ids(
-                    cache_slot_ids, padded_batch_size
-                ),
-                block_tables=block_tables if self.is_hybrid else None,
+                cache_position=decode_inputs.cache_position,
+                local_block_tables=decode_inputs.local_block_tables,
+                block_tables=decode_inputs.block_tables if self.is_hybrid else None,
             ).logits
             logits = logits[:request_nums]
         return logits

@@ -660,7 +660,6 @@ class RBLNOptimumModelRunner(
             )
 
         seq_len = len(prompt_tokens)
-        input_positions = list(range(seq_len))
         num_blocks = num_blocks_per_req[req_index]
         # Full prompt tokens before any prefix-cache trim; needed by MRoPE
         # models to recompute positions over the whole prompt on a partial hit.
@@ -679,7 +678,6 @@ class RBLNOptimumModelRunner(
             total_cached_length = sum(cached_length)
             if total_cached_length > 0:
                 prompt_tokens = prompt_tokens[total_cached_length:]
-                input_positions = input_positions[total_cached_length:]
                 assert len(prompt_tokens) > 0, (
                     "The prompt tokens is empty after removing the cached tokens."
                 )
@@ -702,7 +700,9 @@ class RBLNOptimumModelRunner(
         )
 
         input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
-        input_positions = torch.tensor(input_positions).unsqueeze(0)
+        input_positions = torch.arange(
+            total_cached_length, seq_len, dtype=torch.int32
+        ).unsqueeze(0)
         block_table = block_table.unsqueeze(0)
         return (
             input_tokens,
@@ -743,8 +743,8 @@ class RBLNOptimumModelRunner(
                 block_tables_list.append(block_table)
             running_request_ids.append(req_id)
 
-        input_tokens = torch.tensor(input_tokens)
-        input_positions = torch.tensor(input_positions)
+        input_tokens = torch.tensor(input_tokens, dtype=torch.int64)
+        input_positions = torch.tensor(input_positions, dtype=torch.int32)
         block_tables = torch.stack(block_tables_list)
 
         return input_tokens, input_positions, block_tables, running_request_ids

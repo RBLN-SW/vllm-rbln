@@ -507,9 +507,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """
         cache_position = model_input.input_positions
         running_requests_ids = model_input.running_requests_ids
-        # int32 mirrors the cache_position dtype the prior decode path used
-        # (cast in preprocess_for_decoder before computing position embeds).
-        cache_position = cache_position.to(torch.int32)
         padded_batch_size = self.decoder_batch_size
         if self.use_multiple_decoder:
             padded_batch_size = select_bucket_size(
@@ -533,47 +530,34 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         return torch.cat(position_embeds, dim=1)
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
-
-        request_nums = input_ids.shape[0]
-        is_prompt = model_input.is_prompt
+        request_nums = model_input.input_tokens.shape[0]
 
         # FIXME This should be removed in the future
         # by moving the padding logic into model runner.
         assert len(model_input.running_requests_ids) == request_nums, (
             f"The number of running requests is "
             f"{len(model_input.running_requests_ids)}, "
-            f"but the shape of input_ids is {input_ids.shape}"
+            f"but the shape of input_ids is {model_input.input_tokens.shape}"
         )
 
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-        cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
-            prefill_kwargs = {
-                "inputs_embeds": model_input.inputs_embeds,
-                "position_embed": model_input.position_embed,
-                "block_tables": block_tables,
-                "cache_position": cache_position,
-            }
-            logits = self.model.prefill_decoder(**prefill_kwargs).logits
+        if model_input.is_prompt:
+            prefill_inputs = self.prepare_prefill_inputs(model_input)
+            logits = self.model.prefill_decoder(
+                inputs_embeds=model_input.inputs_embeds,
+                position_embed=model_input.position_embed,
+                block_tables=prefill_inputs.block_tables,
+                cache_position=prefill_inputs.cache_position,
+            ).logits
         else:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-            self.model.decoder = self.model.decoders[padded_batch_size]
-            input_ids = kwargs.pop("input_ids")
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            decode_inputs = self.prepare_decode_inputs(model_input)
+            self.model.decoder = self.model.decoders[decode_inputs.padded_batch_size]
+            inputs_embeds = self.model.embed_tokens(decode_inputs.input_ids)
             logits = self.model.decoder(
                 inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
+                cache_position=decode_inputs.cache_position,
                 position_embed=model_input.position_embed,
-                block_tables=block_tables,
+                block_tables=decode_inputs.block_tables,
             ).logits
-        if not is_prompt:
             logits = logits[:request_nums]
         return logits
 

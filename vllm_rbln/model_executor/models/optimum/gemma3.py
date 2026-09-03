@@ -58,7 +58,7 @@ class MultimodalHybridAttentionStateManager:
             attention_mask=attention_mask,
         )
 
-    def build_decode_inputs(
+    def build_decode_attention_inputs(
         self,
         running_requests_ids: list[str],
         position_ids: torch.Tensor,
@@ -136,24 +136,15 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         self.attention_manager = MultimodalHybridAttentionStateManager()
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        position_ids = model_input.input_positions
-        block_tables = model_input.block_tables
         cache_slot_ids = model_input.cache_slot_ids
         assert cache_slot_ids is not None
 
-        is_prompt = model_input.is_prompt
         running_requests_ids = model_input.running_requests_ids
-        request_nums = input_ids.shape[0]
+        request_nums = model_input.input_tokens.shape[0]
 
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, position_ids
-        )
-        cache_position = kwargs.pop("cache_position")
-        input_ids = kwargs.pop("input_ids")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
+        if model_input.is_prompt:
+            prefill_inputs = self.prepare_prefill_inputs(model_input)
+            input_ids = prefill_inputs.input_ids
             # token_type_ids model_input != token_type_ids of gemma3
             # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
             token_type_ids = torch.zeros_like(input_ids)
@@ -170,10 +161,10 @@ class RBLNOptimumGemma3ForConditionalGeneration(
                 raise version_error
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
+                cache_position=prefill_inputs.cache_position,
                 attention_mask=attention_mask,
                 local_block_tables=cache_slot_ids,
-                block_tables=block_tables,
+                block_tables=prefill_inputs.block_tables,
                 token_type_ids=token_type_ids,
             )
             logits = output.logits
@@ -188,9 +179,11 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         else:
             if self.model.language_model.decoders is None:
                 raise ValueError("Decoders is None")
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
+            decode_inputs = self.prepare_decode_inputs(
+                model_input, cache_slot_ids=cache_slot_ids
+            )
             self.model.language_model.decoder = self.model.language_model.decoders[
-                padded_batch_size
+                decode_inputs.padded_batch_size
             ]
             # `cache_position` and `position_ids` are distinguished due to the
             # padding space reserved in the cache during prefill.
@@ -198,19 +191,17 @@ class RBLNOptimumGemma3ForConditionalGeneration(
                 cache_position,
                 position_ids,
                 attention_mask,
-            ) = self.attention_manager.build_decode_inputs(
+            ) = self.attention_manager.build_decode_attention_inputs(
                 running_requests_ids,
-                cache_position,
-                padded_batch_size,
+                decode_inputs.cache_position,
+                decode_inputs.padded_batch_size,
             )
 
             logits = self.model.language_model.decoder(
-                input_ids=input_ids,
+                input_ids=decode_inputs.input_ids,
                 cache_position=cache_position,
-                block_tables=block_tables,
-                local_block_tables=self.pad_cache_slot_ids(
-                    cache_slot_ids, padded_batch_size
-                ),
+                block_tables=decode_inputs.block_tables,
+                local_block_tables=decode_inputs.local_block_tables,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
             ).logits

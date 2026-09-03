@@ -59,43 +59,31 @@ class RBLNOptimumSlidingWindowAttentionForCausalLM(
         self.is_hybrid = getattr(self.model.rbln_config, "cache_impl", None) == "hybrid"
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
         cache_slot_ids = model_input.cache_slot_ids
         assert cache_slot_ids is not None
+        request_nums = model_input.input_tokens.shape[0]
 
-        request_nums = input_ids.shape[0]
-        is_prompt = model_input.is_prompt
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-
-        padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-        cache_position = kwargs.pop("cache_position")
-        input_ids = kwargs.pop("input_ids")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
+        if model_input.is_prompt:
             if self.model.prefill_decoder is None:
                 raise version_error
+            prefill_inputs = self.prepare_prefill_inputs(model_input)
             output = self.model.prefill_decoder(
-                input_ids=input_ids,
-                cache_position=cache_position,
+                input_ids=prefill_inputs.input_ids,
+                cache_position=prefill_inputs.cache_position,
                 local_block_tables=cache_slot_ids,
-                block_tables=block_tables if self.is_hybrid else None,
+                block_tables=prefill_inputs.block_tables if self.is_hybrid else None,
             )
             logits = output.logits
         else:
-            self.model.decoder = self.model.decoders[padded_batch_size]
+            decode_inputs = self.prepare_decode_inputs(
+                model_input, cache_slot_ids=cache_slot_ids
+            )
+            self.model.decoder = self.model.decoders[decode_inputs.padded_batch_size]
             logits = self.model.decoder(
-                input_ids=input_ids,
-                cache_position=cache_position,
-                local_block_tables=self.pad_cache_slot_ids(
-                    cache_slot_ids, padded_batch_size
-                ),
-                block_tables=block_tables if self.is_hybrid else None,
+                input_ids=decode_inputs.input_ids,
+                cache_position=decode_inputs.cache_position,
+                local_block_tables=decode_inputs.local_block_tables,
+                block_tables=decode_inputs.block_tables if self.is_hybrid else None,
             ).logits
             logits = logits[:request_nums]
         return logits
