@@ -113,9 +113,6 @@ def compile_sampler(
         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
         global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
-        # FIXME: Currently, sampler ops do not support caching.
-        # Reusing seed buffer is not supported when the compiled sampler is loaded.
-        use_cache=False,
     )
 
 
@@ -391,21 +388,21 @@ class RBLNSampler(VLLMSampler):
 
 WARM_UP_CONFIGS: list[dict[str, Any]] = [
     {
-        "name": "no_penalty_greedy",
+        "name": "greedy",
         "no_penalties": True,
         "all_greedy": True,
         "all_random": False,
         "temperature": 0.0,
     },
     {
-        "name": "no_penalty_random",
+        "name": "multinomial",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topp",
+        "name": "topp",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
@@ -413,7 +410,7 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topk",
+        "name": "topk",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
@@ -421,52 +418,8 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topp_topk",
+        "name": "topp_topk",
         "no_penalties": True,
-        "all_greedy": False,
-        "all_random": True,
-        "top_p": 0.9,
-        "top_k": 1.0,
-        "temperature": 0.5,
-    },
-    {
-        "name": "penalty_greedy",
-        "no_penalties": False,
-        "frequency_penalties": 0.1,
-        "presence_penalties": 0.1,
-        "repetition_penalties": 1.0,
-        "all_greedy": True,
-        "all_random": False,
-        "temperature": 0.0,
-    },
-    {
-        "name": "penalty_topp",
-        "no_penalties": False,
-        "frequency_penalties": 0.1,
-        "presence_penalties": 0.1,
-        "repetition_penalties": 1.0,
-        "all_greedy": False,
-        "all_random": True,
-        "top_p": 0.9,
-        "temperature": 0.5,
-    },
-    {
-        "name": "penalty_topk",
-        "no_penalties": False,
-        "frequency_penalties": 0.1,
-        "presence_penalties": 0.1,
-        "repetition_penalties": 1.0,
-        "all_greedy": False,
-        "all_random": True,
-        "top_k": 1.0,
-        "temperature": 0.5,
-    },
-    {
-        "name": "penalty_topp_topk",
-        "no_penalties": False,
-        "frequency_penalties": 0.1,
-        "presence_penalties": 0.1,
-        "repetition_penalties": 1.0,
         "all_greedy": False,
         "all_random": True,
         "top_p": 0.9,
@@ -474,3 +427,14 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.5,
     },
 ]
+
+# Compiled graphs per batch size. `dynamic=False` makes dynamo specialize on
+# whether `k` and `p` are None, so each row is its own graph:
+#
+#   compiled function          inputs                       warm-up config
+#   rbln_greedy_sample         logits                       no_penalty_greedy
+#   rbln_top_k_top_p_sample    logits, temperature          no_penalty_random
+#   rbln_top_k_top_p_sample    logits, temperature, p       no_penalty_topp
+#   rbln_top_k_top_p_sample    logits, temperature, k       no_penalty_topk
+#   rbln_top_k_top_p_sample    logits, temperature, k, p    no_penalty_topp_topk
+SAMPLER_GRAPHS_PER_BATCH_SIZE = 5

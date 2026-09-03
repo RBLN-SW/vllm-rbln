@@ -260,3 +260,91 @@ def test_update_states_request_unscheduled(model_runner):
 
     assert _is_req_added(model_runner, new_req_id)
     assert _is_req_scheduled(model_runner, new_req_id)
+
+
+def _wire_mega_cache(model_runner, monkeypatch) -> list[tuple]:
+    """Record the order of bundle load/save and sampler compiles."""
+    from vllm_rbln.v1.worker import mega_cache
+
+    steps: list[tuple] = []
+    model_runner.use_rbln_sampler = True
+    monkeypatch.setattr(
+        model_runner, "sampler", lambda **kwargs: steps.append(("compile",))
+    )
+    monkeypatch.setattr(
+        mega_cache, "load", lambda model, sig: steps.append(("load", model, sig))
+    )
+    monkeypatch.setattr(
+        mega_cache, "save", lambda model, sig: steps.append(("save", model, sig))
+    )
+    return steps
+
+
+def test_dummy_sampler_run_loads_bundle_first_and_saves_last(model_runner, monkeypatch):
+    steps = _wire_mega_cache(model_runner, monkeypatch)
+
+    model_runner.dummy_sampler_run()
+
+    kinds = [step[0] for step in steps]
+    assert kinds[0] == "load"
+    assert kinds[-1] == "save"
+    assert "compile" in kinds
+    # Same (model, sig) on both ends, or the run writes a bundle it can never
+    # load back.
+    assert steps[0][1:] == steps[-1][1:]
+    assert steps[0][1] == model_runner.model_config.model
+
+
+def test_failed_dummy_sampler_run_writes_no_bundle(model_runner, monkeypatch):
+    steps = _wire_mega_cache(model_runner, monkeypatch)
+
+    def failing_sampler(**kwargs):
+        raise RuntimeError("compile failed")
+
+    monkeypatch.setattr(model_runner, "sampler", failing_sampler)
+
+    with pytest.raises(RuntimeError, match="compile failed"):
+        model_runner.dummy_sampler_run()
+    assert [step[0] for step in steps] == ["load"]
+
+
+def _prepare_sampler_with_buckets(model_runner, monkeypatch, bucket_sizes):
+    monkeypatch.setattr(
+        RBLNOptimumModelRunner,
+        "get_bucket_sizes",
+        staticmethod(lambda max_num_seqs: list(bucket_sizes)),
+    )
+    # The pooled logits are (bucket, vocab); keep them small for many buckets.
+    monkeypatch.setattr(model_runner.model_config, "get_vocab_size", lambda: 8)
+    model_runner.prepare_rbln_sampler()
+
+
+def test_prepare_rbln_sampler_fits_every_graph_under_both_recompile_limits(
+    model_runner, monkeypatch
+):
+    from vllm_rbln.v1.sample import SAMPLER_GRAPHS_PER_BATCH_SIZE
+
+    dynamo_config = torch._dynamo.config
+    monkeypatch.setattr(dynamo_config, "recompile_limit", 8)
+    monkeypatch.setattr(dynamo_config, "accumulated_recompile_limit", 256)
+    # Enough batch sizes that the sampler graphs alone exceed the default
+    # process-wide limit.
+    bucket_sizes = range(1, 256 // SAMPLER_GRAPHS_PER_BATCH_SIZE + 2)
+
+    _prepare_sampler_with_buckets(model_runner, monkeypatch, bucket_sizes)
+
+    num_graphs = SAMPLER_GRAPHS_PER_BATCH_SIZE * len(bucket_sizes)
+    assert num_graphs > 256
+    assert dynamo_config.recompile_limit >= num_graphs
+    assert dynamo_config.accumulated_recompile_limit >= num_graphs
+
+
+def test_prepare_rbln_sampler_never_lowers_recompile_limits(model_runner, monkeypatch):
+    dynamo_config = torch._dynamo.config
+    monkeypatch.setattr(dynamo_config, "recompile_limit", 1000)
+    monkeypatch.setattr(dynamo_config, "accumulated_recompile_limit", 2000)
+
+    _prepare_sampler_with_buckets(model_runner, monkeypatch, [1, 2, 4, 8])
+
+    assert dynamo_config.recompile_limit == 1000
+    assert dynamo_config.accumulated_recompile_limit == 2000
