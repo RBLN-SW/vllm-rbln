@@ -188,7 +188,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             # identity: past that the two lengths are not the same unit.
             if remote_info.remote_physical_blocks_per_logical == 1:
                 meta.local_physical_block_ids = self._trim_to_consumer_blocks(
-                    meta.local_physical_block_ids, meta.remote.block_ids
+                    meta.local_physical_block_ids,
+                    meta.remote.block_ids,
+                    engine_id,
+                    meta.remote.request_id,
                 )
             return super()._xfer_blocks_for_req(req_id, meta)
 
@@ -211,7 +214,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         )
 
         local_block_ids = self._trim_to_consumer_blocks(
-            local_block_ids, remote_block_ids
+            local_block_ids, remote_block_ids, engine_id, meta.remote.request_id
         )
         n_write_blocks = sum(len(g) for g in local_block_ids)
         if not n_write_blocks:
@@ -277,7 +280,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
     @staticmethod
     def _trim_to_consumer_blocks(
-        local_block_ids: BlockIds, remote_block_ids: BlockIds
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        engine_id: str,
+        req_id: str,
     ) -> BlockIds:
         """Drop from our side the blocks the consumer already had.
 
@@ -293,10 +299,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         local = list(local_block_ids)
         for i, remote_group in enumerate(remote_block_ids):
             num_remote = len(remote_group)
-            assert num_remote <= len(local[i]), (
-                f"group {i}: consumer registered {num_remote} blocks but this "
-                f"producer holds {len(local[i])}; the pair cannot be aligned"
-            )
+            if num_remote > len(local[i]):
+                raise RuntimeError(
+                    f"RBLN NIXL: consumer {engine_id} registered {num_remote} "
+                    f"block(s) for request {req_id} in group {i}, more than the "
+                    f"{len(local[i])} this producer holds; the peer's advertised "
+                    "length crosses the handshake, so the pair is refused rather "
+                    "than trimmed to it."
+                )
             if num_remote < len(local[i]):
                 local[i] = local[i][-num_remote:]
         return tuple(local)

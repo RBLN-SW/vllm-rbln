@@ -364,7 +364,7 @@ class TestPerShardWrite:
         # WRITE would be the alternative, and it is the peer that would then
         # wait on a notification for a transfer that carries no bytes.
         worker = self._writing_worker(ranks=1)
-        worker._trim_to_consumer_blocks = lambda local, remote: ((),)
+        worker._trim_to_consumer_blocks = lambda *_: ((),)
 
         worker._xfer_blocks_for_req("r0", self._meta(([1],), ([3],)))
 
@@ -375,13 +375,20 @@ class TestPerShardWrite:
 class TestTrimToConsumerBlocks:
     def test_more_blocks_than_the_consumer_registered_trims_the_head(self):
         trimmed = RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
-            ([1, 2, 3, 4],), ([7, 8],)
+            ([1, 2, 3, 4],), ([7, 8],), "eng0", "req0"
         )
         assert trimmed == ([3, 4],)
 
-    def test_a_consumer_asking_for_more_than_we_hold_is_an_error(self):
-        with pytest.raises(AssertionError, match="cannot be aligned"):
-            RblnNixlPushConnectorWorker._trim_to_consumer_blocks(([1],), ([7, 8],))
+    def test_a_consumer_asking_for_more_than_we_hold_is_refused(self):
+        # A peer's advertised length, so it is refused rather than asserted --
+        # and the message has to name the pair an operator has to go look at.
+        with pytest.raises(RuntimeError) as excinfo:
+            RblnNixlPushConnectorWorker._trim_to_consumer_blocks(
+                ([1],), ([7, 8],), "eng0", "req0"
+            )
+        msg = str(excinfo.value)
+        assert "eng0" in msg and "req0" in msg
+        assert "registered 2 block(s)" in msg and "the 1 this producer holds" in msg
 
 
 class TestWriterCountAccounting:
