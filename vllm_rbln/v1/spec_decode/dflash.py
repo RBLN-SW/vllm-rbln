@@ -57,6 +57,9 @@ class RBLNDFlashProposer(DFlashProposer):
     _determine_batch_execution_and_padding = (
         RBLNEagleProposer._determine_batch_execution_and_padding
     )
+    # Read by `_determine_batch_execution_and_padding`. `_require_dense_drafter`
+    # is what keeps it false.
+    draft_has_moe = False
 
     @staticmethod
     def _require_single_sequence(scheduler_config) -> None:
@@ -67,6 +70,17 @@ class RBLNDFlashProposer(DFlashProposer):
                 f"{scheduler_config.max_num_seqs}. A wider decode batch "
                 "silently collapses acceptance to below the no-speculation "
                 "baseline."
+            )
+
+    @staticmethod
+    def _require_dense_drafter(draft_model) -> None:
+        """Fused MoE reads the token dimension `_run_query_pass` does not pad."""
+        if any(isinstance(module, MoERunner) for module in draft_model.modules()):
+            raise NotImplementedError(
+                "The DFlash drafter cannot carry fused MoE on RBLN: the draft "
+                "pass runs at this rank's own token count rather than the "
+                "padded batch the DP ranks agreed on, so its expert dimension "
+                "would disagree with its peers' and hang the group."
             )
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
@@ -215,6 +229,7 @@ class RBLNDFlashProposer(DFlashProposer):
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
         self._check_rope_style(target_model)
+        self._require_dense_drafter(self.model)
 
         # Projection inputs are padded to one of two shapes so the region
         # compiles twice: one draft block per request in decode, one prefill
@@ -303,11 +318,6 @@ class RBLNDFlashProposer(DFlashProposer):
         )
         self.model_executable = compile(model_wrapper, **compile_kwargs)
         self._project_context_kv = compile(project_context_kv, **compile_kwargs)
-        # Whether a draft forward joins the DP all-gather; an idle rank may only
-        # skip drafting when it does not.
-        self.draft_has_moe = any(
-            isinstance(module, MoERunner) for module in self.model.modules()
-        )
 
     def _check_rope_style(self, target_model) -> None:
         """Refuse a drafter whose RoPE style differs from the target's.
@@ -354,13 +364,10 @@ class RBLNDFlashProposer(DFlashProposer):
         the query pass always runs one draft block per request.
         """
         status = self.runner.dp_status
-        if (
-            status is not None
-            and status.is_idle[self.dp_rank]
-            and not self.draft_has_moe
-        ):
-            # Same condition as the chained drafter: what this pass produces is
-            # discarded, and without fused MoE no busy rank waits on it.
+        if status is not None and status.is_idle[self.dp_rank]:
+            # What this pass produces is discarded, and the drafter runs no
+            # collective of its own -- `_require_dense_drafter` refuses the one
+            # thing that would give it one -- so no busy rank waits on it.
             return
 
         # 1) The projection. Both buckets, straight from the staging buffers --

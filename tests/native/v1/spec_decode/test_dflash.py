@@ -306,31 +306,21 @@ class TestPlatformRefusals:
             self._construct()
 
 
-class TestIdleSkip:
-    """A DP-idle rank may skip its draft only when the drafter runs no
-    collective of its own. Fused MoE is the one thing that would give it one,
-    and a busy rank would then block in a collective the idle rank never
-    joined -- so the skip is keyed off `draft_has_moe`, as it is for the
-    chained drafter."""
+class TestDenseDrafterGuard:
+    """A fused-MoE drafter is refused rather than run. The draft pass keeps only
+    `num_tokens_across_dp` and drops the padded batch the ranks agreed on, so
+    its expert dimension would not match its peers' and the group would hang --
+    a silent stall, not an error. With MoE refused, a DP-idle rank may skip its
+    draft unconditionally: the drafter runs no collective of its own."""
 
     @staticmethod
-    def _has_moe(modules):
-        """What `load_model` computes."""
-        return any(isinstance(module, dflash_module.MoERunner) for module in modules)
+    def _model(*modules):
+        return SimpleNamespace(modules=lambda: modules)
 
-    @staticmethod
-    def _skips(is_idle, draft_has_moe):
-        """The `dummy_run` guard."""
-        return is_idle and not draft_has_moe
+    def test_a_dense_drafter_is_allowed(self):
+        RBLNDFlashProposer._require_dense_drafter(self._model(object(), object()))
 
-    def test_a_dense_drafter_lets_an_idle_rank_skip(self):
-        assert not self._has_moe([object(), object()])
-        assert self._skips(is_idle=True, draft_has_moe=False)
-
-    def test_a_moe_drafter_keeps_an_idle_rank_drafting(self):
+    def test_a_moe_drafter_is_refused(self):
         moe = object.__new__(dflash_module.MoERunner)
-        assert self._has_moe([object(), moe])
-        assert not self._skips(is_idle=True, draft_has_moe=True)
-
-    def test_a_busy_rank_always_drafts(self):
-        assert not self._skips(is_idle=False, draft_has_moe=False)
+        with pytest.raises(NotImplementedError, match="fused MoE"):
+            RBLNDFlashProposer._require_dense_drafter(self._model(object(), moe))
