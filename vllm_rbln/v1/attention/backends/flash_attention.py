@@ -183,6 +183,7 @@ class RBLNFlashAttentionMetadataBuilder(
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
 
         self._staged: dict[tuple, torch.Tensor] = {}
+        self._draft_index = 0
 
     def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
         """Copy a host tensor into this builder's persistent device buffer.
@@ -191,14 +192,17 @@ class RBLNFlashAttentionMetadataBuilder(
         cache_offsets share both shape and dtype, so keying on those alone
         would silently make them share one buffer.
 
-        The returned tensor is overwritten by the next build() call, so the
-        caller must run the forward pass before building again. That holds
-        because each AttentionGroup owns its own builder instance and every
-        build() is immediately followed by a forward.
+        The buffer is also keyed on `draft_index`, so a caller may build every
+        draft step's metadata up front and hold all of them at once. Without
+        that the returned tensor is overwritten by the next build(), and the
+        caller has to interleave build and forward one step at a time -- which
+        puts the whole metadata build inside the draft loop. vllm-ascend keeps
+        the same per-step groups (`seq_lens_group[draft_index]`) for the same
+        reason.
         """
         if t is None:
             return None
-        key = (slot, t.shape, t.dtype)
+        key = (slot, self._draft_index, t.shape, t.dtype)
         if (buf := self._staged.get(key)) is None:
             buf = torch.empty(t.shape, dtype=t.dtype, device=self.device)
             self._staged[key] = buf
@@ -216,7 +220,9 @@ class RBLNFlashAttentionMetadataBuilder(
         positions: torch.Tensor,
         batch_pad: int,
         is_prefill: bool,
+        draft_index: int = 0,
     ) -> RBLNFlashAttentionMetadata:
+        self._draft_index = draft_index
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
         # to the device only when constructing RBLNFlashAttentionMetadata below.

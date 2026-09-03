@@ -326,20 +326,20 @@ class TestInitGuards:
 
 class TestToTargetTokenIds:
     def test_applies_d2t_as_an_offset(self):
-        # d2t holds offsets, not absolute target ids: id -> id + d2t[id]. Both
-        # operands sit on the proposer's device, so this is the gather production
-        # runs -- the reason the mapping moved out of the compiled graph.
+        # d2t holds offsets, not absolute target ids: id -> id + d2t[id]. The
+        # table is host-resident and the draft ids arrive on the device, which is
+        # the gather production runs -- the reason the mapping moved out of the
+        # compiled graph.
         proposer = make_eagle_proposer()
-        proposer.draft_id_to_target_id = torch.tensor(
-            [0, 2, 3, 5, 8], dtype=torch.long, device=proposer.device
-        )
+        proposer.draft_id_to_target_id = torch.tensor([0, 2, 3, 5, 8], dtype=torch.long)
         draft_ids = torch.tensor(
             [0, 1, 4, 2], dtype=torch.int64, device=proposer.device
         )
 
         out = proposer._to_target_token_ids(draft_ids)
 
-        assert out.cpu().tolist() == [0, 3, 12, 5]
+        assert out.device.type == "cpu"
+        assert out.tolist() == [0, 3, 12, 5]
 
     def test_matches_full_vocab_scatter_then_argmax(self):
         # Upstream widens the draft logits into the target vocabulary and
@@ -364,13 +364,13 @@ class TestToTargetTokenIds:
         )
         full_logits[:, target_ids] = draft_logits
         proposer = make_eagle_proposer()
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
 
         out = proposer._to_target_token_ids(
             draft_logits.argmax(dim=-1).to(proposer.device)
         )
 
-        assert out.cpu().tolist() == full_logits.argmax(dim=-1).tolist()
+        assert out.tolist() == full_logits.argmax(dim=-1).tolist()
 
 
 class TestPropose:
@@ -446,7 +446,7 @@ class TestPropose:
         proposer.model_executable = _fake_model_exec([42, 60], proposer.hidden_size)
         d2t = torch.zeros(128, dtype=torch.long)
         d2t[42], d2t[60] = 5, 7
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
 
         out = _call_propose(proposer)
 
@@ -461,7 +461,7 @@ class TestPropose:
         _wire_runner(proposer, num_reqs=2)
         d2t = torch.zeros(128, dtype=torch.long)
         d2t[1], d2t[2], d2t[3], d2t[4] = 2, 3, 5, 8
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
         argmax_per_call = [[1, 3], [2, 4]]
         seen: list[torch.Tensor] = []
 
@@ -658,17 +658,22 @@ class TestLoadModel:
         # selection -- only a real compile on the device reaches the SIGSEGV, so
         # this guards against someone routing back through compute_logits.
         d2t = torch.tensor([0, 2, 3], dtype=torch.long)
-        model = self._FakeMappedDraft(d2t)
-        self._stub_super_load_model(monkeypatch, model)
         proposer = make_eagle_proposer(num_speculative_tokens=1)
+        # The draft model holds the table wherever its weights live, which is
+        # what load_model has to lift off it.
+        model = self._FakeMappedDraft(d2t.to(proposer.device))
+        self._stub_super_load_model(monkeypatch, model)
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", True
         )
         proposer.load_model(target_model=object())
 
         # Taking that branch at all depends on load_model lifting d2t off the
-        # draft model, so this covers the capture too.
-        assert proposer.draft_id_to_target_id is d2t
+        # draft model, so this covers the capture too. It lands on the host: the
+        # gather is an integer op the eager device path does not take, and a
+        # device-resident table would be read back on every call.
+        assert proposer.draft_id_to_target_id.device.type == "cpu"
+        assert torch.equal(proposer.draft_id_to_target_id, d2t)
 
         h = proposer.hidden_size
         hidden = torch.arange(2 * 3 * h, dtype=torch.float32).view(2, 3, h)

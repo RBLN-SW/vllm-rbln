@@ -274,10 +274,13 @@ class TestPadDepad:
 
     def test_padded_metadata_breaks_the_eagle_reader_it_would_reach(self):
         # Why the pad lives in _sample, not in the producer: this reader
-        # differences cu_num_draft_tokens against num_reqs-sized tensors.
+        # differences cu_num_draft_tokens against num_reqs-sized tensors. The
+        # mismatch is what is under test, not which library reports it -- the
+        # helper computes in numpy, so a shape mismatch surfaces as ValueError
+        # where a torch expression would have raised RuntimeError.
         padded = _pad_spec_decode_metadata(_spec_decode_metadata([1, 1]), 4)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises((RuntimeError, ValueError)):
             eagle_prepare_inputs_padded(
                 padded.cu_num_draft_tokens,
                 torch.tensor([2, 2], dtype=torch.int32),
