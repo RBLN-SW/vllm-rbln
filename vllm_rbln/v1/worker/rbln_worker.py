@@ -1264,7 +1264,6 @@ class RBLNWorker(WorkerBase):
                     logger.debug(
                         "Starting torch profiler with tarce name: %s", trace_name
                     )
-                # vLLM's ProfilerKind cannot carry "rbln", so RBLN_PROFILER gates it.
                 elif profiler_type is None:
                     self.profiler = RblnProfilerWrapper(self.profiler_config)
                     logger.debug("Starting RBLN profiler on %s", rank_suffix)
