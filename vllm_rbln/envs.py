@@ -58,7 +58,6 @@ if TYPE_CHECKING:
     # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
-    VLLM_RBLN_NUM_RAY_NODES: int = 1
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
     # --- ATTENTION ---
@@ -279,10 +278,6 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # Number of Ray nodes
-    "VLLM_RBLN_NUM_RAY_NODES": lambda: int(
-        os.environ.get("VLLM_RBLN_NUM_RAY_NODES", 1)
-    ),
     # --- DYNAMIC KV CACHE ---
     # Size the KV cache from the compiled artifact instead of the estimate
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
@@ -417,7 +412,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         # sampler graphs compile with use_cache=False, never enter the bundle
         "VLLM_RBLN_SAMPLER",
         "VLLM_RBLN_COMPILE_STRICT_MODE",
-        "VLLM_RBLN_NUM_RAY_NODES",
         "VLLM_RBLN_ENABLE_WARM_UP",
         "VLLM_RBLN_METRICS",
         "VLLM_RBLN_METRICS_FILE",

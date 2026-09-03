@@ -120,7 +120,6 @@ def make_worker(monkeypatch):
         world_size_across_dp=None,
         assigned_physical_gpu_ids=None,
         num_devices=1,
-        num_ray_nodes=1,
         has_torch_rbln=False,
         device_name="RBLN-CA25",
         vllm_config=None,
@@ -159,7 +158,6 @@ def make_worker(monkeypatch):
         monkeypatch.setattr(
             wm.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", num_devices
         )
-        monkeypatch.setattr(wm.envs, "VLLM_RBLN_NUM_RAY_NODES", num_ray_nodes)
         monkeypatch.setattr(wm, "has_torch_rbln", has_torch_rbln)
         return RBLNWorker(
             vllm_config=vllm_config,
@@ -272,11 +270,6 @@ class TestInitDeviceEnv:
         os.environ["RBLN_VISIBLE_DEVICES"] = "0,1"
         with pytest.raises(ValueError, match="RBLN_VISIBLE_DEVICES='0,1'"):
             make_worker(world_size=4, local_rank=2)
-
-    def test_ray_nodes_divide_what_this_node_must_cover(self, make_worker):
-        os.environ["RBLN_VISIBLE_DEVICES"] = "0,1"
-        make_worker(world_size=4, num_ray_nodes=2, local_rank=1)
-        assert os.environ["RBLN_VISIBLE_DEVICES"] == "1"
 
     def test_non_integer_entry_raises(self, make_worker):
         os.environ["RBLN_VISIBLE_DEVICES"] = "a,b,c,d"

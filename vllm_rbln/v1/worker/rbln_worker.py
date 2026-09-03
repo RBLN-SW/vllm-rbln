@@ -212,9 +212,6 @@ class RBLNWorker(WorkerBase):
     def _init_device_env(self) -> None:
         env_var = current_platform.device_control_env_var
         num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
-        local_world_size = (
-            self.parallel_config.world_size // envs.VLLM_RBLN_NUM_RAY_NODES
-        )
 
         # UniProcExecutor never publishes the mapping, so publish it here rather
         # than only reading it.
@@ -222,24 +219,20 @@ class RBLNWorker(WorkerBase):
         if assigned and get_assigned_physical_gpu_ids() is None:
             set_assigned_physical_gpu_ids(assigned)
 
-        needed = local_world_size * num_devices
+        first = self.local_rank * num_devices
         try:
-            # The whole node's share, so a pool too small for it is reported by
-            # every rank rather than by whichever one runs off the end.
-            node_devices = [
-                current_platform.device_id_to_physical_device_id(index)
-                for index in range(needed)
+            selected = [
+                current_platform.device_id_to_physical_device_id(first + offset)
+                for offset in range(num_devices)
             ]
         except IndexError as e:
             raise ValueError(
-                f"this node needs {needed} NPU(s): local world size "
-                f"{local_world_size} x {num_devices} per rank, and "
-                f"{env_var}={os.environ.get(env_var, '')!r} does not hold that "
-                f"many. One entry per NPU is expected."
+                f"local rank {self.local_rank} needs {num_devices} NPU(s) from "
+                f"index {first} of {env_var}="
+                f"{os.environ.get(env_var, '')!r}, or of the data parallel "
+                f"mapping when one is in effect. One entry per NPU is expected."
             ) from e
 
-        first = self.local_rank * num_devices
-        selected = node_devices[first : first + num_devices]
         selected_devices = ",".join(str(device) for device in selected)
         os.environ[env_var] = selected_devices
         logger.info(
