@@ -1224,7 +1224,7 @@ class RBLNWorker(WorkerBase):
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
         if self.profiler_config is None or (
-            self.profiler_config.profiler is None and not rbln_profiler.is_enabled()
+            self.profiler_config.profiler is None and not rbln_profiler.is_activated()
         ):
             raise RuntimeError(
                 "Profiling is not enabled. Please set --profiler-config to enable "
