@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -246,9 +247,12 @@ class TestGetKvCacheNames:
 
 
 class TestPrepareKernelBlockSizes:
-    def test_sliding_window_uses_window(self):
-        # RBLNSlidingWindowSpec group -> kernel block size is its sliding_window.
-        sw = RBLNSlidingWindowSpec(
+    @pytest.mark.parametrize("spec_cls", [SlidingWindowSpec, RBLNSlidingWindowSpec])
+    def test_sliding_window_uses_window(self, spec_cls):
+        # Either sliding-window spec -> kernel block size is its sliding_window,
+        # so the cache the kernel sees is the same on both paths. A backend is
+        # never consulted, hence the empty attention group.
+        sw = spec_cls(
             block_size=32,
             num_kv_heads=1,
             head_size=8,
