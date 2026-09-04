@@ -34,13 +34,13 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -805,7 +805,11 @@ def prepare_kernel_block_sizes(
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
-        if isinstance(kv_cache_spec, RBLNSlidingWindowSpec):
+        if isinstance(kv_cache_spec, SlidingWindowSpec):
+            # Both sliding-window kernels address the cache in windows rather
+            # than in the manager's blocks; upstream BlockTable splits each
+            # block into window-sized ones, and rejects a block the window does
+            # not divide.
             kernel_block_sizes.append(kv_cache_spec.sliding_window)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
