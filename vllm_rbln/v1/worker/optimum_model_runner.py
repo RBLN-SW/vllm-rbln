@@ -306,6 +306,11 @@ class RBLNOptimumModelRunner(
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
+        if isinstance(self.model, RBLNOptimumDecoderMixin):
+            assert self.model.kv_block_adapter is not None
+            self.available_blocks = torch.arange(
+                self.model.kv_block_adapter._estimated_num_blocks(), dtype=torch.int16
+            )
         assert self.model.dtype == self.dtype, (
             "Internal dtype mismatch: "
             f"runner dtype is {self.dtype!r}, but the compiled model dtype is "
@@ -511,17 +516,8 @@ class RBLNOptimumModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> tuple[ModelInputForRBLN, np.ndarray]:
-        """
-        :return: ModelInputForRBLN[
-            input_tokens: Token IDs,
-            input_positions: Position IDs,
-            sampling_metadata, pooling_metadata: It is `None` in V1,
-            multi_modal_kwargs: Batched multi-modal data,
-            block_tables: [num_reqs, num_blocks_per_req] shaped tensor,
-            running_requests_ids: RUNNING request IDs,
-            is_prompt: It is used only in V1
-        ]
-        """
+        """Build the graph-ready ModelInputForRBLN for this step (see its
+        docstring for the layout) and the per-request scheduled token counts."""
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -546,20 +542,10 @@ class RBLNOptimumModelRunner(
         ):
             is_prefill = True
 
-        partial_prefix = None
         if is_prefill:
-            (
-                input_ids,
-                positions,
-                block_tables,
-                multi_modal_kwargs,
-                running_request_ids,
-                partial_prefix,
-            ) = self._prepare_prefill(scheduler_output)
+            model_input = self._prepare_prefill(scheduler_output)
         else:
-            input_ids, positions, block_tables, running_request_ids = (
-                self._prepare_decode(scheduler_output)
-            )
+            model_input = self._prepare_decode(scheduler_output)
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -569,28 +555,6 @@ class RBLNOptimumModelRunner(
         self.seq_lens[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs]
             + num_scheduled_tokens_np[:num_reqs]
-        )
-
-        cache_slot_ids = torch.tensor(
-            [
-                scheduler_output.cache_slot_id_dict[req_id]
-                for req_id in running_request_ids
-            ],
-            dtype=torch.int16,
-        )
-
-        # TODO interemediate_tensor should be set
-        model_input = ModelInputForRBLN(
-            input_tokens=input_ids,
-            input_positions=positions,
-            multi_modal_kwargs=multi_modal_kwargs if is_prefill else None,
-            block_tables=block_tables,
-            cache_slot_ids=cache_slot_ids,
-            running_requests_ids=running_request_ids,
-            # FIXME unify the variable name is_prefill and is_prompt
-            is_prompt=is_prefill,
-            dummy_block=scheduler_output.dummy_block,
-            partial_prefix=partial_prefix,
         )
         return model_input, num_scheduled_tokens_np
 
@@ -622,16 +586,7 @@ class RBLNOptimumModelRunner(
     def _prepare_prefill(
         self,
         scheduler_output: "RBLNSchedulerOutput",
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        BatchedTensorInputs | None,
-        list[str],
-        PartialPrefixInfo | None,
-    ]:
-        running_request_ids = []
-
+    ) -> ModelInputForRBLN:
         num_blocks_per_req = self.input_batch.block_table.block_tables[
             0
         ].num_blocks_per_row
@@ -660,7 +615,6 @@ class RBLNOptimumModelRunner(
             )
 
         seq_len = len(prompt_tokens)
-        input_positions = list(range(seq_len))
         num_blocks = num_blocks_per_req[req_index]
         # Full prompt tokens before any prefix-cache trim; needed by MRoPE
         # models to recompute positions over the whole prompt on a partial hit.
@@ -679,7 +633,6 @@ class RBLNOptimumModelRunner(
             total_cached_length = sum(cached_length)
             if total_cached_length > 0:
                 prompt_tokens = prompt_tokens[total_cached_length:]
-                input_positions = input_positions[total_cached_length:]
                 assert len(prompt_tokens) > 0, (
                     "The prompt tokens is empty after removing the cached tokens."
                 )
@@ -695,59 +648,120 @@ class RBLNOptimumModelRunner(
                 block_table.tolist(),
             )
 
-        running_request_ids.append(req_id)
-
         batched_mm_inputs, partial_prefix = self._extract_prefill_mm_inputs(
             scheduler_output, total_cached_length, full_prompt_tokens
         )
 
-        input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
-        input_positions = torch.tensor(input_positions).unsqueeze(0)
-        block_table = block_table.unsqueeze(0)
-        return (
-            input_tokens,
-            input_positions,
-            block_table,
-            batched_mm_inputs,
-            running_request_ids,
-            partial_prefix,
+        return ModelInputForRBLN(
+            input_tokens=torch.tensor(prompt_tokens, dtype=torch.int64).unsqueeze(0),
+            input_positions=torch.arange(
+                total_cached_length, seq_len, dtype=torch.int32
+            ).unsqueeze(0),
+            block_tables=block_table.to(torch.int16),
+            running_requests_ids=[req_id],
+            padded_batch_size=1,
+            is_prompt=True,
+            multi_modal_kwargs=batched_mm_inputs,
+            dummy_block=scheduler_output.dummy_block,
+            cache_slot_ids=torch.tensor(
+                [scheduler_output.cache_slot_id_dict[req_id]], dtype=torch.int16
+            ),
+            partial_prefix=partial_prefix,
         )
 
     def _prepare_decode(
         self,
-        scheduler_output: "SchedulerOutput",
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
-        input_tokens: list[list[int]] = []
-        input_positions: list[list[int]] = []
-        block_tables_list = []
-        running_request_ids = []
+        scheduler_output: "RBLNSchedulerOutput",
+    ) -> ModelInputForRBLN:
+        """Lay the running requests out in the decoder's padded batch.
+
+        The model chooses the layout: running order at rows [0, num_reqs)
+        padded to its batch bucket, or (for graphs with per-row on-device
+        state) each request pinned to a row of the full decoder batch. Padding
+        rows point at the scheduler's scratch block, or at a block no request in
+        the batch uses, and at a cache slot no running request owns.
+        """
         block_tables_cpu = self.input_batch.block_table.block_tables[0].get_cpu_tensor()
         num_blocks_per_req = self.input_batch.block_table.block_tables[
             0
         ].num_blocks_per_row
 
         req_ids = self.input_batch.req_ids
+        num_reqs = len(req_ids)
+        tokens: list[int] = []
+        positions: list[int] = []
+        block_tables_list = []
         for req_id in req_ids:
             req_index = self.input_batch.req_id_to_index[req_id]
-            input_position = int(self.input_batch.num_computed_tokens_cpu[req_index])
-            input_tokens.append(
-                [self.input_batch.token_ids_cpu[req_index][input_position]]
-            )
-            input_positions.append([input_position])
-            num_blocks = num_blocks_per_req[req_index]
+            position = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            tokens.append(int(self.input_batch.token_ids_cpu[req_index][position]))
+            positions.append(position)
             if self.enable_prefix_caching:
                 block_tables_list.append(scheduler_output.block_table_dict[req_id])
             else:
-                block_table = block_tables_cpu[req_index]
-                block_table = self.mask_block_table(block_table, num_blocks)
-                block_tables_list.append(block_table)
-            running_request_ids.append(req_id)
-
-        input_tokens = torch.tensor(input_tokens)
-        input_positions = torch.tensor(input_positions)
+                block_tables_list.append(
+                    self.mask_block_table(
+                        block_tables_cpu[req_index], num_blocks_per_req[req_index]
+                    )
+                )
         block_tables = torch.stack(block_tables_list)
+        cache_slot_ids = torch.tensor(
+            [scheduler_output.cache_slot_id_dict[req_id] for req_id in req_ids],
+            dtype=torch.int16,
+        )
 
-        return input_tokens, input_positions, block_tables, running_request_ids
+        batch_rows = self.model.decode_batch_rows(cache_slot_ids, block_tables)
+        rows: torch.Tensor | slice
+        if batch_rows is None:
+            padded_batch_size = self.model.decode_padded_batch_size(num_reqs)
+            rows = slice(0, num_reqs)
+        else:
+            padded_batch_size = self.model.decoder_batch_size
+            rows = batch_rows
+
+        input_tokens = torch.zeros(padded_batch_size, 1, dtype=torch.int64)
+        input_tokens[rows, 0] = torch.tensor(tokens, dtype=torch.int64)
+        input_positions = torch.zeros(padded_batch_size, 1, dtype=torch.int32)
+        input_positions[rows, 0] = torch.tensor(positions, dtype=torch.int32)
+
+        num_blocks = block_tables.shape[1]
+        if padded_batch_size > num_reqs:
+            pad_block = scheduler_output.dummy_block
+            if pad_block is None:
+                # Every running request is in this batch, so a block absent
+                # from its tables is free to take the padding rows' K/V writes.
+                pad_block = int(
+                    self.available_blocks[
+                        ~torch.isin(self.available_blocks, block_tables.flatten())
+                    ][0]
+                )
+            padded_block_tables = torch.full(
+                (padded_batch_size, num_blocks), pad_block, dtype=torch.int16
+            )
+        else:
+            padded_block_tables = torch.empty(
+                (padded_batch_size, num_blocks), dtype=torch.int16
+            )
+        padded_block_tables[rows] = block_tables.to(torch.int16)
+
+        used_slots = set(cache_slot_ids.tolist())
+        pad_slot = next((i for i in range(padded_batch_size) if i not in used_slots), 0)
+        padded_cache_slot_ids = torch.full(
+            (padded_batch_size, 1), pad_slot, dtype=torch.int16
+        )
+        padded_cache_slot_ids[rows] = cache_slot_ids.unsqueeze(1)
+
+        return ModelInputForRBLN(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            block_tables=padded_block_tables,
+            running_requests_ids=list(req_ids),
+            padded_batch_size=padded_batch_size,
+            is_prompt=False,
+            dummy_block=scheduler_output.dummy_block,
+            batch_rows=batch_rows,
+            cache_slot_ids=padded_cache_slot_ids,
+        )
 
     def _extract_prefill_mm_inputs(
         self,

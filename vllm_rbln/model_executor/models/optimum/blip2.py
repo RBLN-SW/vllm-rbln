@@ -56,42 +56,25 @@ class RBLNOptimumBlip2ForConditionalGeneration(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
-
-        is_prompt = model_input.is_prompt
-
-        request_nums = input_ids.shape[0]
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-
-        if is_prompt:
-            block_tables = kwargs.pop("block_tables")
-            cache_position = kwargs.pop("cache_position")
-
-            inputs_embeds = model_input.inputs_embeds
-            logits = self.model.language_model.prefill_decoder(
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                block_tables=block_tables,
+        if model_input.is_prompt:
+            return self.model.language_model.prefill_decoder(
+                inputs_embeds=model_input.inputs_embeds,
+                cache_position=model_input.input_positions,
+                block_tables=model_input.block_tables,
             ).logits
-        else:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-            self.model.language_model.decoder = self.model.language_model.decoders[
-                padded_batch_size
-            ]
 
-            logits = self.model.language_model.decoder(**kwargs).logits
-        if not is_prompt:
-            logits = logits[:request_nums]
-        return logits
+        self.model.language_model.decoder = self.model.language_model.decoders[
+            model_input.padded_batch_size
+        ]
+        logits = self.model.language_model.decoder(
+            input_ids=model_input.input_tokens,
+            cache_position=model_input.input_positions,
+            block_tables=model_input.block_tables,
+        ).logits
+        return logits[: len(model_input.running_requests_ids)]
 
     def get_language_model(self):
         return self.model.language_model

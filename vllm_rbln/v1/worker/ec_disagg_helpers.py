@@ -148,20 +148,10 @@ class ECDisaggHelpersMixin:
                 )
             cached_mm_outputs.append(self.encoder_cache[mm_hash])
 
-        input_ids = model_input.input_tokens
-        kwargs = self.model.preprocess_for_decoder(
-            True,
-            model_input.block_tables,
-            input_ids,
-            model_input.input_positions,
-        )
-        cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
-
         prefill_params = self.model.build_prefill_inputs_from_cache(
-            input_ids,
+            model_input.input_tokens,
             cached_mm_outputs,
-            cache_position=cache_position,
+            cache_position=model_input.input_positions,
             running_requests_ids=model_input.running_requests_ids,
             mrope_position_deltas=self.mrope_position_deltas,
             # Needed for partial prefix-cache hits: carries partial_prefix so the
@@ -175,7 +165,7 @@ class ECDisaggHelpersMixin:
         language_model = self.model.get_language_model()
         logits = language_model.prefill_decoder(
             **prefill_params,
-            block_tables=block_tables,
+            block_tables=model_input.block_tables,
         ).logits
         return logits
 

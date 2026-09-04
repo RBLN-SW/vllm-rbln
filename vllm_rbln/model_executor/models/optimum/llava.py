@@ -56,7 +56,6 @@ class RBLNOptimumLlavaForConditionalGeneration(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
     def _forward(
@@ -92,38 +91,22 @@ class RBLNOptimumLlavaForConditionalGeneration(
         return logits
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
-
         is_prompt = model_input.is_prompt
-
-        request_nums = input_ids.shape[0]
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-        input_ids = kwargs.pop("input_ids")
-        cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
         if not is_prompt:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
             self.model.language_model.decoder = self.model.language_model.decoders[
-                padded_batch_size
+                model_input.padded_batch_size
             ]
-
-        inputs_embeds = model_input.inputs_embeds if is_prompt else None
 
         logits = self._forward(
             is_prefill=is_prompt,
-            block_tables=block_tables,
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
+            block_tables=model_input.block_tables,
+            input_ids=model_input.input_tokens,
+            inputs_embeds=model_input.inputs_embeds if is_prompt else None,
+            cache_position=model_input.input_positions,
         )
 
         if not is_prompt:
-            logits = logits[:request_nums]
+            logits = logits[: len(model_input.running_requests_ids)]
         return logits
 
     def get_language_model(self):

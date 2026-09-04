@@ -204,17 +204,19 @@ class RBLNOptimumWhisperForConditionalGeneration(
             use_multiple_decoder=False,
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=[self.batch_size],
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
         self.dec_max_seq_len = self.model_config.max_model_len
         self.dec_lengths = [0] * self.batch_size
 
+    def decode_batch_rows(
+        self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
+    ) -> torch.Tensor:
+        # The decoder KV cache holds one block per batch row, so a request's
+        # block id is its row.
+        return block_tables.flatten().to(torch.long)
+
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        block_tables = model_input.block_tables
-        request_nums = input_ids.shape[0]
         is_prompt = model_input.is_prompt
-        valid_block_ids = block_tables.flatten().to(torch.int32)
 
         if is_prompt:
             if model_input.multi_modal_kwargs:
@@ -226,7 +228,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 raise ValueError("Whisper requires `input_features` as an input.")
             _ = self.model.encoder(
                 input_features=input_features,
-                block_tables=block_tables.squeeze(0).to(torch.int16),
+                block_tables=model_input.block_tables,
             )
 
         # Whisper model does not support bucketing.
@@ -234,12 +236,12 @@ class RBLNOptimumWhisperForConditionalGeneration(
             self.batch_size, self.dec_max_seq_len, dtype=self.dtype
         )
         if is_prompt:
-            # valid_block_ids has length 1 in prefill.
-            assert valid_block_ids.shape[0] == 1, (
+            assert model_input.block_tables.shape[0] == 1, (
                 "Whisper only supports batch_size=1 in prefill step."
             )
-            batch_idx = valid_block_ids[0]
-            token_sequence = input_ids[0].tolist()
+            valid_block_ids = model_input.block_tables.to(torch.long)
+            batch_idx = int(valid_block_ids[0])
+            token_sequence = model_input.input_tokens[0].tolist()
             step_decoder_input_ids = torch.zeros(self.batch_size, 1, dtype=torch.long)
             # The decoder runtime is compiled at self.batch_size, so prefill
             # must still feed every slot. Point unused slots at a scratch
@@ -280,19 +282,12 @@ class RBLNOptimumWhisperForConditionalGeneration(
             self.dec_lengths[batch_idx] = len(token_sequence)
 
         else:
-            cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
-            kwargs = self.preprocess_for_decoder(
-                is_prompt=False,
-                block_tables=block_tables,
-                input_ids=input_ids,
-                cache_position=cache_position,
-                input_block_ids=valid_block_ids,
-                dummy_block=model_input.dummy_block,
+            valid_block_ids = model_input.batch_rows
+            assert valid_block_ids is not None
+            # Whisper tracks decoder positions itself in dec_lengths.
+            decoder_cache_position = torch.zeros(
+                model_input.padded_batch_size, 1, dtype=torch.int32
             )
-            decoder_cache_position = kwargs.pop("cache_position")
-            decoder_block_tables = kwargs.pop("block_tables")
-            decoder_input_ids = kwargs.pop("input_ids")
-            # Generate cache_position using dec_lengths
             for batch_idx in valid_block_ids:
                 decoder_cache_position[batch_idx] = self.dec_lengths[batch_idx]
                 decoder_attention_mask[
@@ -300,10 +295,10 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 ] = 1
                 self.dec_lengths[batch_idx] += 1
             decoder_output = self.model.decoder(
-                decoder_input_ids=decoder_input_ids.contiguous(),
+                decoder_input_ids=model_input.input_tokens.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
                 cache_position=decoder_cache_position,
-                block_tables=decoder_block_tables,
+                block_tables=model_input.block_tables,
             )
 
         lm_logits = decoder_output.logits

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -249,7 +250,7 @@ def test_update_states_request_unscheduled(model_runner):
     # scheduling new request(req1)
     # prevent req0 from being scheduled
     scheduler_output = _schedule_new_request(
-        new_req_id, block_ids=([1],), outer_block_ids=torch.tensor([[1]])
+        new_req_id, block_ids=([1],), outer_block_ids=[1]
     )
 
     metadata_before = model_runner._update_states(scheduler_output)
@@ -260,3 +261,79 @@ def test_update_states_request_unscheduled(model_runner):
 
     assert _is_req_added(model_runner, new_req_id)
     assert _is_req_scheduled(model_runner, new_req_id)
+
+
+def _decode_step(req_ids: list[str], cache_slot_ids: list[int], dummy_block=None):
+    # Only the scheduler fields _prepare_decode reads.
+    return SimpleNamespace(
+        block_table_dict={
+            req_id: torch.tensor([index + 1]) for index, req_id in enumerate(req_ids)
+        },
+        cache_slot_id_dict=dict(zip(req_ids, cache_slot_ids)),
+        dummy_block=dummy_block,
+    )
+
+
+def _two_running_requests(model_runner):
+    model_runner._update_states(
+        _schedule_new_request("r0", "r1", block_ids=([1],), outer_block_ids=[0])
+    )
+    # Advance r1 so the two rows differ: r1 decodes token 3 at position 2.
+    r1 = model_runner.input_batch.req_id_to_index["r1"]
+    model_runner.input_batch.num_computed_tokens_cpu[r1] = 2
+
+
+def test_prepare_decode_pads_running_order_to_the_decoder_batch(model_runner):
+    _two_running_requests(model_runner)
+    batch = model_runner.model.decoder_batch_size
+
+    model_input = model_runner._prepare_decode(_decode_step(["r0", "r1"], [0, 3]))
+
+    assert model_input.padded_batch_size == batch
+    assert model_input.batch_rows is None
+    assert model_input.input_tokens.dtype == torch.int64
+    assert model_input.input_tokens[:2, 0].tolist() == [1, 3]
+    assert model_input.input_positions.dtype == torch.int32
+    assert model_input.input_positions[:2, 0].tolist() == [0, 2]
+    assert model_input.block_tables.dtype == torch.int16
+    assert model_input.block_tables.shape[0] == batch
+    # Padding rows share one block that no running request uses...
+    real_blocks = model_input.block_tables[:2]
+    pad_blocks = model_input.block_tables[2:]
+    assert (pad_blocks == pad_blocks[0, 0]).all()
+    assert not torch.isin(pad_blocks, real_blocks).any()
+    # ...and a cache slot that no running request owns.
+    slots = model_input.cache_slot_ids
+    assert slots.shape == (batch, 1) and slots.dtype == torch.int16
+    assert slots[:2, 0].tolist() == [0, 3]
+    assert not torch.isin(slots[2:], slots[:2]).any()
+
+
+def test_prepare_decode_pads_with_the_scheduler_scratch_block(model_runner):
+    _two_running_requests(model_runner)
+
+    model_input = model_runner._prepare_decode(
+        _decode_step(["r0", "r1"], [0, 1], dummy_block=7)
+    )
+
+    assert (model_input.block_tables[2:] == 7).all()
+
+
+def test_prepare_decode_pins_rows_the_model_names(model_runner):
+    _two_running_requests(model_runner)
+    # A model with per-row on-device state pins each request to its cache slot.
+    model_runner.model.decode_batch_rows = lambda slots, block_tables: slots.to(
+        torch.long
+    )
+
+    model_input = model_runner._prepare_decode(_decode_step(["r0", "r1"], [3, 0]))
+
+    assert model_input.batch_rows.tolist() == [3, 0]
+    assert model_input.padded_batch_size == model_runner.model.decoder_batch_size
+    # r0 lands on row 3 and r1 on row 0; the other rows are padding.
+    assert model_input.input_tokens[3, 0] == 1 and model_input.input_tokens[0, 0] == 3
+    assert model_input.input_positions[3, 0] == 0
+    assert model_input.input_positions[0, 0] == 2
+    assert model_input.cache_slot_ids[3, 0] == 3
+    assert model_input.cache_slot_ids[0, 0] == 0
+    assert model_input.block_tables[3, 0] != model_input.block_tables[1, 0]

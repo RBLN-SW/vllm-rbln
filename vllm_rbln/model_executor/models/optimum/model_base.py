@@ -290,7 +290,6 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         use_multiple_decoder: bool,
         default_batch_size: int,
         decoder_batch_sizes: list[int],
-        num_blocks: int,
     ):
         self.attn_impl = attn_impl
         self.use_multiple_decoder = use_multiple_decoder
@@ -300,134 +299,23 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             self.decoder_batch_sizes = tuple(reversed(decoder_batch_sizes))
 
         self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
-        self.available_blocks = torch.arange(
-            0,
-            num_blocks,
-            dtype=torch.int16,
-        )
 
-    def pad_decoder_items(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        block_tables: torch.Tensor,
-        input_block_ids: torch.Tensor | None = None,
-        padded_batch_size: int | None = None,
-        dummy_block: int | None = None,
-    ):
-        assert input_ids.shape[1] == 1
-        if input_block_ids is None and padded_batch_size is None:
-            raise ValueError(
-                "Either input_block_ids or padded_batch_size must be provided."
-            )
-        elif input_block_ids is not None and padded_batch_size is not None:
-            raise ValueError(
-                "Cannot provide both input_block_ids and padded_batch_size."
-            )
+    def decode_batch_rows(
+        self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Row of each running request in the padded decode batch, or None to
+        lay the requests out in running order at rows [0, num_reqs).
 
-        if padded_batch_size is None:
-            padded_batch_size = self.decoder_batch_size
-
-        original_batch_size = input_ids.shape[0]
-
-        padded_input_ids = torch.zeros(padded_batch_size, 1, dtype=input_ids.dtype)
-        padded_position_ids = torch.zeros(padded_batch_size, 1, dtype=positions.dtype)
-        padded_block_tables = torch.zeros(
-            padded_batch_size, block_tables.shape[1], dtype=block_tables.dtype
-        ).fill_(-1)
-
-        mask = torch.ones_like(
-            padded_block_tables,
-            dtype=torch.bool,
-            device=block_tables.device,
-        )
-
-        if input_block_ids is None:
-            padded_input_ids[:original_batch_size] = input_ids
-            padded_position_ids[:original_batch_size] = positions
-            padded_block_tables[:original_batch_size] = block_tables
-            mask[:original_batch_size, :] = False
-        else:
-            padded_input_ids[input_block_ids] = input_ids
-            padded_position_ids[input_block_ids] = positions
-            padded_block_tables[input_block_ids] = block_tables
-            mask[input_block_ids, :] = False
-
-        if torch.any(mask):
-            if dummy_block is not None:
-                padding_blocks = torch.tensor([dummy_block], dtype=block_tables.dtype)
-            else:
-                padding_blocks = self.available_blocks[
-                    ~torch.isin(self.available_blocks, block_tables.flatten())
-                ]
-            padded_block_tables[mask] = padding_blocks[0]
-        return padded_input_ids, padded_position_ids, padded_block_tables
-
-    def preprocess_for_decoder(
-        self,
-        is_prompt: bool,
-        block_tables: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        cache_position: torch.Tensor | None = None,
-        input_block_ids: list[int] | None = None,
-        dummy_block: int | None = None,
-    ):
-        padded_batch_size = None
-        # 1. Set the type
-        # TODO: Does it require changing the dtype dynamically?
-        input_ids = input_ids.to(torch.int64) if input_ids is not None else None
-        cache_position = (
-            cache_position.to(torch.int32) if cache_position is not None else None
-        )
-        block_tables = block_tables.to(torch.int16)
-
-        # 2. Adjust the shape of tensors by squeezing and padding
-        if is_prompt:
-            block_tables = block_tables.squeeze(0)
-            padded_batch_size = 1
-        else:
-            if input_block_ids is None:
-                padded_batch_size = self.decoder_batch_size
-                if input_ids is not None:
-                    request_nums = input_ids.shape[0]
-                # Select lower-bounded batch size in case of multiple decoders
-                if self.use_multiple_decoder:
-                    padded_batch_size = select_bucket_size(
-                        request_nums, self.decoder_batch_sizes
-                    )
-
-            input_ids, cache_position, block_tables = self.pad_decoder_items(
-                input_ids,
-                cache_position,
-                block_tables,
-                input_block_ids=input_block_ids,
-                padded_batch_size=padded_batch_size,
-                dummy_block=dummy_block,
-            )
-        kwargs = {
-            "block_tables": block_tables,
-            "padded_batch_size": padded_batch_size,
-            "input_ids": input_ids,
-            "cache_position": cache_position,
-        }
-        return kwargs
-
-    @staticmethod
-    def pad_cache_slot_ids(
-        cache_slot_ids: torch.Tensor,
-        padded_batch_size: int,
-    ) -> torch.Tensor:
-        """Pad the decode cache slot ids to [padded_batch_size, 1].
-
-        Padding rows must not alias a scheduled request's row in the
-        per-sequence cache, so the pad value is the lowest id no scheduled
-        request owns (0 when the batch is full and no padding row exists).
+        A model whose graph keeps per-row on-device state overrides this to pin
+        each request to its row; the runner then pads to the decoder's full
+        batch and scatters the inputs to those rows.
         """
-        used_ids = set(cache_slot_ids.tolist())
-        pad_value = next((i for i in range(padded_batch_size) if i not in used_ids), 0)
-        padded = torch.full((padded_batch_size, 1), pad_value, dtype=torch.int16)
-        padded[: cache_slot_ids.shape[0], 0] = cache_slot_ids
-        return padded
+        return None
+
+    def decode_padded_batch_size(self, num_reqs: int) -> int:
+        if self.use_multiple_decoder:
+            return select_bucket_size(num_reqs, self.decoder_batch_sizes)
+        return self.decoder_batch_size
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder
@@ -447,7 +335,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         Args:
             cached_block_tables: Source block IDs to copy from.
             cached_lengths: Cached length for each source block.
-            block_tables: Tensor whose first row holds the destination block IDs.
+            block_tables: Destination block IDs of the request.
         """
         if not cached_block_tables:
             return
@@ -461,7 +349,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
 
         prefill_decoder = self.get_prefill_decoder()
         # Convert to list once for efficiency
-        dst_blocks = block_tables[0].tolist()
+        dst_blocks = block_tables.tolist()
 
         for block_idx, (src_block, dst_block) in enumerate(
             zip(cached_block_tables, dst_blocks)
@@ -526,8 +414,9 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         multimodal_embeddings = self.embed_multimodal(
             **(model_input.multi_modal_kwargs or {})
         )
-        input_ids = model_input.input_tokens.to(torch.int64)
-        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
+        inputs_embeds = self.embed_input_ids(
+            model_input.input_tokens, multimodal_embeddings
+        )
         return replace(model_input, inputs_embeds=inputs_embeds)
 
     def _build_partial_prefill_forward_inputs(
@@ -542,8 +431,9 @@ class RBLNOptimumMultimodalMixin(SupportsMultiModal):
         multimodal_embeddings = self._build_partial_mm_embeds(
             model_input.partial_prefix, multimodal_embeddings
         )
-        input_ids = model_input.input_tokens.to(torch.int64)
-        inputs_embeds = self.embed_input_ids(input_ids, multimodal_embeddings)
+        inputs_embeds = self.embed_input_ids(
+            model_input.input_tokens, multimodal_embeddings
+        )
         return replace(model_input, inputs_embeds=inputs_embeds)
 
     def compute_decode_position_embed(
