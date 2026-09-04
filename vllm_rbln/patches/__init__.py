@@ -31,6 +31,7 @@ from . import (
     deepseek_v2,
     distributed_utils,
     dynamic_kv,
+    engine_core,
     fp8_moe_method,
     gpt_oss,
     gpt_oss_mxfp4_config,
