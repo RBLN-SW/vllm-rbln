@@ -30,13 +30,13 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
 import vllm_rbln.v1.worker.utils as worker_utils
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.utils import (
     REBEL_DRAM_NBYTES,
     chiplet_replication_factor,
@@ -246,17 +246,6 @@ class TestGetKvCacheNames:
 
 
 class TestPrepareKernelBlockSizes:
-    def test_sliding_window_uses_window(self):
-        # RBLNSlidingWindowSpec group -> kernel block size is its sliding_window.
-        sw = RBLNSlidingWindowSpec(
-            block_size=32,
-            num_kv_heads=1,
-            head_size=8,
-            dtype=torch.float16,
-            sliding_window=16,
-        )
-        assert prepare_kernel_block_sizes(_kv_config(sw), [[]]) == [16]
-
     def test_attention_uses_select_common_block_size(self):
         # AttentionSpec group -> select_common_block_size splits 32 to a backend-
         # supported 16.
@@ -296,7 +285,7 @@ class TestPrepareKernelBlockSizes:
 
     def test_mixed_groups_ordered(self):
         # Several groups -> block sizes returned in group order.
-        sw = RBLNSlidingWindowSpec(
+        sw = SlidingWindowSpec(
             block_size=32,
             num_kv_heads=1,
             head_size=8,
@@ -306,9 +295,13 @@ class TestPrepareKernelBlockSizes:
         mamba = MambaSpec(block_size=8, shapes=((64,),), dtypes=(torch.float16,))
         result = prepare_kernel_block_sizes(
             _kv_config(sw, mamba, _full_attn(64)),
-            [[], [], [SimpleNamespace(backend=_backend([64]))]],
+            [
+                [SimpleNamespace(backend=_backend([32]))],
+                [],
+                [SimpleNamespace(backend=_backend([64]))],
+            ],
         )
-        assert result == [16, 8, 64]
+        assert result == [32, 8, 64]
 
 
 def _input_batch(num_reqs=4):
