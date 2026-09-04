@@ -13,11 +13,14 @@
 # limitations under the License.
 
 
+from dataclasses import fields
+
 import pytest
 import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.envs as envs
+import vllm_rbln.v1.attention.backends.flash_attention as flash_attention
 from tests.native.v1.attention.utils import (
     make_builder,
     make_common_attn_metadata,
@@ -132,36 +135,8 @@ class TestFlashAttentionMetadataPostInit:
         assert _metadata().seq_lens.dtype == torch.int64
 
     def test_custom_kernel_on_casts_seq_lens_to_int32(self, custom_kernel_on):
-        # The custom-kernel path casts seq_lens; absent cache tensors stay None.
-        md = _metadata()
-        assert md.seq_lens.dtype == torch.int32
-        assert md.cache_seq_lens is None
-        assert md.cache_offsets is None
-
-    # cache_seq_lens and cache_offsets share the exact same (buggy) handling, so
-    # every case runs against both to catch a fix/regression applied to only one.
-    CACHE_FIELDS = ["cache_seq_lens", "cache_offsets"]
-
-    @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_multielement_cache_field_raises_ambiguous(self, custom_kernel_on, field):
-        # KNOWN BUG pinned: `if self.<field>` on a multi-element tensor raises.
-        # The real SWA/decode path emits [batch, 1], so it fires at batch >= 2.
-        with pytest.raises(RuntimeError, match="ambiguous"):
-            _metadata(**{field: torch.tensor([[1], [2]], dtype=torch.int64)})
-
-    @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_single_zero_cache_field_is_silently_dropped(self, custom_kernel_on, field):
-        # TODO(RBLN): KNOWN BUG pinned — a 1-element tensor of value 0 is falsy,
-        # so a valid all-zero value is discarded to None instead of cast.
-        md = _metadata(**{field: torch.tensor([[0]], dtype=torch.int64)})
-        assert getattr(md, field) is None
-
-    @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_single_nonzero_cache_field_is_cast(self, custom_kernel_on, field):
-        # The only shape that survives correctly: 1 element, != 0.
-        md = _metadata(**{field: torch.tensor([[3]], dtype=torch.int64)})
-        assert getattr(md, field) is not None
-        assert getattr(md, field).dtype == torch.int32
+        # The custom-kernel path casts seq_lens.
+        assert _metadata().seq_lens.dtype == torch.int32
 
 
 class TestMetadataBuilderConstants:
@@ -214,7 +189,6 @@ class TestBuildPrefillCausal:
         assert md.attn_masks is None
         assert md.block_tables.tolist() == [7, 8, 9]  # block_table_tensor[0], 1D
         assert md.seq_lens.reshape(-1).tolist() == [0]  # seq_idx, unpadded
-        assert md.cache_seq_lens is None and md.swa_attn_masks is None
 
 
 class TestBuildPrefillNonCausal:
@@ -320,91 +294,26 @@ class TestBuildDecodeNonCausal:
         assert torch.equal(mask.float(), expected)
 
 
-class TestBuildSlidingWindowPrefill:
-    @pytest.mark.parametrize(
-        "seq_len, exp_cache, exp_offset",
-        [(10, 4, 8), (5, 1, 5), (8, 4, 8)],  # clamped, unclamped, boundary
-    )
-    def test_cache_seq_lens_and_offsets(self, cfg, seq_len, exp_cache, exp_offset):
-        # cache_seq_lens = clamp(num_computed, window); cache_offsets adds
-        # query_lens; local_block_tables is the first block; no SWA/attn mask.
-        window = 4
-        builder = make_builder(cfg, sliding_window=window)  # causal
-        md = builder.build(
-            _cam(
-                num_reqs=1,
-                query_start_loc=[0, 4],  # query_len 4 -> num_computed = seq_len - 4
-                seq_lens=[seq_len],
-                block_table=[[7, 8, 9]],
-            ),
-            torch.arange(4),
-            batch_pad=1,
-            is_prefill=True,
+class TestBuildSlidingWindow:
+    def test_builds_what_a_full_attention_group_builds(self, cfg):
+        # The window is resolved inside the op, so nothing the builder emits
+        # depends on it: seq_idx stays absolute and the whole block table
+        # travels, exactly as for a full-attention group.
+        cam = _cam(
+            num_reqs=1, query_start_loc=[0, 1], seq_lens=[7], block_table=[[5, 6]]
         )
-        assert md.cache_seq_lens.reshape(-1).tolist() == [exp_cache]
-        assert md.cache_offsets.reshape(-1).tolist() == [exp_offset]
-        assert md.local_block_tables.reshape(-1).tolist() == [7]  # block[..., :1]
-        assert md.swa_attn_masks is None  # prefill
-        assert md.attn_masks is None  # causal
+        args = (cam, torch.arange(10))
+        kwargs = dict(batch_pad=2, is_prefill=False)
+        swa = make_builder(cfg, sliding_window=4).build(*args, **kwargs)
+        full = make_builder(cfg).build(*args, **kwargs)
 
-    def test_noncausal_still_sets_swa_fields(self, cfg, monkeypatch):
-        # SWA block is independent of is_causal: chunked mask AND SWA fields set.
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
-        builder = make_builder(cfg, sliding_window=4)
-        md = builder.build(
-            _cam(num_reqs=1, query_start_loc=[0, 4], seq_lens=[10], block_table=[[7]]),
-            torch.arange(4),
-            batch_pad=1,
-            is_prefill=True,
-        )
-        assert md.attn_masks is not None
-        assert md.cache_seq_lens is not None
-
-    def test_respects_num_reqs_slice(self, cfg):
-        # Only seq_lens[:num_reqs] feeds the SWA fields: req0 clamps to 1 while
-        # req1 would clamp to 4, so the value identifies which was used.
-        builder = make_builder(cfg, sliding_window=4)
-        md = builder.build(
-            _cam(
-                num_reqs=1,
-                query_start_loc=[0, 4, 6],  # query_seq_lens = [4, 2]
-                seq_lens=[5, 99],  # num_computed = [1, 97]; second must be ignored
-                block_table=[[7, 8, 9]],
-            ),
-            torch.arange(4),
-            batch_pad=1,
-            is_prefill=True,
-        )
-        assert md.cache_seq_lens.reshape(-1).tolist() == [1]  # clamp(1, 4), req0 only
-
-
-class TestBuildSlidingWindowDecode:
-    def test_padding_swa_mask_and_local_block_tables(self, cfg):
-        # Decode SWA: cache_* padded to batch_pad, swa mask marks positions
-        # <= cache_seq_len, local_block_tables is the first block per row.
-        window = 4
-        builder = make_builder(cfg, sliding_window=window)  # causal
-        md = builder.build(
-            _cam(
-                num_reqs=1,
-                query_start_loc=[0, 1],  # query_len 1 -> num_computed = 3 - 1 = 2
-                seq_lens=[3],
-                block_table=[[5]],
-            ),
-            torch.arange(10),
-            batch_pad=2,
-            is_prefill=False,
-        )
-        # clamp(2, 4) = 2, padded to batch_pad=2 -> [2, 0]
-        assert md.cache_seq_lens.reshape(-1).tolist() == [2, 0]
-        # cache_offsets = cache_seq_lens + query_lens(=1) = 3, padded -> [3, 0]
-        assert md.cache_offsets.reshape(-1).tolist() == [3, 0]
-        assert md.swa_attn_masks.shape == (2, 1, 1, window)
-        # row0 (cache=2): arange(4) <= 2 -> [1,1,1,0]; row1 (cache=0): [1,0,0,0]
-        expected = torch.tensor([[[[1.0, 1, 1, 0]]], [[[1.0, 0, 0, 0]]]])
-        assert torch.equal(md.swa_attn_masks.float(), expected)
-        # decode block_tables padded to [[5], [0]], then [..., :1]
-        assert md.local_block_tables.reshape(-1).tolist() == [5, 0]
+        for field in fields(RBLNFlashAttentionMetadata):
+            swa_value = getattr(swa, field.name)
+            full_value = getattr(full, field.name)
+            if isinstance(swa_value, torch.Tensor):
+                assert torch.equal(swa_value, full_value)
+            else:
+                assert swa_value == full_value
 
 
 class TestBuildOutputAssembly:
@@ -446,13 +355,11 @@ class TestStage:
         assert second.tolist() == [4, 5, 6]
 
     def test_distinct_slots_do_not_alias(self, cfg):
-        # cache_seq_lens and cache_offsets share shape/dtype; the slot keeps them
-        # from sharing one buffer (the _stage docstring warning).
+        # Two tensors of one shape and dtype; the slot keeps them from sharing
+        # a buffer (the _stage docstring warning).
         builder = make_builder(cfg)
         t = torch.tensor([1, 2, 3])
-        assert builder._stage(t, "cache_seq_lens") is not builder._stage(
-            t, "cache_offsets"
-        )
+        assert builder._stage(t, "seq_idx") is not builder._stage(t, "attn_masks")
 
     def test_different_shape_gets_new_buffer(self, cfg):
         # A different shape is a different key, so it gets its own buffer.
@@ -594,3 +501,58 @@ class TestFlashImplInit:
 
     def test_is_normal_false_when_sinks_present(self, cfg_square):
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
+
+
+@pytest.mark.maybe_use_device
+class TestForwardSlidingWindow:
+    WINDOW = 4
+    HEADS, DIM = 8, 128  # make_impl defaults; num_queries_per_kv is 1
+
+    def _forward(self, cfg, monkeypatch, metadata):
+        impl = make_impl(cfg, sliding_window=self.WINDOW)
+        b_size = metadata.seq_lens.shape[0]
+        recorded = []
+
+        def record(*args):
+            recorded.append(args)
+            return torch.zeros(b_size, self.HEADS, 1, 1, self.DIM)
+
+        monkeypatch.setattr(flash_attention, "sliding_window_attention_v1", record)
+        qkv = torch.zeros(b_size, self.HEADS, self.DIM)
+        impl.forward(
+            None,  # layer: only the flash causal branch reads it
+            qkv,
+            qkv,
+            qkv,
+            torch.zeros(1),  # kv_cache: handed to the op untouched
+            metadata,
+            torch.zeros(b_size, self.HEADS, self.DIM),
+        )
+        return recorded[0]
+
+    def test_the_op_gets_seq_idx_the_whole_table_and_the_window(self, cfg, monkeypatch):
+        # One op for both phases, and neither the position nor the table is cut
+        # on the way in: the op resolves the window from them itself.
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[6], [0]]),
+            block_tables=torch.tensor([[7, 8, 9], [0, 0, 0]]),
+            is_prefill=False,
+        )
+        _q, _k, _v, _cache, seq_idx, _scale, tables, window, sinks = self._forward(
+            cfg, monkeypatch, md
+        )
+        assert seq_idx is md.seq_lens  # absolute, not clamped to the window
+        assert tables is md.block_tables  # the whole table, not its first column
+        assert window == self.WINDOW
+        assert sinks is None
+
+    def test_prefill_takes_the_same_call(self, cfg, monkeypatch):
+        # Prefill hands the op its 1-D block table as is; the op reshapes it.
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[6]]),
+            block_tables=torch.tensor([7, 8, 9]),
+            is_prefill=True,
+        )
+        *_, tables, window, _sinks = self._forward(cfg, monkeypatch, md)
+        assert tables.tolist() == [7, 8, 9]
+        assert window == self.WINDOW
