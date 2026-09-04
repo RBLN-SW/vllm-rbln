@@ -40,10 +40,6 @@ jobs:
           VERSION="${{ inputs.optimum-version }}"
           VERSION="${VERSION#v}"
 
-          # `uv add` replaces the whole specifier, so a bare floor would drop the
-          # upper bound and let a published wheel resolve to whatever optimum-rbln
-          # is newest at install time. Cap the bump to its own patch line, the
-          # shape tests/test_packaging_bounds.py requires.
           CEILING=$(python -c 'import re, sys; m = re.match(r"(\d+)\.(\d+)\.(\d+)", sys.argv[1]) or sys.exit(f"cannot derive a patch-line ceiling from {sys.argv[1]!r}"); print(f"{m[1]}.{m[2]}.{int(m[3]) + 1}")' "${VERSION}")
 
           # Bump optimum-rbln in pyproject.toml and refresh uv.lock in one step.
