@@ -27,9 +27,13 @@ completing a handshake.
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from vllm.config.utils import hash_factors
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
+
+if TYPE_CHECKING:
+    from vllm.config import SpeculativeConfig
 
 # Bump on any incompatible change to the RBLN metadata schema or semantics.
 # Folded into the NIXL compatibility hash so an RBLN peer speaking a different
@@ -76,9 +80,14 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
 
 
-def rbln_compat_hash(base_hash: str, *, writes_into_peer: bool) -> str:
-    """Fold the RBLN schema version and the transfer direction into the upstream
-    NIXL compat hash.
+def rbln_compat_hash(
+    base_hash: str,
+    *,
+    writes_into_peer: bool,
+    speculative_config: "SpeculativeConfig | None" = None,
+) -> str:
+    """Fold the RBLN schema version, the transfer direction and the draft model
+    into the upstream NIXL compat hash.
 
     An extension rather than a change to ``compute_nixl_compatibility_hash``,
     which stays upstream's. The direction belongs in it because the read and the
@@ -86,11 +95,26 @@ def rbln_compat_hash(base_hash: str, *, writes_into_peer: bool) -> str:
     into a consumer expecting to read finds a peer whose every length check
     passes. This vLLM hashes nothing that separates them -- the connector name
     is not a factor -- so this is the only place it can be settled.
+
+    The draft model belongs in it because its attention layers are members of
+    the KV cache this connector registers, while upstream's factors describe
+    the target alone. Model-level values only -- the hash is compared across
+    every shard, so a per-rank quantity would differ between PP stages.
     """
-    return hash_factors(
-        {
-            "base": base_hash,
-            "rbln_nixl_connector_version": RBLN_NIXL_CONNECTOR_VERSION,
-            "rbln_writes_into_peer": writes_into_peer,
+    factors: dict[str, object] = {
+        "base": base_hash,
+        "rbln_nixl_connector_version": RBLN_NIXL_CONNECTOR_VERSION,
+        "rbln_writes_into_peer": writes_into_peer,
+    }
+    if speculative_config is not None and (
+        speculative_config.use_eagle() or speculative_config.uses_draft_model()
+    ):
+        draft_model_config = speculative_config.draft_model_config
+        assert draft_model_config is not None
+        factors |= {
+            "rbln_spec_method": speculative_config.method,
+            "rbln_draft_model": draft_model_config.model,
+            "rbln_draft_revision": draft_model_config.revision,
+            "rbln_draft_code_revision": draft_model_config.code_revision,
         }
-    )
+    return hash_factors(factors)
