@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -39,6 +40,7 @@ import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 from ..ops.attention_naive import (
     attention_naive_decode,
@@ -56,9 +58,23 @@ from ..ops.flash_causal_attention_naive import (
     flash_causal_attention_naive_decode,
     flash_causal_attention_naive_prefill,
 )
-from ..ops.sliding_window_attention import sliding_window_attention_v1
+from ..ops.sliding_window_attention import (
+    sliding_window_attention_naive_decode,
+    sliding_window_attention_naive_prefill,
+    sliding_window_attention_v1,
+)
 
 logger = init_logger(__name__)
+
+
+def swa_appends_kv() -> bool:
+    """Whether a sliding-window layer writes its KV cache by append.
+
+    Only CR13 carries the sliding_window_attention_v1 kernel. Elsewhere the
+    window is one block the kernel shifts in place, which needs the
+    RBLNSlidingWindowSpec cache layout and the metadata describing its fill.
+    """
+    return "cr13" in current_platform.get_device_name().lower()
 
 
 def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
@@ -131,6 +147,13 @@ class RBLNFlashAttentionMetadata:
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
 
+    # For sliding window attention on the shift path; the append path resolves
+    # the window inside the op and leaves all four unset.
+    cache_seq_lens: torch.Tensor | None = None
+    cache_offsets: torch.Tensor | None = None
+    local_block_tables: torch.Tensor | None = None
+    swa_attn_masks: torch.Tensor | None = None
+
     def __post_init__(self):
         # FIXME(RBLN): to_dynamic_index does not accept int64 inputs.Thus in the
         # VLLM_RBLN_USE_CUSTOM_KERNEL=0 path, rebel-compiler automatically converts
@@ -144,6 +167,12 @@ class RBLNFlashAttentionMetadata:
             return
 
         self.seq_lens = self.seq_lens.to(torch.int32)
+        self.cache_seq_lens = (
+            self.cache_seq_lens.to(torch.int32) if self.cache_seq_lens else None
+        )
+        self.cache_offsets = (
+            self.cache_offsets.to(torch.int32) if self.cache_offsets else None
+        )
 
 
 class RBLNFlashAttentionMetadataBuilder(
@@ -179,8 +208,9 @@ class RBLNFlashAttentionMetadataBuilder(
     def _stage(self, t: torch.Tensor | None, slot: str) -> torch.Tensor | None:
         """Copy a host tensor into this builder's persistent device buffer.
 
-        `slot` must be unique per logical tensor: two tensors that share a
-        shape and a dtype would otherwise silently share one buffer.
+        `slot` must be unique per logical tensor: cache_seq_lens and
+        cache_offsets share both shape and dtype, so keying on those alone
+        would silently make them share one buffer.
 
         The returned tensor is overwritten by the next build() call, so the
         caller must run the forward pass before building again. That holds
@@ -217,6 +247,8 @@ class RBLNFlashAttentionMetadataBuilder(
         seq_lens_cpu = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
 
+        query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        num_computed_tokens = seq_lens_cpu - query_seq_lens_cpu
         seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
         max_seq_len = self.model_config.max_model_len
 
@@ -263,11 +295,42 @@ class RBLNFlashAttentionMetadataBuilder(
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
                 attn_masks = decode_attention_mask
 
+        cache_seq_lens = None
+        cache_offsets = None
+        local_block_tables = None
+        swa_attn_masks = None
+        # The shift kernel's one block, described: how full it is, where the
+        # chunk ends in it, and which block it is. RBLNSlidingWindowSpec is that
+        # cache layout, so its absence is the append path, which needs none of
+        # it.
+        if isinstance(self.kv_cache_spec, RBLNSlidingWindowSpec):
+            sliding_window = self.kv_cache_spec.sliding_window
+            num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
+            seq_lens = seq_lens_cpu[:num_reqs].view(-1, 1)
+            query_lens = seq_lens - num_computed_tokens
+            cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
+            cache_offsets = cache_seq_lens + query_lens
+            if not is_prefill:
+                cache_seq_lens = rbln_utils.pad(cache_seq_lens, 0, batch_pad)
+                cache_offsets = rbln_utils.pad(cache_offsets, 0, batch_pad)
+                # Generate sliding window attention mask for decode
+                # mask[b, s] = 1.0 if s <= cache_seq_lens[b] else 0.0
+                positions = torch.arange(sliding_window)[None, :]
+                swa_attn_masks = torch.where(positions - cache_seq_lens > 0, 0.0, 1.0)[
+                    :, None, None, :
+                ]
+
+            local_block_tables = block_tables_tensor[..., :1]
+
         attn_metadata = RBLNFlashAttentionMetadata(
             seq_lens=self._stage(seq_idx, "seq_idx"),
             block_tables=self._stage(block_tables_tensor, "block_tables"),
             is_prefill=is_prefill,
             attn_masks=self._stage(attn_masks, "attn_masks"),
+            cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
+            cache_offsets=self._stage(cache_offsets, "cache_offsets"),
+            local_block_tables=self._stage(local_block_tables, "local_block_tables"),
+            swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
         )
 
         return attn_metadata
@@ -358,14 +421,16 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
             and not vllm_config.attention_config.use_non_causal
         )
+        self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
 
-        if self.sliding_window is not None and envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        self.swa_appends = sliding_window is not None and swa_appends_kv()
+        if self.swa_appends and envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
             raise NotImplementedError(
                 "Sliding window attention is not supported with "
-                "VLLM_RBLN_USE_CUSTOM_KERNEL=1: rbln_triton_ops has no "
+                "VLLM_RBLN_USE_CUSTOM_KERNEL=1 on CR13: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
 
@@ -481,21 +546,56 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
         if self.sliding_window is not None:
-            # One op for both phases. `seq_lens` is the absolute position the
-            # chunk starts at, uncapped: it names the slot every token is
-            # written to, and the blocks the window covers are resolved from it
-            # and the whole block table inside the op.
-            attn_output = sliding_window_attention_v1(
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata.seq_lens,
-                self.scale,
-                attn_metadata.block_tables,
-                self.sliding_window,
-                self.sinks,
-            )
+            if self.swa_appends:
+                # One op for both phases. `seq_lens` is the absolute position the
+                # chunk starts at, uncapped: it names the slot every token is
+                # written to, and the blocks the window covers are resolved from it
+                # and the whole block table inside the op.
+                attn_output = sliding_window_attention_v1(
+                    query,
+                    key,
+                    value,
+                    kv_cache,
+                    attn_metadata.seq_lens,
+                    self.scale,
+                    attn_metadata.block_tables,
+                    self.sliding_window,
+                    self.sinks,
+                )
+            else:
+                assert self.sliding_window == kv_cache.size(-2), (
+                    "SWA kernel_block_size must match window_size"
+                )
+                assert attn_metadata.cache_seq_lens is not None
+                assert attn_metadata.cache_offsets is not None
+
+                if attn_metadata.is_prefill:
+                    attn_output = sliding_window_attention_naive_prefill(
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.sinks,
+                    )
+                else:
+                    attn_output = sliding_window_attention_naive_decode(
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        attn_metadata.swa_attn_masks
+                        if self.is_batch_attention_opt and b_size > 1
+                        else None,
+                        self.sinks,
+                    )
 
         elif self.is_causal:
             if self.is_normal:

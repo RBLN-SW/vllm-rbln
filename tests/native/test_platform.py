@@ -562,6 +562,45 @@ class TestPreRegisterAndUpdate:
         assert EngineArgs.get_batch_defaults.__func__ is before
 
 
+class TestCustomKvCacheSpecs:
+    @pytest.fixture(autouse=True)
+    def restore_registry(self):
+        # The registry is a process global with lazy init: it populates itself
+        # only while empty, so leaving it half-filled makes every later test that
+        # builds a scheduler fail with "No manager registered for ...".
+        from vllm.v1 import kv_cache_spec_registry as registry
+
+        saved = dict(registry._REGISTRY_KVCACHESPEC_LIST)
+        yield
+        registry._REGISTRY_KVCACHESPEC_LIST.clear()
+        registry._REGISTRY_KVCACHESPEC_LIST.update(saved)
+
+    def test_the_sliding_window_manager_is_reachable(self, configured):
+        # The runner looks the manager up by spec at KV-cache init; an
+        # unregistered pair only fails there, on a device. Registered through
+        # register_all_kvcache_specs like production does -- it fills in the
+        # built-in specs first and calls the platform hook last.
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+        from vllm_rbln.v1.kv_cache import (
+            RBLNSlidingWindowManager,
+            RBLNSlidingWindowSpec,
+        )
+
+        register_all_kvcache_specs(configured)
+        spec = RBLNSlidingWindowSpec(
+            block_size=1024,
+            num_kv_heads=2,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=512,
+        )
+        assert KVCacheSpecRegistry.get_manager_class(spec) is RBLNSlidingWindowManager
+
+
 def test_running_the_hook_twice_changes_nothing(configured, reconfigure):
     """The premise every reconfigure() test rests on: each field the hook writes
     is already at its final value, so a second pass is a no-op. Should the hook

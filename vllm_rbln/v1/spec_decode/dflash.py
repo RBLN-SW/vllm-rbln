@@ -520,11 +520,12 @@ class RBLNDFlashProposer(DFlashProposer):
                 per_layer[layer_name] = full_metadata
             if not sliding:
                 continue
-            # The window travels in `attn_masks`: `DFlashQwen3Attention` never
-            # declares `layer_types`, so every draft layer gets a
-            # `FullAttentionSpec` and the full-attention kernel. Per-layer
-            # `seq_lens` would need a second dynamic index on an already-indexed
-            # partition, which the compiler refuses with a segfault.
+            # The window travels in `attn_masks`, not `swa_attn_masks`:
+            # `DFlashQwen3Attention` never declares `layer_types`, so every
+            # draft layer gets a `FullAttentionSpec` and a kernel that ignores
+            # the SWA fields. Per-layer `seq_lens` would need a second dynamic
+            # index on an already-indexed partition, which the compiler
+            # refuses with a segfault rather than a diagnostic.
             window_metadata = copy(attn_metadata)
             window_metadata.attn_masks = (
                 self._draft_block_mask(
