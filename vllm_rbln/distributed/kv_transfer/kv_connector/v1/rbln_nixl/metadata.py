@@ -26,6 +26,7 @@ completing a handshake.
 """
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 from vllm.config.utils import hash_factors
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
@@ -35,14 +36,27 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 # schema fails the handshake cleanly (both ends are RBLN). Upstream keeps its
 # own counterpart the same way (``NIXL_CONNECTOR_VERSION``).
 #   1: pp_rank / pp_size / registered_layer_names (the layer axis)
-#   2: + kv_areas / kv_slices (the head axis: chiplet geometry)
+#   2: + kv_areas / kv_slices (chiplet geometry)
 #   3: + the transfer direction in the hash
-RBLN_NIXL_CONNECTOR_VERSION: int = 3
+#   4: + kv_split_axis (which axis the geometry above came from)
+RBLN_NIXL_CONNECTOR_VERSION: int = 4
+
+
+class KVSplitAxis(Enum):
+    """Which axis the compiler cut a KV entry on across the chiplets.
+
+    ``HEAD`` means an area holds some of the shard's KV heads over every token
+    of a block; ``NON_HEAD`` means every head over some of the tokens.
+    """
+
+    HEAD = 0
+    NON_HEAD = 1
 
 
 @dataclass
 class RblnNixlAgentMetadata(NixlAgentMetadata):
-    """``NixlAgentMetadata`` + which layers and which KV heads this shard holds.
+    """``NixlAgentMetadata`` + which layers and which slice of the KV cache
+    this shard holds.
 
     New fields default to the single-shard, single-area values, so a blob decoded
     by upstream (which uses ``NixlAgentMetadata`` and ignores the extra fields)
@@ -57,6 +71,9 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # DISTINCT rather than replicas (see `_slice_head_bounds`).
     kv_areas: int = 1
     kv_slices: int = 1
+    # The default keeps a blob without this field meaning what versions 2 and 3
+    # meant by the two counts above.
+    kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
 
 
 def rbln_compat_hash(base_hash: str, *, writes_into_peer: bool) -> str:
