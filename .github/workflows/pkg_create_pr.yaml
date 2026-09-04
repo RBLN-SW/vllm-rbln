@@ -40,9 +40,11 @@ jobs:
           VERSION="${{ inputs.optimum-version }}"
           VERSION="${VERSION#v}"
 
+          CEILING=$(python -c 'import re, sys; m = re.match(r"(\d+)\.(\d+)\.(\d+)", sys.argv[1]) or sys.exit(f"cannot derive a patch-line ceiling from {sys.argv[1]!r}"); print(f"{m[1]}.{m[2]}.{int(m[3]) + 1}")' "${VERSION}")
+
           # Bump optimum-rbln in pyproject.toml and refresh uv.lock in one step.
           for i in {1..6}; do
-            uv add "optimum-rbln>=${VERSION}" --upgrade-package optimum-rbln && exit 0
+            uv add "optimum-rbln>=${VERSION},<${CEILING}" --upgrade-package optimum-rbln && exit 0
             sleep 10
           done
           echo "::error::uv add failed after retries"
