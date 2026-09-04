@@ -36,7 +36,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
-import vllm_rbln.envs as envs
+from vllm_rbln.config import build_rbln_config, get_rbln_config, set_rbln_config
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
@@ -70,11 +70,13 @@ class RBLNScheduler(Scheduler):
     ) -> None:
         super().__init__(*args, **kwargs)
 
+        set_rbln_config(build_rbln_config(self.vllm_config.additional_config))
+
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
         # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
         # so that each prefill does not span multiple blocks.
-        if sub_block_size is None and envs.VLLM_RBLN_SUB_BLOCK_CACHE:
+        if sub_block_size is None and get_rbln_config().sub_block_cache:
             sub_block_size = self.scheduler_config.max_num_batched_tokens
         if (
             self.cache_config.enable_prefix_caching

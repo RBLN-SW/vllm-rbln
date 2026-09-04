@@ -110,6 +110,7 @@ from vllm_rbln.compilation import (
     create_compile_context,
     set_compile_stage,
 )
+from vllm_rbln.config import get_rbln_config
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
@@ -546,7 +547,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # phase classification. Instead, we perform a stable sort by current sequence
         # length (num_tokens_no_spec, descending).
         if (
-            not envs.VLLM_RBLN_SORT_BATCH
+            not get_rbln_config().sort_batch
             or len(self.kv_cache_config.kv_cache_groups) == 0
         ):
             return

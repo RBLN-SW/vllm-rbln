@@ -149,6 +149,7 @@ def create_rbln_scheduler(
     policy: str = "fcfs",
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
+    additional_config: dict | None = None,
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
@@ -195,6 +196,7 @@ def create_rbln_scheduler(
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        additional_config=additional_config or {},
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
