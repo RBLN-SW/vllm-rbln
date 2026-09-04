@@ -342,6 +342,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
         is_pooling_model=False,
         model_config=SimpleNamespace(get_vocab_size=lambda: 10),
         device=torch.device("cpu"),
+        dtype=torch.bfloat16,
         bucketing_manager=SimpleNamespace(
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),

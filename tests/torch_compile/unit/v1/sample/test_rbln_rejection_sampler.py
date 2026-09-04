@@ -337,7 +337,8 @@ def test_apply_sampling_constraints_leaves_all_greedy_logits_untouched(impl):
     assert torch.equal(out, logits)
 
 
-def test_apply_sampling_constraints_scales_only_random_rows(impl):
+def test_apply_sampling_constraints_leaves_mixed_batch_logits_untouched(impl):
+    """Mixed batches are not scaled here either -- the NPU impl is a no-op."""
     logits = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
     metadata = make_sampling_metadata(
         temperature=torch.tensor([0.0, 2.0]),
@@ -351,10 +352,7 @@ def test_apply_sampling_constraints_scales_only_random_rows(impl):
         sampling_metadata=metadata,
     )
 
-    # The greedy row is divided by 1 (scaling cannot move an argmax); the random
-    # row by its own temperature.
-    expected = torch.stack([logits[0], logits[1] / 2.0])
-    assert torch.equal(out, expected)
+    assert torch.equal(out, logits)
 
 
 ########################### rejection_sample ###########################
@@ -394,7 +392,7 @@ def run_rejection_sample(
             torch.tensor(num_draft_tokens, dtype=torch.int32), dim=0
         ),
         draft_probs=None,
-        target_probs=make_target_probs(target_argmax_token_ids),
+        target_logits=make_target_probs(target_argmax_token_ids),
         bonus_token_ids=torch.tensor(bonus_token_ids, dtype=torch.int64).unsqueeze(-1),
         sampling_metadata=metadata,
     )

@@ -3278,8 +3278,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
-        target_probs = torch.zeros(
-            num_tokens, vocab_size, dtype=torch.float32, device=self.device
+        target_logits = torch.zeros(
+            num_tokens, vocab_size, dtype=self.dtype, device=self.device
         )
         cu_num_draft_tokens = torch.arange(
             num_spec,
@@ -3317,7 +3317,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_spec,
             cu_num_draft_tokens,
             None,
-            target_probs,
+            target_logits,
             bonus_token_ids,
             dummy_sampling_metadata,
         )
