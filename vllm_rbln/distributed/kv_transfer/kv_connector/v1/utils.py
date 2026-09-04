@@ -12,15 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helpers for finalizing KV-cache registration across (multi-)connectors.
+"""Helpers for driving RBLN connector hooks across (multi-)connectors.
 
-Some RBLN connectors defer part of their KV-cache registration until the
-compiled model's KV cache physical views exist, i.e. until after warm-up. The
-worker triggers that finalization once warm-up has run. When connectors are
-combined via vLLM's ``MultiConnector``, the registration hook lives on the
-nested child connectors rather than the wrapper, so this module flattens the
-connector tree and finalizes every child that supports it -- otherwise the
-nested connector's registration is silently skipped.
+Under ``MultiConnector`` these hooks sit on the nested children, so a hook driven
+on the wrapper alone is silently skipped.
 """
 
 from collections.abc import Iterator
@@ -48,6 +43,13 @@ class SupportsKVCacheRegistrationFinalize(Protocol):
     def finalize_kv_cache_registration(self) -> None: ...
 
 
+@runtime_checkable
+class SupportsDeferredLoad(Protocol):
+    """A connector that holds a KV load until a submission is in flight."""
+
+    def flush_deferred_load(self) -> None: ...
+
+
 def iter_kv_connectors(
     connector: KVConnectorBase_V1,
 ) -> Iterator[KVConnectorBase_V1]:
@@ -71,3 +73,10 @@ def finalize_kv_cache_registrations(connector: KVConnectorBase_V1) -> None:
                 "Finalizing KV cache registration for %s", type(child).__name__
             )
             child.finalize_kv_cache_registration()
+
+
+def flush_deferred_loads(connector: KVConnectorBase_V1) -> None:
+    """Issue the KV loads every connector that defers them is holding."""
+    for child in iter_kv_connectors(connector):
+        if isinstance(child, SupportsDeferredLoad):
+            child.flush_deferred_load()

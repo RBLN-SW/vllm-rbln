@@ -776,6 +776,89 @@ class TestDummyRunPadding:
         assert captured["layout"].num_reqs_padded == 1
 
 
+def _drafter_stub(order):
+    """An RBLNEagleProposer the dummy step will call, recording only that it ran.
+
+    A real instance would need a model and a bucketing manager; what the
+    ordering here turns on is just that the call happens, and isinstance()
+    against the production class is what selects the branch.
+    """
+    drafter = object.__new__(RBLNEagleProposer)
+    drafter.dummy_run = lambda *a, **kw: order.append("draft")
+    return drafter
+
+
+class TestDummyRunFlushesTheDeferredLoad:
+    """The dummy step issues a KV read a step with no forward handed over.
+
+    The forward submission returns without waiting for the device, so a read
+    issued after it runs while this rank's graph runs and the busy ranks sit in
+    their samplers. Reusing TestDummyRunPadding's stub: what changes here is only
+    which calls are recorded.
+    """
+
+    @staticmethod
+    def _runner_with_connector(monkeypatch, **kwargs):
+        runner, captured = TestDummyRunPadding._runner(monkeypatch, **kwargs)
+        order: list[str] = []
+        runner.model_executable = lambda **kw: order.append("submit")
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: "CONNECTOR")
+        monkeypatch.setattr(
+            mr,
+            "flush_deferred_loads",
+            lambda connector: order.append(f"flush:{connector}"),
+        )
+        return runner, captured, order
+
+    def test_flush_comes_after_the_submission(self, monkeypatch):
+        # The whole point is that the read runs behind a submission already in
+        # flight. Flushing first would delay the submission the MoE collective
+        # waits on, so the order is the behaviour, not just the call.
+        runner, _, order = self._runner_with_connector(
+            monkeypatch, reqs_across_dp=[2, 1, 1, 1]
+        )
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert order == ["submit", "flush:CONNECTOR"]
+
+    def test_warmup_does_not_flush(self, monkeypatch):
+        # Warm-up compiles shapes before serving; there is no connector metadata
+        # to issue, and asking for the transfer group there is out of place.
+        runner, _, order = self._runner_with_connector(
+            monkeypatch, reqs_across_dp=[2, 1, 1, 1]
+        )
+        runner._dummy_run(1, 1, is_prefill=False)
+
+        assert order == ["submit"]
+
+    def test_the_flush_precedes_the_draft(self, monkeypatch):
+        # The draft submits several times with each call depending on the last,
+        # so it occupies the host rather than leaving it idle. Issuing the read
+        # after it would land on a host already spent; the window is the one the
+        # main submission opened.
+        runner, _, order = self._runner_with_connector(
+            monkeypatch, reqs_across_dp=[2, 1, 1, 1]
+        )
+        runner.drafter = _drafter_stub(order)
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert order == ["submit", "flush:CONNECTOR", "draft"]
+
+    def test_a_drained_group_flushes_nothing(self, monkeypatch):
+        # Every rank stops before the forward here, so this dummy has no
+        # submission for the read to run behind either -- issuing it would be the
+        # synchronous submission the deferral exists to avoid. The recovery flush
+        # on the next execute_model picks it up instead.
+        runner, captured, order = self._runner_with_connector(
+            monkeypatch, reqs_across_dp=[1, 1, 1, 1], peers_idle=True
+        )
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert captured == {}
+        assert order == []
+
+
 class TestProcessKvCacheCopyOps:
     # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
     # and VLLM_RBLN_COMPILE_MODEL. Forced deterministically via monkeypatch.
@@ -1438,3 +1521,158 @@ class TestDummyRunPPIntermediateTensors:
         assert captured["intermediate_tensors"]["h"].shape == (8, 1, self.HIDDEN)
         assert captured["layout"].num_reqs == 1
         assert captured["layout"].num_reqs_padded == 8
+
+
+class TestExecuteModelRecoversADeferredLoad:
+    """A read the dummy step never issued goes out on the next execute_model.
+
+    The scheduler lists a request in `reqs_to_recv` once and clears the list
+    while building the metadata, so a read nobody issues strands its request:
+    the consumer waits on KV that no producer was ever asked for. The rounds
+    where no dummy step runs -- a drained group, a sleeping executor, a round
+    the engine loop skipped -- are covered here rather than by matching the
+    conditions that decide whether a dummy step runs at all.
+    """
+
+    @staticmethod
+    def _runner(monkeypatch):
+        order: list[str] = []
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        connector = SimpleNamespace(
+            handle_preemptions=lambda meta: order.append(f"preemptions:{meta}")
+        )
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+        monkeypatch.setattr(
+            mr,
+            "flush_deferred_loads",
+            lambda c: order.append("flush" if c is connector else "flush:WRONG"),
+        )
+
+        def no_forward(scheduler_output, vllm_config):
+            order.append("no_forward")
+            return "OUTPUT"
+
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            use_async_scheduling=False,
+            _update_states=lambda so: order.append("update_states"),
+            kv_connector_no_forward=no_forward,
+            vllm_config="VLLM_CONFIG",
+        )
+        return runner, order
+
+    @staticmethod
+    def _scheduler_output():
+        return SimpleNamespace(
+            total_num_scheduled_tokens=0,
+            kv_connector_metadata="META",
+            kv_cache_copy_ops=None,
+        )
+
+    def test_the_held_read_is_issued_before_the_connector_step(self, monkeypatch):
+        # Issued on entry, so the request is no longer waiting on a read nobody
+        # asked for by the time this step's connector work runs.
+        runner, order = self._runner(monkeypatch)
+
+        out = runner.execute_model(self._scheduler_output())
+
+        assert out == "OUTPUT"
+        assert order == [
+            "preemptions:META",
+            "flush",
+            "update_states",
+            "no_forward",
+        ]
+
+    def test_no_transfer_group_asks_no_connector(self, monkeypatch):
+        # Without a connector there is nothing to recover, and reaching for the
+        # transfer group would raise.
+        runner, order = self._runner(monkeypatch)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+
+        assert (
+            runner.execute_model(self._scheduler_output())
+            is mr.EMPTY_MODEL_RUNNER_OUTPUT
+        )
+        assert order == ["update_states"]
+
+
+class TestExecuteModelFlushesAfterTheSubmission:
+    """A real step issues its read after the forward submission, not before.
+
+    Upstream calls `start_load_kv` before the submission; the connector holds the
+    read instead, and `execute_model` issues it once the submission is in flight.
+    Under expert parallelism every peer's collective waits on that submission, so
+    the order is the behaviour here, not just the call.
+    """
+
+    @staticmethod
+    def _runner(monkeypatch):
+        order: list[str] = []
+        connector = SimpleNamespace(handle_preemptions=lambda meta: None)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+        monkeypatch.setattr(mr, "flush_deferred_loads", lambda c: order.append("flush"))
+        monkeypatch.setattr(mr, "set_forward_context", lambda *a, **kw: nullcontext())
+        monkeypatch.setattr(
+            mr, "build_kv_cache_forward_context_kwargs", lambda *a, **kw: {}
+        )
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        monkeypatch.setattr(
+            RBLNModelRunner,
+            "maybe_get_kv_connector_output",
+            staticmethod(lambda *a, **kw: nullcontext("KV_OUT")),
+        )
+
+        def executable(**kwargs):
+            order.append("submit")
+            return ("HIDDEN", "LOGITS", None)
+
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            use_async_scheduling=False,
+            _update_states=lambda so: None,
+            _prepare_inputs=lambda so, counts: (
+                "LOGITS_IDX",
+                None,
+                torch.ones(1, dtype=torch.int32),
+                1,
+            ),
+            _determine_batch_execution_and_padding=lambda *a, **kw: _resolved_batch(
+                num_reqs_padded=1, query_len=1, num_tokens_padded=1
+            ),
+            _build_attention_metadata=lambda **kw: ("ATTN", None),
+            _preprocess=lambda *a, **kw: (
+                SimpleNamespace(as_kwargs=lambda: {}),
+                {},
+            ),
+            _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
+            input_batch=SimpleNamespace(num_reqs=1, req_ids=["r0"]),
+            cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+            speculative_config=None,
+            is_pooling_model=False,
+            vllm_config="VLLM_CONFIG",
+            model_executable=executable,
+            num_prompt_logprobs=None,
+            kv_cache_bases=None,
+        )
+        return runner, order
+
+    def test_the_flush_follows_the_submission(self, monkeypatch):
+        runner, order = self._runner(monkeypatch)
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"r0": 1},
+            kv_connector_metadata="META",
+            kv_cache_copy_ops=None,
+        )
+
+        runner.execute_model(scheduler_output)
+
+        # The entry flush recovers a stale hold, then this step's read goes out
+        # only after its own submission.
+        assert order == ["flush", "submit", "flush"]

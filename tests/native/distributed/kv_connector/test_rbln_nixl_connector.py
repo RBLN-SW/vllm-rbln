@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # RblnNixlPullConnector's construction guards, role -> scheduler/worker wiring,
-# finalize delegation and the side-channel keying it hands upstream, with the
-# base __init__ and sub-connectors patched out.
+# finalize delegation, the side-channel keying it hands upstream, and the read it
+# holds until a submission is in flight, with the upstream __init__ and
+# sub-connectors patched out.
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -27,6 +28,9 @@ import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
     RblnNixlPullConnector,
     RblnNixlPushConnector,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    flush_deferred_loads,
 )
 
 
@@ -209,3 +213,91 @@ class TestConnectorWiring:
         # pin that this direction goes through it.
         with pytest.raises(AssertionError, match="kv_buffer_device"):
             push_connector(KVConnectorRole.WORKER, kv_buffer_device="gpu")
+
+
+class TestDeferredLoad:
+    """Holding a read until a model submission is in flight to run it behind."""
+
+    @pytest.fixture
+    def worker_connector(self, isolated_connector, monkeypatch):
+        def build():
+            connector = isolated_connector(_vllm_config(), role=KVConnectorRole.WORKER)
+            connector.connector_worker = SimpleNamespace(
+                started=[],
+                start_load_kv=lambda meta: connector.connector_worker.started.append(
+                    meta
+                ),
+            )
+            return connector
+
+        return build
+
+    @staticmethod
+    def _ctx(attn_metadata):
+        return SimpleNamespace(attn_metadata=attn_metadata)
+
+    def test_the_read_is_held(self, worker_connector):
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        assert connector.connector_worker.started == []
+
+    def test_upstream_is_never_reached_at_this_point(
+        self, worker_connector, monkeypatch
+    ):
+        # Upstream issues here; this override replaces that rather than adding to
+        # it. Patching the upstream method so a rename or a re-route on that side
+        # fails here (monkeypatch raises by default).
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        delegated = []
+        monkeypatch.setattr(
+            cm.NixlPullConnector,
+            "start_load_kv",
+            lambda self, forward_context, **kw: delegated.append(forward_context),
+        )
+
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        assert delegated == []
+
+    def test_flush_issues_the_held_read_once(self, worker_connector):
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == ["META"]
+
+    def test_flush_again_issues_nothing(self, worker_connector):
+        # A second flush in the same round -- the dummy step and the next
+        # execute_model both call it -- must not read every block twice.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+        connector.flush_deferred_load()
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == ["META"]
+
+    def test_flush_with_nothing_held_issues_nothing(self, worker_connector):
+        connector = worker_connector()
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == []
+
+    def test_the_helper_reaches_this_connector(self, worker_connector):
+        # The runner flushes through the helper, which skips anything without the
+        # protocol -- so going through it is what proves this connector is reached.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        flush_deferred_loads(connector)
+
+        assert connector.connector_worker.started == ["META"]
