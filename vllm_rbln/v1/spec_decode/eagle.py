@@ -60,7 +60,14 @@ class RBLNEagleProposer(EagleProposer):
         device: torch.device,
         runner: "RBLNModelRunner",
     ):
-        super().__init__(vllm_config, device, runner)
+        # NOTE(RBLN): the drafter's own bookkeeping -- the token ids, positions,
+        # sample indices and backup ids it edits between graph launches -- lives
+        # on the host. torch-rbln runs int/bool eager ops through a CPU
+        # fallback, so editing them as device tensors round-trips the host op
+        # by op. The device is kept for the attention metadata builders and the
+        # input stager, which stage the compiled graph's inputs onto it.
+        super().__init__(vllm_config, torch.device("cpu"), runner)
+        self.device = device
 
         if self.supports_mm_inputs:
             raise NotImplementedError
@@ -100,6 +107,8 @@ class RBLNEagleProposer(EagleProposer):
         assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens = target_token_ids.shape[0]
+        if token_indices_to_sample is None:
+            token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
 
         assert self.runner is not None
         is_prefill = self.runner.is_prefill
@@ -167,10 +176,7 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
 
-        assert token_indices_to_sample_padded is not None
-        positions = target_positions[
-            token_indices_to_sample_padded.to(target_positions.device)
-        ]
+        positions = target_positions[token_indices_to_sample]
 
         # `hidden_states` is deliberately not gathered here -- #821 moved
         # that gather inside `model_wrapper`. Doing it again would index an
@@ -284,6 +290,10 @@ class RBLNEagleProposer(EagleProposer):
         Equivalent to upstream's scatter-then-argmax for a monotonic mapping:
         both pick the same winner, and on an exact tie both pick the lowest id.
         """
+        # The ids are a graph output, so they arrive on the device: this is the
+        # one small D2H of a draft pass, and the mapping, the stack and `tolist`
+        # stay on the host after it.
+        draft_token_ids = draft_token_ids.cpu()
         d2t = self.draft_id_to_target_id
         if d2t is None:
             return draft_token_ids.long().clone()
@@ -314,6 +324,9 @@ class RBLNEagleProposer(EagleProposer):
         assert backup_tokens_gpu.dtype == torch.int32
 
         batch_size = sampled_token_ids.shape[0]
+        # A step without drafts samples on the device; meet the backup ids where
+        # this proposer keeps them (the host here, the device for DFlash).
+        sampled_token_ids = sampled_token_ids.to(backup_tokens_gpu.device)
         return eagle_prepare_next_token_padded(
             sampled_token_ids,
             discard_request_mask[:batch_size],
@@ -369,6 +382,9 @@ class RBLNEagleProposer(EagleProposer):
         super().load_model(target_model)
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
+        if self.draft_id_to_target_id is not None:
+            # Read next to the host-side draft ids in `_to_target_token_ids`.
+            self.draft_id_to_target_id = self.draft_id_to_target_id.cpu()
 
         # Fused MoE is the only reader of the step's padded token dimension, so a
         # draft without it runs no collective of its own -- which is what lets an
@@ -679,7 +695,7 @@ class RBLNEagleProposer(EagleProposer):
             if token_indices_to_sample is None:
                 assert cad is not None
                 token_indices_to_sample = cad.query_start_loc[1:] - 1
-            token_indices_to_sample = token_indices_to_sample.to(self.device)
+            token_indices_to_sample = token_indices_to_sample.cpu()
 
             self.input_ids[: num_input_tokens - 1] = target_token_ids[1:]
             self.input_ids[token_indices_to_sample] = next_token_ids

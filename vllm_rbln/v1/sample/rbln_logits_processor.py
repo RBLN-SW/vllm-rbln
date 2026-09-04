@@ -35,37 +35,54 @@ logger = init_logger(__name__)
 
 
 class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
-    # index_put_ requires the value dtype to exactly match the logits
-    # dtype, and two dtypes reach one instance within a single spec-decode
-    # step: apply() sees model-dtype logits from the RBLN sampler, while
-    # apply_with_spec_decode() sees the float32-upcast target logits from
-    # the rejection sampler. The -inf constant is therefore synced to the
-    # incoming logits dtype per call, with one cached tensor per dtype.
+    # index_put_ requires the value dtype and device to exactly match the
+    # logits, and two kinds of logits reach one instance within a single
+    # spec-decode step: apply() sees model-dtype logits on the device from the
+    # RBLN sampler, while apply_with_spec_decode() sees the float32-upcast
+    # target logits the rejection sampler works on (host tensors, see
+    # RBLNModelRunner._sample). The -inf constant is therefore synced to the
+    # incoming logits per call, with one cached tensor per (dtype, device),
+    # and the spec-decode path builds its index tensors on the logits device.
     neg_inf_tensor: torch.Tensor
 
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
     ):
         super().__init__(vllm_config, device, is_pin_memory)
-        self._neg_inf_tensors = {self.neg_inf_tensor.dtype: self.neg_inf_tensor}
+        self._neg_inf_tensors = {
+            (self.neg_inf_tensor.dtype, self.neg_inf_tensor.device): self.neg_inf_tensor
+        }
 
-    def _sync_neg_inf_dtype(self, dtype: torch.dtype):
-        tensor = self._neg_inf_tensors.get(dtype)
+    def _sync_neg_inf(self, logits: torch.Tensor):
+        key = (logits.dtype, logits.device)
+        tensor = self._neg_inf_tensors.get(key)
         if tensor is None:
-            tensor = self._neg_inf_tensors[dtype] = self.neg_inf_tensor.to(dtype)
+            # Built fresh rather than copied across from the original, which
+            # may sit on the other device.
+            tensor = self._neg_inf_tensors[key] = torch.tensor(
+                -float("inf"), dtype=logits.dtype, device=logits.device
+            )
         self.neg_inf_tensor = tensor
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if self.min_toks:
-            self._sync_neg_inf_dtype(logits.dtype)
+            self._sync_neg_inf(logits)
         return super().apply(logits)
 
     def apply_with_spec_decode(
         self, logits: torch.Tensor, num_draft_tokens: list[int]
     ) -> torch.Tensor:
-        if self.min_toks:
-            self._sync_neg_inf_dtype(logits.dtype)
-        return super().apply_with_spec_decode(logits, num_draft_tokens)
+        if not self.min_toks:
+            return logits
+        self._sync_neg_inf(logits)
+        # Upstream allocates the row / token index tensors on `self.device`,
+        # which is where update_state() keeps the non-spec `logits_slice`; the
+        # spec-decode logits may live elsewhere, so point it at them for the call.
+        device, self.device = self.device, logits.device
+        try:
+            return super().apply_with_spec_decode(logits, num_draft_tokens)
+        finally:
+            self.device = device
 
 
 class RBLNLogitBiasLogitsProcessor(LogitBiasLogitsProcessor):

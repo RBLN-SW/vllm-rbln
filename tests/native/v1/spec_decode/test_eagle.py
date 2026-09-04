@@ -326,13 +326,11 @@ class TestInitGuards:
 
 class TestToTargetTokenIds:
     def test_applies_d2t_as_an_offset(self):
-        # d2t holds offsets, not absolute target ids: id -> id + d2t[id]. Both
-        # operands sit on the proposer's device, so this is the gather production
-        # runs -- the reason the mapping moved out of the compiled graph.
+        # d2t holds offsets, not absolute target ids: id -> id + d2t[id]. The
+        # ids arrive on the device and d2t sits on the host (load_model puts it
+        # there), so this is the gather production runs.
         proposer = make_eagle_proposer()
-        proposer.draft_id_to_target_id = torch.tensor(
-            [0, 2, 3, 5, 8], dtype=torch.long, device=proposer.device
-        )
+        proposer.draft_id_to_target_id = torch.tensor([0, 2, 3, 5, 8], dtype=torch.long)
         draft_ids = torch.tensor(
             [0, 1, 4, 2], dtype=torch.int64, device=proposer.device
         )
@@ -364,7 +362,7 @@ class TestToTargetTokenIds:
         )
         full_logits[:, target_ids] = draft_logits
         proposer = make_eagle_proposer()
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
 
         out = proposer._to_target_token_ids(
             draft_logits.argmax(dim=-1).to(proposer.device)
@@ -446,7 +444,7 @@ class TestPropose:
         proposer.model_executable = _fake_model_exec([42, 60], proposer.hidden_size)
         d2t = torch.zeros(128, dtype=torch.long)
         d2t[42], d2t[60] = 5, 7
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
 
         out = _call_propose(proposer)
 
@@ -461,7 +459,7 @@ class TestPropose:
         _wire_runner(proposer, num_reqs=2)
         d2t = torch.zeros(128, dtype=torch.long)
         d2t[1], d2t[2], d2t[3], d2t[4] = 2, 3, 5, 8
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
         argmax_per_call = [[1, 3], [2, 4]]
         seen: list[torch.Tensor] = []
 

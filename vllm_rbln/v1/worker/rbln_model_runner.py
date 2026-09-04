@@ -1093,8 +1093,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        # Stays on the host: the rejection sampler runs there (see `_sample`).
         draft_token_ids = self.input_ids[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1].to(self.device)
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -1315,6 +1316,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     spec_decode_metadata, bucket
                 )
                 sampling_metadata = _pad_sampling_metadata(sampling_metadata, bucket)
+            # The logits came to the host in execute_model; the input batch keeps
+            # its sampling tensors on the device, so bring the few read here along.
+            sampling_metadata = _sampling_metadata_to_host(sampling_metadata)
             out = self.rejection_sampler(
                 spec_decode_metadata,
                 None,  # draft_probs
@@ -1732,7 +1736,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
             if not self.is_prefill and spec_decode_metadata is not None:
-                logits = logits[logits_indices]
+                # NOTE(RBLN): a speculative step samples on the host, and this is
+                # its one D2H. torch-rbln runs int/bool/fp32 eager ops through a
+                # CPU fallback, so the int64 gather below and everything the
+                # rejection sampler does would otherwise round-trip the host op
+                # by op. The step without drafts keeps the device sampler.
+                logits = logits.cpu()[logits_indices]
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -3277,20 +3286,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         batch_size = self.bucketing_manager.max_batch_size
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
-        draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+        # The op is fed host tensors (see RBLNRejectionSampler).
+        device = torch.device("cpu")
+        draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
         target_probs = torch.zeros(
-            num_tokens, vocab_size, dtype=torch.float32, device=self.device
+            num_tokens, vocab_size, dtype=torch.float32, device=device
         )
         cu_num_draft_tokens = torch.arange(
             num_spec,
             num_tokens + 1,
             num_spec,
             dtype=torch.int32,
-            device=self.device,
+            device=device,
         )
-        bonus_token_ids = torch.zeros(
-            batch_size, 1, dtype=torch.int64, device=self.device
-        )
+        bonus_token_ids = torch.zeros(batch_size, 1, dtype=torch.int64, device=device)
         dummy_sampling_metadata = SamplingMetadata(
             temperature=None,
             all_greedy=True,
@@ -3467,6 +3476,32 @@ def _pad_spec_decode_metadata(
         cu_num_sampled_tokens=_pad_rows(md.cu_num_sampled_tokens, bucket),
         bonus_logits_indices=_pad_rows(md.bonus_logits_indices, bucket),
     )
+
+
+def _sampling_metadata_to_host(md: SamplingMetadata) -> SamplingMetadata:
+    """Copy the tensor fields a rejection-sampling step reads to the host.
+
+    `logitsprocs` is left as is: a logits processor with device state is not
+    served by the host sampling path.
+    """
+
+    fields = (
+        "temperature",
+        "top_p",
+        "top_k",
+        "allowed_token_ids_mask",
+        "frequency_penalties",
+        "presence_penalties",
+        "repetition_penalties",
+        "prompt_token_ids",
+    )
+    moved = {
+        name: t.cpu()
+        for name in fields
+        if (t := getattr(md, name)) is not None and t.device.type != "cpu"
+    }
+    # Already on the host (the host-tensor path): hand the metadata through.
+    return dataclasses.replace(md, **moved) if moved else md
 
 
 def _pad_sampling_metadata(md: SamplingMetadata, bucket: int) -> SamplingMetadata:
