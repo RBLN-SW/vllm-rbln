@@ -49,7 +49,7 @@ logger = init_logger(__name__)
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
 # sysfs lists every card on the host, /dev only ours; reading sysfs by the raw
-# RBLN_DEVICES entry would charge a neighbouring container's workload to us.
+# RBLN_VISIBLE_DEVICES entry would charge a neighbouring container's workload to us.
 RBLN_DEV_DIR = "/dev"
 
 # 144 GiB of quad-chiplet DRAM minus the 4 GiB system region
@@ -117,13 +117,13 @@ def num_attn_module(model_config, cache_dtype) -> int:
 
 
 def get_rbln_visible_card_indices() -> list[int]:
-    """Card indices this process may use, from `RBLN_DEVICES`.
+    """Card indices this process may use, from `RBLN_VISIBLE_DEVICES`.
 
     Unset or empty means every card under /sys/class/rebellions. Prefer
     `get_rbln_owned_card_indices`; this one reads each entry as a sysfs card
     name and remains only as the fallback for hosts with no device nodes.
     """
-    raw = os.environ.get("RBLN_DEVICES", "")
+    raw = os.environ.get("RBLN_VISIBLE_DEVICES", "")
     if raw.strip():
         return sorted(
             {int(token) for token in raw.replace(",", " ").split() if token.strip()}
@@ -154,7 +154,7 @@ def _rbln_present_card_indices() -> list[int]:
 
 
 def get_rbln_owned_card_indices() -> list[int]:
-    """sysfs card indices this process owns, with `RBLN_DEVICES` resolved.
+    """sysfs card indices this process owns, with `RBLN_VISIBLE_DEVICES` resolved.
 
     Entry `i` selects the `i`-th present device; a physical name is accepted too,
     but the positional reading wins when both are possible.
@@ -164,7 +164,7 @@ def get_rbln_owned_card_indices() -> list[int]:
         # No device nodes (unit tests, host without the driver): nothing better
         # is knowable, so keep the previous behaviour exactly.
         return get_rbln_visible_card_indices()
-    raw = os.environ.get("RBLN_DEVICES", "")
+    raw = os.environ.get("RBLN_VISIBLE_DEVICES", "")
     if not raw.strip():
         return present
     owned: list[int] = []

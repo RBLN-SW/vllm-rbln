@@ -1038,13 +1038,13 @@ class TestReplicationFactorIsGated:
 # ---------------------------------------------------------------------------
 class TestRblnSysfsReaders:
     def test_visible_indices_from_env(self):
-        with patch.dict(os.environ, {"RBLN_DEVICES": "2,0,1"}):
+        with patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "2,0,1"}):
             assert get_rbln_visible_card_indices() == [0, 1, 2]
 
     def test_owned_indices_resolve_container_local_numbering(self, tmp_path):
-        """`RBLN_DEVICES` indexes the container's devices, not sysfs card names.
+        """`RBLN_VISIBLE_DEVICES` indexes the container's devices, not sysfs card names.
 
-        Measured on a container exposing /dev/rbln4..7: `RBLN_DEVICES=4,5,6,7`
+        Measured on a container exposing /dev/rbln4..7: `RBLN_VISIBLE_DEVICES=4,5,6,7`
         enumerates zero logical devices, `0,1,2,3` works, and holding `rbln:0`
         there put the context on physical rbln4. So entry `i` is the `i`-th
         present device and must not be used as a sysfs name.
@@ -1052,7 +1052,7 @@ class TestRblnSysfsReaders:
         for index in (4, 5, 6, 7):
             (tmp_path / f"rbln{index}").touch()
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "0,1,2,3"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0,1,2,3"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(tmp_path)),
         ):
             assert get_rbln_owned_card_indices() == [4, 5, 6, 7]
@@ -1063,7 +1063,7 @@ class TestRblnSysfsReaders:
         for index in (4, 5, 6, 7):
             (tmp_path / f"rbln{index}").touch()
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "4,5,6,7"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "4,5,6,7"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(tmp_path)),
         ):
             assert get_rbln_owned_card_indices() == [4, 5, 6, 7]
@@ -1072,7 +1072,7 @@ class TestRblnSysfsReaders:
         """No /dev/rbln* (unit env, host without the driver) keeps the previous
         behaviour exactly rather than guessing."""
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "1,2"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "1,2"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(tmp_path)),
         ):
             assert get_rbln_owned_card_indices() == [1, 2]
@@ -1097,7 +1097,7 @@ class TestRblnSysfsReaders:
             card.mkdir()
             (card / "dram_used").write_text("0\n")
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "0,1,2,3"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0,1,2,3"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):
@@ -1117,7 +1117,7 @@ class TestRblnSysfsReaders:
         (sysfs / "rbln4" / "dram_used").write_text("0\n")
         (sysfs / "rbln5" / "dram_used").write_text("2048\n")
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0,1"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):
@@ -1128,14 +1128,14 @@ class TestRblnSysfsReaders:
             (tmp_path / f"rbln{index}").mkdir()
         (tmp_path / "rsd0").mkdir()
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": ""}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": ""}),
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(tmp_path)),
         ):
             assert get_rbln_visible_card_indices() == [0, 1, 3]
 
     def test_dram_total_is_none_without_sysfs(self, tmp_path):
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": ""}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": ""}),
             patch(
                 "vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR",
                 str(tmp_path / "missing"),
@@ -1145,7 +1145,7 @@ class TestRblnSysfsReaders:
             assert read_rbln_card_dram_used_bytes() == 0
 
     def test_dram_total_reads_uniform_capacity(self, tmp_path):
-        # RBLN_DEV_DIR must be patched too: both readers resolve RBLN_DEVICES
+        # RBLN_DEV_DIR must be patched too: both readers resolve RBLN_VISIBLE_DEVICES
         # against the device nodes actually present, so leaving /dev alone makes
         # the result depend on the host's card numbering. On a container exposing
         # /dev/rbln4..7 "0,1" resolves to cards 4 and 5, which this fake sysfs
@@ -1161,7 +1161,7 @@ class TestRblnSysfsReaders:
             (card / "dram_used").write_text(f"{index * 1024}\n")
             (dev / f"rbln{index}").touch()
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0,1"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):
@@ -1185,7 +1185,7 @@ class TestRblnSysfsReaders:
             (card / "dram_total").write_text(f"{size}\n")
             (dev / f"rbln{index}").touch()
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0,1"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
             pytest.raises(RuntimeError, match="different dram_total"),
@@ -1195,7 +1195,7 @@ class TestRblnSysfsReaders:
     def test_dram_total_ignores_cards_we_do_not_own(self, tmp_path):
         """Capacity must come from our own cards, like `dram_used`.
 
-        A container holding /dev/rbln4..7 with RBLN_DEVICES=0,1 owns physical
+        A container holding /dev/rbln4..7 with RBLN_VISIBLE_DEVICES=0,1 owns physical
         cards 4 and 5. Reading the raw entry instead would report card 0's
         capacity -- somebody else's card, and a different SKU here.
         """
@@ -1215,7 +1215,7 @@ class TestRblnSysfsReaders:
             (card / "dram_total").write_text("75161927680\n")
 
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "0,1"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0,1"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):
@@ -1250,7 +1250,7 @@ class TestRblnSysfsReaders:
         (card / "dram_total").write_text(f"{reported}\n")
         (dev / "rbln0").touch()
         with (
-            patch.dict(os.environ, {"RBLN_DEVICES": "0"}),
+            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0"}),
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):

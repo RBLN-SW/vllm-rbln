@@ -55,6 +55,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
+from vllm.platforms.interface import (
+    get_assigned_physical_gpu_ids,
+    set_assigned_physical_gpu_ids,
+)
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
@@ -183,9 +187,10 @@ class RBLNWorker(WorkerBase):
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             self._foreign_dram_used_bytes = read_rbln_card_dram_used_bytes()
             logger.debug(
-                "foreign device DRAM at worker init: %d bytes (RBLN_DEVICES=%s)",
+                "foreign device DRAM at worker init: %d bytes "
+                "(RBLN_VISIBLE_DEVICES=%s)",
                 self._foreign_dram_used_bytes,
-                os.environ.get("RBLN_DEVICES", ""),
+                os.environ.get("RBLN_VISIBLE_DEVICES", ""),
             )
 
         self.profiler: Any | None = None
@@ -205,44 +210,30 @@ class RBLNWorker(WorkerBase):
         pass
 
     def _init_device_env(self) -> None:
-        world_size = self.parallel_config.world_size // envs.VLLM_RBLN_NUM_RAY_NODES
         env_var = current_platform.device_control_env_var
-
         num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
-        total_device_count = world_size * num_devices
 
-        if env_var not in os.environ:
-            dev_begin = total_device_count * self.parallel_config.data_parallel_rank
-            dev_end = dev_begin + total_device_count
-            device_ids = [str(i) for i in range(dev_begin, dev_end)]
-            start_idx = self.local_rank * num_devices
-            end_idx = start_idx + num_devices
-            selected_devices = ",".join(device_ids[start_idx:end_idx])
-        else:
-            # vLLM 0.24 stopped narrowing the device-control env var per DP rank
-            # and puts the mapping on the config instead, so under DP the env var
-            # now holds the whole deployment's list (vllm/v1/engine/utils.py,
-            # set_assigned_physical_gpu_ids_for_dp_rank). getattr: older vLLM has
-            # no such field.
-            assigned = getattr(self.parallel_config, "assigned_physical_gpu_ids", None)
-            if assigned:
-                device_ids = [str(i) for i in assigned]
-            else:
-                device_ids = os.environ[env_var].split(",")
-            assert len(device_ids) == world_size, (
-                f"device_ids: {device_ids} should have device count: {world_size}"
-            )
-            try:
-                device_id = int(device_ids[self.local_rank])
-                start_idx = device_id * num_devices
-                end_idx = start_idx + num_devices
-                device_ids = [str(i) for i in range(start_idx, end_idx)]
-                selected_devices = ",".join(device_ids)
-            except ValueError as e:
-                raise ValueError(
-                    f"device_ids: {device_ids} should be a list of integers"
-                ) from e
+        # UniProcExecutor never publishes the mapping, so publish it here rather
+        # than only reading it.
+        assigned = self.parallel_config.assigned_physical_gpu_ids
+        if assigned and get_assigned_physical_gpu_ids() is None:
+            set_assigned_physical_gpu_ids(assigned)
 
+        first = self.local_rank * num_devices
+        try:
+            selected = [
+                current_platform.device_id_to_physical_device_id(first + offset)
+                for offset in range(num_devices)
+            ]
+        except IndexError as e:
+            raise ValueError(
+                f"local rank {self.local_rank} needs {num_devices} NPU(s) from "
+                f"index {first} of {env_var}="
+                f"{os.environ.get(env_var, '')!r}, or of the data parallel "
+                f"mapping when one is in effect. One entry per NPU is expected."
+            ) from e
+
+        selected_devices = ",".join(str(device) for device in selected)
         os.environ[env_var] = selected_devices
         logger.info(
             "Local rank: %d, Selected devices: %s",

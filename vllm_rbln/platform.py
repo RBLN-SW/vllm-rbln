@@ -51,6 +51,8 @@ USE_DEVICE_TENSOR: bool = (
 )
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
+# Superseded by RblnPlatform.device_control_env_var.
+DEPRECATED_DEVICE_CONTROL_ENV_VAR = "RBLN_DEVICES"
 
 
 def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
@@ -73,7 +75,7 @@ class RblnPlatform(Platform):
     dist_backend: str = "rbln-ccl" if USE_DEVICE_TENSOR else ""
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
-    device_control_env_var: str = "RBLN_DEVICES"
+    device_control_env_var: str = "RBLN_VISIBLE_DEVICES"
     simple_compile_backend = "bypass"
 
     @classmethod
@@ -220,10 +222,33 @@ class RblnPlatform(Platform):
         EngineArgs._rbln_user_mnbt_patched = True
 
     @classmethod
+    def _adopt_deprecated_device_control_env_var(cls) -> None:
+        """Fold ``RBLN_DEVICES`` into ``device_control_env_var`` and unset it.
+
+        The runtime takes both names but prefers ``RBLN_DEVICES``, so one left
+        in the environment would override the pool a worker narrows itself to
+        and put every rank on the same NPUs.
+        """
+        legacy = os.environ.pop(DEPRECATED_DEVICE_CONTROL_ENV_VAR, None)
+        if legacy is None:
+            return
+        in_effect = os.environ.setdefault(cls.device_control_env_var, legacy)
+        logger.warning_once(
+            "%s is deprecated and will be removed in a future release. Please "
+            "use %s instead; this run uses %s=%s.",
+            DEPRECATED_DEVICE_CONTROL_ENV_VAR,
+            cls.device_control_env_var,
+            cls.device_control_env_var,
+            in_effect,
+        )
+
+    @classmethod
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
-        # Runs before max_num_seqs is resolved from None to its default.
+        # Early enough that vLLM has read neither the device-control env var nor
+        # max_num_seqs, which is still None here.
+        cls._adopt_deprecated_device_control_env_var()
         cls._override_default_max_num_seqs()
         cls._capture_user_max_num_batched_tokens()
 
