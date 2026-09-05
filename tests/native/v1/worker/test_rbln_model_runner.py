@@ -1402,6 +1402,7 @@ class TestDummyRunPPIntermediateTensors:
             vllm_config=SimpleNamespace(),
             input_stager=SimpleNamespace(stage=stage),
             model_executable=lambda **k: None,
+            intermediate_tensors_dict={},
         )
         monkeypatch.setattr(RBLNModelRunner, "use_wrapped_compute_logits", False)
         monkeypatch.setattr(
