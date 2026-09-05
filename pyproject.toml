@@ -70,7 +70,7 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler~=0.11.3.dev96",
+    "rebel-compiler~=0.11.3.dev235",
 ]
 
 
