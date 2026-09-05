@@ -86,6 +86,8 @@ def compile(
     cache_dir: str = "",
     use_static_output: bool = False,
     use_direct_dispatch: bool = False,
+    hash_param_repr: str = "",
+    buffer_namespace: str | None = None,
 ) -> CompiledTarget:
     if use_direct_dispatch and not fullgraph:
         # A dispatched call runs one code object, so whatever Dynamo leaves
@@ -118,6 +120,8 @@ def compile(
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
     set_option("use_static_output", use_static_output)
+    set_option("hash_param_repr", hash_param_repr)
+    set_option("buffer_namespace", buffer_namespace)
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
         set_option("mega_cache_only", True)

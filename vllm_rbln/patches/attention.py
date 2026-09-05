@@ -23,6 +23,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 from vllm.v1.attention.backend import AttentionMetadata, AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from vllm_rbln.compilation.layerwise import layer_slot
 from vllm_rbln.patches import register_patch
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionBackend,
@@ -127,7 +128,9 @@ def patched_get_attention_context(
     forward_context = get_forward_context()
     attn_metadata_raw = forward_context.attn_metadata
     attn_metadata: AttentionMetadata
-    if isinstance(attn_metadata_raw, dict):
+    if layer_slot.bound:
+        attn_metadata = layer_slot.attn_metadata_for(layer_name)
+    elif isinstance(attn_metadata_raw, dict):
         attn_metadata = attn_metadata_raw[layer_name]
     elif isinstance(attn_metadata_raw, list):
         # list[dict[str, AttentionMetadata]]: used in speculative decoding
@@ -135,7 +138,11 @@ def patched_get_attention_context(
         attn_metadata = attn_metadata_raw[0][layer_name]
     else:
         attn_metadata = attn_metadata_raw
-    attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]
+    attn_layer: Attention | MLAAttention
+    if layer_slot.bound:
+        attn_layer = layer_slot.attn_layer_for(layer_name)
+    else:
+        attn_layer = forward_context.no_compile_layers[layer_name]
 
     slot_mapping = forward_context.slot_mapping
     assert isinstance(slot_mapping, dict), (
@@ -185,7 +192,10 @@ def patched_unified_attention_with_output(
     # NOTE(RBLN) - To represent kv cache as model input, resolve it from
     # attention metadata here (a graph input) instead of using the attention
     # layer's embedded kv cache (self.kv_cache, a baked module attribute).
-    kv_cache = _resolve_kv_cache(attn_metadata, attn.layer_index)
+    if layer_slot.bound:
+        kv_cache = layer_slot.kv_cache_for(layer_name)
+    else:
+        kv_cache = _resolve_kv_cache(attn_metadata, attn.layer_index)
     attn.impl.forward(
         attn,
         query,

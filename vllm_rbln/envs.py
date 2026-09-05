@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_LAYERWISE_COMPILE: bool = False
+    VLLM_RBLN_LAYERWISE_GROUP_SIZE: int = 1
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
@@ -230,6 +232,20 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Compile each decoder layer as its own graph (plus an embedding and a
+    # norm+logits shell) instead of the whole model as one graph. Layers whose
+    # graphs hash alike share one artifact, so compile time stops scaling with
+    # the layer count. Requires VLLM_RBLN_USE_DEVICE_TENSOR=1.
+    "VLLM_RBLN_LAYERWISE_COMPILE": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_LAYERWISE_COMPILE", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Decoder layers per compiled region under VLLM_RBLN_LAYERWISE_COMPILE.
+    "VLLM_RBLN_LAYERWISE_GROUP_SIZE": lambda: int(
+        os.environ.get("VLLM_RBLN_LAYERWISE_GROUP_SIZE", 1)
+    ),
     # Compile-only mode for NPU-less (CPU-only) hosts such as CI build workers.
     # When set, the rbln torch.compile backend compiles + caches each graph and
     # builds its runtime on a dummy device (no NPU required); the populated
@@ -392,6 +408,8 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_USE_VLLM_MODEL",
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_COMPILE_MODEL",
+        "VLLM_RBLN_LAYERWISE_COMPILE",
+        "VLLM_RBLN_LAYERWISE_GROUP_SIZE",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",

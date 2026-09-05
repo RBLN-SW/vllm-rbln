@@ -15,10 +15,11 @@
 import collections
 import dataclasses
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
 from functools import partial
+from itertools import islice
 from typing import Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -2133,38 +2134,150 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model_executable = model_wrapper
             self.compute_logits = self.model.compute_logits
         else:
-            process_group_dict = build_process_group_dict()
-            self.model_executable = compile(
-                model_wrapper,
+            compile_kwargs = dict(
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
                 num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=process_group_dict,
+                process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                 # Logits are consumed by sampling within the same step, so the
                 # output buffer can be reused across steps even under async scheduling.
                 use_static_output=True,
-                use_direct_dispatch=True,
             )
+            if envs.VLLM_RBLN_LAYERWISE_COMPILE:
+                self.model_executable = self._build_layerwise_executable(compile_kwargs)
+            else:
+                self.model_executable = compile(
+                    model_wrapper, use_direct_dispatch=True, **compile_kwargs
+                )
             # NOTE(RBLN): We compile compute_logits separately to cover cases when
             # `self.use_wrapped_compute_logits` is `False`
-            self.compute_logits = compile(
-                self.model.compute_logits,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.compile_context,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=process_group_dict,
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_static_output=True,
+            self.compute_logits = compile(self.model.compute_logits, **compile_kwargs)
+
+    def _build_layerwise_executable(self, compile_kwargs: dict) -> Callable:
+        """One compiled region per group of decoder layers, plus an embedding region
+        and a norm+logits region. Groups hash alike (weight values excluded, KV cache
+        and attention metadata read through `layer_slot`), so the compiler builds one
+        artifact per distinct group graph and instances it per group under its own
+        buffer namespace."""
+        from vllm_rbln.compilation.layerwise import (
+            group_layers,
+            layer_slot,
+            single_attention,
+            with_own_code,
+        )
+        from vllm_rbln.patches.attention import (
+            _resolve_kv_cache,
+            patched_get_attention_context,
+        )
+
+        if not USE_DEVICE_TENSOR:
+            raise NotImplementedError(
+                "VLLM_RBLN_LAYERWISE_COMPILE requires VLLM_RBLN_USE_DEVICE_TENSOR=1"
             )
+        if get_pp_group().world_size != 1:
+            raise NotImplementedError("VLLM_RBLN_LAYERWISE_COMPILE supports PP=1 only")
+        if self.use_aux_hidden_state_outputs or self.drafter is not None:
+            raise NotImplementedError(
+                "VLLM_RBLN_LAYERWISE_COMPILE does not support speculative decoding yet"
+            )
+
+        decoder = self.model.model
+        layers = list(islice(decoder.layers, decoder.start_layer, decoder.end_layer))
+        groups = group_layers(layers, envs.VLLM_RBLN_LAYERWISE_GROUP_SIZE)
+        group_attns = [[single_attention(layer) for layer in group] for group in groups]
+
+        def embed_region(input_ids: torch.Tensor) -> torch.Tensor:
+            return decoder.embed_input_ids(input_ids)
+
+        def make_layer_region(group: list[torch.nn.Module]) -> Callable:
+            def layer_region(
+                positions: torch.Tensor,
+                hidden_states: torch.Tensor,
+                residual: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                for layer in group:
+                    hidden_states, residual = layer(positions, hidden_states, residual)
+                return hidden_states, residual
+
+            return with_own_code(layer_region)
+
+        def head_region(
+            hidden_states: torch.Tensor,
+            residual: torch.Tensor,
+            token_indices: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            hidden_states, _ = decoder.norm(hidden_states, residual)
+            logits = None
+            if self.use_wrapped_compute_logits and self.logits_processor is not None:
+                if token_indices is not None:
+                    hidden_states = hidden_states[:, token_indices]
+                logits = self.model.compute_logits(hidden_states)
+                logits = logits.view(-1, logits.size(-1))
+            return hidden_states, logits
+
+        embed_exec = compile(embed_region, use_direct_dispatch=True, **compile_kwargs)
+        layer_execs = [
+            compile(
+                make_layer_region(group),
+                use_direct_dispatch=True,
+                hash_param_repr="structural",
+                buffer_namespace=f"layers{idx}",
+                **compile_kwargs,
+            )
+            for idx, group in enumerate(groups)
+        ]
+        head_exec = compile(head_region, use_direct_dispatch=True, **compile_kwargs)
+        zero_residuals: dict[tuple, torch.Tensor] = {}
+
+        def model_wrapper(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            intermediate_tensors: IntermediateTensors | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            token_indices: torch.Tensor | None = None,
+            **kwargs,
+        ):
+            if intermediate_tensors is not None or kwargs:
+                raise NotImplementedError(
+                    "VLLM_RBLN_LAYERWISE_COMPILE got model inputs it does not route: "
+                    f"intermediate_tensors={intermediate_tensors is not None}, "
+                    f"kwargs={sorted(kwargs)}"
+                )
+            hidden_states = (
+                inputs_embeds if inputs_embeds is not None else embed_exec(input_ids)
+            )
+            # Layer 0 gets a zero residual instead of None so its graph matches the
+            # other layers' (fused add + norm of x + 0 == norm of x).
+            key = (hidden_states.shape, hidden_states.dtype, hidden_states.device)
+            residual = zero_residuals.get(key)
+            if residual is None:
+                residual = zero_residuals[key] = torch.zeros_like(hidden_states)
+            try:
+                for attns, layer_exec in zip(group_attns, layer_execs):
+                    layer_slot.clear()
+                    attn_metadatas = [
+                        patched_get_attention_context(attn.layer_name)[0]
+                        for attn in attns
+                    ]
+                    kv_caches = [
+                        _resolve_kv_cache(attn_metadata, attn.layer_index)
+                        for attn, attn_metadata in zip(attns, attn_metadatas)
+                    ]
+                    layer_slot.bind(attns, attn_metadatas, kv_caches)
+                    hidden_states, residual = layer_exec(
+                        positions, hidden_states, residual
+                    )
+            finally:
+                layer_slot.clear()
+            hidden_states, logits = head_exec(hidden_states, residual, token_indices)
+            return hidden_states, logits, None
+
+        return model_wrapper
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
