@@ -1183,9 +1183,11 @@ class RBLNWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
         intermediate_tensors = None
-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
 
-        if forward_pass and not get_pp_group().is_first_rank:
+        if (
+            scheduler_output.total_num_scheduled_tokens > 0
+            and not get_pp_group().is_first_rank
+        ):
             intermediate_tensors = self.model_runner.recv_intermediate_tensors()
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
