@@ -47,6 +47,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.worker.dp_utils import determine_batch_execution_and_padding
 
 
 class RBLNDFlashProposer(DFlashProposer):
@@ -63,13 +64,12 @@ class RBLNDFlashProposer(DFlashProposer):
 
     @staticmethod
     def _require_dense_drafter(draft_model) -> None:
-        """Fused MoE reads the token dimension `_run_query_pass` does not pad."""
+        """Fused MoE would require DP-idle ranks to join the draft collectives."""
         if any(isinstance(module, MoERunner) for module in draft_model.modules()):
             raise NotImplementedError(
                 "The DFlash drafter cannot carry fused MoE on RBLN: the draft "
-                "pass runs at this rank's own token count rather than the "
-                "padded batch the DP ranks agreed on, so its expert dimension "
-                "would disagree with its peers' and hang the group."
+                "pass skips DP-idle ranks, so a busy rank's expert collective "
+                "would wait for peers that never join it."
             )
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
@@ -741,6 +741,20 @@ class RBLNDFlashProposer(DFlashProposer):
             num_reqs, num_query_total, False, first_pass=False
         )
         num_reqs_padded = batch_desc.num_reqs_padded
+        status = self.runner.dp_status
+        if status is not None and not status.is_prefill[self.dp_rank]:
+            # A DP peer's phase or batch can widen target verification beyond
+            # this dense drafter's local bucket. Replay the target's pure shape
+            # decision from the published status, without another collective.
+            target_batch, _ = determine_batch_execution_and_padding(
+                cfg=self.runner.shape_config,
+                num_reqs=num_reqs,
+                num_tokens=status.num_tokens[self.dp_rank],
+                is_prefill=False,
+                status=status,
+            )
+            assert target_batch is not None
+            num_reqs_padded = target_batch.num_reqs_padded
         num_query_total_padded = num_reqs_padded * num_query_per_req
         assert num_query_total_padded <= self.max_num_tokens, (
             f"the {num_reqs_padded}-request decode bucket needs "
@@ -768,9 +782,11 @@ class RBLNDFlashProposer(DFlashProposer):
             self.vllm_config,
             num_tokens=num_query_total,
             num_tokens_across_dp=num_tokens_across_dp,
-            # None off the DP path, which `RBLNDPMetadata.make` requires; the
-            # token dimension the step settled on otherwise.
-            num_padded_tokens=batch_desc.num_tokens_padded,
+            # The dense drafter has no expert collective; its token dimension
+            # follows the query batch, independently of the target's query length.
+            num_padded_tokens=(
+                num_query_total_padded if num_tokens_across_dp is not None else None
+            ),
             **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
         ):
             return self.model_executable(

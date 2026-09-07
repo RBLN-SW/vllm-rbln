@@ -37,7 +37,11 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 
 import vllm_rbln.v1.spec_decode.dflash as dflash_module
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
-from vllm_rbln.v1.worker.dp_utils import DPStatus, ShapeConfig
+from vllm_rbln.v1.worker.dp_utils import (
+    DPStatus,
+    ShapeConfig,
+    determine_batch_execution_and_padding,
+)
 
 BLOCK_SIZE = 1024
 WINDOW = 2048
@@ -321,11 +325,8 @@ class TestPlatformRefusals:
 
 
 class TestDenseDrafterGuard:
-    """A fused-MoE drafter is refused rather than run. The draft pass keeps only
-    `num_tokens_across_dp` and drops the padded batch the ranks agreed on, so
-    its expert dimension would not match its peers' and the group would hang --
-    a silent stall, not an error. With MoE refused, a DP-idle rank may skip its
-    draft unconditionally: the drafter runs no collective of its own."""
+    """A DP-idle rank skips its draft, so a fused-MoE drafter would hang a busy
+    rank's expert collective. Dense drafters run no collective of their own."""
 
     @staticmethod
     def _model(*modules):
@@ -356,7 +357,15 @@ class TestQueryPassBatch:
     STALE = 99  # what a previous step left in the buffers
 
     def _proposer(
-        self, monkeypatch, num_reqs, *, dp_size=1, dp_status=None, max_tokens=None
+        self,
+        monkeypatch,
+        num_reqs,
+        *,
+        dp_size=1,
+        dp_status=None,
+        max_tokens=None,
+        specialized_moe_decode=False,
+        dp_rank=0,
     ):
         max_tokens = self.MAX_TOKENS if max_tokens is None else max_tokens
         proposer = RBLNDFlashProposer.__new__(RBLNDFlashProposer)
@@ -365,7 +374,7 @@ class TestQueryPassBatch:
                 decode_batch_buckets=self.BUCKETS,
                 find_bucket=lambda n: next(b for b in self.BUCKETS if b >= n),
                 max_num_tokens=max_tokens,
-                specialized_moe_decode=False,
+                specialized_moe_decode=specialized_moe_decode,
             ),
             dp_status=dp_status,
             kv_cache_bases=None,
@@ -374,7 +383,7 @@ class TestQueryPassBatch:
         proposer.vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(data_parallel_size=dp_size)
         )
-        proposer.dp_rank = 0
+        proposer.dp_rank = dp_rank
         proposer.draft_has_moe = False
         proposer.num_speculative_tokens = NUM_SPEC
         proposer.block_size = BLOCK_SIZE
@@ -513,3 +522,70 @@ class TestQueryPassBatch:
         proposer, _ = self._proposer(monkeypatch, num_reqs=3, max_tokens=3 * QUERY_LEN)
         with pytest.raises(AssertionError, match="decode bucket"):
             self._run(proposer, 3)
+
+    @pytest.mark.parametrize(
+        "tokens,reqs,prefill,idle,rank,specialized,expected_bucket",
+        [
+            ((8, 24), (1, 3), (False, False), (False, False), 0, True, 4),
+            ((24, 8), (3, 1), (False, False), (False, False), 1, True, 4),
+            ((8, 32), (1, 1), (False, True), (False, False), 0, True, 4),
+            ((8, 2), (1, 2), (False, False), (False, False), 0, True, 4),
+            ((32, 24), (1, 3), (True, False), (False, False), 0, True, 1),
+            ((8, 24), (1, 3), (False, False), (False, False), 0, False, 1),
+            ((8, 1), (1, 1), (False, False), (False, True), 0, True, 1),
+        ],
+        ids=[
+            "busier-peer",
+            "nonzero-rank",
+            "prefilling-peer",
+            "different-query-lengths",
+            "local-prefill",
+            "unspecialized",
+            "idle-peer",
+        ],
+    )
+    def test_dp_query_batch_matches_target(
+        self,
+        monkeypatch,
+        tokens,
+        reqs,
+        prefill,
+        idle,
+        rank,
+        specialized,
+        expected_bucket,
+    ):
+        status = DPStatus(
+            num_tokens=tokens,
+            num_reqs=reqs,
+            is_prefill=prefill,
+            is_idle=idle,
+            num_tokens_across_dp=torch.tensor(tokens, dtype=torch.int32),
+        )
+        num_reqs = reqs[rank]
+        proposer, calls = self._proposer(
+            monkeypatch,
+            num_reqs,
+            dp_size=2,
+            dp_status=status,
+            specialized_moe_decode=specialized,
+            dp_rank=rank,
+        )
+        target_batch, _ = determine_batch_execution_and_padding(
+            cfg=proposer.runner.shape_config,
+            num_reqs=num_reqs,
+            num_tokens=tokens[rank],
+            is_prefill=prefill[rank],
+            status=status,
+        )
+        assert target_batch.num_reqs_padded == expected_bucket
+
+        self._run(proposer, num_reqs)
+
+        assert calls.metadata[:2] == (num_reqs, expected_bucket)
+        assert calls.model == (
+            (expected_bucket, QUERY_LEN),
+            (expected_bucket, QUERY_LEN),
+            expected_bucket * NUM_SPEC,
+        )
+        assert calls.context["num_padded_tokens"] == expected_bucket * QUERY_LEN
