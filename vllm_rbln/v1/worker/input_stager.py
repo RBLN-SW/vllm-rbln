@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.sequence import IntermediateTensors
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ class InputBuffer:
 class StagedModelInputs:
     input_ids: torch.Tensor
     positions: torch.Tensor
-    intermediate_tensors: torch.Tensor | None
+    intermediate_tensors: IntermediateTensors | None
     inputs_embeds: torch.Tensor | None
     token_indices: torch.Tensor | None
     # For Eagle3 drafter
@@ -72,7 +73,7 @@ class InputStager:
         *,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         token_indices: torch.Tensor | None = None,
         hidden_states: torch.Tensor | None = None,
