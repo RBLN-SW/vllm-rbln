@@ -785,6 +785,37 @@ class TestPartialBlockReuse:
         assert match.num_tokens == 4
         manager.release_sub_block_match(match)
 
+    def test_allocate_slots_after_a_full_block_hit_plus_a_sub_block_match(self):
+        # A full-block hit and a sub-block match together: the tokens computed
+        # for the request stop inside a block, which upstream reads as a shared
+        # tail block to redirect through its own CoW copy.
+        manager = make_manager(8, 4, 10)
+        tokens0 = list(range(8 + 4))
+        req0 = make_request("0", tokens0, 8)
+        prefill_request(manager, req0)
+        manager.free(req0)
+        req1 = make_request("1", tokens0 + [800 + i for i in range(8)], 8)
+        computed_blocks, num_computed, _ = manager.get_computed_blocks(req1)
+        assert num_computed == 8
+        match = manager.get_computed_blocks_sub_block(req1, num_computed)
+        assert match is not None
+        assert match.num_tokens == 4
+
+        # num_computed, not num_computed + match.num_tokens: the sub-block
+        # tokens belong on the tokens-to-compute side (see the allocate_slots
+        # call in RBLNScheduler.schedule).
+        blocks = manager.allocate_slots(
+            req1,
+            req1.num_tokens - num_computed,
+            num_computed,
+            computed_blocks,
+        )
+
+        assert blocks is not None
+        # The hit block plus one for the rest: no extra CoW block was pulled.
+        assert len(manager.get_blocks(req1.request_id).blocks[0]) == 3
+        manager.apply_sub_block_match(match)
+
     def test_multi_prefill_no_stale_sub_block_match(self):
         # Two prefills sharing a prefix in the same step must not match each
         # other (KV not computed yet); a third request in the next step does.
