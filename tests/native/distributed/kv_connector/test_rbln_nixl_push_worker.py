@@ -21,7 +21,7 @@ import queue
 import threading
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -1495,7 +1495,7 @@ class TestSettleOnCoverage:
         w._recving_metadata = {
             "r0": SimpleNamespace(local_physical_block_ids=([4, 5, 6],))
         }
-        w._pending_completion_notifs = queue.Queue()
+        w._pending_completion_notifs = pw._CoverageNotifQueue(w)
         w.transfer_topo = MagicMock()
         return w
 
@@ -1525,6 +1525,34 @@ class TestSettleOnCoverage:
         worker._get_new_notifs()
 
         assert handed_through == [b"r0:4"]
+
+    def test_a_notification_queued_mid_drain_still_arrives_stripped(self):
+        """The writer thread puts into this queue throughout the step.
+
+        Stripping in a pass of its own left a window: a notification arriving
+        after that pass and before upstream's drain reached upstream still
+        prefixed, and upstream reads the prefix as part of the request id. No
+        request has that id, so the range is dropped -- and a request missing a
+        range never settles, which makes the loss silent until it hangs.
+        """
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:r0:1")
+        seen = []
+
+        def fake_base(self):
+            """Upstream's drain, with one more arriving part way through it."""
+            while True:
+                try:
+                    seen.append(self._pending_completion_notifs.get_nowait())
+                except queue.Empty:
+                    return set()
+                if len(seen) == 1:
+                    self._pending_completion_notifs.put(b"RBLNS:0:0:3:r1:1")
+
+        with patch.object(NixlPushConnectorWorker, "_get_new_notifs", fake_base):
+            worker._get_new_notifs()
+
+        assert seen == [b"r0:1", b"r1:1"]
 
     def test_a_writer_that_has_sent_part_does_not_settle_the_request(
         self, handed_through
