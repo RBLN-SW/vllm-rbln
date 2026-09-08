@@ -39,7 +39,7 @@ dependencies = [
     "pyyaml",
     "datasets>=4.0.0",
     "qwen_vl_utils",
-    "vllm==0.24.0+cpu",
+    "vllm==0.26.0+cpu",
     "fastapi[standard]<0.137",
     "torch",
     "torchvision",
@@ -180,10 +180,14 @@ environments = [
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
+# vllm>=0.26.0 requires torchcodec>=0.14 while optimum-rbln pins torchcodec==0.11.0.
+# torchcodec 0.13+ runs on any torch>=2.11 and optimum-rbln never imports it, so
+# the newer torchcodec is safe; drop this once optimum-rbln relaxes its pin.
+override-dependencies = ["torchcodec>=0.14"]
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.24.0/cpu"
+url = "https://wheels.vllm.ai/0.26.0/cpu"
 explicit = true
 
 [[tool.uv.index]]
