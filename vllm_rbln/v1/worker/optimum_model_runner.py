@@ -44,6 +44,7 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
 
 # from vllm.utils import LazyLoader, is_pin_memory_available)
@@ -248,7 +249,7 @@ class RBLNOptimumModelRunner(
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
-            max_num_blocks_per_req=None,
+            max_num_blocks_per_req=[cdiv(self.max_model_len, cache_config.block_size)],
             logitsprocs=logitsprocs,
             num_spec_tokens=0,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,

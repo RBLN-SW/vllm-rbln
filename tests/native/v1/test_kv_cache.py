@@ -79,12 +79,12 @@ class TestRBLNSlidingWindowSpec:
 
 class TestRBLNSlidingWindowManager:
     def test_num_blocks_to_allocate_is_one_when_empty(self):
-        assert _manager().get_num_blocks_to_allocate("r", 10, [], 0, 10) == 1
+        assert _manager().get_num_blocks_to_allocate("r", 10, [], 0, 0, 10) == 1
 
     def test_num_blocks_to_allocate_is_zero_when_present(self):
         m = _manager()
         m.req_to_blocks["r"] = [object()]
-        assert m.get_num_blocks_to_allocate("r", 10, [], 0, 10) == 0
+        assert m.get_num_blocks_to_allocate("r", 10, [], 0, 0, 10) == 0
 
     def test_allocate_new_blocks_first_call_allocates_one(self):
         pool = _pool()
@@ -145,7 +145,7 @@ class TestRBLNSlidingWindowManager:
             drop_eagle_block=False,
             alignment_tokens=None,
         )
-        assert hits == ([], [], [])
+        assert hits == (([], [], []), 0)
 
     def test_get_num_common_prefix_blocks_is_zero(self):
         assert _manager().get_num_common_prefix_blocks("r") == 0
@@ -204,7 +204,7 @@ class TestCoordinatorExternalTokens:
         return get_kv_cache_coordinator(
             kv_cache_config=config,
             max_model_len=block_size * 32,
-            max_num_batched_tokens=512,
+            max_in_flight_tokens=512,
             use_eagle=False,
             enable_caching=False,
             enable_kv_cache_events=False,
