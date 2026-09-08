@@ -107,6 +107,39 @@ class _StreamedSend:
     issued_hwm: int = 0
 
 
+class _CoverageNotifQueue(queue.Queue):
+    """Upstream's completion queue, with this connector's coverage prefix taken
+    off on the way out and a writer's reports held until its ranges cover the
+    request -- see `_writer_still_pending` for what that leaves upstream.
+
+    On the way out rather than in a pass of its own. The writer thread puts
+    into this queue throughout the step, so a pass that drained it, stripped
+    what it found and queued the results back left a window: a notification
+    arriving after that pass and before upstream's drain reached upstream still
+    prefixed, and upstream read the prefix as part of the request id. No
+    request has that id, so the range that notification carried was dropped --
+    and a request missing a range never settles (`_covers`), which makes the
+    loss silent until it hangs.
+    """
+
+    def __init__(self, worker: "RblnNixlPushConnectorWorker") -> None:
+        super().__init__()
+        self._worker = worker
+
+    def get_nowait(self) -> bytes:
+        """The next notification upstream should act on, or raise `Empty`.
+
+        Held-back notifications are consumed rather than returned, so the loop
+        upstream drains this with is unchanged: it ends on `Empty` either way.
+        """
+        while True:
+            notif = super().get_nowait()
+            worker = self._worker
+            writer, span, notif = worker._split_coverage(notif)
+            if not worker._writer_still_pending(notif, writer, span):
+                return notif
+
+
 class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     """Writes a request's KV to the consumer that registered for it.
 
@@ -133,6 +166,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         self._coverage_by_req: defaultdict[str, defaultdict[int, list[Span]]] = (
             defaultdict(lambda: defaultdict(list))
         )
+
+        # Replaces the plain queue upstream made, so its own drain is the only
+        # one and nothing can reach it unstripped.
+        self._pending_completion_notifs = _CoverageNotifQueue(self)
 
         self._early_push_enabled = push_stream_enabled(
             vllm_config,
@@ -350,31 +387,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         )
         self._push_writer_thread.start()
         logger.info("nixl-push-writer thread started (rank=%d)", self.tp_rank)
-
-    def _get_new_notifs(self) -> set[str]:
-        """Hold a streamed writer back until it has covered the request.
-
-        NOTE(RBLN): a streamed write reports once per batch, and upstream
-        counts one report per writing rank. It would settle the request on the
-        first few batches while the rest of it is still arriving, and host
-        staging would copy a half-filled buffer to the device. Each report
-        names the range it filled, so the ones before a writer's last are
-        dropped here and upstream is handed the shape it counts.
-        """
-        for notif in self._drain_completion_notifs():
-            writer, span, notif = self._split_coverage(notif)
-            if self._writer_still_pending(notif, writer, span):
-                continue
-            self._pending_completion_notifs.put(notif)
-        return super()._get_new_notifs()
-
-    def _drain_completion_notifs(self) -> list[bytes]:
-        notifs = []
-        while True:
-            try:
-                notifs.append(self._pending_completion_notifs.get_nowait())
-            except queue.Empty:
-                return notifs
 
     def _writer_still_pending(
         self, notif: bytes, writer: int | None, span: "Span | None"
