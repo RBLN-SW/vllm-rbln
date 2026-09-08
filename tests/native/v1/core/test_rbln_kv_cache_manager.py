@@ -353,7 +353,7 @@ class TestGetComputedBlocksSubBlock:
         # Two full blocks + the third block's first sub-block, then divergence.
         req1_tokens = list(range(2 * 8 + 4)) + [999] * 7
         req1 = make_request("1", req1_tokens, 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 2 * 8
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
@@ -369,7 +369,7 @@ class TestGetComputedBlocksSubBlock:
         prefill_request(manager, req0)
         manager.free(req0)
         req1 = make_request("1", tokens + [99, 99, 99], 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 2 * 8
         assert manager.get_computed_blocks_sub_block(req1, num_computed) is None
 
@@ -378,7 +378,7 @@ class TestGetComputedBlocksSubBlock:
         manager = make_manager(8, 4, 10)
         prefill_request(manager, make_request("0", list(range(8)), 8))
         req1 = make_request("1", [500 + i for i in range(2 * 8)], 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 0
         assert manager.get_computed_blocks_sub_block(req1, num_computed) is None
 
@@ -388,7 +388,7 @@ class TestGetComputedBlocksSubBlock:
         manager = make_manager(8, 4, 10)
         prefill_request(manager, make_request("0", list(range(8)), 8))
         req1 = make_request("1", [0, 1], 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert manager.get_computed_blocks_sub_block(req1, num_computed) is None
 
     def test_computed_tokens_capped_at_num_tokens_minus_one(self):
@@ -400,7 +400,7 @@ class TestGetComputedBlocksSubBlock:
         prefill_request(manager, req0)
         manager.free(req0)
         req1 = make_request("1", tokens, 16)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 0
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
@@ -416,7 +416,7 @@ class TestGetComputedBlocksSubBlock:
         prefill_request(manager, req0)
         manager.free(req0)
         req1 = make_request("1", list(range(4)), 16)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 0
         assert manager.get_computed_blocks_sub_block(req1, num_computed) is None
 
@@ -440,7 +440,7 @@ class TestGetComputedBlocksSubBlock:
         req = make_request(
             "2", list(range(4)) + [100 + i for i in range(8)], 8, prompt_logprobs=5
         )
-        _, num_computed = manager.get_computed_blocks(req)
+        _, num_computed, _ = manager.get_computed_blocks(req)
         assert num_computed == 0
         assert manager.get_computed_blocks_sub_block(req, num_computed) is None
 
@@ -453,7 +453,7 @@ class TestGetComputedBlocksSubBlock:
         prefill_request(manager, req0)
         manager.free(req0)
         req1 = make_request("1", tokens, 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 0
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
@@ -469,7 +469,7 @@ class TestGetComputedBlocksSubBlock:
         prefill_request(manager, req0)
         manager.free(req0)
         req1 = make_request("1", list(range(4)) + [100] * 8, 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
         src = match.group_matches[0].src_block
@@ -515,7 +515,7 @@ class TestApplyReleaseSubBlockMatch:
         prefill_request(manager, req0)
         manager.free(req0)
         req1 = make_request("1", list(range(4)) + [100] * 8, 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
         src = match.group_matches[0].src_block
@@ -571,7 +571,7 @@ class TestSubBlockIndexingFlow:
         # allocate_slots(delay=False) auto-registers the request for indexing.
         manager = make_manager(8, 4, 10)
         req = make_request("0", list(range(8)), 8)
-        cb, n = manager.get_computed_blocks(req)
+        cb, n, _ = manager.get_computed_blocks(req)
         manager.allocate_slots(req, req.num_tokens - n, n, cb)
         assert req.request_id in manager._pending_indexing
 
@@ -579,7 +579,7 @@ class TestSubBlockIndexingFlow:
         # delay_cache_blocks=True skips auto-registration (caller's job).
         manager = make_manager(8, 4, 10)
         req = make_request("0", list(range(8)), 8)
-        cb, n = manager.get_computed_blocks(req)
+        cb, n, _ = manager.get_computed_blocks(req)
         manager.allocate_slots(req, req.num_tokens - n, n, cb, delay_cache_blocks=True)
         assert req.request_id not in manager._pending_indexing
 
@@ -677,7 +677,7 @@ class TestSubBlockIndexingFlow:
         assert partial_id in idx._block_hashes
         assert len(idx._block_hashes[partial_id]) == 3
         req1 = make_request("1", tokens + [999] * 16, 16)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 16
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
@@ -736,7 +736,7 @@ class TestSubBlockIndexingFlow:
         assert partial_blk.block_id in sub_block_index(manager)._block_hashes
         assert partial_blk.block_hash is None
         req1 = make_request("1", list(range(8 + 4)) + [100 + i for i in range(8)], 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 8
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
@@ -778,7 +778,7 @@ class TestPartialBlockReuse:
         prefill_request(manager, req0)
         manager.free(req0)
         req1 = make_request("1", tokens0 + [800 + i for i in range(8)], 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 8
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
@@ -792,10 +792,10 @@ class TestPartialBlockReuse:
         shared = list(range(4))
         req0 = make_request("0", shared + [100] * 8, 8, max_tokens=1)
         req1 = make_request("1", shared + [200] * 8, 8, max_tokens=1)
-        cb0, nc0 = manager.get_computed_blocks(req0)
+        cb0, nc0, _ = manager.get_computed_blocks(req0)
         assert manager.get_computed_blocks_sub_block(req0, nc0) is None
         manager.allocate_slots(req0, req0.num_tokens, 0, cb0)
-        cb1, nc1 = manager.get_computed_blocks(req1)
+        cb1, nc1, _ = manager.get_computed_blocks(req1)
         assert manager.get_computed_blocks_sub_block(req1, nc1) is None
         manager.allocate_slots(req1, req1.num_tokens, 0, cb1)
         req0.num_computed_tokens = req0.num_tokens
@@ -803,7 +803,7 @@ class TestPartialBlockReuse:
         manager.do_pending_indexing()
         assert len(sub_block_index(manager)._hash_to_blocks) > 0
         req2 = make_request("2", shared + [300] * 8, 8, max_tokens=1)
-        _, nc2 = manager.get_computed_blocks(req2)
+        _, nc2, _ = manager.get_computed_blocks(req2)
         match = manager.get_computed_blocks_sub_block(req2, nc2)
         assert match is not None
         assert match.num_tokens == 4
@@ -834,11 +834,11 @@ class TestIsolation:
         shared = list(range(4))
         unique = [100 + i for i in range(8)]
         req1 = make_request("1", shared + unique, 8, cache_salt="B")
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 0
         assert manager.get_computed_blocks_sub_block(req1, num_computed) is None
         req2 = make_request("2", shared + unique, 8)
-        _, nc2 = manager.get_computed_blocks(req2)
+        _, nc2, _ = manager.get_computed_blocks(req2)
         assert manager.get_computed_blocks_sub_block(req2, nc2) is None
 
     def test_lora_isolation(self):
@@ -853,7 +853,7 @@ class TestIsolation:
         req1 = make_request(
             "1", list(range(4)) + [100 + i for i in range(8)], 8, lora_request=lora_b
         )
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 0
         assert manager.get_computed_blocks_sub_block(req1, num_computed) is None
 
@@ -1219,7 +1219,7 @@ class TestMultiGroup:
         assert len(manager._group_infos[0].sub_block_index._block_hashes) > 0
         assert len(manager._group_infos[1].sub_block_index._block_hashes) > 0
         req1 = make_request("1", list(range(4)) + [100 + i for i in range(16)], 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         assert num_computed == 0
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
@@ -1250,7 +1250,7 @@ class TestMultiGroup:
         prefill_request(manager, req0)
         manager.free(req0)
         req1 = make_request("1", tokens, 8)
-        _, num_computed = manager.get_computed_blocks(req1)
+        _, num_computed, _ = manager.get_computed_blocks(req1)
         match = manager.get_computed_blocks_sub_block(req1, num_computed)
         assert match is not None
         assert num_computed == 0

@@ -413,7 +413,11 @@ def prefill_request(
     """Drive the full get_computed_blocks -> allocate_slots flow, then simulate
     execute_model completion. Returns ``(computed_blocks, total_computed_tokens,
     allocated_blocks)``."""
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
+    (
+        computed_blocks,
+        num_computed_tokens,
+        request.shared_prefix_boundary,
+    ) = manager.get_computed_blocks(request)
     match = manager.get_computed_blocks_sub_block(request, num_computed_tokens)
     sub_extra = match.num_tokens if match else 0
     total_computed = num_computed_tokens + sub_extra

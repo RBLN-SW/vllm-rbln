@@ -545,9 +545,15 @@ class RBLNScheduler(Scheduler):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens (full-block matches only).
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    (
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        # Junction to pin (Marconi-style APC) so its
+                        # sparse-retention state (Mamba block / sliding-window
+                        # tail) survives retention and serves a later hit; 0
+                        # if no uncached shared prefix was detected.
+                        request.shared_prefix_boundary,
+                    ) = self.kv_cache_manager.get_computed_blocks(request)
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
