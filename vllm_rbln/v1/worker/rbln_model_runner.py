@@ -460,12 +460,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(RBLN): RBLN compiles a fixed decode-batch shape, so bucket to the
         # per-PP-stage decode batch (max_num_seqs // pp_size) -- the same ceiling
         # the scheduler's admission cap uses -- not the raw max_num_seqs.
-        max_decode_batch_size = decode_batch_size(
-            self.max_num_reqs, self.parallel_config.pipeline_parallel_size
-        )
         self.bucketing_manager = get_bucketing_manager(
             envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
-            max_batch_size=max_decode_batch_size,
+            max_batch_size=decode_batch_size(
+                self.max_num_reqs, self.parallel_config.pipeline_parallel_size
+            ),
             min_batch_size=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MIN,
             step=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STEP,
             limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
