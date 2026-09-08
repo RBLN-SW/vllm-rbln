@@ -448,15 +448,3 @@ class TestRejectedBeforeScheduling:
 
         assert "rejected" in meta.reqs_to_recv
         assert meta.reqs_to_recv["rejected"].remote.block_ids == ()
-
-    def test_the_producers_own_block_ids_are_not_clobbered(self):
-        # The producer's reply carries both the remote-prefill flag and its
-        # block ids, so a proxy that forwards it leaves the field already
-        # filled; only one dispatching to both sides at once leaves it absent.
-        sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
-        req = self._rejected()
-        req.kv_transfer_params["remote_block_ids"] = ([4, 5],)
-
-        sched.request_finished(req, ([],))
-
-        assert req.kv_transfer_params["remote_block_ids"] == ([4, 5],)

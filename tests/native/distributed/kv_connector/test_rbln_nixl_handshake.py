@@ -737,6 +737,8 @@ class TestValidateRemoteAgentHandshake:
         w.dst_num_blocks = {"eng": dst_num_blocks}
         w.vllm_config = MagicMock()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
+        # add_remote_agent reads the cached copy __init__ makes of it.
+        w.pp_size = 1
         w._kv_areas = 1
         w._kv_slices = 1
         w._sw_ratio = None

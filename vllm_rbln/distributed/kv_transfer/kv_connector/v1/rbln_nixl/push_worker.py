@@ -204,7 +204,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         )
         remote_block_size = remote_info.remote_block_size
 
-        meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
+        meta.remote.block_ids = self._logical_to_kernel_block_ids(
             meta.remote.block_ids, remote_info.remote_physical_blocks_per_logical
         )
         remote_block_ids = meta.remote.block_ids

@@ -84,6 +84,11 @@ class TestShardReadPath:
         # which counts our pipeline ranks too (see _xfer_notif_id).
         w.vllm_config = MagicMock()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
+        # Upstream reads both on the read path it hands us: start_load_kv
+        # converts to kernel block ids, and _read_blocks_for_req checks the
+        # bidirectional turn-2 expiry before delegating.
+        w._physical_blocks_per_logical_kv_block = 1
+        w._bidirectional_kv_xfer_enabled = False
         w._has_mamba = False  # non-Mamba scope: _apply_prefix_caching end-trims
         w.world_size = 1
         w.num_blocks = 8
@@ -112,7 +117,7 @@ class TestShardReadPath:
         topo.tp_ratio.return_value = 1
         topo.block_size_ratio.return_value = 1
         w.transfer_topo = topo
-        w._logical_to_remote_kernel_block_ids = lambda ids, _n: ids
+        w._logical_to_kernel_block_ids = lambda ids, _n: ids
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.make_prepped_xfer.side_effect = lambda *a, **k: object()
         return w
@@ -297,7 +302,7 @@ class TestUpstreamReachesTheOverride:
         # Upstream's start_load_kv calls _read_blocks_for_req; if that call
         # moves, every transfer falls back to the whole-engine path.
         w = TestShardReadPath._read_worker(pp_size=2)
-        w._logical_to_kernel_block_ids = lambda ids: ids
+        w._logical_to_kernel_block_ids = lambda ids, _n: ids
         w._handshake_lock = threading.RLock()
         w._ready_requests = queue.Queue()
         meta = TestShardReadPath._meta([[1, 2]], [[3, 4]])
@@ -317,7 +322,6 @@ class TestUpstreamReachesTheOverride:
         w._sw_ratio = 2
         w._group_specs = [_sliding_window_spec()]
         w.num_regions = 2
-        w._physical_blocks_per_logical_kv_block = 1
         w.engine_id = "local"
         w.src_xfer_handles_by_block_size = {16: 900}
         w.block_size = 16

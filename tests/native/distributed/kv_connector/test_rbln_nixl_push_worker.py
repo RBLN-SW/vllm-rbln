@@ -215,7 +215,7 @@ class TestPerShardWrite:
         )
         topo.block_size_ratio.return_value = 1
         w.transfer_topo = topo
-        w._logical_to_remote_kernel_block_ids = lambda ids, _n: ids
+        w._logical_to_kernel_block_ids = lambda ids, _n: ids
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.make_prepped_xfer.side_effect = lambda *a, **k: object()
         return w
