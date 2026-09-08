@@ -33,7 +33,7 @@ from . import (
     dynamic_kv,
     engine_core,
     fp8_moe_method,
-    # gpt_oss,  # TODO(vllm>=0.26.0): vllm#46441 landed; delete this module
+    gpt_oss,
     gpt_oss_mxfp4_config,
     llama_eagle3,
     metrics,
@@ -41,7 +41,6 @@ from . import (
     mla,
     modelopt_mixed_config,
     models_utils,
-    # multi_connector,  # TODO(vllm>=0.26.0): vllm#46865 landed; delete this module
     oot,
     profiler,
     qwen2_moe,
