@@ -12,6 +12,9 @@ supported-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 
+[manifest]
+overrides = [{ name = "torchcodec", specifier = ">=0.14", index = "https://download.pytorch.org/whl/cpu" }]
+
 [[package]]
 name = "accelerate"
 version = "1.14.0"
@@ -1629,7 +1632,7 @@ dependencies = [
     { name = "tokenizers" },
     { name = "torch" },
     { name = "torchaudio", marker = "platform_python_implementation == 'CPython'" },
-    { name = "torchcodec", marker = "platform_python_implementation == 'CPython'" },
+    { name = "torchcodec" },
     { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
 ]
