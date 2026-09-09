@@ -2362,3 +2362,24 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
             peers *= max(1, local_pp // remote_pp)
         return f"{remote_request_id}:{peers * remote_tp_size}".encode()
+
+    # TODO(vllm-project/vllm#54518): delete both overrides once a pinned vLLM
+    # carries eb74fbb3.
+    def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
+        # A request that failed in an earlier poll was already reported through
+        # _failed_recv_reqs and get_finished() popped its metadata; the poll
+        # that drains its remaining handles must not report it a second time.
+        done = super()._pop_done_transfers(transfers)
+        return {req_id for req_id in done if req_id in self._recving_metadata}
+
+    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
+        # One handle per remote rank, and they do not all fail in the same
+        # poll. The first failure reports the request; the later ones are left
+        # with the handle cleanup only.
+        if (meta := self._recving_metadata.get(req_id)) is not None:
+            if not self._is_hma_required:
+                self._invalid_block_ids.put(set(meta.local_block_ids[0]))
+            self._failed_recv_reqs.put(req_id)
+        if handle is not None:
+            self.nixl_wrapper.release_xfer_handle(handle)
+        self.xfer_stats.record_failed_transfer()

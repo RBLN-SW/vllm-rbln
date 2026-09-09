@@ -96,6 +96,7 @@ class TestShardReadPath:
         w.dst_num_blocks = {"eng": 8, "local": 8}
         w._recving_transfers = defaultdict(list)
         w._engine_last_active = {}
+        w._engine_clock_offset = {}
         # What upstream's failure path reads: it logs with the engine id, looks the
         # request's metadata up, queues the failure and the invalidated blocks.
         w.engine_id = "local"
@@ -158,8 +159,12 @@ class TestShardReadPath:
         w = self._read_worker(pp_size=3)
         first = object()
         w.nixl_wrapper.make_prepped_xfer.side_effect = [first, RuntimeError("boom")]
+        # start_load_kv registers the metadata before any read; the failure
+        # path reports a request through it.
+        meta = self._meta([[1, 2]], [[3, 4]])
+        w._recving_metadata["r0"] = meta
 
-        w._read_blocks_for_req("r0", self._meta([[1, 2]], [[3, 4]]))
+        w._read_blocks_for_req("r0", meta)
 
         assert w._recving_transfers["r0"] == []
         # The stage that already submitted is released, and the third is never
@@ -169,6 +174,36 @@ class TestShardReadPath:
         # Reported failed exactly once, which is what the engine counts.
         assert w._failed_recv_reqs.qsize() == 1
         assert w._failed_recv_reqs.get_nowait() == "r0"
+
+    def test_stragglers_of_a_failed_read_do_not_kill_the_engine(self):
+        # A dead producer link fails a request's per-stage handles in separate
+        # polls. The first failure reports the request and drops its metadata;
+        # a later one must release its handle only. A second report reaches
+        # the engine core after the metadata is gone and it asserts.
+        w = self._read_worker(pp_size=2)
+        w.tp_rank = 0
+        w._reqs_to_send = {}
+        w.nixl_wrapper.get_new_notifs.return_value = {}
+        w.nixl_wrapper.make_prepped_xfer.side_effect = [1, 2]
+        meta = self._meta([[1, 2]], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+        w._read_blocks_for_req("r0", meta)
+
+        # Poll 1: stage 0's handle fails while stage 1 is still in flight.
+        w.nixl_wrapper.check_xfer_state.side_effect = (
+            lambda h: "ERR" if h == 1 else "PROC"
+        )
+        assert w.get_finished() == (set(), {"r0"})
+        assert "r0" not in w._recving_metadata
+        assert w._recving_transfers["r0"] == [2]
+
+        # Poll 2: the straggler fails too, the way the incident's poll did --
+        # the status query itself raising.
+        w.nixl_wrapper.check_xfer_state.side_effect = RuntimeError("getXferStatus")
+        assert w.get_finished() == (set(), set())
+        assert "r0" not in w._recving_transfers
+        assert w._failed_recv_reqs.empty()
+        w.nixl_wrapper.release_xfer_handle.assert_any_call(2)
 
     def test_prefix_hit_notifies_each_stage_no_read(self):
         # Full prefix hit (empty local list): no read, one notif per stage.
