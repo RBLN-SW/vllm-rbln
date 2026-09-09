@@ -509,15 +509,16 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # instead and more than one slice there has no other explanation. Above
         # one head both axes fit the same count, so an axis that is not derived
         # stays HEAD rather than guessed.
-        region_non_head = {
-            heads == 1 and len(set(xfer.slice_ids[r * areas : (r + 1) * areas])) > 1
+        region_cut = [
+            (heads, len(set(xfer.slice_ids[r * areas : (r + 1) * areas])))
             for r, heads in enumerate(logical_kv_heads)
-        }
+        ]
+        region_non_head = {heads == 1 and slices > 1 for heads, slices in region_cut}
         if len(region_non_head) > 1:
             raise RuntimeError(
                 "RBLN NIXL (D2D): this engine's KV regions were not all cut on "
                 "the same axis, which one advertised geometry cannot describe. "
-                f"Head counts per logical region: {logical_kv_heads}."
+                f"(head count, distinct slice ids) per logical region: {region_cut}."
             )
         self._kv_split_axis = (
             KVSplitAxis.NON_HEAD if region_non_head == {True} else KVSplitAxis.HEAD
