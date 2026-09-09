@@ -148,7 +148,9 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: `_window_grid()` for this engine, parked so a transfer does
     #: not recompute the head band per request.
     _window_grid_cut: tuple[int, int] | None
-    _request_tail: tuple[int | None, int | None] | None
+    _request_tail: (
+        tuple[int | None, int | None, tuple[tuple[int, tuple[int, int]], ...]] | None
+    )
 
     def _observe_swa_kernel_block(self) -> set[int]:
         """Tokens a block holds in the view the sliding-window kernel reads.
@@ -325,9 +327,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
 
         The runs are `_block_runs`; the chunks are what a prefill step leaves
         of a span. None where a chunk comes out the whole span -- what a step
-        at or above one asks for -- so neither list grows.
+        at or above one asks for -- so neither list grows. A side that writes a
+        request in pieces asks for a grid as the knob does.
         """
-        if not self._chunk_mode:
+        if not (self._chunk_mode or self._writes_less_than_a_request()):
             return None
         cut = self._block_runs(split=split, kv_runs=kv_runs)
         if cut is None:

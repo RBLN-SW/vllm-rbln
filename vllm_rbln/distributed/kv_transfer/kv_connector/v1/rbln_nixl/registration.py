@@ -495,7 +495,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # the block. A head cut gives every area every token, and reads no
         # span out of a position at all.
         if (
-            self._chunk_mode
+            (self._chunk_mode or self._writes_less_than_a_request())
             and self._kv_split_axis is KVSplitAxis.NON_HEAD
             and not (
                 self._kv_areas == self._kv_slices
@@ -503,7 +503,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             )
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode on a context-cut KV "
+                "RBLN NIXL (D2D): cutting a block on a context-cut KV "
                 "cache needs unreplicated chiplet areas that divide the "
                 f"block. Got areas={self._kv_areas}, "
                 f"slices={self._kv_slices}, block_size={self.block_size}."

@@ -199,7 +199,10 @@ class RblnNixlWorkerBase(
         self._swa_kernel_blocks: set[int] = set()
         # How far the request being transferred fills its last block, parked
         # for the length of one upstream call (`_tail_viewed_as`).
-        self._request_tail: tuple[int | None, int | None] | None = None
+        self._request_tail: (
+            tuple[int | None, int | None, tuple[tuple[int, tuple[int, int]], ...]]
+            | None
+        ) = None
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.
         self.local_seen_layer_names: list[str] = []

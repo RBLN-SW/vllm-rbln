@@ -43,14 +43,14 @@ if TYPE_CHECKING:
 # upstream does with ``NIXL_CONNECTOR_VERSION``. Folded into the NIXL compat
 # hash so an RBLN peer on another schema fails the handshake cleanly -- both
 # ends are RBLN; earlier bumps are `git log -L` on this line.
-#   8: a completion notification names which consumer blocks the write covered
-RBLN_NIXL_CONNECTOR_VERSION: int = 8
+#   9: the unit a coverage range is counted in
+RBLN_NIXL_CONNECTOR_VERSION: int = 9
 
 # Prefix a push completion notification carries when it names the half-open
-# range of consumer blocks this write filled: ``RBLNS:<writer>:<lo>:<hi>:``
-# ahead of the message upstream builds. A consumer settles on the ranges it
-# has seen, not on how many peers reported. Left off where no single range
-# describes the write, so a consumer must accept a bare message.
+# range this write filled: ``RBLNS:<writer>:<lo>:<hi>:<per_block>:`` ahead of
+# the message upstream builds, counting units of one consumer block divided
+# by ``per_block`` (1 where a write never splits one). Left off where no
+# single range describes the write, so a consumer must accept a bare message.
 RBLN_COVERAGE_NOTIF_PREFIX: bytes = b"RBLNS:"
 
 
@@ -118,6 +118,12 @@ class RblnNixlConnectorMetadata(NixlConnectorMetadata):
         # window begins can only be found from the total -- and the prefix
         # offered mid-stream is shorter than it.
         self.push_stream_total: dict[ReqId, int] = {}
+        # Tokens of KV the offered prefix holds. Distinct from `valid_tokens`,
+        # which is the request's final count and only exists once it is over:
+        # an offer is a prefix of a request still being computed, and how much
+        # of its last block is filled is what a write smaller than a block
+        # needs to know.
+        self.push_stream_tokens: dict[ReqId, int] = {}
         # Tokens of KV the offered block list holds, so a last block that is not
         # full can leave the areas above its final token behind. Absent where
         # the count is unknown, which keeps the whole block.

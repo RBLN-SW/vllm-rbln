@@ -112,7 +112,9 @@ class TestComputeDescIds:
         worker._kv_areas = 1
         worker._kv_split_axis = KVSplitAxis.HEAD
         worker._chunk_grid = grid
-        worker._request_tail = tail
+        # A whole-request write names no pieces of its own, so the third
+        # field is empty here; the streamed path is what fills it.
+        worker._request_tail = None if tail is None else (*tail, ())
         worker._group_specs = [
             MagicMock(),  # full attention
             sliding_window_spec(block_size=64, sliding_window=32),
@@ -143,6 +145,18 @@ class TestComputeDescIds:
         whole = worker.num_regions * 4
         assert list(out)[-2:] == [12, 20]
         assert all(whole <= i < whole * (1 + worker._sw_ratio) for i in out[-2:])
+
+    def test_a_write_owing_only_the_window_asks_for_no_chunks(self, monkeypatch):
+        # A prefill ending on a chunk boundary leaves the full-attention group
+        # empty on the write that still owes the window. There is no last block
+        # to cut there, and reaching for one raised inside the writer loop --
+        # which swallows it, so the write vanished and the request never
+        # settled.
+        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
+
+        out = worker._compute_desc_ids([[], [2]], 4, None, 1)
+
+        assert list(out) == [12, 20]
 
     def test_a_last_block_needing_every_chunk_is_left_whole(self, monkeypatch):
         # The benefit test: the same bytes in more descriptors is a loss, so
@@ -347,7 +361,9 @@ class TestTheWindowsOwnGranules:
         w.block_size = 64
         w.num_regions = 1
         w._chunk_grid = None
-        w._request_tail = (valid_tokens, None)
+        # The third member is the chunk ranges a streamed batch names; a whole
+        # request names none.
+        w._request_tail = (valid_tokens, None, ())
         w._group_specs = [MagicMock(spec=SlidingWindowSpec)]
         return list(
             w._compute_desc_ids(

@@ -559,7 +559,7 @@ class TestShardReadPath:
         # The token count and the request's own block count, parked for the
         # length of that call: upstream's `_compute_desc_ids` is what selects
         # the descriptors and its signature has no room for either.
-        assert seen == [(17, 2)]
+        assert seen == [(17, 2, ())]
         assert w._request_tail is None
 
     def test_a_chunked_engine_without_a_window_may_not_reach_it(self):

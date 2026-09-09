@@ -1712,8 +1712,8 @@ class TestChunkSizing:
             self._sized(span_tokens=2048, tokens=256)
 
     @staticmethod
-    def _grid_worker(*, block_len, areas=4, prefill=512):
-        w = object.__new__(RblnNixlPullConnectorWorker)
+    def _grid_worker(*, block_len, areas=4, prefill=512, cls=None):
+        w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._chunk_mode = True
         w._kv_areas = areas
         w._kv_split_axis = KVSplitAxis.NON_HEAD
@@ -1721,6 +1721,10 @@ class TestChunkSizing:
         w.block_len_per_layer = [block_len] * 8
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
+        # __init__ never ran, so the state a push worker's shutdown()
+        # reaches through __del__ is absent; silence it rather than leak
+        # an unraisable at GC.
+        w.shutdown = lambda: None
         return w
 
     def test_a_context_cut_spreads_a_chunk_over_one_run(self, monkeypatch):
@@ -1770,6 +1774,15 @@ class TestChunkSizing:
         w._chunk_mode = False
 
         assert w._shard_chunk_grid(block_size=8192, split=1) is None
+
+    def test_a_side_that_writes_in_pieces_gets_a_grid_without_the_knob(self):
+        # Streaming names a range of a block whether or not the knob is on, so
+        # it asks for the same grid the knob would have built.
+        w = self._grid_worker(block_len=2048 * 256, cls=RblnNixlPushConnectorWorker)
+        w._chunk_mode = False
+        w._early_push_enabled = True
+
+        assert w._shard_chunk_grid(block_size=8192, split=1) == (1, 4)
 
 
 class TestBaseFanInHandle:
@@ -2714,6 +2727,9 @@ class TestDescriptorOrderContract:
             # __init__ never ran, so the writer state shutdown() reaches through
             # __del__ is absent; silence it rather than leak an unraisable at GC.
             w.shutdown = lambda: None
+            # The write path reads this to decide whether a peer needs a chunk
+            # range; off, as the streaming tests are the ones that turn it on.
+            w._early_push_enabled = False
         w.transfer_topo.is_kv_layout_blocks_first = False
         w.nixl_wrapper = MagicMock()
         w._shard_descs_per_block = {}

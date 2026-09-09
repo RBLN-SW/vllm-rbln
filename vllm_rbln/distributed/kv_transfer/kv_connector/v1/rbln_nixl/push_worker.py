@@ -20,6 +20,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -58,6 +59,28 @@ logger = init_logger(__name__)
 #: registered.
 Span = tuple[int, int]
 
+
+class OfferedBlocks(tuple):
+    """A released offer's block list, carrying the tokens it was built for.
+
+    Carried on the list rather than kept per request because the writer runs
+    on its own thread: a step can hold and release the next offer before the
+    writer picks the previous one up, and a count read off the request then
+    describes the wrong one. What that costs is a write claiming tokens this
+    rank has not computed, into the consumer's blocks, silently.
+
+    A tuple subclass so every reader of a block list -- upstream's parking
+    dict, its grouping helper, its `ReqMeta` -- keeps working untouched.
+    """
+
+    offered_tokens: int
+
+    def __new__(cls, groups: "BlockIds", offered_tokens: int) -> "OfferedBlocks":
+        self = super().__new__(cls, groups)
+        self.offered_tokens = offered_tokens
+        return self
+
+
 # How long a flush waits for an early write to leave the NIC before giving up
 # on it. Bounded because it runs on the engine main thread: a wedged transfer
 # must not take the engine with it. A fault detector, not a deadline -- what a
@@ -85,6 +108,9 @@ class _StreamedSend:
     # Blocks this rank has closed, held for the next step to hand over. None
     # once released, or once an abort dropped the offer.
     pending_offer: "BlockIds | None" = None
+    # Tokens that offer holds. Travels with it to the writer -- see
+    # `OfferedBlocks`.
+    pending_offer_tokens: int = 0
     # Whether the writer has been told about this request at all. Not derivable
     # from `pending_offer`: an aborted offer clears that without ever releasing.
     released: bool = False
@@ -105,6 +131,9 @@ class _StreamedSend:
     expected: int | None = None
     # How many of the consumer's blocks the writer has already filled.
     issued_hwm: int = 0
+    # And how many chunks of the one after those, for a block written in
+    # pieces. Reset when that block is written whole, which subsumes them.
+    issued_chunks: int = 0
 
 
 class _CoverageNotifQueue(queue.Queue):
@@ -135,8 +164,8 @@ class _CoverageNotifQueue(queue.Queue):
         while True:
             notif = super().get_nowait()
             worker = self._worker
-            writer, span, notif = worker._split_coverage(notif)
-            if not worker._writer_still_pending(notif, writer, span):
+            writer, span, per_block, notif = worker._split_coverage(notif)
+            if not worker._writer_still_pending(notif, writer, span, per_block):
                 return notif
 
 
@@ -165,6 +194,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # settles only once every one of them has covered the whole list.
         self._coverage_by_req: defaultdict[str, defaultdict[int, list[Span]]] = (
             defaultdict(lambda: defaultdict(list))
+        )
+        # The unit those ranges are counted in, per writer. A writer states it
+        # once and is held to it: a range read in the wrong unit reaches the
+        # terminal count early and settles a request whose KV is incomplete.
+        self._coverage_units_by_req: defaultdict[str, dict[int, int]] = defaultdict(
+            dict
         )
 
         # Replaces the plain queue upstream made, so its own drain is the only
@@ -277,6 +312,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         for req_id, meta in metadata.reqs_to_save.items():
             send = self._streamed.setdefault(req_id, _StreamedSend())
             send.pending_offer = meta.local_block_ids
+            send.pending_offer_tokens = metadata.push_stream_tokens.get(req_id, 0)
             total = metadata.push_stream_total.get(req_id)
             if total is not None:
                 send.total = total
@@ -297,7 +333,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         stalls with its KV never arriving.
         """
         offers = [
-            (req_id, send, send.pending_offer)
+            (req_id, send, OfferedBlocks(send.pending_offer, send.pending_offer_tokens))
             for req_id, send in self._streamed.items()
             if send.pending_offer is not None
         ]
@@ -308,6 +344,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 send.released = True
         for req_id, send, block_ids in offers:
             send.pending_offer = None
+            send.pending_offer_tokens = 0
             send.queued += 1
             self._finished_blocks_inbox.put((req_id, block_ids))
         self._push_writer_wake.set()
@@ -389,7 +426,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         logger.info("nixl-push-writer thread started (rank=%d)", self.tp_rank)
 
     def _writer_still_pending(
-        self, notif: bytes, writer: int | None, span: "Span | None"
+        self, notif: bytes, writer: int | None, span: "Span | None", per_block: int
     ) -> bool:
         """Whether this notification leaves its writer short of the request.
 
@@ -401,9 +438,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         upstream one notification per writing rank. A writer that names none
         sends one already.
 
-        The block count comes from what this rank registered, not from
-        anything the peer said -- a peer that sends the wrong ranges must
-        stall the request, not settle it early.
+        The block count comes from what this rank registered, not from anything
+        the peer said -- a peer that sends the wrong ranges must stall the
+        request, not settle it early. The peer does say what unit it counts in,
+        which it has to (the alternative is assuming its chiplet geometry
+        equals ours), and is held to one per request for the same reason.
         """
         msg = notif.decode("utf-8")
         if msg.startswith("HB:"):
@@ -417,13 +456,28 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         if span is None or writer is None:
             return False
 
+        if per_block < 1:
+            raise RuntimeError(
+                f"RBLN NIXL push: writer {writer} named coverage of request "
+                f"{req_id} in {per_block} units per block"
+            )
+        units = self._coverage_units_by_req[req_id]
+        if units.setdefault(writer, per_block) != per_block:
+            raise RuntimeError(
+                f"RBLN NIXL push: writer {writer} changed the coverage unit of "
+                f"request {req_id} from {units[writer]} to {per_block}"
+            )
         spans = self._coverage_by_req[req_id][writer]
         spans.append(span)
-        return not self._covers(spans, len(meta.local_physical_block_ids[0]))
+        # Registration refuses a streamed engine with no full-attention group,
+        # which is what would leave nothing to count in.
+        prompt_blocks = self._prompt_blocks(meta.local_physical_block_ids)
+        assert prompt_blocks is not None
+        return not self._covers(spans, prompt_blocks * per_block)
 
     @staticmethod
-    def _covers(spans: list["Span"], num_blocks: int) -> bool:
-        """Whether the half-open ranges together leave no gap below num_blocks.
+    def _covers(spans: list["Span"], total: int) -> bool:
+        """Whether the half-open ranges together leave no gap below `total`.
 
         Ranges rather than a running total because a preempted request is
         rescheduled from the start of its block list, so a writer re-sends what
@@ -435,9 +489,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             if lo > reach:
                 return False
             reach = max(reach, hi)
-            if reach >= num_blocks:
+            if reach >= total:
                 return True
-        return num_blocks == 0
+        return total == 0
 
     def _do_start_push_kv(
         self,
@@ -520,6 +574,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # inherit a partial count.
         for req_id in done_recving:
             self._coverage_by_req.pop(req_id, None)
+            self._coverage_units_by_req.pop(req_id, None)
         sealed_done = self._finish_sealed_requests()
         if sealed_done:
             # Upstream drops the writer's state for what it reports itself,
@@ -656,26 +711,54 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # token count describes this producer's whole list, and the request's
         # last block is only in the write that reaches the consumer's end.
         n_prompt_blocks = sum(len(g) for g in local_block_ids)
-        registered = len(remote_block_ids[0]) if len(remote_block_ids) == 1 else None
+        # Registration refuses a streamed engine with no full-attention group,
+        # which is what would leave nothing to count in.
+        counted = self._counted_group(remote_block_ids)
+        assert counted is not None
+        registered = len(remote_block_ids[counted])
 
-        window = self._stream_window(req_id, local_block_ids, remote_block_ids)
+        # One window serves every peer of this request, and `issued_hwm` is
+        # the request's, so the peers have to agree on the unit it counts in.
+        # Where they do not, none of them gets chunks.
+        grids = {self._shard_chunk_grids.get((engine_id, r)) for r in peer_ranks}
+        chunk_grid = grids.pop() if len(grids) == 1 else None
+        gpb = 1 if chunk_grid is None else chunk_grid[1]
+        # Only the handover carries the request's final token count, and that
+        # is what says how many chunks of its last block hold tokens. The
+        # descriptor builders below derive the same number from the count they
+        # are handed; the window needs it too, to stop a block it writes in
+        # pieces at the same place.
+        needed = self._tail_chunks(
+            n_prompt_blocks, self._valid_tokens.get(req_id), chunks_per_span=gpb
+        )
+        window = self._stream_window(
+            req_id,
+            local_block_ids,
+            remote_block_ids,
+            chunk_grid=chunk_grid,
+            offered_tokens=getattr(meta.local_block_ids, "offered_tokens", 0),
+            tail=needed,
+        )
+        pieces = window[3] if window is not None else ()
         if window is None:
             local_block_ids = self._trim_to_consumer_blocks(
                 local_block_ids, remote_block_ids, engine_id, meta.remote.request_id
             )
-            span = (0, len(remote_block_ids[0])) if len(remote_block_ids) == 1 else None
+            span = (0, registered * gpb)
         else:
-            local_block_ids, remote_block_ids, span = window
-        notif_id = self._with_coverage(notif_id, span)
-        # Only the write that carries the request's last block may cut it.
+            local_block_ids, remote_block_ids, span, _ = window
+        notif_id = self._with_coverage(notif_id, span, gpb)
+        # Only the write that carries the request's last block may cut it. The
+        # span counts in chunks now, so the consumer's end is that many past
+        # its last block rather than the block count itself.
         tail_tokens = (
-            self._valid_tokens.get(req_id)
-            if span is not None and span[1] == registered
-            else None
+            self._valid_tokens.get(req_id) if span[1] == registered * gpb else None
         )
         n_write_blocks = sum(len(g) for g in local_block_ids)
-        if not n_write_blocks:
-            logger.warning("per-shard write req %s: no blocks to push", req_id)
+        if not n_write_blocks and not pieces:
+            # Ordinary once an offer grows every step: a step that computes
+            # tokens without closing a chunk leaves the window where it was.
+            logger.debug("per-shard write req %s: nothing new to push", req_id)
             with self._sending_transfers_lock:
                 send = self._streamed.get(req_id)
                 if send is not None and send.released:
@@ -709,6 +792,34 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 num_valid_tokens=tail_tokens,
                 num_prompt_blocks=n_prompt_blocks,
             )
+            # The chunks come from the second range of the same two lists, so
+            # they join this batch rather than costing it a second transfer --
+            # and one range keeps the notification single.
+            for local_block, remote_block, chunk_span in pieces:
+                remote_descs = np.concatenate(
+                    (
+                        remote_descs,
+                        self._chunk_descs_ids_for_shard(
+                            engine_id,
+                            global_rank,
+                            self.dst_num_blocks[engine_id],
+                            remote_block,
+                            chunk_span,
+                        ),
+                    )
+                )
+                local_descs = np.concatenate(
+                    (
+                        local_descs,
+                        self._chunk_descs_ids_for_shard(
+                            engine_id,
+                            global_rank,
+                            self.num_blocks,
+                            local_block,
+                            chunk_span,
+                        ),
+                    )
+                )
             assert len(local_descs) == len(remote_descs)
             local_handle = self.src_xfer_handles_by_remote[
                 (engine_id, global_rank, remote_block_size)
@@ -755,67 +866,156 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 send.done += 1
 
     def _stream_window(
-        self, req_id: str, local_block_ids: BlockIds, remote_block_ids: BlockIds
-    ) -> "tuple[BlockIds, BlockIds, Span] | None":
+        self,
+        req_id: str,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        chunk_grid: tuple[int, int] | None = None,
+        offered_tokens: int = 0,
+        tail: int | None = None,
+    ) -> "tuple[BlockIds, BlockIds, Span, tuple[tuple[int, int, Span], ...]] | None":
         """The part of the consumer's list this batch is the first to fill.
 
-        None for a request that is not streamed, which is every request while
-        the flag is off and every one whose whole prompt is offered at once.
-        Those take the trim, and this leaves them exactly as they were.
+        Whole blocks, then the pieces of a block written in chunks: at most the
+        rest of the one a previous batch left part-written and the start of the
+        one being filled now. None where a request is not streamed -- the flag
+        off, or a whole prompt offered at once -- which takes the trim instead.
 
         A streamed offer is a growing prefix of the producer's blocks, and the
-        consumer registered the TAIL of the prompt -- what its own cache did
-        not cover. So the window it wants starts at `total - registered` of
-        ours, a place a prefix shorter than the whole prompt cannot be asked
-        for. The total comes over with the offer for that reason.
+        consumer registered the TAIL of the prompt, what its own cache did not
+        cover. So the window starts at `total - registered` of ours, which a
+        prefix shorter than the prompt cannot name -- hence the total travels
+        with the offer.
 
         Only where both sides expand a logical block by the same factor: past
-        that, the two lengths this arithmetic subtracts are counted in
-        different units.
+        that, the two lengths subtracted here count different units.
         """
         send = self._streamed.get(req_id)
         total = send.total if send else None
-        if total is None or len(remote_block_ids) != 1:
+        if total is None:
             return None
         expand = self._physical_blocks_per_logical_kv_block
         if expand != self._remote_expand_for(req_id):
             return None
 
-        registered = len(remote_block_ids[0])
+        f = self._counted_group(remote_block_ids)
+        assert f is not None
+        registered = len(remote_block_ids[f])
         offset = total * expand - registered
-        have = len(local_block_ids[0])
+        have = len(local_block_ids[f])
         assert send is not None
+        gpb = 1 if chunk_grid is None else chunk_grid[1]
         lo = send.issued_hwm
-        hi = max(0, min(registered, have - offset))
-        if hi <= lo:
-            return (), (), (lo, lo)
+        # How many of our blocks the offer has CLOSED. Its length says so only
+        # while it holds nothing else; once it carries the block being filled, a
+        # peer that takes no chunks would write that one whole -- KV this rank has
+        # not computed. So the token count decides, and the length is left to the
+        # handover offer, which carries no count.
+        closed = offered_tokens // self.block_size if offered_tokens else have
+        hi = max(0, min(registered, closed - offset))
+
+        # Chunks the offer holds of the block after those. Without a grid there
+        # are none, which is a block written whole or not at all. An offer that
+        # has not reached the consumer's window holds none either: `hi` clamps
+        # to 0 there, and the block it would take them from is one the offer
+        # does not have.
+        tail_chunks = 0
+        if (
+            gpb > 1
+            and offered_tokens
+            and offset <= closed < have
+            and 0 <= hi < registered
+        ):
+            rem = offered_tokens - closed * self.block_size
+            if rem > 0:
+                tail_chunks = rem * gpb // self.block_size
+        # Chunks of the block at `lo` that earlier batches already wrote.
+        head_chunks = send.issued_chunks
+
+        if hi <= lo and tail_chunks <= head_chunks:
+            reach = lo * gpb + head_chunks
+            return (
+                self._windowed(local_block_ids, f, []),
+                self._windowed(remote_block_ids, f, []),
+                (reach, reach),
+                (),
+            )
+
+        def piece(index: int, chunk_span: "Span") -> tuple[int, int, "Span"]:
+            return (
+                local_block_ids[f][offset + index],
+                remote_block_ids[f][index],
+                chunk_span,
+            )
+
+        # The block at `lo` closes with part of it already gone, so the write takes
+        # the rest in chunks and the whole-block range starts after it; writing it
+        # whole would repeat what a previous batch sent. That rest stops at `tail`
+        # where the block is the request's last, since the chunks past its tokens
+        # are the ones this mode exists not to send.
+        pieces: list[tuple[int, int, Span]] = []
+        first = lo
+        if hi > lo and head_chunks:
+            end = tail if tail is not None and lo == registered - 1 else gpb
+            if end > head_chunks:
+                pieces.append(piece(lo, (head_chunks, end)))
+            first = lo + 1
+        tail_lo = head_chunks if hi == lo else 0
+        if tail_chunks > tail_lo:
+            pieces.append(piece(hi, (tail_lo, tail_chunks)))
+
         send.issued_hwm = hi
+        send.issued_chunks = (
+            tail_chunks if tail_chunks > tail_lo else (0 if hi > lo else head_chunks)
+        )
         return (
-            (local_block_ids[0][offset + lo : offset + hi],),
-            (remote_block_ids[0][lo:hi],),
-            (lo, hi),
+            self._windowed(
+                local_block_ids, f, local_block_ids[f][offset + first : offset + hi]
+            ),
+            self._windowed(remote_block_ids, f, remote_block_ids[f][first:hi]),
+            (lo * gpb + head_chunks, hi * gpb + tail_chunks),
+            tuple(pieces),
         )
 
-    def _with_coverage(self, notif_id: bytes, span: "Span | None") -> bytes:
-        """Name the half-open range of consumer blocks this write filled.
+    @staticmethod
+    def _windowed(block_ids: BlockIds, group: int, window: list[int]) -> BlockIds:
+        """This batch's slice of one group, with every other group untouched.
 
-        The range is positions into the list the consumer registered. A request
+        A sliding window's group is not streamed -- its one block holds the
+        live window and the kernel keeps overwriting it, so it is final only
+        once the prefill is -- and the offer that carries it is the handover.
+        Passing the other groups through is what lets that block ride the
+        write this window ends on, and keeps them out of the ones before it.
+        """
+        return tuple(
+            window if g == group else list(ids) for g, ids in enumerate(block_ids)
+        )
+
+    def _with_coverage(
+        self, notif_id: bytes, span: "Span | None", per_block: int
+    ) -> bytes:
+        """Name the half-open range this write filled, and its unit.
+
+        The range is positions into the list the consumer registered, counted
+        in units of one consumer block divided by `per_block`. A request
         written once covers all of it; one written in batches covers the part
         this batch is the first to reach, which is what lets the consumer tell
         a complete request from a partly written one.
 
-        Left off when no single range describes the write -- a request with
-        more than one KV cache group, whose groups go out together but carry
-        their own lengths. A consumer has to accept a message without the
-        prefix for that reason alone, which is also what lets the per-shard
-        route carry it while the route upstream drives does not.
+        The unit travels with the range because the consumer cannot derive it:
+        it would have to assume the writer's chiplet geometry equals its own.
+
+        Left off when no single range describes the write -- a request with more
+        than one KV cache group, whose groups go out together carrying their own
+        lengths. A consumer has to accept a message without the prefix for that
+        reason alone, which is what lets the per-shard route carry it anyway.
         """
         if span is None:
             return notif_id
         pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
         pp_rank = get_pp_group().rank_in_group if pp_size > 1 else 0
         writer = pp_rank * self.world_size + self.tp_rank
-        head = f"{writer}:{span[0]}:{span[1]}:".encode()
+        head = f"{writer}:{span[0]}:{span[1]}:{per_block}:".encode()
         return RBLN_COVERAGE_NOTIF_PREFIX + head + notif_id
 
     def _remote_expand_for(self, req_id: str) -> int:
@@ -830,7 +1030,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         ).remote_physical_blocks_per_logical
 
     @staticmethod
-    def _split_coverage(notif: bytes) -> "tuple[int | None, Span | None, bytes]":
+    def _split_coverage(
+        notif: bytes,
+    ) -> "tuple[int | None, Span | None, int, bytes]":
         """Take the coverage prefix off, returning what it said and what is left.
 
         Upstream reads a completion notification as `req_id:count` with
@@ -839,9 +1041,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         handed before this rank started naming ranges.
         """
         if not notif.startswith(RBLN_COVERAGE_NOTIF_PREFIX):
-            return None, None, notif
-        writer, lo, hi, rest = notif[len(RBLN_COVERAGE_NOTIF_PREFIX) :].split(b":", 3)
-        return int(writer), (int(lo), int(hi)), rest
+            return None, None, 1, notif
+        writer, lo, hi, per_block, rest = notif[
+            len(RBLN_COVERAGE_NOTIF_PREFIX) :
+        ].split(b":", 4)
+        return int(writer), (int(lo), int(hi)), int(per_block), rest
 
     @staticmethod
     def _trim_to_consumer_blocks(

@@ -91,7 +91,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         )
         # How much of each request's prefix has already been offered, so a
         # step that closes no new block offers nothing.
-        self._streamed_blocks: dict[str, int] = {}
+        self._streamed_chunks: dict[str, int] = {}
         # Requests offered early, kept until either the lease takes over
         # (terminal finish) or their blocks go back to the allocator without
         # one, which the worker has to be told about (`push_early_flush`).
@@ -159,6 +159,14 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         the writer -- which takes the offer at the start of a later step -- only
         ever reads KV a forward has already finished with.
         """
+        # What the offer has to grow by to be worth releasing. One prefill
+        # step is the finest unit any write can name -- the write path floors
+        # its chunk at one step (`kv_chunk_tokens`) -- so a step's worth of
+        # tokens is the right cursor here whether or not it divides a block:
+        # all this counter asks is whether the offer grew.
+        chunk = min(
+            self.vllm_config.scheduler_config.max_num_batched_tokens, self.block_size
+        )
         for req_id, new_block_id_groups, resumed in yield_req_data(scheduler_output):
             req = self._reqs_need_save.get(req_id)
             if req is None:
@@ -166,7 +174,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             assert req.kv_transfer_params is not None
 
             if self._accumulate_blocks_to_save(req_id, new_block_id_groups, resumed):
-                self._streamed_blocks.pop(req_id, None)
+                self._streamed_chunks.pop(req_id, None)
 
             groups = self._block_ids_need_save.get(req_id)
             # A request enters the table on the step it is admitted, which is
@@ -178,26 +186,36 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
                 f"num_computed={req.num_computed_tokens} "
                 f"num_prompt={req.num_prompt_tokens}"
             )
-            closed = min(
-                req.num_computed_tokens // self.block_size,
-                min(len(group) for group in groups),
+            # Tokens the blocks we hold actually back. A step can compute
+            # past them -- the accumulation lags by a step on a resume -- and
+            # offering tokens no block of ours holds names KV that is not
+            # there.
+            held = min(
+                req.num_computed_tokens,
+                min(len(group) for group in groups) * self.block_size,
             )
-            if closed <= self._streamed_blocks.get(req_id, 0):
+            chunks = held // chunk
+            if chunks <= self._streamed_chunks.get(req_id, 0):
                 continue
-            self._streamed_blocks[req_id] = closed
+            self._streamed_chunks[req_id] = chunks
             meta.push_stream_total[req_id] = cdiv(
                 req.num_prompt_tokens, self.block_size
             )
+            meta.push_stream_tokens[req_id] = held
+            # The block being filled comes too. A write takes only the chunks
+            # of it the token count backs, and a peer that takes no chunks
+            # leaves it alone -- see `_stream_window`.
+            offered = cdiv(held, self.block_size)
             meta.add_new_req_to_save(
                 request_id=req_id,
-                local_block_ids=tuple(group[:closed] for group in groups),
+                local_block_ids=tuple(group[:offered] for group in groups),
                 kv_transfer_params=req.kv_transfer_params,
             )
 
     def request_finished(
         self, request: "Request", block_ids: "BlockIds"
     ) -> tuple[bool, dict[str, Any] | None]:
-        self._streamed_blocks.pop(request.request_id, None)
+        self._streamed_chunks.pop(request.request_id, None)
         delay_free_blocks, out_params = super().request_finished(request, block_ids)
         if delay_free_blocks:
             # The lease now holds the blocks, so the write no longer needs
