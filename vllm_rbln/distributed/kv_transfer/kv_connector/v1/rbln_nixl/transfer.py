@@ -228,20 +228,13 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                     # Window mode registered no range: this group's blocks go
                     # whole, and the chunk range cuts the full-attention
                     # group's last block only.
-                    all_descs.append(whole(group_arr))
+                    if group:
+                        all_descs.append(whole(group))
                     continue
                 runs, granules_per_block = window
                 # Nothing having said how many tokens the request holds leaves
                 # nothing to say where its window is, so every granule goes --
                 # which is the block itself.
-                if window is None:
-                    # Window mode registered no range: this group's blocks go
-                    # whole, and the chunk range cuts the full-attention
-                    # group's last block only.
-                    if group:
-                        all_descs.append(whole(group))
-                    continue
-                runs, granules_per_block = window
                 if group:
                     picked = (
                         [(b, gran) for b in group for gran in range(granules_per_block)]

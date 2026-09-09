@@ -1533,6 +1533,25 @@ class TestShardLocalRegions:
             is needs_own
         )
 
+    @pytest.mark.parametrize("sw_ratio, needs_own", [(8, False), (None, True)])
+    def test_a_streamed_engine_asks_for_its_own_descriptors_unless_windowed(
+        self, sw_ratio, needs_own
+    ):
+        # Streaming asks for per-shard ids so a batch can be named on the
+        # wire, and gives way to a window for the same reason chunk mode
+        # does: a hybrid's two groups fit on no other list.
+        w = self._wired_worker()
+        w._chunk_mode = False
+        w._sw_ratio = sw_ratio
+        w._writes_less_than_a_request = lambda: True
+
+        assert (
+            w._needs_own_descriptors(
+                pp_size=1, partial=False, fan_in=False, split=1, fanout=1, kv_runs=1
+            )
+            is needs_own
+        )
+
     def test_register_shard_xfer_state_hands_the_derived_grid_on(self):
         # Derived once here and used for the local list; left out, the local
         # list holds whole blocks while every peer's carries the range.

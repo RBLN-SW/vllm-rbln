@@ -29,6 +29,11 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+#: What a transfer parks for `_compute_desc_ids`, whose signature is
+#: upstream's: the request's final token count and block count, and the chunk
+#: ranges a streamed batch named on the side that call is for.
+RequestTail = tuple[int | None, int | None, tuple[tuple[int, tuple[int, int]], ...]]
+
 
 def kv_chunk_tokens(
     *,
@@ -148,9 +153,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: `_window_grid()` for this engine, parked so a transfer does
     #: not recompute the head band per request.
     _window_grid_cut: tuple[int, int] | None
-    _request_tail: (
-        tuple[int | None, int | None, tuple[tuple[int, tuple[int, int]], ...]] | None
-    )
+    _request_tail: "RequestTail | None"
 
     def _observe_swa_kernel_block(self) -> set[int]:
         """Tokens a block holds in the view the sliding-window kernel reads.

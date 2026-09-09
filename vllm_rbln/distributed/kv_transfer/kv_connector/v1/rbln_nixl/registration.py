@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -52,8 +53,63 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     RblnTransferTopology,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 logger = init_logger(__name__)
+
+
+def sliding_window_ratio(specs: list[KVCacheSpec]) -> int | None:
+    """How many windows tile a block, where a hybrid has a window to name.
+
+    None where there is none -- no sliding window, or one as wide as the block.
+    The ratio is what the window range divides a block length by, and its
+    presence is what says a hybrid can be described by our own lists at all:
+    without it `_compute_desc_ids` hands the whole request to upstream, whose
+    list has room for neither that range nor the chunk range beside it.
+
+    Derived in one place because the worker sets its descriptor layout from it
+    and the scheduler decides whether to stream from it, and the two must not
+    disagree -- which is why the refusal below lives here rather than in either.
+    """
+    ratios: set[int] = set()
+    for spec in specs:
+        if not isinstance(spec, SlidingWindowSpec):
+            continue
+        if spec.block_size % spec.sliding_window != 0:
+            # Upstream's block table refuses this where the kernel addresses
+            # the cache in windows; where it addresses whole blocks the engine
+            # starts, and this is then the only place that sees a window no
+            # granule can tile.
+            raise RuntimeError(
+                "RBLN NIXL: a window range cuts a block into windows, so a "
+                f"{spec.sliding_window}-token window has to divide the "
+                f"{spec.block_size}-token block this engine's manager leases."
+            )
+        ratios.add(spec.block_size // spec.sliding_window)
+        if spec.block_size == spec.sliding_window:
+            continue
+        # Which granule the range names is read off the request's token count,
+        # and that is where the window is only where it slides. This spec's
+        # manager leases one block a request and the runner reads its first
+        # granule, wherever the count points.
+        if isinstance(spec, RBLNSlidingWindowSpec):
+            raise RuntimeError(
+                "RBLN NIXL: a window range needs a window that moves through "
+                "its block, and this engine pins every one to the block's "
+                "first kernel block. Turn off whichever of swa_window_mode, "
+                "chunk_mode and push_stream asked for one."
+            )
+    if len(ratios) > 1:
+        # The builder reads a group as windowed from its spec and then cuts it
+        # by the one ratio this engine carries, so a group that tiles its block
+        # differently would be named in another group's granules -- part of its
+        # block, with the descriptor count unchanged.
+        raise RuntimeError(
+            "RBLN NIXL: every sliding-window group has to cut its block into "
+            "the same number of kernel blocks, and this engine's groups cut it "
+            f"{sorted(ratios)} ways."
+        )
+    return next((r for r in ratios if r != 1), None)
 
 
 class RblnNixlRegistrationMixin(RblnNixlWorkerState):
@@ -464,28 +520,32 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         full_groups = sum(
             not isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
-        if self._chunk_mode and not (
+        # Streaming names part of a block for its own reason and needs the
+        # same shape to do it: one group whose blocks it counts in, and any
+        # other group described by a range of its own.
+        cutter = "chunk_mode" if self._chunk_mode else "a streamed write"
+        if (self._chunk_mode or self._writes_less_than_a_request()) and not (
             full_groups == 1
             and (len(self._group_specs) == 1 or self._own_engine_layout)
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode needs one "
-                "full-attention KV-cache group, and any other group to be a "
-                "sliding window whose view it can extend. Got "
-                f"groups={len(self._group_specs)}, full={full_groups}, "
-                f"swa={self._has_swa}, sw_ratio={self._sw_ratio}."
+                f"RBLN NIXL (D2D): {cutter} needs one full-attention KV-cache "
+                "group, and any other group to be a sliding window whose view "
+                f"it can extend. Got groups={len(self._group_specs)}, "
+                f"full={full_groups}, swa={self._has_swa}, "
+                f"sw_ratio={self._sw_ratio}."
             )
         # An engine that owns the whole-engine lists names a block's chunks
         # there without naming which span holds the request's last token -- so
         # a block cut into several spans would send chunks past the request's
         # own blocks. A head cut leaves one span a block.
         if (
-            self._chunk_mode
+            (self._chunk_mode or self._writes_less_than_a_request())
             and self._own_engine_layout
             and self._kv_split_axis is KVSplitAxis.NON_HEAD
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode on a sliding-window engine needs "
+                f"RBLN NIXL (D2D): {cutter} on a sliding-window engine needs "
                 "a head cut, which leaves one token range a block. This cache "
                 f"is cut on the {self._kv_split_axis.name} axis into "
                 f"{self._kv_areas} area(s)."

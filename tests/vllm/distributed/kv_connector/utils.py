@@ -767,6 +767,7 @@ def build_worker(
     stripe_width=None,
     chunk_mode=False,
     chunk_tokens=0,
+    push_stream=False,
     swa_kernel_block=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
@@ -829,6 +830,7 @@ def build_worker(
         chunk_tokens=chunk_tokens,
         swa_window_mode=swa_window_mode,
         stripe_width=stripe_width,
+        push_stream=push_stream,
     )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # What the worker sets before it builds the connector; `register_kv_caches`

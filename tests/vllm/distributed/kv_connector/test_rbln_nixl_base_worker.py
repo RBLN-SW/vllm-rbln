@@ -888,6 +888,20 @@ class TestWindowModeNeedsAWindowThatMoves:
                 swa_window_mode=True,
             )
 
+    def test_host_staging_asks_for_no_range_on_the_streaming_knob(self, monkeypatch):
+        # Streaming is refused host staging, so the knob that turns it on asks
+        # for no window range there -- the scheduler's `push_stream_enabled`
+        # answers the same, and a worker that disagreed would refuse a spec
+        # for a feature that is off.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            specs=[sliding_window_spec(block_size=64, sliding_window=32)],
+            push_stream=True,
+        )
+
+        assert worker._sw_ratio is None
+
     def test_a_window_that_moves_is_not(self, monkeypatch):
         # The control: the same geometry under the spec whose window slides.
         worker = build_worker(

@@ -38,12 +38,15 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.registration import (
     RblnNixlRegistrationMixin,
+    sliding_window_ratio,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    RequestTail,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
     RblnNixlTransferMixin,
 )
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -199,10 +202,7 @@ class RblnNixlWorkerBase(
         self._swa_kernel_blocks: set[int] = set()
         # How far the request being transferred fills its last block, parked
         # for the length of one upstream call (`_tail_viewed_as`).
-        self._request_tail: (
-            tuple[int | None, int | None, tuple[tuple[int, tuple[int, int]], ...]]
-            | None
-        ) = None
+        self._request_tail: RequestTail | None = None
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.
         self.local_seen_layer_names: list[str] = []
@@ -228,52 +228,25 @@ class RblnNixlWorkerBase(
             isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
         self._sw_ratio: int | None = None
+        # Chunk mode and streaming turn window mode on rather than asking for
+        # it: a hybrid is describable only by the whole-engine lists, and those
+        # carry a second range only in window mode. Without it
+        # `_own_engine_layout` is false and the whole list goes to upstream,
+        # which has room for neither that range nor the chunk range beside it.
         swa_window_mode = connector_option(self.vllm_config, "swa_window_mode", False)
-        if self._has_swa and swa_window_mode:
-            ratios: set[int] = set()
-            for spec in self._group_specs:
-                if not isinstance(spec, SlidingWindowSpec):
-                    continue
-                if spec.block_size % spec.sliding_window != 0:
-                    # Upstream's block table refuses this where the kernel
-                    # addresses the cache in windows; where it addresses whole
-                    # blocks the engine starts, and this is then the only place
-                    # that sees a window no granule can tile.
-                    raise RuntimeError(
-                        "RBLN NIXL: a window range cuts a block into windows, "
-                        f"so a {spec.sliding_window}-token window has to "
-                        f"divide the {spec.block_size}-token block this "
-                        "engine's manager leases. Turn swa_window_mode off."
-                    )
-                ratio = spec.block_size // spec.sliding_window
-                ratios.add(ratio)
-                if ratio == 1:
-                    continue
-                # Which granule the range names is read off the request's token
-                # count, and that is where the window is only where it slides.
-                # This spec's manager leases one block a request and the runner
-                # reads its first granule, wherever the count points.
-                if isinstance(spec, RBLNSlidingWindowSpec):
-                    raise RuntimeError(
-                        "RBLN NIXL: a window range needs a window that moves "
-                        "through its block, and this engine pins every one to "
-                        "the block's first kernel block. Turn swa_window_mode "
-                        "off."
-                    )
-            if len(ratios) > 1:
-                # The builder reads a group as windowed from its spec and then
-                # cuts it by the one ratio this engine carries, so a group that
-                # tiles its block differently would be named in another group's
-                # granules -- part of its block, with the descriptor count
-                # unchanged.
-                raise RuntimeError(
-                    "RBLN NIXL: every sliding-window group has to cut its "
-                    "block into the same number of kernel blocks, and this "
-                    f"engine's groups cut it into {sorted(ratios)} kernel "
-                    "block(s)."
-                )
-            self._sw_ratio = next((r for r in ratios if r != 1), None)
-            if self._sw_ratio is None:
+        if self._has_swa and (
+            swa_window_mode
+            or connector_option(self.vllm_config, "chunk_mode", False)
+            or (
+                # Already off on host staging (`push_stream_enabled`), so no
+                # window range there would serve it -- which is why that knob
+                # is absent from the refusal above.
+                connector_option(self.vllm_config, "push_stream", False)
+                and not self.use_host_buffer
+            )
+        ):
+            self._sw_ratio = sliding_window_ratio(self._group_specs)
+            if self._sw_ratio is None and swa_window_mode:
                 # Doing nothing is right here -- a granule would be the block,
                 # so the range would repeat what the whole one names. Saying so
                 # is what was missing: the knob is set and nothing follows.
@@ -290,6 +263,15 @@ class RblnNixlWorkerBase(
                     raise RuntimeError(
                         "RBLN NIXL: SWA window mode is not supported with a "
                         "sliding-window MLA cache."
+                    )
+                if not swa_window_mode:
+                    logger.warning(
+                        "RBLN NIXL: %s turned SWA window mode on over "
+                        "swa_window_mode=0 -- a hybrid engine is describable "
+                        "only by the lists that range sits in.",
+                        "chunk_mode"
+                        if connector_option(self.vllm_config, "chunk_mode", False)
+                        else "push_stream",
                     )
                 logger.info(
                     "SWA window mode on: %d sliding_window-sized desc(s) per "

@@ -226,6 +226,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             vllm_config,
             is_hma_required=self._is_hma_required,
             use_host_buffer=self.use_host_buffer,
+            specs=self._group_specs,
         )
         # Per request, for as long as it is being pushed in pieces. Created
         # when this rank first closes a chunk of it, dropped when the send is
@@ -665,18 +666,23 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # count and the loop below describing different peers.
         peer_ranks = self._overlapping_ranks.get(engine_id)
         if not peer_ranks:
-            # Streaming asks for per-shard state from every peer it writes to,
-            # so a request written in pieces cannot arrive on this route.
-            send = self._streamed.get(req_id)
-            assert send is None or not send.released, (
-                f"RBLN NIXL push: request {req_id} was written early but is "
-                f"served by a whole-engine handle (peer {engine_id}), which "
-                "the streaming handshake asks not to be given."
-            )
-            # Chunk mode asks for per-shard state, so a request written in
-            # pieces cannot arrive on this route -- unless a sliding window
-            # kept it here.
+            # Chunk mode asks for per-shard state, because those ids are what
+            # can leave part of a block out -- unless a sliding window kept it
+            # on this route, whose list carries the range instead.
             assert not self._chunk_mode or self._own_engine_layout
+            send = self._streamed.get(req_id)
+            if send is not None and send.released:
+                # Streaming asks for the same state, and for the same reason
+                # is refused it where a sliding window is present: only the
+                # whole-engine list can name two KV cache groups. So this side
+                # issues the batch itself, since the notification upstream
+                # builds has no room to say which blocks it filled.
+                assert self._own_engine_layout, (
+                    f"RBLN NIXL push: request {req_id} was written early but "
+                    f"is served by a whole-engine handle (peer {engine_id}), "
+                    "which only a sliding window asks for."
+                )
+                return self._xfer_batch_over_engine_handle(req_id, meta, remote_info)
             tail: AbstractContextManager = (
                 self._tail_viewed_as(
                     self._valid_tokens.get(req_id),
@@ -845,6 +851,121 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             )
 
         self._submit_writes(req_id, engine_id, notif_id, writes)
+
+    def _xfer_batch_over_engine_handle(
+        self, req_id: str, meta: "ReqMeta", remote_info: Any
+    ) -> None:
+        """Write one batch of a streamed request over the whole-engine handle.
+
+        The route upstream drives moves a whole request and names it with a
+        notification it builds itself, so a batch of one cannot take it:
+        nothing in that message says which blocks it filled. Everything else is
+        upstream's -- the same handles, and `_compute_desc_ids` for the
+        descriptors, which is where the sliding window's view and the chunk
+        range already are.
+        """
+        assert meta.remote is not None and self.transfer_topo is not None
+        engine_id = meta.remote.engine_id
+        block_size_ratio = self.transfer_topo.block_size_ratio(
+            remote_info.remote_block_size
+        )
+        assert block_size_ratio == 1, (
+            "RBLN NIXL streamed whole-engine write requires equal P/D block "
+            f"sizes (got block_size_ratio={block_size_ratio})"
+        )
+        # A sliding window is refused every pairing that is not one-to-one
+        # (see the handshake), so one peer rank holds what this rank writes.
+        ranks = self.tp_mappings[engine_id].all_source_ranks
+        assert len(ranks) == 1, (
+            f"RBLN NIXL push: {len(ranks)} peer ranks for a sliding-window "
+            f"engine {engine_id}, which the handshake does not allow"
+        )
+        meta.remote.block_ids = self._logical_to_kernel_block_ids(
+            meta.remote.block_ids, remote_info.remote_physical_blocks_per_logical
+        )
+        remote_block_ids = meta.remote.block_ids
+        local_block_ids = meta.local_physical_block_ids
+        n_prompt_blocks = self._prompt_blocks(local_block_ids)
+        counted = self._counted_group(remote_block_ids)
+        # Registration refuses a streamed engine with no full-attention group,
+        # which is what would leave nothing to count in.
+        assert n_prompt_blocks is not None and counted is not None
+        registered = len(remote_block_ids[counted])
+        gpb = 1 if self._chunk_grid is None else self._chunk_grid[1]
+        needed = self._tail_chunks(
+            n_prompt_blocks, self._valid_tokens.get(req_id), chunks_per_span=gpb
+        )
+        window = self._stream_window(
+            req_id,
+            local_block_ids,
+            remote_block_ids,
+            chunk_grid=self._chunk_grid,
+            offered_tokens=getattr(meta.local_block_ids, "offered_tokens", 0),
+            tail=needed,
+        )
+        assert window is not None, (
+            f"RBLN NIXL push: request {req_id} reached the streamed write "
+            "without a window, which only a request being streamed can"
+        )
+        local_block_ids, remote_block_ids, span, pieces = window
+        # Align the groups the way upstream aligns them before it reads them:
+        # a streamed batch empties the window's group on our side while the
+        # consumer keeps the block it registered for it, and the two lists
+        # have to name the same descriptors.
+        pairs = [
+            (loc[: len(rem)], rem[: len(loc)])
+            for loc, rem in zip(local_block_ids, remote_block_ids)
+        ]
+        local_block_ids = tuple(loc for loc, _ in pairs)
+        remote_block_ids = tuple(rem for _, rem in pairs)
+        notif_id = self._with_coverage(
+            self._xfer_notif_id(
+                engine_id, meta.remote.request_id, remote_info.remote_tp_size
+            ),
+            span,
+            gpb,
+        )
+        tail_tokens = (
+            self._valid_tokens.get(req_id) if span[1] == registered * gpb else None
+        )
+        if not sum(len(g) for g in local_block_ids) and not pieces:
+            logger.debug("streamed write req %s: nothing new to push", req_id)
+            return self._submit_writes(req_id, engine_id, notif_id, [])
+
+        # Each side parks its own pieces: one call describes one list, and the
+        # block ids in it are that side's.
+        with self._tail_viewed_as(
+            tail_tokens, n_prompt_blocks, tuple((b, c) for _, b, c in pieces)
+        ):
+            remote_descs = self._compute_desc_ids(
+                remote_block_ids,
+                self.dst_num_blocks[engine_id],
+                None,
+                remote_info.remote_physical_blocks_per_logical,
+            )
+        with self._tail_viewed_as(
+            tail_tokens, n_prompt_blocks, tuple((b, c) for b, _, c in pieces)
+        ):
+            local_descs = self._compute_desc_ids(
+                local_block_ids,
+                self.dst_num_blocks[self.engine_id],
+                block_size_ratio,
+                self._physical_blocks_per_logical_kv_block,
+            )
+        self._submit_writes(
+            req_id,
+            engine_id,
+            notif_id,
+            [
+                _Write(
+                    ranks[0],
+                    self.src_xfer_handles_by_block_size[remote_info.remote_block_size],
+                    self.dst_xfer_side_handles[engine_id][ranks[0]],
+                    local_descs,
+                    remote_descs,
+                )
+            ],
+        )
 
     def _submit_writes(
         self,
