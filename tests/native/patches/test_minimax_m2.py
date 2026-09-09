@@ -128,16 +128,25 @@ def _build_stage(rank: int, pp_size: int, monkeypatch) -> MiniMaxM2Model:
     return model
 
 
-def _slot_indices(keys) -> list[int]:
-    return sorted(
-        int(key.rsplit("_", 1)[1]) for key in keys if key.startswith(eagle3_pp.AUX_SLOT)
-    )
+def _stamped_layers(aux: torch.Tensor | None) -> list[int]:
+    """Which layer each hidden-wide block of a combined aux tensor came from.
+
+    Every stub layer fills its whole output with its own index, so block `k` of the
+    concatenation reads back the layer it was captured from.
+    """
+    if aux is None:
+        return []
+    return [
+        int(aux[..., block * HIDDEN].flatten()[0].item())
+        for block in range(aux.shape[-1] // HIDDEN)
+    ]
 
 
 def _run_pipeline(pp_size: int, aux_layers: tuple[int, ...], monkeypatch):
     """Drive every stage in order; return the last output and what each stage sent."""
     carried = None
-    slots_sent = []
+    layers_sent = []
+    keys_sent = []
     for rank in range(pp_size):
         model = _build_stage(rank, pp_size, monkeypatch)
         model._set_aux_hidden_state_layers(aux_layers)
@@ -147,9 +156,10 @@ def _run_pipeline(pp_size: int, aux_layers: tuple[int, ...], monkeypatch):
             intermediate_tensors=carried,
         )
         if rank < pp_size - 1:
-            slots_sent.append(_slot_indices(out.tensors))
+            layers_sent.append(_stamped_layers(out.tensors.get(eagle3_pp.AUX_COMBINED)))
+            keys_sent.append(sorted(out.tensors))
             carried = out
-    return out, slots_sent
+    return out, layers_sent, keys_sent
 
 
 @pytest.mark.parametrize("pp_size", [2, 4])
@@ -157,11 +167,10 @@ def _run_pipeline(pp_size: int, aux_layers: tuple[int, ...], monkeypatch):
     "aux_layers", [AUX_LAYERS, CHECKPOINT_AUX_LAYERS, BOUNDARY_AUX_LAYERS]
 )
 def test_last_stage_receives_every_aux_layer_in_order(pp_size, aux_layers, monkeypatch):
-    out, _ = _run_pipeline(pp_size, aux_layers, monkeypatch)
+    out, _, _ = _run_pipeline(pp_size, aux_layers, monkeypatch)
 
     _, aux = out
-    stamped = [int(tensor.flatten()[0].item()) for tensor in aux]
-    assert stamped == list(aux_layers)
+    assert _stamped_layers(torch.cat(aux, dim=-1)) == list(aux_layers)
 
 
 def test_a_boundary_layer_is_captured_once(monkeypatch):
@@ -170,19 +179,28 @@ def test_a_boundary_layer_is_captured_once(monkeypatch):
     # duplicate it.
     assert get_pp_indices(NUM_LAYERS, 2, 4)[0] == 31
 
-    out, slots_sent = _run_pipeline(4, AUX_LAYERS, monkeypatch)
+    out, layers_sent, _ = _run_pipeline(4, AUX_LAYERS, monkeypatch)
 
-    assert slots_sent == [[2], [2, 31], [2, 31]]
+    assert layers_sent == [[2], [2, 31], [2, 31]]
     _, aux = out
-    assert len(aux) == len(AUX_LAYERS)
+    assert len(_stamped_layers(torch.cat(aux, dim=-1))) == len(AUX_LAYERS)
 
 
 def test_a_stage_owning_no_aux_layer_forwards_the_slots(monkeypatch):
     # Stage 2 spans [31, 47) and owns none of (1, 30, 58); it must still pass what
     # stage 1 sent, or the last stage comes up short.
-    _, slots_sent = _run_pipeline(4, CHECKPOINT_AUX_LAYERS, monkeypatch)
+    _, layers_sent, _ = _run_pipeline(4, CHECKPOINT_AUX_LAYERS, monkeypatch)
 
-    assert slots_sent[2] == slots_sent[1] == [1, 30]
+    assert layers_sent[2] == layers_sent[1] == [1, 30]
+
+
+def test_the_handoff_carries_one_aux_tensor_whatever_it_holds(monkeypatch):
+    # A P2P transfer is priced per call, so the two aux layers that
+    # stages 1 and 2 pass on have to travel as one tensor rather than one each.
+    _, layers_sent, keys_sent = _run_pipeline(4, CHECKPOINT_AUX_LAYERS, monkeypatch)
+
+    assert layers_sent == [[1], [1, 30], [1, 30]]
+    assert keys_sent == [[eagle3_pp.AUX_COMBINED, "hidden_states", "residual"]] * 3
 
 
 def test_the_handoff_placeholder_follows_a_later_setter_call(monkeypatch):
@@ -198,7 +216,7 @@ def test_the_handoff_placeholder_follows_a_later_setter_call(monkeypatch):
     inner._set_aux_hidden_state_layers(CHECKPOINT_AUX_LAYERS)
 
     tensors = snapshot(batch_size=BATCH, dtype=torch.float32, device="cpu")
-    assert _slot_indices(tensors.tensors) == [1]
+    assert tensors[eagle3_pp.AUX_COMBINED].shape[-1] == HIDDEN
 
 
 def test_handoff_carries_no_aux_slots_when_eagle3_is_off(monkeypatch):
