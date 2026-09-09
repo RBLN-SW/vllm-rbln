@@ -91,6 +91,22 @@ _EARLY_FLUSH_POLL_INTERVAL_S = 0.001
 
 
 @dataclass
+class _Write:
+    """One peer's half of a batch: the two handles and the two descriptor lists.
+
+    Named because two routes build these -- per-shard lists, and the
+    whole-engine lists a sliding window keeps a hybrid on -- and a tuple of
+    five would leave the reader to work out which handle is whose.
+    """
+
+    peer_rank: int
+    local_handle: int
+    remote_handle: int
+    local_descs: "np.ndarray"
+    remote_descs: "np.ndarray"
+
+
+@dataclass
 class _StreamedSend:
     """What one request being pushed in pieces needs tracked between batches.
 
@@ -759,11 +775,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             # Ordinary once an offer grows every step: a step that computes
             # tokens without closing a chunk leaves the window where it was.
             logger.debug("per-shard write req %s: nothing new to push", req_id)
-            with self._sending_transfers_lock:
-                send = self._streamed.get(req_id)
-                if send is not None and send.released:
-                    send.done += 1
-            return
+            return self._submit_writes(req_id, engine_id, notif_id, [])
 
         logger.debug(
             "per-shard write req %s: ranks=%d write_blocks=%d",
@@ -773,8 +785,8 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         )
 
         # Publish once, for the reason the read path states (see
-        # `_read_blocks_for_req`); failure is per peer here, not per request.
-        handles: list[int] = []
+        # `_read_blocks_for_req`).
+        writes: list[_Write] = []
         for global_rank in peer_ranks:
             remote_descs = self._shard_descs_for_tokens(
                 engine_id,
@@ -820,20 +832,47 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                         ),
                     )
                 )
-            assert len(local_descs) == len(remote_descs)
-            local_handle = self.src_xfer_handles_by_remote[
-                (engine_id, global_rank, remote_block_size)
-            ]
-            remote_handle = self.dst_xfer_side_handles[engine_id][global_rank]
+            writes.append(
+                _Write(
+                    global_rank,
+                    self.src_xfer_handles_by_remote[
+                        (engine_id, global_rank, remote_block_size)
+                    ],
+                    self.dst_xfer_side_handles[engine_id][global_rank],
+                    local_descs,
+                    remote_descs,
+                )
+            )
 
+        self._submit_writes(req_id, engine_id, notif_id, writes)
+
+    def _submit_writes(
+        self,
+        req_id: str,
+        engine_id: str,
+        notif_id: bytes,
+        writes: "list[_Write]",
+    ) -> None:
+        """Issue this batch's transfers and account for what they produced.
+
+        Two routes build the descriptors and both end here, so a batch is
+        accounted for the same way whichever built it. Failure is per peer, not
+        per request: the peers that submitted are still writing.
+
+        An empty batch is a batch too. A streamed request is finished by its
+        count reaching the seal, so one that never counts never finishes.
+        """
+        handles: list[int] = []
+        for write in writes:
+            assert len(write.local_descs) == len(write.remote_descs)
             handle = None
             try:
                 handle = self.nixl_wrapper.make_prepped_xfer(
                     "WRITE",
-                    local_handle,
-                    local_descs,
-                    remote_handle,
-                    remote_descs,
+                    write.local_handle,
+                    write.local_descs,
+                    write.remote_handle,
+                    write.remote_descs,
                     notif_msg=notif_id,
                 )
                 self.nixl_wrapper.transfer(handle)
@@ -845,7 +884,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     msg="Push WRITE submission failed; releasing handle",
                     error=e,
                     dst_engine_id=engine_id,
-                    remote_pp_rank=global_rank,
+                    remote_pp_rank=write.peer_rank,
                 )
                 # Outbound only: there is no local metadata to invalidate, so
                 # release this peer's handle and let the remaining peers go.
@@ -855,15 +894,16 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
         with self._sending_transfers_lock:
             send = self._streamed.get(req_id)
-            if send is None or not send.released:
+            if send is not None and send.released:
+                if handles:
+                    send.transfers.append(handles)
+                else:
+                    # Every peer's submission failed, or the batch covered
+                    # nothing. Either way it is over, and a request whose
+                    # count never reaches its seal never finishes.
+                    send.done += 1
+            elif writes:
                 self._sending_transfers[req_id].extend(handles)
-            elif handles:
-                send.transfers.append(handles)
-            else:
-                # Every peer's submission failed. The batch is over either
-                # way, and a request whose count never reaches its seal is a
-                # request that never finishes.
-                send.done += 1
 
     def _stream_window(
         self,
