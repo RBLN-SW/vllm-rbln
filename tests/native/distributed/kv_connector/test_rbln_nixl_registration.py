@@ -1451,6 +1451,21 @@ class TestTailBlockTrim:
         with pytest.raises(RuntimeError, match="context-cut"):
             self._register(monkeypatch, areas=5, slices=5, chunk_mode=True)
 
+    def test_a_streamed_write_is_refused_on_the_same_geometry(self, monkeypatch):
+        # The grid is built for a side that writes a request in pieces as well
+        # as for the knob, so the position arithmetic it feeds has to hold for
+        # both. Without the knob nothing here says `chunk_mode`, and a refusal
+        # that named it alone would let this through.
+        with (
+            patch.object(
+                RblnNixlPullConnectorWorker,
+                "_writes_less_than_a_request",
+                return_value=True,
+            ),
+            pytest.raises(RuntimeError, match="context-cut"),
+        ):
+            self._register(monkeypatch, areas=4, slices=2, chunk_mode=False)
+
     def test_host_staging_is_refused_before_anything_registers(self, monkeypatch):
         # Host staging keeps one full-shape buffer per layer, so the flag would
         # otherwise be silently inert: `_register_kv_caches_impl` is D2D-only.

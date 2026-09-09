@@ -106,7 +106,9 @@ class TestComputeDescIds:
         worker._kv_areas = 1
         worker._kv_split_axis = KVSplitAxis.HEAD
         worker._chunk_grid = grid
-        worker._request_tail = tail
+        # A whole-request write names no pieces of its own, so the third
+        # field is empty here; the streamed path is what fills it.
+        worker._request_tail = None if tail is None else (*tail, ())
         worker._group_specs = [
             MagicMock(),  # full attention
             sliding_window_spec(block_size=64, sliding_window=32),

@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
     NixlPushConnectorWorker,
 )
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker as pw
 from tests.native.distributed.kv_connector.utils import (
@@ -109,6 +110,7 @@ def _push_worker():
     w._recving_metadata = {}
     w._writer_counts_by_req = defaultdict(int)
     w._coverage_by_req = defaultdict(lambda: defaultdict(list))
+    w._coverage_units_by_req = defaultdict(dict)
     w._reqs_to_send = {}
     w._reqs_to_process = set()
     w.consumer_notification_counts_by_req = {}
@@ -282,6 +284,7 @@ class TestPerShardWrite:
         w.vllm_config.parallel_config.pipeline_parallel_size = 4
         w.world_size = 1
         w.num_blocks = 8
+        w.block_size = 16
         w.dst_num_blocks = {"eng": 8}
         w._engine_last_active = {}
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
@@ -315,6 +318,9 @@ class TestPerShardWrite:
         meta = MagicMock()
         meta.remote = remote
         meta.local_physical_block_ids = local_ids
+        # The logical list is where a released offer carries its token count,
+        # so a mock in its place answers every question with a truthy Mock.
+        meta.local_block_ids = local_ids
         return meta
 
     def test_one_write_per_paired_rank_with_that_rank_s_handles(self):
@@ -484,7 +490,7 @@ class TestPerShardWrite:
         # out to one on the far side -- and our stages stay out of it, because
         # that far side multiplies them back in itself. Ahead of it, the range
         # of consumer blocks this write filled -- both of the two it registered.
-        assert notifs == {b"RBLNS:0:0:2:r0:1"}
+        assert notifs == {b"RBLNS:0:0:2:1:r0:1"}
 
     def test_a_partial_prefix_hit_keeps_our_matching_tail(self):
         # The consumer registered only the last block of a three-block prompt,
@@ -1038,7 +1044,7 @@ class TestDelegatedRouteAlignment:
 
         # The token count and the request's own block count, counted before
         # the trim and parked for the length of upstream's call.
-        assert seen == [(17, 3)]
+        assert seen == [(17, 3, ())]
         assert w._request_tail is None
 
     def test_the_producer_tail_is_what_reaches_the_base(self, monkeypatch):
@@ -1093,7 +1099,7 @@ class TestEarlySend:
         return w
 
     @staticmethod
-    def _meta(saves=(), pushes=(), recvs=None, totals=None):
+    def _meta(saves=(), pushes=(), recvs=None, totals=None, offered=None):
         """The real metadata object, built the way the scheduler builds it.
 
         Hand-rolling it here would leave the one thing the two sides have to
@@ -1119,6 +1125,7 @@ class TestEarlySend:
                 },
             )
         meta.push_stream_total.update(totals or {})
+        meta.push_stream_tokens.update(offered or {})
         return meta
 
     def test_a_closed_prefill_is_held_rather_than_handed_over(self):
@@ -1162,6 +1169,30 @@ class TestEarlySend:
         assert worker._streamed["r0"].released
         assert worker._streamed["r0"].pending_offer is None
         assert worker._push_writer_wake.is_set()
+
+    def test_a_released_offer_carries_the_tokens_it_was_built_for(self):
+        worker = self._worker()
+
+        worker.start_early_push(self._meta(saves=["r0"], offered={"r0": 1500}))
+        worker.release_early_offers()
+
+        _, blocks = worker._finished_blocks_inbox.get_nowait()
+        assert blocks.offered_tokens == 1500
+
+    def test_a_later_offer_does_not_rewrite_an_earlier_one_s_tokens(self):
+        # The writer drains on its own thread, so a step can hold and release
+        # the next offer before the writer has picked the previous one up.
+        # Reading the count off the request would then claim tokens this
+        # rank has not written -- silently, into the consumer's blocks.
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"], offered={"r0": 1500}))
+        worker.release_early_offers()
+        _, first = worker._finished_blocks_inbox.get_nowait()
+
+        worker.start_early_push(self._meta(saves=["r0"], offered={"r0": 3800}))
+        worker.release_early_offers()
+
+        assert first.offered_tokens == 1500
 
     def test_a_step_that_closes_nothing_still_releases_what_is_held(self):
         # The release cannot wait for another closing chunk: steps that close
@@ -1264,7 +1295,7 @@ class TestEarlySend:
             c.kwargs["notif_msg"]
             for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
         }
-        assert notifs == {b"RBLNS:0:0:1:r0:1"}
+        assert notifs == {b"RBLNS:0:0:1:1:r0:1"}
 
     def test_the_delegated_route_never_carries_an_early_write(self, monkeypatch):
         # That route's notification has no room for the range a write filled,
@@ -1420,7 +1451,7 @@ class TestCoverageNotif:
             c.kwargs["notif_msg"]
             for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
         }
-        assert notifs == {b"RBLNS:0:0:3:r0:1"}
+        assert notifs == {b"RBLNS:0:0:3:1:r0:1"}
 
     def test_a_pipeline_stage_names_itself(self, monkeypatch):
         # The writer id is the flat rank the per-shard route already pairs by,
@@ -1442,13 +1473,17 @@ class TestCoverageNotif:
         # pp_rank 3 of a 2-wide tensor split, tp_rank 1 -> flat rank 7.
         assert {n.split(b":")[1] for n in notifs} == {b"7"}
 
-    def test_several_kv_groups_leave_the_range_off(self):
-        # Guard: the groups go out together but carry their own lengths, so no
-        # single range describes the write. The consumer has to cope with the
-        # prefix being absent, which is also how the route upstream drives
-        # stays on the old wire.
+    def test_several_kv_groups_name_the_range_of_the_counted_one(self):
+        # The groups go out together and carry their own lengths, and the one
+        # a coverage range is counted in is the full-attention group -- a
+        # window's group holds one block whatever the prompt length, so its
+        # length describes no request.
         worker = TestPerShardWrite._writing_worker(ranks=1)
         worker._shard_region_group_ids = {("eng", 0): (0, 0)}
+        worker._group_specs = [
+            MagicMock(spec=SlidingWindowSpec),
+            MagicMock(),  # full attention, and the second group at that
+        ]
 
         worker._xfer_blocks_for_req(
             "r0", TestPerShardWrite._meta(([1], [2, 3]), ([7], [8, 9]))
@@ -1458,21 +1493,25 @@ class TestCoverageNotif:
             c.kwargs["notif_msg"]
             for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
         }
-        assert notifs == {b"r0:1"}
+        assert notifs == {b"RBLNS:0:0:2:1:r0:1"}
 
     def test_upstream_is_handed_the_message_it_had_before(self):
         # Upstream reads a notification as `req_id:count` with rsplit, so a
         # prefix left on would make it look up a request that does not exist.
-        assert RblnNixlPushConnectorWorker._split_coverage(b"RBLNS:2:0:5:r0:4") == (
+        assert RblnNixlPushConnectorWorker._split_coverage(b"RBLNS:2:0:5:4:r0:4") == (
             2,
             (0, 5),
+            4,
             b"r0:4",
         )
 
     def test_a_message_without_a_range_passes_through(self):
+        # One unit per block: what a range means when nobody named a unit is
+        # what every range meant before the field existed.
         assert RblnNixlPushConnectorWorker._split_coverage(b"r0:4") == (
             None,
             None,
+            1,
             b"r0:4",
         )
 
@@ -1536,7 +1575,7 @@ class TestSettleOnCoverage:
         range never settles, which makes the loss silent until it hangs.
         """
         worker = self._receiving_worker()
-        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:1:r0:1")
         seen = []
 
         def fake_base(self):
@@ -1547,7 +1586,7 @@ class TestSettleOnCoverage:
                 except queue.Empty:
                     return set()
                 if len(seen) == 1:
-                    self._pending_completion_notifs.put(b"RBLNS:0:0:3:r1:1")
+                    self._pending_completion_notifs.put(b"RBLNS:0:0:3:1:r1:1")
 
         with patch.object(NixlPushConnectorWorker, "_get_new_notifs", fake_base):
             worker._get_new_notifs()
@@ -1559,7 +1598,7 @@ class TestSettleOnCoverage:
     ):
         worker = self._receiving_worker()
         # Three blocks registered; this writer has filled the first two.
-        worker._pending_completion_notifs.put(b"RBLNS:0:0:2:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:2:1:r0:1")
 
         worker._get_new_notifs()
 
@@ -1567,11 +1606,11 @@ class TestSettleOnCoverage:
 
     def test_the_pieces_together_settle_it(self, handed_through):
         worker = self._receiving_worker()
-        worker._pending_completion_notifs.put(b"RBLNS:0:0:2:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:2:1:r0:1")
         worker._get_new_notifs()
         assert handed_through == []
 
-        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:1:r0:1")
         worker._get_new_notifs()
 
         assert handed_through == [b"r0:1"]
@@ -1582,20 +1621,95 @@ class TestSettleOnCoverage:
         # the second, counting one notification per writing rank. Handing it
         # both is what lets that count reach its total.
         worker = self._receiving_worker()
-        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:r0:2")
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:1:r0:2")
         worker._get_new_notifs()
         assert handed_through == [b"r0:2"]
 
-        worker._pending_completion_notifs.put(b"RBLNS:1:0:3:r0:2")
+        worker._pending_completion_notifs.put(b"RBLNS:1:0:3:1:r0:2")
         worker._get_new_notifs()
 
         assert handed_through == [b"r0:2", b"r0:2"]
+
+    def test_a_finer_unit_needs_that_many_more_to_settle(self, handed_through):
+        # Three blocks at four units each: spanning three units is one block,
+        # not the request. Read in the wrong unit this settles at once.
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:4:r0:1")
+        worker._get_new_notifs()
+        assert handed_through == []
+
+        worker._pending_completion_notifs.put(b"RBLNS:0:3:12:4:r0:1")
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:1"]
+
+    def test_each_writer_is_measured_in_its_own_unit(self, handed_through):
+        # One producer can serve two peers at different units, so a consumer
+        # cannot hold every writer to one of them.
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:1:r0:2")
+        worker._get_new_notifs()
+        assert handed_through == [b"r0:2"]
+
+        worker._pending_completion_notifs.put(b"RBLNS:1:0:6:2:r0:2")
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:2", b"r0:2"]
+
+    def test_a_writer_that_changes_its_unit_is_refused(self, handed_through):
+        # Ranges already counted in one unit cannot be compared against a
+        # range counted in another; taking the second would reach the total
+        # early and settle a request whose KV is incomplete.
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:2:1:r0:1")
+        worker._get_new_notifs()
+
+        worker._pending_completion_notifs.put(b"RBLNS:0:2:12:4:r0:1")
+        with pytest.raises(RuntimeError, match="changed the coverage unit"):
+            worker._get_new_notifs()
+
+    def test_a_unit_below_one_is_refused(self, handed_through):
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:0:r0:1")
+
+        with pytest.raises(RuntimeError, match="units per block"):
+            worker._get_new_notifs()
+
+    def test_one_writer_s_ranges_do_not_settle_another(self, handed_through):
+        # Held per writer, not per request: read as one bucket, a writer that
+        # has covered the list settles a writer that has filled one block of it,
+        # and the request goes on with that rank's KV missing.
+        worker = self._receiving_worker()
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:1:r0:2")
+        worker._get_new_notifs()
+        assert handed_through == [b"r0:2"]
+
+        worker._pending_completion_notifs.put(b"RBLNS:1:0:1:1:r0:2")
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:2"]
+
+    def test_a_resent_range_does_not_undo_what_it_overlaps(self, handed_through):
+        # A preempted request re-sends a range already inside one that landed,
+        # and a later batch continues past it. Taking each range's end as the
+        # reach rather than the furthest seen walks the coverage backwards, and
+        # the request never settles.
+        worker = self._receiving_worker()
+        worker._recving_metadata = {
+            "r0": SimpleNamespace(local_physical_block_ids=([1, 2, 3, 4, 5, 6],))
+        }
+        for span in (b"0:3", b"1:2", b"3:6"):
+            worker._pending_completion_notifs.put(b"RBLNS:0:" + span + b":1:r0:1")
+
+        worker._get_new_notifs()
+
+        assert handed_through == [b"r0:1"]
 
     def test_one_write_for_the_whole_request_settles_at_once(self, handed_through):
         # Guard: this is every request today, and it has to settle exactly
         # where the count would have settled it.
         worker = self._receiving_worker()
-        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:3:1:r0:1")
 
         worker._get_new_notifs()
 
@@ -1607,7 +1721,7 @@ class TestSettleOnCoverage:
         # reach three here with the third never written.
         worker = self._receiving_worker()
         for span in (b"0:1", b"0:1", b"0:1"):
-            worker._pending_completion_notifs.put(b"RBLNS:0:" + span + b":r0:1")
+            worker._pending_completion_notifs.put(b"RBLNS:0:" + span + b":1:r0:1")
 
         worker._get_new_notifs()
 
@@ -1618,8 +1732,8 @@ class TestSettleOnCoverage:
         # written. Whether a range starts past what has been covered is the
         # only thing separating this from a complete request.
         worker = self._receiving_worker()
-        worker._pending_completion_notifs.put(b"RBLNS:0:0:1:r0:1")
-        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:1:1:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:1:r0:1")
 
         worker._get_new_notifs()
 
@@ -1627,12 +1741,12 @@ class TestSettleOnCoverage:
 
     def test_filling_the_gap_settles_it(self, handed_through):
         worker = self._receiving_worker()
-        worker._pending_completion_notifs.put(b"RBLNS:0:0:1:r0:1")
-        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:0:1:1:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:2:3:1:r0:1")
         worker._get_new_notifs()
         assert handed_through == []
 
-        worker._pending_completion_notifs.put(b"RBLNS:0:1:2:r0:1")
+        worker._pending_completion_notifs.put(b"RBLNS:0:1:2:1:r0:1")
         worker._get_new_notifs()
 
         assert handed_through == [b"r0:1"]
@@ -1725,6 +1839,7 @@ class TestSealedCompletion:
         w._push_writer_wake = threading.Event()
         w._writer_counts_by_req = defaultdict(int)
         w._coverage_by_req = defaultdict(lambda: defaultdict(list))
+        w._coverage_units_by_req = defaultdict(dict)
         _send(w, released=True)
         return w
 
@@ -1930,6 +2045,303 @@ class TestStreamWindow:
             for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
         ]
 
+    def _chunked(
+        self,
+        *,
+        total,
+        offered,
+        have,
+        registered=2,
+        gpb=2,
+        hwm=0,
+        chunks=0,
+        valid=None,
+    ):
+        """Call the window directly with a grid. The offer's block list is
+        `have` long and holds `offered` tokens; the consumer registered
+        `registered` blocks of the prompt's `total`. `valid` is the request's
+        final token count, which only the handover carries."""
+        w = self._worker(total=total)
+        w.block_size = 16
+        send = w._streamed["r0"]
+        send.issued_hwm = hwm
+        send.issued_chunks = chunks
+        tail = None
+        if valid is not None:
+            w._chunk_mode = True
+            w._kv_areas = 1
+            w._kv_split_axis = KVSplitAxis.HEAD
+            tail = w._tail_chunks(total, valid, chunks_per_span=gpb)
+        return w, w._stream_window(
+            "r0",
+            (list(range(have)),),
+            (list(range(100, 100 + registered)),),
+            chunk_grid=(2, gpb),
+            offered_tokens=offered,
+            tail=tail,
+        )
+
+    def test_a_partial_last_block_leaves_as_chunks(self):
+        # Four blocks held, three closed and the fourth holding 8 of 16 tokens.
+        # The consumer registered two, so its block 0 goes whole and its block
+        # 1 goes half -- and the range says so in chunks, not blocks.
+        w, out = self._chunked(total=4, offered=3 * 16 + 8, have=4)
+        local, remote, span, pieces = out
+
+        assert local == ([2],) and remote == ([100],)
+        assert span == (0, 1 * 2 + 1)
+        assert pieces == ((3, 101, (0, 1)),)  # our block 3, their 101, chunk 0
+        assert w._streamed["r0"].issued_chunks == 1
+
+    def test_the_next_batch_only_advances_the_chunks(self):
+        # Four chunks a block, so a block can fill in steps without closing:
+        # 12 of 16 tokens is three chunks, one past what already went. Nothing
+        # goes whole and the range moves by that one chunk.
+        w, out = self._chunked(
+            total=4, offered=3 * 16 + 12, have=4, gpb=4, hwm=1, chunks=2
+        )
+        local, remote, span, pieces = out
+
+        assert local == ([],) and remote == ([],)
+        assert span == (1 * 4 + 2, 1 * 4 + 3)
+        # Picks up where the last batch stopped.
+        assert pieces == ((3, 101, (2, 3)),)
+
+    def test_a_block_that_closes_sends_only_the_chunks_still_missing(self):
+        # Half of the consumer's block 1 went out as a chunk last batch. It has
+        # closed now, and writing it whole would repeat that half -- so the
+        # write takes the rest of it in chunks and the whole-block range starts
+        # after it. Here that leaves the whole-block range empty.
+        w, out = self._chunked(total=4, offered=4 * 16, have=4, hwm=1, chunks=1)
+        local, remote, span, pieces = out
+
+        assert local == ([],) and remote == ([],)
+        assert pieces == ((3, 101, (1, 2)),)  # chunk 1 only, not the block
+        assert span == (1 * 2 + 1, 2 * 2)
+        assert w._streamed["r0"].issued_hwm == 2
+        assert w._streamed["r0"].issued_chunks == 0
+
+    def test_a_step_that_closes_no_chunk_writes_nothing(self):
+        w, out = self._chunked(total=4, offered=3 * 16 + 8, have=4, hwm=1, chunks=1)
+        local, remote, span, pieces = out
+
+        # Every group keeps its slot -- the window empties one, it does not
+        # drop the rest -- so a hybrid's window block still rides the write
+        # this batch would have carried.
+        assert local == ([],) and remote == ([],) and pieces == ()
+        assert span == (3, 3)
+
+    def test_the_handover_stops_at_the_tokens_the_last_block_holds(self):
+        # The last block half-filled and half of that already streamed. The
+        # handover owes the chunk that holds tokens, not every chunk left in
+        # the block: the tokens past the prompt are what chunk mode exists not
+        # to send, and this is the write the consumer is waiting on.
+        w, out = self._chunked(
+            total=4, offered=0, have=4, gpb=4, hwm=1, chunks=1, valid=3 * 16 + 8
+        )
+        _local, _remote, span, pieces = out
+
+        assert pieces == ((3, 101, (1, 2)),)  # chunk 1 only, not chunks 1..4
+        # The range still names the whole request: it says what the write is
+        # responsible for, not which descriptors went out.
+        assert span == (1 * 4 + 1, 2 * 4)
+
+    def test_a_peer_without_chunks_leaves_the_partial_block_alone(self):
+        # The offer holds the block being filled, but this peer's lists have
+        # no chunk range. It must write the blocks that closed and stop --
+        # writing the partial one whole would ship KV not computed yet.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        worker._shard_chunk_grids = {("eng", 0): None}
+        meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 8)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert self._sent(worker) == [[2]]  # our block 2, not 2 and 3
+        assert worker._streamed["r0"].issued_hwm == 1
+
+    def test_a_batch_with_a_tail_writes_both_ranges_in_one_transfer(self):
+        # The chunks come from the second range of the same lists, so they
+        # ride the batch rather than costing it a transfer of its own -- which
+        # would be a second notification for one offer.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        worker._shard_chunk_grids = {("eng", 0): (2, 2)}
+        meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 8)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 1
+        local = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
+        # 2 regions x (1 whole block + 2 heads x 1 chunk).
+        assert len(local) == 2 * 3
+        whole = 2 * worker.num_blocks
+        assert sum(1 for d in local if d >= whole) == 2 * 2
+        # And the range is counted in chunks, not blocks.
+        notif = worker.nixl_wrapper.make_prepped_xfer.call_args.kwargs["notif_msg"]
+        assert notif.startswith(b"RBLNS:0:0:3:2:")
+
+    def test_the_next_batch_does_not_repeat_a_chunk_it_already_sent(self):
+        """A block that closes after part of it went out is written from where
+        that part stopped. Writing it whole instead moves those bytes a second
+        time, and every block passes through the partly-filled state whenever a
+        prefill chunk is narrower than a block -- so it would be every block."""
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        worker._shard_chunk_grids = {("eng", 0): (2, 2)}
+
+        first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        first.local_block_ids = pw.OfferedBlocks(first.local_block_ids, 3 * 16 + 8)
+        worker._xfer_blocks_for_req("r0", first)
+
+        second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        second.local_block_ids = pw.OfferedBlocks(second.local_block_ids, 4 * 16)
+        worker._xfer_blocks_for_req("r0", second)
+
+        # Nothing goes whole in the second write: the only block it still owes
+        # is the one it half-sent, and it owes just the other half.
+        assert self._sent(worker) == [[2], []]
+        descs = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
+        whole = 2 * worker.num_blocks
+        assert all(d >= whole for d in descs)
+        assert len(descs) == 2 * 2  # 2 regions x 2 heads x 1 chunk
+
+    def test_a_peer_with_a_grid_is_counted_in_chunks_even_unstreamed(self):
+        # No total, so there is no window and the whole list goes at once -- but
+        # the peer still counts in chunks, and the `per_block` the notification
+        # carries says so. A range named in blocks never reaches the total the
+        # consumer computes from that unit, and the request never settles.
+        gpb, heads = 2, 2
+        worker = self._worker()
+        worker._shard_chunk_grids = {("eng", 0): (heads, gpb)}
+
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2],), ([4, 5, 6],))
+        )
+
+        spans = {
+            tuple(c.kwargs["notif_msg"].decode().split(":")[2:5])
+            for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
+        }
+        # Three blocks at two chunks each, and the unit beside the range.
+        assert spans == {("0", "6", "2")}
+
+    def test_a_part_filled_chunk_is_not_offered(self):
+        # The count rounds DOWN here, unlike at handover: a chunk the offer
+        # reaches into but does not fill holds tokens the forward has not
+        # computed, and the writer reads device memory without checking.
+        # 49 tokens over blocks of 16 leaves one token in a chunk of eight.
+        gpb, heads = 2, 2
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        worker._shard_chunk_grids = {("eng", 0): (heads, gpb)}
+        meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5, 6, 7],))
+        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 49)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        spans = {
+            tuple(c.kwargs["notif_msg"].decode().split(":")[2:4])
+            for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
+        }
+        # Three whole blocks at two chunks each, and nothing of the fourth.
+        assert spans == {("0", "6")}
+
+    def test_a_prefill_writes_every_chunk_exactly_once(self):
+        """Walk a whole prefill and account for every byte of it.
+
+        Two properties at once, and neither survives a range that is off by a
+        chunk. Nothing may be written twice, which is what makes streaming in
+        chunks cheaper than not streaming at all; and nothing may be left out,
+        because the ranges the consumer settles on say it was written -- a hole
+        there is a torn block hashed into its prefix cache.
+        """
+        gpb, heads, regions = 2, 2, 2
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        worker._shard_chunk_grids = {("eng", 0): (heads, gpb)}
+        whole_descs = regions * worker.num_blocks
+
+        def decode(desc: int) -> set[tuple[int, int, int, int]]:
+            """(region, block, head, chunk) a descriptor id covers."""
+            if desc < whole_descs:
+                region, block = divmod(desc, worker.num_blocks)
+                return {(region, block, h, c) for h in range(heads) for c in range(gpb)}
+            within = desc - whole_descs
+            block_ix, rest = divmod(within, heads * gpb)
+            region, block = divmod(block_ix, worker.num_blocks)
+            head, chunk = divmod(rest, gpb)
+            return {(region, block, head, chunk)}
+
+        written: list[tuple[int, int, int, int]] = []
+        spans: list[tuple[int, int]] = []
+        # A chunk is 8 tokens, so the offer grows by one chunk a step until the
+        # four blocks are full; the handover then carries no token count.
+        for tokens in [*range(8, 4 * 16 + 1, 8), 0]:
+            meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5, 6, 7],))
+            meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, tokens)
+            worker.nixl_wrapper.make_prepped_xfer.reset_mock()
+            worker._xfer_blocks_for_req("r0", meta)
+            for call in worker.nixl_wrapper.make_prepped_xfer.call_args_list:
+                for desc in call.args[2]:
+                    written.extend(decode(int(desc)))
+                notif = call.kwargs["notif_msg"].decode()
+                lo, hi = notif.split(":")[2:4]
+                spans.append((int(lo), int(hi)))
+
+        expected = {
+            (r, b, h, c)
+            for r in range(regions)
+            for b in range(4)  # this rank's four blocks, all of them offered
+            for h in range(heads)
+            for c in range(gpb)
+        }
+        assert sorted(written) == sorted(expected), (
+            "a chunk was written twice or not at all"
+        )
+        # And the ranges the consumer settles on tile the same span end to end.
+        assert [s for s in spans if s[0] != s[1]] == sorted(
+            {s for s in spans if s[0] != s[1]}
+        )
+        merged = [s for s in spans if s[0] != s[1]]
+        assert merged[0][0] == 0 and merged[-1][1] == 4 * gpb
+        assert all(a[1] == b[0] for a, b in zip(merged, merged[1:]))
+
+    @pytest.mark.parametrize(
+        "second, expected",
+        [
+            # Both peers count in halves of a block, so the request does.
+            ((2, 2), b"RBLNS:0:0:3:2:"),
+            # One of them does not, so neither gets chunks: one window serves
+            # every peer and `issued_hwm` is the request's, so a per-peer unit
+            # would count one request's coverage two ways. The block being
+            # filled is then left alone -- one block, not two.
+            (None, b"RBLNS:0:0:1:1:"),
+            # Two peers that both count in chunks, but not the same ones. A set
+            # holding one grid and a `None` cannot tell "they disagree" from
+            # "take whichever is there": `set.pop()` answers `None` on it either
+            # way. Two real grids separate the two.
+            ((2, 4), b"RBLNS:0:0:1:1:"),
+        ],
+    )
+    def test_every_peer_of_a_request_counts_in_one_unit(self, second, expected):
+        worker = TestPerShardWrite._writing_worker(ranks=2)
+        worker._physical_blocks_per_logical_kv_block = 1
+        worker._recving_metadata = {}
+        _send(worker, total=4)
+        worker.block_size = 16
+        worker._shard_chunk_grids = {("eng", 0): (2, 2), ("eng", 1): second}
+        meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 8)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 2
+        for call in worker.nixl_wrapper.make_prepped_xfer.call_args_list:
+            assert call.kwargs["notif_msg"].startswith(expected)
+
     def test_the_first_batch_starts_where_the_consumer_window_does(self):
         # Four blocks in the prompt, the consumer registered the last two: its
         # window begins at our block 2. Two closed so far, so exactly one of
@@ -1976,7 +2388,7 @@ class TestStreamWindow:
             c.kwargs["notif_msg"]
             for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
         ]
-        assert notifs == [b"RBLNS:0:0:1:r0:1", b"RBLNS:0:1:2:r0:1"]
+        assert notifs == [b"RBLNS:0:0:1:1:r0:1", b"RBLNS:0:1:2:1:r0:1"]
 
     def test_a_request_that_is_not_streamed_is_left_to_the_trim(self):
         # Guard: with the flag off no total ever arrives, and this is every

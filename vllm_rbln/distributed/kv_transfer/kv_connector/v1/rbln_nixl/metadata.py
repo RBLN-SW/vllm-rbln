@@ -48,15 +48,14 @@ if TYPE_CHECKING:
 #   3: + the transfer direction in the hash
 #   4: + kv_split_axis (which axis the geometry above came from)
 #   5: + which consumer blocks a completion notification covered
-RBLN_NIXL_CONNECTOR_VERSION: int = 5
+#   6: + the unit that range is counted in
+RBLN_NIXL_CONNECTOR_VERSION: int = 6
 
 # Prefix a push completion notification carries when it names the half-open
-# range of consumer blocks that write filled: ``RBLNS:<writer>:<lo>:<hi>:``
-# ahead of the message upstream builds. A consumer settles a request on the
-# ranges it has seen rather than on how many peers reported, which is what
-# lets one peer's KV arrive in several writes. The producer leaves it off
-# where a single range cannot describe the write, so a consumer has to accept
-# a message without it.
+# range this write filled: ``RBLNS:<writer>:<lo>:<hi>:<per_block>:`` ahead of
+# the message upstream builds, counting units of one consumer block divided
+# by ``per_block`` (1 where a write never splits one). Left off where no
+# single range describes the write, so a consumer must accept a bare message.
 RBLN_COVERAGE_NOTIF_PREFIX: bytes = b"RBLNS:"
 
 
@@ -115,6 +114,12 @@ class RblnNixlConnectorMetadata(NixlConnectorMetadata):
         # window begins can only be found from the total -- and the prefix
         # offered mid-stream is shorter than it.
         self.push_stream_total: dict[ReqId, int] = {}
+        # Tokens of KV the offered prefix holds. Distinct from `valid_tokens`,
+        # which is the request's final count and only exists once it is over:
+        # an offer is a prefix of a request still being computed, and how much
+        # of its last block is filled is what a write smaller than a block
+        # needs to know.
+        self.push_stream_tokens: dict[ReqId, int] = {}
         # Tokens of KV the offered block list holds, so a last block that is not
         # full can leave the areas above its final token behind. Absent where
         # the count is unknown, which keeps the whole block.

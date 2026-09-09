@@ -142,7 +142,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched._has_mamba = False
     sched.vllm_config.scheduler_config.max_num_batched_tokens = 512
     if cls is RblnNixlPushConnectorScheduler:
-        sched._streamed_blocks = {}
+        sched._streamed_chunks = {}
         sched._push_pending_registrations = {}
         sched._push_registration_deadlines = {}
         sched._push_registration_timeout = 480
@@ -430,7 +430,7 @@ class TestSchedulerCleanupReachesBothDirections:
         monkeypatch.setattr(direction_cls, "request_finished", record)
         scheduler = object.__new__(scheduler_cls)
         scheduler._block_ids_need_save = {"r0": ([1, 2],)}
-        scheduler._streamed_blocks = {"r0": 2}
+        scheduler._streamed_chunks = {"r0": 2}
         scheduler._valid_tokens = {}
 
         # A real Request always carries the field, even when it is None.
@@ -443,7 +443,7 @@ class TestSchedulerCleanupReachesBothDirections:
         if scheduler_cls is RblnNixlPushConnectorScheduler:
             # The offered prefix goes with it: a retry reusing the id would
             # otherwise be thought to have already streamed what it has not.
-            assert scheduler._streamed_blocks == {}
+            assert scheduler._streamed_chunks == {}
 
 
 class TestRejectedBeforeScheduling:
@@ -498,6 +498,82 @@ class TestEarlyOfferOnTheWritePath:
         )
         sched._early_push_enabled = enabled
         return sched
+
+    @staticmethod
+    def _chunking_scheduler(chunk):
+        """A push scheduler whose config asks for writes smaller than a block.
+
+        The shared fixture's config is a mock, so the chunk derivation falls
+        back to the block and no offer holds a partial one. Naming the prefill
+        chunk is what turns that on.
+        """
+        sched = TestEarlyOfferOnTheWritePath._push_scheduler()
+        sched.vllm_config.scheduler_config.max_num_batched_tokens = chunk
+        return sched
+
+    def test_an_offer_carries_the_block_being_filled(self):
+        # Half a block computed: the block holding it comes with the offer, and
+        # the token count says how much of it is there. Offering only closed
+        # blocks leaves that half until the request ends.
+        sched = self._chunking_scheduler(8)
+        req = _Request("prefill", num_prompt_tokens=512)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 24
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 24))
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2],)
+        assert meta.push_stream_tokens["prefill"] == 24
+
+    def test_an_offer_grows_by_a_chunk_rather_than_by_a_block(self):
+        # A step that closes no block still closes a chunk, and today that
+        # step offers nothing at all.
+        sched = self._chunking_scheduler(8)
+        req = _Request("prefill", num_prompt_tokens=512)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 8
+        sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 8))
+        assert sched._streamed_chunks == {"prefill": 1}
+
+        req.num_computed_tokens = 16
+        meta = sched.build_connector_meta(
+            _sched_output("prefill", ([1, 2],), 16, is_new=False)
+        )
+
+        assert "prefill" in meta.reqs_to_save
+        assert meta.push_stream_tokens["prefill"] == 16
+
+    def test_a_part_chunk_does_not_count_as_a_whole_one(self):
+        # The cursor rounds DOWN: counting the chunk a step reached into as
+        # done would make the next step, which actually closes it, look like no
+        # progress -- and that step's offer would never go out.
+        sched = self._chunking_scheduler(8)
+        req = _Request("prefill", num_prompt_tokens=512)
+        sched._reqs_need_save["prefill"] = req
+
+        req.num_computed_tokens = 44  # five whole chunks of eight, and half a sixth
+        first = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 44))
+        assert "prefill" in first.reqs_to_save
+
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 48  # the sixth chunk closes here
+        second = sched.build_connector_meta(_sched_output("prefill", ([1, 2, 3],), 48))
+
+        assert "prefill" in second.reqs_to_save
+        assert second.push_stream_tokens["prefill"] == 48
+
+    def test_an_offer_never_names_tokens_no_block_of_ours_holds(self):
+        # A step can compute past the blocks we have -- the accumulation lags
+        # by a step on a resume -- and a count past them names KV that is not
+        # there for the writer to read.
+        sched = self._chunking_scheduler(8)
+        req = _Request("prefill", num_prompt_tokens=512)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 100
+
+        meta = sched.build_connector_meta(_sched_output("prefill", ([1, 2],), 100))
+
+        assert meta.push_stream_tokens["prefill"] == 2 * 16
 
     def test_a_producer_request_is_tracked_for_the_offer(self):
         # The offer reads the accumulation upstream builds only under host
@@ -556,7 +632,7 @@ class TestEarlyOfferOnTheWritePath:
         sched._reqs_need_save["preempted"] = req
         req.num_computed_tokens = 64
         sched.build_connector_meta(_sched_output("preempted", ([1, 2, 3],), 64))
-        assert sched._streamed_blocks == {"preempted": 3}
+        assert sched._streamed_chunks == {"preempted": 3}
 
         req.num_computed_tokens = 32
         meta = sched.build_connector_meta(
