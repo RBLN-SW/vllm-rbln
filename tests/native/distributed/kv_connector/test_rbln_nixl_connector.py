@@ -263,6 +263,16 @@ class TestDeferredLoad:
 
         assert delegated == []
 
+    def test_holding_a_second_read_is_refused(self, worker_connector):
+        # The entry flush is what keeps this unreachable, so the assert is the
+        # only thing that would notice if that ordering were ever changed.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+
+        with pytest.raises(AssertionError):
+            connector.start_load_kv(self._ctx(None))
+
     def test_flush_issues_the_held_read_once(self, worker_connector):
         connector = worker_connector()
         connector._connector_metadata = "META"

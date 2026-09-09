@@ -174,7 +174,11 @@ class RblnNixlPullConnector(
         reported finished, so the read and the forward touch disjoint blocks.
         `clear_connector_metadata` rebinds that field to None, so the object
         kept here survives the step.
+
+        The assert holds because every `execute_model` flushes on entry: losing
+        a held read strands its request as surely as never issuing one.
         """
+        assert self._deferred_load_meta is None
         self._deferred_load_meta = self._connector_metadata
 
     def flush_deferred_load(self) -> None:
@@ -182,6 +186,13 @@ class RblnNixlPullConnector(
 
         A request is listed for receive once, so a read nobody issues strands it
         for good -- hence every site that can be a step's last chance flushes.
+
+        That another step comes at all rests on the scheduler counting
+        `skipped_waiting` as unfinished work, which a paused one does not: both
+        pause states leave it out, holding a read until the unpause.
+
+        The replay is the whole of `start_load_kv`, lease arming and heartbeats
+        included; their deadlines are absolute, so only their arrival shifts.
         """
         meta = self._deferred_load_meta
         if meta is None:
