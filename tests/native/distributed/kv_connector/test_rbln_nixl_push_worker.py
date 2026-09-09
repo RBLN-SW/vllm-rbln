@@ -108,7 +108,6 @@ def _push_worker():
     w._valid_tokens = {}
     w._physical_blocks_per_logical_kv_block = 1
     w._recving_metadata = {}
-    w._writer_counts_by_req = defaultdict(int)
     w._coverage_by_req = defaultdict(lambda: defaultdict(list))
     w._coverage_units_by_req = defaultdict(dict)
     w._reqs_to_send = {}
@@ -986,6 +985,122 @@ class TestTheThreeListsAgree:
         assert grid == (1, 2)
 
 
+class TestStreamedEngineHandleWrite:
+    """A hybrid streams over the whole-engine handle, because that is the only
+    descriptor list able to name two KV cache groups. So this side issues the
+    batch itself: the notification upstream builds has no room for a range."""
+
+    @staticmethod
+    def _worker(*, total=4, grid=(2, 2)):
+        w = TestPerShardWrite._writing_worker(ranks=1)
+        w._overlapping_ranks = {}  # nothing narrowed: the engine handle
+        w._sw_ratio = 2
+        w._chunk_mode = True
+        w._chunk_grid = grid
+        w._request_tail = None
+        w.num_regions = 2
+        w._kv_areas = 1
+        w._kv_split_axis = KVSplitAxis.HEAD
+        w._physical_blocks_per_logical_kv_block = 1
+        w._recving_metadata = {}
+        w._group_specs = [
+            MagicMock(),  # full attention
+            MagicMock(spec=SlidingWindowSpec),
+        ]
+        w.engine_id = "self"
+        w.dst_num_blocks["self"] = 8
+        w.src_xfer_handles_by_block_size = {16: 300}
+        w.tp_mappings = {"eng": MagicMock(all_source_ranks=[0])}
+        _send(w, total=total)
+        w._streamed["r0"].released = True
+        return w
+
+    @staticmethod
+    def _offer(local_groups, remote_groups, tokens):
+        meta = TestPerShardWrite._meta(local_groups, remote_groups)
+        meta.local_block_ids = pw.OfferedBlocks(local_groups, tokens)
+        return meta
+
+    @staticmethod
+    def _descs(worker):
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        return list(call.args[2]), call.kwargs["notif_msg"]
+
+    def test_a_write_with_no_range_carries_the_bare_notification(self):
+        # A request written in one transfer has no range to name, and the
+        # consumer settles it on upstream's own count -- so what reaches it is
+        # the message upstream would have built.
+        worker = self._worker()
+
+        assert worker._with_coverage(b"r0:1", None, 1) == b"r0:1"
+
+    def test_a_streamed_batch_names_its_range_and_leaves_the_window_alone(self):
+        # Three blocks closed of four and the consumer registered the last
+        # two, so its block 0 is what this batch is the first to fill. The
+        # window's group is not in the offer -- its one block holds the live
+        # window, which the kernel is still overwriting -- and the consumer's
+        # registration of it is trimmed away rather than written.
+        worker = self._worker()
+        meta = self._offer(([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        descs, notif = self._descs(worker)
+        assert notif.startswith(b"RBLNS:0:0:2:2:")  # one block, counted in chunks
+        # 2 regions x 8 blocks = 16 whole descriptors, so the window's range
+        # is [16, 32) and no descriptor of this write may fall in it.
+        assert descs == [2, 10]
+        remote_descs = list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
+        assert remote_descs == [4, 12]
+
+    def test_the_handover_carries_the_window_with_the_last_block(self):
+        # The prompt's last block is half full, so it goes as the one chunk
+        # that holds tokens -- and the window's block rides the same write,
+        # which is the only one that may carry it.
+        worker = self._worker()
+        worker._valid_tokens = {"r0": 3 * 16 + 8}
+        meta = self._offer(([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        _descs, notif = self._descs(worker)
+        assert notif.startswith(b"RBLNS:0:0:4:2:")
+        remote = list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
+        # The block that closed whole, one chunk of the last block from the
+        # third range, and the window's block from the second.
+        assert remote[:2] == [4, 12]
+        assert remote[2:6] == [52, 54, 84, 86]
+        assert remote[6:] == [6 + 16, 14 + 16]
+
+    def test_a_batch_that_writes_nothing_still_counts_toward_the_seal(self):
+        # The per-shard route has the same guard: a batch issuing no write
+        # still raises the landed count, or the request sits one short of its
+        # seal forever. This route reaches it when the offer adds nothing past
+        # the high-water mark and the window's block is not in the offer.
+        worker = self._worker()
+        worker._streamed["r0"].issued_hwm = 2
+        meta = self._offer(([0, 1, 2, 3], []), ([4, 5], [6]), 2 * 16)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 0
+        assert worker._streamed["r0"].done == 1
+
+    def test_a_handover_with_nothing_left_still_writes_the_window(self):
+        # The prefill ended on a chunk boundary, so streaming already sent
+        # every chunk the prompt backs and the handover owes no full-attention
+        # bytes at all. It still owes the window: nothing else may send it.
+        worker = self._worker()
+        worker._valid_tokens = {"r0": 4 * 16}
+        worker._streamed["r0"].issued_hwm = 2
+        meta = self._offer(([0, 1, 2, 3], [7]), ([100, 101], [50]), 0)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        descs, _notif = self._descs(worker)
+        assert descs == [7 + 16, 15 + 16]  # the window's block, and only it
+
+
 class TestDelegatedRouteAlignment:
     """A peer a whole-engine handle already describes is written by upstream,
     whose alignment truncates the longer block list and keeps its head. Under a
@@ -1527,9 +1642,6 @@ class TestSettleOnCoverage:
     def _receiving_worker():
         w = _push_worker()
         w.world_size = 1
-        w._coverage_by_req = defaultdict(lambda: defaultdict(list))
-        w._reqs_to_send = {}
-        w._reqs_to_process = set()
         # Three blocks registered: what a writer's ranges have to cover.
         w._recving_metadata = {
             "r0": SimpleNamespace(local_physical_block_ids=([4, 5, 6],))
@@ -1592,6 +1704,23 @@ class TestSettleOnCoverage:
             worker._get_new_notifs()
 
         assert seen == [b"r0:1", b"r1:1"]
+
+    def test_the_ranges_survive_a_request_the_worker_has_not_seen(self, monkeypatch):
+        # Built through __init__ rather than by the helper, which hands the map
+        # in already made: a plain dict passes there and KeyErrors on the first
+        # notification.
+        def stub_base(self, *a):
+            # The three the gate reads; the real base derives them from the
+            # config.
+            self._is_hma_required = False
+            self.use_host_buffer = False
+            self._group_specs = []
+
+        monkeypatch.setattr(RblnNixlWorkerBase, "__init__", stub_base)
+        worker = RblnNixlPushConnectorWorker(mock_vllm_config(), "eng", MagicMock())
+        worker.shutdown = lambda: None  # the writer state __del__ reaches is absent
+        worker._coverage_by_req["r0"][0].append((0, 1))
+        assert worker._coverage_by_req == {"r0": {0: [(0, 1)]}}
 
     def test_a_writer_that_has_sent_part_does_not_settle_the_request(
         self, handed_through
@@ -1837,7 +1966,6 @@ class TestSealedCompletion:
         w._recving_metadata = {}
         w._evict_finished_inbox = queue.Queue()
         w._push_writer_wake = threading.Event()
-        w._writer_counts_by_req = defaultdict(int)
         w._coverage_by_req = defaultdict(lambda: defaultdict(list))
         w._coverage_units_by_req = defaultdict(dict)
         _send(w, released=True)

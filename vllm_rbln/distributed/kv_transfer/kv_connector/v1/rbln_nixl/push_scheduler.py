@@ -33,35 +33,41 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RblnNixlConnectorMetadata,
     connector_option,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.registration import (
+    sliding_window_view_ratio,
+)
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.request import Request
 
 
 def push_stream_enabled(
-    vllm_config: VllmConfig, *, is_hma_required: bool, use_host_buffer: bool
+    vllm_config: VllmConfig,
+    *,
+    is_hma_required: bool,
+    use_host_buffer: bool,
+    specs: list["KVCacheSpec"],
 ) -> bool:
     """Whether a prefill's closed prefix leaves before the request ends.
 
-    A hybrid model is left out because its groups do not close together: they
-    hold different numbers of blocks for the same tokens, and an offer advances
-    every group by one count. Its handover clips each group to its own window
-    from the tail, which is the end a prefix sent from the front never reaches.
-    Host staging is left out because it holds no areas to write out of.
+    A hybrid model streams only what a sliding window it can view lets it: the
+    offer carries the full-attention group and the handover carries the
+    window's block, and the write path can only tell them apart on the one
+    descriptor list able to name two groups, which is the list that view
+    builds. A hybrid without one is left out, as is host staging, which holds
+    no areas to write out of.
 
     Derived in one place because the two sides decide different things from it
     and must not disagree: the scheduler stops building offers, and the worker
     stops asking a peer for per-shard descriptors. A side that takes one
     without the other routes its peers to a path nothing feeds.
     """
-    return (
-        connector_option(vllm_config, "push_stream", False)
-        and not is_hma_required
-        and not use_host_buffer
-    )
+    if not connector_option(vllm_config, "push_stream", False) or use_host_buffer:
+        return False
+    return not is_hma_required or sliding_window_view_ratio(specs) is not None
 
 
 class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorScheduler):
@@ -88,6 +94,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             vllm_config,
             is_hma_required=self._is_hma_required,
             use_host_buffer=self.use_host_buffer,
+            specs=[g.kv_cache_spec for g in kv_cache_config.kv_cache_groups],
         )
         # How much of each request's prefix has already been offered, so a
         # step that closes no new block offers nothing.
@@ -167,6 +174,12 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         chunk = min(
             self.vllm_config.scheduler_config.max_num_batched_tokens, self.block_size
         )
+        # The group everything here is counted in, and the one an offer carries.
+        # A sliding window's group holds one block whatever the prompt length,
+        # and that block is the live window the kernel keeps overwriting -- final
+        # only once the prefill is, so the handover carries it, clipped to the
+        # window by upstream.
+        counted = next(g for g, blocks in enumerate(self.blocks_per_sw) if not blocks)
         for req_id, new_block_id_groups, resumed in yield_req_data(scheduler_output):
             req = self._reqs_need_save.get(req_id)
             if req is None:
@@ -192,7 +205,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             # there.
             held = min(
                 req.num_computed_tokens,
-                min(len(group) for group in groups) * self.block_size,
+                len(groups[counted]) * self.block_size,
             )
             chunks = held // chunk
             if chunks <= self._streamed_chunks.get(req_id, 0):
@@ -208,7 +221,10 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
             offered = cdiv(held, self.block_size)
             meta.add_new_req_to_save(
                 request_id=req_id,
-                local_block_ids=tuple(group[:offered] for group in groups),
+                local_block_ids=tuple(
+                    group[:offered] if g == counted else []
+                    for g, group in enumerate(groups)
+                ),
                 kv_transfer_params=req.kv_transfer_params,
             )
 

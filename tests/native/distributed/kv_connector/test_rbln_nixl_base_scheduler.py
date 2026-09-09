@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPullConnectorScheduler,
     NixlPushConnectorScheduler,
 )
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import RequestStatus
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
@@ -543,6 +544,24 @@ class TestEarlyOfferOnTheWritePath:
         assert "prefill" in meta.reqs_to_save
         assert meta.push_stream_tokens["prefill"] == 16
 
+    def test_a_hybrid_offers_its_full_attention_blocks_and_no_window(self):
+        # The window's group holds one block whatever the prompt length, so a
+        # prefix that never reaches its length would be capped at one block
+        # forever; and that block is the live window the kernel keeps
+        # overwriting, so nothing before the handover may send it.
+        sched = self._chunking_scheduler(8)
+        sched.blocks_per_sw = [0, 2]  # group 1 is the sliding window
+        req = _Request("prefill", num_prompt_tokens=512)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 40
+
+        meta = sched.build_connector_meta(
+            _sched_output("prefill", ([1, 2, 3], [9]), 40)
+        )
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([1, 2, 3], [])
+        assert meta.push_stream_tokens["prefill"] == 40
+
     def test_a_part_chunk_does_not_count_as_a_whole_one(self):
         # The cursor rounds DOWN: counting the chunk a step reached into as
         # done would make the next step, which actually closes it, look like no
@@ -561,6 +580,24 @@ class TestEarlyOfferOnTheWritePath:
 
         assert "prefill" in second.reqs_to_save
         assert second.push_stream_tokens["prefill"] == 48
+
+    def test_the_window_s_group_is_not_the_one_counted(self):
+        # The counted group is found by which one the window does not hold, not
+        # by position. Sized from the window's group instead, an offer would be
+        # one block whatever the prompt length -- and that block is the live
+        # window.
+        sched = self._chunking_scheduler(8)
+        sched.blocks_per_sw = [2, 0]  # group 0 is the sliding window this time
+        req = _Request("prefill", num_prompt_tokens=512)
+        sched._reqs_need_save["prefill"] = req
+        req.num_computed_tokens = 40
+
+        meta = sched.build_connector_meta(
+            _sched_output("prefill", ([9], [1, 2, 3]), 40)
+        )
+
+        assert meta.reqs_to_save["prefill"].local_block_ids == ([], [1, 2, 3])
+        assert meta.push_stream_tokens["prefill"] == 40
 
     def test_an_offer_never_names_tokens_no_block_of_ours_holds(self):
         # A step can compute past the blocks we have -- the accumulation lags
@@ -732,6 +769,17 @@ class TestEarlyOfferOnTheWritePath:
         assert meta.push_early_flush == set()
 
 
+def _sw_spec(*, block_size, sliding_window):
+    spec = MagicMock(spec=SlidingWindowSpec)
+    spec.block_size = block_size
+    spec.sliding_window = sliding_window
+    return spec
+
+
+def _kv_config(specs):
+    return MagicMock(kv_cache_groups=[MagicMock(kv_cache_spec=spec) for spec in specs])
+
+
 class TestEarlyPushGate:
     @pytest.mark.parametrize(
         ("flag", "pp_size", "hybrid", "host_buffer", "expected"),
@@ -741,8 +789,9 @@ class TestEarlyPushGate:
             # prefill has finished can leave before the request does.
             (True, 1, False, False, True),
             (False, 4, False, False, False),
-            # A hybrid model's groups hold different numbers of blocks for the
-            # same tokens, so one closed count cannot advance them together.
+            # A hybrid model streams only over the descriptor list its
+            # sliding-window view builds, which is the one able to name both
+            # of its groups. Without a window to view there is no such list.
             (True, 4, True, False, False),
             # Host staging holds no areas to write out of.
             (True, 4, False, True, False),
@@ -760,9 +809,25 @@ class TestEarlyPushGate:
         config.parallel_config.pipeline_parallel_size = pp_size
         config.kv_transfer_config.kv_buffer_device = "cpu" if host_buffer else "rbln"
 
-        sched = RblnNixlPushConnectorScheduler(config, "eng", MagicMock())
+        sched = RblnNixlPushConnectorScheduler(config, "eng", _kv_config([]))
 
         assert sched._early_push_enabled is expected
+
+    def test_a_hybrid_streams_where_its_window_can_be_viewed(self, monkeypatch):
+        # The offer carries the full-attention group and the handover carries
+        # the window's block; telling them apart on the wire needs the one
+        # descriptor list that names two groups, which the view builds.
+        def stub_init(self, *a, **k):
+            self._is_hma_required = True
+
+        monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
+        config = mock_vllm_config(push_stream=True)
+
+        sched = RblnNixlPushConnectorScheduler(
+            config, "eng", _kv_config([_sw_spec(block_size=1024, sliding_window=128)])
+        )
+
+        assert sched._early_push_enabled is True
 
     @pytest.mark.parametrize("hybrid", [False, True])
     @pytest.mark.parametrize("host_buffer", [False, True])
@@ -773,20 +838,22 @@ class TestEarlyPushGate:
         per-shard descriptors. A side that takes one without the other sends
         its peers down a route nothing feeds -- and the route asserts on the
         group count a hybrid model has."""
+        specs = [_sw_spec(block_size=1024, sliding_window=128)] if hybrid else []
 
         def stub_init(self, *a, **k):
             # Both bases derive these identically; stub them at the same depth
             # so the gate line is the only thing left that can differ.
             self._is_hma_required = hybrid
             self.use_host_buffer = host_buffer
+            self._group_specs = specs
 
         monkeypatch.setattr(RblnNixlSchedulerBase, "__init__", stub_init)
         monkeypatch.setattr(RblnNixlWorkerBase, "__init__", stub_init)
         config = mock_vllm_config(push_stream=True)
         config.parallel_config.pipeline_parallel_size = 4
 
-        sched = RblnNixlPushConnectorScheduler(config, "eng", MagicMock())
-        worker = RblnNixlPushConnectorWorker(config, "eng", MagicMock())
+        sched = RblnNixlPushConnectorScheduler(config, "eng", _kv_config(specs))
+        worker = RblnNixlPushConnectorWorker(config, "eng", _kv_config(specs))
         worker.shutdown = lambda: None  # the base __init__ was stubbed out
 
         assert worker._early_push_enabled is sched._early_push_enabled

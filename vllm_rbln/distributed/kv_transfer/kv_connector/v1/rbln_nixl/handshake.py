@@ -1033,21 +1033,20 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         upstream's handle carries one per block.
         """
         # Trimming narrows a block rather than a peer, and the per-shard ids
-        # are what can leave part of one out -- except where a sliding window
-        # already gave the whole-engine list a second range, which is the one
-        # list that can carry a third and the only one that can name two KV
-        # groups. Streaming narrows
-        # neither: it needs its own descriptors because the whole-engine
-        # handle's notification has no room to say which blocks a transfer
-        # filled.
+        # are what can leave part of one out. Streaming narrows neither: its
+        # own descriptors are what give a notification room to say which blocks
+        # a write filled. Both give way to a sliding window, whose view leaves
+        # the whole-engine list the only place such a range can sit.
         return (
             pp_size > 1
             or partial
             or fan_in
             or split > 1
             or fanout > 1
-            or (self._chunk_mode and self._sw_ratio is None)
-            or self._writes_less_than_a_request()
+            or (
+                (self._chunk_mode or self._writes_less_than_a_request())
+                and self._sw_ratio is None
+            )
         )
 
     def _register_shard_xfer_state(

@@ -28,6 +28,11 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+#: What a transfer parks for `_compute_desc_ids`, whose signature is
+#: upstream's: the request's final token count and block count, and the chunk
+#: ranges a streamed batch named on the side that call is for.
+RequestTail = tuple[int | None, int, tuple[tuple[int, tuple[int, int]], ...]]
+
 
 # What the byte target is when nobody names one: large enough that the fixed
 # cost of a descriptor is small beside what it carries.
@@ -151,9 +156,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _shard_descs_per_block: dict[tuple[str, int], int]
     _shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None]
     _chunk_grid: tuple[int, int] | None
-    _request_tail: (
-        tuple[int | None, int, tuple[tuple[int, tuple[int, int]], ...]] | None
-    )
+    _request_tail: "RequestTail | None"
 
     @property
     def _spans_per_block(self) -> int:

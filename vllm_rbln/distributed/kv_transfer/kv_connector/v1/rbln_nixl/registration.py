@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -54,6 +55,37 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def sliding_window_view_ratio(specs: list[KVCacheSpec]) -> int | None:
+    """How many windows tile a block, where a hybrid's window can be viewed.
+
+    None where there is nothing to view -- no sliding window, or one as wide as
+    the block. The ratio is what a second descriptor range divides a block
+    length by, and its presence is what says a hybrid can be described by our
+    own lists at all: without it `_compute_desc_ids` hands the whole request to
+    upstream, whose list has room for neither that range nor the chunk range
+    beside it.
+
+    Derived in one place because the worker sets its descriptor layout from it
+    and the scheduler decides whether to stream from it, and the two must not
+    disagree.
+    """
+    ratio: int | None = None
+    for spec in specs:
+        if not isinstance(spec, SlidingWindowSpec):
+            continue
+        assert spec.block_size % spec.sliding_window == 0
+        if spec.block_size == spec.sliding_window:
+            continue
+        if ratio is None:
+            ratio = spec.block_size // spec.sliding_window
+        else:
+            assert ratio == spec.block_size // spec.sliding_window, (
+                "RBLN NIXL connector assumes a single SWA ratio across "
+                f"groups, got {ratio} vs {spec.block_size // spec.sliding_window}"
+            )
+    return ratio
 
 
 class RblnNixlRegistrationMixin(RblnNixlWorkerState):
@@ -404,28 +436,32 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         full_groups = sum(
             not isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
-        if self._chunk_mode and not (
+        # Streaming names part of a block for its own reason and needs the
+        # same shape to do it: one group whose blocks it counts in, and any
+        # other group described by a range of its own.
+        cutter = "chunk_mode" if self._chunk_mode else "a streamed write"
+        if (self._chunk_mode or self._writes_less_than_a_request()) and not (
             full_groups == 1
             and (len(self._group_specs) == 1 or self._sw_ratio is not None)
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode needs one "
-                "full-attention KV-cache group, and any other group to be a "
-                "sliding window whose view it can extend. Got "
-                f"groups={len(self._group_specs)}, full={full_groups}, "
-                f"swa={self._has_swa}, sw_ratio={self._sw_ratio}."
+                f"RBLN NIXL (D2D): {cutter} needs one full-attention KV-cache "
+                "group, and any other group to be a sliding window whose view "
+                f"it can extend. Got groups={len(self._group_specs)}, "
+                f"full={full_groups}, swa={self._has_swa}, "
+                f"sw_ratio={self._sw_ratio}."
             )
         # A windowed engine keeps the whole-engine lists, and those name a
         # block's chunks without naming which span holds the request's last
         # token -- so a block cut into several spans would send chunks past
         # the request's own blocks. A head cut leaves one span a block.
         if (
-            self._chunk_mode
+            (self._chunk_mode or self._writes_less_than_a_request())
             and self._sw_ratio is not None
             and self._kv_split_axis is KVSplitAxis.NON_HEAD
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode on a sliding-window engine needs "
+                f"RBLN NIXL (D2D): {cutter} on a sliding-window engine needs "
                 "a head cut, which leaves one token range a block. This cache "
                 f"is cut on the {self._kv_split_axis.name} axis into "
                 f"{self._kv_areas} area(s)."

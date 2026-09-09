@@ -172,6 +172,7 @@ def _prep_impl_worker(
     specs=None,
     chunk_mode=False,
     chunk_bytes=0,
+    push_stream=False,
 ):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = build_worker(
@@ -183,6 +184,7 @@ def _prep_impl_worker(
         specs=specs,
         chunk_mode=chunk_mode,
         chunk_bytes=chunk_bytes,
+        push_stream=push_stream,
     )
     worker.tp_rank = 0
     worker.world_size = 1
@@ -1454,8 +1456,8 @@ class TestTailBlockTrim:
     def test_a_streamed_write_is_refused_on_the_same_geometry(self, monkeypatch):
         # The grid is built for a side that writes a request in pieces as well
         # as for the knob, so the position arithmetic it feeds has to hold for
-        # both. Without the knob nothing here says `chunk_mode`, and a refusal
-        # that named it alone would let this through.
+        # both. Without the knob nothing here says `chunk_mode`, and the
+        # refusal that names it would let this through.
         with (
             patch.object(
                 RblnNixlPullConnectorWorker,
@@ -1481,8 +1483,10 @@ class TestChunkModeWithASlidingWindow:
     groups share every region."""
 
     @staticmethod
-    def _register(monkeypatch, *, specs, chunk_mode=True, axis=None):
-        worker = _prep_impl_worker(monkeypatch, specs=specs, chunk_mode=chunk_mode)
+    def _register(monkeypatch, *, specs, chunk_mode=True, axis=None, push_stream=False):
+        worker = _prep_impl_worker(
+            monkeypatch, specs=specs, chunk_mode=chunk_mode, push_stream=push_stream
+        )
         # A context cut is one head per region over more than one slice; a head
         # cut is the default 8 heads over one. The axis is derived from that
         # pair, so asking for it here means building the geometry that makes it.
@@ -1561,6 +1565,27 @@ class TestChunkModeWithASlidingWindow:
             self._register(
                 monkeypatch,
                 specs=self._hybrid_specs(),
+                axis=KVSplitAxis.NON_HEAD,
+            )
+
+    def test_a_streamed_hybrid_on_a_context_cut_is_refused(self, monkeypatch):
+        # A hybrid stays on the whole-engine lists whichever asked for the
+        # chunks, and those lists name every region's chunks with no way to say
+        # which span holds the last token. Streaming reaches them without the
+        # knob, so the refusal cannot be the knob's alone.
+        with (
+            patch.object(
+                RblnNixlPullConnectorWorker,
+                "_writes_less_than_a_request",
+                return_value=True,
+            ),
+            pytest.raises(RuntimeError, match="needs a head cut"),
+        ):
+            self._register(
+                monkeypatch,
+                specs=self._hybrid_specs(),
+                chunk_mode=False,
+                push_stream=True,
                 axis=KVSplitAxis.NON_HEAD,
             )
 
