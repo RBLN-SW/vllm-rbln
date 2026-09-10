@@ -631,6 +631,9 @@ def build_worker(
         # Upstream's own __init__ sets this to None;
         # register_kv_caches reads it after super().register_kv_caches().
         self.xfer_handshake_metadata = None
+        # Upstream's __init__ derives this from the group specs; the connector
+        # refuses a Mamba/SSM group at registration, so the stub has to carry it.
+        self._has_mamba = False
         # add_remote_agent asks for tp_ratio before deciding whether upstream's
         # positional pairing applies; 1 keeps these cases homogeneous.
         self.transfer_topo = MagicMock()
