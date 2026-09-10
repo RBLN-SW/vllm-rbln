@@ -682,6 +682,8 @@ class RblnPlatform(Platform):
 
     @classmethod
     def validate_and_setup_prerequisite(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.config import RBLNConfig
+
         scheduler_config = vllm_config.scheduler_config
         if not scheduler_config.enable_chunked_prefill:
             raise ValueError(
@@ -734,10 +736,11 @@ class RblnPlatform(Platform):
                     "when DP enabled."
                 )
 
+            rbln_config: RBLNConfig = vllm_config.additional_config
             if (
                 parallel_config.data_parallel_size > 1
                 or parallel_config.enable_expert_parallel
-            ) and not envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
+            ) and not rbln_config.use_moe_tokens_mask:
                 raise ValueError(
                     "VLLM_RBLN_USE_MOE_TOKENS_MASK is required when DP or EP enabled: "
                     "the mask marks padded tokens introduced by DP multicast. "

@@ -184,17 +184,20 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
 _MIGRATED = frozenset(
     {
         "batch_attn_opt",
+        "combine_all2all",
         "compile_model",
         "decode_batch_bucket_limit",
         "decode_batch_bucket_manual_buckets",
         "decode_batch_bucket_min",
         "decode_batch_bucket_step",
         "decode_batch_bucket_strategy",
+        "dispatch_all2all",
         "enforce_model_fp32",
         "flash_causal_attn",
         "specialize_moe_decode",
         "sub_block_cache",
         "use_custom_kernel",
+        "use_moe_tokens_mask",
     }
 )
 
