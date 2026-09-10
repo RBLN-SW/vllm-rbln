@@ -47,6 +47,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
+    RblnNixlPushConnectorWorker,
+)
 
 
 def _encode_payload(
@@ -1005,6 +1008,24 @@ class TestShardLocalRegions:
         # One group id per region of the shard: layers l2,l3 x rpl 2 = 4.
         assert w._shard_region_group_ids == {("eng", 2): (0, 0, 0, 0)}
 
+    def test_register_shard_xfer_state_records_pieces_times_copies(self):
+        # `_shard_descs_per_block` is what the read path multiplies a (region,
+        # block) pair by to reach its descriptor ids, so it has to be the pieces
+        # a head is cut into TIMES the peer copies each piece is written to.
+        # Two pieces and three copies: a product of six that neither factor
+        # alone, and no pair of ones, can produce.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+        w._shard_descs_per_block = {}
+
+        w._register_shard_xfer_state(
+            "eng", 2, 16, ("l2", "l3"), split=2, replica_fanout=3
+        )
+
+        assert w._shard_descs_per_block == {("eng", 2): 6}
+
     def test_register_shard_xfer_state_rejects_multiple_groups(self):
         # The single-group assumption is what makes the all-zero tuple above
         # right; more than one group has to fail rather than mislabel regions.
@@ -1037,6 +1058,15 @@ class TestBaseFanInHandle:
     def test_picks_the_split_for_this_producer(self):
         w = self._worker()
         assert w._base_fan_in_handle("eng", 2, 16, [0, 1, 2, 3], 4) == 72
+
+    def test_picks_by_position_in_the_producer_list_not_by_rank(self):
+        # `all_source_ranks` is the identity only for local rank 0: upstream
+        # builds it from `tp_rank * abs(tp_ratio)`, so rank 1 at a ratio of -4
+        # reads producers 4..7. Indexing the borrowed handles by the global rank
+        # would then run off the end, or take another rank's split.
+        w = self._worker()
+        w.tp_mappings = {"eng": MagicMock(all_source_ranks=(4, 5, 6, 7))}
+        assert w._base_fan_in_handle("eng", 6, 16, [0, 1, 2, 3], 4) == 72
 
     def test_no_narrowing_for_device_transfers(self):
         # D2D narrows by area, so borrowing would double-narrow.
@@ -1542,6 +1572,43 @@ class TestHeadBandMatching:
             {(region, block, 0): 1 for region in range(4) for block in range(2)}
         )
 
+    def test_each_region_is_read_at_its_own_width(self):
+        # Two logical regions of DIFFERENT widths, which is what tells the
+        # builder's two per-region lookups -- the descriptor length and the
+        # peer's page -- apart from a per-LAYER lookup. A draft model with the
+        # same head count over a narrower head dimension is that shape: equal
+        # bands, unequal bytes.
+        w = self._worker(
+            tp_rank=0,
+            tp_size=1,
+            areas=4,
+            slices=4,
+            n_logical=2,
+            block_len=[512, 256],
+        )
+        meta = self._meta(
+            areas=4, slices=4, n_logical=2, block_len=[256, 128], num_blocks=2
+        )
+        out = w._build_head_matched_remote(
+            meta, remote_tp_rank=0, remote_tp_size=2, peer_areas=[0, 1]
+        )
+        # Two areas of each logical region, two blocks, two pieces each: our
+        # area holds two heads and the peer's one. The piece length is our
+        # region's width over the split, so it follows the region, not the
+        # layer index.
+        assert len(out) == 16
+        lens = [ln for _, ln, _ in out]
+        assert sorted(set(lens)) == [128, 256]
+        assert lens.count(256) == lens.count(128) == 8
+        # And the peer's own page width per region, which is the stride from one
+        # block to the next and the divisor the head offset is read in: our
+        # logical region 1 reads the peer's regions 4..7, at 128B each. Taking
+        # the width by layer index instead lands those descriptors at 256B
+        # strides -- outside the regions they name.
+        assert self._decoded(out, meta) == Counter(
+            {(region, block, 0): 1 for region in range(8) for block in range(2)}
+        )
+
     def test_a_draft_region_is_banded_by_its_own_head_count(self):
         # The target's 8 heads cut cleanly over TP2 x 4 areas while the draft's 4
         # do not, so the draft's region has no band and the divisibility guard is
@@ -1741,10 +1808,12 @@ class TestDescriptorOrderContract:
     AREAS = 4
 
     @staticmethod
-    def _worker(n_logical=1):
+    def _worker(n_logical=1, cls=None):
         # Each layer over 4 chiplet areas, all 8 heads, TP1: our area holds 2
         # heads. Wired for the local dlist as well as the remote one, since the
-        # contract here is that the two are emitted in the same order.
+        # contract here is that the two are emitted in the same order. The write
+        # direction is asked for by name, because a peer copy is only fanned out
+        # to when this side originates the bytes.
         areas = TestDescriptorOrderContract.AREAS
         w = TestHeadBandMatching._worker(
             tp_rank=0,
@@ -1765,6 +1834,11 @@ class TestDescriptorOrderContract:
         w.kv_caches_base_addr = {
             "eng": {0: [0x10000 * (i + 1) for i in range(w.num_regions)]}
         }
+        if cls is not None:
+            w.__class__ = cls
+            # __init__ never ran, so the writer state shutdown() reaches through
+            # __del__ is absent; silence it rather than leak an unraisable at GC.
+            w.shutdown = lambda: None
         w.transfer_topo.is_kv_layout_blocks_first = False
         w.nixl_wrapper = MagicMock()
         w._shard_descs_per_block = {}
@@ -1819,6 +1893,60 @@ class TestDescriptorOrderContract:
         }
         # And the pairing is a bijection: no local piece feeds two peer pieces.
         assert len(set(pairs)) == len(pairs)
+
+    def test_pieces_and_copies_nest_the_same_way_on_both_sides(self):
+        # Both cases here run at one copy per piece, where the two innermost
+        # loops collapse into one and their relative nesting is unasserted. A
+        # write to a peer that replicates each slice has both: our region is cut
+        # into pieces, and every piece goes to every copy.
+        from tests.native.distributed.kv_connector.utils import decode
+
+        w = self._worker(cls=RblnNixlPushConnectorWorker)
+        meta = TestHeadBandMatching._meta(
+            areas=self.AREAS, slices=2, n_logical=1, block_len=256, num_blocks=2
+        )
+        # The peer is finer, so our band spreads over several of its ranks and
+        # only the area whose heads rank 0 owns goes to it (_fan_in_peer_areas).
+        remote = w._build_head_matched_remote(
+            meta, remote_tp_rank=0, remote_tp_size=4, peer_areas=[0]
+        )
+        _, local = w._register_shard_local_xfer_handler(
+            w.block_size, ("l0",), peer_areas=[0], split=2, replica_fanout=2
+        )
+        # 1 area x 2 blocks x 2 pieces x 2 copies.
+        assert len(local) == len(remote) == 8
+
+        pairs = list(
+            zip(
+                decode(
+                    local,
+                    bases=w.kv_caches_base_addr["eng"][0],
+                    block_lens=w.block_len_per_layer,
+                    num_blocks=w.num_blocks,
+                ),
+                decode(
+                    remote,
+                    bases=meta.kv_caches_base_addr,
+                    block_lens=meta.block_lens,
+                    num_blocks=meta.num_blocks,
+                ),
+            )
+        )
+        # The peer's rank 0 holds our area 0's two heads one per slice, each
+        # duplicated over two of its areas: head 0 is its regions 0 and 1, head
+        # 1 its 2 and 3. Counting the copies is not enough -- swapping the piece
+        # and copy loops on either side keeps every count while sending head 1
+        # to head 0's copy.
+        assert set(pairs) == {
+            ((0, 0, 0), (0, 0, 0)),
+            ((0, 0, 0), (1, 0, 0)),
+            ((0, 0, 1), (2, 0, 0)),
+            ((0, 0, 1), (3, 0, 0)),
+            ((0, 1, 0), (0, 1, 0)),
+            ((0, 1, 0), (1, 1, 0)),
+            ((0, 1, 1), (2, 1, 0)),
+            ((0, 1, 1), (3, 1, 0)),
+        }
 
     def test_two_layers_pair_within_their_own_layer(self):
         # Two layers, so the layer axis can be reordered at all: reversing

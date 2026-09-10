@@ -1306,6 +1306,21 @@ class TestWhatRegistrationSettles:
         lens = [full for _, _, full in sys.modules["nixl_rbln"].regions_seen[0]]
         assert lens[2] * 8 == lens[0] * draft_kv_heads
 
+    def test_a_draft_moves_the_compatibility_hash(self, make_worker):
+        # The hash is what stops a producer running a draft from pairing with a
+        # consumer that is not: their region tables differ, and the handshake is
+        # the only place that can refuse it. `rbln_compat_hash` folds the
+        # speculative config, but only the publish passes it, so the factor is
+        # unpinned unless a worker built with a draft is compared with one
+        # without.
+        plain = make_worker(kv_cache=KvGeometry(layers=("l0", "l1")))
+        drafted = make_worker(
+            kv_cache=KvGeometry(layers=("l0", "l1"), draft_layers=("l1",)),
+            draft_kv_heads=4,
+        )
+        assert plain.compat_hash and drafted.compat_hash
+        assert plain.compat_hash != drafted.compat_hash
+
     def test_an_undeclared_head_count_has_no_band(self, make_worker):
         # Neither the target's count nor any declared draft's: replicated heads
         # report a product no model in this engine has, and _layer_kv_heads
