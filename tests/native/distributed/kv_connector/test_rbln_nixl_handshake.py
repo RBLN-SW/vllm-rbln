@@ -58,18 +58,20 @@ def _encode_payload(
     layers_per_stage=1,
     layer_names=None,
     kv_slices=1,
+    regions_per_layer=1,
 ):
     if layer_names is None:
         layer_names = [
             f"layer.{pp_rank * layers_per_stage + j}" for j in range(layers_per_stage)
         ]
+    n_regions = len(layer_names) * regions_per_layer
     meta = RblnNixlAgentMetadata(
         engine_id=engine_id,
         agent_metadata=b"agent",
-        kv_caches_base_addr=[0x1000],
+        kv_caches_base_addr=[0x1000 * (i + 1) for i in range(n_regions)],
         device_id=0,
         num_blocks=4,
-        block_lens=[8192],
+        block_lens=[8192] * n_regions,
         kv_cache_layout="HND",
         block_size=16,
         ssm_sizes=(0, 0),
@@ -121,11 +123,13 @@ class _FakeSock:
         layers_per_stage=1,
         stage_layers=None,
         kv_slices=1,
+        regions_per_layer=1,
     ):
         self.pp_size = pp_size
         self.engine_id = engine_id
         self.compat = compat
         self.layers_per_stage = layers_per_stage
+        self.regions_per_layer = regions_per_layer
         # Optional per-stage layer-name lists (for uneven splits); indexed by
         # global_rank. When None, stages advertise a uniform layers_per_stage.
         self.stage_layers = stage_layers
@@ -152,6 +156,7 @@ class _FakeSock:
                 self.stage_layers[self._last] if self.stage_layers is not None else None
             ),
             kv_slices=self.kv_slices,
+            regions_per_layer=self.regions_per_layer,
         )
 
 
@@ -430,6 +435,24 @@ class TestPpHandshakeFanout:
         # the handshake check divides out -- comes back wrong.
         assert list(sliced.registered_layer_names) == ["layer.2"]
 
+    def test_trim_agent_meta_to_layers_scales_by_regions_per_layer(self):
+        # With one region per layer the trim's scaling is the identity, so the
+        # case above cannot tell it apart from slicing by layer index. On D2D a
+        # layer is K/V times the chiplet count, and the peer's band starts that
+        # many regions in.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.local_seen_layer_names = ["layer.2"]
+        w.num_regions = 2  # K and V: two regions per layer
+        meta = _agent_meta(
+            kv_caches_base_addr=[0x10 * i for i in range(8)],
+            block_lens=[10 * i for i in range(8)],
+            registered_layer_names=[f"layer.{i}" for i in range(4)],
+        )
+        sliced = w._trim_agent_meta_to_layers(meta, [(2, 0)])
+        assert list(sliced.kv_caches_base_addr) == [0x40, 0x50]
+        assert list(sliced.block_lens) == [40, 50]
+        assert list(sliced.registered_layer_names) == ["layer.2"]
+
     def test_trim_agent_meta_to_layers_rejects_a_non_contiguous_span(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.local_seen_layer_names = ["layer.0", "layer.2"]
@@ -573,6 +596,19 @@ class TestPpHandshakeFanout:
         assert w._register_shard_xfer_state.call_count == 1
         assert w._overlapping_ranks["eng"] == [0]
 
+    def test_a_wider_peer_geometry_is_refused_before_the_trim(self):
+        # The peer expands a logical region into more chiplet areas than we do,
+        # so nothing pairs. The trim that presents a wider stage as our own band
+        # slices by OUR regions per layer, which makes the pairing check's
+        # division an identity -- so it has to see what the peer published.
+        w = _make_worker(tp_ratio=1, host_buffer=False)
+        w.local_seen_layer_names = ["layer.0"]
+        w.num_regions = 2  # K and V: two regions per layer
+        sock = _FakeSock(pp_size=1, layers_per_stage=2, regions_per_layer=4)
+
+        with pytest.raises(RuntimeError, match="per layer"):
+            _handshake(w, sock, remote_tp_size=1)
+
     def test_a_fanned_out_peer_alone_forces_the_per_shard_path(self):
         # Third companion: nothing narrows and no region is split, but the peer
         # replicates each of its head slices across chiplet areas, so a write
@@ -586,6 +622,12 @@ class TestPpHandshakeFanout:
         w._peer_head_split = lambda *a, **k: 1
         w._peer_replica_fanout = lambda *a, **k: 2
         w._fan_in_peer_areas = lambda *a, **k: None
+
+        _handshake(w, _FakeSock(pp_size=1, layers_per_stage=1), remote_tp_size=1)
+
+        assert w._register_shard_xfer_state.call_count == 1
+        assert w._overlapping_ranks["eng"] == [0]
+        assert w._register_shard_xfer_state.call_args.kwargs["replica_fanout"] == 2
 
     def test_compat_hash_mismatch_raises(self):
         w = _make_worker(compat="LOCAL")

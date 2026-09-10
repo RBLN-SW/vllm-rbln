@@ -268,9 +268,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         D2D publishes one region per chiplet area, so region i is the same head
         band only at equal TP; unequal TP pairs by head range instead
         (``_add_remote_agent_head_matched``), which a sliding window is not
-        supported with. The other refusal compares regions per layer, not
-        totals -- a peer holding more layers is the reverse pipeline shape, and
-        upstream would catch a real mismatch at transfer time only.
+        supported with. The other refusal divides the peer's region list by its
+        layer count, so it has to run on what the peer published: a stage wider
+        than our band reaches ``add_remote_agent`` already sliced to our own
+        regions per layer, which would make that division an identity.
 
         Host-bounce has no per-area list, so none of it applies.
         """
@@ -681,6 +682,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     else:
                         # Equal TP delegates to upstream, which needs a wider
                         # stage trimmed to our band (_trim_agent_meta_to_layers).
+                        # The pairing check divides the peer's regions by its
+                        # layers and the trim makes that quotient our own, so it
+                        # runs first, on what the peer published.
+                        self._check_d2d_region_pairing(metadata, remote_tp_size)
                         remote_rank_to_agent_name[global_rank] = self.add_remote_agent(
                             self._trim_agent_meta_to_layers(metadata, overlap)
                             if partial
