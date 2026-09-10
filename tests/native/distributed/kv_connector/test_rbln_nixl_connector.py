@@ -25,7 +25,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector as cm
 import vllm_rbln.envs as envs
-from tests.native.distributed.kv_connector.utils import setattr_in_package
+from tests.native.distributed.kv_connector.utils import (
+    setattr_in_package,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
     RblnNixlPullConnector,
     RblnNixlPushConnector,
