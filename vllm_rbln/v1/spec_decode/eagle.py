@@ -175,6 +175,11 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
 
+        # Early exit if it's an intermediate chunked prefill,
+        # since the draft tokens are discarded anyway.
+        if self.runner.is_intermediate_chunked_prefill:
+            return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
+
         positions = target_positions[token_indices_to_sample]
 
         # `hidden_states` is deliberately not gathered here -- #821 moved
