@@ -75,11 +75,6 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "RBLN NIXL: cross-layer-blocks mode is not supported with "
                 "pipeline_parallel_size > 1."
             )
-        if self._has_mamba:
-            raise RuntimeError(
-                "RBLN NIXL: hybrid (Mamba/SSM) models are not supported with "
-                "pipeline_parallel_size > 1 over NIXL P/D."
-            )
         if self._has_swa:
             raise RuntimeError(
                 "RBLN NIXL: sliding-window attention is not supported with "
@@ -362,9 +357,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self.num_regions = len(xfer.base_addrs)
         if self.topo.virtually_split_kv_in_blocks:
             # A Mamba state indexes its two regions separately, which doubles
-            # the count -- except for key-only MLA regions, which have no
-            # second half. Registration reaches this; the descriptor path then
-            # refuses Mamba, so the doubled count never reaches a transfer.
+            # the count -- except for key-only MLA regions, which have no second
+            # half. Unreachable: upstream returns this for a Mamba group alone,
+            # and `register_kv_caches` refuses one.
             self.num_regions = sum(
                 1 if self._is_region_replicated(i) else 2
                 for i in range(len(self._region_is_mla))
@@ -507,6 +502,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         is installed the RBLN backend only has to exist first, so that
         upstream's `register_memory(..., backends=["RBLN"])` resolves.
         """
+        if self._has_mamba:
+            raise RuntimeError(
+                "RBLN NIXL: a Mamba/SSM KV-cache group is not supported over "
+                "NIXL P/D. Its cache is one blocks-first region per layer, "
+                "which the per-area region table this connector publishes "
+                "cannot describe. Mixed full and sliding-window attention is a "
+                "different thing and is supported."
+            )
         # Capture the ordered local layer names before any deferral so the PP
         # metadata publish (and the consumer-side name->region matching) can
         # use them; the D2D path re-uses these at finalize time.
