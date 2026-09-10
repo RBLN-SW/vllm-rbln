@@ -227,6 +227,59 @@ class RblnPlatform(Platform):
         EngineArgs._rbln_user_mnbt_patched = True
 
     @classmethod
+    def _allow_gemma4_global_per_layer_attribute_access(cls) -> None:
+        """Inject the gemma4 hf_overrides that vLLM 0.26.0 needs on transformers 5.15.
+
+        transformers 5.15 makes gemma4's ``head_dim`` a per-layer attribute and
+        raises on a top-level read, but vLLM's gemma4 config convertor still reads
+        it inside ``ModelConfig.__post_init__``. Upstream fixed the convertor in
+        vllm-project/vllm#49797 (v0.28.0). TODO(vllm>=0.28.0): delete.
+
+        The optimum path only uses the value for the KV cache spec page size,
+        which cancels out of the block count, so the global value is safe here.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+        from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
+        from vllm.transformers_utils.utils import is_cloud_storage, maybe_model_redirect
+
+        if getattr(EngineArgs, "_rbln_gemma4_hf_overrides_patched", False):
+            return
+
+        orig_create_model_config = EngineArgs.create_model_config
+
+        def _allow_on_text_config(config):
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None:
+                text_config.allow_global_per_layer_attribute_access = True
+            return config
+
+        def create_model_config(self):
+            model = maybe_model_redirect(self.hf_config_path or self.model)
+            if not is_cloud_storage(model):
+                config_dict = get_hf_file_to_dict("config.json", model, self.revision)
+                if (
+                    config_dict is not None
+                    and config_dict.get("model_type") == "gemma4"
+                ):
+                    if callable(self.hf_overrides):
+                        user_fn = self.hf_overrides
+                        self.hf_overrides = lambda config: _allow_on_text_config(
+                            user_fn(config)
+                        )
+                    else:
+                        overrides = dict(self.hf_overrides)
+                        text_config = dict(overrides.get("text_config", {}))
+                        text_config.setdefault(
+                            "allow_global_per_layer_attribute_access", True
+                        )
+                        overrides["text_config"] = text_config
+                        self.hf_overrides = overrides
+            return orig_create_model_config(self)
+
+        EngineArgs.create_model_config = create_model_config
+        EngineArgs._rbln_gemma4_hf_overrides_patched = True
+
+    @classmethod
     def _adopt_deprecated_device_control_env_var(cls) -> None:
         """Fold ``RBLN_DEVICES`` into ``device_control_env_var`` and unset it.
 
@@ -259,6 +312,7 @@ class RblnPlatform(Platform):
             # Only sync_from_vllm reads the key it writes, and on the native
             # path it would be an unknown field of RBLNConfig.
             cls._capture_user_max_num_batched_tokens()
+            cls._allow_gemma4_global_per_layer_attribute_access()
 
         if parser is None:
             return
