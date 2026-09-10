@@ -113,6 +113,7 @@ from vllm_rbln.compilation import (
     create_compile_context,
     set_compile_stage,
 )
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
@@ -249,6 +250,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        self.rbln_config: RBLNConfig = vllm_config.additional_config
 
         # Step phase; see is_prefill for authority and lifecycle.
         self._is_prefill_step: bool = False
@@ -466,14 +468,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # per-PP-stage decode batch (max_num_seqs // pp_size) -- the same ceiling
         # the scheduler's admission cap uses -- not the raw max_num_seqs.
         self.bucketing_manager = get_bucketing_manager(
-            envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
+            self.rbln_config.decode_batch_bucket_strategy,
             max_batch_size=decode_batch_size(
                 self.max_num_reqs, self.parallel_config.pipeline_parallel_size
             ),
-            min_batch_size=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MIN,
-            step=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STEP,
-            limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
-            manual_buckets=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS,
+            min_batch_size=self.rbln_config.decode_batch_bucket_min,
+            step=self.rbln_config.decode_batch_bucket_step,
+            limit=self.rbln_config.decode_batch_bucket_limit,
+            manual_buckets=self.rbln_config.decode_batch_bucket_manual_buckets,
         )
         logger.info(
             "Using %s. Decode batch buckets: %s",
@@ -483,7 +485,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         self.specialized_moe_decode = (
             parallel_config.data_parallel_size > 1
-            and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
+            and self.rbln_config.specialize_moe_decode
         )
         # The batched dynamic decode kernel (REBEL CR13, or any device with
         # VLLM_RBLN_BATCH_ATTN_OPT) processes the first valid_batch[p] rows of
@@ -3077,7 +3079,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize KV cache based on `kv_cache_config`."""
-        if envs.VLLM_RBLN_SUB_BLOCK_CACHE and (
+        if self.rbln_config.sub_block_cache and (
             len(kv_cache_config.kv_cache_groups) > 1
         ):
             raise NotImplementedError(

@@ -48,12 +48,9 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
-    def test_sub_block_size_defaults_to_max_num_batched_tokens(self, monkeypatch):
-        # With VLLM_RBLN_SUB_BLOCK_CACHE and no explicit sub_block_size, the
+    def test_sub_block_size_defaults_to_max_num_batched_tokens(self):
+        # sub_block_cache is on by default, so with no explicit sub_block_size the
         # scheduler uses max_num_batched_tokens as the sub_block_size.
-        import vllm_rbln.envs as envs
-
-        monkeypatch.setattr(envs, "VLLM_RBLN_SUB_BLOCK_CACHE", True)
         sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,

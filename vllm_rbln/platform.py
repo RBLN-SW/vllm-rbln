@@ -323,17 +323,16 @@ class RblnPlatform(Platform):
             cls._validate_dynamic_kv_config(vllm_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            vllm_config.additional_config = build_rbln_config(
-                vllm_config.additional_config
-            )
-            set_rbln_config(vllm_config.additional_config)
+            rbln_config = build_rbln_config(vllm_config.additional_config)
+            vllm_config.additional_config = rbln_config
+            set_rbln_config(rbln_config)
 
             if vllm_config.lora_config is not None:
                 raise ValueError("LoRA is not supported on RBLN.")
 
             cls.validate_and_setup_prerequisite(vllm_config)
 
-            if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
+            if rbln_config.enforce_model_fp32:
                 if model_config.dtype != torch.float32:
                     # FIXME(RBLN): force model dtype into fp32 for graph compilation
                     original_dtype = model_config.dtype

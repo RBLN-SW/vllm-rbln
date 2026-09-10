@@ -287,11 +287,8 @@ class TestDtype:
         )
         assert config.model_config.dtype == torch.float32
 
-    def test_enforce_fp32_overrides_a_supported_dtype(self, monkeypatch, reconfigure):
-        monkeypatch.setattr(platform.envs, "VLLM_RBLN_ENFORCE_MODEL_FP32", True)
-        config = reconfigure(
-            lambda config: setattr(config.model_config, "dtype", torch.float16)
-        )
+    def test_enforce_fp32_overrides_a_supported_dtype(self):
+        config = _build(dtype="float16", additional_config={"enforce_model_fp32": True})
         assert config.model_config.dtype == torch.float32
 
 

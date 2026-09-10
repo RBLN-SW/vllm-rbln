@@ -17,12 +17,19 @@
 from __future__ import annotations
 
 import dataclasses
+import pathlib
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_rbln.config import _ENV_PROBE, _GROUP_TITLE, RBLNConfig, build_rbln_config
+from vllm_rbln.config import (
+    _ENV_PROBE,
+    _GROUP_TITLE,
+    _MIGRATED,
+    RBLNConfig,
+    build_rbln_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -155,6 +162,24 @@ def test_invalid_value_is_rejected():
         build_rbln_config({"decode_batch_bucket_strategy": "garbage"})
     with pytest.raises(ValueError):
         build_rbln_config({"use_w8a8": "junk"})
+
+
+def test_migrated_fields_are_no_longer_read_from_the_environment():
+    """A name in `_MIGRATED` silences the "may not take effect" warning, so the
+    claim has to hold: nothing may still read that field's variable."""
+    import vllm_rbln
+
+    root = pathlib.Path(vllm_rbln.__file__).parent
+    sources = "\n".join(
+        path.read_text()
+        for path in root.rglob("*.py")
+        if str(path.relative_to(root)) not in ("envs.py", "config.py")
+    )
+    assert not [
+        name
+        for name in sorted(_MIGRATED)
+        if f"envs.VLLM_RBLN_{name.upper()}" in sources
+    ]
 
 
 def test_only_compile_fields_change_the_hash():

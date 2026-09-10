@@ -178,6 +178,23 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
 }
 
 
+# Fields whose call sites read RBLNConfig instead of `envs.py`. Every other
+# field is still decided by its environment variable, which is what the warning
+# in `build_rbln_config` is about. One subsystem moves over at a time.
+_MIGRATED = frozenset(
+    {
+        "decode_batch_bucket_limit",
+        "decode_batch_bucket_manual_buckets",
+        "decode_batch_bucket_min",
+        "decode_batch_bucket_step",
+        "decode_batch_bucket_strategy",
+        "enforce_model_fp32",
+        "specialize_moe_decode",
+        "sub_block_cache",
+    }
+)
+
+
 def _env_overrides() -> dict[str, Any]:
     from vllm_rbln import envs
 
@@ -222,9 +239,21 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
     shadowed = sorted(set(given) & set(overrides))
     overrides.update(given)
 
+    if unwired := sorted(set(given) - _MIGRATED):
+        # TODO(#1047): delete with _MIGRATED, once it covers every field.
+        logger.warning_once(
+            "These options are still read from the environment, so the value "
+            "given here may not take effect. Set %s instead.",
+            ", ".join(
+                _ENV_PROBE.get(name, (f"VLLM_RBLN_{name.upper()}",))[0]
+                for name in unwired
+            ),
+        )
+
     if shadowed:
         logger.warning_once(
-            "Ignoring the environment variables for %s; the CLI value wins.",
+            "Both the environment and additional_config set %s; RBLNConfig "
+            "takes the additional_config value.",
             ", ".join(shadowed),
         )
 
@@ -336,7 +365,11 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
 
     group = parser.add_argument_group(
         title=_GROUP_TITLE,
-        description=RBLNConfig.__doc__,
+        # TODO(#1047): drop the second sentence when the read sites move.
+        description=(
+            f"{RBLNConfig.__doc__} These flags are not wired to most call "
+            "sites yet; set the matching VLLM_RBLN_* variable instead."
+        ),
     )
     kwargs = get_kwargs(RBLNConfig)
     for f in _FIELDS:
