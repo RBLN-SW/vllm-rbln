@@ -81,7 +81,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         block_ids: BlockIds,
     ) -> np.ndarray:
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
-        per_block = self._shard_descs_per_block.get((engine_id, global_rank), 1)
+        per_block = self._shard_descs_per_block[(engine_id, global_rank)]
         # Converted once, not once per region: this runs per request, and every
         # region of a layer names the same group.
         group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
