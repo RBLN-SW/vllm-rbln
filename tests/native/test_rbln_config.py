@@ -139,13 +139,27 @@ def test_manual_strategy_needs_buckets():
         RBLNConfig(decode_batch_bucket_strategy="manual")
 
 
-def test_unresolved_config_raises(monkeypatch):
-    """No silent env fallback: a process that never resolved one must fail."""
-    from vllm_rbln import config as config_module
+def test_get_rbln_config_needs_the_current_config_context():
+    """It reads the config the model is being built under, so there has to be one."""
+    from vllm_rbln.config import get_rbln_config
 
-    monkeypatch.setattr(config_module, "_rbln_config", None)
-    with pytest.raises(RuntimeError, match="never resolved in this process"):
-        config_module.get_rbln_config()
+    with pytest.raises(AssertionError, match="Current vLLM config is not set"):
+        get_rbln_config()
+
+
+def test_get_rbln_config_rejects_a_config_that_is_not_ours():
+    """The optimum-rbln path leaves a dict there, and nothing resolves it."""
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+
+    from vllm_rbln.config import get_rbln_config
+
+    with (
+        set_current_vllm_config(SimpleNamespace(additional_config={})),
+        pytest.raises(RuntimeError, match="not an RBLNConfig"),
+    ):
+        get_rbln_config()
 
 
 def test_json_values_are_coerced():

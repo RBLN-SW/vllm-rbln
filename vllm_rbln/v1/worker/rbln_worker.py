@@ -73,7 +73,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation.backends import set_compile_stage
-from vllm_rbln.config import RBLNConfig, build_rbln_config, set_rbln_config
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
@@ -173,9 +173,6 @@ class RBLNWorker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
         self.fail_fast = issubclass(Executor.get_class(vllm_config), MultiprocExecutor)
-
-        # Before _init_device_env(), which reads device-count options.
-        set_rbln_config(build_rbln_config(vllm_config.additional_config))
 
         self._init_device_env()
 

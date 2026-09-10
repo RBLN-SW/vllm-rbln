@@ -327,16 +327,6 @@ class TestConformance:
         assert override == ["self"]
 
 
-class TestConfigResolution:
-    def test_additional_config_reaches_the_worker(self, make_worker):
-        # The worker receives an already-built VllmConfig, so __init__ is the
-        # only place the section can be resolved. No env var is involved.
-        from vllm_rbln.config import get_rbln_config
-
-        make_worker(vllm_config=_make_vllm_config(additional_config={"sampler": False}))
-        assert get_rbln_config().sampler is False
-
-
 class TestInitDeviceEnv:
     """The env var is a pool of NPUs to index into, one entry per NPU.
 

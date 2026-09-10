@@ -261,46 +261,42 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
             ", ".join(shadowed),
         )
 
-    return RBLNConfig(**overrides)
+    resolved = RBLNConfig(**overrides)
 
-
-_rbln_config: RBLNConfig | None = None
-
-
-def set_rbln_config(config: RBLNConfig) -> None:
-    """Publish the resolved config for this process.
-
-    Each process does this at its own entry point. A worker and EngineCore
-    receive an already-built `VllmConfig`, so its `__post_init__` -- where the
-    platform hook runs -- does not run again there.
-    """
-    global _rbln_config
-    _rbln_config = config
-
+    # Upstream's `non-default args` covers what the CLI was given, but not what
+    # the environment resolved to, and `VllmConfig.__str__` leaves
+    # additional_config out entirely. This is the only record of the values a
+    # run actually used.
     defaults = RBLNConfig()
     changed = {
-        f.name: getattr(config, f.name)
+        f.name: getattr(resolved, f.name)
         for f in _FIELDS
-        if getattr(config, f.name) != getattr(defaults, f.name)
+        if getattr(resolved, f.name) != getattr(defaults, f.name)
     }
     logger.info("RBLN config: %s", changed or "all defaults")
 
+    return resolved
+
 
 def get_rbln_config() -> RBLNConfig:
-    """The resolved RBLN config for this process.
+    """The RBLN section of the config the current model is being built under.
 
-    There is deliberately no fallback to the environment. A child process
-    inherits env vars but not `--rbln-*` values, so a fallback would be right
-    when the option came from the environment and wrong when it came from the
-    command line.
+    For code that cannot reach a `vllm_config` of its own -- a free function, or
+    a constructor whose signature upstream owns. Every such call site runs
+    inside `set_current_vllm_config`, which upstream opens around worker start-up,
+    device init and model construction. Read `vllm_config.additional_config`
+    directly wherever one is in hand.
     """
-    if _rbln_config is None:
+    from vllm.config import get_current_vllm_config
+
+    rbln_config = get_current_vllm_config().additional_config
+    if not isinstance(rbln_config, RBLNConfig):
         raise RuntimeError(
-            "RBLNConfig was never resolved in this process. Call "
-            "set_rbln_config(build_rbln_config(vllm_config.additional_config)) "
-            "from this process's entry point."
+            "additional_config is not an RBLNConfig; "
+            "check_and_update_config resolves it on the vLLM-native path, so "
+            f"this is the optimum-rbln path or an unbuilt config: {rbln_config!r}"
         )
-    return _rbln_config
+    return rbln_config
 
 
 # `from_cli_args` only copies dataclass fields, so a `--rbln-*` flag cannot

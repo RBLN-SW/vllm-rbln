@@ -929,10 +929,6 @@ def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None):
 class TestUpdateStates:
     # Request-state bookkeeping on a real InputBatch; scheduler_output is
     # duck-typed since every access is an attribute or index read.
-    @pytest.fixture(autouse=True)
-    def _config(self, rbln_config):
-        rbln_config()
-
     @staticmethod
     def _runner(monkeypatch, *, input_batch, requests=None):
         monkeypatch.setattr(

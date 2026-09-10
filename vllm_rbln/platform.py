@@ -302,7 +302,7 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.config import build_rbln_config, set_rbln_config
+        from vllm_rbln.config import build_rbln_config
         from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
         from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
         from vllm_rbln.utils.optimum.registry import is_pooling_arch
@@ -325,7 +325,6 @@ class RblnPlatform(Platform):
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             rbln_config = build_rbln_config(vllm_config.additional_config)
             vllm_config.additional_config = rbln_config
-            set_rbln_config(rbln_config)
 
             if vllm_config.lora_config is not None:
                 raise ValueError("LoRA is not supported on RBLN.")
