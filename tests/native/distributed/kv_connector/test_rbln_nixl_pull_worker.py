@@ -47,7 +47,9 @@ class TestShardReadPath:
         # group. Single group -> region_id * num_blocks + block_ids[0].
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}  # 4 regions, group 0
-        w._shard_descs_per_block = {}
+        # Written together with the group ids by _register_shard_xfer_state, so
+        # a shard the read path can reach always has both.
+        w._shard_descs_per_block = {("eng", 1): 1}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
         )
@@ -69,7 +71,7 @@ class TestShardReadPath:
     def test_get_block_descs_ids_for_shard_empty_group(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 0): (0, 0)}
-        w._shard_descs_per_block = {}
+        w._shard_descs_per_block = {("eng", 0): 1}
         descs = w._get_block_descs_ids_for_shard("eng", 0, num_blocks=4, block_ids=[[]])
         assert descs.size == 0
 
@@ -101,7 +103,7 @@ class TestShardReadPath:
         # single group, 2 regions per shard
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
-        w._shard_descs_per_block = {}
+        w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
         w._remote_agents = {"eng": {r: f"agent{r}" for r in range(pp_size)}}
