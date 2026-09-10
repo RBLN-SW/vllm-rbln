@@ -198,6 +198,7 @@ _MIGRATED = frozenset(
         "sub_block_cache",
         "use_custom_kernel",
         "use_moe_tokens_mask",
+        "use_w8a8",
     }
 )
 
