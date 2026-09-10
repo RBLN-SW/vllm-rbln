@@ -194,6 +194,7 @@ _MIGRATED = frozenset(
         "dispatch_all2all",
         "enforce_model_fp32",
         "flash_causal_attn",
+        "sampler",
         "specialize_moe_decode",
         "sub_block_cache",
         "use_custom_kernel",

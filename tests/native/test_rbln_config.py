@@ -180,14 +180,21 @@ def test_invalid_value_is_rejected():
 
 def test_migrated_fields_are_no_longer_read_from_the_environment():
     """A name in `_MIGRATED` silences the "may not take effect" warning, so the
-    claim has to hold: nothing may still read that field's variable."""
+    claim has to hold: nothing on this path may still read that field's variable.
+
+    `build_rbln_config` emits that warning and only the vLLM-native path calls
+    it, so the optimum-rbln path's own readers are outside the claim.
+    """
     import vllm_rbln
 
     root = pathlib.Path(vllm_rbln.__file__).parent
+    optimum_owned = ("utils/optimum/", "model_executor/models/optimum/")
     sources = "\n".join(
         path.read_text()
         for path in root.rglob("*.py")
-        if str(path.relative_to(root)) not in ("envs.py", "config.py")
+        if (rel := path.relative_to(root).as_posix()) not in ("envs.py", "config.py")
+        and not rel.startswith(optimum_owned)
+        and not path.name.startswith("optimum_")
     )
     assert not [
         name

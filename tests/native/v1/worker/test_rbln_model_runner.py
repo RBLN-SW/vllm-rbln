@@ -291,9 +291,10 @@ class TestPadDepad:
 
 class TestSamplePadding:
     @staticmethod
-    def _runner(rejection_output: SamplerOutput):
+    def _runner(rejection_output: SamplerOutput, *, sampler: bool):
         rejection_sampler = MagicMock(return_value=rejection_output)
         runner = _make_runner_stub(
+            rbln_config=RBLNConfig(sampler=sampler),
             _is_prefill_step=False,
             use_async_scheduling=False,
             input_batch=SimpleNamespace(
@@ -308,26 +309,24 @@ class TestSamplePadding:
         )
         return runner, rejection_sampler
 
-    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", True)
+    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self):
         output = SamplerOutput(
             sampled_token_ids=torch.zeros((4, 3), dtype=torch.int32),
             logprobs_tensors=None,
         )
-        runner, rejection_sampler = self._runner(output)
+        runner, rejection_sampler = self._runner(output, sampler=True)
 
         runner._sample(torch.zeros((4, 10)), _spec_decode_metadata([1, 1]))
 
         padded_metadata = rejection_sampler.call_args.args[0]
         assert len(padded_metadata.num_draft_tokens) == 4
 
-    def test_torch_rejection_sampler_keeps_live_batch_metadata(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", False)
+    def test_torch_rejection_sampler_keeps_live_batch_metadata(self):
         output = SamplerOutput(
             sampled_token_ids=torch.zeros((2, 3), dtype=torch.int32),
             logprobs_tensors=None,
         )
-        runner, rejection_sampler = self._runner(output)
+        runner, rejection_sampler = self._runner(output, sampler=False)
         spec_decode_metadata = _spec_decode_metadata([1, 1])
         sampling_metadata = runner.input_batch.sampling_metadata
 
@@ -337,10 +336,10 @@ class TestSamplePadding:
         assert rejection_sampler.call_args.args[3] is sampling_metadata
 
 
-def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
-    monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", True)
+def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
     rejection_sample = MagicMock()
     runner = _make_runner_stub(
+        rbln_config=RBLNConfig(sampler=True),
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,

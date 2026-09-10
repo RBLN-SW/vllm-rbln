@@ -317,17 +317,17 @@ class TestWorkerAndScheduler:
             == "pkg.mod.MyWorker"
         )
 
-    def test_scheduler_is_replaced_unconditionally(self, monkeypatch, reconfigure):
+    def test_scheduler_is_replaced_unconditionally(self, reconfigure):
         # Unlike worker_cls there is no "auto" guard: whatever was asked for is
         # overwritten. Reading the expectation back off the config under test
         # would agree with whatever the platform decided, so the carriers are
         # pinned off and the sync scheduler named outright.
-        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
-        config = reconfigure(
-            lambda config: setattr(
-                config.scheduler_config, "scheduler_cls", "pkg.mod.MyScheduler"
-            )
-        )
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.scheduler_cls = "pkg.mod.MyScheduler"
+            config.additional_config = replace(config.additional_config, sampler=False)
+
+        config = reconfigure(mutate)
         assert (
             config.scheduler_config.scheduler_cls
             == "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
