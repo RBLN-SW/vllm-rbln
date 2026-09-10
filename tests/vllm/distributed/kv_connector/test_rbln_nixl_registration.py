@@ -1030,9 +1030,15 @@ class TestPpConstraints:
         with pytest.raises(RuntimeError, match="cross-layer-blocks"):
             self._worker(pp_size=2, cross_layers=True)._check_pp_constraints()
 
-    def test_mamba_pp_raises(self):
-        with pytest.raises(RuntimeError, match="Mamba"):
-            self._worker(pp_size=2, has_mamba=True)._check_pp_constraints()
+    def test_an_ssm_group_is_refused_before_any_registration(self):
+        # Not a PP constraint: the region table this connector publishes is one
+        # entry per chiplet area, and an SSM group's cache is one blocks-first
+        # region per layer. Both paths pass through register_kv_caches, so the
+        # refusal belongs there.
+        w = self._worker(pp_size=1, has_mamba=True)
+        w.kv_buffer_device = "rbln"
+        with pytest.raises(RuntimeError, match="Mamba/SSM"):
+            w.register_kv_caches({"l0": MagicMock()})
 
     @pytest.mark.parametrize("sw_ratio", [2, None])
     def test_swa_pp_raises(self, sw_ratio):
@@ -1080,6 +1086,7 @@ class TestPublishHandshakeMetadata:
         axis=KVSplitAxis.HEAD,
         cls=None,
         has_mamba=False,
+        cross_layers=False,
     ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
@@ -1092,7 +1099,7 @@ class TestPublishHandshakeMetadata:
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
         w.vllm_config.speculative_config = None
         w.transfer_topo = MagicMock()
-        w.transfer_topo.cross_layers_blocks = False
+        w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
         w._sw_ratio = None
         w._has_swa = False
@@ -1113,8 +1120,8 @@ class TestPublishHandshakeMetadata:
     def test_publishing_is_where_the_pp_guard_fires(self):
         # The guard is only reached from here, so a test that calls it directly
         # cannot tell whether anything still does.
-        with pytest.raises(RuntimeError, match="Mamba"):
-            self._publish(pp_rank=0, pp_size=2, layer_names=["l0"], has_mamba=True)
+        with pytest.raises(RuntimeError, match="cross-layer-blocks"):
+            self._publish(pp_rank=0, pp_size=2, layer_names=["l0"], cross_layers=True)
 
     def test_a_writer_publishes_the_write_path_hash(self):
         # The direction is a class fact, and the hash has to come from the class
@@ -1178,6 +1185,7 @@ class TestPublishHandshakeMetadata:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w.kv_buffer_device = "cpu"
+        w._has_mamba = False
         w._use_rbln_nixl_backend = False
         w.xfer_handshake_metadata = MagicMock(
             agent_metadata_bytes=msgspec.msgpack.encode(self._base_meta())
@@ -1315,12 +1323,11 @@ class TestWhatRegistrationSettles:
         assert lens[1] * 8 == lens[0] * draft_kv_heads
 
     def test_a_draft_moves_the_compatibility_hash(self, make_worker):
-        # The hash is what stops a producer running a draft from pairing with a
-        # consumer that is not: their region tables differ, and the handshake is
-        # the only place that can refuse it. `rbln_compat_hash` folds the
-        # speculative config, but only the publish passes it, so the factor is
-        # unpinned unless a worker built with a draft is compared with one
-        # without.
+        # The hash is the only thing that stops a producer running a draft from
+        # pairing with a consumer that is not, and their region tables differ.
+        # `rbln_compat_hash` folds the speculative config, but only the publish
+        # passes it, so the factor is unpinned unless a drafted worker is
+        # compared with one built the same way without.
         plain = make_worker(kv_cache=KvGeometry(layers=("l0", "l1")))
         drafted = make_worker(
             kv_cache=KvGeometry(layers=("l0", "l1"), draft_layers=("l1",)),
