@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
@@ -178,6 +179,7 @@ class RBLNFlashAttentionMetadataBuilder(
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.scheduler_config = vllm_config.scheduler_config
+        rbln_config: RBLNConfig = vllm_config.additional_config
 
         self.block_size = kv_cache_spec.block_size
         self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
@@ -187,7 +189,7 @@ class RBLNFlashAttentionMetadataBuilder(
         # the draft config only, so a non-causal drafter and a causal target
         # coexist in one process.
         self.is_causal = (
-            envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+            rbln_config.flash_causal_attn
             and not vllm_config.attention_config.use_non_causal
         )
 
@@ -353,6 +355,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         sinks: torch.Tensor | None = None,
     ) -> None:
         vllm_config = get_current_vllm_config()
+        rbln_config: RBLNConfig = vllm_config.additional_config
         self.enforce_eager = vllm_config.model_config.enforce_eager
         self.device = vllm_config.device_config.device
         self.block_size = vllm_config.cache_config.block_size
@@ -416,10 +419,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 self.sinks = self.sinks[:, None]
 
         self.is_causal = (
-            envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+            rbln_config.flash_causal_attn
             and not vllm_config.attention_config.use_non_causal
         )
-        self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
+        self.is_batch_attention_opt = rbln_config.batch_attn_opt
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )

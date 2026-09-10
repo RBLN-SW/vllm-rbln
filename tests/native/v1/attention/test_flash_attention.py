@@ -86,6 +86,15 @@ def cfg():
 
 
 @pytest.fixture(scope="module")
+def cfg_noncausal():
+    return make_vllm_config(
+        max_model_len=MAX_LEN,
+        max_num_batched_tokens=CHUNK,
+        additional_config={"flash_causal_attn": False},
+    )
+
+
+@pytest.fixture(scope="module")
 def cfg_square():
     # block_size == max_model_len, so is_normal can be True.
     return make_vllm_config(max_model_len=64, block_size=64)
@@ -228,8 +237,7 @@ class TestBuildPrefillCausal:
 
 
 class TestBuildPrefillNonCausal:
-    def _mask(self, config, monkeypatch, *, positions):
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
+    def _mask(self, config, *, positions):
         builder = make_builder(config)
         return builder.build(
             _cam(
@@ -243,17 +251,17 @@ class TestBuildPrefillNonCausal:
             is_prefill=True,
         ).attn_masks
 
-    def test_step_below_chunk_places_triangle_only(self, cfg, monkeypatch):
+    def test_step_below_chunk_places_triangle_only(self, cfg_noncausal):
         # step = positions[0] = 0 (< chunk): no cached region, triangle at [0:chunk]
-        mask = self._mask(cfg, monkeypatch, positions=torch.arange(4))
+        mask = self._mask(cfg_noncausal, positions=torch.arange(4))
         assert mask.shape == (1, 1, 1, CHUNK, MAX_LEN)
         expected = torch.zeros(1, 1, 1, CHUNK, MAX_LEN)
         expected[..., 0:CHUNK] = _lower_triangular(CHUNK)
         assert torch.equal(mask.float(), expected)
 
-    def test_step_at_chunk_fills_cached_region(self, cfg, monkeypatch):
+    def test_step_at_chunk_fills_cached_region(self, cfg_noncausal):
         # step = positions[0] = CHUNK (>= chunk): [:step] all attend, triangle after
-        mask = self._mask(cfg, monkeypatch, positions=torch.arange(4) + CHUNK)
+        mask = self._mask(cfg_noncausal, positions=torch.arange(4) + CHUNK)
         expected = torch.zeros(1, 1, 1, CHUNK, MAX_LEN)
         expected[..., :CHUNK] = 1
         expected[..., CHUNK : 2 * CHUNK] = _lower_triangular(CHUNK)
@@ -264,7 +272,7 @@ class TestBuildPrefillNonCausal:
         [(False, torch.float32), (True, torch.float16)],
     )
     def test_mask_dtype_follows_enforce_eager(
-        self, cfg, monkeypatch, eager, expected_dtype
+        self, cfg_noncausal, eager, expected_dtype
     ):
         # float16 under enforce_eager, float32 otherwise. enforce_eager needs
         # device tensors, so that case is skipped on the cpu lane.
@@ -275,11 +283,12 @@ class TestBuildPrefillNonCausal:
                 max_model_len=MAX_LEN,
                 max_num_batched_tokens=CHUNK,
                 enforce_eager=True,
+                additional_config={"flash_causal_attn": False},
             )
             if eager
-            else cfg
+            else cfg_noncausal
         )
-        mask = self._mask(config, monkeypatch, positions=torch.arange(4))
+        mask = self._mask(config, positions=torch.arange(4))
         assert mask.dtype == expected_dtype
 
 
@@ -305,11 +314,10 @@ class TestBuildDecodeCausal:
 
 
 class TestBuildDecodeNonCausal:
-    def test_per_request_attend_length(self, cfg, monkeypatch):
+    def test_per_request_attend_length(self, cfg_noncausal):
         # Decode mask: each batch row attends positions 0..seq_len; rows beyond
         # the request count stay zero.
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
-        builder = make_builder(cfg)
+        builder = make_builder(cfg_noncausal)
         md = builder.build(
             _cam(
                 num_reqs=2,
@@ -357,10 +365,9 @@ class TestBuildSlidingWindowPrefill:
         assert md.swa_attn_masks is None  # prefill
         assert md.attn_masks is None  # causal
 
-    def test_noncausal_still_sets_swa_fields(self, cfg, monkeypatch):
+    def test_noncausal_still_sets_swa_fields(self, cfg_noncausal):
         # SWA block is independent of is_causal: chunked mask AND SWA fields set.
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
-        builder = make_builder(cfg, sliding_window=4, appends_kv=False)
+        builder = make_builder(cfg_noncausal, sliding_window=4, appends_kv=False)
         md = builder.build(
             _cam(num_reqs=1, query_start_loc=[0, 4], seq_lens=[10], block_table=[[7]]),
             torch.arange(4),
@@ -589,11 +596,10 @@ class TestFlashImplInit:
         with pytest.raises(NotImplementedError, match="flash causal"):
             make_impl(cfg_square, kv_cache_dtype="fp8")
 
-    def test_fp8_non_causal_raises(self, cfg, monkeypatch):
+    def test_fp8_non_causal_raises(self, cfg_noncausal):
         # is_causal off routes to the plain attention ops.
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
         with pytest.raises(NotImplementedError, match="flash causal"):
-            make_impl(cfg, kv_cache_dtype="fp8")
+            make_impl(cfg_noncausal, kv_cache_dtype="fp8")
 
     def test_fp8_with_custom_kernel_raises(self, cfg, custom_kernel_on):
         # The rbln_triton_ops variants drop the scales even on the flash

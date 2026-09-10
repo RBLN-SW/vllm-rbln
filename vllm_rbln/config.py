@@ -183,12 +183,14 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
 # in `build_rbln_config` is about. One subsystem moves over at a time.
 _MIGRATED = frozenset(
     {
+        "batch_attn_opt",
         "decode_batch_bucket_limit",
         "decode_batch_bucket_manual_buckets",
         "decode_batch_bucket_min",
         "decode_batch_bucket_step",
         "decode_batch_bucket_strategy",
         "enforce_model_fp32",
+        "flash_causal_attn",
         "specialize_moe_decode",
         "sub_block_cache",
     }

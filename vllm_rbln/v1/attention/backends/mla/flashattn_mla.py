@@ -25,7 +25,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
-import vllm_rbln.envs as envs
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 
 from ...ops.flash_causal_mla_naive import (
@@ -150,6 +150,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             raise NotImplementedError("KV sharing is not supported in RBLN.")
 
         vllm_config = get_current_vllm_config()
+        rbln_config: RBLNConfig = vllm_config.additional_config
         self.device = vllm_config.device_config.device
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
@@ -163,7 +164,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             )
 
         self.sliding_window = sliding_window
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        self.is_causal = rbln_config.flash_causal_attn
         self.scale_tensor = torch.tensor(scale, device=self.device)
 
     # -- stubs required by MLAAttentionImpl interface -----------------------
