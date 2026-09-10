@@ -30,6 +30,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.handshake impor
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
+    connector_option,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.registration import (
     RblnNixlRegistrationMixin,
@@ -91,6 +92,12 @@ class RblnNixlWorkerBase(
         # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
+        if self.use_host_buffer and connector_option(vllm_config, "chunk_mode", False):
+            raise RuntimeError(
+                "RBLN NIXL: chunk_mode needs the chiplet "
+                "areas of the direct path; host staging registers one "
+                "full-shape buffer per layer and has none to drop."
+            )
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
@@ -102,6 +109,9 @@ class RblnNixlWorkerBase(
         self._kv_slices: int = 1
         # And which axis they came from -- the two counts alone do not say.
         self._kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
+        # Whether a transfer may carry less than a whole block. What it
+        # leaves out is a token range of that block.
+        self._chunk_mode: bool = False
 
         # Model-wide counts, not this rank's share. None where the layer has
         # no head band (`_layer_kv_heads`).

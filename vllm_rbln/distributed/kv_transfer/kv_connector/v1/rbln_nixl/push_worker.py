@@ -16,6 +16,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
 )
@@ -26,6 +27,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnNixlConnectorMetadata,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -33,6 +37,7 @@ if TYPE_CHECKING:
         NixlConnectorMetadata,
         ReqMeta,
     )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
@@ -48,6 +53,13 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
     _writes_into_peer = True
 
+    def __init__(
+        self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
+    ) -> None:
+        super().__init__(vllm_config, engine_id, kv_cache_config)
+        # Tokens a handed-over request holds, for `_tail_areas`.
+        self._valid_tokens: dict[str, int] = {}
+
     def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
         """Hand this step's work to the writer, once the KV it names is settled.
 
@@ -59,6 +71,8 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         that, and if it ever stopped holding, the writer would ship a staging
         buffer still being filled -- silently, and only under host staging.
         """
+        assert isinstance(metadata, RblnNixlConnectorMetadata)
+        self._valid_tokens.update(metadata.valid_tokens)
         if self.use_host_buffer and metadata.push_finished_blocks:
             both = metadata.push_finished_blocks.keys() & metadata.reqs_to_save.keys()
             assert not both, (
@@ -95,6 +109,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         self._push_writer_thread.start()
         logger.info("nixl-push-writer thread started (rank=%d)", self.tp_rank)
 
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        done_sending, done_recving = super().get_finished()
+        for req_id in done_sending:
+            self._valid_tokens.pop(req_id, None)
+        return done_sending, done_recving
+
     def _xfer_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         """Write this request's blocks, one transfer per paired peer rank.
 
@@ -126,6 +146,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     engine_id,
                     meta.remote.request_id,
                 )
+            # Trimming registers per-shard state against every peer, so
+            # reaching upstream's whole-engine write means it did not.
+            assert not self._chunk_mode
             return super()._xfer_blocks_for_req(req_id, meta)
 
         block_size_ratio = self.transfer_topo.block_size_ratio(
@@ -149,6 +172,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             count_stages=False,
         )
 
+        # Counted before the consumer trim below, which cuts the front: the
+        # token count describes this producer's whole list, and both lists keep
+        # their tail, so the last element is still the request's last block.
+        n_prompt_blocks = sum(len(g) for g in local_block_ids)
+        keep_spans = self._tail_areas(n_prompt_blocks, self._valid_tokens.get(req_id))
         local_block_ids = self._trim_to_consumer_blocks(
             local_block_ids, remote_block_ids, engine_id, meta.remote.request_id
         )
@@ -173,9 +201,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 global_rank,
                 self.dst_num_blocks[engine_id],
                 remote_block_ids,
+                keep_spans=keep_spans,
             )
             local_descs = self._get_block_descs_ids_for_shard(
-                engine_id, global_rank, self.num_blocks, local_block_ids
+                engine_id,
+                global_rank,
+                self.num_blocks,
+                local_block_ids,
+                keep_spans=keep_spans,
             )
             assert len(local_descs) == len(remote_descs)
             local_handle = self.src_xfer_handles_by_remote[

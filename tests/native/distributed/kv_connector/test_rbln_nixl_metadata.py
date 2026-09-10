@@ -23,8 +23,12 @@
 from unittest.mock import MagicMock
 
 import msgspec
+import pytest
 from vllm.config import SpeculativeConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlAgentMetadata,
+    NixlConnectorMetadata,
+)
 
 from tests.native.distributed.kv_connector.utils import setattr_in_package
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
@@ -32,6 +36,8 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RBLN_NIXL_CONNECTOR_VERSION,
     KVSplitAxis,
     RblnNixlAgentMetadata,
+    RblnNixlConnectorMetadata,
+    connector_option,
     rbln_compat_hash,
 )
 
@@ -52,6 +58,42 @@ _BASE_FIELDS = dict(
 
 def _make(**pp):
     return RblnNixlAgentMetadata(**_BASE_FIELDS, **pp)
+
+
+class TestConnectorOptions:
+    """Where this connector's knobs come from, and what a wrong one does."""
+
+    @staticmethod
+    def _config(extra):
+        from types import SimpleNamespace
+
+        from vllm.config import KVTransferConfig
+
+        return SimpleNamespace(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config=extra,
+            )
+        )
+
+    def test_a_knob_nobody_set_is_its_default(self):
+        assert connector_option(self._config({}), "chunk_mode", False) is False
+        assert connector_option(self._config({}), "chunk_bytes", 0) == 0
+
+    def test_a_knob_that_was_set_is_what_it_says(self):
+        config = self._config({"chunk_mode": True, "chunk_bytes": 128})
+
+        assert connector_option(config, "chunk_mode", False) is True
+        assert connector_option(config, "chunk_bytes", 0) == 128
+
+    def test_a_value_of_the_wrong_type_is_refused(self):
+        # The knob would otherwise be read for its truthiness, which "0" and
+        # "false" both pass -- and this config is written by hand.
+        config = self._config({"chunk_mode": "false"})
+
+        with pytest.raises(RuntimeError, match="takes a bool"):
+            connector_option(config, "chunk_mode", False)
 
 
 class TestRblnNixlAgentMetadata:
@@ -227,3 +269,32 @@ class TestRblnCompatHash:
             monkeypatch, RBLN_NIXL_CONNECTOR_VERSION=RBLN_NIXL_CONNECTOR_VERSION + 1
         )
         assert md.rbln_compat_hash("BASE", writes_into_peer=False) != h1
+
+
+class TestRblnNixlConnectorMetadata:
+    def test_promotion_keeps_every_field_upstream_filled(self):
+        # Upstream scheduler names its own type, so ours is copied from the
+        # instance it built; a field lost here is a step's transfers lost.
+        base = NixlConnectorMetadata()
+        base.reqs_to_recv = {"r0": "recv"}
+        base.reqs_to_save = {"r1": "save"}
+        base.reqs_in_batch = {"r2"}
+        base.push_finished_blocks = {"r3": ([1],)}
+
+        promoted = RblnNixlConnectorMetadata.promote(base)
+
+        assert promoted.reqs_to_recv == {"r0": "recv"}
+        assert promoted.reqs_to_save == {"r1": "save"}
+        assert promoted.reqs_in_batch == {"r2"}
+        assert promoted.push_finished_blocks == {"r3": ([1],)}
+        assert promoted.valid_tokens == {}
+        # Upstream asserts on its own type in several places.
+        assert isinstance(promoted, NixlConnectorMetadata)
+
+    def test_promotion_carries_the_token_counts(self):
+        # Promotion runs on an instance this side already filled, not only on a
+        # bare upstream one, so the added field has to survive it.
+        meta = RblnNixlConnectorMetadata()
+        meta.valid_tokens = {"r2": 33}
+
+        assert RblnNixlConnectorMetadata.promote(meta).valid_tokens == {"r2": 33}
