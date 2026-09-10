@@ -42,6 +42,7 @@ import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 import vllm_rbln.v1.worker.utils as worker_utils
 from tests.native.v1.worker.utils import make_runner_config, schedule_new
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
@@ -842,7 +843,7 @@ class TestDummyRunPadding:
 
 class TestProcessKvCacheCopyOps:
     # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
-    # and VLLM_RBLN_COMPILE_MODEL. Forced deterministically via monkeypatch.
+    # and compile_model. Forced deterministically.
     def test_eager_copy_non_mla(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)  # -> eager path
         # non-MLA layout: (2, num_blocks, heads, 1, block_tokens, dim).
@@ -874,7 +875,6 @@ class TestProcessKvCacheCopyOps:
 
     def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         calls = []
         runtime = SimpleNamespace(
             _copy_kv_cache=lambda src, dst, nt: calls.append((src, dst, nt))
@@ -883,6 +883,7 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
+            rbln_config=RBLNConfig(),
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
         assert calls == [(5, 6, 4)]
@@ -1131,14 +1132,15 @@ class TestAllocateKvCacheTensors:
             ],
         )
 
-    def _runner(self):
+    def _runner(self, *, compile_model=True):
         return _make_runner_stub(
-            device=torch.device("cpu"), runner_only_attn_layers=set()
+            device=torch.device("cpu"),
+            runner_only_attn_layers=set(),
+            rbln_config=RBLNConfig(compile_model=compile_model),
         )
 
-    def test_cpu_when_not_compiling(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+    def test_cpu_when_not_compiling(self):
+        raw = self._runner(compile_model=False)._allocate_kv_cache_tensors(self._cfg())
         assert set(raw) == {"l0", "l1", "l2"}
         assert raw["l0"].device.type == "cpu"
         # Layers sharing a pool share the same buffer object.
@@ -1146,13 +1148,11 @@ class TestAllocateKvCacheTensors:
         assert raw["l0"] is not raw["l2"]
 
     def test_meta_when_compiling_without_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "meta"
 
     def test_self_device_when_compiling_with_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here

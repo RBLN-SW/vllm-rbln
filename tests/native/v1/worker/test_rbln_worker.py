@@ -33,6 +33,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.v1.worker.rbln_worker as wm
 import vllm_rbln.v1.worker.utils as worker_utils
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import RblnPlatform
 from vllm_rbln.v1.worker.rbln_worker import (
     RBLNWorker,
@@ -693,11 +694,12 @@ class TestCompileOrWarmUpModel:
         data_parallel_size=1,
     ):
         vcfg = _make_vllm_config(
-            enforce_eager=enforce_eager, data_parallel_size=data_parallel_size
+            enforce_eager=enforce_eager,
+            data_parallel_size=data_parallel_size,
+            additional_config=RBLNConfig(compile_model=compile_model),
         )
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
-        monkeypatch.setattr(wm.envs, "VLLM_RBLN_COMPILE_MODEL", compile_model)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_ENABLE_WARM_UP", warm_up)
         monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: False)
         monkeypatch.setattr(wm, "set_random_seed", lambda s: None)

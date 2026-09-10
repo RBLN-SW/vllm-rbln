@@ -73,11 +73,13 @@ def _lower_triangular(n: int) -> torch.Tensor:
     return 1 - torch.triu(torch.ones(n, n), diagonal=1)
 
 
-@pytest.fixture
-def custom_kernel_on(monkeypatch):
-    # USE_CUSTOM_KERNEL resolves from RBLN_USE_CUSTOM_KERNEL, not the
-    # VLLM_RBLN_-prefixed name (pinned in test_envs).
-    monkeypatch.setenv("RBLN_USE_CUSTOM_KERNEL", "1")
+@pytest.fixture(scope="module")
+def cfg_custom_kernel():
+    return make_vllm_config(
+        max_model_len=MAX_LEN,
+        max_num_batched_tokens=CHUNK,
+        additional_config={"use_custom_kernel": True},
+    )
 
 
 @pytest.fixture(scope="module")
@@ -145,14 +147,13 @@ class TestBackendRegistration:
 
 
 class TestFlashAttentionMetadataPostInit:
-    def test_custom_kernel_off_leaves_dtype_untouched(self, monkeypatch):
+    def test_custom_kernel_off_leaves_dtype_untouched(self):
         # Without the custom kernel, __post_init__ returns early: no casting.
-        monkeypatch.delenv("RBLN_USE_CUSTOM_KERNEL", raising=False)
         assert _metadata().seq_lens.dtype == torch.int64
 
-    def test_custom_kernel_on_casts_seq_lens_to_int32(self, custom_kernel_on):
+    def test_custom_kernel_on_casts_seq_lens_to_int32(self):
         # The custom-kernel path casts seq_lens; absent cache tensors stay None.
-        md = _metadata()
+        md = _metadata(use_custom_kernel=True)
         assert md.seq_lens.dtype == torch.int32
         assert md.cache_seq_lens is None
         assert md.cache_offsets is None
@@ -162,23 +163,30 @@ class TestFlashAttentionMetadataPostInit:
     CACHE_FIELDS = ["cache_seq_lens", "cache_offsets"]
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_multielement_cache_field_raises_ambiguous(self, custom_kernel_on, field):
+    def test_multielement_cache_field_raises_ambiguous(self, field):
         # KNOWN BUG pinned: `if self.<field>` on a multi-element tensor raises.
         # The real SWA/decode path emits [batch, 1], so it fires at batch >= 2.
         with pytest.raises(RuntimeError, match="ambiguous"):
-            _metadata(**{field: torch.tensor([[1], [2]], dtype=torch.int64)})
+            _metadata(
+                use_custom_kernel=True,
+                **{field: torch.tensor([[1], [2]], dtype=torch.int64)},
+            )
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_single_zero_cache_field_is_silently_dropped(self, custom_kernel_on, field):
+    def test_single_zero_cache_field_is_silently_dropped(self, field):
         # TODO(RBLN): KNOWN BUG pinned — a 1-element tensor of value 0 is falsy,
         # so a valid all-zero value is discarded to None instead of cast.
-        md = _metadata(**{field: torch.tensor([[0]], dtype=torch.int64)})
+        md = _metadata(
+            use_custom_kernel=True, **{field: torch.tensor([[0]], dtype=torch.int64)}
+        )
         assert getattr(md, field) is None
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_single_nonzero_cache_field_is_cast(self, custom_kernel_on, field):
+    def test_single_nonzero_cache_field_is_cast(self, field):
         # The only shape that survives correctly: 1 element, != 0.
-        md = _metadata(**{field: torch.tensor([[3]], dtype=torch.int64)})
+        md = _metadata(
+            use_custom_kernel=True, **{field: torch.tensor([[3]], dtype=torch.int64)}
+        )
         assert getattr(md, field) is not None
         assert getattr(md, field).dtype == torch.int32
 
@@ -601,11 +609,11 @@ class TestFlashImplInit:
         with pytest.raises(NotImplementedError, match="flash causal"):
             make_impl(cfg_noncausal, kv_cache_dtype="fp8")
 
-    def test_fp8_with_custom_kernel_raises(self, cfg, custom_kernel_on):
+    def test_fp8_with_custom_kernel_raises(self, cfg_custom_kernel):
         # The rbln_triton_ops variants drop the scales even on the flash
         # causal path.
         with pytest.raises(NotImplementedError, match="CUSTOM_KERNEL"):
-            make_impl(cfg, kv_cache_dtype="fp8")
+            make_impl(cfg_custom_kernel, kv_cache_dtype="fp8")
 
     def test_logits_soft_cap_disabled_with_warning(self, cfg, monkeypatch):
         # RBLN does not support a logits soft cap: it warns and forces it to 0.

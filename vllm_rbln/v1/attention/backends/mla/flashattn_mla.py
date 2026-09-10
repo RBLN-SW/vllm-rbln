@@ -151,6 +151,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
 
         vllm_config = get_current_vllm_config()
         rbln_config: RBLNConfig = vllm_config.additional_config
+        self.compile_model = rbln_config.compile_model
         self.device = vllm_config.device_config.device
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
@@ -260,6 +261,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             attn_metadata.seq_lens,
             attn_metadata.block_tables,
             self.scale_tensor,
+            compile_model=self.compile_model,
         )
 
         # attn_output: [B, H, S, kv_lora_rank] → V-up projection → [B, S, H*v_head_dim]

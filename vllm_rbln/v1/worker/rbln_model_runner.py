@@ -2213,7 +2213,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             return hidden_states, logits, combined_hidden_states
 
-        if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+        if self.model_config.enforce_eager or not self.rbln_config.compile_model:
             self.model_executable = model_wrapper
             self.compute_logits = self.model.compute_logits
         else:
@@ -2804,7 +2804,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             device = (
                 "cpu"
-                if not envs.VLLM_RBLN_COMPILE_MODEL
+                if not self.rbln_config.compile_model
                 else self.device
                 if USE_DEVICE_TENSOR
                 else "meta"
@@ -3033,7 +3033,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if (
             not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
+            and self.rbln_config.compile_model
         ):
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
@@ -3497,7 +3497,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if (
             not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
+            and self.rbln_config.compile_model
         ):
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (VLLM_RBLN_USE_VLLM_MODEL).

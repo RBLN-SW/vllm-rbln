@@ -73,7 +73,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation.backends import set_compile_stage
-from vllm_rbln.config import build_rbln_config, set_rbln_config
+from vllm_rbln.config import RBLNConfig, build_rbln_config, set_rbln_config
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
@@ -534,7 +534,8 @@ class RBLNWorker(WorkerBase):
         """Why the compile and warm-up will be skipped, or None if they will run."""
         if self.model_config.enforce_eager:
             return "enforce_eager is set"
-        if not envs.VLLM_RBLN_COMPILE_MODEL:
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        if not rbln_config.compile_model:
             return "VLLM_RBLN_COMPILE_MODEL is off"
         if not envs.VLLM_RBLN_ENABLE_WARM_UP:
             return "VLLM_RBLN_ENABLE_WARM_UP is off"
