@@ -375,6 +375,13 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 "descriptors. Use equal TP on both sides, or "
                 "kv_buffer_device='cpu'."
             )
+        if self._chunk_mode and nixl_agent_meta.block_size != self.block_size:
+            raise RuntimeError(
+                "RBLN NIXL D2D: trimming a request's last block needs both "
+                "sides to give an area the same token range, but the peer's "
+                f"block holds {nixl_agent_meta.block_size} tokens and this "
+                f"worker's holds {self.block_size}."
+            )
 
     def _cleanup_remote_engine(
         self, engine_id: str, *, log_eviction: bool = True
@@ -787,19 +794,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         )
                         remote_rank_to_agent_name[(pp_rank, remote_tp_rank)] = agent
 
-                    if not (
-                        pp_size > 1
-                        or partial
-                        or fan_in
-                        or split > 1
-                        or fanout > 1
-                        or kv_runs > 1
+                    if not self._needs_own_descriptors(
+                        pp_size=pp_size,
+                        partial=partial,
+                        fan_in=fan_in,
+                        split=split,
+                        fanout=fanout,
+                        kv_runs=kv_runs,
                     ):
-                        # Nothing is narrowed: upstream's whole-engine handle
-                        # describes this peer, so the transfer path delegates.
-                        # Fan-out and a K/V split narrow it at one piece per
-                        # head too -- upstream names a block once where our
-                        # list names it per copy and per range.
                         continue
                     self._register_shard_xfer_state(
                         expected_engine_id,
@@ -1028,6 +1030,40 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             group_spec_types=self._group_spec_types,
         )
 
+    def _needs_own_descriptors(
+        self,
+        *,
+        pp_size: int,
+        partial: bool,
+        fan_in: bool,
+        split: int,
+        fanout: int,
+        kv_runs: int,
+    ) -> bool:
+        """Whether this peer needs descriptors of ours rather than upstream's.
+
+        Upstream registers one handle per engine, and its notification names a
+        whole request. That describes a peer only while nothing about the
+        transfer is narrower than the engine, so each way one can be is a
+        reason here: a pipelined producer holds part of the layers, a partial
+        overlap part of the names, a fan-in peer part of the heads, and a split
+        reads part of a region. A fan-out peer counts even at one piece per
+        head, because the remote list carries a descriptor per copy where
+        upstream's handle carries one per block, and so does a K/V split,
+        where upstream names a block once and our list names it per range.
+        """
+        # Trimming narrows a block rather than a peer, and only the per-shard
+        # ids can leave part of one out.
+        return (
+            pp_size > 1
+            or partial
+            or fan_in
+            or split > 1
+            or fanout > 1
+            or kv_runs > 1
+            or self._chunk_mode
+        )
+
     def _register_shard_xfer_state(
         self,
         engine_id: str,
@@ -1040,6 +1076,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         replica_fanout: int = 1,
         kv_runs: int = 1,
     ) -> None:
+        # The trim reads a region's position modulo the area count as its area.
+        # An area filter compresses those positions, and a head band or a
+        # replica fan-out puts several descriptors on one block.
+        assert not self._chunk_mode or (
+            peer_areas is None and split == 1 and replica_fanout == 1
+        )
         # Compute the local region ids once and reuse them for the handler
         # (PP context is always the shard path: SWA + PP is rejected earlier).
         region_ids = self._shard_local_region_ids(
