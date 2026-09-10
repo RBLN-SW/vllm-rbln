@@ -730,9 +730,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         )
                         remote_rank_to_agent_name[(pp_rank, remote_tp_rank)] = agent
 
-                    if not (pp_size > 1 or partial or fan_in or split > 1):
+                    if not (
+                        pp_size > 1 or partial or fan_in or split > 1 or fanout > 1
+                    ):
                         # Nothing is narrowed: upstream's whole-engine handle
                         # describes this peer, so the transfer path delegates.
+                        # A fan-out peer IS narrowed even at one piece per head:
+                        # the remote list carries one descriptor per copy, and
+                        # upstream's handle carries one per block.
                         continue
                     self._register_shard_xfer_state(
                         expected_engine_id,
