@@ -2444,6 +2444,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs_padded=batch_desc.num_reqs_padded,
         )
 
+        if is_idle:
+            # Only the real path writes these persistent buffers, so slicing them
+            # here would feed this rank its previous request's last token id and
+            # position. An idle rank still joins the expert all-gather, so those
+            # stale values enter the collective and cost the whole group device
+            # time on every step.
+            self.input_ids[:num_tokens].zero_()
+            self.positions[:num_tokens].zero_()
+
         input_ids = self.input_ids[:num_tokens]
         inputs_embeds = None
         positions = self.positions[:num_tokens]
