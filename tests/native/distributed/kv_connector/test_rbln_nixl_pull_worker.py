@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Unit coverage: the read path -- which producer shards this rank reads from,
-# and the descriptor ids it reads with. The pairing those ids come from lives in
-# base_worker and is covered by test_rbln_nixl_handshake.py.
+# and the descriptor ids it reads with. The pairing those ids index is covered by
+# test_rbln_nixl_handshake.py, and the ids themselves by test_rbln_nixl_transfer.py.
 
 import queue
 import threading
@@ -148,10 +148,16 @@ class TestShardReadPath:
         w = self._read_worker(pp_size=3)
         first = object()
         w.nixl_wrapper.make_prepped_xfer.side_effect = [first, RuntimeError("boom")]
+        w._log_failure = MagicMock()
 
         w._read_blocks_for_req("r0", self._meta([[1, 2]], [[3, 4]]))
 
         assert w._recving_transfers["r0"] == []
+        # The mock is installed to keep the log quiet; assert on it too, or a
+        # failure that reports nothing to an operator reads as a clean abort.
+        assert (
+            w._log_failure.call_args.kwargs["failure_type"] == "transfer_setup_failed"
+        )
         # The stage that already submitted is released, and the third is never
         # submitted -- the request is failed, not partially read.
         w.nixl_wrapper.release_xfer_handle.assert_called_once_with(first)

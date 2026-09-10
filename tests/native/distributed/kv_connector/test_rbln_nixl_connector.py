@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector as cm
 import vllm_rbln.envs as envs
+from tests.native.distributed.kv_connector.utils import setattr_in_package
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
     RblnNixlPullConnector,
     RblnNixlPushConnector,
@@ -45,10 +46,11 @@ def isolated_connector(monkeypatch):
     and the sub-connectors faked, so only the guards + wiring execute. Returns a
     builder(vllm_config, role, use_device_tensor=True)."""
     monkeypatch.setattr(cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(
-        cm, "RblnNixlPullConnectorScheduler", lambda *a, **k: "SCHEDULER"
+    setattr_in_package(
+        monkeypatch,
+        RblnNixlPullConnectorScheduler=lambda *a, **k: "SCHEDULER",
+        RblnNixlPullConnectorWorker=lambda *a, **k: "WORKER",
     )
-    monkeypatch.setattr(cm, "RblnNixlPullConnectorWorker", lambda *a, **k: "WORKER")
 
     def build(vllm_config, role=KVConnectorRole.SCHEDULER, use_device_tensor=True):
         monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", use_device_tensor)
@@ -174,10 +176,11 @@ class TestConnectorWiring:
         monkeypatch.setattr(
             cm.KVConnectorBase_V1, "__init__", lambda self, *a, **k: None
         )
-        monkeypatch.setattr(
-            cm, "RblnNixlPushConnectorScheduler", lambda *a, **k: "SCHEDULER"
+        setattr_in_package(
+            monkeypatch,
+            RblnNixlPushConnectorScheduler=lambda *a, **k: "SCHEDULER",
+            RblnNixlPushConnectorWorker=lambda *a, **k: "WORKER",
         )
-        monkeypatch.setattr(cm, "RblnNixlPushConnectorWorker", lambda *a, **k: "WORKER")
         monkeypatch.setattr(envs, "VLLM_RBLN_USE_DEVICE_TENSOR", True)
 
         def build(role, kv_buffer_device="rbln"):
