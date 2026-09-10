@@ -28,8 +28,9 @@ Resolution order, highest first:
      applies. `_ENV_PROBE` lists the names that break the pattern.
   3. the field default
 
-Most call sites still read `envs.py` directly. They move over one subsystem
-at a time.
+`envs.py` still carries the variables and their parsing. The options that stay
+there rather than move -- a patch condition reads two of them before this config
+exists, and the rest are bring-up knobs -- are not fields here.
 """
 
 import argparse
@@ -65,20 +66,8 @@ class RBLNConfig:
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
     possible."""
 
-    compile_strict_mode: bool = False
-    """Compile with torch.compile's strict mode, which fails on a graph break
-    instead of falling back to eager."""
-
-    num_hidden_layers: int = 0
-    """Build only the first N decoder layers and leave the rest as
-    `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
-    truncation."""
-
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
-
-    use_dynamic_kv_cache: bool = False
-    """Size the KV cache from the compiled artifact instead of the estimate."""
 
     flash_causal_attn: bool = True
     """Use flash attention for causal attention."""
@@ -120,11 +109,6 @@ class RBLNConfig:
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
-    nixl_swa_view_opt: bool = False
-    """Publish a second SWA-sized descriptor range alongside the Full-sized
-    range at the same NIXL base addresses, so SWA groups transfer only
-    `sliding_window` bytes per block over RDMA."""
-
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
@@ -140,11 +124,9 @@ class RBLNConfig:
 
         ignored_factors = {
             # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. The rest change what runs, not what is built.
+            # the bundle. Sub-block caching changes what runs, not what is built.
             "sampler",
-            "compile_strict_mode",
             "sub_block_cache",
-            "nixl_swa_view_opt",
         }
         return hash_factors(get_hash_factors(self, ignored_factors))
 
@@ -176,33 +158,6 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
     ),
     "use_custom_kernel": ("RBLN_USE_CUSTOM_KERNEL",),
 }
-
-
-# Fields whose call sites read RBLNConfig instead of `envs.py`. Every other
-# field is still decided by its environment variable, which is what the warning
-# in `build_rbln_config` is about. One subsystem moves over at a time.
-_MIGRATED = frozenset(
-    {
-        "batch_attn_opt",
-        "combine_all2all",
-        "compile_model",
-        "decode_batch_bucket_limit",
-        "decode_batch_bucket_manual_buckets",
-        "decode_batch_bucket_min",
-        "decode_batch_bucket_step",
-        "decode_batch_bucket_strategy",
-        "dispatch_all2all",
-        "enforce_model_fp32",
-        "flash_causal_attn",
-        "num_devices_per_local_rank",
-        "sampler",
-        "specialize_moe_decode",
-        "sub_block_cache",
-        "use_custom_kernel",
-        "use_moe_tokens_mask",
-        "use_w8a8",
-    }
-)
 
 
 def _env_overrides() -> dict[str, Any]:
@@ -248,17 +203,6 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
     overrides = _env_overrides()
     shadowed = sorted(set(given) & set(overrides))
     overrides.update(given)
-
-    if unwired := sorted(set(given) - _MIGRATED):
-        # TODO(#1047): delete with _MIGRATED, once it covers every field.
-        logger.warning_once(
-            "These options are still read from the environment, so the value "
-            "given here may not take effect. Set %s instead.",
-            ", ".join(
-                _ENV_PROBE.get(name, (f"VLLM_RBLN_{name.upper()}",))[0]
-                for name in unwired
-            ),
-        )
 
     if shadowed:
         logger.warning_once(
@@ -371,11 +315,7 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
 
     group = parser.add_argument_group(
         title=_GROUP_TITLE,
-        # TODO(#1047): drop the second sentence when the read sites move.
-        description=(
-            f"{RBLNConfig.__doc__} These flags are not wired to most call "
-            "sites yet; set the matching VLLM_RBLN_* variable instead."
-        ),
+        description=RBLNConfig.__doc__,
     )
     kwargs = get_kwargs(RBLNConfig)
     for f in _FIELDS:

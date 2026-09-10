@@ -26,7 +26,6 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_rbln.config import (
     _ENV_PROBE,
     _GROUP_TITLE,
-    _MIGRATED,
     RBLNConfig,
     build_rbln_config,
 )
@@ -91,11 +90,14 @@ def test_flags_reach_the_config(parser):
 def test_coexists_with_additional_config(parser):
     """The dotted form is appended at the end of argv, so it must merge."""
     args = parser.parse_args(
-        ["--rbln-use-w8a8", "--additional-config.num_hidden_layers", "2"]
+        ["--rbln-use-w8a8", "--additional-config.decode_batch_bucket_limit", "2"]
     )
-    assert args.additional_config == {"use_w8a8": True, "num_hidden_layers": 2}
+    assert args.additional_config == {
+        "use_w8a8": True,
+        "decode_batch_bucket_limit": 2,
+    }
     config = build_rbln_config(args.additional_config)
-    assert (config.use_w8a8, config.num_hidden_layers) == (True, 2)
+    assert (config.use_w8a8, config.decode_batch_bucket_limit) == (True, 2)
 
 
 def test_json_form_is_equivalent(parser):
@@ -178,12 +180,15 @@ def test_invalid_value_is_rejected():
         build_rbln_config({"use_w8a8": "junk"})
 
 
-def test_migrated_fields_are_no_longer_read_from_the_environment():
-    """A name in `_MIGRATED` silences the "may not take effect" warning, so the
-    claim has to hold: nothing on this path may still read that field's variable.
+def test_no_field_is_read_from_the_environment():
+    """A field here is the source, so nothing on this path may read its variable.
 
-    `build_rbln_config` emits that warning and only the vLLM-native path calls
-    it, so the optimum-rbln path's own readers are outside the claim.
+    `envs.py` resolves the variable into the field; a reader that goes around
+    that would ignore `--rbln-*` and `additional_config`. The options that stay
+    in `envs.py` are not fields, so they are exempt by construction.
+
+    `build_rbln_config` only runs on the vLLM-native path, so the optimum-rbln
+    path's own readers are outside the claim.
     """
     import vllm_rbln
 
@@ -197,9 +202,9 @@ def test_migrated_fields_are_no_longer_read_from_the_environment():
         and not path.name.startswith("optimum_")
     )
     assert not [
-        name
-        for name in sorted(_MIGRATED)
-        if f"envs.VLLM_RBLN_{name.upper()}" in sources
+        f.name
+        for f in dataclasses.fields(RBLNConfig)
+        if f"envs.VLLM_RBLN_{f.name.upper()}" in sources
     ]
 
 
