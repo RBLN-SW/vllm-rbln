@@ -75,7 +75,9 @@ def _make_vllm_config(
         cache_config=SimpleNamespace(gpu_memory_utilization=0.9, num_gpu_blocks=None),
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
-        additional_config=additional_config if additional_config is not None else {},
+        additional_config=(
+            additional_config if additional_config is not None else RBLNConfig()
+        ),
     )
 
 
@@ -146,6 +148,7 @@ def make_worker(monkeypatch):
             data_parallel_rank_local=data_parallel_rank_local,
             world_size_across_dp=wsd,
             assigned_physical_gpu_ids=assigned_physical_gpu_ids,
+            additional_config=RBLNConfig(num_devices_per_local_rank=num_devices),
         )
         # MultiprocExecutor.worker_main publishes the mapping in every worker
         # process before the worker is built, so a test that supplies one must
@@ -177,9 +180,6 @@ def make_worker(monkeypatch):
                     RblnPlatform.device_id_to_physical_device_id
                 ),
             ),
-        )
-        monkeypatch.setattr(
-            wm.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", num_devices
         )
         monkeypatch.setattr(wm, "has_torch_rbln", has_torch_rbln)
         return RBLNWorker(

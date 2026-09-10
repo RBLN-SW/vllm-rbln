@@ -306,11 +306,12 @@ class RBLNDFlashProposer(DFlashProposer):
             # NOTE(RBLN): the greedy pick belongs in the graph.
             return torch.ops.rbln.argmax(logits)
 
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         compile_kwargs = dict(
             dynamic=False,
             fullgraph=True,
             compile_context=self.runner.compile_context,
-            num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+            num_devices=rbln_config.num_devices_per_local_rank,
             model_trace_method="export" if USE_DEVICE_TENSOR else "",
             process_group_dict=build_process_group_dict(),
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
