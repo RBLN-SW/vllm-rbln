@@ -16,6 +16,7 @@ import numpy as np
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
@@ -79,15 +80,23 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         global_rank: int,
         num_blocks: int,
         block_ids: BlockIds,
+        keep_spans: int | None = None,
     ) -> np.ndarray:
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
+        assert keep_spans is None or per_block == 1
         # Converted once, not once per region: this runs per request, and every
         # region of a layer names the same group.
         group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
         desc_ids: list[np.ndarray] = []
         for region_id, group_id in enumerate(region_group_ids):
             group_arr = group_arrays[group_id]
+            # Regions run area-minor within a layer, and a shard that leaves
+            # part of a block out keeps every area (asserted where it
+            # registers), so this position names the span whose token range the
+            # request's last block does not reach.
+            if keep_spans is not None and region_id % self._kv_areas >= keep_spans:
+                group_arr = group_arr[:-1]
             if group_arr.size == 0:
                 continue
             block_ix = region_id * num_blocks + group_arr
@@ -104,6 +113,30 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         if not desc_ids:
             return np.empty(0, dtype=np.int64)
         return np.concatenate(desc_ids)
+
+    def _tail_areas(self, num_blocks: int, num_valid_tokens: int | None) -> int | None:
+        """How many chiplet areas of a request's last block hold its tokens.
+
+        A context cut gives area a the in-block positions [a*ps, (a+1)*ps), so
+        a last block filled to `rem` tokens has nothing above cdiv(rem, ps).
+        None keeps every area, which is what a full last block wants and what
+        every geometry chunk mode cannot address wants.
+
+        An area is the whole of what a transfer can leave out today, so it is
+        the chunk chunk mode names -- and the last line is already the rule
+        that declines when every one of them is needed.
+        """
+        if not self._chunk_mode or not num_valid_tokens or num_blocks <= 0:
+            return None
+        rem = num_valid_tokens - (num_blocks - 1) * self.block_size
+        if not 1 <= rem <= self.block_size:
+            raise RuntimeError(
+                f"RBLN NIXL D2D: a request holding {num_blocks} block(s) of "
+                f"{self.block_size} reports {num_valid_tokens} token(s); its "
+                "block list and its token count describe different KV."
+            )
+        tail = cdiv(rem, self.block_size // self._kv_areas)
+        return tail if tail < self._kv_areas else None
 
     def _xfer_notif_id(
         self, engine_id: str, remote_request_id: str, remote_tp_size: int

@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
 from tests.native.distributed.kv_connector.utils import (
     KvGeometry,
     build_worker,
+    mock_vllm_config,
     patch_in_package,
     patched_in_package,
 )
@@ -162,7 +163,15 @@ def _fake_nixl_rbln(xfer_result):
     return module
 
 
-def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
+def _prep_impl_worker(
+    monkeypatch,
+    *,
+    num_blocks=128,
+    block_size=64,
+    specs=None,
+    chunk_mode=False,
+    chunk_bytes=0,
+):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = build_worker(
         monkeypatch,
@@ -170,6 +179,9 @@ def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
         num_blocks=num_blocks,
         block_size=block_size,
         nixl_available=True,
+        specs=specs,
+        chunk_mode=chunk_mode,
+        chunk_bytes=chunk_bytes,
     )
     worker.tp_rank = 0
     worker.world_size = 1
@@ -1001,7 +1013,7 @@ class TestPpConstraints:
         use_mla=False,
     ):
         w = object.__new__(RblnNixlPullConnectorWorker)
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
         w.vllm_config.speculative_config = None
         w.transfer_topo = MagicMock()
@@ -1089,7 +1101,7 @@ class TestPublishHandshakeMetadata:
         w.shutdown = lambda: None
         w.compat_hash = "BASE"
         # _check_pp_constraints reads these; a plain PP producer passes.
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
         w.vllm_config.speculative_config = None
         w.transfer_topo = MagicMock()
@@ -1196,7 +1208,7 @@ class TestPublishHandshakeMetadata:
         # the target's, or a speculative draft's where there is one.
         w.model_config = MagicMock()
         w.model_config.get_total_num_kv_heads.return_value = 8
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.speculative_config = None
 
         with patch.object(NixlBaseConnectorWorker, "register_kv_caches"):
@@ -1335,3 +1347,84 @@ class TestWhatRegistrationSettles:
         geo = KvGeometry(layers=("l0", "l1"), per_layer_heads={"l1": 2})
         w = make_worker(kv_cache=geo)
         assert w._logical_region_kv_heads == [8, 8, None, None]
+
+
+class TestTailBlockTrim:
+    # Whether a context-cut engine may leave a last block's empty areas out,
+    # and the geometries whose areas do not name a token range at all.
+
+    @staticmethod
+    def _register(monkeypatch, *, areas, slices, num_kv_heads=1, **kw):
+        worker = _prep_impl_worker(
+            monkeypatch,
+            specs=[MagicMock(spec=FullAttentionSpec)],
+            **kw,
+        )
+        worker.use_mla = True
+        spec = MagicMock(spec=MLAAttentionSpec)
+        spec.page_size_bytes = 4096
+        spec.num_kv_heads = num_kv_heads
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _mla_kv_caches(num_blocks=worker.num_blocks)
+
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000 + 0x1000 * i for i in range(2 * areas)]
+        xfer_result.block_lens = [1024] * (2 * areas)
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = areas
+        xfer_result.slices = slices
+        # Replicas sit innermost, so each slice repeats areas // slices times.
+        xfer_result.slice_ids = [i // (areas // slices) for i in range(areas)] * 2
+        fake = _fake_nixl_rbln(xfer_result)
+
+        topo = MagicMock(
+            is_kv_layout_blocks_first=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = lambda cache, _spec: [cache]
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patched_in_package("rebel") as mock_rebel,
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+        return worker
+
+    def test_a_context_cut_into_whole_areas_enables_the_trim(self, monkeypatch):
+        worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=True)
+        assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
+        assert worker._chunk_mode is True
+
+    def test_the_flag_off_leaves_the_same_geometry_alone(self, monkeypatch):
+        # Same cut, opposite answer: nothing about the geometry turns this on.
+        worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=False)
+        assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
+        assert worker._chunk_mode is False
+
+    def test_a_head_cut_is_refused(self, monkeypatch):
+        # 8 heads over 4 slices is head tiling, where an area holds every token
+        # of some heads -- dropping one drops heads, not the block's tail.
+        with pytest.raises(RuntimeError, match="NON_HEAD axis"):
+            self._register(
+                monkeypatch, areas=4, slices=4, num_kv_heads=8, chunk_mode=True
+            )
+
+    def test_replicated_areas_are_refused(self, monkeypatch):
+        # Two areas per slice: the position no longer names one token range.
+        with pytest.raises(RuntimeError, match="NON_HEAD axis"):
+            self._register(monkeypatch, areas=4, slices=2, chunk_mode=True)
+
+    def test_areas_that_do_not_divide_the_block_are_refused(self, monkeypatch):
+        # 64 tokens over 5 areas: no area is a whole number of them.
+        with pytest.raises(RuntimeError, match="NON_HEAD axis"):
+            self._register(monkeypatch, areas=5, slices=5, chunk_mode=True)
+
+    def test_host_staging_is_refused_before_anything_registers(self, monkeypatch):
+        # Host staging keeps one full-shape buffer per layer, so the flag would
+        # otherwise be silently inert: `_register_kv_caches_impl` is D2D-only.
+        with pytest.raises(RuntimeError, match="host staging"):
+            build_worker(monkeypatch, kv_buffer_device="cpu", chunk_mode=True)

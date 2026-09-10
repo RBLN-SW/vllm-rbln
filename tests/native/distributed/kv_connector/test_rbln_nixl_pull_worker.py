@@ -28,6 +28,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
+from tests.native.distributed.kv_connector.utils import (
+    mock_vllm_config,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnNixlConnectorMetadata,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
@@ -68,6 +74,52 @@ class TestShardReadPath:
         # region 0: blocks 2,5 -> descs (2*2,+1) and (5*2,+1); region 1 adds 10*2.
         assert list(descs) == [4, 5, 10, 11, 24, 25, 30, 31]
 
+    @staticmethod
+    def _trim_worker():
+        # 4 regions over 2 chiplet areas: positions 0,2 are area 0 and 1,3 are
+        # area 1, which is the relation the trim indexes by.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}
+        w._shard_descs_per_block = {("eng", 1): 1}
+        w._kv_areas = 2
+        return w
+
+    def test_the_tail_block_leaves_the_areas_above_it_out(self):
+        w = self._trim_worker()
+        descs = w._get_block_descs_ids_for_shard(
+            "eng", 1, num_blocks=10, block_ids=[[2, 5, 7]], keep_spans=1
+        )
+        # Area 0 keeps all three blocks; area 1 drops the last, and the list
+        # stays region-major so the two sides still pair by position.
+        assert list(descs) == [2, 5, 7, 12, 15, 22, 25, 27, 32, 35]
+
+    def test_no_tail_is_todays_list(self):
+        # Same input, and the descriptors a full last block still needs.
+        w = self._trim_worker()
+        descs = w._get_block_descs_ids_for_shard(
+            "eng", 1, num_blocks=10, block_ids=[[2, 5, 7]], keep_spans=None
+        )
+        assert list(descs) == [2, 5, 7, 12, 15, 17, 22, 25, 27, 32, 35, 37]
+
+    def test_a_single_block_drops_the_higher_areas_entirely(self):
+        # The whole request is that one block, so an area above its last token
+        # contributes no descriptor at all rather than an empty range.
+        w = self._trim_worker()
+        descs = w._get_block_descs_ids_for_shard(
+            "eng", 1, num_blocks=10, block_ids=[[4]], keep_spans=1
+        )
+        assert list(descs) == [4, 24]
+
+    def test_a_head_band_split_cannot_be_trimmed(self):
+        # With more than one descriptor per block the position no longer names
+        # an area, so the two would index different things.
+        w = self._trim_worker()
+        w._shard_descs_per_block = {("eng", 1): 2}
+        with pytest.raises(AssertionError):
+            w._get_block_descs_ids_for_shard(
+                "eng", 1, num_blocks=10, block_ids=[[2, 5]], keep_spans=1
+            )
+
     def test_get_block_descs_ids_for_shard_empty_group(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 0): (0, 0)}
@@ -84,7 +136,7 @@ class TestShardReadPath:
         w._overlapping_ranks = {"eng": list(range(pp_size))}
         # The read notification carries how many of us read each producer rank,
         # which counts our pipeline ranks too (see _xfer_notif_id).
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
         w._has_mamba = False  # non-Mamba scope: _apply_prefix_caching end-trims
         w.world_size = 1
@@ -104,6 +156,9 @@ class TestShardReadPath:
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
+        # Off, as the default is; the chunk tests turn it on.
+        w._chunk_mode = False
+        w._recv_valid_tokens = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
         w._remote_agents = {"eng": {r: f"agent{r}" for r in range(pp_size)}}
@@ -204,6 +259,39 @@ class TestShardReadPath:
             assert len(remote_descs) == 2
         assert len(w._recving_transfers["r0"]) == 2
 
+    def test_the_producers_token_count_shortens_the_read(self):
+        # The same read with the producer's count in hand: its
+        # last block holds one token, so only the first of the two areas is
+        # read and each stage issues half the descriptors.
+        w = self._read_worker(pp_size=2)
+        w._chunk_mode = True
+        w._kv_areas = 2
+        w.block_size = 16
+        w._recv_valid_tokens = {"r0": 33}
+
+        w._read_blocks_for_req("r0", self._meta([[7]], [[3, 4, 7]]))
+
+        assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
+        for c in w.nixl_wrapper.make_prepped_xfer.call_args_list:
+            local_descs, remote_descs = c.args[2], c.args[4]
+            assert len(local_descs) == len(remote_descs)
+            assert len(remote_descs) == 1
+        # Consumed, so a later step cannot read it against another block list.
+        assert w._recv_valid_tokens == {}
+
+    def test_a_count_arriving_before_the_read_is_kept(self):
+        # A request whose handshake is still running is read on a later step,
+        # whose metadata no longer lists it -- so the counts accumulate.
+        w = self._read_worker(pp_size=1)
+        w._recv_valid_tokens = {"earlier": 5}
+        meta = RblnNixlConnectorMetadata()
+        meta.valid_tokens = {"r0": 33}
+
+        with patch.object(NixlPullConnectorWorker, "start_load_kv"):
+            w.start_load_kv(meta)
+
+        assert w._recv_valid_tokens == {"earlier": 5, "r0": 33}
+
     def test_single_stage_read_delegates_to_upstream(self):
         # A producer that advertised pp_size 1 reads through the upstream path:
         # the per-stage loop would key handles the non-PP registration never
@@ -212,6 +300,8 @@ class TestShardReadPath:
         w._engine_last_active = {}
         w._remote_pp_size = {}  # unknown engine defaults to a single stage
         w._overlapping_ranks = {}  # nothing narrowed -> upstream's handle covers it
+        w._chunk_mode = False
+        w._recv_valid_tokens = {}
         w.transfer_topo = MagicMock()
         meta = MagicMock()
         meta.remote.engine_id = "eng"
@@ -242,7 +332,7 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.world_size = local_tp
         w._remote_pp_size = {"eng": remote_pp}
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = local_pp
 
         notif = w._xfer_notif_id("eng", "req-1", remote_tp).decode()

@@ -53,6 +53,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _kv_areas: int
     _kv_slices: int
     _kv_split_axis: KVSplitAxis
+    _chunk_mode: bool
     _logical_region_kv_heads: list[int | None]
     _logical_region_slices: list[int]
     local_seen_layer_names: list[str]

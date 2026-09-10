@@ -30,10 +30,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 )
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker as pw
+from tests.native.distributed.kv_connector.utils import (
+    mock_vllm_config,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
     RblnNixlPullConnectorWorker,
     RblnNixlPushConnectorWorker,
     RblnNixlWorkerBase,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnNixlConnectorMetadata,
 )
 
 
@@ -67,6 +73,9 @@ def _push_worker():
     # the shape the pairing predicates read before an engine is registered.
     w.use_host_buffer = False
     w._sw_ratio = None
+    # Off, as the environment variable is; the trim tests turn it on.
+    w._chunk_mode = False
+    w._valid_tokens = {}
     # __init__ never ran, so the writer state shutdown() reaches through
     # __del__ is absent; silence it rather than leak an unraisable at GC.
     w.shutdown = lambda: None
@@ -214,7 +223,7 @@ class TestPerShardWrite:
         w = _push_worker()
         w._remote_pp_size = {"eng": 1}
         w._overlapping_ranks = {"eng": list(range(ranks))}
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
         w.world_size = 1
         w.num_blocks = 8
@@ -572,10 +581,12 @@ class TestSaveBeforeWriteInvariant:
 
     @staticmethod
     def _meta(saves, pushes):
-        return SimpleNamespace(
-            reqs_to_save=dict.fromkeys(saves, object()),
-            push_finished_blocks=dict.fromkeys(pushes, ([1],)),
-        )
+        # The real type, not a stand-in: start_load_kv reads a field only the
+        # promoted metadata carries.
+        meta = RblnNixlConnectorMetadata()
+        meta.reqs_to_save = dict.fromkeys(saves, object())
+        meta.push_finished_blocks = dict.fromkeys(pushes, ([1],))
+        return meta
 
     def test_the_same_request_in_both_is_refused(self, monkeypatch):
         monkeypatch.setattr(
@@ -876,3 +887,96 @@ class TestDelegatedRouteAlignment:
         )
 
         assert local == ([5, 6, 7],)
+
+
+class TestTailBlockTrimOnTheWritePath:
+    """A write leaves out the areas of a last block that hold no tokens."""
+
+    @classmethod
+    def _trimming_worker(cls):
+        # 2 regions over 2 areas, 16-token blocks: area 0 holds the first 8
+        # in-block positions and area 1 the rest.
+        w = TestPerShardWrite._writing_worker(ranks=1)
+        w._chunk_mode = True
+        w._kv_areas = 2
+        w.block_size = 16
+        w._valid_tokens = {"r0": 17}
+        return w
+
+    def test_the_write_leaves_the_empty_area_of_the_last_block_out(self):
+        # 17 tokens over two blocks: the second holds one, which is area 0's.
+        worker = self._trimming_worker()
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1, 2],), ([3, 4],)))
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        assert len(call.args[2]) == len(call.args[4]) == 3
+
+    def test_a_count_from_an_earlier_step_survives_the_next(self, monkeypatch):
+        # A request handed over in one step is written in a later one, whose
+        # metadata no longer lists it -- so the counts accumulate rather than
+        # replace. Replaced, that request writes its last block whole.
+        worker = self._trimming_worker()
+        worker._valid_tokens = {"earlier": 5}
+        meta = RblnNixlConnectorMetadata()
+        meta.valid_tokens = {"r0": 17}
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
+        )
+
+        worker.start_load_kv(meta)
+
+        assert worker._valid_tokens == {"earlier": 5, "r0": 17}
+
+    def test_a_consumer_that_had_the_front_still_sizes_the_last_block(self):
+        # The consumer registered only the suffix it was missing, so our list
+        # is trimmed before the write. The token count describes the request's
+        # OWN blocks, so counting after the trim would read 17 tokens as one
+        # block's worth and refuse the write.
+        worker = self._trimming_worker()
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1, 2],), ([4],)))
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        local_descs, remote_descs = call.args[2], call.args[4]
+        # One block left to write, and the trim on the last block still applies.
+        assert len(local_descs) == len(remote_descs) == 1
+
+    def test_a_full_last_block_writes_every_area(self):
+        # The same write with a count that fills both blocks: nothing to leave
+        # out, and the descriptor list is the one this path always sent.
+        worker = self._trimming_worker()
+        worker._valid_tokens = {"r0": 32}
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1, 2],), ([3, 4],)))
+
+        assert len(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4]) == 4
+
+    def test_the_count_reaches_the_writer_through_the_metadata(self, monkeypatch):
+        # The write reads worker state, and only start_load_kv puts the
+        # scheduler's count there -- so the trim has to survive that hop.
+        worker = self._trimming_worker()
+        worker._valid_tokens = {}
+        meta = RblnNixlConnectorMetadata()
+        meta.valid_tokens = {"r0": 17}
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
+        )
+
+        worker.start_load_kv(meta)
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1, 2],), ([3, 4],)))
+
+        assert len(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4]) == 3
+
+    def test_a_reported_request_drops_its_token_count(self, monkeypatch):
+        # Nothing else pops it, so a count kept here would outlive its request.
+        worker = self._trimming_worker()
+        worker._valid_tokens = {"r0": 17, "other": 9}
+        worker._writer_counts_by_req = defaultdict(int)
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "get_finished", lambda self: ({"r0"}, set())
+        )
+
+        worker.get_finished()
+
+        assert worker._valid_tokens == {"other": 9}

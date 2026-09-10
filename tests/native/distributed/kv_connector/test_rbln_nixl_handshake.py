@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from tests.native.distributed.kv_connector.utils import (
     build_worker,
+    mock_vllm_config,
     patched_in_package,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
@@ -183,7 +184,7 @@ def _make_worker(
     # tp_ratio to decide between positional and head-band region pairing.
     w.transfer_topo.tp_ratio.return_value = tp_ratio
     w.transfer_topo.tp_size = 1
-    w.vllm_config = MagicMock()
+    w.vllm_config = mock_vllm_config()
     w.vllm_config.parallel_config.pipeline_parallel_size = 1
     # No speculative decoding: the compat hash then folds what it always did.
     w.vllm_config.speculative_config = None
@@ -191,6 +192,8 @@ def _make_worker(
     w.enforce_compat_hash = True
     w._sw_ratio = sw_ratio
     w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
+    # Off, as the environment variable is; the trim tests turn it on.
+    w._chunk_mode = False
     w._remote_shard_layer_names = defaultdict(dict)
     w._remote_pp_size = {}
     w._overlapping_ranks = defaultdict(list)
@@ -482,6 +485,18 @@ class TestPpHandshakeFanout:
         _handshake(w, _FakeSock(pp_size=1))
         assert w._overlapping_ranks["eng"] == []
         assert w._register_shard_xfer_state.call_count == 0
+
+    def test_a_side_that_trims_a_last_block_asks_even_a_matching_peer(self):
+        # Same peer again, and the same reason in a different shape: the trim
+        # narrows a block rather than a peer, and only the per-shard ids can
+        # leave part of one out.
+        w = _make_worker()
+        w._chunk_mode = True
+
+        _handshake(w, _FakeSock(pp_size=1))
+
+        assert w._overlapping_ranks["eng"] == [0]
+        assert w._register_shard_xfer_state.call_count == 1
 
     @pytest.mark.parametrize("sw_ratio", [0.5, None])
     def test_swa_plus_pp_raises(self, sw_ratio):
@@ -871,6 +886,7 @@ class TestShardLocalRegions:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.local_seen_layer_names = list(local_names)
         w.num_regions = num_regions
+        w._chunk_mode = False
         return w
 
     def test_regions_per_layer(self):
@@ -1037,6 +1053,23 @@ class TestShardLocalRegions:
         with pytest.raises(AssertionError, match="single KV-cache group"):
             w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
 
+    @pytest.mark.parametrize(
+        "narrowed",
+        [{"peer_areas": [0]}, {"split": 2}, {"replica_fanout": 2}],
+    )
+    def test_a_trimming_engine_refuses_a_narrowed_shard(self, narrowed):
+        # Each of the three breaks the position-to-area relation the trim reads
+        # (see `_register_shard_xfer_state`), which is why one assertion covers
+        # them together.
+        w = self._wired_worker()
+        w._chunk_mode = True
+        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+
+        with pytest.raises(AssertionError):
+            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"), **narrowed)
+
 
 class TestBaseFanInHandle:
     # Host staging has no chiplet areas to narrow with, so a shard reading from
@@ -1113,12 +1146,13 @@ class TestValidateRemoteAgentHandshake:
         w.num_regions = num_layers * 2 * areas
         w.block_len_per_layer = [64] * (num_layers * 2 * areas)
         w.dst_num_blocks = {"eng": dst_num_blocks}
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
         w.vllm_config.speculative_config = None
         w._kv_areas = 1
         w._kv_slices = 1
         w._kv_split_axis = KVSplitAxis.HEAD
+        w._chunk_mode = False
         w._sw_ratio = None
         w._has_swa = False
         topo = MagicMock()
@@ -2603,10 +2637,12 @@ class TestSplitAxisConstraints:
     # by them, which is the one thing a count cannot say.
 
     @staticmethod
-    def _worker(*, axis, tp_ratio=1, host_buffer=False):
+    def _worker(*, axis, tp_ratio=1, host_buffer=False, trim=False, block_size=16):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.use_host_buffer = host_buffer
         w._kv_split_axis = axis
+        w._chunk_mode = trim
+        w.block_size = block_size
         w._sw_ratio = None
         topo = MagicMock()
         topo.tp_size = 2
@@ -2633,6 +2669,33 @@ class TestSplitAxisConstraints:
         # right; rejecting this would refuse the only shape that does work.
         w = self._worker(axis=KVSplitAxis.NON_HEAD)
         meta = _agent_meta(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
+        w._check_split_axis_constraints(meta, 2)  # no raise
+
+    def test_a_trimming_peer_must_size_its_block_the_same(self):
+        # Same axis, equal TP, and still wrong: an area is a fraction of a
+        # block, so a peer whose block holds a different number of tokens gives
+        # the same area a different token range while the byte counts fit.
+        w = self._worker(axis=KVSplitAxis.NON_HEAD, trim=True, block_size=16)
+        meta = _agent_meta(
+            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
+        )
+        with pytest.raises(RuntimeError, match="the same token range"):
+            w._check_split_axis_constraints(meta, 2)
+
+    def test_a_matching_block_size_passes_while_trimming(self):
+        w = self._worker(axis=KVSplitAxis.NON_HEAD, trim=True, block_size=16)
+        meta = _agent_meta(
+            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=16
+        )
+        w._check_split_axis_constraints(meta, 2)  # no raise
+
+    def test_a_differing_block_size_is_upstreams_when_not_trimming(self):
+        # The refusal is scoped to the trim: without it this pairing is
+        # upstream's and unchanged.
+        w = self._worker(axis=KVSplitAxis.NON_HEAD, block_size=16)
+        meta = _agent_meta(
+            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
+        )
         w._check_split_axis_constraints(meta, 2)  # no raise
 
     def test_host_bounce_is_exempt(self):

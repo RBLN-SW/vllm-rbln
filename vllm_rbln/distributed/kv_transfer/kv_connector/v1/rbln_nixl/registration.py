@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
     RblnNixlAgentMetadata,
+    connector_option,
     rbln_compat_hash,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
@@ -394,6 +395,26 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self._kv_split_axis = (
             KVSplitAxis.NON_HEAD if region_non_head == {True} else KVSplitAxis.HEAD
         )
+        # The chunk is a whole area today, and reading an area as a token
+        # range is only true of a context cut -- so that range has to be one
+        # area wide and whole.
+        self._chunk_mode = connector_option(self.vllm_config, "chunk_mode", False)
+        if self._chunk_mode and not (
+            self._kv_split_axis is KVSplitAxis.NON_HEAD
+            and self._kv_areas == self._kv_slices
+            and self.block_size % self._kv_areas == 0
+            and not self._has_swa
+            and len(self.kv_cache_config.kv_cache_groups) == 1
+        ):
+            raise RuntimeError(
+                "RBLN NIXL (D2D): chunk_mode needs a KV "
+                "cache cut on the NON_HEAD axis into unreplicated areas that "
+                "divide the block, in a single full-attention group. Got "
+                f"axis={self._kv_split_axis.name}, areas={self._kv_areas}, "
+                f"slices={self._kv_slices}, block_size={self.block_size}, "
+                f"groups={len(self.kv_cache_config.kv_cache_groups)}, "
+                f"swa={self._has_swa}."
+            )
         logger.info(
             "RBLN NIXL (D2D): registered %d transfer region(s) across %d chiplet "
             "area(s), %d logical slice(s), cut on the %s axis%s.",
