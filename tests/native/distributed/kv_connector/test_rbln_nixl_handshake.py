@@ -573,6 +573,20 @@ class TestPpHandshakeFanout:
         assert w._register_shard_xfer_state.call_count == 1
         assert w._overlapping_ranks["eng"] == [0]
 
+    def test_a_fanned_out_peer_alone_forces_the_per_shard_path(self):
+        # Third companion: nothing narrows and no region is split, but the peer
+        # replicates each of its head slices across chiplet areas, so a write
+        # has to reach every copy. The remote list then carries one descriptor
+        # per copy while upstream's whole-engine handle carries one per block,
+        # and the two are indexed by the same desc ids.
+        w = _make_worker(tp_ratio=2, host_buffer=False)
+        w.local_seen_layer_names = ["layer.0"]
+        w.num_regions = 1
+        w._add_remote_agent_head_matched = lambda *a, **k: "agent"
+        w._peer_head_split = lambda *a, **k: 1
+        w._peer_replica_fanout = lambda *a, **k: 2
+        w._fan_in_peer_areas = lambda *a, **k: None
+
     def test_compat_hash_mismatch_raises(self):
         w = _make_worker(compat="LOCAL")
         sock = _FakeSock(pp_size=1, compat="REMOTE")
