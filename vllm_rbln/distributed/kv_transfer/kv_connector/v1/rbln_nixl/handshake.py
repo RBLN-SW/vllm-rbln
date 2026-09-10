@@ -783,12 +783,18 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         remote_rank_to_agent_name[(pp_rank, remote_tp_rank)] = agent
 
                     if not (
-                        pp_size > 1 or partial or fan_in or split > 1 or kv_runs > 1
+                        pp_size > 1
+                        or partial
+                        or fan_in
+                        or split > 1
+                        or fanout > 1
+                        or kv_runs > 1
                     ):
                         # Nothing is narrowed: upstream's whole-engine handle
                         # describes this peer, so the transfer path delegates.
-                        # A K/V split narrows it too: upstream names a block
-                        # once where our list names it per range.
+                        # Fan-out and a K/V split narrow it at one piece per
+                        # head too -- upstream names a block once where our
+                        # list names it per copy and per range.
                         continue
                     self._register_shard_xfer_state(
                         expected_engine_id,
