@@ -24,6 +24,8 @@ import types
 import pytest
 import torch
 
+from vllm_rbln.model_executor.models.optimum import qwen3_asr
+from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 from vllm_rbln.model_executor.models.optimum.qwen3_asr import (
     RBLNOptimumQwen3ASRForConditionalGeneration as Qwen3ASR,
 )
@@ -93,6 +95,39 @@ def test_process_audio_input_rejects_dtype_mismatch_with_text_embeds():
 
     with pytest.raises(AssertionError, match="dtype"):
         obj._process_audio_input(_audio_input())
+
+
+class _ReachedModelInit(Exception):
+    """Raised by the faked base __init__ to show the checkpoint guard passed."""
+
+
+def _construct_with_config_json(monkeypatch, config_json: dict) -> None:
+    monkeypatch.setattr(
+        qwen3_asr, "get_hf_file_to_dict", lambda name, model, revision: config_json
+    )
+
+    def stop(self, vllm_config):
+        raise _ReachedModelInit
+
+    monkeypatch.setattr(RBLNOptimumModelBase, "__init__", stop)
+    vllm_config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(model="Qwen/Qwen3-ASR-0.6B", revision=None)
+    )
+    Qwen3ASR(vllm_config)
+
+
+def test_original_checkpoint_layout_is_rejected_with_hf_hint(monkeypatch):
+    with pytest.raises(ValueError, match="-hf"):
+        _construct_with_config_json(
+            monkeypatch, {"model_type": "qwen3_asr", "thinker_config": {}}
+        )
+
+
+def test_transformers_native_checkpoint_layout_passes_guard(monkeypatch):
+    with pytest.raises(_ReachedModelInit):
+        _construct_with_config_json(
+            monkeypatch, {"model_type": "qwen3_asr", "audio_config": {}}
+        )
 
 
 def _bare_decoder(max_batch_size: int) -> Qwen3ASR:

@@ -23,6 +23,7 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
 )
 from vllm.model_executor.models.qwen3_asr import _get_feat_extract_output_lengths
 from vllm.model_executor.models.whisper import ISO639_1_SUPPORTED_LANGS
+from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 from .base import ModelInputForRBLN
 from .model_base import (
@@ -51,6 +52,23 @@ class RBLNOptimumQwen3ASRForConditionalGeneration(
         self,
         vllm_config: VllmConfig,
     ) -> None:
+        # vLLM reads both Qwen3-ASR checkpoint layouts, but optimum-rbln wraps
+        # transformers' Qwen3ASRForConditionalGeneration, which only loads the
+        # transformers-native one (the `-hf` repos): the original layout nests
+        # everything under `thinker_config` and its weights are dropped.
+        model_config = vllm_config.model_config
+        config_dict = get_hf_file_to_dict(
+            "config.json", model_config.model, model_config.revision
+        )
+        if config_dict is not None and "thinker_config" in config_dict:
+            raise ValueError(
+                f"Use the `-hf` Qwen3-ASR repo (e.g. `Qwen/Qwen3-ASR-1.7B-hf`) "
+                f"instead of {model_config.model!r}. The RBLN optimum path loads "
+                "the checkpoint through transformers' "
+                "Qwen3ASRForConditionalGeneration, which needs the "
+                "transformers-native layout; the original `thinker_config` "
+                "layout cannot be loaded."
+            )
         super().__init__(vllm_config=vllm_config)
         if vllm_config.lora_config is not None:
             raise NotImplementedError(
