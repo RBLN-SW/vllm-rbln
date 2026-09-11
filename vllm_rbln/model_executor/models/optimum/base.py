@@ -17,23 +17,6 @@ import torch
 from vllm.multimodal.inputs import BatchedTensorInputs
 
 
-@dataclass(frozen=True)
-class PartialPrefixInfo:
-    """Inputs to rebuild the uncached tail of a partial prefix-cache hit
-    (boundary may end inside an image).
-
-    - `full_input_tokens`: untrimmed prompt (MRoPE positions computed over it).
-    - `num_cached_tokens`: cache boundary in tokens (= tail start).
-    - `mrope_mm_kwargs`: every item's grid (incl. cached) for get_rope_index.
-    - `mm_embed_tail_starts`: per kept item, first uncached feature index.
-    """
-
-    full_input_tokens: torch.Tensor
-    num_cached_tokens: int
-    mrope_mm_kwargs: BatchedTensorInputs | None
-    mm_embed_tail_starts: dict[str, list[int]] | None
-
-
 # FIXME(eunji): In original vLLM, this dataclasss is located in model_runner.
 # And it makes available to decouple the vllm logic and hf model logic
 @dataclass(frozen=True)
@@ -55,7 +38,15 @@ class ModelInputForRBLN:
     # Decode batch the tensors are padded to; 1 for prefill.
     padded_batch_size: int
     is_prompt: bool = False
+    # Raw multimodal kwargs of this prefill's items, for models that encode
+    # inside forward (Whisper). Others take their encoder output from mm_embeds.
     multi_modal_kwargs: BatchedTensorInputs | None = None
+    # Prefill: encoder output of every multimodal item overlapping this
+    # prefill's tokens, one 2D tensor per item in prompt order and cut to the
+    # tokens being prefilled, plus the [1, seq_len] mask of the positions they
+    # fill (see the runner's _gather_mm_embeddings). None on decode.
+    mm_embeds: list[torch.Tensor] | None = None
+    is_mm_embed: torch.Tensor | None = None
     # Block the scheduler set aside as scratch space for padding rows. None
     # when the scheduler did not set one aside; the runner then picks a block
     # no running request uses.
@@ -75,9 +66,9 @@ class ModelInputForRBLN:
     # deepstack features. Left None for models that don't use them.
     visual_pos_mask: torch.Tensor | None = None
     deepstack_embeds: torch.Tensor | None = None
-    # Set only on a partial prefix-cache hit (see PartialPrefixInfo); None on the
-    # no-hit path and for non-MRoPE models.
-    partial_prefix: "PartialPrefixInfo | None" = None
+    # MRoPE models: the (t, h, w) positions of the tokens above as
+    # [3, padded_batch_size, seq_len], 0 in the padding rows. None otherwise.
+    mrope_positions: torch.Tensor | None = None
 
 
 version_error = RuntimeError(

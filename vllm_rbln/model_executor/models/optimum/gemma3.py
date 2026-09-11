@@ -201,25 +201,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     def get_language_model(self):
         return self.model.language_model
 
-    def build_prefill_inputs_from_cache(
-        self,
-        input_ids: torch.Tensor,
-        cached_mm_outputs: list,
-        *,
-        cache_position: torch.Tensor | None = None,
-        running_requests_ids: list[str] | None = None,
-        mrope_position_deltas: dict[str, float] | None = None,
-    ) -> dict:
-        # NOTE: this guard is currently unreachable — init_model() only enables
-        # the EC path for "RBLNQwen3VLForConditionalGeneration", so Gemma3 never
-        # enters here today. It documents the contract for when EC is extended.
-        raise NotImplementedError(
-            "EC disaggregation is not implemented for Gemma3: its hybrid "
-            "sliding-window attention prefill needs the cache slot ids from "
-            "ModelInputForRBLN and must record the prefill graph's attention "
-            "mask, which build_prefill_inputs_from_cache does not support."
-        )
-
     def _process_image_input(
         self, image_input: Gemma3ImageInputs
     ) -> list[torch.Tensor]:

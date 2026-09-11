@@ -19,7 +19,6 @@ from vllm.logger import init_logger
 
 from vllm_rbln.model_executor.models.optimum.base import (
     ModelInputForRBLN,
-    PartialPrefixInfo,
 )
 from vllm_rbln.utils.optimum.predicates import is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import (
@@ -119,6 +118,5 @@ def load_model(vllm_config: VllmConfig) -> nn.Module:
 __all__ = [
     "load_model",
     "ModelInputForRBLN",
-    "PartialPrefixInfo",
     "RBLNOptimumForEncoderModel",
 ]

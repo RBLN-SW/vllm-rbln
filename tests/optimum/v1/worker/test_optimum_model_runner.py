@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import tempfile
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +29,7 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import CachedRequestData
@@ -440,3 +441,144 @@ def test_prepare_decode_pins_rows_the_model_names(model_runner):
     assert model_input.cache_slot_ids[3, 0] == 3
     assert model_input.cache_slot_ids[0, 0] == 0
     assert model_input.block_tables[3, 0] != model_input.block_tables[1, 0]
+
+
+def _feature(mm_hash, offset, length, is_embed=None):
+    if is_embed is not None:
+        is_embed = torch.tensor(is_embed, dtype=torch.bool)
+    return SimpleNamespace(
+        identifier=mm_hash,
+        modality="image",
+        data=f"pixels:{mm_hash}",
+        mm_position=PlaceholderRange(offset=offset, length=length, is_embed=is_embed),
+    )
+
+
+def _mm_runner(mm_features, encoder_cache):
+    """The runner's encoder/gather steps on a fake self: they read only the
+    encoder cache (and the model, for encoding)."""
+    fake = SimpleNamespace(
+        mm_features=mm_features, encoder_cache=encoder_cache, device="cpu", saved=[]
+    )
+    fake.maybe_save_ec_to_connector = lambda cache, mm_hash: fake.saved.append(mm_hash)
+    for name in ("_execute_mm_encoder", "_gather_mm_embeddings"):
+        setattr(fake, name, MethodType(getattr(RBLNOptimumModelRunner, name), fake))
+    return fake
+
+
+def _rows(n, base):
+    return torch.arange(n, dtype=torch.float32).unsqueeze(1) + base
+
+
+# imgA fills [2, 6), imgB fills [8, 11) of a 12-token prompt.
+IMG_A = _feature("imgA", offset=2, length=4)
+IMG_B = _feature("imgB", offset=8, length=3)
+CACHE = {"imgA": _rows(4, 100), "imgB": _rows(3, 200)}
+
+
+class TestGatherMmEmbeddings:
+    def test_full_prefill_takes_every_item_in_prompt_order(self):
+        runner = _mm_runner([IMG_A, IMG_B], CACHE)
+        mm_embeds, mask = runner._gather_mm_embeddings(runner.mm_features, 0, 12)
+        assert [t[0, 0].item() for t in mm_embeds] == [100, 200]
+        assert mask.shape == (1, 12)
+        assert mask[0].nonzero().flatten().tolist() == [2, 3, 4, 5, 8, 9, 10]
+
+    def test_prefix_hit_inside_an_item_keeps_only_its_tail(self):
+        runner = _mm_runner([IMG_A, IMG_B], CACHE)
+        # 4 tokens are cached: the first two rows of imgA are already in KV.
+        mm_embeds, mask = runner._gather_mm_embeddings(runner.mm_features, 4, 12)
+        assert mm_embeds[0].shape[0] == 2 and mm_embeds[0][0, 0] == 102
+        assert mask[0].nonzero().flatten().tolist() == [0, 1, 4, 5, 6]
+
+    def test_fully_cached_item_is_dropped(self):
+        runner = _mm_runner([IMG_A, IMG_B], CACHE)
+        mm_embeds, mask = runner._gather_mm_embeddings(runner.mm_features, 6, 12)
+        assert [t.shape[0] for t in mm_embeds] == [3]
+        assert mask.shape == (1, 6)
+
+    def test_is_embed_skips_structural_tokens(self):
+        # idefics3-style block: only the T positions get an embedding row.
+        block = _feature("blk", offset=1, length=5, is_embed=[0, 1, 1, 0, 1])
+        runner = _mm_runner([block], {"blk": _rows(3, 300)})
+        mm_embeds, mask = runner._gather_mm_embeddings(runner.mm_features, 0, 6)
+        assert mm_embeds[0].shape[0] == 3
+        assert mask[0].nonzero().flatten().tolist() == [2, 3, 5]
+
+    def test_cache_miss_is_an_error(self):
+        runner = _mm_runner([IMG_A], {})
+        with pytest.raises(RuntimeError, match="Encoder cache miss for imgA"):
+            runner._gather_mm_embeddings(runner.mm_features, 0, 12)
+
+
+class TestExecuteMmEncoder:
+    @pytest.fixture(autouse=True)
+    def one_item_per_batch(self, monkeypatch):
+        # Stand in for vLLM's batching: one group per item, kwargs = its data.
+        monkeypatch.setattr(
+            runner_module,
+            "group_and_batch_mm_kwargs",
+            lambda mm_kwargs, **_: (
+                (modality, 1, {"data": data}) for modality, data in mm_kwargs
+            ),
+        )
+
+    def _model(self):
+        calls = []
+
+        def embed_multimodal(**kwargs):
+            calls.append(kwargs["data"])
+            return [_rows(1, len(calls))]
+
+        return SimpleNamespace(embed_multimodal=embed_multimodal), calls
+
+    def test_encodes_the_missing_items_and_caches_each_by_hash(self):
+        runner = _mm_runner([IMG_A, IMG_B], {"imgA": _rows(4, 100)})
+        runner.model, calls = self._model()
+
+        runner._execute_mm_encoder(runner.mm_features, 0, 12)
+
+        assert calls == ["pixels:imgB"]
+        assert set(runner.encoder_cache) == {"imgA", "imgB"}
+        assert runner.saved == ["imgB"]
+
+    def test_items_inside_the_cached_prefix_are_not_encoded(self):
+        runner = _mm_runner([IMG_A, IMG_B], {})
+        runner.model, calls = self._model()
+
+        runner._execute_mm_encoder(runner.mm_features, 6, 12)
+
+        assert calls == ["pixels:imgB"]
+
+    def test_nothing_to_encode_does_not_touch_the_model(self):
+        runner = _mm_runner([IMG_A], {"imgA": _rows(4, 100)})
+        runner.model = SimpleNamespace()  # no embed_multimodal at all
+
+        runner._execute_mm_encoder(runner.mm_features, 0, 12)
+
+        assert runner.saved == []
+
+
+class TestMropePositions:
+    # A 4-token prompt whose positions were computed once; decode continues at
+    # the delta.
+    STATE = SimpleNamespace(
+        mrope_positions=torch.tensor([[0, 1, 1, 2], [0, 1, 1, 2], [0, 1, 2, 2]]),
+        mrope_position_delta=-1,
+    )
+
+    def test_prefill_window_slices_the_prompt_positions(self):
+        out = RBLNOptimumModelRunner._mrope_positions(self.STATE, 1, 4)
+        assert out.tolist() == [[1, 1, 2], [1, 1, 2], [1, 2, 2]]
+
+    def test_completion_positions_continue_from_the_delta(self):
+        out = RBLNOptimumModelRunner._mrope_positions(self.STATE, 5, 6)
+        assert out.tolist() == [[4], [4], [4]]
+
+    def test_a_resumed_prefill_spans_prompt_and_completion(self):
+        out = RBLNOptimumModelRunner._mrope_positions(self.STATE, 3, 6)
+        assert out.tolist() == [[2, 3, 4], [2, 3, 4], [2, 3, 4]]
+
+    def test_models_without_mrope_get_none(self):
+        state = SimpleNamespace(mrope_positions=None, mrope_position_delta=None)
+        assert RBLNOptimumModelRunner._mrope_positions(state, 0, 3) is None
