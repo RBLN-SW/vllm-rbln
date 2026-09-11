@@ -42,6 +42,7 @@ from . import (
     modelopt_mixed_config,
     models_utils,
     multi_connector,
+    multi_connector_kv_events,
     oot,
     profiler,
     qwen2_moe,
