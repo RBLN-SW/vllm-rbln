@@ -75,12 +75,15 @@ def _push_worker():
 
 class TestInheritance:
     def test_shared_machinery_sits_next_to_the_upstream_push_classes(self):
-        # The pairing layer must come first so its overrides win, and the
-        # upstream push class must follow so the write path is the inherited one.
-        assert RblnNixlPushConnectorWorker.__mro__[1:4] == (
-            RblnNixlWorkerBase,
-            NixlPushConnectorWorker,
-            NixlBaseConnectorWorker,
+        # The pairing layer must come before the upstream push class so its
+        # overrides win, and that one before the upstream base so the write
+        # path is the inherited one. Asserted as an order rather than the exact
+        # tuple: what matters is which class wins, not how many sit between.
+        mro = RblnNixlPushConnectorWorker.__mro__
+        assert (
+            mro.index(RblnNixlWorkerBase)
+            < mro.index(NixlPushConnectorWorker)
+            < mro.index(NixlBaseConnectorWorker)
         )
 
     def test_only_the_write_direction_carries_the_direction_flag(self):
@@ -107,6 +110,24 @@ class TestInheritance:
             RblnNixlPushConnectorWorker._xfer_blocks
             is NixlPushConnectorWorker._xfer_blocks
         )
+
+
+class TestBuiltForReal:
+    # Built through the real __init__ and registered, so the direction facts are
+    # asserted against a worker that reached them rather than against attributes
+    # set by hand.
+
+    def test_the_two_directions_advertise_different_hashes(self, make_worker):
+        # A writer must not present the hash a reader would accept: the peer's
+        # handshake gate is what refuses a transfer aimed the wrong way.
+        from tests.native.distributed.kv_connector.utils import KvGeometry
+
+        geo = KvGeometry(layers=("l0",))
+        reader = make_worker(kv_cache=geo)
+        writer = make_worker(kv_cache=geo, direction="push")
+
+        assert (reader._writes_into_peer, writer._writes_into_peer) == (False, True)
+        assert reader.compat_hash != writer.compat_hash
 
 
 class TestMlaOnTheWritePath:
@@ -202,7 +223,9 @@ class TestPerShardWrite:
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         # single group, 2 regions per shard
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(ranks)}
-        w._shard_descs_per_block = {}
+        # Written together with the group ids by _register_shard_xfer_state, so a
+        # shard the write path can reach always has both.
+        w._shard_descs_per_block = {("eng", r): 1 for r in range(ranks)}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(ranks)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(ranks)}}
         w._sending_transfers = defaultdict(list)
@@ -323,6 +346,13 @@ class TestPerShardWrite:
         assert worker._sending_transfers["r0"] == []
         worker.xfer_stats.record_failed_transfer.assert_called_once()
         worker.nixl_wrapper.release_xfer_handle.assert_not_called()
+        # The mock is installed to keep the log quiet; assert on it too, or the
+        # operator-facing half of the report can be deleted unnoticed -- the stat
+        # above is the other half.
+        assert (
+            worker._log_failure.call_args.kwargs["failure_type"]
+            == "transfer_setup_failed"
+        )
 
     def test_a_failure_after_the_handle_exists_releases_it(self):
         # The other half of the same branch: the submission succeeded, so a

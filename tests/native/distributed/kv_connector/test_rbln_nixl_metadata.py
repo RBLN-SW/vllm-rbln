@@ -26,6 +26,7 @@ import msgspec
 from vllm.config import SpeculativeConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 
+from tests.native.distributed.kv_connector.utils import setattr_in_package
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RBLN_NIXL_CONNECTOR_VERSION,
@@ -222,7 +223,7 @@ class TestRblnCompatHash:
     def test_version_is_folded(self, monkeypatch):
         # Bumping RBLN_NIXL_CONNECTOR_VERSION changes the hash (gates schema drift).
         h1 = md.rbln_compat_hash("BASE", writes_into_peer=False)
-        monkeypatch.setattr(
-            md, "RBLN_NIXL_CONNECTOR_VERSION", RBLN_NIXL_CONNECTOR_VERSION + 1
+        setattr_in_package(
+            monkeypatch, RBLN_NIXL_CONNECTOR_VERSION=RBLN_NIXL_CONNECTOR_VERSION + 1
         )
         assert md.rbln_compat_hash("BASE", writes_into_peer=False) != h1
