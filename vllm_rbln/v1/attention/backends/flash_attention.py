@@ -29,7 +29,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -39,6 +39,7 @@ import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 from ..ops.attention_naive import (
     attention_naive_decode,
@@ -56,9 +57,10 @@ from ..ops.flash_causal_attention_naive import (
     flash_causal_attention_naive_decode,
     flash_causal_attention_naive_prefill,
 )
-from ..ops.sliding_window_attention_naive import (
+from ..ops.sliding_window_attention import (
     sliding_window_attention_naive_decode,
     sliding_window_attention_naive_prefill,
+    sliding_window_attention_v1,
 )
 
 logger = init_logger(__name__)
@@ -134,7 +136,7 @@ class RBLNFlashAttentionMetadata:
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
 
-    # For sliding window attention
+    swa_appends: bool = False
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
@@ -188,6 +190,17 @@ class RBLNFlashAttentionMetadataBuilder(
             envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
             and not vllm_config.attention_config.use_non_causal
         )
+
+        self.swa_appends = isinstance(
+            kv_cache_spec, SlidingWindowSpec
+        ) and not isinstance(kv_cache_spec, RBLNSlidingWindowSpec)
+        if self.swa_appends and envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            raise NotImplementedError(
+                "Sliding window attention is not supported with "
+                "VLLM_RBLN_USE_CUSTOM_KERNEL=1 and "
+                "VLLM_RBLN_USE_MULTI_BLOCK_ATTN=1: rbln_triton_ops has no "
+                "sliding_window_attention_v1 kernel."
+            )
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
@@ -285,7 +298,10 @@ class RBLNFlashAttentionMetadataBuilder(
         cache_offsets = None
         local_block_tables = None
         swa_attn_masks = None
-        if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
+        # RBLNSlidingWindowSpec is the shift kernel's cache layout, so its
+        # absence is the append path, which needs none of these.
+        if isinstance(self.kv_cache_spec, RBLNSlidingWindowSpec):
+            sliding_window = self.kv_cache_spec.sliding_window
             num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
             seq_lens = seq_lens_cpu[:num_reqs].view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
@@ -308,6 +324,7 @@ class RBLNFlashAttentionMetadataBuilder(
             block_tables=self._stage(block_tables_tensor, "block_tables"),
             is_prefill=is_prefill,
             attn_masks=self._stage(attn_masks, "attn_masks"),
+            swa_appends=self.swa_appends,
             cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
@@ -519,39 +536,55 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
         if self.sliding_window is not None:
-            assert self.sliding_window == kv_cache.size(-2), (
-                "SWA kernel_block_size must match window_size"
-            )
-            assert attn_metadata.cache_seq_lens is not None
-            assert attn_metadata.cache_offsets is not None
-
-            if attn_metadata.is_prefill:
-                attn_output = sliding_window_attention_naive_prefill(
+            if attn_metadata.swa_appends:
+                # `seq_lens` is the absolute position the chunk starts at, not
+                # a length: the op resolves the window's blocks from it and the
+                # whole table.
+                attn_output = sliding_window_attention_v1(
                     query,
                     key,
                     value,
                     kv_cache,
-                    attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
+                    attn_metadata.seq_lens,
                     self.scale,
-                    attn_metadata.local_block_tables,
+                    attn_metadata.block_tables,
+                    self.sliding_window,
                     self.sinks,
                 )
             else:
-                attn_output = sliding_window_attention_naive_decode(
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
-                    self.scale,
-                    attn_metadata.local_block_tables,
-                    attn_metadata.swa_attn_masks
-                    if self.is_batch_attention_opt and b_size > 1
-                    else None,
-                    self.sinks,
+                assert self.sliding_window == kv_cache.size(-2), (
+                    "SWA kernel_block_size must match window_size"
                 )
+                assert attn_metadata.cache_seq_lens is not None
+                assert attn_metadata.cache_offsets is not None
+
+                if attn_metadata.is_prefill:
+                    attn_output = sliding_window_attention_naive_prefill(
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.sinks,
+                    )
+                else:
+                    attn_output = sliding_window_attention_naive_decode(
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        attn_metadata.swa_attn_masks
+                        if self.is_batch_attention_opt and b_size > 1
+                        else None,
+                        self.sinks,
+                    )
 
         elif self.is_causal:
             if self.is_normal:
