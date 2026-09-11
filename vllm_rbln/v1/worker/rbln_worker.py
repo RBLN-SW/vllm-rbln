@@ -76,6 +76,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.device_fail_fast import fail_fast_on_device_error
 from vllm_rbln.v1.worker.kv_profile import (
     MERGED_PROFILE_LOG_KEY,
     assert_budget_covers_profile,
@@ -1163,6 +1164,7 @@ class RBLNWorker(WorkerBase):
         return self.model_runner.get_supported_tasks()
 
     @torch.inference_mode()
+    @fail_fast_on_device_error
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1174,6 +1176,7 @@ class RBLNWorker(WorkerBase):
         get_pp_group().send_tensor_dict(tensors)
 
     @torch.inference_mode()
+    @fail_fast_on_device_error
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1261,6 +1264,7 @@ class RBLNWorker(WorkerBase):
                 return
             self.profiler.stop()
 
+    @fail_fast_on_device_error
     def execute_dummy_batch(self) -> None:
         # Serving-time DP-idle step: this rank has no real work. Run a non-warmup
         # dummy (warmup=False) so it contributes a minimal (num_reqs=1, qlen=1)
