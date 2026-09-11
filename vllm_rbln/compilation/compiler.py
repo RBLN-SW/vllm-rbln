@@ -14,7 +14,7 @@
 
 import os
 from collections.abc import Callable
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
 from rebel import CompileContext
@@ -22,6 +22,9 @@ from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 
 from vllm_rbln import envs
 from vllm_rbln.compilation.backends import rbln_backend
+
+if TYPE_CHECKING:
+    from rebel._C import Context
 from vllm_rbln.compilation.dispatch import Dispatcher
 
 CompiledTarget = TypeVar("CompiledTarget")
@@ -86,7 +89,18 @@ def compile(
     cache_dir: str = "",
     use_static_output: bool = False,
     use_direct_dispatch: bool = False,
+    context: "Context | Callable[[], Context] | None" = None,
 ) -> CompiledTarget:
+    """torch.compile `target` with the rbln backend.
+
+    `context` binds the compiled graph's runtime to an existing rebel runtime
+    context instead of letting the backend resolve one from the device id. A
+    zero-arg callable is resolved when the runtime is built (first call), so it
+    may point at a runtime that does not exist yet. Needed under
+    `RBLN_CTX_STANDALONE=1`, where a device admits a single context: a second
+    context on the model's NPUs is refused by the driver and surfaces as
+    `SYS_ENODEV ([context] create failed)`.
+    """
     if use_direct_dispatch and not fullgraph:
         # A dispatched call runs one code object, so whatever Dynamo leaves
         # outside the graph is unreachable: a graph break's resume function only
@@ -117,6 +131,7 @@ def compile(
     set_option("mode", mode)
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
+    set_option("context", context)
     set_option("use_static_output", use_static_output)
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))

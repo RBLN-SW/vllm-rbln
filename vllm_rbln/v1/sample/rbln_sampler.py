@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import rebel
 import torch
@@ -28,6 +28,9 @@ import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+
+if TYPE_CHECKING:
+    from rebel._C import Context
 from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
 
 logger = init_logger(__name__)
@@ -94,7 +97,10 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
 def compile_sampler(
     op: Callable[..., torch.Tensor],
     compile_context: rebel.CompileContext | None,
+    context: "Context | Callable[[], Context] | None" = None,
 ) -> Callable[..., torch.Tensor]:
+    # `context` shares the model's runtime context with the sampler op; see
+    # `vllm_rbln.compilation.compile`.
     compile_context = (
         compile_context
         or create_compile_context(
@@ -116,6 +122,7 @@ def compile_sampler(
         # FIXME: Currently, sampler ops do not support caching.
         # Reusing seed buffer is not supported when the compiled sampler is loaded.
         use_cache=False,
+        context=context,
     )
 
 
@@ -124,6 +131,7 @@ class RBLNTopKTopPSampler(nn.Module):
         self,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         compile_context: rebel.CompileContext | None = None,
+        context: "Context | Callable[[], Context] | None" = None,
     ):
         # TODO(rbln): Merge more ops to rbln context.
         #       Currently, we only have softmax in rbln context.
@@ -135,7 +143,7 @@ class RBLNTopKTopPSampler(nn.Module):
         )
 
         self._compiled_rbln_topk_topp_sampler = compile_sampler(
-            rbln_top_k_top_p_sample, compile_context
+            rbln_top_k_top_p_sample, compile_context, context=context
         )
 
     def forward(
@@ -169,6 +177,7 @@ class RBLNSampler(VLLMSampler):
         logprobs_mode: LogprobsMode = "raw_logprobs",
         use_fp64_gumbel: bool = False,
         compile_context: rebel.CompileContext | None = None,
+        context: "Context | Callable[[], Context] | None" = None,
     ):
         super().__init__(logprobs_mode=logprobs_mode, use_fp64_gumbel=use_fp64_gumbel)
 
@@ -182,7 +191,9 @@ class RBLNSampler(VLLMSampler):
         )
         if logprobs_mode in ("raw_logprobs", "raw_logits"):
             self.topk_topp_sampler = RBLNTopKTopPSampler(
-                logprobs_mode=logprobs_mode, compile_context=compile_context
+                logprobs_mode=logprobs_mode,
+                compile_context=compile_context,
+                context=context,
             )
         else:
             logger.warning_once(
@@ -191,7 +202,7 @@ class RBLNSampler(VLLMSampler):
             )
 
         self._compiled_greedy_sample = compile_sampler(
-            rbln_greedy_sample, compile_context
+            rbln_greedy_sample, compile_context, context=context
         )
 
     def greedy_sample(

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,7 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
 
 if TYPE_CHECKING:
     from rebel import CompileContext
+    from rebel._C import Context
     from vllm.config import SpeculativeConfig
 
 
@@ -55,6 +57,7 @@ class RBLNRejectionSampler(RejectionSampler):
         compile_context: "CompileContext | None" = None,
         spec_config: "SpeculativeConfig | None" = None,
         device: torch.device | None = None,
+        context: "Context | Callable[[], Context] | None" = None,
     ):
         super().__init__(sampler, spec_config, device)
 
@@ -74,7 +77,7 @@ class RBLNRejectionSampler(RejectionSampler):
                 "`VLLM_RBLN_SAMPLER=0` for this mode."
             )
         self.impl = (
-            RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
+            RBLNRejectionSamplerImpl(compile_context, num_spec_tokens, context=context)
             if envs.VLLM_RBLN_SAMPLER
             else TorchRejectionSamplerImpl()
         )
@@ -324,6 +327,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         self,
         compile_context: "CompileContext | None" = None,
         num_spec_tokens: int = 0,
+        context: "Context | Callable[[], Context] | None" = None,
     ):
         super().__init__()
         self.num_spec_tokens = num_spec_tokens or self.max_spec_len
@@ -347,6 +351,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             # Built only under VLLM_RBLN_SAMPLER, so a bundle saved with the
             # sampler off misses this op and forces a partial compile.
             use_cache=False,
+            context=context,
         )
         # The graph's small inputs, one set per shape. The same tensors every
         # step keep the runtime's bindings; a fresh address is re-bound.

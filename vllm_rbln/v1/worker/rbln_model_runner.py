@@ -292,6 +292,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
+                context=self._model_runtime_context,
             )
             logger.info("Using RBLN sampler.")
         else:
@@ -361,6 +362,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.compile_context,
                 self.speculative_config,
                 self.device,
+                context=self._model_runtime_context,
             )
 
         self.num_spec_tokens = 0
@@ -587,6 +589,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     dst = next_dst
 
         reorder_input_batch(ib, sorted_order)
+
+    def _model_runtime_context(self):
+        """Runtime context of the compiled main model, or None before load_model().
+
+        Handed to the sampler ops as a lazy `context` so they attach to the model's
+        context instead of opening a second one on the same NPUs, which the driver
+        refuses under `RBLN_CTX_STANDALONE=1` (model parallel).
+        """
+        if not self.runtime_holder:
+            return None
+        return self.runtime_holder[0].context
 
     def _update_states(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the scheduler
