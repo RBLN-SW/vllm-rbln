@@ -17,7 +17,6 @@ from dataclasses import fields
 
 import pytest
 import torch
-from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.envs as envs
@@ -75,14 +74,14 @@ def _lower_triangular(n: int) -> torch.Tensor:
 
 
 @pytest.fixture
-def on_cr13(monkeypatch):
-    # The append path is CR13-only, and the impl reads the NPU name at __init__.
-    monkeypatch.setattr(current_platform, "get_device_name", lambda *a: "RBLN-CR13")
+def multi_block_on(monkeypatch):
+    # The impl resolves the flag once, at __init__.
+    monkeypatch.setenv("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", "1")
 
 
 @pytest.fixture
-def off_cr13(monkeypatch):
-    monkeypatch.setattr(current_platform, "get_device_name", lambda *a: "RBLN-CA25")
+def multi_block_off(monkeypatch):
+    monkeypatch.setenv("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", "0")
 
 
 @pytest.fixture
@@ -686,8 +685,8 @@ class TestForwardSlidingWindow:
             local_block_tables=torch.tensor([[7], [0]]),
         )
 
-    def test_cr13_appends_with_the_position_and_the_whole_table(
-        self, cfg, monkeypatch, on_cr13
+    def test_multi_block_appends_with_the_position_and_the_whole_table(
+        self, cfg, monkeypatch, multi_block_on
     ):
         # Neither the position nor the table is cut on the way in: the op
         # resolves the window from them itself.
@@ -700,8 +699,8 @@ class TestForwardSlidingWindow:
         assert window == self.WINDOW
         assert sinks is None
 
-    def test_elsewhere_the_shift_kernel_takes_the_fill_and_one_block(
-        self, cfg, monkeypatch, off_cr13
+    def test_otherwise_the_shift_kernel_takes_the_fill_and_one_block(
+        self, cfg, monkeypatch, multi_block_off
     ):
         # The shift path is untouched: the clamped fill, its end, and the single
         # block the window lives in.
@@ -713,7 +712,7 @@ class TestForwardSlidingWindow:
         assert cache_offset is md.cache_offsets
         assert tables is md.local_block_tables
 
-    def test_prefill_on_cr13_takes_the_same_call(self, cfg, monkeypatch, on_cr13):
+    def test_prefill_takes_the_same_call(self, cfg, monkeypatch, multi_block_on):
         # One op for both phases; its 1-D block table is reshaped by the op.
         md = RBLNFlashAttentionMetadata(
             seq_lens=torch.tensor([[6]]),

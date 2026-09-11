@@ -27,11 +27,11 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
+from vllm_rbln import envs
 from vllm_rbln.patches import register_patch
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionBackend,
     RBLNFlashAttentionMetadata,
-    swa_appends_kv,
 )
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
@@ -242,9 +242,10 @@ def patched_attention_init(self: Attention, *args, **kwargs) -> None:
         "vllm.model_executor.layers.attention.attention.Attention.get_kv_cache_spec"
     ),
     reason=(
-        "A sliding-window layer needs the RBLN spec on every NPU whose kernel "
+        "A sliding-window layer needs the RBLN spec for the kernel that "
         "shifts the window in place: one block per request, no reclaim, no "
-        "prefix sharing. CR13 appends instead and takes upstream's spec."
+        "prefix sharing. VLLM_RBLN_USE_MULTI_BLOCK_ATTN appends instead and "
+        "takes upstream's spec."
     ),
 )
 def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -257,7 +258,11 @@ def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
             raise NotImplementedError(
                 "MLA is not supported with sliding window attention."
             )
-        spec_cls = SlidingWindowSpec if swa_appends_kv() else RBLNSlidingWindowSpec
+        spec_cls = (
+            SlidingWindowSpec
+            if envs.VLLM_RBLN_USE_MULTI_BLOCK_ATTN
+            else RBLNSlidingWindowSpec
+        )
         return spec_cls(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,

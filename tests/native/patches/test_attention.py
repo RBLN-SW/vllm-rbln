@@ -13,13 +13,13 @@
 # limitations under the License.
 
 """The KV-cache spec a sliding-window layer declares. Which one it is decides
-the cache layout for the whole run, and the NPU decides which one."""
+the cache layout for the whole run, and VLLM_RBLN_USE_MULTI_BLOCK_ATTN decides
+which one."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
@@ -46,42 +46,42 @@ def _config(use_mla=False):
 
 
 @pytest.fixture
-def npu(monkeypatch):
-    def named(name):
-        monkeypatch.setattr(current_platform, "get_device_name", lambda *a: name)
+def multi_block(monkeypatch):
+    def switch(on):
+        monkeypatch.setenv("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", "1" if on else "0")
 
-    return named
+    return switch
 
 
 class TestSlidingWindowSpec:
-    def test_cr13_declares_upstreams_spec(self, npu):
-        # CR13 appends into an ordinary paged cache, which upstream's spec and
-        # its manager already describe: several blocks, reclaimed behind the
-        # window.
-        npu("RBLN-CR13")
+    def test_multi_block_declares_upstreams_spec(self, multi_block):
+        # Appending into an ordinary paged cache is what upstream's spec and its
+        # manager already describe: several blocks, reclaimed behind the window.
+        multi_block(True)
         spec = patched_get_kv_cache_spec(_layer(16), _config())
         assert type(spec) is SlidingWindowSpec
 
-    def test_every_other_npu_declares_the_rbln_spec(self, npu):
+    @pytest.mark.parametrize("explicitly_off", [True, False])
+    def test_otherwise_the_rbln_spec(self, monkeypatch, multi_block, explicitly_off):
         # The shift kernel holds the window in one block, which only
-        # RBLNSlidingWindowSpec and its manager allocate that way.
-        npu("RBLN-CA25")
+        # RBLNSlidingWindowSpec and its manager allocate that way. It stays the
+        # default, so an unset variable has to land here too.
+        if explicitly_off:
+            multi_block(False)
+        else:
+            monkeypatch.delenv("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", raising=False)
         spec = patched_get_kv_cache_spec(_layer(16), _config())
         assert type(spec) is RBLNSlidingWindowSpec
 
-    def test_a_layer_without_a_window_asks_no_npu(self, monkeypatch):
-        # Full attention is the same on every NPU, so the name is never read --
-        # it is not always resolvable (a CPU-only compile host needs an env var).
-        monkeypatch.setattr(
-            current_platform,
-            "get_device_name",
-            lambda *a: pytest.fail("the NPU name is irrelevant to full attention"),
-        )
+    def test_a_layer_without_a_window_ignores_the_flag(self, multi_block):
+        # The flag names a sliding-window cache layout; full attention keeps the
+        # one spec it has on either setting.
+        multi_block(True)
         assert type(patched_get_kv_cache_spec(_layer(None), _config())) is (
             FullAttentionSpec
         )
 
-    def test_mla_with_a_window_is_rejected(self, npu):
-        npu("RBLN-CR13")
+    def test_mla_with_a_window_is_rejected(self, multi_block):
+        multi_block(True)
         with pytest.raises(NotImplementedError, match="MLA"):
             patched_get_kv_cache_spec(_layer(16), _config(use_mla=True))

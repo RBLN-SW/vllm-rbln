@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -65,16 +64,6 @@ from ..ops.sliding_window_attention import (
 )
 
 logger = init_logger(__name__)
-
-
-def swa_appends_kv() -> bool:
-    """Whether a sliding-window layer writes its KV cache by append.
-
-    Only CR13 carries the sliding_window_attention_v1 kernel. Elsewhere the
-    window is one block the kernel shifts in place, which needs the
-    RBLNSlidingWindowSpec cache layout and the metadata describing its fill.
-    """
-    return "cr13" in current_platform.get_device_name().lower()
 
 
 def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
@@ -426,11 +415,14 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             self.sinks is None
         )
 
-        self.swa_appends = sliding_window is not None and swa_appends_kv()
+        self.swa_appends = (
+            sliding_window is not None and envs.VLLM_RBLN_USE_MULTI_BLOCK_ATTN
+        )
         if self.swa_appends and envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
             raise NotImplementedError(
                 "Sliding window attention is not supported with "
-                "VLLM_RBLN_USE_CUSTOM_KERNEL=1 on CR13: rbln_triton_ops has no "
+                "VLLM_RBLN_USE_CUSTOM_KERNEL=1 and "
+                "VLLM_RBLN_USE_MULTI_BLOCK_ATTN=1: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
 
