@@ -15,7 +15,7 @@
 import time
 from contextlib import contextmanager
 from dataclasses import replace
-from typing import Any, Literal
+from typing import Any
 
 import msgspec
 import numpy as np
@@ -41,7 +41,6 @@ from vllm.utils.network_utils import make_zmq_path
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
     RblnNixlAgentMetadata,
-    connector_option,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     RblnNixlWorkerState,
@@ -50,66 +49,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-# What the byte target is when nobody names one: large enough that the fixed
-# cost of a descriptor is small beside what it carries.
-DEFAULT_CHUNK_BYTES = 256 * 1024
-
-
-def kv_chunk_tokens(
-    *,
-    span_tokens: int,
-    bytes_per_token: int,
-    prefill_step_tokens: int,
-    chunk_bytes: int = 0,
-    chunk_tokens: int = 0,
-) -> int:
-    """Tokens one chunk of a span holds, ``span_tokens`` for the whole span.
-
-    The byte knob is a floor, not a size: under the transfer size a fabric
-    moves efficiently a descriptor pays more fixed cost than it carries, so a
-    target landing between two sizes that tile the span takes the larger.
-
-    One prefill step is a second floor. A step closes at most one chunk, which
-    is what lets a chunk be the unit a coverage range counts in, and the token
-    knob has to obey it as well -- given a smaller one, an operator has asked
-    for something the write path cannot count in.
-
-    Args:
-        span_tokens: tokens one whole descriptor covers -- a block, or one
-            chiplet area's token range where a context cut gives it one.
-        bytes_per_token: what one token of one span costs.
-        prefill_step_tokens: ``max_num_batched_tokens``. Named for the step
-            rather than the chunk it is, because the chunk this returns is the
-            other one and the two are compared here.
-        chunk_bytes: the byte target; 0 where nobody named one.
-        chunk_tokens: the size itself, named instead of the target; 0 unset.
-    """
-    if chunk_tokens and chunk_tokens < prefill_step_tokens:
-        raise RuntimeError(
-            f"RBLN NIXL: chunk_tokens={chunk_tokens} is under the "
-            f"{prefill_step_tokens}-token prefill step, so a step would close "
-            "several chunks; raise it or leave it unset for the byte target."
-        )
-    if chunk_tokens and chunk_bytes:
-        raise RuntimeError(
-            f"RBLN NIXL: chunk_tokens={chunk_tokens} and chunk_bytes="
-            f"{chunk_bytes} both name a chunk size; set one."
-        )
-    want = max(
-        chunk_tokens or (chunk_bytes or DEFAULT_CHUNK_BYTES) // bytes_per_token,
-        prefill_step_tokens,
-    )
-    # A chunk that does not tile the span leaves a descriptor reaching into the
-    # next one, so the answer is the smallest size at or above the floor that
-    # does. The span itself always qualifies, which is where "no chunk" comes
-    # from.
-    return next(
-        size
-        for size in range(min(want, span_tokens), span_tokens + 1)
-        if span_tokens % size == 0
-    )
 
 
 class RblnNixlHandshakeMixin(RblnNixlWorkerState):
@@ -1171,8 +1110,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         upstream's handle carries one per block, and so does a K/V split,
         where upstream names a block once and our list names it per range.
         """
-        # Trimming narrows a block rather than a peer, and only the per-shard
-        # ids can leave part of one out.
+        # Trimming narrows a block rather than a peer, and the per-shard ids
+        # are what can leave part of one out -- except where a sliding window
+        # already gave the whole-engine list a second range, which is the one
+        # list that can carry a third and the only one that can name two KV
+        # groups.
         return (
             pp_size > 1
             or partial
@@ -1180,7 +1122,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             or split > 1
             or fanout > 1
             or kv_runs > 1
-            or self._chunk_mode
+            or (self._chunk_mode and self._sw_ratio is None)
         )
 
     def _register_shard_xfer_state(
@@ -1240,66 +1182,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         )
         self._shard_chunk_grids[(engine_id, global_rank)] = chunk_grid
 
-    def _shard_chunk_grid(
-        self, *, block_size: int, split: int
-    ) -> tuple[int, int] | None:
-        """`(byte runs a chunk is spread over, chunks each run is cut into)`.
-
-        None where a chunk comes out the whole span, so neither list grows and
-        a transfer keeps naming whole spans -- which is what a block too small
-        for the byte target, or a prefill chunk as wide as a span, asks for.
-
-        The axis says where a chunk sits. A context cut gives an area the
-        in-block token range [a * span, (a + 1) * span), so a chunk of it is
-        one run of bytes. A head cut gives every area every token of some
-        heads, so the span is the block and a chunk is one run per head -- and
-        that band has to be one number, since the two lists carry one grid:
-        regions that disagree, a draft's named past the target's, get no grid
-        rather than one region's band standing for the rest. A piece narrower
-        than a head gets none for the same reason.
-        """
-        if not self._chunk_mode:
-            return None
-        if self._kv_split_axis is KVSplitAxis.NON_HEAD:
-            spans, heads_per_span = self._kv_areas, 1
-        else:
-            bands = {
-                self._slice_head_bounds(
-                    self.tp_rank,
-                    self.topo.tp_size,
-                    heads,
-                    self._kv_areas,
-                    self._kv_slices,
-                    side="local",
-                )[1]
-                for heads in self._logical_region_kv_heads
-                if heads is not None
-            }
-            if len(bands) != 1:
-                return None
-            spans, heads_per_span = 1, bands.pop()
-        if heads_per_span % split:
-            return None
-        span_tokens = block_size // spans
-        chunk_tokens = kv_chunk_tokens(
-            span_tokens=span_tokens,
-            # A region holds one band of one span, so this divides out both.
-            bytes_per_token=self.block_len_per_layer[0]
-            // (span_tokens * heads_per_span),
-            prefill_step_tokens=(
-                self.vllm_config.scheduler_config.max_num_batched_tokens
-            ),
-            chunk_bytes=connector_option(self.vllm_config, "chunk_bytes", 0),
-            chunk_tokens=connector_option(self.vllm_config, "chunk_tokens", 0),
-        )
-        chunks = span_tokens // chunk_tokens
-        # What keeps the arithmetic downstream free of the axis: a block is a
-        # whole number of chunks however its spans are cut.
-        assert chunk_tokens * chunks * spans == block_size
-        if chunks == 1:
-            return None
-        return heads_per_span // split, chunks
-
     def _reject_uneven_region_slices(self, remote_tp_size: int) -> None:
         """Refuse a head-banded peer whose regions disagree on their slice count.
 
@@ -1328,50 +1210,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             "count bands every region. Head-band pairing with a peer at TP "
             f"{remote_tp_size} needs one."
         )
-
-    @staticmethod
-    def _slice_head_bounds(
-        tp_rank: int,
-        tp_size: int,
-        total_kv_heads: int,
-        areas: int,
-        slices: int,
-        *,
-        side: Literal["local", "peer"],
-    ) -> tuple[int, int]:
-        """(first head this shard owns, heads per logical slice).
-
-        The compiler cuts a shard's heads into ``slices`` pieces, one per
-        chiplet area -- but a shard owning fewer heads than the device has
-        chiplets gets ``areas // slices`` replicas of each, the replication
-        axis innermost (``slice_id = area // (areas // slices)``).
-
-        Callers pass a peer's advertised geometry as well as this rank's, so
-        the three below refuse a pairing rather than assert an invariant;
-        ``side`` says whose numbers failed.
-        """
-        if total_kv_heads % tp_size:
-            raise RuntimeError(
-                f"RBLN NIXL: the {side} tensor-parallel size {tp_size} does not "
-                f"divide the model's {total_kv_heads} KV heads; upstream then "
-                "replicates one head across ranks and a head band would be a "
-                "fraction of a head, which no descriptor names."
-            )
-        heads_per_rank = total_kv_heads // tp_size
-        if slices <= 0 or heads_per_rank % slices:
-            raise RuntimeError(
-                f"RBLN NIXL: the {side} shard owns {heads_per_rank} KV heads cut "
-                f"into {slices} logical slice(s), which does not divide them; the "
-                "compiler gives every slice the same head count."
-            )
-        if areas % slices:
-            raise RuntimeError(
-                f"RBLN NIXL: the {side} shard reports {areas} chiplet area(s) over "
-                f"{slices} logical slice(s), which does not divide them; areas "
-                "carry whole slices, replicated when a shard owns fewer heads "
-                "than the device has chiplets."
-            )
-        return tp_rank * heads_per_rank, heads_per_rank // slices
 
     def _trim_agent_meta_to_layers(
         self, nixl_agent_meta: RblnNixlAgentMetadata, overlap: list[tuple[int, int]]
@@ -1598,6 +1436,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # _sw_ratio is not None here (the None case returned early above).
         kv_per_block = self._kv_per_block
         length_divisors = [1, self._sw_ratio]
+        pieces: list[tuple[int, int, int, int]] = []
         for divisor in length_divisors:
             for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
                 local_block_len = self.get_backend_aware_kv_block_len(
@@ -1616,6 +1455,15 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 # The step from K to V is the peer's own, as in
                 # `_head_matched_desc`; the two ends hold the same layout here.
                 kv_stride = page_size // kv_per_block
+                if divisor == 1:
+                    pieces.append(
+                        (
+                            base_addr + rank_offset,
+                            desc_len,
+                            page_size,
+                            nixl_agent_meta.device_id,
+                        )
+                    )
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * page_size + rank_offset
                     for kv in range(kv_per_block):
@@ -1627,14 +1475,26 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                             )
                         )
 
-        logger.debug(
-            "Created %s remote blocks (%s) for dst engine %s "
-            "remote rank %s local rank %s",
+        # Derived here rather than passed between the lists: a range one side
+        # carries and the other does not pairs chunk descriptors against whole
+        # blocks, and the length check ahead of a transfer compares how many
+        # indices each side named, not how far they reach.
+        grid = self._shard_chunk_grid(block_size=nixl_agent_meta.block_size, split=1)
+        if grid is not None:
+            blocks_data += self._chunk_range_descs(
+                pieces, num_blocks=num_blocks, grid=grid
+            )
+
+        logger.info(
+            "RBLN NIXL: %d remote descriptor(s) for engine %s rank %d: whole, a "
+            "1/%d sliding-window view, and %s.",
             len(blocks_data),
-            "Full + SWA",
             engine_id,
             remote_tp_rank,
-            self.tp_rank,
+            self._sw_ratio,
+            f"a chunk range of {grid[0]} run(s) x {grid[1]} chunk(s)"
+            if grid is not None
+            else "no chunk range",
         )
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
