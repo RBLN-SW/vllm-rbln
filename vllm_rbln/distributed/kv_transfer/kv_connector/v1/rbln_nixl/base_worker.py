@@ -346,27 +346,27 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
     def _layer_kv_heads(self, layer_name: str) -> int | None:
         """Model-wide KV heads of one layer, or None where no head band names it.
 
-        Upstream floors the per-rank share at 1 (`max(1, total // tp)`), so below
-        one head per rank the product overstates the model AND satisfies the
-        divisibility guard meant to refuse the layout: 4 heads at TP 8 report 1
-        per rank, the product reads 8, and `8 % 8 == 0` passes where `4 % 8`
-        would not. A product no model here has is that case -- replicated heads.
+        Upstream floors the per-rank share at 1, so below one head per rank it
+        fits more than one declared count -- a draft's as well as the target's.
         """
         layer_spec = self._unwrapped_layer_spec(layer_name)
         if isinstance(layer_spec, MambaSpec):
             return None
-        total = layer_spec.num_kv_heads * self.world_size
-        # One count per model that contributes attention layers: the target, and
-        # a speculative draft where there is one.
         known = {self.model_config.get_total_num_kv_heads()}
         speculative_config = self.vllm_config.speculative_config
         if speculative_config is not None:
             draft_model_config = speculative_config.draft_model_config
             if draft_model_config is not None:
                 known.add(draft_model_config.get_total_num_kv_heads())
-        if total not in known:
+        candidates = {
+            total
+            for total in known
+            if max(1, total // self.world_size) == layer_spec.num_kv_heads
+        }
+        if len(candidates) != 1:
             return None
-        return total
+        total = candidates.pop()
+        return None if total < self.world_size else total
 
     def _region_kv_heads(self, logical_region: int) -> int:
         """Model-wide KV heads of the layer one logical region belongs to."""

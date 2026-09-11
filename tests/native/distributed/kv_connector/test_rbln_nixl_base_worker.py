@@ -922,6 +922,24 @@ class TestRegisterKvCachesImpl:
         with pytest.raises(AssertionError, match="no head band"):
             worker._region_kv_heads(0)
 
+    def test_two_models_sharing_a_per_rank_share_of_one_is_refused(self, monkeypatch):
+        # Target 4 heads and draft 8 at TP 8: both report 1 per rank, so the
+        # target's replicated layer is indistinguishable from the draft's real 8.
+        # Banded at 8, rank 3 would claim head 3 while it holds head 1.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.world_size = 8
+        worker.model_config.get_total_num_kv_heads.return_value = 4
+        spec_cfg = MagicMock(method="eagle3")
+        spec_cfg.draft_model_config.model = "draft"
+        spec_cfg.draft_model_config.revision = None
+        spec_cfg.draft_model_config.code_revision = None
+        spec_cfg.draft_model_config.get_total_num_kv_heads.return_value = 8
+        worker.vllm_config.speculative_config = spec_cfg
+        spec = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=1)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+
+        assert worker._layer_kv_heads("l0") is None
+
     def test_a_head_count_a_model_in_the_engine_has_is_kept(self, monkeypatch):
         # The counterpart: 8 heads over TP 8 replicates nothing, so the band is
         # real and recorded.
