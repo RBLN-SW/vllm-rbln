@@ -293,11 +293,6 @@ class TestPlatformRefusals:
         with pytest.raises(NotImplementedError, match="cannot run eager"):
             RBLNDFlashProposer(self._config(enforce_eager=True), torch.device("cpu"))
 
-    def test_compile_disabled_is_refused(self, monkeypatch):
-        monkeypatch.setattr(dflash_module.envs, "VLLM_RBLN_COMPILE_MODEL", False)
-        with pytest.raises(NotImplementedError, match="cannot run eager"):
-            self._construct()
-
     def test_host_visible_cache_is_required(self, monkeypatch):
         """Without device tensors the cache is on `meta` and the context write
         is dropped without an error."""

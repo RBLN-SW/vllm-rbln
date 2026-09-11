@@ -78,8 +78,8 @@ would serve from the pre-compile estimate this feature exists to replace.
 Two cases warn and continue on the pre-compile estimate instead, because both are
 an explicit request from the caller:
 
-- Compile and warm-up are skipped (`--enforce-eager`, `VLLM_RBLN_COMPILE_MODEL=0`,
-  `VLLM_RBLN_ENABLE_WARM_UP=0`). Nothing compiles, so no artifact reports a profile.
+- Compile and warm-up are skipped (`--enforce-eager`, `VLLM_RBLN_ENABLE_WARM_UP=0`).
+  Nothing compiles, so no artifact reports a profile.
 - `--num-gpu-blocks-override` is set. The override pins the count and wins.
 
 In both cases `mark_dynamic` is still applied and still logged, so that log line

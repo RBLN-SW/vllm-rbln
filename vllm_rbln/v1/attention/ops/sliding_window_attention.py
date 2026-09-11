@@ -30,34 +30,31 @@ def sliding_window_attention_naive_prefill(
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            return torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill(
-                q,
-                k,
-                v,
-                kv_cache,
-                cache_seq_len,
-                cache_offset,
-                scale,
-                block_tables,
-                scale,  # dummy
-            )
-        else:
-            return torch.ops.rbln_custom_ops.sliding_window_attention_naive_prefill(
-                q,
-                k,
-                v,
-                kv_cache,
-                cache_seq_len,
-                cache_offset,
-                scale,
-                block_tables,
-                scale,  # dummy
-                sinks,
-            )
-
-    raise NotImplementedError
+    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        return torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill(
+            q,
+            k,
+            v,
+            kv_cache,
+            cache_seq_len,
+            cache_offset,
+            scale,
+            block_tables,
+            scale,  # dummy
+        )
+    else:
+        return torch.ops.rbln_custom_ops.sliding_window_attention_naive_prefill(
+            q,
+            k,
+            v,
+            kv_cache,
+            cache_seq_len,
+            cache_offset,
+            scale,
+            block_tables,
+            scale,  # dummy
+            sinks,
+        )
 
 
 def sliding_window_attention_naive_decode(
@@ -72,35 +69,32 @@ def sliding_window_attention_naive_decode(
     attn_mask: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            return torch.ops.rbln_triton_ops.sliding_window_attention_naive_decode(
-                q,
-                k,
-                v,
-                kv_cache,
-                cache_seq_len,
-                cache_offset,
-                scale,
-                block_tables,
-                scale,  # dummy
-            )
-        else:
-            return torch.ops.rbln_custom_ops.sliding_window_attention_naive_decode(
-                q,
-                k,
-                v,
-                kv_cache,
-                cache_seq_len,
-                cache_offset,
-                scale,
-                block_tables,
-                scale,  # dummy
-                attn_mask,
-                sinks,
-            )
-
-    raise NotImplementedError
+    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        return torch.ops.rbln_triton_ops.sliding_window_attention_naive_decode(
+            q,
+            k,
+            v,
+            kv_cache,
+            cache_seq_len,
+            cache_offset,
+            scale,
+            block_tables,
+            scale,  # dummy
+        )
+    else:
+        return torch.ops.rbln_custom_ops.sliding_window_attention_naive_decode(
+            q,
+            k,
+            v,
+            kv_cache,
+            cache_seq_len,
+            cache_offset,
+            scale,
+            block_tables,
+            scale,  # dummy
+            attn_mask,
+            sinks,
+        )
 
 
 def sliding_window_attention_v1(

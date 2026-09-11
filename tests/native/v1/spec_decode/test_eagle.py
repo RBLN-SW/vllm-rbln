@@ -590,7 +590,6 @@ class TestLoadModel:
             eagle_module, "compile", lambda fn, **kw: captured.update(kw) or sentinel
         )
         monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
-        monkeypatch.setattr(eagle_module.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", False

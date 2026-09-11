@@ -2207,7 +2207,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             return hidden_states, logits, combined_hidden_states
 
-        if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+        if self.model_config.enforce_eager:
             self.model_executable = model_wrapper
             self.compute_logits = self.model.compute_logits
         else:
@@ -2796,13 +2796,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = (
-                "cpu"
-                if not envs.VLLM_RBLN_COMPILE_MODEL
-                else self.device
-                if USE_DEVICE_TENSOR
-                else "meta"
-            )
+            device = self.device if USE_DEVICE_TENSOR else "meta"
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
@@ -3024,11 +3018,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
 
-        if (
-            not USE_DEVICE_TENSOR
-            and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
-        ):
+        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
@@ -3488,11 +3478,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if (
-            not USE_DEVICE_TENSOR
-            and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
-        ):
+        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (VLLM_RBLN_USE_VLLM_MODEL).
             for op in copy_ops:

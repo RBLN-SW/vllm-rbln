@@ -61,10 +61,6 @@ class RBLNConfig:
     sampler: bool = True
     """Use the customized RBLN sampler."""
 
-    compile_model: bool = True
-    """Compile models with torch.compile. Otherwise run CPU eager mode, if
-    possible."""
-
     compile_strict_mode: bool = False
     """Compile with torch.compile's strict mode, which fails on a graph break
     instead of falling back to eager."""

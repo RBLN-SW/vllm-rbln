@@ -62,10 +62,7 @@ class RBLNMedusaProposer(MedusaProposer):
             logits = self.model.compute_logits(hidden_states)
             return logits
 
-        if (
-            self.vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
-        ):
+        if self.vllm_config.speculative_config.enforce_eager:
             self.model_executable = model_wrapper
         else:
             self.model_executable = compile(

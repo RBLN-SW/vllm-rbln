@@ -32,35 +32,32 @@ def flash_causal_attention_naive_prefill(
     v_quantize_scale: torch.Tensor | None = None,
     cache_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            return torch.ops.rbln_triton_ops.flash_causal_attention_naive_prefill(
-                q,
-                k,
-                v,
-                kv_cache,
-                scale,
-                seq_idx,
-                block_tables,
-                scale,  # dummy
-            )
-        else:
-            return torch.ops.rbln_custom_ops.flash_causal_attention_naive_prefill(
-                q,
-                k,
-                v,
-                kv_cache,
-                scale,
-                seq_idx,
-                block_tables,
-                scale,  # dummy,
-                sinks,
-                k_quantize_scale,
-                v_quantize_scale,
-                cache_dtype,
-            )
-
-    raise NotImplementedError
+    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        return torch.ops.rbln_triton_ops.flash_causal_attention_naive_prefill(
+            q,
+            k,
+            v,
+            kv_cache,
+            scale,
+            seq_idx,
+            block_tables,
+            scale,  # dummy
+        )
+    else:
+        return torch.ops.rbln_custom_ops.flash_causal_attention_naive_prefill(
+            q,
+            k,
+            v,
+            kv_cache,
+            scale,
+            seq_idx,
+            block_tables,
+            scale,  # dummy,
+            sinks,
+            k_quantize_scale,
+            v_quantize_scale,
+            cache_dtype,
+        )
 
 
 def flash_causal_attention_naive_decode(
@@ -76,32 +73,29 @@ def flash_causal_attention_naive_decode(
     v_quantize_scale: torch.Tensor | None = None,
     cache_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            return torch.ops.rbln_triton_ops.flash_causal_attention_naive_decode(
-                q,
-                k,
-                v,
-                kv_cache,
-                scale,
-                seq_idx,
-                block_tables,
-                scale,  # dummy,
-            )
-        else:
-            return torch.ops.rbln_custom_ops.flash_causal_attention_naive_decode(
-                q,
-                k,
-                v,
-                kv_cache,
-                scale,
-                seq_idx,
-                block_tables,
-                scale,  # dummy,
-                sinks,
-                k_quantize_scale,
-                v_quantize_scale,
-                cache_dtype,
-            )
-
-    raise NotImplementedError
+    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        return torch.ops.rbln_triton_ops.flash_causal_attention_naive_decode(
+            q,
+            k,
+            v,
+            kv_cache,
+            scale,
+            seq_idx,
+            block_tables,
+            scale,  # dummy,
+        )
+    else:
+        return torch.ops.rbln_custom_ops.flash_causal_attention_naive_decode(
+            q,
+            k,
+            v,
+            kv_cache,
+            scale,
+            seq_idx,
+            block_tables,
+            scale,  # dummy,
+            sinks,
+            k_quantize_scale,
+            v_quantize_scale,
+            cache_dtype,
+        )

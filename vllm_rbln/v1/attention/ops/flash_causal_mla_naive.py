@@ -18,8 +18,6 @@
 
 import torch
 
-from vllm_rbln import envs
-
 
 def paged_flash_causal_mla_naive_prefill(
     q: torch.Tensor,
@@ -30,18 +28,15 @@ def paged_flash_causal_mla_naive_prefill(
     block_tables: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        return torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill(
-            q,
-            kv_c_normed,
-            k_pe,
-            kv_cache,
-            seq_idx,
-            block_tables,
-            scale,
-        )
-
-    raise NotImplementedError
+    return torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill(
+        q,
+        kv_c_normed,
+        k_pe,
+        kv_cache,
+        seq_idx,
+        block_tables,
+        scale,
+    )
 
 
 def paged_flash_causal_mla_naive_decode(
@@ -53,15 +48,12 @@ def paged_flash_causal_mla_naive_decode(
     block_tables: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        return torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode(
-            q,
-            kv_c_normed,
-            k_pe,
-            kv_cache,
-            seq_idx,
-            block_tables,
-            scale,
-        )
-
-    raise NotImplementedError
+    return torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode(
+        q,
+        kv_c_normed,
+        k_pe,
+        kv_cache,
+        seq_idx,
+        block_tables,
+        scale,
+    )

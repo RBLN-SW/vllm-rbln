@@ -64,7 +64,7 @@ def test_flags_reach_the_config(parser):
     config = resolve(
         parser,
         [
-            "--no-rbln-compile-model",
+            "--no-rbln-sampler",
             "--rbln-num-devices-per-local-rank",
             "4",
             "--rbln-decode-batch-bucket-strategy",
@@ -75,7 +75,7 @@ def test_flags_reach_the_config(parser):
             "16",
         ],
     )
-    assert config.compile_model is False
+    assert config.sampler is False
     assert config.num_devices_per_local_rank == 4
     assert config.decode_batch_bucket_strategy == "manual"
     assert config.decode_batch_bucket_manual_buckets == [1, 4, 16]
@@ -118,7 +118,7 @@ def test_cli_wins_over_env(parser, monkeypatch):
 
 def test_unknown_key_is_rejected():
     with pytest.raises(ValueError, match="are not fields"):
-        build_rbln_config({"compile_modell": False})
+        build_rbln_config({"samplerr": False})
 
 
 def test_upstream_key_is_rejected():

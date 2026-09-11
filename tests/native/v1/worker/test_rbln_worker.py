@@ -602,7 +602,6 @@ class TestCompileOrWarmUpModel:
         monkeypatch,
         *,
         enforce_eager=False,
-        compile_model=True,
         warm_up=True,
         warmup_side_effect=None,
         data_parallel_size=1,
@@ -612,7 +611,6 @@ class TestCompileOrWarmUpModel:
         )
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
-        monkeypatch.setattr(wm.envs, "VLLM_RBLN_COMPILE_MODEL", compile_model)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_ENABLE_WARM_UP", warm_up)
         monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: False)
         monkeypatch.setattr(wm, "set_random_seed", lambda s: None)
@@ -642,11 +640,6 @@ class TestCompileOrWarmUpModel:
 
     def test_skips_when_enforce_eager(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch, enforce_eager=True)
-        worker.compile_or_warm_up_model()
-        assert calls == []
-
-    def test_skips_when_compile_disabled(self, make_worker, monkeypatch):
-        worker, calls = self._worker(make_worker, monkeypatch, compile_model=False)
         worker.compile_or_warm_up_model()
         assert calls == []
 

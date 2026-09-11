@@ -700,7 +700,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
 
         # 2. attention output reshape for attention backend return
         # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch*L,H*4,D]
-        if self.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+        if self.enforce_eager:
             attn_output = attn_output.reshape(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)

@@ -86,7 +86,6 @@ class TestLoadModel:
             medusa_module, "compile", lambda fn, **kw: captured.update(kw) or sentinel
         )
         monkeypatch.setattr(medusa_module, "build_process_group_dict", lambda: {})
-        monkeypatch.setattr(medusa_module.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         proposer = make_medusa_proposer()
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", False

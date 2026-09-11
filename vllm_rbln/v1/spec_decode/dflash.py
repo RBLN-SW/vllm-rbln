@@ -86,10 +86,7 @@ class RBLNDFlashProposer(DFlashProposer):
     def __init__(self, vllm_config, device: torch.device, runner=None):
         # Checked before the base class does any work.
         self._require_single_sequence(vllm_config.scheduler_config)
-        if (
-            vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
-        ):
+        if vllm_config.speculative_config.enforce_eager:
             # The attention ops are pattern stubs the compiler replaces, so an
             # eager context write would silently write nothing.
             raise NotImplementedError(

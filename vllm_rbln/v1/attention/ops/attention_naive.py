@@ -30,34 +30,31 @@ def attention_naive_prefill(
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            return torch.ops.rbln_triton_ops.attention_naive_prefill(
-                q,
-                k,
-                v,
-                kv_cache,
-                mask,
-                seq_idx,
-                scale,
-                block_tables,
-                scale,  # dummy
-            )
-        else:
-            return torch.ops.rbln_custom_ops.attention_naive_prefill(
-                q,
-                k,
-                v,
-                kv_cache,
-                mask,
-                seq_idx,
-                scale,
-                block_tables,
-                scale,  # dummy
-                sinks,
-            )
-
-    raise NotImplementedError
+    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        return torch.ops.rbln_triton_ops.attention_naive_prefill(
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            seq_idx,
+            scale,
+            block_tables,
+            scale,  # dummy
+        )
+    else:
+        return torch.ops.rbln_custom_ops.attention_naive_prefill(
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            seq_idx,
+            scale,
+            block_tables,
+            scale,  # dummy
+            sinks,
+        )
 
 
 def attention_naive_decode(
@@ -71,31 +68,28 @@ def attention_naive_decode(
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            return torch.ops.rbln_triton_ops.attention_naive_decode(
-                q,
-                k,
-                v,
-                kv_cache,
-                mask,
-                seq_idx,
-                scale,
-                block_tables,
-                scale,  # dummy
-            )
-        else:
-            return torch.ops.rbln_custom_ops.attention_naive_decode(
-                q,
-                k,
-                v,
-                kv_cache,
-                mask,
-                seq_idx,
-                scale,
-                block_tables,
-                scale,  # dummy
-                sinks,
-            )
-
-    raise NotImplementedError
+    if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        return torch.ops.rbln_triton_ops.attention_naive_decode(
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            seq_idx,
+            scale,
+            block_tables,
+            scale,  # dummy
+        )
+    else:
+        return torch.ops.rbln_custom_ops.attention_naive_decode(
+            q,
+            k,
+            v,
+            kv_cache,
+            mask,
+            seq_idx,
+            scale,
+            block_tables,
+            scale,  # dummy
+            sinks,
+        )

@@ -788,8 +788,8 @@ class TestDummyRunPadding:
 
 
 class TestProcessKvCacheCopyOps:
-    # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
-    # and VLLM_RBLN_COMPILE_MODEL. Forced deterministically via monkeypatch.
+    # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager.
+    # Forced deterministically via monkeypatch.
     def test_eager_copy_non_mla(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)  # -> eager path
         # non-MLA layout: (2, num_blocks, heads, 1, block_tokens, dim).
@@ -821,7 +821,6 @@ class TestProcessKvCacheCopyOps:
 
     def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         calls = []
         runtime = SimpleNamespace(
             _copy_kv_cache=lambda src, dst, nt: calls.append((src, dst, nt))
@@ -1083,23 +1082,16 @@ class TestAllocateKvCacheTensors:
             device=torch.device("cpu"), runner_only_attn_layers=set()
         )
 
-    def test_cpu_when_not_compiling(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", False)
+    def test_meta_without_device_tensor(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert set(raw) == {"l0", "l1", "l2"}
-        assert raw["l0"].device.type == "cpu"
+        assert raw["l0"].device.type == "meta"
         # Layers sharing a pool share the same buffer object.
         assert raw["l0"] is raw["l1"]
         assert raw["l0"] is not raw["l2"]
 
-    def test_meta_when_compiling_without_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert raw["l0"].device.type == "meta"
-
-    def test_self_device_when_compiling_with_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
+    def test_self_device_with_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here

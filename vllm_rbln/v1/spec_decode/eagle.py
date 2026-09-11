@@ -434,10 +434,7 @@ class RBLNEagleProposer(EagleProposer):
             # the logits too.
             return hidden_states, torch.ops.rbln.argmax(logits)
 
-        if (
-            self.vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
-        ):
+        if self.vllm_config.speculative_config.enforce_eager:
             self.model_executable = model_wrapper
         else:
             self.model_executable = compile(
