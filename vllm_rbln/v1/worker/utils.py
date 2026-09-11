@@ -53,7 +53,10 @@ WORKER_DEVICE_FAILURE_EXIT_CODE = 70
 
 
 def abort_worker(exc: Exception, *, where: str) -> NoReturn:
-    """Skip device cleanup, which may block on the failed context."""
+    """Skip device cleanup even if logging raises.
+
+    Logging can still block on handler locks or I/O.
+    """
     try:
         logger.error(
             "RBLN worker %d: %s raised %s: %s. Ending this worker process "
@@ -71,7 +74,11 @@ def abort_worker(exc: Exception, *, where: str) -> NoReturn:
 
 
 def fail_fast_on_device_error(function: _F) -> _F:
-    """Guard worker methods and deferred outputs that carry parallel_config."""
+    """Terminate mp workers when an operation raises.
+
+    The receiver must expose parallel_config. Uni and external_launcher
+    propagate in-process; Ray owns its task error transport.
+    """
 
     @wraps(function)
     def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:

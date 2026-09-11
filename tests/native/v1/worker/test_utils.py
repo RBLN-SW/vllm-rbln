@@ -111,7 +111,14 @@ class TestFailFastOnDeviceError:
 
     @pytest.mark.parametrize(
         ("backend", "setting"),
-        [("uni", "1"), ("mp", "0"), ("mp", "FALSE"), ("mp", "no")],
+        [
+            ("uni", "1"),
+            ("ray", "1"),
+            ("external_launcher", "1"),
+            ("mp", "0"),
+            ("mp", "FALSE"),
+            ("mp", "no"),
+        ],
     )
     def test_exception_propagates_without_exit(
         self, monkeypatch, exit_codes, backend, setting

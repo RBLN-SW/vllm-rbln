@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
+    VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR: bool = True
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
@@ -66,7 +67,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
-    VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR: bool = True
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -269,6 +269,11 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Disable only for debugging worker failures without terminating mp workers.
+    "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR": lambda: os.environ.get(
+        "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", "1"
+    ).lower()
+    not in ("0", "false", "no"),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
@@ -311,11 +316,6 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
-    # Disable only for debugging worker failures without terminating mp workers.
-    "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR": lambda: os.environ.get(
-        "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", "1"
-    ).lower()
-    not in ("0", "false", "no"),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (

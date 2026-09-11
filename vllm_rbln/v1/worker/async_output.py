@@ -14,9 +14,9 @@
 
 """The ModelRunnerOutput async scheduling hands back before its tokens exist.
 
-The runner returns one of these instead of a ModelRunnerOutput; vLLM calls
-get_output() on the worker's async output thread, once the next forward is
-already in flight.
+The runner returns one of these instead of a ModelRunnerOutput. With the mp
+executor, vLLM calls get_output() on the worker's async output thread, once
+the next forward is already in flight.
 """
 
 from collections import deque
@@ -45,6 +45,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         logprobs_tensors: LogprobsTensors | None,
         parallel_config: ParallelConfig,
     ):
+        # Public to satisfy the shared fail_fast_on_device_error contract.
         self.parallel_config = parallel_config
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -70,7 +71,7 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
-        Blocks until the copy finishes. Runs on the worker's async output thread.
+        Blocks until the copy finishes. Runs on mp's worker async output thread.
         InferenceMode is thread-local, hence off here, and updating
         _sampled_token_ids_cpu - an inference tensor allocated
         under sample_tokens - in place with it off is a hard error.
