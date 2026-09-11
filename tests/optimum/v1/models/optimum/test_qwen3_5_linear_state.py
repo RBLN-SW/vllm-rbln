@@ -46,30 +46,26 @@ class TestDecodeLayoutWiring:
         obj.decoder_batch_size = max_batch_size
         # ``dtype`` is a read-only property (-> self.model.rbln_config.dtype); the
         # forward test supplies it via a mocked model instead of setting it here.
-        obj.available_blocks = torch.arange(50, 60, dtype=torch.int16)
         return obj
 
-    def test_pad_decoder_items_scatters_to_batch_idx_rows(self):
-        # Running order [B, A]; B's row is 1, A's row is 0. The real
-        # pad_decoder_items must land B (running idx 0) on row 1 and A on row 0.
+    def test_decode_batch_rows_are_the_cache_slots(self):
+        # The runner asks the model where each running request sits in the
+        # decode batch; Qwen3.5 pins it to its scheduler-assigned cache slot.
         obj = self._bare_qwen3_5(max_batch_size=4)
-        input_ids = torch.tensor([[201], [200]])  # running order: B=201, A=200
-        positions = torch.tensor([[5], [7]])
-        block_tables = torch.tensor([[10], [11]], dtype=torch.int16)
-        batch_indices = torch.tensor([1, 0])  # rows of [B, A]
 
-        padded_ids, padded_pos, padded_bt = obj.pad_decoder_items(
-            input_ids, positions, block_tables, input_block_ids=batch_indices
+        rows = obj.decode_batch_rows(
+            torch.tensor([1, 0], dtype=torch.int16),
+            torch.tensor([[10], [11]], dtype=torch.int16),
         )
 
-        assert padded_ids[1, 0] == 201 and padded_ids[0, 0] == 200  # B->1, A->0
-        assert padded_pos[1, 0] == 5 and padded_pos[0, 0] == 7
-        assert padded_bt[1, 0] == 10 and padded_bt[0, 0] == 11
+        assert rows.dtype == torch.long
+        assert rows.tolist() == [1, 0]
 
     def test_forward_decode_pairs_each_request_with_its_own_row(self):
-        # The scheduler pinned A to row 0 and B to row 1; this decode step's
-        # running order is the REVERSE [B, A]. Each must still land on its own
-        # row, and logits come back in running order.
+        # A owns row 0 and B owns row 1, but this step runs them as [B, A].
+        # The runner has already placed each request on its own row, so
+        # forward must pass the batch through untouched and return the logits
+        # in running order, B first.
         obj = self._bare_qwen3_5(max_batch_size=2)
 
         recorded = {}
@@ -87,16 +83,18 @@ class TestDecodeLayoutWiring:
         model_input = types.SimpleNamespace(
             is_prompt=False,
             running_requests_ids=["B", "A"],  # reversed vs prefill order
-            input_tokens=torch.tensor([[201], [200]]),  # B=201, A=200
-            input_positions=torch.tensor([[5], [7]]),
-            block_tables=torch.tensor([[10], [11]], dtype=torch.int16),
+            padded_batch_size=2,
+            batch_rows=torch.tensor([1, 0]),  # rows of [B, A]
+            input_tokens=torch.tensor([[200], [201]]),  # row 0 = A, row 1 = B
+            input_positions=torch.tensor([[7], [5]], dtype=torch.int32),
+            block_tables=torch.tensor([[11], [10]], dtype=torch.int16),
             position_embed=torch.zeros(2, 2, 1, 1, 1),
-            cache_slot_ids=torch.tensor([1, 0], dtype=torch.int16),
+            cache_slot_ids=torch.tensor([[0], [1]], dtype=torch.int16),
         )
 
         logits = obj.forward(model_input)
 
-        # Physical batch is laid out BY ROW: row0 == A's row, row1 == B's row.
+        # The graph sees the batch BY ROW: row0 == A's row, row1 == B's row.
         assert recorded["inputs_embeds"][0, 0, 0] == 200  # A on row 0
         assert recorded["inputs_embeds"][1, 0, 0] == 201  # B on row 1
         # ...and logits come back in RUNNING order [B, A] -> [201, 200].
@@ -125,11 +123,13 @@ class TestDecodeLayoutWiring:
         model_input = types.SimpleNamespace(
             is_prompt=False,
             running_requests_ids=["B"],
-            input_tokens=torch.tensor([[201]]),
-            input_positions=torch.tensor([[9]]),
-            block_tables=torch.tensor([[10]], dtype=torch.int16),
-            position_embed=torch.zeros(2, 1, 1, 1, 1),
-            cache_slot_ids=torch.tensor([1], dtype=torch.int16),
+            padded_batch_size=2,
+            batch_rows=torch.tensor([1]),
+            input_tokens=torch.tensor([[0], [201]]),  # row 0 is padding
+            input_positions=torch.tensor([[0], [9]], dtype=torch.int32),
+            block_tables=torch.tensor([[50], [10]], dtype=torch.int16),
+            position_embed=torch.zeros(2, 2, 1, 1, 1),
+            cache_slot_ids=torch.tensor([[0], [1]], dtype=torch.int16),
         )
         logits = obj.forward(model_input)
 
@@ -159,8 +159,8 @@ class TestDecodeLayoutWiring:
             is_prompt=True,
             running_requests_ids=["B"],
             input_tokens=torch.tensor([[1]]),
-            input_positions=torch.tensor([[0]]),
-            block_tables=torch.tensor([[10]], dtype=torch.int16),
+            input_positions=torch.tensor([[0]], dtype=torch.int32),
+            block_tables=torch.tensor([10], dtype=torch.int16),
             inputs_embeds=torch.zeros(1, 1, 1),
             position_embed=torch.zeros(2, 1, 1, 1, 1),
             cache_slot_ids=torch.tensor([1], dtype=torch.int16),

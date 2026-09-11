@@ -34,7 +34,7 @@ CACHED_LENGTH = [4]
 
 class MockDecoderModelWrapper(MockModelWrapper, RBLNOptimumDecoderMixin):
     def __init__(self, fail_copy: bool = False):
-        super().__init__()
+        super().__init__(max_num_seqs=1)
         self.fail_copy = fail_copy
         self.copy_calls: list[tuple[list[int], list[int]]] = []
 
