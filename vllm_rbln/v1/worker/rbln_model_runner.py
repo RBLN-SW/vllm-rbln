@@ -1859,7 +1859,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if not self.is_prefill and (
                 spec_decode_metadata is not None or self.uses_fixed_decode_window
             ):
-                logits = logits[logits_indices]
+                num_rows = logits_indices.shape[0]
+                if int(logits_indices[-1]) == num_rows - 1:
+                    # Indices climbing from 0 end at num_rows - 1 only when the
+                    # sampled rows lead the batch; a view replaces the gather.
+                    logits = logits[:num_rows]
+                else:
+                    # `index_select` is the cheaper gather on the device.
+                    logits = torch.index_select(logits, 0, logits_indices)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -3527,9 +3534,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             batch_size, 1, dtype=torch.int32, device=self.device
         )
         logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
-        for bonus_token_ids_in, bonus_logits_in in (
-            (None, bonus_logits),
-            (bonus_token_ids, None),
+        # Three graphs: the bonus rows' logits argmaxed (all-greedy step), the
+        # same logits drawn with top-k/top-p (random step), and the ids the
+        # bonus sampler produced (logprobs). Any can come first at run time.
+        random_sampling_metadata = dataclasses.replace(
+            dummy_sampling_metadata,
+            all_greedy=False,
+            all_random=True,
+            temperature=torch.ones(batch_size, dtype=self.dtype, device=self.device),
+        )
+        for bonus_kwargs, sampling_metadata in (
+            ({"bonus_logits": bonus_logits}, dummy_sampling_metadata),
+            ({"bonus_logits": bonus_logits}, random_sampling_metadata),
+            ({"bonus_token_ids": bonus_token_ids}, dummy_sampling_metadata),
         ):
             self.rejection_sampler.impl.rejection_sample(
                 draft_token_ids,
@@ -3538,9 +3555,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 cu_num_draft_tokens,
                 None,
                 target_logits,
-                bonus_token_ids_in,
-                dummy_sampling_metadata,
-                bonus_logits=bonus_logits_in,
+                bonus_kwargs.get("bonus_token_ids"),
+                sampling_metadata,
+                bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
 
     def warmup_model(self) -> None:
