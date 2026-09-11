@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Unit coverage for the RBLN NIXL metadata extension: the layer axis and the
-# chiplet geometry a shard advertises.
+# Unit coverage for the RBLN NIXL metadata extension: the layer axis, the
+# chiplet geometry a shard advertises, and which axis that geometry came from.
 #
 # Self-contained: exercises only ``rbln_nixl.metadata`` (base vLLM NIXL +
 # msgspec + hash), so it does not require the ``nixl-rbln`` install or a worker.
@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RBLN_NIXL_CONNECTOR_VERSION,
+    KVSplitAxis,
     RblnNixlAgentMetadata,
     rbln_compat_hash,
 )
@@ -55,6 +56,8 @@ class TestRblnNixlAgentMetadata:
         assert (m.pp_rank, m.pp_size) == (0, 1)
         assert m.registered_layer_names == []
         assert (m.kv_areas, m.kv_slices) == (1, 1)
+        # The axis default is what the two counts above used to mean on their own.
+        assert m.kv_split_axis is KVSplitAxis.HEAD
 
     def test_roundtrip_preserves_pp_fields(self):
         # msgspec encode→decode with the RBLN type preserves PP descriptors.
@@ -103,6 +106,16 @@ class TestRblnNixlAgentMetadata:
             msgspec.msgpack.Encoder().encode(m)
         )
         assert back.registered_layer_names == names
+
+    def test_roundtrip_preserves_the_split_axis(self):
+        # The axis crosses the wire as an enum member, and it is the one field a
+        # peer cannot recompute from the rest -- decoding it as anything else
+        # would put a context cut back under the head-band arithmetic.
+        m = _make(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
+        back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            msgspec.msgpack.Encoder().encode(m)
+        )
+        assert back.kv_split_axis is KVSplitAxis.NON_HEAD
 
 
 class TestRblnCompatHash:
