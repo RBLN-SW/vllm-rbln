@@ -94,9 +94,10 @@ class RblnNixlWorkerBase(
         self.use_host_buffer = self.kv_buffer_device == "cpu"
         if self.use_host_buffer and connector_option(vllm_config, "chunk_mode", False):
             raise RuntimeError(
-                "RBLN NIXL: chunk_mode needs the chiplet "
-                "areas of the direct path; host staging registers one "
-                "full-shape buffer per layer and has none to drop."
+                "RBLN NIXL: chunk_mode needs the descriptor "
+                "lists of the direct path; host staging registers one "
+                "full-shape buffer per layer and gives a narrowed peer a "
+                "handle upstream built, and a chunk range extends neither."
             )
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
@@ -144,6 +145,9 @@ class RblnNixlWorkerBase(
         # How many descriptors each of that shard's regions is cut into
         # (_head_split).
         self._shard_descs_per_block: dict[tuple[str, int], int] = {}
+        # Per peer shard, the grid its chunk range was built over, or None
+        # where its lists carry no such range. See `_shard_chunk_grid`.
+        self._shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None] = {}
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.
         self.local_seen_layer_names: list[str] = []

@@ -25,6 +25,9 @@ from tests.native.distributed.kv_connector.utils import (
     build_worker,
     sliding_window_spec,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    KVSplitAxis,
+)
 
 
 class TestComputeDescIds:
@@ -91,3 +94,86 @@ class TestComputeDescIds:
         worker._group_specs = [MagicMock()]
         out = worker._compute_desc_ids([[]], 4, None, 1)
         assert out.size == 0
+
+
+class TestTailChunks:
+    # `_tail_chunks` over a 64-token block cut into 4 areas by a context cut,
+    # so a chunk is 16 tokens at one per area and the boundaries the table
+    # walks fall at 16 and its multiples; two per area makes it 8.
+
+    @staticmethod
+    def _worker(monkeypatch, *, chunked=True, axis=KVSplitAxis.NON_HEAD):
+        w = build_worker(monkeypatch, block_size=64)
+        w._kv_areas = 4
+        w._kv_split_axis = axis
+        w._chunk_mode = chunked
+        return w
+
+    @pytest.mark.parametrize(
+        ("chunks_per_span", "num_valid_tokens", "expected"),
+        [
+            # One chunk per area, which is what every deployment whose spans a
+            # chunk cannot cut keeps getting.
+            (1, 129, 1),
+            # 16 tokens exactly fills the first chunk; 17 reaches the second.
+            (1, 144, 1),
+            (1, 145, 2),
+            (1, 176, 3),
+            # A full last block has no tail to drop.
+            (1, 192, None),
+            # No count means no claim about the tail.
+            (1, None, None),
+            (1, 0, None),
+            # Twice as many chunks: half an area is addressable now, so the
+            # same one-token last block sends half of what it did.
+            (2, 129, 1),
+            (2, 136, 1),
+            (2, 137, 2),
+            (2, 144, 2),
+            (2, 145, 3),
+            # One token short of full still needs every chunk, and the same
+            # bytes in more descriptors is a loss.
+            (2, 191, None),
+        ],
+    )
+    def test_the_tail_is_counted_in_chunks(
+        self, monkeypatch, chunks_per_span, num_valid_tokens, expected
+    ):
+        w = self._worker(monkeypatch)
+        assert (
+            w._tail_chunks(3, num_valid_tokens, chunks_per_span=chunks_per_span)
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("chunks_per_span", "num_valid_tokens", "expected"),
+        [(4, 129, 1), (4, 144, 1), (4, 145, 2), (4, 192, None)],
+    )
+    def test_a_head_cut_counts_the_whole_block_in_chunks(
+        self, monkeypatch, chunks_per_span, num_valid_tokens, expected
+    ):
+        # A head cut gives every area every token, so the span a chunk cuts is
+        # the block itself -- the same four chunks of 16 tokens, reached
+        # without the area count.
+        w = self._worker(monkeypatch, axis=KVSplitAxis.HEAD)
+
+        assert (
+            w._tail_chunks(3, num_valid_tokens, chunks_per_span=chunks_per_span)
+            == expected
+        )
+
+    def test_chunk_mode_being_off_keeps_every_chunk(self, monkeypatch):
+        # The same input the table answers 1 for.
+        w = self._worker(monkeypatch, chunked=False)
+        assert w._tail_chunks(3, 129, chunks_per_span=1) is None
+
+    @pytest.mark.parametrize("num_valid_tokens", [128, 300])
+    def test_a_count_that_does_not_fit_the_block_list_raises(
+        self, monkeypatch, num_valid_tokens
+    ):
+        # 3 blocks of 64 hold between 129 and 192 tokens. Below or above that,
+        # the list and the count describe different KV, and no descriptor
+        # derived from either is safe.
+        w = self._worker(monkeypatch)
+        with pytest.raises(RuntimeError, match="different KV"):
+            w._tail_chunks(3, num_valid_tokens, chunks_per_span=1)
