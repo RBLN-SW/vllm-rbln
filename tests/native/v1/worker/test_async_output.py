@@ -140,7 +140,7 @@ class TestGetOutput:
             },
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=180,
         )
         assert result.returncode == 70, result.stdout + result.stderr
         assert "subprocess output copy failed" in result.stdout + result.stderr

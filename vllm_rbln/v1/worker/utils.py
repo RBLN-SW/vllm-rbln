@@ -76,8 +76,8 @@ def abort_worker(exc: Exception, *, where: str) -> NoReturn:
 def fail_fast_on_device_error(function: _F) -> _F:
     """Terminate mp workers when an operation raises.
 
-    The receiver must expose parallel_config. Uni and external_launcher
-    propagate in-process; Ray owns its task error transport.
+    The receiver must expose parallel_config. Hard exits are limited to mp;
+    Ray is unsupported on RBLN. Other executors propagate the exception.
     """
 
     @wraps(function)
