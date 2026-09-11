@@ -84,7 +84,10 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
     ) -> np.ndarray:
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
-        assert keep_spans is None or per_block == 1
+        # Zero drops the last block from every region, whatever a position
+        # names, which is what a head cut asks for -- there the token axis is
+        # not spread over the regions at all.
+        assert not keep_spans or per_block == 1
         # Converted once, not once per region: this runs per request, and every
         # region of a layer names the same group.
         group_arrays = [np.asarray(g, dtype=np.int64) for g in block_ids]
@@ -114,17 +117,74 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             return np.empty(0, dtype=np.int64)
         return np.concatenate(desc_ids)
 
-    def _tail_areas(self, num_blocks: int, num_valid_tokens: int | None) -> int | None:
-        """How many chiplet areas of a request's last block hold its tokens.
+    def _chunk_descs_ids_for_shard(
+        self,
+        engine_id: str,
+        global_rank: int,
+        num_blocks: int,
+        block_id: int,
+        chunk_span: tuple[int, int],
+        span_ix: int | None = None,
+    ) -> np.ndarray:
+        """Descriptors for chunks `[lo, hi)` of one block, in every region.
 
-        A context cut gives area a the in-block positions [a*ps, (a+1)*ps), so
-        a last block filled to `rem` tokens has nothing above cdiv(rem, ps).
-        None keeps every area, which is what a full last block wants and what
-        every geometry chunk mode cannot address wants.
+        `span_ix` narrows that to the regions holding one span of the block,
+        which is what a context cut needs: an area IS a token range there, so
+        the chunks of a partly-filled one belong to that area alone. None
+        takes every region, which is a head cut, where every region holds the
+        same token range of a different head band.
 
-        An area is the whole of what a transfer can leave out today, so it is
-        the chunk chunk mode names -- and the last line is already the rule
-        that declines when every one of them is needed.
+        Indexes the second range the shard's lists carry (see
+        `_register_shard_local_xfer_handler`), which follows the whole-block
+        range and holds `runs * chunks` entries where that one holds 1. Both
+        lists are laid out the same way, so one index array serves either side.
+
+        Empty where this shard has no such range, which is every peer the
+        chunk grid was not derived for.
+        """
+        grid = self._shard_chunk_grids.get((engine_id, global_rank))
+        lo, hi = chunk_span
+        if grid is None or hi <= lo:
+            return np.empty(0, dtype=np.int64)
+        runs, chunks = grid
+        if not 0 <= lo < hi <= chunks:
+            raise RuntimeError(
+                f"RBLN NIXL: chunk range [{lo}, {hi}) is outside the "
+                f"{chunks} chunk(s) a block holds"
+            )
+        region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
+        per_block = self._shard_descs_per_block.get((engine_id, global_rank), 1)
+        # Where the chunk range starts: the whole-block range covers every
+        # region, block and piece once.
+        whole = len(region_group_ids) * num_blocks * per_block
+        per_chunk_block = per_block * runs * chunks
+        within = (
+            np.arange(per_block, dtype=np.int64)[:, None, None] * (runs * chunks)
+            + np.arange(runs, dtype=np.int64)[None, :, None] * chunks
+            + np.arange(lo, hi, dtype=np.int64)[None, None, :]
+        ).ravel()
+        positions = np.arange(len(region_group_ids), dtype=np.int64)
+        if span_ix is not None:
+            positions = positions[positions % self._kv_areas == span_ix]
+        starts = whole + (positions * num_blocks + block_id) * per_chunk_block
+        return (starts[:, None] + within[None, :]).ravel()
+
+    def _tail_chunks(
+        self,
+        num_blocks: int,
+        num_valid_tokens: int | None,
+        *,
+        chunks_per_span: int,
+    ) -> int | None:
+        """How many chunks of a request's last block hold its tokens.
+
+        A block is `spans * chunks_per_span` chunks of equal token width
+        however its spans are cut, so a last block filled to `rem` tokens has
+        nothing above cdiv(rem, chunk). None keeps the whole block: that is
+        what a full last block wants, and what one needing every chunk wants
+        -- the same bytes in more descriptors is a loss.
+
+        Rounds up, because every token counted has to reach the peer.
         """
         if not self._chunk_mode or not num_valid_tokens or num_blocks <= 0:
             return None
@@ -135,8 +195,59 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 f"{self.block_size} reports {num_valid_tokens} token(s); its "
                 "block list and its token count describe different KV."
             )
-        tail = cdiv(rem, self.block_size // self._kv_areas)
-        return tail if tail < self._kv_areas else None
+        chunks_per_block = self._spans_per_block * chunks_per_span
+        needed = cdiv(rem, self.block_size // chunks_per_block)
+        return needed if needed < chunks_per_block else None
+
+    def _shard_descs_for_tokens(
+        self,
+        engine_id: str,
+        global_rank: int,
+        num_blocks: int,
+        block_ids: BlockIds,
+        *,
+        num_valid_tokens: int | None,
+        num_prompt_blocks: int,
+    ) -> np.ndarray:
+        """This shard's descriptors for `block_ids`, cut to the tokens held.
+
+        The last block goes out as the chunks that hold tokens: the spans below
+        the one its last token falls in from the block range, and that span's
+        chunks from the chunk range. Both sides build this the same way, so the
+        two lists still pair by position.
+
+        `num_prompt_blocks` is the request's own block count, which is what
+        the token count describes -- `block_ids` may have lost its prefix to a
+        cache hit.
+        """
+        grid = self._shard_chunk_grids.get((engine_id, global_rank))
+        chunks_per_span = grid[1] if grid is not None else 1
+        needed = self._tail_chunks(
+            num_prompt_blocks, num_valid_tokens, chunks_per_span=chunks_per_span
+        )
+        keep_spans = None if needed is None else needed // chunks_per_span
+        descs = self._get_block_descs_ids_for_shard(
+            engine_id, global_rank, num_blocks, block_ids, keep_spans=keep_spans
+        )
+        part = 0 if needed is None else needed % chunks_per_span
+        if not part or not block_ids[0]:
+            return descs
+        # A head cut spreads no span axis over the regions, so every one of
+        # them holds this block's chunks.
+        span_ix = keep_spans if self._spans_per_block > 1 else None
+        return np.concatenate(
+            (
+                descs,
+                self._chunk_descs_ids_for_shard(
+                    engine_id,
+                    global_rank,
+                    num_blocks,
+                    block_ids[0][-1],
+                    (0, part),
+                    span_ix=span_ix,
+                ),
+            )
+        )
 
     def _xfer_notif_id(
         self, engine_id: str, remote_request_id: str, remote_tp_size: int

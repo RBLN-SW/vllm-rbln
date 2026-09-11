@@ -100,11 +100,10 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
             engine_id, meta.remote.request_id, remote_info.remote_tp_size
         )
         prefix_hit = len(local_block_ids) == 0
-        n_prompt_blocks = sum(len(g) for g in remote_block_ids)
         # Counted before the prefix trim below, which cuts the front: the token
         # count describes the producer's whole list, and both lists keep their
         # tail, so the last element is still the request's last block.
-        keep_spans = self._tail_areas(n_prompt_blocks, valid_tokens)
+        n_prompt_blocks = sum(len(g) for g in remote_block_ids)
 
         if not prefix_hit:
             # _apply_prefix_caching indexes per KV-cache group, so a group-count
@@ -157,19 +156,23 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                     self.xfer_stats.record_failed_notification()
                 continue
 
-            remote_descs = self._get_block_descs_ids_for_shard(
+            # Per peer, because the chunk grid is: a read reaches several
+            # producers, and there is no step where they agree on one.
+            remote_descs = self._shard_descs_for_tokens(
                 engine_id,
                 global_rank,
                 self.dst_num_blocks[engine_id],
                 remote_block_ids,
-                keep_spans=keep_spans,
+                num_valid_tokens=valid_tokens,
+                num_prompt_blocks=n_prompt_blocks,
             )
-            local_descs = self._get_block_descs_ids_for_shard(
+            local_descs = self._shard_descs_for_tokens(
                 engine_id,
                 global_rank,
                 self.num_blocks,
                 local_block_ids,
-                keep_spans=keep_spans,
+                num_valid_tokens=valid_tokens,
+                num_prompt_blocks=n_prompt_blocks,
             )
             assert len(local_descs) == len(remote_descs)
             local_handle = self.src_xfer_handles_by_remote[

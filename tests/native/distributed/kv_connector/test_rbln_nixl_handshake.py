@@ -41,6 +41,9 @@ from tests.native.distributed.kv_connector.utils import (
     mock_vllm_config,
     patched_in_package,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.handshake import (
+    kv_chunk_tokens,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
     RblnNixlAgentMetadata,
@@ -682,6 +685,7 @@ class TestPeerRegionView:
             w.block_len_per_layer[-cls.RPL :] = [cls.DRAFT_LEN] * cls.RPL
         w._region_is_mla = [False] * (w.num_regions - mla_tail) + [True] * mla_tail
         w._kv_areas = 1
+        w._chunk_mode = False
         w.device_id = 0
         w.transfer_topo = MagicMock()
         w.transfer_topo.virtually_split_kv_in_blocks = False
@@ -751,6 +755,58 @@ class TestPeerRegionView:
             out = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
 
         assert [ln for _, ln, _ in out] == [self.TARGET_LEN] * 8
+
+    def test_the_peer_list_carries_the_chunk_range_at_equal_tp(self):
+        """A peer with our TP degree is served by the list upstream builds,
+        while ours carries the chunk range like any other shard's. A prepared
+        transfer pairs the two by position, so an index into a range only one
+        side has names a descriptor the peer never published -- which the
+        device rejects at transfer time, not at registration."""
+        w = self._consumer()
+        peer = self._peer(layer_names=["l5", "l6"], block_lens=[self.TARGET_LEN] * 4)
+
+        plain = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
+        with patch.object(
+            RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=(1, 2)
+        ) as grid:
+            both = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
+
+        # The peer's block size, not ours: its addresses are what is being
+        # cut. And this builder serves the peers this rank does not band by
+        # head, which is where a split of 1 comes from.
+        assert grid.call_args.kwargs == {"block_size": peer.block_size, "split": 1}
+        assert both[: len(plain)] == plain
+        assert len(both) == len(plain) * 3
+        addr, span, dev = plain[0]
+        assert both[len(plain) : len(plain) + 2] == [
+            (addr, span // 2, dev),
+            (addr + span // 2, span // 2, dev),
+        ]
+
+    def test_more_than_one_run_walks_the_piece(self):
+        # A head cut gives a span one run per head the region holds, so the
+        # run axis has to advance inside the piece. At one run the stride is
+        # unasserted -- the second chunk of the first run and the first chunk
+        # of the second land on the same address.
+        w = self._consumer()
+        peer = self._peer(layer_names=["l5", "l6"], block_lens=[self.TARGET_LEN] * 4)
+
+        plain = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
+        with patch.object(
+            RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=(2, 2)
+        ):
+            both = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
+
+        assert len(both) == len(plain) * 5
+        addr, span, dev = plain[0]
+        quarter = span // 4
+        # run 0's two chunks, then run 1's -- the second run starts halfway.
+        assert both[len(plain) : len(plain) + 4] == [
+            (addr, quarter, dev),
+            (addr + quarter, quarter, dev),
+            (addr + 2 * quarter, quarter, dev),
+            (addr + 3 * quarter, quarter, dev),
+        ]
 
     def test_a_stage_starting_at_our_first_layer_needs_no_translation(self):
         # The first stage's positions already are our region ids, which is why a
@@ -936,6 +992,7 @@ class TestShardLocalRegions:
         w._sw_ratio = None  # shard registration goes through the SWA dispatch
         w.use_host_buffer = False  # D2D: narrowing comes from chiplet areas
         w._shard_descs_per_block = {}
+        w._shard_chunk_grids = {}
         w._borrowed_src_handles = set()
         return w
 
@@ -962,6 +1019,101 @@ class TestShardLocalRegions:
             {(region, block, 0): 1 for region in (4, 5, 6, 7) for block in range(4)}
         )
 
+    def test_a_chunk_grid_appends_a_second_range_over_the_same_bytes(self):
+        # A token chunk is one run per axis the block spreads it over -- on a
+        # head cut, one per head. So a grid of (2 runs, 2 chunks) turns each
+        # block's one descriptor into four, appended after the whole-block
+        # range rather than replacing it -- both ranges stay selectable.
+        w = self._wired_worker()
+
+        _handle, plain = w._register_shard_local_xfer_handler(16, ("l2", "l3"))
+        _handle, both = w._register_shard_local_xfer_handler(
+            16, ("l2", "l3"), chunk_grid=(2, 2)
+        )
+
+        assert both[: len(plain)] == plain
+        assert len(both) == len(plain) * 5  # 1 whole + 2 runs x 2 chunks
+        # One block of one region: the whole piece, then its four quarters at
+        # head- and chunk-strided offsets inside it.
+        start, span, _ = plain[0]
+        assert [(a - start, ln) for a, ln, _ in both[len(plain) : len(plain) + 4]] == [
+            (0, span // 4),
+            (span // 4, span // 4),
+            (span // 2, span // 4),
+            (span // 2 + span // 4, span // 4),
+        ]
+
+    # A peer served one piece per block, and one cut into two pieces that each
+    # go to two copies. The second is what says the per-block factor is in the
+    # index: at one descriptor a block it cancels and any factor would do.
+    @pytest.mark.parametrize(("split", "fanout"), [(1, 1), (2, 2)])
+    def test_the_chunk_indices_point_at_the_chunks_the_builder_made(
+        self, split, fanout
+    ):
+        # The one check that ties the two halves together: an index computed
+        # from the layout has to land on the descriptor the builder put there.
+        w = self._wired_worker()
+        _handle, blocks = w._register_shard_local_xfer_handler(
+            16, ("l2", "l3"), split=split, replica_fanout=fanout, chunk_grid=(2, 2)
+        )
+        regions = [4, 5, 6, 7]
+        per_block = split * fanout
+        key = ("eng", 0)
+        w._shard_region_group_ids = {key: (0,) * len(regions)}
+        w._shard_descs_per_block[key] = per_block
+        w._shard_chunk_grids[key] = (2, 2)
+
+        ids = w._chunk_descs_ids_for_shard("eng", 0, w.num_blocks, 1, (0, 1))
+
+        # Chunk 0 of block 1, for every piece the block is cut into and every
+        # run inside it.
+        assert len(ids) == len(regions) * per_block * 2
+        whole = len(regions) * w.num_blocks * per_block
+        picked = [blocks[i] for i in ids]
+        for n in range(len(regions)):
+            for p in range(per_block):
+                piece = blocks[(n * w.num_blocks + 1) * per_block + p]
+                span = piece[1]
+                at = (n * per_block + p) * 2
+                assert picked[at] == (piece[0], span // 4, piece[2])
+                assert picked[at + 1] == (piece[0] + span // 2, span // 4, piece[2])
+        assert all(i >= whole for i in ids)
+
+    def test_a_chunk_range_outside_the_block_is_refused(self):
+        # An index that lands anywhere else lands on a descriptor for other
+        # bytes, and a write that reaches them is not told.
+        w = self._wired_worker()
+        key = ("eng", 0)
+        w._shard_region_group_ids = {key: (0,) * 4}
+        w._shard_descs_per_block[key] = 1
+        w._shard_chunk_grids[key] = (2, 2)
+
+        with pytest.raises(RuntimeError, match="outside the 2 chunk"):
+            w._chunk_descs_ids_for_shard("eng", 0, w.num_blocks, 0, (1, 3))
+
+    def test_no_chunk_range_selects_nothing(self):
+        # A peer the grid was not derived for: the lists hold no such range, so
+        # an index into it would address past their end.
+        w = self._wired_worker()
+        key = ("eng", 0)
+        w._shard_region_group_ids = {key: (0,) * 4}
+        w._shard_descs_per_block[key] = 1
+        w._shard_chunk_grids[key] = None
+
+        assert w._chunk_descs_ids_for_shard("eng", 0, w.num_blocks, 0, (0, 1)).size == 0
+
+    def test_no_chunk_grid_leaves_the_list_as_it_was(self):
+        # Guard: the grid is what the knob turns on, and off it must cost
+        # nothing -- a longer dlist is memory every peer pays for.
+        w = self._wired_worker()
+
+        _handle, plain = w._register_shard_local_xfer_handler(16, ("l2", "l3"))
+        _handle, none_grid = w._register_shard_local_xfer_handler(
+            16, ("l2", "l3"), chunk_grid=None
+        )
+
+        assert none_grid == plain
+
     def test_register_local_xfer_handler_routes_to_the_shard_path(self):
         # Dispatch to the shard path: no SWA view opt, layer names present. Miss
         # it and a stage registers the whole model's regions, so the descriptor
@@ -982,6 +1134,7 @@ class TestShardLocalRegions:
             split=1,
             region_ids=None,
             replica_fanout=1,
+            chunk_grid=None,
         )
 
     def test_a_borrowed_handle_is_recorded_as_borrowed(self):
@@ -1042,6 +1195,75 @@ class TestShardLocalRegions:
 
         assert w._shard_descs_per_block == {("eng", 2): 6}
 
+        with (
+            patch.object(
+                RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=(1, 2)
+            ),
+            patch.object(
+                RblnNixlPullConnectorWorker,
+                "register_local_xfer_handler",
+                return_value=(42, []),
+            ) as register,
+        ):
+            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"))
+
+        assert register.call_args.kwargs["chunk_grid"] == (1, 2)
+
+    @pytest.mark.parametrize(("split", "expected"), [(1, (2, 2)), (2, (1, 2))])
+    def test_the_local_grid_is_derived_for_the_piece_this_shard_sends(
+        self, split, expected
+    ):
+        # A split halves the piece, so it holds half the heads and a chunk is
+        # one run fewer. The peer's list is derived with the same split
+        # (`_build_head_matched_remote`); derived with a different one, the two
+        # carry different grids and a transfer pairs them by position anyway.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+        w._shard_descs_per_block = {}
+        # The geometry the grid is read off: 8 heads over 4 areas is 2 a
+        # region, and 512B over a 16-token block is 16B a token.
+        w._chunk_mode = True
+        w._kv_split_axis = KVSplitAxis.HEAD
+        w._kv_areas = 4
+        w._kv_slices = 4
+        w._logical_region_kv_heads = [8]
+        w.block_len_per_layer = [512] * 8
+        w.tp_rank = 0
+        w.transfer_topo.tp_size = 1
+        w.vllm_config = mock_vllm_config(chunk_bytes=128)
+        w.vllm_config.scheduler_config.max_num_batched_tokens = 8
+
+        with patch.object(
+            RblnNixlPullConnectorWorker,
+            "register_local_xfer_handler",
+            return_value=(42, []),
+        ) as register:
+            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"), split=split)
+
+        assert register.call_args.kwargs["chunk_grid"] == expected
+        assert w._shard_chunk_grids[("eng", 2)] == expected
+
+    def test_a_head_cut_chunk_engine_takes_a_narrowed_shard(self):
+        # The three a context cut refuses are all about a region's position
+        # naming a span, which a head cut does not do -- every region there
+        # holds every token of its own heads.
+        w = self._wired_worker()
+        w._chunk_mode = True
+        w._kv_split_axis = KVSplitAxis.HEAD
+        w._kv_areas = 2
+        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+
+        with patch.object(
+            RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=None
+        ):
+            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"), split=2)
+
+        assert w.src_xfer_handles_by_remote == {("eng", 2, 16): 42}
+
     def test_register_shard_xfer_state_rejects_multiple_groups(self):
         # The single-group assumption is what makes the all-zero tuple above
         # right; more than one group has to fail rather than mislabel regions.
@@ -1063,12 +1285,134 @@ class TestShardLocalRegions:
         # them together.
         w = self._wired_worker()
         w._chunk_mode = True
+        w._kv_split_axis = KVSplitAxis.NON_HEAD
+        w._kv_areas = 2
         w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
 
         with pytest.raises(AssertionError):
             w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"), **narrowed)
+
+
+class TestChunkSizing:
+    """What a chunk descriptor covers, and the grid a shard's lists take.
+
+    Sized in bytes because that is what the fabric charges for, floored by the
+    prefill chunk because that is the unit a write covers, and rounded to a
+    size that tiles the span because a descriptor may not reach past it.
+    """
+
+    @staticmethod
+    def _sized(monkeypatch, *, span_tokens, bytes_per_token, prefill=512, **knobs):
+        return kv_chunk_tokens(
+            span_tokens=span_tokens,
+            bytes_per_token=bytes_per_token,
+            prefill_step_tokens=prefill,
+            chunk_bytes=knobs.get("BYTES", 0),
+            chunk_tokens=knobs.get("TOKENS", 0),
+        )
+
+    @pytest.mark.parametrize(
+        "knobs, span_tokens, bytes_per_token, prefill, expected",
+        [
+            # 256 KiB of a 256-byte token is 1024, which tiles an 8k block cut
+            # into four areas.
+            ({}, 2048, 256, 512, 1024),
+            # A target between two tiling sizes takes the larger: below the
+            # size the fabric moves efficiently, the smaller pays fixed cost
+            # for bytes it does not carry.
+            ({"BYTES": 153600}, 2048, 256, 512, 1024),
+            # An MLA token is wide enough that the target names fewer tokens
+            # than a prefill step covers, and the floor is what catches that.
+            ({}, 2048, 1152, 512, 512),
+            # The token knob is taken over the byte target, which says 1024.
+            ({"TOKENS": 512}, 2048, 256, 512, 512),
+            # And it tiles the span as well -- 700 would leave a descriptor
+            # reaching into the next span.
+            ({"TOKENS": 700}, 2048, 256, 512, 1024),
+            # A span the target names the whole of, and one a prefill step
+            # fills: both leave the span uncut.
+            ({}, 512, 256, 512, 512),
+            ({}, 2048, 256, 2048, 2048),
+            ({}, 2048, 256, 4096, 2048),
+        ],
+    )
+    def test_the_chunk_is_the_smallest_tiling_size_the_floors_allow(
+        self, monkeypatch, knobs, span_tokens, bytes_per_token, prefill, expected
+    ):
+        assert (
+            self._sized(
+                monkeypatch,
+                span_tokens=span_tokens,
+                bytes_per_token=bytes_per_token,
+                prefill=prefill,
+                **knobs,
+            )
+            == expected
+        )
+
+    def test_both_size_knobs_at_once_are_refused(self, monkeypatch):
+        # Picking one and logging the other says nothing about which the
+        # operator meant, and this runs once per peer list, so the log would
+        # repeat while the transfer used a size nobody confirmed.
+        with pytest.raises(RuntimeError, match="both name a chunk size"):
+            self._sized(
+                monkeypatch,
+                span_tokens=2048,
+                bytes_per_token=256,
+                TOKENS=512,
+                BYTES=153600,
+            )
+
+    def test_a_token_knob_under_one_prefill_step_is_refused(self, monkeypatch):
+        # Rounding it up instead would ignore the size an operator asked for,
+        # and a step closing several chunks is not something the write path
+        # can count in.
+        with pytest.raises(RuntimeError, match="prefill step"):
+            self._sized(monkeypatch, span_tokens=2048, bytes_per_token=256, TOKENS=256)
+
+    @staticmethod
+    def _grid_worker(*, block_len, areas=4, prefill=512):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._chunk_mode = True
+        w._kv_areas = areas
+        w._kv_split_axis = KVSplitAxis.NON_HEAD
+        w.block_len_per_layer = [block_len] * 8
+        w.vllm_config = mock_vllm_config()
+        w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
+        return w
+
+    def test_a_context_cut_spreads_a_chunk_over_one_run(self, monkeypatch):
+        # An 8k block over four areas: each area holds 2048 tokens of 256
+        # bytes, and 256 KiB of that is half an area. A run per head would be
+        # the head axis; here the area already is a token range.
+        w = self._grid_worker(block_len=2048 * 256)
+
+        assert w._shard_chunk_grid(block_size=8192, split=1) == (1, 2)
+
+    @pytest.mark.parametrize(
+        "kwargs, block_size",
+        [
+            # A 2k block over four areas is 512 tokens an area, which one
+            # prefill step fills: the area is already the smallest unit, and
+            # that is what chunk mode drops today.
+            ({"block_len": 512 * 256}, 2048),
+            # A prefill chunk as wide as an area, at any block size.
+            ({"block_len": 2048 * 256, "prefill": 2048}, 8192),
+        ],
+    )
+    def test_a_span_a_chunk_cannot_cut_gets_no_grid(self, kwargs, block_size):
+        w = self._grid_worker(**kwargs)
+
+        assert w._shard_chunk_grid(block_size=block_size, split=1) is None
+
+    def test_off_the_knob_there_is_no_grid(self):
+        # Off, neither list may grow: a longer dlist is memory every peer pays.
+        w = self._grid_worker(block_len=2048 * 256)
+        w._chunk_mode = False
+
+        assert w._shard_chunk_grid(block_size=8192, split=1) is None
 
 
 class TestBaseFanInHandle:
@@ -1436,6 +1780,7 @@ class TestHeadBandMatching:
         w.get_backend_aware_kv_block_len = lambda layer_idx, **_: w.block_len_per_layer[
             layer_idx
         ]
+        w._chunk_mode = False  # the grid tests turn it on
         return w
 
     @staticmethod
@@ -1537,6 +1882,87 @@ class TestHeadBandMatching:
         assert self._decoded(out, meta) == Counter(
             {(0, 0, 0): 2, (0, 1, 0): 2, (0, 0, 1): 2, (0, 1, 1): 2}
         )
+
+    def _grid_worker(self, *, monkeypatch, kv_heads=8, chunk_bytes=128, prefill=8):
+        w = self._worker(
+            tp_rank=0,
+            tp_size=1,
+            areas=4,
+            slices=4,
+            n_logical=1,
+            block_len=512,
+            kv_heads=kv_heads,
+        )
+        # A 16-token block whose 2-head region costs 16B a token, so a 128B
+        # descriptor target is 8 tokens: two chunks of a block.
+        w._chunk_mode = True
+        w._kv_split_axis = KVSplitAxis.HEAD
+        w.vllm_config = mock_vllm_config(chunk_bytes=chunk_bytes)
+        w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
+        return w
+
+    def test_a_head_band_is_what_a_token_costs(self, monkeypatch):
+        # A region holds one token range of SEVERAL heads, so a token costs the
+        # band, not the range. The default case above cannot see this: its byte
+        # target and its prefill floor answer 8 either way. Here the target
+        # decides, and dropping the band from the cost halves the chunk.
+        w = self._grid_worker(monkeypatch=monkeypatch, chunk_bytes=64, prefill=2)
+
+        # 512B over 16 tokens of 2 heads is 16B a token, so 64B is 4 tokens --
+        # four chunks of the block, one run per head.
+        assert w._shard_chunk_grid(block_size=16, split=1) == (2, 4)
+
+    @pytest.mark.parametrize(
+        "split, expected",
+        [
+            # 8 heads over 4 areas is 2 per area, and a block is two chunks.
+            (1, (2, 2)),
+            # A split halves the piece, so it holds half the heads.
+            (2, (1, 2)),
+            # A piece narrower than a head cannot be cut by head.
+            (4, None),
+        ],
+    )
+    def test_a_head_cut_spreads_a_chunk_over_one_run_per_head(
+        self, monkeypatch, split, expected
+    ):
+        w = self._grid_worker(monkeypatch=monkeypatch)
+
+        assert w._shard_chunk_grid(block_size=16, split=split) == expected
+
+    def test_regions_that_disagree_on_their_band_get_no_grid(self, monkeypatch):
+        # Both lists carry one grid, so one region's head band cannot describe
+        # them -- a draft's regions are named past the target's.
+        w = self._grid_worker(monkeypatch=monkeypatch, kv_heads=[8, 4])
+
+        assert w._shard_chunk_grid(block_size=16, split=1) is None
+
+    def test_the_remote_list_takes_the_same_chunk_grid(self):
+        """`make_prepped_xfer` pairs the two lists by position, so a range
+        published on one side only would pair chunk descriptors against whole
+        blocks. The peer's list is built over the same two grids."""
+        w = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
+
+        plain = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
+        with patch.object(type(w), "_shard_chunk_grid", return_value=(2, 2)) as grid:
+            both = w._build_head_matched_remote(
+                meta, remote_tp_rank=0, remote_tp_size=1
+            )
+        # Derived here rather than handed in, from the split this list used.
+        assert grid.call_args.kwargs["split"] == 1
+
+        assert both[: len(plain)] == plain
+        assert len(both) == len(plain) * 5
+        start, span, _ = plain[0]
+        assert [(a - start, ln) for a, ln, _ in both[len(plain) : len(plain) + 4]] == [
+            (0, span // 4),
+            (span // 4, span // 4),
+            (span // 2, span // 4),
+            (span // 2 + span // 4, span // 4),
+        ]
 
     def test_area_index_permutation_zero_offset(self):
         """P TP2 -> D TP4: head widths match so the offset is 0, but local area
@@ -1876,6 +2302,7 @@ class TestDescriptorOrderContract:
         w.transfer_topo.is_kv_layout_blocks_first = False
         w.nixl_wrapper = MagicMock()
         w._shard_descs_per_block = {}
+        w._shard_chunk_grids = {}
         w._borrowed_src_handles = set()
         return w
 
@@ -2291,6 +2718,7 @@ class TestCleanupRemoteEngine:
         w.src_xfer_handles_by_remote = {("eng", 0, 16): 100}
         w._shard_region_group_ids = {("eng", 0): (0,)}
         w._shard_descs_per_block = {("eng", 0): 1}
+        w._shard_chunk_grids = {("eng", 0): None}
         w._borrowed_src_handles = set()
         w._remote_shard_layer_names = defaultdict(dict, {"eng": {0: ("l0",)}})
         w._overlapping_ranks = defaultdict(list, {"eng": [0]})
@@ -2318,6 +2746,11 @@ class TestCleanupRemoteEngine:
             ("other", 0): (0,),
         }
         w._shard_descs_per_block = {("eng", 0): 1, ("eng", 1): 2, ("other", 0): 1}
+        w._shard_chunk_grids = {
+            ("eng", 0): (1, 2),
+            ("eng", 1): None,
+            ("other", 0): None,
+        }
         w._borrowed_src_handles = set()
         w._remote_shard_layer_names = defaultdict(dict, {"eng": {0: ("l0",)}})
         w._overlapping_ranks = defaultdict(list, {"eng": [0, 1], "other": [0]})
@@ -2334,6 +2767,8 @@ class TestCleanupRemoteEngine:
         assert [k for k in w.src_xfer_handles_by_remote if k[0] == "eng"] == []
         assert [k for k in w._shard_region_group_ids if k[0] == "eng"] == []
         assert [k for k in w._shard_descs_per_block if k[0] == "eng"] == []
+        # A grid left behind would index a range the re-handshake did not build.
+        assert [k for k in w._shard_chunk_grids if k[0] == "eng"] == []
         # Local dlist handles are ours to release; one per stage.
         assert sorted(
             c.args[0] for c in w.nixl_wrapper.release_dlist_handle.call_args_list
@@ -2351,6 +2786,7 @@ class TestCleanupRemoteEngine:
         w._borrowed_src_handles = {("eng", 1, 16)}
         w._shard_region_group_ids = {}
         w._shard_descs_per_block = {}
+        w._shard_chunk_grids = {}
         w._remote_shard_layer_names = defaultdict(dict)
         w._overlapping_ranks = defaultdict(list)
         w._remote_pp_size = {}
@@ -2679,7 +3115,7 @@ class TestSplitAxisConstraints:
         meta = _agent_meta(
             kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
         )
-        with pytest.raises(RuntimeError, match="the same token range"):
+        with pytest.raises(RuntimeError, match="the same chunks"):
             w._check_split_axis_constraints(meta, 2)
 
     def test_a_matching_block_size_passes_while_trimming(self):

@@ -395,25 +395,35 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self._kv_split_axis = (
             KVSplitAxis.NON_HEAD if region_non_head == {True} else KVSplitAxis.HEAD
         )
-        # The chunk is a whole area today, and reading an area as a token
-        # range is only true of a context cut -- so that range has to be one
-        # area wide and whole.
+        # A chunk is a token range of every block of one group, which a
+        # second attention shape has no descriptor for.
         self._chunk_mode = connector_option(self.vllm_config, "chunk_mode", False)
         if self._chunk_mode and not (
-            self._kv_split_axis is KVSplitAxis.NON_HEAD
-            and self._kv_areas == self._kv_slices
-            and self.block_size % self._kv_areas == 0
-            and not self._has_swa
-            and len(self.kv_cache_config.kv_cache_groups) == 1
+            not self._has_swa and len(self.kv_cache_config.kv_cache_groups) == 1
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode needs a KV "
-                "cache cut on the NON_HEAD axis into unreplicated areas that "
-                "divide the block, in a single full-attention group. Got "
-                f"axis={self._kv_split_axis.name}, areas={self._kv_areas}, "
-                f"slices={self._kv_slices}, block_size={self.block_size}, "
+                "RBLN NIXL (D2D): chunk_mode needs a single "
+                "full-attention KV-cache group. Got "
                 f"groups={len(self.kv_cache_config.kv_cache_groups)}, "
                 f"swa={self._has_swa}."
+            )
+        # On a context cut a region's position is what names the span its
+        # chunks belong to, so the areas have to be unreplicated and divide
+        # the block. A head cut gives every area every token, and reads no
+        # span out of a position at all.
+        if (
+            self._chunk_mode
+            and self._kv_split_axis is KVSplitAxis.NON_HEAD
+            and not (
+                self._kv_areas == self._kv_slices
+                and self.block_size % self._kv_areas == 0
+            )
+        ):
+            raise RuntimeError(
+                "RBLN NIXL (D2D): chunk_mode on a context-cut KV "
+                "cache needs unreplicated chiplet areas that divide the "
+                f"block. Got areas={self._kv_areas}, "
+                f"slices={self._kv_slices}, block_size={self.block_size}."
             )
         logger.info(
             "RBLN NIXL (D2D): registered %d transfer region(s) across %d chiplet "

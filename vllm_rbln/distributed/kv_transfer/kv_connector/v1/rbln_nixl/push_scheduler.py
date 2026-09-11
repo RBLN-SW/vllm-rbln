@@ -44,7 +44,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        # Tokens each handed-over request holds, for the worker's `_tail_areas`.
+        # Tokens each handed-over request holds, for the worker's `_tail_chunks`.
         self._valid_tokens: dict[ReqId, int] = {}
 
     def build_connector_meta(

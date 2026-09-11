@@ -1405,22 +1405,24 @@ class TestTailBlockTrim:
         assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
         assert worker._chunk_mode is False
 
-    def test_a_head_cut_is_refused(self, monkeypatch):
-        # 8 heads over 4 slices is head tiling, where an area holds every token
-        # of some heads -- dropping one drops heads, not the block's tail.
-        with pytest.raises(RuntimeError, match="NON_HEAD axis"):
-            self._register(
-                monkeypatch, areas=4, slices=4, num_kv_heads=8, chunk_mode=True
-            )
+    def test_a_head_cut_is_taken_as_well(self, monkeypatch):
+        # 8 heads over 4 slices is head tiling: an area holds every token of
+        # some heads, so a chunk is a token range of the block rather than of
+        # an area -- which the chunk range names either way.
+        worker = self._register(
+            monkeypatch, areas=4, slices=4, num_kv_heads=8, chunk_mode=True
+        )
+        assert worker._kv_split_axis is KVSplitAxis.HEAD
+        assert worker._chunk_mode is True
 
-    def test_replicated_areas_are_refused(self, monkeypatch):
+    def test_replicated_areas_are_refused_on_a_context_cut(self, monkeypatch):
         # Two areas per slice: the position no longer names one token range.
-        with pytest.raises(RuntimeError, match="NON_HEAD axis"):
+        with pytest.raises(RuntimeError, match="context-cut"):
             self._register(monkeypatch, areas=4, slices=2, chunk_mode=True)
 
     def test_areas_that_do_not_divide_the_block_are_refused(self, monkeypatch):
         # 64 tokens over 5 areas: no area is a whole number of them.
-        with pytest.raises(RuntimeError, match="NON_HEAD axis"):
+        with pytest.raises(RuntimeError, match="context-cut"):
             self._register(monkeypatch, areas=5, slices=5, chunk_mode=True)
 
     def test_host_staging_is_refused_before_anything_registers(self, monkeypatch):

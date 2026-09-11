@@ -64,7 +64,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # Completion notifications seen per request being received, counted
         # against the number of writers the peer put in them.
         self._writer_counts_by_req: defaultdict[str, int] = defaultdict(int)
-        # Tokens a handed-over request holds, for `_tail_areas`.
+        # Tokens a handed-over request holds, for `_tail_chunks`.
         self._valid_tokens: dict[str, int] = {}
 
     def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
@@ -229,7 +229,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # token count describes this producer's whole list, and both lists keep
         # their tail, so the last element is still the request's last block.
         n_prompt_blocks = sum(len(g) for g in local_block_ids)
-        keep_spans = self._tail_areas(n_prompt_blocks, self._valid_tokens.get(req_id))
+        tail_tokens = self._valid_tokens.get(req_id)
         local_block_ids = self._trim_to_consumer_blocks(
             local_block_ids, remote_block_ids, engine_id, meta.remote.request_id
         )
@@ -249,19 +249,21 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # `_read_blocks_for_req`); failure is per peer here, not per request.
         handles: list[int] = []
         for global_rank in peer_ranks:
-            remote_descs = self._get_block_descs_ids_for_shard(
+            remote_descs = self._shard_descs_for_tokens(
                 engine_id,
                 global_rank,
                 self.dst_num_blocks[engine_id],
                 remote_block_ids,
-                keep_spans=keep_spans,
+                num_valid_tokens=tail_tokens,
+                num_prompt_blocks=n_prompt_blocks,
             )
-            local_descs = self._get_block_descs_ids_for_shard(
+            local_descs = self._shard_descs_for_tokens(
                 engine_id,
                 global_rank,
                 self.num_blocks,
                 local_block_ids,
-                keep_spans=keep_spans,
+                num_valid_tokens=tail_tokens,
+                num_prompt_blocks=n_prompt_blocks,
             )
             assert len(local_descs) == len(remote_descs)
             local_handle = self.src_xfer_handles_by_remote[

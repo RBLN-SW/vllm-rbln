@@ -39,6 +39,7 @@ from vllm.utils.network_utils import make_zmq_path
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
     RblnNixlAgentMetadata,
+    connector_option,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     RblnNixlWorkerState,
@@ -46,6 +47,66 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# What the byte target is when nobody names one: large enough that the fixed
+# cost of a descriptor is small beside what it carries.
+DEFAULT_CHUNK_BYTES = 256 * 1024
+
+
+def kv_chunk_tokens(
+    *,
+    span_tokens: int,
+    bytes_per_token: int,
+    prefill_step_tokens: int,
+    chunk_bytes: int = 0,
+    chunk_tokens: int = 0,
+) -> int:
+    """Tokens one chunk of a span holds, ``span_tokens`` for the whole span.
+
+    The byte knob is a floor, not a size: under the transfer size a fabric
+    moves efficiently a descriptor pays more fixed cost than it carries, so a
+    target landing between two sizes that tile the span takes the larger.
+
+    One prefill step is a second floor. A step closes at most one chunk, which
+    is what lets a chunk be the unit a coverage range counts in, and the token
+    knob has to obey it as well -- given a smaller one, an operator has asked
+    for something the write path cannot count in.
+
+    Args:
+        span_tokens: tokens one whole descriptor covers -- a block, or one
+            chiplet area's token range where a context cut gives it one.
+        bytes_per_token: what one token of one span costs.
+        prefill_step_tokens: ``max_num_batched_tokens``. Named for the step
+            rather than the chunk it is, because the chunk this returns is the
+            other one and the two are compared here.
+        chunk_bytes: the byte target; 0 where nobody named one.
+        chunk_tokens: the size itself, named instead of the target; 0 unset.
+    """
+    if chunk_tokens and chunk_tokens < prefill_step_tokens:
+        raise RuntimeError(
+            f"RBLN NIXL: chunk_tokens={chunk_tokens} is under the "
+            f"{prefill_step_tokens}-token prefill step, so a step would close "
+            "several chunks; raise it or leave it unset for the byte target."
+        )
+    if chunk_tokens and chunk_bytes:
+        raise RuntimeError(
+            f"RBLN NIXL: chunk_tokens={chunk_tokens} and chunk_bytes="
+            f"{chunk_bytes} both name a chunk size; set one."
+        )
+    want = max(
+        chunk_tokens or (chunk_bytes or DEFAULT_CHUNK_BYTES) // bytes_per_token,
+        prefill_step_tokens,
+    )
+    # A chunk that does not tile the span leaves a descriptor reaching into the
+    # next one, so the answer is the smallest size at or above the floor that
+    # does. The span itself always qualifies, which is where "no chunk" comes
+    # from.
+    return next(
+        size
+        for size in range(min(want, span_tokens), span_tokens + 1)
+        if span_tokens % size == 0
+    )
 
 
 class RblnNixlHandshakeMixin(RblnNixlWorkerState):
@@ -169,7 +230,26 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # local dlists from our own region ids and must not be translated.
         assert isinstance(nixl_agent_meta, RblnNixlAgentMetadata)
         with self._regions_viewed_as(self._peer_region_ids(nixl_agent_meta)):
-            return super()._build_fa_remote(plan, nixl_agent_meta, block_size_ratio)
+            whole = super()._build_fa_remote(plan, nixl_agent_meta, block_size_ratio)
+        # Upstream's builder is reached only by a peer this rank does not band
+        # by head, which is exactly where `_peer_head_split` answers 1.
+        grid = self._shard_chunk_grid(block_size=nixl_agent_meta.block_size, split=1)
+        if grid is None:
+            return whole
+        # The same addresses cut finer, appended after the whole-block range
+        # rather than inside it, which is the order the local list takes --
+        # a prepared transfer pairs the two by position.
+        runs, chunks = grid
+        return whole + [
+            (
+                addr + r * (length // runs) + c * (length // runs // chunks),
+                length // runs // chunks,
+                device_id,
+            )
+            for addr, length, device_id in whole
+            for r in range(runs)
+            for c in range(chunks)
+        ]
 
     def _build_head_matched_remote(
         self,
@@ -190,6 +270,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         ``registered_layer_names`` narrows this to one pipeline stage, its
         region list indexed by position within the stage; None means the peer
         owns every layer.
+
+        The chunk range follows the whole-piece one where the geometry allows
+        it, asked for here rather than passed in so that the split it is
+        derived from is the split this list was built with.
         """
         areas_l, slices_l = self._kv_areas, self._kv_slices
         areas_r = nixl_agent_meta.kv_areas
@@ -197,6 +281,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
 
         split = self._head_split(
             self.topo.tp_size * slices_l, remote_tp_size * slices_r
+        )
+        chunk_grid = self._shard_chunk_grid(
+            block_size=nixl_agent_meta.block_size, split=split
         )
 
         replicas_l = areas_l // slices_l
@@ -213,50 +300,62 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         out: list[tuple[int, int, int]] = []
         # Axis order is `_shard_local_region_ids`'; within a region, block-major
         # to match _compute_desc_ids' region_id * num_blocks + b.
-        for logical_l, logical_r in logical_pairs:
-            # A model-config count describes the target's layers, and on a
-            # draft's it lands a plausible offset inside the wrong bytes. The
-            # peer's region holds the same layer, so one count answers for both
-            # sides (the handshake verifies it).
-            total_heads = self._region_kv_heads(logical_l)
-            base_l, per_slice_l = self._slice_head_bounds(
-                self.tp_rank,
-                self.topo.tp_size,
-                total_heads,
-                areas_l,
-                slices_l,
-                side="local",
-            )
-            base_r, per_slice_r = self._slice_head_bounds(
-                remote_tp_rank,
-                remote_tp_size,
-                total_heads,
-                areas_r,
-                slices_r,
-                side="peer",
-            )
-            for area_l in areas_iter:
-                out.extend(
-                    self._head_matched_desc(
-                        region_id=logical_l * areas_l + area_l,
-                        logical_r=logical_r,
-                        area_l=area_l,
-                        geom=(base_l, per_slice_l, replicas_l),
-                        peer=(base_r, per_slice_r, replicas_r, slices_r),
-                        areas_r=areas_r,
-                        remote_bases=remote_bases,
-                        remote_lens=remote_lens,
-                        device_id=nixl_agent_meta.device_id,
-                        num_blocks=num_blocks,
-                        split=split,
-                    )
+        # Every region for one grid before the next, which is the order
+        # `_register_shard_local_xfer_handler` builds its list in.
+        grids = [(1, 1)] if chunk_grid is None else [(1, 1), chunk_grid]
+        for grid in grids:
+            for logical_l, logical_r in logical_pairs:
+                # A model-config count describes the target's layers, and on a
+                # draft's it lands a plausible offset inside the wrong bytes. The
+                # peer's region holds the same layer, so one count answers for both
+                # sides (the handshake verifies it).
+                total_heads = self._region_kv_heads(logical_l)
+                base_l, per_slice_l = self._slice_head_bounds(
+                    self.tp_rank,
+                    self.topo.tp_size,
+                    total_heads,
+                    areas_l,
+                    slices_l,
+                    side="local",
                 )
+                base_r, per_slice_r = self._slice_head_bounds(
+                    remote_tp_rank,
+                    remote_tp_size,
+                    total_heads,
+                    areas_r,
+                    slices_r,
+                    side="peer",
+                )
+                for area_l in areas_iter:
+                    out.extend(
+                        self._head_matched_desc(
+                            region_id=logical_l * areas_l + area_l,
+                            logical_r=logical_r,
+                            area_l=area_l,
+                            geom=(base_l, per_slice_l, replicas_l),
+                            peer=(base_r, per_slice_r, replicas_r, slices_r),
+                            areas_r=areas_r,
+                            remote_bases=remote_bases,
+                            remote_lens=remote_lens,
+                            device_id=nixl_agent_meta.device_id,
+                            num_blocks=num_blocks,
+                            split=split,
+                            grid=grid,
+                        )
+                    )
         # Per block, a region becomes one descriptor per head piece per peer
         # copy -- the same count `_register_shard_local_xfer_handler` builds
-        # locally and `_shard_descs_per_block` records.
+        # locally and `_shard_descs_per_block` records -- and that again for
+        # every chunk of every run when a grid follows it.
         fanout = replicas_r if self._writes_into_peer else 1
+        per_grid = 1 if chunk_grid is None else 1 + chunk_grid[0] * chunk_grid[1]
         assert len(out) == (
-            len(logical_pairs) * len(areas_iter) * num_blocks * split * fanout
+            len(logical_pairs)
+            * len(areas_iter)
+            * num_blocks
+            * split
+            * fanout
+            * per_grid
         )
         return out
 
@@ -361,8 +460,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
         if self._chunk_mode and nixl_agent_meta.block_size != self.block_size:
             raise RuntimeError(
-                "RBLN NIXL D2D: trimming a request's last block needs both "
-                "sides to give an area the same token range, but the peer's "
+                "RBLN NIXL D2D: leaving part of a last block out needs both "
+                "sides to cut a block into the same chunks, but the peer's "
                 f"block holds {nixl_agent_meta.block_size} tokens and this "
                 f"worker's holds {self.block_size}."
             )
@@ -388,6 +487,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             del self._shard_region_group_ids[skey]
         for skey in [k for k in self._shard_descs_per_block if k[0] == engine_id]:
             del self._shard_descs_per_block[skey]
+        for skey in [k for k in self._shard_chunk_grids if k[0] == engine_id]:
+            del self._shard_chunk_grids[skey]
         self._remote_shard_layer_names.pop(engine_id, None)
         self._overlapping_ranks.pop(engine_id, None)
         self._remote_pp_size.pop(engine_id, None)
@@ -453,6 +554,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         device_id: int,
         num_blocks: int,
         split: int,
+        grid: tuple[int, int] = (1, 1),
     ) -> list[tuple[int, int, int]]:
         """Descriptors for one local region: ``split`` (`_head_split`) per block.
 
@@ -509,9 +611,22 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     )
                 pieces.append((remote_bases[remote_region] + head_offset, page))
 
+        # One grid's worth. `(1, 1)` names the piece itself, so the default is
+        # what this built before grids existed: `sub_len // 1 // 1` is
+        # `sub_len`. The caller runs every region for one grid before moving to
+        # the next, which is the order the local list is built in -- and
+        # `make_prepped_xfer` pairs the two lists by position.
+        runs, chunks = grid
+        run_span = sub_len // runs
+        desc_len = run_span // chunks
         for block_id in range(num_blocks):
             for base, page in pieces:
-                out.append((base + block_id * page, sub_len, device_id))
+                start = base + block_id * page
+                for r in range(runs):
+                    for c in range(chunks):
+                        out.append(
+                            (start + r * run_span + c * desc_len, desc_len, device_id)
+                        )
         return out
 
     @staticmethod
@@ -936,17 +1051,22 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         remote_tp_size: int = 1,
         replica_fanout: int = 1,
     ) -> None:
-        # The trim reads a region's position modulo the area count as its area.
-        # An area filter compresses those positions, and a head band or a
-        # replica fan-out puts several descriptors on one block.
-        assert not self._chunk_mode or (
-            peer_areas is None and split == 1 and replica_fanout == 1
+        # A context cut makes a region's position name a span, which the span
+        # count reads modulo the area count. An area filter compresses those
+        # positions, and a head band or a replica fan-out puts several
+        # descriptors on one block. A head cut names no span with a position,
+        # so none of that applies to it.
+        assert (
+            not self._chunk_mode
+            or self._spans_per_block == 1
+            or (peer_areas is None and split == 1 and replica_fanout == 1)
         )
         # Compute the local region ids once and reuse them for the handler
         # (PP context is always the shard path: SWA + PP is rejected earlier).
         region_ids = self._shard_local_region_ids(
             registered_layer_names, peer_areas=peer_areas
         )
+        chunk_grid = self._shard_chunk_grid(block_size=block_size, split=split)
         key = (engine_id, global_rank, block_size)
         handle = self._base_fan_in_handle(
             engine_id, global_rank, block_size, region_ids, remote_tp_size
@@ -961,6 +1081,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 split=split,
                 region_ids=region_ids,
                 replica_fanout=replica_fanout,
+                chunk_grid=chunk_grid,
             )
         self.src_xfer_handles_by_remote[key] = handle
         n_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -970,6 +1091,67 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         )
         self._shard_region_group_ids[(engine_id, global_rank)] = (0,) * len(region_ids)
         self._shard_descs_per_block[(engine_id, global_rank)] = split * replica_fanout
+        self._shard_chunk_grids[(engine_id, global_rank)] = chunk_grid
+
+    def _shard_chunk_grid(
+        self, *, block_size: int, split: int
+    ) -> tuple[int, int] | None:
+        """`(byte runs a chunk is spread over, chunks each run is cut into)`.
+
+        None where a chunk comes out the whole span, so neither list grows and
+        a transfer keeps naming whole spans -- which is what a block too small
+        for the byte target, or a prefill chunk as wide as a span, asks for.
+
+        The axis says where a chunk sits. A context cut gives an area the
+        in-block token range [a * span, (a + 1) * span), so a chunk of it is
+        one run of bytes. A head cut gives every area every token of some
+        heads, so the span is the block and a chunk is one run per head -- and
+        that band has to be one number, since the two lists carry one grid:
+        regions that disagree, a draft's named past the target's, get no grid
+        rather than one region's band standing for the rest. A piece narrower
+        than a head gets none for the same reason.
+        """
+        if not self._chunk_mode:
+            return None
+        if self._kv_split_axis is KVSplitAxis.NON_HEAD:
+            spans, heads_per_span = self._kv_areas, 1
+        else:
+            bands = {
+                self._slice_head_bounds(
+                    self.tp_rank,
+                    self.topo.tp_size,
+                    heads,
+                    self._kv_areas,
+                    self._kv_slices,
+                    side="local",
+                )[1]
+                for heads in self._logical_region_kv_heads
+                if heads is not None
+            }
+            if len(bands) != 1:
+                return None
+            spans, heads_per_span = 1, bands.pop()
+        if heads_per_span % split:
+            return None
+        span_tokens = block_size // spans
+        chunk_tokens = kv_chunk_tokens(
+            span_tokens=span_tokens,
+            # A region holds one band of one span, so this divides out both.
+            bytes_per_token=self.block_len_per_layer[0]
+            // (span_tokens * heads_per_span),
+            prefill_step_tokens=(
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            chunk_bytes=connector_option(self.vllm_config, "chunk_bytes", 0),
+            chunk_tokens=connector_option(self.vllm_config, "chunk_tokens", 0),
+        )
+        chunks = span_tokens // chunk_tokens
+        # What keeps the arithmetic downstream free of the axis: a block is a
+        # whole number of chunks however its spans are cut.
+        assert chunk_tokens * chunks * spans == block_size
+        if chunks == 1:
+            return None
+        return heads_per_span // split, chunks
 
     def _reject_uneven_region_slices(self, remote_tp_size: int) -> None:
         """Refuse a head-banded peer whose regions disagree on their slice count.

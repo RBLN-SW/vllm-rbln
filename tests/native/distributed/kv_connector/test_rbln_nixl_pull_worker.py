@@ -32,6 +32,7 @@ from tests.native.distributed.kv_connector.utils import (
     mock_vllm_config,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    KVSplitAxis,
     RblnNixlConnectorMetadata,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
@@ -56,6 +57,7 @@ class TestShardReadPath:
         # Written together with the group ids by _register_shard_xfer_state, so
         # a shard the read path can reach always has both.
         w._shard_descs_per_block = {("eng", 1): 1}
+        w._shard_chunk_grids = {}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
         )
@@ -68,6 +70,7 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0)}  # 2 regions
         w._shard_descs_per_block = {("eng", 1): 2}
+        w._shard_chunk_grids = {}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
         )
@@ -81,7 +84,9 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}
         w._shard_descs_per_block = {("eng", 1): 1}
+        w._shard_chunk_grids = {}
         w._kv_areas = 2
+        w._kv_split_axis = KVSplitAxis.NON_HEAD
         return w
 
     def test_the_tail_block_leaves_the_areas_above_it_out(self):
@@ -110,11 +115,165 @@ class TestShardReadPath:
         )
         assert list(descs) == [4, 24]
 
+    @classmethod
+    def _chunk_worker(cls, grid):
+        # The same 4 regions over 2 areas, now with a chunk range: a 64-token
+        # block is two 32-token areas, each cut into `grid[1]` chunks.
+        w = cls._trim_worker()
+        w.block_size = 64
+        w._chunk_mode = True
+        w._shard_chunk_grids = {("eng", 1): grid}
+        return w
+
+    def test_the_last_block_goes_out_as_the_chunks_that_hold_tokens(self):
+        # 129 tokens over 3 blocks: one token of the last, which is one 16-token
+        # chunk of area 0. So the block range drops that block everywhere and
+        # the chunk range names its first chunk -- in area 0's regions only,
+        # since an area IS a token range here.
+        w = self._chunk_worker((1, 2))
+
+        descs = w._shard_descs_for_tokens(
+            "eng",
+            1,
+            10,
+            [[2, 5, 7]],
+            num_valid_tokens=129,
+            num_prompt_blocks=3,
+        )
+
+        # 40 whole descriptors come first (4 regions x 10 blocks), then two
+        # chunks per block: 40 + (0*10 + 7)*2 for region 0 and 40 + (2*10 +
+        # 7)*2 for region 2.
+        assert list(descs) == [2, 5, 12, 15, 22, 25, 32, 35, 54, 94]
+
+    def test_a_tail_that_lands_on_a_span_boundary_needs_no_chunk(self):
+        # 145 tokens: 17 of the last block, which needs both 16-token chunks of
+        # area 0 and none of area 1. Whole spans come from the block range, so
+        # this is the trim on its own -- the chunk range names nothing.
+        w = self._chunk_worker((1, 2))
+
+        descs = w._shard_descs_for_tokens(
+            "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=145, num_prompt_blocks=3
+        )
+
+        assert list(descs) == [2, 5, 7, 12, 15, 22, 25, 27, 32, 35]
+
+    def test_a_last_block_needing_every_chunk_goes_whole(self):
+        # A full last block: the chunk range would cost the same bytes in more
+        # descriptors.
+        w = self._chunk_worker((1, 2))
+
+        descs = w._shard_descs_for_tokens(
+            "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=192, num_prompt_blocks=3
+        )
+
+        assert list(descs) == [2, 5, 7, 12, 15, 17, 22, 25, 27, 32, 35, 37]
+
+    def test_a_head_cut_sends_the_last_blocks_chunks_in_every_region(self):
+        # A head cut gives every region every token of some heads, so the
+        # chunks of a partly-filled block are in all of them and the block
+        # range drops that block everywhere. Two chunks a block here, so one
+        # token of the last block is its first chunk in each of two runs.
+        w = self._chunk_worker((2, 2))
+        w._kv_split_axis = KVSplitAxis.HEAD
+
+        descs = w._shard_descs_for_tokens(
+            "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=129, num_prompt_blocks=3
+        )
+
+        # Four chunk descriptors a block, so region r's block 7 starts at
+        # 40 + (r*10 + 7)*4 and its two runs are two apart.
+        assert list(descs) == [2, 5, 12, 15, 22, 25, 32, 35] + [
+            68,
+            70,
+            108,
+            110,
+            148,
+            150,
+            188,
+            190,
+        ]
+
+    @pytest.mark.parametrize("grid", [(1, 2), (2, 4), (3, 8)])
+    def test_a_head_cut_never_drops_the_last_block_from_a_region(self, grid):
+        """Every region carries the last block, whatever it is filled to.
+
+        A head cut spreads no span axis over the regions, so `keep_spans` has
+        to stay 0 and the block range has to drop the last block from all of
+        them or none. `_tail_chunks` is what holds it there: it answers None
+        once every chunk is needed, and `needed // chunks_per_span` is 0 for
+        every answer below that. Raise that cut by one and `keep_spans`
+        becomes 1, whose position predicate is the context-cut shape -- the
+        regions above area 0 drop the block while `part` is 0, so no chunk
+        descriptor replaces it and that KV never leaves. The pre-transfer
+        length check compares index counts, so nothing fails: the peer settles
+        on a request whose last block is partly missing.
+        """
+        w = self._chunk_worker(grid)
+        w._kv_split_axis = KVSplitAxis.HEAD
+        runs, chunks = grid
+        num_blocks, last_block = 10, 7
+        regions = len(w._shard_region_group_ids[("eng", 1)])
+        chunk_range = regions * num_blocks
+
+        for rem in range(1, w.block_size + 1):
+            descs = set(
+                w._shard_descs_for_tokens(
+                    "eng",
+                    1,
+                    num_blocks,
+                    [[2, 5, last_block]],
+                    num_valid_tokens=2 * w.block_size + rem,
+                    num_prompt_blocks=3,
+                ).tolist()
+            )
+            for region in range(regions):
+                block_ix = region * num_blocks + last_block
+                base = chunk_range + block_ix * runs * chunks
+                carried = ({block_ix} | set(range(base, base + runs * chunks))) & descs
+                assert carried, (
+                    f"{rem} token(s) in the last block: region {region} sends "
+                    f"none of it (grid {grid})"
+                )
+
+    def test_a_full_last_block_is_one_descriptor_a_region_under_a_head_cut(self):
+        """The collapse point of the head-cut sweep, named on its own.
+
+        A last block needing every chunk goes whole, so each region spends one
+        descriptor on it rather than `runs * chunks`. This is the value the
+        cut is asserting, and the case a raised cut turns into silent loss.
+        """
+        w = self._chunk_worker((2, 4))
+        w._kv_split_axis = KVSplitAxis.HEAD
+
+        descs = w._shard_descs_for_tokens(
+            "eng",
+            1,
+            10,
+            [[2, 5, 7]],
+            num_valid_tokens=3 * w.block_size,
+            num_prompt_blocks=3,
+        )
+
+        assert list(descs) == [2, 5, 7, 12, 15, 17, 22, 25, 27, 32, 35, 37]
+
+    def test_a_peer_without_a_chunk_range_still_drops_whole_areas(self):
+        # What a deployment whose spans a chunk cannot cut keeps getting: the
+        # area is the unit, and no index reaches a range its lists lack.
+        w = self._chunk_worker(None)
+
+        descs = w._shard_descs_for_tokens(
+            "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=129, num_prompt_blocks=3
+        )
+
+        assert list(descs) == [2, 5, 7, 12, 15, 22, 25, 27, 32, 35]
+
     def test_a_head_band_split_cannot_be_trimmed(self):
         # With more than one descriptor per block the position no longer names
         # an area, so the two would index different things.
         w = self._trim_worker()
         w._shard_descs_per_block = {("eng", 1): 2}
+        w._shard_chunk_grids = {}
         with pytest.raises(AssertionError):
             w._get_block_descs_ids_for_shard(
                 "eng", 1, num_blocks=10, block_ids=[[2, 5]], keep_spans=1
@@ -124,6 +283,7 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 0): (0, 0)}
         w._shard_descs_per_block = {("eng", 0): 1}
+        w._shard_chunk_grids = {}
         descs = w._get_block_descs_ids_for_shard("eng", 0, num_blocks=4, block_ids=[[]])
         assert descs.size == 0
 
@@ -157,6 +317,7 @@ class TestShardReadPath:
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         # Off, as the default is; the chunk tests turn it on.
+        w._shard_chunk_grids = {}
         w._chunk_mode = False
         w._recv_valid_tokens = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
@@ -266,6 +427,7 @@ class TestShardReadPath:
         w = self._read_worker(pp_size=2)
         w._chunk_mode = True
         w._kv_areas = 2
+        w._kv_split_axis = KVSplitAxis.NON_HEAD
         w.block_size = 16
         w._recv_valid_tokens = {"r0": 33}
 
