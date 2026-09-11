@@ -117,20 +117,30 @@ class RBLNRejectionSampler(RejectionSampler):
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
-        # Indexing with a tensor creates new storage, so both slices below are
-        # safe to update in place.
+        # Both selections create new storage, so they are safe to update in
+        # place; `index_select` is the cheaper gather on the device.
         assert logits is not None
-        bonus_logits = logits[bonus_logits_indices]
-        raw_target_logits = logits[target_logits_indices]
+        bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+        raw_target_logits = torch.index_select(logits, 0, target_logits_indices)
 
         output_logprobs_requested = sampling_metadata.max_num_logprobs is not None
         bonus_token_ids = None
-        if (
-            sampling_metadata.all_greedy
+        # The graph draws the bonus token unless logprobs need the sampler's
+        # logits or an active argmax-invariant processor (min-p) reshapes the
+        # rows before the draw; the activity test is `RBLNSampler.sample`'s.
+        bonus_in_graph = (
+            isinstance(self.impl, RBLNRejectionSamplerImpl)
             and not output_logprobs_requested
             and not sampling_metadata.logprob_token_ids
-            and isinstance(self.impl, RBLNRejectionSamplerImpl)
-        ):
+            and (
+                sampling_metadata.all_greedy
+                or not any(
+                    getattr(p, "min_p_count", 1)
+                    for p in sampling_metadata.logitsprocs.argmax_invariant
+                )
+            )
+        )
+        if bonus_in_graph:
             bonus_logits = self.sampler.apply_logits_processors(
                 bonus_logits, sampling_metadata, predict_bonus_token=True
             )
@@ -431,6 +441,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                     batch_size, dtype=torch.int32, device=device
                 ),
                 "counts": torch.zeros(batch_size, dtype=torch.int32, device=device),
+                "bonus_temperature": torch.ones(batch_size, dtype=dtype, device=device),
             }
 
         # Pad the packed inputs to the fixed [B*K] length the op wants. Rows past
@@ -474,6 +485,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         # NOTE(RBLN): Per-row temperature for the divide inside the graph. Padding
         # and greedy rows must carry 1.0 -- a 0 would divide by zero.
         reshaped_temperature = bufs["ones"]
+        bonus_temperature = None
         temperature = sampling_metadata.temperature
         if not sampling_metadata.all_greedy and temperature is not None:
             reshaped_temperature = bufs["temperature"]
@@ -483,6 +495,10 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                     temperature.new_ones(()),
                     temperature,
                 )
+            if bonus_logits is not None:
+                # Per-row temperature for the in-graph bonus draw.
+                bonus_temperature = bufs["bonus_temperature"]
+                bonus_temperature.copy_(temperature)
             if padded_len == N:
                 # Full K drafts everywhere, so request r's draft c sits at
                 # r * K + c. The input must stay directly allocated: an
@@ -511,6 +527,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             bonus_token_ids,
             num_draft_tokens_t,
             bonus_logits,
+            bonus_temperature,
         )
 
     def apply_sampling_constraints(
@@ -540,6 +557,7 @@ def rbln_rejection_sample(
     bonus_token_ids: torch.Tensor | None,
     num_draft_tokens: torch.Tensor,
     bonus_logits: torch.Tensor | None = None,
+    bonus_temperature: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample, then build the output token ids.
 
@@ -554,9 +572,13 @@ def rbln_rejection_sample(
             a 0 would divide by zero. Shape is [B*K].
         draft_per_batch: Per-request, with `PLACEHOLDER_TOKEN_ID` in the
             padding. Shape is [B, K], int32.
-        bonus_token_ids: The token to emit when a request accepts every draft
-            it proposed. Shape is [B, 1].
+        bonus_token_ids: The token a request that accepts every draft emits.
+            Shape is [B, 1]. None when the graph draws it from `bonus_logits`.
         num_draft_tokens: Shape is [B], int32.
+        bonus_logits: The bonus rows' raw logits, argmaxed unless
+            `bonus_temperature` is given. Shape is [B, vocab_size].
+        bonus_temperature: Per-row divisor for a top-k/top-p draw of the bonus
+            token under the same `top_k`/`top_p`. Shape is [B].
 
     Returns:
         The sampled token ids, `PLACEHOLDER_TOKEN_ID` in unfilled slots. Shape
@@ -615,7 +637,13 @@ def rbln_rejection_sample(
     bonus_mask = all_accepted.unsqueeze(1) & (
         positions_k1 == num_draft_tokens.unsqueeze(1)
     )
-    if bonus_logits is not None:
+    if bonus_logits is not None and bonus_temperature is not None:
+        # The bonus sampler's draw; a greedy row's top_k == 1 makes it an argmax.
+        bonus_probs = torch.softmax(
+            bonus_logits / bonus_temperature.unsqueeze(1), dim=-1
+        )
+        bonus = torch.ops.rbln.top_k_top_p(bonus_probs, top_k, top_p).reshape(-1, 1)
+    elif bonus_logits is not None:
         # `rbln::argmax` returns [B]; `bonus_token_ids` already comes as [B, 1].
         bonus = torch.ops.rbln.argmax(bonus_logits).unsqueeze(1)
     else:
