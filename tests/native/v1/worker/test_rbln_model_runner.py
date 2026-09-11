@@ -355,8 +355,17 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
 
     runner._warmup_sampler_decode_batches()
 
-    assert rejection_sample.call_count == 1
-    assert len(rejection_sample.call_args.args[1]) == 4
+    # One call per bonus-token graph: the argmax-in-graph one an all-greedy
+    # step without logprobs takes, and the pre-sampled-ids one every other
+    # step takes. Both are warmed at the same batch bound.
+    assert rejection_sample.call_count == 2
+    for call in rejection_sample.call_args_list:
+        assert len(call.args[1]) == 4
+    variants = [
+        (call.args[6] is None, call.kwargs["bonus_logits"] is None)
+        for call in rejection_sample.call_args_list
+    ]
+    assert sorted(variants) == [(False, True), (True, False)]
 
 
 class TestPredicates:
