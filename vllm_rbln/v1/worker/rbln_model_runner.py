@@ -1967,6 +1967,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_ids=list(self.input_batch.req_ids),
             placeholder_pos=dict(self._placeholder_pos),
             logprobs_tensors=self._async_logprobs_tensors,
+            parallel_config=self.parallel_config,
         )
         return async_output
 

@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
+    VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR: bool = True
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -310,6 +311,11 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
+    # Disable only for debugging worker failures without terminating mp workers.
+    "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR": lambda: os.environ.get(
+        "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", "1"
+    ).lower()
+    not in ("0", "false", "no"),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (
@@ -405,6 +411,7 @@ RBLN_COMPILE_ENV = frozenset(
 
 RBLN_NON_COMPILE_ENV = frozenset(
     {
+        "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR",
         # sampler graphs compile with use_cache=False, never enter the bundle
         "VLLM_RBLN_SAMPLER",
         "VLLM_RBLN_COMPILE_STRICT_MODE",

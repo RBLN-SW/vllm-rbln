@@ -18,7 +18,8 @@ import os
 import platform
 from collections import defaultdict
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
@@ -46,6 +47,46 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+WORKER_DEVICE_FAILURE_EXIT_CODE = 70
+
+
+def abort_worker(exc: Exception, *, where: str) -> NoReturn:
+    """Skip device cleanup, which may block on the failed context."""
+    try:
+        logger.error(
+            "RBLN worker %d: %s raised %s: %s. Ending this worker process "
+            "with exit code %d so the executor detects the failure.",
+            os.getpid(),
+            where,
+            type(exc).__name__,
+            exc,
+            WORKER_DEVICE_FAILURE_EXIT_CODE,
+            exc_info=exc,
+        )
+    finally:
+        # StreamHandler flushes each record; avoid shutdown's handler locks.
+        os._exit(WORKER_DEVICE_FAILURE_EXIT_CODE)
+
+
+def fail_fast_on_device_error(function: _F) -> _F:
+    """Guard worker methods and deferred outputs that carry parallel_config."""
+
+    @wraps(function)
+    def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return function(self, *args, **kwargs)
+        except Exception as exc:
+            if (
+                self.parallel_config.distributed_executor_backend == "mp"
+                and envs.VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR
+            ):
+                abort_worker(exc, where=function.__qualname__)
+            raise
+
+    return guarded  # type: ignore[return-value]
+
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
 # sysfs lists every card on the host, /dev only ours; reading sysfs by the raw

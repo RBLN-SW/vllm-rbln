@@ -17,11 +17,15 @@
 # thread drains a step later.
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from vllm.v1.outputs import ModelRunnerOutput
 
+import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.v1.worker.async_output import (
     AsyncRBLNModelRunnerOutput,
     PendingTokenWriteback,
@@ -42,7 +46,7 @@ def _output(req_ids):
     )
 
 
-def _async_output(tokens, *, invalid_req_indices=()):
+def _async_output(tokens, *, invalid_req_indices=(), backend="uni"):
     req_ids = [f"r{i}" for i in range(len(tokens))]
     queue: PendingTokenWriteback = deque()
     async_out = AsyncRBLNModelRunnerOutput(
@@ -53,11 +57,51 @@ def _async_output(tokens, *, invalid_req_indices=()):
         req_ids=req_ids,
         placeholder_pos={req_id: 3 for req_id in req_ids},
         logprobs_tensors=None,
+        parallel_config=SimpleNamespace(distributed_executor_backend=backend),
     )
     return async_out, queue
 
 
 class TestGetOutput:
+    @pytest.mark.parametrize("failure_stage", ["copy", "logprobs"])
+    @pytest.mark.parametrize(
+        ("backend", "enabled", "should_exit"),
+        [("mp", "1", True), ("mp", "0", False), ("uni", "1", False)],
+    )
+    def test_output_thread_failure_uses_worker_exit_policy(
+        self, monkeypatch, failure_stage, backend, enabled, should_exit
+    ):
+        async_out, _ = _async_output([[7]], backend=backend)
+        error = RuntimeError("device output failed")
+        if failure_stage == "copy":
+            monkeypatch.setattr(
+                async_out._sampled_token_ids_cpu, "copy_", Mock(side_effect=error)
+            )
+        else:
+            async_out._logprobs_tensors = SimpleNamespace(
+                tolists=Mock(side_effect=error)
+            )
+        monkeypatch.setenv("VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", enabled)
+        exit_codes = []
+
+        def fake_exit(code):
+            exit_codes.append(code)
+            raise SystemExit(code)
+
+        monkeypatch.setattr(worker_utils.os, "_exit", fake_exit)
+        expected = SystemExit if should_exit else RuntimeError
+        with (
+            ThreadPoolExecutor(max_workers=1) as pool,
+            pytest.raises(expected) as excinfo,
+        ):
+            pool.submit(async_out.get_output).result(timeout=5)
+        if should_exit:
+            assert exit_codes == [70]
+            assert excinfo.value.code == 70
+        else:
+            assert exit_codes == []
+            assert excinfo.value is error
+
     def test_returns_the_sampled_tokens(self):
         async_out, _ = _async_output([[7], [8]])
         assert async_out.get_output().sampled_token_ids == [[7], [8]]

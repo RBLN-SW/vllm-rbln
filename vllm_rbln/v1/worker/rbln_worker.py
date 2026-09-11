@@ -76,7 +76,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.worker.device_fail_fast import fail_fast_on_device_error
 from vllm_rbln.v1.worker.kv_profile import (
     MERGED_PROFILE_LOG_KEY,
     assert_budget_covers_profile,
@@ -89,6 +88,7 @@ from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
     estimate_model_kernel_size,
+    fail_fast_on_device_error,
     get_rbln_planned_affinity_cpu_count,
     read_rbln_card_dram_total_bytes,
     read_rbln_card_dram_used_bytes,
