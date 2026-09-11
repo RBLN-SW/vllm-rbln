@@ -1403,6 +1403,89 @@ class TestDummyRunDraftParticipation:
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)  # must not raise
 
 
+class TestRecvIntermediateTensorsLanding:
+    # rcclRecv takes a single pointer, so a PP recv can only fill one device area.
+    # The graph input is pinned and may be replicated across chiplets, so the recv
+    # lands in a staging tensor and is copied in — the copy is what reaches every
+    # area the input is replicated across.
+    HIDDEN = 4
+    KEY = (2, 3)
+
+    def _runner(self, monkeypatch, recorded):
+        def make_empty(batch_size, dtype, device):
+            return {
+                "hidden_states": torch.zeros(batch_size, self.HIDDEN, dtype=dtype),
+                "residual": torch.zeros(batch_size, self.HIDDEN, dtype=dtype),
+            }
+
+        runner = _make_runner_stub(
+            model=SimpleNamespace(make_empty_intermediate_tensors=make_empty),
+            model_config=SimpleNamespace(dtype=torch.float16),
+            device=torch.device("cpu"),
+            intermediate_tensors_dict={},
+            recv_landing_dict={},
+        )
+
+        num_reqs_padded, query_len = self.KEY
+        meta = mr.TensorMetadata(
+            "cpu", torch.float16, torch.Size((num_reqs_padded, query_len, self.HIDDEN))
+        )
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(
+                rank_in_group=1,
+                world_size=2,
+                ranks=[0, 1],
+                cpu_group=object(),
+                device_group=object(),
+                recv_object=lambda src: [("hidden_states", meta), ("residual", meta)],
+            ),
+        )
+
+        def irecv(tensor, src, group):
+            recorded.append(tensor)
+            tensor.fill_(float(len(recorded)))
+            return SimpleNamespace(wait=lambda: None)
+
+        monkeypatch.setattr(torch.distributed, "irecv", irecv)
+        return runner
+
+    def test_recv_lands_in_staging_then_copies_into_pinned_input(self, monkeypatch):
+        recorded: list = []
+        runner = self._runner(monkeypatch, recorded)
+
+        out = runner.recv_intermediate_tensors()
+
+        landing = runner.recv_landing_dict[self.KEY]
+        pinned = runner.intermediate_tensors_dict[self.KEY]
+        # irecv wrote into the staging tensors, not the graph input.
+        assert [id(t) for t in recorded] == [
+            id(landing["hidden_states"]),
+            id(landing["residual"]),
+        ]
+        # The graph input is handed on unchanged in identity, with the data copied in.
+        for name in ("hidden_states", "residual"):
+            assert out[name] is pinned[name]
+            assert torch.equal(out[name], landing[name])
+        assert out["hidden_states"][0, 0, 0] == 1.0
+        assert out["residual"][0, 0, 0] == 2.0
+
+    def test_staging_and_input_are_reused_across_calls(self, monkeypatch):
+        recorded: list = []
+        runner = self._runner(monkeypatch, recorded)
+
+        first = runner.recv_intermediate_tensors()
+        landing_first = runner.recv_landing_dict[self.KEY]["hidden_states"]
+        second = runner.recv_intermediate_tensors()
+
+        # One staging set and one graph input per shape; neither is reallocated.
+        assert runner.recv_landing_dict[self.KEY]["hidden_states"] is landing_first
+        assert second["hidden_states"] is first["hidden_states"]
+        # The second recv's data replaced the first's.
+        assert second["hidden_states"][0, 0, 0] == 3.0
+
+
 class TestDummyRunPPIntermediateTensors:
     # A non-first PP rank builds empty intermediate tensors for the dummy step at
     # the group-bucket batch (num_reqs_padded), since the stager passes them
@@ -1440,6 +1523,7 @@ class TestDummyRunPPIntermediateTensors:
             input_stager=SimpleNamespace(stage=stage),
             model_executable=lambda **k: None,
             intermediate_tensors_dict={},
+            recv_landing_dict={},
         )
         monkeypatch.setattr(RBLNModelRunner, "use_wrapped_compute_logits", False)
         monkeypatch.setattr(
@@ -1466,6 +1550,22 @@ class TestDummyRunPPIntermediateTensors:
         )
         monkeypatch.setattr(mr, "build_kv_cache_forward_context_kwargs", lambda b: {})
         return runner, captured
+
+    def test_dummy_run_claims_the_recv_staging_buffer(self, monkeypatch):
+        # The staging buffer a PP recv lands in is allocated here rather than on the
+        # first recv, so a shape's first real step does not pay for it.
+        runner, _ = self._runner(monkeypatch, num_reqs_padded=8, query_len=1)
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        key = (8, 1)
+        assert key in runner.recv_landing_dict
+        landing = runner.recv_landing_dict[key]
+        graph_input = runner.intermediate_tensors_dict[key]
+        for name in graph_input.tensors:
+            assert landing[name].shape == graph_input[name].shape
+            assert landing[name].dtype == graph_input[name].dtype
+            # Distinct storage: the recv must not reach the graph input.
+            assert landing[name].data_ptr() != graph_input[name].data_ptr()
 
     def test_idle_intermediate_tensors_use_group_bucket(self, monkeypatch):
         # DP-idle (warmup=False): this rank stages num_reqs=1 but a peer forced
