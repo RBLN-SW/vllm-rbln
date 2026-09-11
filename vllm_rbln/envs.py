@@ -79,8 +79,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_STEP: int = 2
     VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
-    # --- KV CONNECTOR ---
-    VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
     # --- QUANTIZATION ---
     VLLM_RBLN_USE_W8A8: bool = False
 
@@ -372,17 +370,6 @@ environment_variables = {
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
-    # --- KV CONNECTOR ---
-    # Publish a second SWA-sized descriptor range alongside the Full-sized
-    # range at the same NIXL base addresses, so SWA groups transfer only
-    # `sliding_window` bytes per block over RDMA. Host-side h2d/d2h still
-    # moves the full block — only the remote RDMA payload is trimmed.
-    "VLLM_RBLN_NIXL_SWA_VIEW_OPT": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_NIXL_SWA_VIEW_OPT", "False").lower()
-            in ("true", "1")
-        )
-    ),
     # --- QUANTIZATION ---
     # W8A16 runs on every RBLN NPU, W8A8 only on the ones whose kernels take an
     # fp8 activation, so W8A8 is opted into rather than derived from the device.
@@ -421,7 +408,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_DISABLE_OFFLOAD",
         "VLLM_RBLN_AUTO_PORT",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
-        "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_COMPILE_MODEL",
