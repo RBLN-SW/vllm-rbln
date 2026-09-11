@@ -28,6 +28,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
+from tests.native.distributed.kv_connector.utils import (
+    mock_vllm_config,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    KVSplitAxis,
+    RblnNixlConnectorMetadata,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
@@ -50,6 +57,7 @@ class TestShardReadPath:
         # Written together with the group ids by _register_shard_xfer_state, so
         # a shard the read path can reach always has both.
         w._shard_descs_per_block = {("eng", 1): 1}
+        w._shard_chunk_grids = {}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
         )
@@ -62,16 +70,220 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0)}  # 2 regions
         w._shard_descs_per_block = {("eng", 1): 2}
+        w._shard_chunk_grids = {}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
         )
         # region 0: blocks 2,5 -> descs (2*2,+1) and (5*2,+1); region 1 adds 10*2.
         assert list(descs) == [4, 5, 10, 11, 24, 25, 30, 31]
 
+    @staticmethod
+    def _trim_worker():
+        # 4 regions over 2 chiplet areas: positions 0,2 are area 0 and 1,3 are
+        # area 1, which is the relation the trim indexes by.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}
+        w._shard_descs_per_block = {("eng", 1): 1}
+        w._shard_chunk_grids = {}
+        w._kv_areas = 2
+        w._kv_split_axis = KVSplitAxis.NON_HEAD
+        return w
+
+    def test_the_tail_block_leaves_the_areas_above_it_out(self):
+        w = self._trim_worker()
+        descs = w._get_block_descs_ids_for_shard(
+            "eng", 1, num_blocks=10, block_ids=[[2, 5, 7]], keep_spans=1
+        )
+        # Area 0 keeps all three blocks; area 1 drops the last, and the list
+        # stays region-major so the two sides still pair by position.
+        assert list(descs) == [2, 5, 7, 12, 15, 22, 25, 27, 32, 35]
+
+    def test_no_tail_is_todays_list(self):
+        # Same input, and the descriptors a full last block still needs.
+        w = self._trim_worker()
+        descs = w._get_block_descs_ids_for_shard(
+            "eng", 1, num_blocks=10, block_ids=[[2, 5, 7]], keep_spans=None
+        )
+        assert list(descs) == [2, 5, 7, 12, 15, 17, 22, 25, 27, 32, 35, 37]
+
+    def test_a_single_block_drops_the_higher_areas_entirely(self):
+        # The whole request is that one block, so an area above its last token
+        # contributes no descriptor at all rather than an empty range.
+        w = self._trim_worker()
+        descs = w._get_block_descs_ids_for_shard(
+            "eng", 1, num_blocks=10, block_ids=[[4]], keep_spans=1
+        )
+        assert list(descs) == [4, 24]
+
+    @classmethod
+    def _chunk_worker(cls, grid):
+        # The same 4 regions over 2 areas, now with a chunk range: a 64-token
+        # block is two 32-token areas, each cut into `grid[1]` chunks.
+        w = cls._trim_worker()
+        w.block_size = 64
+        w._chunk_mode = True
+        w._shard_chunk_grids = {("eng", 1): grid}
+        return w
+
+    def test_the_last_block_goes_out_as_the_chunks_that_hold_tokens(self):
+        # 129 tokens over 3 blocks: one token of the last, which is one 16-token
+        # chunk of area 0. So the block range drops that block everywhere and
+        # the chunk range names its first chunk -- in area 0's regions only,
+        # since an area IS a token range here.
+        w = self._chunk_worker((1, 2))
+
+        descs = w._shard_descs_for_tokens(
+            "eng",
+            1,
+            10,
+            [[2, 5, 7]],
+            num_valid_tokens=129,
+            num_prompt_blocks=3,
+        )
+
+        # 40 whole descriptors come first (4 regions x 10 blocks), then two
+        # chunks per block: 40 + (0*10 + 7)*2 for region 0 and 40 + (2*10 +
+        # 7)*2 for region 2.
+        assert list(descs) == [2, 5, 12, 15, 22, 25, 32, 35, 54, 94]
+
+    def test_a_tail_that_lands_on_a_span_boundary_needs_no_chunk(self):
+        # 145 tokens: 17 of the last block, which needs both 16-token chunks of
+        # area 0 and none of area 1. Whole spans come from the block range, so
+        # this is the trim on its own -- the chunk range names nothing.
+        w = self._chunk_worker((1, 2))
+
+        descs = w._shard_descs_for_tokens(
+            "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=145, num_prompt_blocks=3
+        )
+
+        assert list(descs) == [2, 5, 7, 12, 15, 22, 25, 27, 32, 35]
+
+    def test_a_last_block_needing_every_chunk_goes_whole(self):
+        # A full last block: the chunk range would cost the same bytes in more
+        # descriptors.
+        w = self._chunk_worker((1, 2))
+
+        descs = w._shard_descs_for_tokens(
+            "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=192, num_prompt_blocks=3
+        )
+
+        assert list(descs) == [2, 5, 7, 12, 15, 17, 22, 25, 27, 32, 35, 37]
+
+    def test_a_head_cut_sends_the_last_blocks_chunks_in_every_region(self):
+        # A head cut gives every region every token of some heads, so the
+        # chunks of a partly-filled block are in all of them and the block
+        # range drops that block everywhere. Two chunks a block here, so one
+        # token of the last block is its first chunk in each of two runs.
+        w = self._chunk_worker((2, 2))
+        w._kv_split_axis = KVSplitAxis.HEAD
+
+        descs = w._shard_descs_for_tokens(
+            "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=129, num_prompt_blocks=3
+        )
+
+        # Four chunk descriptors a block, so region r's block 7 starts at
+        # 40 + (r*10 + 7)*4 and its two runs are two apart.
+        assert list(descs) == [2, 5, 12, 15, 22, 25, 32, 35] + [
+            68,
+            70,
+            108,
+            110,
+            148,
+            150,
+            188,
+            190,
+        ]
+
+    @pytest.mark.parametrize("grid", [(1, 2), (2, 4), (3, 8)])
+    def test_a_head_cut_never_drops_the_last_block_from_a_region(self, grid):
+        """Every region carries the last block, whatever it is filled to.
+
+        A head cut spreads no span axis over the regions, so `keep_spans` has
+        to stay 0 and the block range has to drop the last block from all of
+        them or none. `_tail_chunks` is what holds it there: it answers None
+        once every chunk is needed, and `needed // chunks_per_span` is 0 for
+        every answer below that. Raise that cut by one and `keep_spans`
+        becomes 1, whose position predicate is the context-cut shape -- the
+        regions above area 0 drop the block while `part` is 0, so no chunk
+        descriptor replaces it and that KV never leaves. The pre-transfer
+        length check compares index counts, so nothing fails: the peer settles
+        on a request whose last block is partly missing.
+        """
+        w = self._chunk_worker(grid)
+        w._kv_split_axis = KVSplitAxis.HEAD
+        runs, chunks = grid
+        num_blocks, last_block = 10, 7
+        regions = len(w._shard_region_group_ids[("eng", 1)])
+        chunk_range = regions * num_blocks
+
+        for rem in range(1, w.block_size + 1):
+            descs = set(
+                w._shard_descs_for_tokens(
+                    "eng",
+                    1,
+                    num_blocks,
+                    [[2, 5, last_block]],
+                    num_valid_tokens=2 * w.block_size + rem,
+                    num_prompt_blocks=3,
+                ).tolist()
+            )
+            for region in range(regions):
+                block_ix = region * num_blocks + last_block
+                base = chunk_range + block_ix * runs * chunks
+                carried = ({block_ix} | set(range(base, base + runs * chunks))) & descs
+                assert carried, (
+                    f"{rem} token(s) in the last block: region {region} sends "
+                    f"none of it (grid {grid})"
+                )
+
+    def test_a_full_last_block_is_one_descriptor_a_region_under_a_head_cut(self):
+        """The collapse point of the head-cut sweep, named on its own.
+
+        A last block needing every chunk goes whole, so each region spends one
+        descriptor on it rather than `runs * chunks`. This is the value the
+        cut is asserting, and the case a raised cut turns into silent loss.
+        """
+        w = self._chunk_worker((2, 4))
+        w._kv_split_axis = KVSplitAxis.HEAD
+
+        descs = w._shard_descs_for_tokens(
+            "eng",
+            1,
+            10,
+            [[2, 5, 7]],
+            num_valid_tokens=3 * w.block_size,
+            num_prompt_blocks=3,
+        )
+
+        assert list(descs) == [2, 5, 7, 12, 15, 17, 22, 25, 27, 32, 35, 37]
+
+    def test_a_peer_without_a_chunk_range_still_drops_whole_areas(self):
+        # What a deployment whose spans a chunk cannot cut keeps getting: the
+        # area is the unit, and no index reaches a range its lists lack.
+        w = self._chunk_worker(None)
+
+        descs = w._shard_descs_for_tokens(
+            "eng", 1, 10, [[2, 5, 7]], num_valid_tokens=129, num_prompt_blocks=3
+        )
+
+        assert list(descs) == [2, 5, 7, 12, 15, 22, 25, 27, 32, 35]
+
+    def test_a_head_band_split_cannot_be_trimmed(self):
+        # With more than one descriptor per block the position no longer names
+        # an area, so the two would index different things.
+        w = self._trim_worker()
+        w._shard_descs_per_block = {("eng", 1): 2}
+        w._shard_chunk_grids = {}
+        with pytest.raises(AssertionError):
+            w._get_block_descs_ids_for_shard(
+                "eng", 1, num_blocks=10, block_ids=[[2, 5]], keep_spans=1
+            )
+
     def test_get_block_descs_ids_for_shard_empty_group(self):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 0): (0, 0)}
         w._shard_descs_per_block = {("eng", 0): 1}
+        w._shard_chunk_grids = {}
         descs = w._get_block_descs_ids_for_shard("eng", 0, num_blocks=4, block_ids=[[]])
         assert descs.size == 0
 
@@ -84,7 +296,7 @@ class TestShardReadPath:
         w._overlapping_ranks = {"eng": list(range(pp_size))}
         # The read notification carries how many of us read each producer rank,
         # which counts our pipeline ranks too (see _xfer_notif_id).
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
         w._has_mamba = False  # non-Mamba scope: _apply_prefix_caching end-trims
         w.world_size = 1
@@ -104,6 +316,10 @@ class TestShardReadPath:
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
+        # Off, as the default is; the chunk tests turn it on.
+        w._shard_chunk_grids = {}
+        w._chunk_mode = False
+        w._recv_valid_tokens = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
         w._remote_agents = {"eng": {r: f"agent{r}" for r in range(pp_size)}}
@@ -204,6 +420,40 @@ class TestShardReadPath:
             assert len(remote_descs) == 2
         assert len(w._recving_transfers["r0"]) == 2
 
+    def test_the_producers_token_count_shortens_the_read(self):
+        # The same read with the producer's count in hand: its
+        # last block holds one token, so only the first of the two areas is
+        # read and each stage issues half the descriptors.
+        w = self._read_worker(pp_size=2)
+        w._chunk_mode = True
+        w._kv_areas = 2
+        w._kv_split_axis = KVSplitAxis.NON_HEAD
+        w.block_size = 16
+        w._recv_valid_tokens = {"r0": 33}
+
+        w._read_blocks_for_req("r0", self._meta([[7]], [[3, 4, 7]]))
+
+        assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
+        for c in w.nixl_wrapper.make_prepped_xfer.call_args_list:
+            local_descs, remote_descs = c.args[2], c.args[4]
+            assert len(local_descs) == len(remote_descs)
+            assert len(remote_descs) == 1
+        # Consumed, so a later step cannot read it against another block list.
+        assert w._recv_valid_tokens == {}
+
+    def test_a_count_arriving_before_the_read_is_kept(self):
+        # A request whose handshake is still running is read on a later step,
+        # whose metadata no longer lists it -- so the counts accumulate.
+        w = self._read_worker(pp_size=1)
+        w._recv_valid_tokens = {"earlier": 5}
+        meta = RblnNixlConnectorMetadata()
+        meta.valid_tokens = {"r0": 33}
+
+        with patch.object(NixlPullConnectorWorker, "start_load_kv"):
+            w.start_load_kv(meta)
+
+        assert w._recv_valid_tokens == {"earlier": 5, "r0": 33}
+
     def test_single_stage_read_delegates_to_upstream(self):
         # A producer that advertised pp_size 1 reads through the upstream path:
         # the per-stage loop would key handles the non-PP registration never
@@ -212,6 +462,8 @@ class TestShardReadPath:
         w._engine_last_active = {}
         w._remote_pp_size = {}  # unknown engine defaults to a single stage
         w._overlapping_ranks = {}  # nothing narrowed -> upstream's handle covers it
+        w._chunk_mode = False
+        w._recv_valid_tokens = {}
         w.transfer_topo = MagicMock()
         meta = MagicMock()
         meta.remote.engine_id = "eng"
@@ -221,6 +473,57 @@ class TestShardReadPath:
 
         base_read.assert_called_once_with("r0", meta)
         assert "eng" in w._engine_last_active
+
+    def test_a_windowed_engine_reads_chunked_through_upstreams_route(self):
+        # Chunk mode normally means per-shard descriptors, and reaching this
+        # route without them is a bug. A sliding window is the exception: its
+        # view gave the whole-engine list the extra range, and the per-shard
+        # lists cannot name its two KV groups at all.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._engine_last_active = {}
+        w._remote_pp_size = {}
+        w._overlapping_ranks = {}
+        w._chunk_mode = True
+        w._sw_ratio = 8
+        w._chunk_grid = None
+        w._request_tail = None
+        w._group_specs = [MagicMock()]  # one full-attention group
+        w._recv_valid_tokens = {"r0": 17}
+        w.transfer_topo = MagicMock()
+        meta = MagicMock()
+        meta.remote.engine_id = "eng"
+        meta.remote.block_ids = [[1, 2]]
+
+        seen = []
+        with patch.object(
+            NixlPullConnectorWorker,
+            "_read_blocks_for_req",
+            lambda self, req_id, m: seen.append(self._request_tail),
+        ):
+            w._read_blocks_for_req("r0", meta)
+
+        # The token count and the request's own block count, parked for the
+        # length of that call: upstream's `_compute_desc_ids` is what selects
+        # the descriptors and its signature has no room for either.
+        assert seen == [(17, 2)]
+        assert w._request_tail is None
+
+    def test_a_chunked_engine_without_a_window_may_not_reach_it(self):
+        # The other side of the same rule: nothing else leaves a chunked
+        # engine on a list that cannot leave part of a block out.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._engine_last_active = {}
+        w._remote_pp_size = {}
+        w._overlapping_ranks = {}
+        w._chunk_mode = True
+        w._sw_ratio = None
+        w._recv_valid_tokens = {}
+        w.transfer_topo = MagicMock()
+        meta = MagicMock()
+        meta.remote.engine_id = "eng"
+
+        with pytest.raises(AssertionError):
+            w._read_blocks_for_req("r0", meta)
 
     @pytest.mark.parametrize(
         ("local_tp", "remote_tp", "local_pp", "remote_pp", "expected_readers"),
@@ -242,7 +545,7 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.world_size = local_tp
         w._remote_pp_size = {"eng": remote_pp}
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = local_pp
 
         notif = w._xfer_notif_id("eng", "req-1", remote_tp).decode()
@@ -323,6 +626,8 @@ class TestUpstreamReachesTheOverride:
         w = TestShardReadPath._read_worker(pp_size=1)
         w._overlapping_ranks = {}  # nothing narrowed -> delegate to upstream
         w._sw_ratio = 2
+        w._chunk_grid = None  # no chunk range: the two ranges as before
+        w._request_tail = None
         w._group_specs = [_sliding_window_spec()]
         w.num_regions = 2
         w._physical_blocks_per_logical_kv_block = 1

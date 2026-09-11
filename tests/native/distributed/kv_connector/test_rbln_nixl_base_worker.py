@@ -17,7 +17,7 @@
 # geometry use `make_worker`, where upstream's __init__ runs; the rest use
 # `build_worker`, which stubs it down to what the RBLN overrides read.
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
@@ -97,6 +97,31 @@ class TestSwaViewRatio:
         # whether or not the view-opt is on.
         assert worker._has_swa
 
+    def test_chunk_mode_turns_the_view_on_over_the_flag(self, monkeypatch):
+        # The chunk range extends this layout and has nowhere else to sit:
+        # `_compute_desc_ids` hands the whole list to upstream where the ratio
+        # is None, and upstream's list carries no second range.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",  # chunk mode is the direct path's
+            swa_view_opt=False,
+            chunk_mode=True,
+            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+        )
+        assert worker._sw_ratio == 4
+
+    def test_chunk_mode_invents_no_ratio_without_a_window(self, monkeypatch):
+        # The override rides on the window, not on the knob: an engine with no
+        # sliding window has nothing to view.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            swa_view_opt=False,
+            chunk_mode=True,
+            specs=[MagicMock()],
+        )
+        assert worker._sw_ratio is None
+
     def test_pure_full_attention_keeps_ratio_none(self, monkeypatch):
         # A non-sliding-window group contributes no ratio.
         worker = build_worker(monkeypatch, swa_view_opt=True, specs=[MagicMock()])
@@ -109,6 +134,25 @@ class TestSwaViewRatio:
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
         assert worker._sw_ratio == 4
+
+    def test_chunk_mode_turning_the_view_on_says_so(self, monkeypatch, caplog):
+        # The operator asked for no view and got one. This log is the only place
+        # that says so, and a chunk range has nowhere else to sit.
+        with caplog.at_level("WARNING"):
+            worker = build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                swa_view_opt=False,
+                chunk_mode=True,
+                specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+            )
+
+        assert worker._sw_ratio == 4
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if "turned the SWA view on" in r.getMessage()
+        ]
 
     def test_window_equal_to_block_collapses_to_none(self, monkeypatch):
         # ratio 1 means the SWA view equals the full block -> no trimming.
@@ -162,7 +206,7 @@ class TestSwaViewRatio:
     def test_mla_with_view_opt_is_rejected_at_startup(self, monkeypatch):
         # The dual desc range and a key-only latent have not been combined,
         # so fail at construction rather than at the first handshake.
-        with pytest.raises(RuntimeError, match="SWA_VIEW_OPT"):
+        with pytest.raises(RuntimeError, match="sliding-window MLA"):
             build_worker(
                 monkeypatch,
                 swa_view_opt=True,
@@ -282,3 +326,59 @@ class TestRegisterLocalXferHandlerSwa:
         assert [addr for addr, _, _ in swa] == [addr for addr, _, _ in full]
         assert {desc_len for _, desc_len, _ in full} == {full_len}
         assert {desc_len for _, desc_len, _ in swa} == {full_len // w._sw_ratio}
+
+    def test_a_chunk_grid_appends_a_third_range(self, monkeypatch):
+        # A grid of (2 runs, 2 chunks) turns each region-block's one Full
+        # descriptor into four quarter-length ones, appended after BOTH
+        # existing ranges -- the SWA view keeps its index space and the
+        # transfer picks a range by offset.
+        worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
+        worker._sw_ratio = 2
+        worker._has_mamba = False
+        worker.tp_rank = 0
+        worker.device_id = 0
+        worker.transfer_topo = MagicMock(is_kv_layout_blocks_first=False)
+        worker.kv_caches_base_addr = {worker.engine_id: {0: [0x1000, 0x2000]}}
+        worker.block_len_per_layer = [256, 256]
+        worker.nixl_memory_type = "DRAM"
+        worker.nixl_wrapper = MagicMock()
+
+        with (
+            patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
+            patch.object(type(worker), "_shard_chunk_grid", return_value=(2, 2)),
+        ):
+            worker.register_local_xfer_handler(64)
+
+        blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
+        # 16 as before, then 2 regions x 4 blocks x 2 runs x 2 chunks.
+        assert len(blocks_data) == 16 + 32
+        # Region 0, block 0: two runs of two chunks, quarter length each. A run
+        # is a head's stretch of the block, so the second run starts halfway.
+        assert blocks_data[16:20] == [
+            (0x1000, 64, 0),
+            (0x1040, 64, 0),
+            (0x1080, 64, 0),
+            (0x10C0, 64, 0),
+        ]
+
+    def test_no_chunk_grid_leaves_the_two_ranges_alone(self, monkeypatch):
+        # Off the knob the list must not grow: a longer dlist is memory every
+        # peer pays for.
+        worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
+        worker._sw_ratio = 2
+        worker._has_mamba = False
+        worker.tp_rank = 0
+        worker.device_id = 0
+        worker.transfer_topo = MagicMock(is_kv_layout_blocks_first=False)
+        worker.kv_caches_base_addr = {worker.engine_id: {0: [0x1000, 0x2000]}}
+        worker.block_len_per_layer = [256, 256]
+        worker.nixl_memory_type = "DRAM"
+        worker.nixl_wrapper = MagicMock()
+
+        with (
+            patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
+            patch.object(type(worker), "_shard_chunk_grid", return_value=None),
+        ):
+            worker.register_local_xfer_handler(64)
+
+        assert len(worker.nixl_wrapper.get_xfer_descs.call_args[0][0]) == 16

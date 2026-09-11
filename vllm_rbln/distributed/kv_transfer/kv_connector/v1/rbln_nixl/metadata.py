@@ -27,13 +27,17 @@ completing a handshake.
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from vllm.config.utils import hash_factors
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlAgentMetadata,
+    NixlConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
 
 if TYPE_CHECKING:
-    from vllm.config import SpeculativeConfig
+    from vllm.config import SpeculativeConfig, VllmConfig
 
 # Bump on any incompatible change to the RBLN metadata schema or semantics.
 # Folded into the NIXL compatibility hash so an RBLN peer speaking a different
@@ -78,6 +82,54 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # The default keeps a blob without this field meaning what versions 2 and 3
     # meant by the two counts above.
     kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
+
+
+class RblnNixlConnectorMetadata(NixlConnectorMetadata):
+    """``NixlConnectorMetadata`` + what the trim needs to size a last block.
+
+    Promoted from the instance upstream builds rather than constructed in its
+    place: ``NixlBaseConnectorScheduler.build_connector_meta`` names the
+    upstream type directly and offers no hook for a subclass. This struct stays
+    inside one engine -- it never reaches a peer -- so it is not part of the
+    handshake schema and does not move ``RBLN_NIXL_CONNECTOR_VERSION``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Tokens of KV the offered block list holds, so a last block that is not
+        # full can leave the areas above its final token behind. Absent where
+        # the count is unknown, which keeps the whole block.
+        self.valid_tokens: dict[ReqId, int] = {}
+
+    @classmethod
+    def promote(cls, base: NixlConnectorMetadata) -> "RblnNixlConnectorMetadata":
+        meta = cls()
+        meta.__dict__.update(base.__dict__)
+        return meta
+
+
+_T = TypeVar("_T")
+
+
+def connector_option(vllm_config: "VllmConfig", key: str, default: _T) -> _T:
+    """One of this connector's knobs, from ``--kv-transfer-config``.
+
+    They live in ``kv_connector_extra_config`` rather than the environment
+    because that is where vLLM puts a connector's own options, and because the
+    environment is read for the mega-cache bundle key -- a transfer knob
+    changes no compiled graph and has no business partitioning it.
+
+    The type follows the default. That config arrives as JSON, so a bool and an
+    int come through as themselves; anything else is a mistake worth naming
+    here rather than coercing into a truthy string.
+    """
+    value = vllm_config.kv_transfer_config.get_from_extra_config(key, default)
+    if not isinstance(value, type(default)):
+        raise RuntimeError(
+            f"RBLN NIXL: kv_connector_extra_config[{key!r}] is "
+            f"{value!r}, but this knob takes a {type(default).__name__}"
+        )
+    return value
 
 
 def rbln_compat_hash(

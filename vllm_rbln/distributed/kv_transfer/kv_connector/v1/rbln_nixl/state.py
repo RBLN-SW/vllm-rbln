@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from collections import defaultdict
 from typing import Any, ClassVar
 
@@ -53,6 +54,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _kv_areas: int
     _kv_slices: int
     _kv_split_axis: KVSplitAxis
+    _chunk_mode: bool
     _logical_region_kv_heads: list[int | None]
     _logical_region_slices: list[int]
     local_seen_layer_names: list[str]
@@ -65,6 +67,19 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _borrowed_src_handles: set[tuple[str, int, int]]
     _shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
     _shard_descs_per_block: dict[tuple[str, int], int]
+    _shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None]
+    _chunk_grid: tuple[int, int] | None
+    _request_tail: tuple[int | None, int] | None
+
+    @property
+    def _spans_per_block(self) -> int:
+        """Descriptors a block's token axis is spread over.
+
+        A context cut gives each chiplet area a token range of every block, so
+        the block's tokens are `_kv_areas` descriptors. A head cut gives every
+        area every token of some heads, so they are one.
+        """
+        return self._kv_areas if self._kv_split_axis is KVSplitAxis.NON_HEAD else 1
 
     @property
     def topo(self) -> TransferTopology:
@@ -155,13 +170,46 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     # Hybrid Full + SWA desc layout (RDMA payload only)
     # ------------------------------------------------------------------
     #
-    # Regions are Full-sized. With VLLM_RBLN_NIXL_SWA_VIEW_OPT and an SWA group,
+    # Regions are Full-sized. With swa_view_opt and an SWA group,
     # two desc ranges share the base addrs: [0, N) Full-length, [N, 2N)
     # sliding_window-length. SWA groups read only the prefix, so RDMA moves less
     # while the host copy still moves whole blocks. _compute_desc_ids routes each
     # group to its range; _sw_ratio None collapses to Full-only. Safe because the
     # tail SWA writes back is never read and the Full/SWA block-id pools are
     # disjoint.
+
+    @staticmethod
+    def _chunk_range_descs(
+        pieces: list[tuple[int, int, int, int]],
+        *,
+        num_blocks: int,
+        grid: tuple[int, int],
+    ) -> list[tuple[int, int, int]]:
+        """A third range: every block of every region, cut into token chunks.
+
+        `pieces` is `(base address, whole length, block stride, device id)` per
+        region; the two sides differ in where those come from and in nothing
+        else. Region-major, then block, then run, then chunk, which is the
+        order `_chunk_desc_ids` reads back.
+
+        A run is one contiguous stretch of a block's bytes. Heads are the outer
+        axis inside a block, so a token range is one run per head the region
+        holds -- naming it as a single prefix would move the first head's
+        tokens and leave the rest stale, and nothing would report it.
+        """
+        runs, chunks = grid
+        out: list[tuple[int, int, int]] = []
+        for base, whole_len, stride, device_id in pieces:
+            run_span = whole_len // runs
+            desc_len = run_span // chunks
+            for block_id in range(num_blocks):
+                start = base + block_id * stride
+                for r in range(runs):
+                    for c in range(chunks):
+                        out.append(
+                            (start + r * run_span + c * desc_len, desc_len, device_id)
+                        )
+        return out
 
     def register_local_xfer_handler(
         self,
@@ -172,6 +220,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         split: int = 1,
         region_ids: list[int] | None = None,
         replica_fanout: int = 1,
+        chunk_grid: tuple[int, int] | None = None,
     ) -> tuple[int, list[tuple[int, int, int]]]:
         if self._sw_ratio is None:
             if (
@@ -192,6 +241,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 split=split,
                 region_ids=region_ids,
                 replica_fanout=replica_fanout,
+                chunk_grid=chunk_grid,
             )
         assert (
             registered_layer_names is None
@@ -211,12 +261,14 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         block_size_ratio = self.block_size // block_size
         local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
         num_blocks = self.num_blocks * block_size_ratio
+        t0 = time.perf_counter()
         blocks_data: list[tuple[int, int, int]] = []
 
         # Two passes when SWA is present: Full descs first, then SWA descs
         # at the same base addresses but `sliding_window`-sized.
         # _sw_ratio is not None here (the None case returned early above).
         length_divisors = [1, self._sw_ratio]
+        pieces: list[tuple[int, int, int, int]] = []
         for divisor in length_divisors:
             for i, base_addr in enumerate(local_base_addresses):
                 kv_block_len = (
@@ -227,16 +279,32 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                     // divisor
                 )
                 stride = self.block_len_per_layer[i] // block_size_ratio
+                if divisor == 1:
+                    pieces.append((base_addr, kv_block_len, stride, self.device_id))
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * stride
                     blocks_data.append((addr, kv_block_len, self.device_id))
 
-        logger.debug(
-            "Created %s local blocks (%s) for engine %s rank %s",
+        # Asked for here rather than handed in, so that the block size it is
+        # derived from is the block size this list was built with.
+        grid = self._shard_chunk_grid(block_size=block_size, split=1)
+        if grid is not None:
+            blocks_data += self._chunk_range_descs(
+                pieces, num_blocks=num_blocks, grid=grid
+            )
+
+        logger.info(
+            "RBLN NIXL: %d local descriptor(s) for this engine over %d region(s) "
+            "x %d block(s): whole, a 1/%d sliding-window view, and %s. Built in "
+            "%.1fms.",
             len(blocks_data),
-            "Full + SWA",
-            self.engine_id,
-            self.tp_rank,
+            len(local_base_addresses),
+            num_blocks,
+            self._sw_ratio,
+            f"a chunk range of {grid[0]} run(s) x {grid[1]} chunk(s)"
+            if grid is not None
+            else "no chunk range",
+            (time.perf_counter() - t0) * 1000.0,
         )
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
@@ -253,7 +321,20 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         split: int = 1,
         region_ids: list[int] | None = None,
         replica_fanout: int = 1,
+        chunk_grid: tuple[int, int] | None = None,
     ) -> tuple[int, list[tuple[int, int, int]]]:
+        """Prepare this shard's local descriptors, optionally twice over.
+
+        `chunk_grid` is `(runs, chunks)`: how many byte runs one piece is
+        spread over and how many token chunks each run is cut into. Given, a
+        second range of descriptors follows the first over the same addresses,
+        naming those chunks -- the shape `swa_view_opt` already
+        uses for a shorter view of the same blocks. A transfer picks one range
+        or the other by index, so both can be selected in one call.
+
+        A token range is one run per axis the block spreads it over, so it is
+        `runs * chunks` descriptors where the whole piece is 1.
+        """
         assert not self.topo.is_kv_layout_blocks_first, (
             "RBLN NIXL connector only supports FA layout (K and V in separate "
             "regions), not FlashInfer."
@@ -268,33 +349,58 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 registered_layer_names, peer_areas=peer_areas
             )
 
+        t0 = time.perf_counter()
         blocks_data: list[tuple[int, int, int]] = []
-        for region_id in region_ids:
-            base_addr = all_base_addrs[region_id]
-            kv_block_len = (
-                self.get_backend_aware_kv_block_len(
-                    layer_idx=region_id, first_split=True, mamba_view=False
+        # The whole piece first, then its chunks. `(1, 1)` names the piece
+        # itself, so the first pass is what this built before `chunk_grid`.
+        grids = [(1, 1)] if chunk_grid is None else [(1, 1), chunk_grid]
+        for runs, chunks in grids:
+            for region_id in region_ids:
+                base_addr = all_base_addrs[region_id]
+                kv_block_len = (
+                    self.get_backend_aware_kv_block_len(
+                        layer_idx=region_id, first_split=True, mamba_view=False
+                    )
+                    // block_size_ratio
                 )
-                // block_size_ratio
-            )
-            stride = self.block_len_per_layer[region_id] // block_size_ratio
-            # The pieces are consecutive byte ranges on this side -- it is the
-            # REMOTE side that scatters.
-            sub_len = kv_block_len // split
-            for block_id in range(num_blocks):
-                for j in range(split):
-                    # One entry per peer copy this piece goes to: the same
-                    # bytes reach every replica (see _head_matched_desc), so
-                    # the source repeats while the destination advances.
-                    for _ in range(replica_fanout):
-                        blocks_data.append(
-                            (
-                                base_addr + block_id * stride + j * sub_len,
-                                sub_len,
-                                self.device_id,
-                            )
-                        )
+                stride = self.block_len_per_layer[region_id] // block_size_ratio
+                # The pieces are consecutive byte ranges on this side -- it is
+                # the REMOTE side that scatters.
+                sub_len = kv_block_len // split
+                run_span = sub_len // runs
+                desc_len = run_span // chunks
+                for block_id in range(num_blocks):
+                    for j in range(split):
+                        # One entry per peer copy this piece goes to: the same
+                        # bytes reach every replica (see _head_matched_desc),
+                        # so the source repeats while the destination advances.
+                        for _ in range(replica_fanout):
+                            piece = base_addr + block_id * stride + j * sub_len
+                            for r in range(runs):
+                                for c in range(chunks):
+                                    blocks_data.append(
+                                        (
+                                            piece + r * run_span + c * desc_len,
+                                            desc_len,
+                                            self.device_id,
+                                        )
+                                    )
 
+        if chunk_grid is not None:
+            runs, chunks = chunk_grid
+            per_grid = 1 + runs * chunks
+            logger.info(
+                "RBLN NIXL: %d local descriptor(s) for this shard, %d of them a "
+                "chunk range of %d run(s) x %d chunk(s) carrying %dB each; a "
+                "whole piece carries %dB. Built in %.1fms.",
+                len(blocks_data),
+                len(blocks_data) // per_grid * (per_grid - 1),
+                runs,
+                chunks,
+                blocks_data[-1][1],
+                blocks_data[0][1],
+                (time.perf_counter() - t0) * 1000.0,
+            )
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
         return (
             self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs),

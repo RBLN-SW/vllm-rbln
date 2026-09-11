@@ -30,10 +30,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 )
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker as pw
+from tests.native.distributed.kv_connector.utils import (
+    mock_vllm_config,
+    set_mock_connector_options,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
     RblnNixlPullConnectorWorker,
     RblnNixlPushConnectorWorker,
     RblnNixlWorkerBase,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    KVSplitAxis,
+    RblnNixlConnectorMetadata,
 )
 
 
@@ -67,6 +75,9 @@ def _push_worker():
     # the shape the pairing predicates read before an engine is registered.
     w.use_host_buffer = False
     w._sw_ratio = None
+    # Off, as the environment variable is; the trim tests turn it on.
+    w._chunk_mode = False
+    w._valid_tokens = {}
     # __init__ never ran, so the writer state shutdown() reaches through
     # __del__ is absent; silence it rather than leak an unraisable at GC.
     w.shutdown = lambda: None
@@ -214,7 +225,7 @@ class TestPerShardWrite:
         w = _push_worker()
         w._remote_pp_size = {"eng": 1}
         w._overlapping_ranks = {"eng": list(range(ranks))}
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
         w.world_size = 1
         w.num_blocks = 8
@@ -226,6 +237,7 @@ class TestPerShardWrite:
         # Written together with the group ids by _register_shard_xfer_state, so a
         # shard the write path can reach always has both.
         w._shard_descs_per_block = {("eng", r): 1 for r in range(ranks)}
+        w._shard_chunk_grids = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(ranks)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(ranks)}}
         w._sending_transfers = defaultdict(list)
@@ -266,6 +278,97 @@ class TestPerShardWrite:
         assert (calls[1].args[1], calls[1].args[3]) == (101, 201)
         # The request settles only once every WRITE it issued has completed.
         assert len(worker._sending_transfers["r0"]) == 2
+
+    @classmethod
+    def _trimming_worker(cls):
+        # 2 regions over 2 areas, 16-token blocks: area 0 holds the first 8
+        # in-block positions and area 1 the rest.
+        w = cls._writing_worker(ranks=1)
+        w._chunk_mode = True
+        w._kv_areas = 2
+        w._kv_split_axis = KVSplitAxis.NON_HEAD
+        w.block_size = 16
+        w._valid_tokens = {"r0": 17}
+        return w
+
+    def test_the_handover_leaves_the_empty_area_of_the_last_block_out(self):
+        # 17 tokens over two blocks: the second holds one, which is area 0's.
+        worker = self._trimming_worker()
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2],), ([3, 4],)))
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        local_descs, remote_descs = call.args[2], call.args[4]
+        assert len(local_descs) == len(remote_descs) == 3
+
+    def test_the_count_reaches_the_writer_through_the_metadata(self, monkeypatch):
+        # The write reads worker state, and only start_load_kv puts the
+        # scheduler's count there -- so the trim has to survive that hop.
+        worker = self._trimming_worker()
+        worker._valid_tokens = {}
+        meta = RblnNixlConnectorMetadata()
+        meta.valid_tokens = {"r0": 17}
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
+        )
+
+        worker.start_load_kv(meta)
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2],), ([3, 4],)))
+
+        assert len(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4]) == 3
+
+    def test_a_count_from_an_earlier_step_survives_the_next(self, monkeypatch):
+        # A request handed over in one step is written in a later one, whose
+        # metadata no longer lists it -- so the counts accumulate rather than
+        # replace. Replaced, that request writes its last block whole.
+        worker = self._trimming_worker()
+        worker._valid_tokens = {"earlier": 5}
+        meta = RblnNixlConnectorMetadata()
+        meta.valid_tokens = {"r0": 17}
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
+        )
+
+        worker.start_load_kv(meta)
+
+        assert worker._valid_tokens == {"earlier": 5, "r0": 17}
+
+    def test_a_consumer_that_had_the_front_still_sizes_the_last_block(self):
+        # The consumer registered only the suffix it was missing, so our list
+        # is trimmed before the write. The token count describes the request's
+        # OWN blocks, so counting after the trim would read 17 tokens as one
+        # block's worth and refuse the write.
+        worker = self._trimming_worker()
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2],), ([4],)))
+
+        call = worker.nixl_wrapper.make_prepped_xfer.call_args
+        local_descs, remote_descs = call.args[2], call.args[4]
+        # One block left to write, and the trim on the last block still applies.
+        assert len(local_descs) == len(remote_descs) == 1
+
+    def test_a_full_last_block_writes_every_area(self):
+        # The same write with a count that fills both blocks: nothing to leave
+        # out, and the descriptor list is the one this path always sent.
+        worker = self._trimming_worker()
+        worker._valid_tokens = {"r0": 32}
+
+        worker._xfer_blocks_for_req("r0", self._meta(([1, 2],), ([3, 4],)))
+
+        assert len(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4]) == 4
+
+    def test_a_reported_request_drops_its_token_count(self, monkeypatch):
+        # Nothing else pops it, so a count kept here would outlive its request.
+        worker = self._trimming_worker()
+        worker._valid_tokens = {"r0": 17, "other": 9}
+        worker._writer_counts_by_req = defaultdict(int)
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "get_finished", lambda self: ({"r0"}, set())
+        )
+
+        worker.get_finished()
+
+        assert worker._valid_tokens == {"other": 9}
 
     def test_upstreams_own_submission_path_reaches_our_override(self):
         # Calling the override directly keeps passing if upstream renames the
@@ -572,10 +675,12 @@ class TestSaveBeforeWriteInvariant:
 
     @staticmethod
     def _meta(saves, pushes):
-        return SimpleNamespace(
-            reqs_to_save=dict.fromkeys(saves, object()),
-            push_finished_blocks=dict.fromkeys(pushes, ([1],)),
-        )
+        # The real type, not a stand-in: start_load_kv reads a field only the
+        # promoted metadata carries.
+        meta = RblnNixlConnectorMetadata()
+        meta.reqs_to_save = dict.fromkeys(saves, object())
+        meta.push_finished_blocks = dict.fromkeys(pushes, ([1],))
+        return meta
 
     def test_the_same_request_in_both_is_refused(self, monkeypatch):
         monkeypatch.setattr(
@@ -781,6 +886,12 @@ class TestTheThreeListsAgree:
         w.nixl_wrapper.get_xfer_descs.side_effect = lambda data, _t: data
         w.nixl_wrapper.prep_xfer_dlist.return_value = 7
         w.nixl_memory_type = "VRAM"
+        # A block of 16 tokens whose 2-head region costs 16B a token: a 128B
+        # descriptor target is 8 tokens, so a block is two chunks.
+        w._chunk_mode = True
+        w._kv_split_axis = KVSplitAxis.HEAD
+        w.vllm_config = mock_vllm_config()
+        w.vllm_config.scheduler_config.max_num_batched_tokens = 8
         return w
 
     @staticmethod
@@ -789,6 +900,7 @@ class TestTheThreeListsAgree:
         meta = MagicMock()
         meta.kv_areas, meta.kv_slices = 4, 2
         meta.num_blocks = 2
+        meta.block_size = 16
         meta.device_id = 0
         # Same shape as ours: K and V, each across its four areas.
         meta.kv_caches_base_addr = [100_000 * (i + 1) for i in range(8)]
@@ -798,17 +910,23 @@ class TestTheThreeListsAgree:
     @pytest.mark.parametrize(
         "cls", [RblnNixlPullConnectorWorker, RblnNixlPushConnectorWorker]
     )
-    def test_both_sides_describe_the_same_number_of_pieces(self, cls):
+    def test_both_sides_describe_the_same_number_of_pieces(self, cls, monkeypatch):
         worker = self._worker(cls)
+        set_mock_connector_options(worker.vllm_config, chunk_bytes=128)
         peer = self._peer()
         fanout = worker._peer_replica_fanout(peer, 4)
         split = worker._peer_head_split(peer, 4)
         areas = worker._fan_in_peer_areas(0, 4)
 
+        # The two builders derive the grid rather than take it, so this is
+        # what `_register_shard_xfer_state` passes the local one, not a knob.
+        grid = worker._shard_chunk_grid(block_size=worker.block_size, split=split)
+
         remote = worker._build_head_matched_remote(peer, 0, 4, peer_areas=areas)
         _handle, local = worker._register_shard_local_xfer_handler(
             worker.block_size,
             ("l0",),
+            chunk_grid=grid,
             peer_areas=areas,
             split=split,
             replica_fanout=fanout,
@@ -818,6 +936,9 @@ class TestTheThreeListsAgree:
         # And that length is the fan-out times what one copy would have needed.
         assert len(remote) % fanout == 0
         assert (cls is RblnNixlPushConnectorWorker) == (fanout == 2)
+        # This shape has to be one that carries a chunk range -- without it
+        # the two lists agree trivially and say nothing about the range.
+        assert grid == (1, 2)
 
 
 class TestDelegatedRouteAlignment:
@@ -846,6 +967,40 @@ class TestDelegatedRouteAlignment:
         )
         worker._xfer_blocks_for_req("r0", meta)
         return seen["local"]
+
+    @pytest.mark.parametrize("sw_ratio, raises", [(8, False), (None, True)])
+    def test_a_chunked_engine_reaches_this_route_only_with_a_window(
+        self, monkeypatch, sw_ratio, raises
+    ):
+        # Chunk mode asks every peer for per-shard state, so arriving here
+        # without it is a bug -- except where a sliding window's view already
+        # put the extra range on the whole-engine list.
+        w = self._worker()
+        w._chunk_mode = True
+        w._sw_ratio = sw_ratio
+        w._chunk_grid = None
+        w._request_tail = None
+        w._group_specs = [MagicMock()]  # one full-attention group
+        w._valid_tokens = {"r0": 17}
+        meta = TestPerShardWrite._meta(([5, 6, 7],), ([9],))
+
+        if raises:
+            with pytest.raises(AssertionError):
+                self._local_reaching_base(monkeypatch, w, meta)
+            return
+
+        seen = []
+        monkeypatch.setattr(
+            NixlPushConnectorWorker,
+            "_xfer_blocks_for_req",
+            lambda self, req_id, m: seen.append(self._request_tail),
+        )
+        w._xfer_blocks_for_req("r0", meta)
+
+        # The token count and the request's own block count, counted before
+        # the trim and parked for the length of upstream's call.
+        assert seen == [(17, 3)]
+        assert w._request_tail is None
 
     def test_the_producer_tail_is_what_reaches_the_base(self, monkeypatch):
         # The consumer kept one block: its cache covered everything before it.

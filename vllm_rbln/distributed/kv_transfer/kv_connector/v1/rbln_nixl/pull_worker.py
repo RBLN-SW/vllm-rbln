@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -22,10 +23,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnNixlConnectorMetadata,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqMeta
+    from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+        ReqMeta,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
@@ -37,6 +46,23 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
     read -- which peers to issue it against.
     """
 
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        engine_id: str,
+        kv_cache_config: "KVCacheConfig",
+    ) -> None:
+        super().__init__(vllm_config, engine_id, kv_cache_config)
+        # The producer's token count per request, until the read consumes it.
+        self._recv_valid_tokens: dict[str, int] = {}
+
+    def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
+        assert isinstance(metadata, RblnNixlConnectorMetadata)
+        # Accumulated rather than replaced: a request waiting on a handshake is
+        # deferred and read on a later step, whose metadata does not list it.
+        self._recv_valid_tokens.update(metadata.valid_tokens)
+        super().start_load_kv(metadata)
+
     def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
@@ -45,13 +71,29 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         # mid-transfer.
         self._engine_last_active[engine_id] = time.perf_counter()
         pp_size = self._remote_pp_size.get(engine_id, 1)
+        valid_tokens = self._recv_valid_tokens.pop(req_id, None)
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         # Per-shard lists exist exactly for peers serving part of what a
         # whole-engine handle covers. Re-deriving that from the parallel sizes
         # misses the reverse case: a producer without pipelining still serves
         # several of our ranks when ours is the finer one.
         if not self._overlapping_ranks.get(engine_id):
-            return super()._read_blocks_for_req(req_id, meta)
+            # Chunk mode registers per-shard state against every peer unless
+            # a sliding window kept it on this route, so reaching upstream's
+            # whole-engine read without one means it did not.
+            assert not self._chunk_mode or self._sw_ratio is not None
+            # Counted before the call: upstream trims the front of both lists
+            # against the local prefix cache, and the token count describes the
+            # request's own blocks.
+            tail: AbstractContextManager = (
+                self._tail_viewed_as(
+                    valid_tokens, self._prompt_blocks(meta.remote.block_ids)
+                )
+                if self._chunk_mode
+                else nullcontext()
+            )
+            with tail:
+                return super()._read_blocks_for_req(req_id, meta)
 
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size
@@ -71,6 +113,9 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
             engine_id, meta.remote.request_id, remote_info.remote_tp_size
         )
         prefix_hit = len(local_block_ids) == 0
+        # Counted before the prefix trim below, which cuts the front: the token
+        # count describes the producer's whole list, and both lists keep their
+        # tail, so the last element is still the request's last block.
         n_prompt_blocks = sum(len(g) for g in remote_block_ids)
 
         if not prefix_hit:
@@ -124,14 +169,23 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                     self.xfer_stats.record_failed_notification()
                 continue
 
-            remote_descs = self._get_block_descs_ids_for_shard(
+            # Per peer, because the chunk grid is: a read reaches several
+            # producers, and there is no step where they agree on one.
+            remote_descs = self._shard_descs_for_tokens(
                 engine_id,
                 global_rank,
                 self.dst_num_blocks[engine_id],
                 remote_block_ids,
+                num_valid_tokens=valid_tokens,
+                num_prompt_blocks=n_prompt_blocks,
             )
-            local_descs = self._get_block_descs_ids_for_shard(
-                engine_id, global_rank, self.num_blocks, local_block_ids
+            local_descs = self._shard_descs_for_tokens(
+                engine_id,
+                global_rank,
+                self.num_blocks,
+                local_block_ids,
+                num_valid_tokens=valid_tokens,
+                num_prompt_blocks=n_prompt_blocks,
             )
             assert len(local_descs) == len(remote_descs)
             local_handle = self.src_xfer_handles_by_remote[

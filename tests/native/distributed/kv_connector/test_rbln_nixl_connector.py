@@ -17,14 +17,17 @@
 # base __init__ and sub-connectors patched out.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector as cm
 import vllm_rbln.envs as envs
-from tests.native.distributed.kv_connector.utils import setattr_in_package
+from tests.native.distributed.kv_connector.utils import (
+    mock_vllm_config,
+    setattr_in_package,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
     RblnNixlPullConnector,
     RblnNixlPushConnector,
@@ -129,7 +132,7 @@ class TestSetXferHandshakeMetadataPpAware:
     @staticmethod
     def _connector(tp_size):
         c = object.__new__(RblnNixlPullConnector)
-        vllm_config = MagicMock()
+        vllm_config = mock_vllm_config()
         vllm_config.parallel_config.tensor_parallel_size = tp_size
         c._vllm_config = vllm_config
         return c
