@@ -179,6 +179,33 @@ def get_rbln_owned_card_indices() -> list[int]:
     return sorted(set(owned)) or present
 
 
+def local_rbln_device_index(local_worker_id: int) -> int:
+    """Logical ``rbln:<n>`` index this worker's own device-side allocations
+    should use, given its node-wide rank/worker id.
+
+    ``RBLNWorker._init_device_env`` narrows the device-control env var
+    (``RBLN_VISIBLE_DEVICES``/``RBLN_DEVICES``) to exactly this worker's own
+    ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK`` NPU(s) *before* torch-rbln plans
+    its device mapping. That means every worker process on the node --
+    rank 0 and rank 7 alike -- ends up with the *same* range of logical
+    devices, ``0..VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK - 1``, never its
+    original node-wide rank.
+
+    Code that only has the rank (e.g. a KV-connector plugin's
+    ``local_worker_id``) and builds a device string directly from it
+    (``f"rbln:{rank}"``) is asking for a device this process was never
+    assigned -- valid on rank 0 only, and failing every other rank with
+    "Logical device rbln:N is not assigned". Re-index through this helper
+    instead of using the rank as a device index directly.
+    """
+    from vllm_rbln import envs
+
+    num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
+    if num_devices <= 0:
+        return local_worker_id
+    return local_worker_id % num_devices
+
+
 def _read_card_attr_int(card_index: int, attr: str) -> int | None:
     path = os.path.join(RBLN_SYSFS_CLASS_DIR, f"rbln{card_index}", attr)
     try:

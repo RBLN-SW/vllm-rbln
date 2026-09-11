@@ -50,6 +50,7 @@ from vllm_rbln.v1.worker.utils import (
     get_rbln_owned_card_indices,
     get_rbln_planned_affinity_cpu_count,
     get_rbln_visible_card_indices,
+    local_rbln_device_index,
     prepare_kernel_block_sizes,
     read_rbln_card_dram_total_bytes,
     read_rbln_card_dram_used_bytes,
@@ -1031,6 +1032,42 @@ class TestReplicationFactorIsGated:
         """
         got = self._measure(mock_envs, mock_platform, 8, False, sysfs_total=sysfs_total)
         assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# local_rbln_device_index — rank -> this process's own logical device
+# ---------------------------------------------------------------------------
+class TestLocalRblnDeviceIndex:
+    """`RBLNWorker._init_device_env` narrows every worker's own process down
+    to `VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK` logical device(s) before
+    torch-rbln plans its device map, so a node-wide rank is never a valid
+    index into *this* process's own device list on its own. This is the
+    re-indexing step a caller that only has the rank (a KV-connector plugin,
+    say) needs instead of asking for `rbln:<rank>` directly.
+    """
+
+    def test_single_npu_per_rank_collapses_every_rank_to_zero(self):
+        """The common case: one NPU per rank, so every rank narrows to the
+        same lone logical device 0 -- this is exactly the shape that made
+        `f"rbln:{rank}"` fail on every rank but 0 (see fsw-inference#428)."""
+        with patch.object(worker_utils.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 1):
+            assert local_rbln_device_index(0) == 0
+            assert local_rbln_device_index(1) == 0
+            assert local_rbln_device_index(3) == 0
+
+    def test_multi_npu_rank_keeps_indexing_within_its_own_group(self):
+        """A rank that owns several aggregated NPUs (RSD) still has more than
+        one logical device to pick from -- only the wrap point moves."""
+        with patch.object(worker_utils.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 4):
+            assert local_rbln_device_index(0) == 0
+            assert local_rbln_device_index(3) == 3
+            assert local_rbln_device_index(4) == 0
+
+    def test_zero_configured_devices_leaves_the_rank_alone(self):
+        """Nothing to index into (misconfigured / not narrowed yet) -- return
+        the rank unchanged rather than divide by zero or guess."""
+        with patch.object(worker_utils.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", 0):
+            assert local_rbln_device_index(2) == 2
 
 
 # ---------------------------------------------------------------------------
