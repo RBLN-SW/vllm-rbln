@@ -191,9 +191,6 @@ class RBLNFlashAttentionMetadataBuilder(
             and not vllm_config.attention_config.use_non_causal
         )
 
-        # patched_get_kv_cache_spec resolves VLLM_RBLN_USE_MULTI_BLOCK_ATTN into
-        # the spec class, so the spec is where that choice is read back and the
-        # two cannot drift apart.
         self.swa_appends = isinstance(
             kv_cache_spec, SlidingWindowSpec
         ) and not isinstance(kv_cache_spec, RBLNSlidingWindowSpec)
