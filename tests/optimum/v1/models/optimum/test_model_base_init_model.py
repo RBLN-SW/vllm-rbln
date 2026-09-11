@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit test for the config optimum-rbln receives on a cache-miss compile.
+"""Unit tests for what optimum-rbln receives on a cache-miss compile.
 
 vLLM's ``hf_config`` may be a vLLM-private config class (e.g. qwen3_asr) that
-transformers' model classes cannot read, so ``init_model`` loads the
-checkpoint's own config through the HF model class and carries over only the
-layer count. Everything that needs an NPU is faked.
+transformers' model classes cannot read, so ``init_model`` does not forward it.
+It passes only the layer count (and the per-layer attention types that HF
+validates against it) as HF config kwargs, nested under ``text_config`` for
+composite models. Everything that needs an NPU is faked.
 """
 
 import types
@@ -27,39 +28,10 @@ from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 
 
-class _TextConfig:
-    def __init__(self, num_hidden_layers: int):
-        self.num_hidden_layers = num_hidden_layers
-
-
-class _CheckpointConfig:
-    def __init__(self):
-        self.text = _TextConfig(num_hidden_layers=28)
-
-    def get_text_config(self):
-        return self.text
-
-
-def test_init_model_compiles_with_checkpoint_config_and_vllm_layer_count(
-    monkeypatch, tmp_path
-):
-    checkpoint_config = _CheckpointConfig()
-    loaded_from = {}
-
-    def load_config(path, trust_remote_code):
-        loaded_from["path"] = path
-        return checkpoint_config
-
-    hf_class = types.SimpleNamespace(
-        config_class=types.SimpleNamespace(from_pretrained=load_config)
-    )
+def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
     passed = {}
 
     class FakeRBLNModel:
-        @classmethod
-        def get_hf_class(cls):
-            return hf_class
-
         @classmethod
         def from_pretrained(cls, path, **kwargs):
             passed.update(kwargs)
@@ -79,19 +51,12 @@ def test_init_model_compiles_with_checkpoint_config_and_vllm_layer_count(
     monkeypatch.setattr(model_base, "is_compiled_dir", lambda path: False)
     monkeypatch.setattr(model_base, "get_attn_block_size", lambda cfg: 4096)
 
-    # vLLM's view of the model: a private config class carrying an
-    # hf_overrides={"num_hidden_layers": 2} smoke-compile override.
-    vllm_hf_config = types.SimpleNamespace(
-        architectures=["Qwen3ForCausalLM"],
-        get_text_config=lambda: _TextConfig(num_hidden_layers=2),
-    )
     obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
     obj.model_config = types.SimpleNamespace(
-        hf_config=vllm_hf_config,
-        model="Qwen/Qwen3-0.6B",
+        hf_config=hf_config,
+        model="repo",
         max_model_len=4096,
         dtype=torch.float16,
-        trust_remote_code=False,
     )
     obj.scheduler_config = types.SimpleNamespace(
         max_num_seqs=1, max_num_batched_tokens=128
@@ -103,10 +68,39 @@ def test_init_model_compiles_with_checkpoint_config_and_vllm_layer_count(
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
         ec_transfer_config=None,
     )
-
     obj.init_model()
+    return passed
 
-    assert loaded_from["path"] == "Qwen/Qwen3-0.6B"
-    assert passed["config"] is checkpoint_config
-    assert passed["config"] is not vllm_hf_config
-    assert checkpoint_config.text.num_hidden_layers == 2
+
+def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_path):
+    # hf_overrides={"num_hidden_layers": 2} on a text-only model: the override
+    # lands on the top-level config, and vLLM's config object stays out.
+    hf_config = types.SimpleNamespace(
+        architectures=["Qwen3ForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["full_attention", "full_attention"],
+    )
+    hf_config.get_text_config = lambda: hf_config
+
+    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+
+    assert "config" not in passed
+    assert passed["num_hidden_layers"] == 2
+    assert passed["layer_types"] == ["full_attention", "full_attention"]
+    assert "text_config" not in passed
+
+
+def test_composite_config_nests_layer_count_under_text_config(monkeypatch, tmp_path):
+    # A vLLM-private composite config (qwen3_asr keeps the text config under
+    # thinker_config): the override must reach HF's text_config sub-config.
+    text_config = types.SimpleNamespace(num_hidden_layers=2)
+    hf_config = types.SimpleNamespace(
+        architectures=["Qwen3ASRForConditionalGeneration"],
+        get_text_config=lambda: text_config,
+    )
+
+    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+
+    assert "config" not in passed
+    assert passed["text_config"] == {"num_hidden_layers": 2}
+    assert "num_hidden_layers" not in passed

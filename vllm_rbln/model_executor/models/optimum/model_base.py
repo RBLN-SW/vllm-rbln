@@ -19,7 +19,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.interfaces import (
@@ -251,26 +250,22 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
-            # Load the checkpoint's own config instead of forwarding vLLM's
-            # hf_config: vLLM substitutes its own config classes for some
-            # model_types (e.g. qwen3_asr) and transformers' model classes
-            # cannot read them. Only the layer count crosses over, so an
-            # hf_overrides={"num_hidden_layers": N} smoke compile still shrinks.
-            config_class = getattr(
-                spec.model_cls.get_hf_class(), "config_class", AutoConfig
-            )
-            config = config_class.from_pretrained(
-                self.model_config.model,
-                trust_remote_code=self.model_config.trust_remote_code,
-            )
-            config.get_text_config().num_hidden_layers = (
-                hf_config.get_text_config().num_hidden_layers
-            )
+            # vLLM's hf_config is not forwarded: for some model_types (e.g.
+            # qwen3_asr) it is a vLLM-private class transformers' model cannot
+            # read. Only the layer count crosses over, as HF config kwargs, so
+            # an hf_overrides={"num_hidden_layers": N} smoke compile still
+            # shrinks. layer_types rides along: HF revalidates it per layer.
+            text_config = hf_config.get_text_config()
+            layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
+            if hasattr(text_config, "layer_types"):
+                layer_override["layer_types"] = text_config.layer_types
+            if text_config is not hf_config:
+                layer_override = {"text_config": layer_override}
             model = spec.model_cls.from_pretrained(
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
-                config=config,
                 dtype=self.model_config.dtype,
+                **layer_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
