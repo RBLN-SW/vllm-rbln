@@ -1097,8 +1097,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        # Host tensor; the rejection sampler copies it into its graph inputs.
         draft_token_ids = self.input_ids[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1].to(self.device)
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -2469,6 +2470,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs_padded=batch_desc.num_reqs_padded,
         )
 
+        if is_idle:
+            # Only the real path writes these persistent buffers, so slicing them
+            # here would feed this rank its previous request's last token id and
+            # position. An idle rank still joins the expert all-gather, so those
+            # stale values enter the collective and cost the whole group device
+            # time on every step.
+            self.input_ids[:num_tokens].zero_()
+            self.positions[:num_tokens].zero_()
+
         input_ids = self.input_ids[:num_tokens]
         inputs_embeds = None
         positions = self.positions[:num_tokens]
@@ -3355,8 +3365,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dtype=torch.int32,
             device=self.device,
         )
-        bonus_token_ids = torch.zeros(
-            batch_size, 1, dtype=torch.int64, device=self.device
+        bonus_logits = torch.zeros(
+            batch_size, vocab_size, dtype=self.dtype, device=self.device
         )
         dummy_sampling_metadata = SamplingMetadata(
             temperature=None,
@@ -3377,17 +3387,26 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs=LogitsProcessors(),
             spec_token_ids=[[] for _ in range(batch_size)],
         )
-        logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
-        self.rejection_sampler.impl.rejection_sample(
-            draft_token_ids,
-            num_draft_tokens,
-            num_spec,
-            cu_num_draft_tokens,
-            None,
-            target_logits,
-            bonus_token_ids,
-            dummy_sampling_metadata,
+        # int32, as the bonus sampler's ops return it.
+        bonus_token_ids = torch.zeros(
+            batch_size, 1, dtype=torch.int32, device=self.device
         )
+        logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
+        for bonus_token_ids_in, bonus_logits_in in (
+            (None, bonus_logits),
+            (bonus_token_ids, None),
+        ):
+            self.rejection_sampler.impl.rejection_sample(
+                draft_token_ids,
+                num_draft_tokens,
+                num_spec,
+                cu_num_draft_tokens,
+                None,
+                target_logits,
+                bonus_token_ids_in,
+                dummy_sampling_metadata,
+                bonus_logits=bonus_logits_in,
+            )
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a

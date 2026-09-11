@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
     "License :: OSI Approved :: Apache Software License",
     "Intended Audience :: Developers",
@@ -30,7 +31,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 dynamic = ["version"]
 dependencies = [
     "setuptools>=64",
@@ -44,7 +45,7 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln>=0.4.0,<0.4.1 ; platform_machine == 'x86_64'",
+    "torch-rbln>=0.5.0rc0,<0.5.1 ; platform_machine == 'x86_64'",
     "optimum-rbln>=0.11.3a4,<0.11.4",
 ]
 

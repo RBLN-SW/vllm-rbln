@@ -300,10 +300,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         if getattr(rbln_config, "requires_batch_sort", False):
             return True
 
-        get_language_model = getattr(model, "get_language_model", None)
-        if get_language_model is None:
+        if not isinstance(model, RBLNOptimumMultimodalMixin):
             return False
-        language_model = get_language_model()
+        language_model = model.get_language_model()
         return bool(getattr(language_model.rbln_config, "requires_batch_sort", False))
 
     @instrument(span_name="Loading (RBLN)")
@@ -1596,8 +1595,18 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     (bucket_size, self.model_config.get_vocab_size()),
                     dtype=self.dtype,
                 )
-        torch._dynamo.config.recompile_limit = len(self.bucket_sizes) * len(
-            WARM_UP_CONFIGS
+
+        num_buckets = len(self.bucket_sizes)
+        greedy_configs = sum(1 for c in WARM_UP_CONFIGS if c["all_greedy"])
+        topk_topp_configs = len(WARM_UP_CONFIGS) - greedy_configs
+        busiest_fn_configs = max(greedy_configs, topk_topp_configs)
+
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit, busiest_fn_configs * num_buckets
+        )
+        torch._dynamo.config.accumulated_recompile_limit = max(
+            torch._dynamo.config.accumulated_recompile_limit,
+            len(WARM_UP_CONFIGS) * num_buckets,
         )
 
     @torch.inference_mode

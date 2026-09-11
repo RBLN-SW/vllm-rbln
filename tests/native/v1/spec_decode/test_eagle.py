@@ -113,7 +113,13 @@ def _echo_model_exec(hidden_size):
     return executable
 
 
-def _call_propose(proposer, target_hidden_states=None):
+# The last slot of each request in _call_propose's [0, 2, 4] query layout.
+_LAST_SLOTS = torch.tensor([1, 3], dtype=torch.int32)
+
+
+def _call_propose(
+    proposer, target_hidden_states=None, token_indices_to_sample=_LAST_SLOTS
+):
     return proposer.propose(
         target_token_ids=torch.arange(4, dtype=torch.int32),
         target_positions=torch.arange(4, dtype=torch.int64),
@@ -121,7 +127,7 @@ def _call_propose(proposer, target_hidden_states=None):
         if target_hidden_states is None
         else target_hidden_states,
         next_token_ids=torch.tensor([30, 31], dtype=torch.int32),
-        token_indices_to_sample=torch.tensor([1, 3], dtype=torch.int32),
+        token_indices_to_sample=token_indices_to_sample,
         common_attn_metadata=make_cad([0, 2, 4], [10, 11]),
     )
 
@@ -141,28 +147,7 @@ class TestPreprocess:
             token_indices_to_sample=token_indices_to_sample,
             target_token_ids=torch.arange(11, 20, dtype=torch.int32),
             next_token_ids=torch.tensor([100, 200, 300], dtype=torch.int32),
-            cad=make_cad([0, 3, 5, 9], [3, 5, 4]),
         )
-
-    def test_first_pass_shifts_tokens_and_inserts_next(self):
-        # Three requests, query_lens [3, 2, 4]. The target ids shift left by one
-        # (drop the first) and each request's next token lands at its last slot.
-        proposer = make_eagle_proposer()
-        # None token indices default to query_start_loc[1:] - 1.
-        _, _, _, tip = self._first_pass(proposer, None)
-        assert tip.cpu().tolist() == [2, 4, 8]
-        # shifted target [12..19] with next tokens overwritten at [2, 4, 8].
-        assert proposer.input_ids[:9].cpu().tolist() == [
-            12,
-            13,
-            100,
-            15,
-            200,
-            17,
-            18,
-            19,
-            300,
-        ]
 
     def test_first_pass_uses_explicit_token_indices_verbatim(self):
         # Given token indices are used as-is (not recomputed from
@@ -326,13 +311,11 @@ class TestInitGuards:
 
 class TestToTargetTokenIds:
     def test_applies_d2t_as_an_offset(self):
-        # d2t holds offsets, not absolute target ids: id -> id + d2t[id]. Both
-        # operands sit on the proposer's device, so this is the gather production
-        # runs -- the reason the mapping moved out of the compiled graph.
+        # d2t holds offsets, not absolute target ids: id -> id + d2t[id]. The
+        # ids arrive on the device and d2t sits on the host (load_model puts it
+        # there), so this is the gather production runs.
         proposer = make_eagle_proposer()
-        proposer.draft_id_to_target_id = torch.tensor(
-            [0, 2, 3, 5, 8], dtype=torch.long, device=proposer.device
-        )
+        proposer.draft_id_to_target_id = torch.tensor([0, 2, 3, 5, 8], dtype=torch.long)
         draft_ids = torch.tensor(
             [0, 1, 4, 2], dtype=torch.int64, device=proposer.device
         )
@@ -364,7 +347,7 @@ class TestToTargetTokenIds:
         )
         full_logits[:, target_ids] = draft_logits
         proposer = make_eagle_proposer()
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
 
         out = proposer._to_target_token_ids(
             draft_logits.argmax(dim=-1).to(proposer.device)
@@ -385,6 +368,18 @@ class TestPropose:
         out = _call_propose(proposer)
         assert out.shape == (2, 1)
         assert out.cpu().tolist() == [[42], [60]]
+
+    def test_none_token_indices_default_to_each_requests_last_slot(self, monkeypatch):
+        # With no indices given, propose derives them from query_start_loc:
+        # [0, 2, 4] -> [1, 3], so the next tokens land where _call_propose's
+        # explicit [1, 3] would put them, after the target ids shift left by one.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=1)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.model_executable = _fake_model_exec([42, 60], proposer.hidden_size)
+
+        _call_propose(proposer, token_indices_to_sample=None)
+        assert proposer.input_ids[:4].cpu().tolist() == [1, 30, 3, 31]
 
     def test_multi_step_feeds_previous_draft_forward(self, monkeypatch):
         # With the echo model each draft is the previous + 1, so consecutive
@@ -446,7 +441,7 @@ class TestPropose:
         proposer.model_executable = _fake_model_exec([42, 60], proposer.hidden_size)
         d2t = torch.zeros(128, dtype=torch.long)
         d2t[42], d2t[60] = 5, 7
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
 
         out = _call_propose(proposer)
 
@@ -461,7 +456,7 @@ class TestPropose:
         _wire_runner(proposer, num_reqs=2)
         d2t = torch.zeros(128, dtype=torch.long)
         d2t[1], d2t[2], d2t[3], d2t[4] = 2, 3, 5, 8
-        proposer.draft_id_to_target_id = d2t.to(proposer.device)
+        proposer.draft_id_to_target_id = d2t
         argmax_per_call = [[1, 3], [2, 4]]
         seen: list[torch.Tensor] = []
 
@@ -657,18 +652,20 @@ class TestLoadModel:
         # write is the SIGSEGV in KV warm-up. What is checked here is the branch
         # selection -- only a real compile on the device reaches the SIGSEGV, so
         # this guards against someone routing back through compute_logits.
-        d2t = torch.tensor([0, 2, 3], dtype=torch.long)
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        # On the device, as a loaded draft model carries it.
+        d2t = torch.tensor([0, 2, 3], dtype=torch.long, device=proposer.device)
         model = self._FakeMappedDraft(d2t)
         self._stub_super_load_model(monkeypatch, model)
-        proposer = make_eagle_proposer(num_speculative_tokens=1)
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", True
         )
         proposer.load_model(target_model=object())
 
         # Taking that branch at all depends on load_model lifting d2t off the
-        # draft model, so this covers the capture too.
-        assert proposer.draft_id_to_target_id is d2t
+        # draft model and onto the host, so this covers the capture too.
+        assert proposer.draft_id_to_target_id.device.type == "cpu"
+        assert torch.equal(proposer.draft_id_to_target_id, d2t.cpu())
 
         h = proposer.hidden_size
         hidden = torch.arange(2 * 3 * h, dtype=torch.float32).view(2, 3, h)
