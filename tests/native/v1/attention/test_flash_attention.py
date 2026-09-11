@@ -74,17 +74,6 @@ def _lower_triangular(n: int) -> torch.Tensor:
 
 
 @pytest.fixture
-def multi_block_on(monkeypatch):
-    # The impl resolves the flag once, at __init__.
-    monkeypatch.setenv("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", "1")
-
-
-@pytest.fixture
-def multi_block_off(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", "0")
-
-
-@pytest.fixture
 def custom_kernel_on(monkeypatch):
     # USE_CUSTOM_KERNEL resolves from RBLN_USE_CUSTOM_KERNEL, not the
     # VLLM_RBLN_-prefixed name (pinned in test_envs).
@@ -431,7 +420,8 @@ class TestBuildSlidingWindowDecode:
 class TestBuildSlidingWindowAppend:
     def test_builds_what_a_full_attention_group_builds(self, cfg):
         # An appended cache is upstream's SlidingWindowSpec, and the window is
-        # resolved inside the op: the builder emits nothing that depends on it.
+        # resolved inside the op: apart from the flag that names the path, the
+        # builder emits nothing that depends on it.
         cam = _cam(
             num_reqs=1, query_start_loc=[0, 1], seq_lens=[7], block_table=[[5, 6]]
         )
@@ -440,13 +430,27 @@ class TestBuildSlidingWindowAppend:
         swa = make_builder(cfg, sliding_window=4).build(*args, **kwargs)
         full = make_builder(cfg).build(*args, **kwargs)
 
+        assert swa.swa_appends and not full.swa_appends
         for field in fields(RBLNFlashAttentionMetadata):
+            if field.name == "swa_appends":
+                continue
             swa_value = getattr(swa, field.name)
             full_value = getattr(full, field.name)
             if isinstance(swa_value, torch.Tensor):
                 assert torch.equal(swa_value, full_value)
             else:
                 assert swa_value == full_value
+
+    def test_the_shift_spec_does_not_append(self, cfg):
+        # The flag follows the spec class, which is what the env var picks.
+        builder = make_builder(cfg, sliding_window=4, appends_kv=False)
+        assert not builder.swa_appends
+
+    def test_custom_kernel_is_rejected(self, cfg, custom_kernel_on):
+        # rbln_triton_ops carries no sliding_window_attention_v1, so the group
+        # cannot be built at all rather than failing at the first forward.
+        with pytest.raises(NotImplementedError, match="MULTI_BLOCK_ATTN"):
+            make_builder(cfg, sliding_window=4)
 
 
 class TestBuildOutputAssembly:
@@ -640,8 +644,8 @@ class TestFlashImplInit:
 
 @pytest.mark.maybe_use_device
 class TestForwardSlidingWindow:
-    """Which kernel a sliding-window layer reaches is decided by
-    VLLM_RBLN_USE_MULTI_BLOCK_ATTN, and the two take different inputs."""
+    """Which kernel a sliding-window layer reaches is carried on the metadata
+    by the builder, and the two take different inputs."""
 
     WINDOW = 4
     HEADS, DIM = 8, 128  # make_impl defaults; num_queries_per_kv is 1
@@ -675,22 +679,21 @@ class TestForwardSlidingWindow:
         )
         return recorded[0]
 
-    def _decode_metadata(self):
+    def _decode_metadata(self, swa_appends):
         return RBLNFlashAttentionMetadata(
             seq_lens=torch.tensor([[6], [0]]),
             block_tables=torch.tensor([[7, 8, 9], [0, 0, 0]]),
             is_prefill=False,
+            swa_appends=swa_appends,
             cache_seq_lens=torch.tensor([[4], [0]]),
             cache_offsets=torch.tensor([[5], [0]]),
             local_block_tables=torch.tensor([[7], [0]]),
         )
 
-    def test_multi_block_appends_with_the_position_and_the_whole_table(
-        self, cfg, monkeypatch, multi_block_on
-    ):
+    def test_appends_with_the_position_and_the_whole_table(self, cfg, monkeypatch):
         # Neither the position nor the table is cut on the way in: the op
         # resolves the window from them itself.
-        md = self._decode_metadata()
+        md = self._decode_metadata(swa_appends=True)
         _q, _k, _v, _cache, seq_idx, _scale, tables, window, sinks = self._forward(
             cfg, monkeypatch, "sliding_window_attention_v1", md
         )
@@ -700,11 +703,11 @@ class TestForwardSlidingWindow:
         assert sinks is None
 
     def test_otherwise_the_shift_kernel_takes_the_fill_and_one_block(
-        self, cfg, monkeypatch, multi_block_off
+        self, cfg, monkeypatch
     ):
         # The shift path is untouched: the clamped fill, its end, and the single
         # block the window lives in.
-        md = self._decode_metadata()
+        md = self._decode_metadata(swa_appends=False)
         *_, cache_seq_len, cache_offset, _scale, tables, _mask, _sinks = self._forward(
             cfg, monkeypatch, "sliding_window_attention_naive_decode", md
         )
@@ -712,12 +715,13 @@ class TestForwardSlidingWindow:
         assert cache_offset is md.cache_offsets
         assert tables is md.local_block_tables
 
-    def test_prefill_takes_the_same_call(self, cfg, monkeypatch, multi_block_on):
+    def test_prefill_takes_the_same_call(self, cfg, monkeypatch):
         # One op for both phases; its 1-D block table is reshaped by the op.
         md = RBLNFlashAttentionMetadata(
             seq_lens=torch.tensor([[6]]),
             block_tables=torch.tensor([7, 8, 9]),
             is_prefill=True,
+            swa_appends=True,
         )
         *_, tables, window, _sinks = self._forward(
             cfg, monkeypatch, "sliding_window_attention_v1", md

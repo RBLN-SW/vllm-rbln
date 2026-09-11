@@ -29,7 +29,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -136,8 +136,7 @@ class RBLNFlashAttentionMetadata:
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
 
-    # For sliding window attention on the shift path; the append path resolves
-    # the window inside the op and leaves all four unset.
+    swa_appends: bool = False
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
@@ -191,6 +190,20 @@ class RBLNFlashAttentionMetadataBuilder(
             envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
             and not vllm_config.attention_config.use_non_causal
         )
+
+        # patched_get_kv_cache_spec resolves VLLM_RBLN_USE_MULTI_BLOCK_ATTN into
+        # the spec class, so the spec is where that choice is read back and the
+        # two cannot drift apart.
+        self.swa_appends = isinstance(
+            kv_cache_spec, SlidingWindowSpec
+        ) and not isinstance(kv_cache_spec, RBLNSlidingWindowSpec)
+        if self.swa_appends and envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            raise NotImplementedError(
+                "Sliding window attention is not supported with "
+                "VLLM_RBLN_USE_CUSTOM_KERNEL=1 and "
+                "VLLM_RBLN_USE_MULTI_BLOCK_ATTN=1: rbln_triton_ops has no "
+                "sliding_window_attention_v1 kernel."
+            )
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
@@ -314,6 +327,7 @@ class RBLNFlashAttentionMetadataBuilder(
             block_tables=self._stage(block_tables_tensor, "block_tables"),
             is_prefill=is_prefill,
             attn_masks=self._stage(attn_masks, "attn_masks"),
+            swa_appends=self.swa_appends,
             cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
@@ -412,17 +426,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
-
-        self.swa_appends = (
-            sliding_window is not None and envs.VLLM_RBLN_USE_MULTI_BLOCK_ATTN
-        )
-        if self.swa_appends and envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
-            raise NotImplementedError(
-                "Sliding window attention is not supported with "
-                "VLLM_RBLN_USE_CUSTOM_KERNEL=1 and "
-                "VLLM_RBLN_USE_MULTI_BLOCK_ATTN=1: rbln_triton_ops has no "
-                "sliding_window_attention_v1 kernel."
-            )
 
         # forward() dispatches on (sliding_window, is_causal, is_normal), and
         # only the flash causal target hands the fp8 dequant scales and the
@@ -536,7 +539,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
         if self.sliding_window is not None:
-            if self.swa_appends:
+            if attn_metadata.swa_appends:
                 # `seq_lens` is the absolute position the chunk starts at, not
                 # a length: the op resolves the window's blocks from it and the
                 # whole table.
