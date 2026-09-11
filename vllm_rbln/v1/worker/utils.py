@@ -806,10 +806,9 @@ def prepare_kernel_block_sizes(
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
         if isinstance(kv_cache_spec, SlidingWindowSpec):
-            # Both sliding-window kernels address the cache in windows rather
-            # than in the manager's blocks; upstream BlockTable splits each
-            # block into window-sized ones, and rejects a block the window does
-            # not divide.
+            # Both sliding-window kernels address the cache in windows, not
+            # in the manager's blocks; upstream BlockTable rejects a block the
+            # window does not divide.
             kernel_block_sizes.append(kv_cache_spec.sliding_window)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.

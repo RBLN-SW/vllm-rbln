@@ -288,10 +288,8 @@ class RBLNFlashAttentionMetadataBuilder(
         cache_offsets = None
         local_block_tables = None
         swa_attn_masks = None
-        # The shift kernel's one block, described: how full it is, where the
-        # chunk ends in it, and which block it is. RBLNSlidingWindowSpec is that
-        # cache layout, so its absence is the append path, which needs none of
-        # it.
+        # RBLNSlidingWindowSpec is the shift kernel's cache layout, so its
+        # absence is the append path, which needs none of these.
         if isinstance(self.kv_cache_spec, RBLNSlidingWindowSpec):
             sliding_window = self.kv_cache_spec.sliding_window
             num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
@@ -539,10 +537,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # attn_output = [batch,H,4,L,D]
         if self.sliding_window is not None:
             if self.swa_appends:
-                # One op for both phases. `seq_lens` is the absolute position the
-                # chunk starts at, uncapped: it names the slot every token is
-                # written to, and the blocks the window covers are resolved from it
-                # and the whole block table inside the op.
+                # `seq_lens` is the absolute position the chunk starts at, not
+                # a length: the op resolves the window's blocks from it and the
+                # whole table.
                 attn_output = sliding_window_attention_v1(
                     query,
                     key,

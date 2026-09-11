@@ -640,8 +640,8 @@ class TestFlashImplInit:
 
 @pytest.mark.maybe_use_device
 class TestForwardSlidingWindow:
-    """Which kernel a sliding-window layer reaches is decided by the NPU, and
-    the two take different inputs."""
+    """Which kernel a sliding-window layer reaches is decided by
+    VLLM_RBLN_USE_MULTI_BLOCK_ATTN, and the two take different inputs."""
 
     WINDOW = 4
     HEADS, DIM = 8, 128  # make_impl defaults; num_queries_per_kv is 1
