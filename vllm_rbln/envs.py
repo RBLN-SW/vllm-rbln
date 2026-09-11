@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     VLLM_RBLN_METRICS: bool = False
     VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_METRICS_DIR: str = ""
+    VLLM_RBLN_KV_DUMP_DIR: str = ""
+    VLLM_RBLN_KV_DUMP_MAX: int = 64
+    VLLM_RBLN_KV_DUMP_LAYERS: list[int] = []
     VLLM_RBLN_NUMA: bool = True
 
     # ====================================================================
@@ -154,6 +157,16 @@ def get_decode_batch_bucket_manual_buckets() -> list[int]:
         ) from e
 
 
+def get_kv_dump_layers() -> list[int]:
+    layers = os.environ.get("VLLM_RBLN_KV_DUMP_LAYERS", "")
+    if not layers.strip():
+        return []
+    try:
+        return [int(layer) for layer in layers.split(",")]
+    except ValueError as e:
+        raise ValueError(f"Invalid VLLM_RBLN_KV_DUMP_LAYERS: {layers}, {e}") from e
+
+
 def use_auto_port() -> bool:
     raw = os.environ.get("VLLM_RBLN_AUTO_PORT")
     if raw is not None:
@@ -202,6 +215,13 @@ environment_variables = {
     "VLLM_RBLN_METRICS_FILE": lambda: os.environ.get("VLLM_RBLN_METRICS_FILE", ""),
     # Directory for per-worker JSON performance reports (empty disables).
     "VLLM_RBLN_METRICS_DIR": lambda: os.environ.get("VLLM_RBLN_METRICS_DIR", ""),
+    # Directory for KV-cache block dumps (empty disables the whole feature).
+    "VLLM_RBLN_KV_DUMP_DIR": lambda: os.environ.get("VLLM_RBLN_KV_DUMP_DIR", ""),
+    # Per-worker cap on the number of KV dumps, so a long run cannot fill a disk.
+    "VLLM_RBLN_KV_DUMP_MAX": lambda: int(os.environ.get("VLLM_RBLN_KV_DUMP_MAX", "64")),
+    # KV layer indices to dump, empty for all. Negative indexes from the end, so
+    # -1 is the spec-decode draft layer.
+    "VLLM_RBLN_KV_DUMP_LAYERS": get_kv_dump_layers,
     # Enable NUMA-based CPU affinity binding for OpenMP threads
     "VLLM_RBLN_NUMA": (
         lambda: os.environ.get("VLLM_RBLN_NUMA", "True").lower() in ("true", "1")
@@ -412,6 +432,9 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_METRICS",
         "VLLM_RBLN_METRICS_FILE",
         "VLLM_RBLN_METRICS_DIR",
+        "VLLM_RBLN_KV_DUMP_DIR",
+        "VLLM_RBLN_KV_DUMP_MAX",
+        "VLLM_RBLN_KV_DUMP_LAYERS",
         "VLLM_RBLN_NUMA",
         "VLLM_RBLN_COMPILE_ONLY",
         "VLLM_RBLN_DISABLE_OFFLOAD",

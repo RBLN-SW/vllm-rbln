@@ -143,7 +143,7 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     install_aux_handoff_slots,
 )
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
-from vllm_rbln.v1.worker import mega_cache
+from vllm_rbln.v1.worker import kv_dump, mega_cache
 from vllm_rbln.v1.worker.async_output import (
     AsyncRBLNModelRunnerOutput,
     PendingTokenWriteback,
@@ -1676,6 +1676,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Stamp the step's phase before any step logic reads it.
         self.is_prefill = step_is_prefill(scheduler_output)
 
+        kv_dump.note_step(scheduler_output)
+
         # Before anything reads token_ids_cpu this step.
         if self.use_async_scheduling:
             self._apply_pending_token_writeback()
@@ -1941,6 +1943,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # model forward so the draft model can also save its KV cache.
         if spec_config is not None:
             self.finalize_kv_connector()
+
+        kv_dump.maybe_dump(self)
 
         # self.kv_connector_output may be modified during drafting.
         kv_connector_output = self.kv_connector_output
