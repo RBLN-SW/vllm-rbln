@@ -13,12 +13,17 @@
 # limitations under the License.
 
 # Unit coverage for the RBLN NIXL metadata extension: the layer axis, the
-# chiplet geometry a shard advertises, and which axis that geometry came from.
+# chiplet geometry a shard advertises and which axis it came from, and the
+# compatibility hash that keeps a peer with another schema, transfer direction
+# or draft model from pairing.
 #
-# Self-contained: exercises only ``rbln_nixl.metadata`` (base vLLM NIXL +
+# Self-contained: exercises only ``rbln_nixl.metadata`` (upstream vLLM NIXL +
 # msgspec + hash), so it does not require the ``nixl-rbln`` install or a worker.
 
+from unittest.mock import MagicMock
+
 import msgspec
+from vllm.config import SpeculativeConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
@@ -141,6 +146,78 @@ class TestRblnCompatHash:
         assert rbln_compat_hash("hash-a", writes_into_peer=False) != rbln_compat_hash(
             "hash-b", writes_into_peer=False
         )
+
+    @staticmethod
+    def _spec_config(*, method="eagle3", model="draft-a", revision=None):
+        draft_model_config = MagicMock()
+        draft_model_config.model = model
+        draft_model_config.revision = revision
+        draft_model_config.code_revision = None
+        spec = MagicMock(method=method, draft_model_config=draft_model_config)
+        # Upstream's own predicates, not a copy of the method names they read:
+        # a method moving between them has to show up here.
+        spec.use_eagle = lambda: SpeculativeConfig.use_eagle(spec)
+        spec.uses_draft_model = lambda: SpeculativeConfig.uses_draft_model(spec)
+        return spec
+
+    def test_no_speculation_leaves_the_factors_alone(self):
+        # Only a deployment running a draft model should see its hash move.
+        assert rbln_compat_hash(
+            "BASE", writes_into_peer=False, speculative_config=None
+        ) == rbln_compat_hash("BASE", writes_into_peer=False)
+
+    def test_a_draft_moves_the_hash(self):
+        # Without this, P with a draft and D without it pair.
+        assert rbln_compat_hash(
+            "BASE", writes_into_peer=False, speculative_config=self._spec_config()
+        ) != rbln_compat_hash("BASE", writes_into_peer=False)
+
+    def test_two_drafts_do_not_share_a_hash(self):
+        # Two drafts register regions of different sizes past the target's depth.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            speculative_config=self._spec_config(model="draft-a"),
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            speculative_config=self._spec_config(model="draft-b"),
+        )
+
+    def test_a_revision_separates_one_name(self):
+        # What the name resolves to is the rest of the answer: every geometry
+        # field the descriptors need follows from the name and this together.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            speculative_config=self._spec_config(revision="r1"),
+        ) != rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            speculative_config=self._spec_config(revision="r2"),
+        )
+
+    def test_a_method_without_a_draft_model_leaves_the_factors_alone(self):
+        # Upstream hands n-gram the target's own config, so a hash keyed on a
+        # draft config's presence would refuse a decode-only n-gram pairing.
+        plain = rbln_compat_hash("BASE", writes_into_peer=False)
+        for method in ("ngram", "suffix"):
+            assert (
+                rbln_compat_hash(
+                    "BASE",
+                    writes_into_peer=False,
+                    speculative_config=self._spec_config(method=method),
+                )
+                == plain
+            )
+
+    def test_a_separate_draft_model_moves_the_hash(self):
+        # The other method that registers layers of its own.
+        assert rbln_compat_hash(
+            "BASE",
+            writes_into_peer=False,
+            speculative_config=self._spec_config(method="draft_model"),
+        ) != rbln_compat_hash("BASE", writes_into_peer=False)
 
     def test_version_is_folded(self, monkeypatch):
         # Bumping RBLN_NIXL_CONNECTOR_VERSION changes the hash (gates schema drift).
