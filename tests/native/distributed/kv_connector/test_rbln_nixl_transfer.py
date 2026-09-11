@@ -95,6 +95,73 @@ class TestComputeDescIds:
         out = worker._compute_desc_ids([[]], 4, None, 1)
         assert out.size == 0
 
+    @staticmethod
+    def _hybrid_worker(monkeypatch, *, grid=(2, 2), tail=None):
+        # Two groups over two regions, four blocks: num_full_descs = 8, so the
+        # SWA range is [8, 16) and the chunk range starts at 16.
+        worker = build_worker(monkeypatch, block_size=64)
+        worker._sw_ratio = 2
+        worker.num_regions = 2
+        worker._chunk_mode = True
+        worker._kv_areas = 1
+        worker._kv_split_axis = KVSplitAxis.HEAD
+        worker._chunk_grid = grid
+        worker._request_tail = tail
+        worker._group_specs = [
+            MagicMock(),  # full attention
+            sliding_window_spec(block_size=64, sliding_window=32),
+        ]
+        return worker
+
+    def test_a_partly_filled_last_block_goes_out_as_its_chunks(self, monkeypatch):
+        # 2 chunks a block, a last block holding 1 of 64 tokens -> one chunk.
+        # The block leaves the whole-block range and comes back from the third.
+        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
+
+        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
+
+        # Full group keeps block 0 (ids 0, 4) and drops block 1; block 1's
+        # first chunk arrives at 16 + (r*4 + 1)*runs*chunks + run*chunks:
+        # region 0 -> 16+4, 16+6; region 1 -> 16+20, 16+22.
+        assert list(out) == [0, 4, 20, 22, 36, 38, 10, 14]
+
+    def test_the_windowed_group_is_never_cut(self, monkeypatch):
+        # Its descriptor IS the window, so there is no unwritten tail in it --
+        # and its blocks are the ones a chunk range does not describe.
+        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
+
+        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
+
+        # The SWA ids are the same two the range gave before chunking existed.
+        assert list(out)[-2:] == [10, 14]
+
+    def test_a_last_block_needing_every_chunk_is_left_whole(self, monkeypatch):
+        # The benefit test: the same bytes in more descriptors is a loss, so
+        # the ids are the ones this returned before the third range existed.
+        worker = self._hybrid_worker(monkeypatch, tail=(128, 2))
+
+        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
+
+        assert list(out) == [0, 1, 4, 5, 10, 14]
+
+    def test_no_parked_tail_is_todays_ids(self, monkeypatch):
+        # Nothing said how far the request fills its last block -- every block
+        # goes whole, which is what every engine without chunk mode gets.
+        worker = self._hybrid_worker(monkeypatch, tail=None)
+
+        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
+
+        assert list(out) == [0, 1, 4, 5, 10, 14]
+
+    def test_no_chunk_grid_is_todays_ids(self, monkeypatch):
+        # A geometry whose span a chunk cannot cut registered no third range,
+        # so no index may reach past the second.
+        worker = self._hybrid_worker(monkeypatch, grid=None, tail=(65, 2))
+
+        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
+
+        assert list(out) == [0, 1, 4, 5, 10, 14]
+
 
 class TestTailChunks:
     # `_tail_chunks` over a 64-token block cut into 4 areas by a context cut,

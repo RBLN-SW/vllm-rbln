@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -77,10 +78,22 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         # misses the reverse case: a producer without pipelining still serves
         # several of our ranks when ours is the finer one.
         if not self._overlapping_ranks.get(engine_id):
-            # Chunk mode registers per-shard state against every peer, so
-            # reaching upstream's whole-engine read means it did not.
-            assert not self._chunk_mode
-            return super()._read_blocks_for_req(req_id, meta)
+            # Chunk mode registers per-shard state against every peer unless
+            # a sliding window kept it on this route, so reaching upstream's
+            # whole-engine read without one means it did not.
+            assert not self._chunk_mode or self._sw_ratio is not None
+            # Counted before the call: upstream trims the front of both lists
+            # against the local prefix cache, and the token count describes the
+            # request's own blocks.
+            tail: AbstractContextManager = (
+                self._tail_viewed_as(
+                    valid_tokens, self._prompt_blocks(meta.remote.block_ids)
+                )
+                if self._chunk_mode
+                else nullcontext()
+            )
+            with tail:
+                return super()._read_blocks_for_req(req_id, meta)
 
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size

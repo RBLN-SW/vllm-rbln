@@ -968,6 +968,40 @@ class TestDelegatedRouteAlignment:
         worker._xfer_blocks_for_req("r0", meta)
         return seen["local"]
 
+    @pytest.mark.parametrize("sw_ratio, raises", [(8, False), (None, True)])
+    def test_a_chunked_engine_reaches_this_route_only_with_a_window(
+        self, monkeypatch, sw_ratio, raises
+    ):
+        # Chunk mode asks every peer for per-shard state, so arriving here
+        # without it is a bug -- except where a sliding window's view already
+        # put the extra range on the whole-engine list.
+        w = self._worker()
+        w._chunk_mode = True
+        w._sw_ratio = sw_ratio
+        w._chunk_grid = None
+        w._request_tail = None
+        w._group_specs = [MagicMock()]  # one full-attention group
+        w._valid_tokens = {"r0": 17}
+        meta = TestPerShardWrite._meta(([5, 6, 7],), ([9],))
+
+        if raises:
+            with pytest.raises(AssertionError):
+                self._local_reaching_base(monkeypatch, w, meta)
+            return
+
+        seen = []
+        monkeypatch.setattr(
+            NixlPushConnectorWorker,
+            "_xfer_blocks_for_req",
+            lambda self, req_id, m: seen.append(self._request_tail),
+        )
+        w._xfer_blocks_for_req("r0", meta)
+
+        # The token count and the request's own block count, counted before
+        # the trim and parked for the length of upstream's call.
+        assert seen == [(17, 3)]
+        assert w._request_tail is None
+
     def test_the_producer_tail_is_what_reaches_the_base(self, monkeypatch):
         # The consumer kept one block: its cache covered everything before it.
         local = self._local_reaching_base(

@@ -474,6 +474,57 @@ class TestShardReadPath:
         base_read.assert_called_once_with("r0", meta)
         assert "eng" in w._engine_last_active
 
+    def test_a_windowed_engine_reads_chunked_through_upstreams_route(self):
+        # Chunk mode normally means per-shard descriptors, and reaching this
+        # route without them is a bug. A sliding window is the exception: its
+        # view gave the whole-engine list the extra range, and the per-shard
+        # lists cannot name its two KV groups at all.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._engine_last_active = {}
+        w._remote_pp_size = {}
+        w._overlapping_ranks = {}
+        w._chunk_mode = True
+        w._sw_ratio = 8
+        w._chunk_grid = None
+        w._request_tail = None
+        w._group_specs = [MagicMock()]  # one full-attention group
+        w._recv_valid_tokens = {"r0": 17}
+        w.transfer_topo = MagicMock()
+        meta = MagicMock()
+        meta.remote.engine_id = "eng"
+        meta.remote.block_ids = [[1, 2]]
+
+        seen = []
+        with patch.object(
+            NixlPullConnectorWorker,
+            "_read_blocks_for_req",
+            lambda self, req_id, m: seen.append(self._request_tail),
+        ):
+            w._read_blocks_for_req("r0", meta)
+
+        # The token count and the request's own block count, parked for the
+        # length of that call: upstream's `_compute_desc_ids` is what selects
+        # the descriptors and its signature has no room for either.
+        assert seen == [(17, 2)]
+        assert w._request_tail is None
+
+    def test_a_chunked_engine_without_a_window_may_not_reach_it(self):
+        # The other side of the same rule: nothing else leaves a chunked
+        # engine on a list that cannot leave part of a block out.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._engine_last_active = {}
+        w._remote_pp_size = {}
+        w._overlapping_ranks = {}
+        w._chunk_mode = True
+        w._sw_ratio = None
+        w._recv_valid_tokens = {}
+        w.transfer_topo = MagicMock()
+        meta = MagicMock()
+        meta.remote.engine_id = "eng"
+
+        with pytest.raises(AssertionError):
+            w._read_blocks_for_req("r0", meta)
+
     @pytest.mark.parametrize(
         ("local_tp", "remote_tp", "local_pp", "remote_pp", "expected_readers"),
         [
@@ -575,6 +626,8 @@ class TestUpstreamReachesTheOverride:
         w = TestShardReadPath._read_worker(pp_size=1)
         w._overlapping_ranks = {}  # nothing narrowed -> delegate to upstream
         w._sw_ratio = 2
+        w._chunk_grid = None  # no chunk range: the two ranges as before
+        w._request_tail = None
         w._group_specs = [_sliding_window_spec()]
         w.num_regions = 2
         w._physical_blocks_per_logical_kv_block = 1

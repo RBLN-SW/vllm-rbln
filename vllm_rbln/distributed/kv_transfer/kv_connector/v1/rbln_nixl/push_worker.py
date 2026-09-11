@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
@@ -190,6 +191,21 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # count and the loop below describing different peers.
         peer_ranks = self._overlapping_ranks.get(engine_id)
         if not peer_ranks:
+            # Chunk mode asks for per-shard state, so a request written in
+            # pieces cannot arrive on this route -- unless a sliding window
+            # kept it here.
+            assert not self._chunk_mode or self._sw_ratio is not None
+            tail: AbstractContextManager = (
+                self._tail_viewed_as(
+                    self._valid_tokens.get(req_id),
+                    # Counted before the trim below, which cuts the head off
+                    # the local list: the token count describes the request's
+                    # own blocks.
+                    self._prompt_blocks(meta.local_physical_block_ids),
+                )
+                if self._chunk_mode
+                else nullcontext()
+            )
             # NOTE(RBLN): upstream aligns by truncating the longer list and
             # keeping its HEAD -- the wrong end (see _trim_to_consumer_blocks)
             # -- and the lengths match either way so nothing catches it. Trim
@@ -202,10 +218,8 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     engine_id,
                     meta.remote.request_id,
                 )
-            # Trimming registers per-shard state against every peer, so
-            # reaching upstream's whole-engine write means it did not.
-            assert not self._chunk_mode
-            return super()._xfer_blocks_for_req(req_id, meta)
+            with tail:
+                return super()._xfer_blocks_for_req(req_id, meta)
 
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size

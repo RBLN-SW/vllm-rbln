@@ -1029,15 +1029,18 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         head, because the remote list carries a descriptor per copy where
         upstream's handle carries one per block.
         """
-        # Trimming narrows a block rather than a peer, and only the per-shard
-        # ids can leave part of one out.
+        # Trimming narrows a block rather than a peer, and the per-shard ids
+        # are what can leave part of one out -- except where a sliding window
+        # already gave the whole-engine list a second range, which is the one
+        # list that can carry a third and the only one that can name two KV
+        # groups.
         return (
             pp_size > 1
             or partial
             or fan_in
             or split > 1
             or fanout > 1
-            or self._chunk_mode
+            or (self._chunk_mode and self._sw_ratio is None)
         )
 
     def _register_shard_xfer_state(
@@ -1134,11 +1137,16 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if heads_per_span % split:
             return None
         span_tokens = block_size // spans
+        bytes_per_token = self.block_len_per_layer[0] // (span_tokens * heads_per_span)
+        assert bytes_per_token > 0, (
+            f"RBLN NIXL: a region holds {self.block_len_per_layer[0]}B per block, "
+            f"which is under one byte per token for {span_tokens} token(s) of "
+            f"{heads_per_span} head(s)"
+        )
         chunk_tokens = kv_chunk_tokens(
             span_tokens=span_tokens,
             # A region holds one band of one span, so this divides out both.
-            bytes_per_token=self.block_len_per_layer[0]
-            // (span_tokens * heads_per_span),
+            bytes_per_token=bytes_per_token,
             prefill_step_tokens=(
                 self.vllm_config.scheduler_config.max_num_batched_tokens
             ),
@@ -1440,6 +1448,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # shorter desc length.
         # _sw_ratio is not None here (the None case returned early above).
         length_divisors = [1, self._sw_ratio]
+        pieces: list[tuple[int, int, int, int]] = []
         for divisor in length_divisors:
             for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
                 local_block_len = self.get_backend_aware_kv_block_len(
@@ -1455,18 +1464,39 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     else 0
                 )
                 page_size = nixl_agent_meta.block_lens[i]
+                if divisor == 1:
+                    pieces.append(
+                        (
+                            base_addr + rank_offset,
+                            desc_len,
+                            page_size,
+                            nixl_agent_meta.device_id,
+                        )
+                    )
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * page_size + rank_offset
                     blocks_data.append((addr, desc_len, nixl_agent_meta.device_id))
 
-        logger.debug(
-            "Created %s remote blocks (%s) for dst engine %s "
-            "remote rank %s local rank %s",
+        # Derived here rather than passed between the lists: a range one side
+        # carries and the other does not pairs chunk descriptors against whole
+        # blocks, and the length check ahead of a transfer compares how many
+        # indices each side named, not how far they reach.
+        grid = self._shard_chunk_grid(block_size=nixl_agent_meta.block_size, split=1)
+        if grid is not None:
+            blocks_data += self._chunk_range_descs(
+                pieces, num_blocks=num_blocks, grid=grid
+            )
+
+        logger.info(
+            "RBLN NIXL: %d remote descriptor(s) for engine %s rank %d: whole, a "
+            "1/%d sliding-window view, and %s.",
             len(blocks_data),
-            "Full + SWA",
             engine_id,
             remote_tp_rank,
-            self.tp_rank,
+            self._sw_ratio,
+            f"a chunk range of {grid[0]} run(s) x {grid[1]} chunk(s)"
+            if grid is not None
+            else "no chunk range",
         )
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)

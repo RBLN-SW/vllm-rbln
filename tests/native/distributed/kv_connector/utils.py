@@ -85,6 +85,20 @@ def engine_config(
     )
 
 
+def set_connector_options(monkeypatch, vllm_config, **options) -> None:
+    """Put this connector's knobs on a config, for the test's duration.
+
+    They live in ``kv_connector_extra_config`` rather than the environment, so
+    a test sets them where production reads them. ``setitem`` rather than a
+    fresh config because `vllm_config_for` caches on its keyword tuple and the
+    object is shared -- monkeypatch takes the entries back out.
+    """
+    for key, value in options.items():
+        monkeypatch.setitem(
+            vllm_config.kv_transfer_config.kv_connector_extra_config, key, value
+        )
+
+
 def mock_vllm_config(**options) -> Any:
     """A mocked config that answers this connector's knob lookups.
 
@@ -642,14 +656,12 @@ def build_worker(
         NixlBaseConnectorWorker,
     )
 
-    import vllm_rbln.envs as envs
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (  # noqa: E501
         RblnNixlPullConnectorWorker,
     )
 
     module = types.ModuleType("nixl_rbln") if nixl_available else None
     monkeypatch.setitem(sys.modules, "nixl_rbln", module)
-    monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_SWA_VIEW_OPT", swa_view_opt)
 
     def fake_super_init(self, vllm_config, engine_id, kv_cache_config):
         self.vllm_config = vllm_config
@@ -676,7 +688,9 @@ def build_worker(
 
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
-    vllm_config = mock_vllm_config(chunk_mode=chunk_mode, chunk_bytes=chunk_bytes)
+    vllm_config = mock_vllm_config(
+        chunk_mode=chunk_mode, swa_view_opt=swa_view_opt, chunk_bytes=chunk_bytes
+    )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # No speculative decoding: the compat hash then folds what it always did.
     vllm_config.speculative_config = None

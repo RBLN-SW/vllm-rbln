@@ -1114,6 +1114,33 @@ class TestShardLocalRegions:
 
         assert none_grid == plain
 
+    def test_a_windowed_engine_carries_the_chunk_range_on_the_whole_engine_list(
+        self,
+    ):
+        # A sliding window keeps a request on the whole-engine lists -- the one
+        # pair that can name two KV groups -- so the chunk range has to follow
+        # the window's range there. The per-shard builder never sees it.
+        w = self._wired_worker()
+        w._sw_ratio = 2
+        w._has_swa = True
+        w._chunk_mode = True
+        runs, chunks = 1, 2
+
+        with patch.object(
+            RblnNixlPullConnectorWorker,
+            "_shard_chunk_grid",
+            return_value=(runs, chunks),
+        ):
+            _handle, blocks = w.register_local_xfer_handler(16)
+
+        whole = w.num_regions * w.num_blocks
+        # Whole blocks, then the window's view of them, then the chunk range.
+        assert len(blocks) == whole * 2 + whole * runs * chunks
+        full_len = w.block_len_per_layer[0]
+        assert {ln for _, ln, _ in blocks[:whole]} == {full_len}
+        assert {ln for _, ln, _ in blocks[whole : whole * 2]} == {full_len // 2}
+        assert {ln for _, ln, _ in blocks[whole * 2 :]} == {full_len // (runs * chunks)}
+
     def test_register_local_xfer_handler_routes_to_the_shard_path(self):
         # Dispatch to the shard path: no SWA view opt, layer names present. Miss
         # it and a stage registers the whole model's regions, so the descriptor
@@ -1183,6 +1210,45 @@ class TestShardLocalRegions:
         # a head is cut into TIMES the peer copies each piece is written to.
         # Two pieces and three copies: a product of six that neither factor
         # alone, and no pair of ones, can produce.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+        w._shard_descs_per_block = {}
+
+        w._register_shard_xfer_state(
+            "eng", 2, 16, ("l2", "l3"), split=2, replica_fanout=3
+        )
+
+        assert w._shard_descs_per_block == {("eng", 2): 6}
+
+    @pytest.mark.parametrize(
+        "sw_ratio, needs_own",
+        [
+            # A sliding window put a second range on the whole-engine list,
+            # which is the one list a third can follow and the only one that
+            # can name two KV groups sharing every region.
+            (8, False),
+            (None, True),
+        ],
+    )
+    def test_a_chunked_engine_asks_for_its_own_descriptors_unless_windowed(
+        self, sw_ratio, needs_own
+    ):
+        w = self._wired_worker()
+        w._chunk_mode = True
+        w._sw_ratio = sw_ratio
+
+        assert (
+            w._needs_own_descriptors(
+                pp_size=1, partial=False, fan_in=False, split=1, fanout=1
+            )
+            is needs_own
+        )
+
+    def test_register_shard_xfer_state_hands_the_derived_grid_on(self):
+        # Derived once here and used for the local list; left out, the local
+        # list holds whole blocks while every peer's carries the range.
         w = self._wired_worker()
         w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
         w.src_xfer_handles_by_remote = {}
@@ -3225,6 +3291,94 @@ class TestAddRemoteAgentSwa:
         assert names.index("register_remote_engine") < names.index("block_size_ratio")
 
         assert out == "remote-agent-name"
+
+    @staticmethod
+    def _swa_remote_worker(monkeypatch):
+        worker = build_worker(monkeypatch, num_blocks=8, block_size=64)
+        worker._sw_ratio = 2
+        worker._has_mamba = False
+        worker.use_mla = False
+        worker.tp_rank = 0
+        worker.device_id = 0
+        worker._group_spec_types = ()
+        worker.nixl_memory_type = "DRAM"
+        topo = MagicMock(is_kv_layout_blocks_first=False)
+        topo.block_size_ratio.return_value = 1
+        topo.tp_ratio.return_value = 1
+        topo.is_kv_replicated.return_value = True
+        worker.transfer_topo = topo
+        worker.tp_mappings = {}
+        worker.dst_num_blocks = {}
+        worker._remote_agents = {}
+        worker.kv_caches_base_addr = collections.defaultdict(dict)
+        worker.kv_caches_base_addr[worker.engine_id] = {0: [0x1000, 0x2000]}
+        worker.block_len_per_layer = [256, 256]
+        worker.dst_xfer_side_handles = collections.defaultdict(dict)
+        worker.src_xfer_handles_by_block_size = {}
+        worker.src_blocks_data = []
+        worker.nixl_wrapper = MagicMock()
+        worker.nixl_wrapper.add_remote_agent.return_value = "remote-agent-name"
+        return worker
+
+    def test_both_lists_cut_a_block_the_same_way(self, monkeypatch):
+        # The one thing the two builders must agree on and nothing else checks:
+        # a chunk's offset inside its block, and its length. Different bases,
+        # different strides, same cut.
+        worker = self._swa_remote_worker(monkeypatch)
+        meta = _remote_agent_meta()
+
+        with (
+            patched_in_package("compute_tp_mapping", MagicMock()),
+            patch.object(worker, "_validate_remote_agent_handshake"),
+            patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
+            patch.object(type(worker), "_shard_chunk_grid", return_value=(2, 2)),
+        ):
+            worker.add_remote_agent(meta, 0, 1)
+            remote = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
+            worker.register_local_xfer_handler(64)
+            local = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
+
+        def cut(descs, whole, base):
+            # The first block of the first region, as (offset in block, length).
+            return [(addr - base, ln) for addr, ln, _ in descs[whole : whole + 4]]
+
+        # Non-empty, or the comparison is two empty lists agreeing.
+        assert (
+            cut(remote, 32, 0x5000)
+            == cut(local, 32, 0x1000)
+            == [
+                (0, 64),
+                (64, 64),
+                (128, 64),
+                (192, 64),
+            ]
+        )
+
+    def test_the_peer_list_takes_the_third_range_too(self, monkeypatch):
+        # A prepared transfer pairs the two lists by position, so a range one
+        # side carries and the other does not pairs chunk descriptors against
+        # whole blocks -- and the length check ahead of a transfer compares how
+        # many indices each side named, not how far they reach.
+        worker = self._swa_remote_worker(monkeypatch)
+        meta = _remote_agent_meta()
+
+        with (
+            patched_in_package("compute_tp_mapping", MagicMock()),
+            patch.object(worker, "_validate_remote_agent_handshake"),
+            patch.object(worker, "get_backend_aware_kv_block_len", return_value=256),
+            patch.object(type(worker), "_shard_chunk_grid", return_value=(2, 2)),
+        ):
+            worker.add_remote_agent(meta, 0, 1)
+
+        blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
+        # 2 ranges x 2 regions x 8 blocks, then 2 regions x 8 blocks x 2 x 2.
+        assert len(blocks_data) == 32 + 64
+        assert blocks_data[32:36] == [
+            (0x5000, 64, 1),
+            (0x5040, 64, 1),
+            (0x5080, 64, 1),
+            (0x50C0, 64, 1),
+        ]
 
     def test_a_smaller_remote_block_shortens_descs_and_adds_a_local_handle(
         self, monkeypatch
