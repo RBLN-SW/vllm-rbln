@@ -278,7 +278,7 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.config import build_rbln_config, set_rbln_config
+        from vllm_rbln.config import build_rbln_config
         from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
         from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
         from vllm_rbln.utils.optimum.registry import is_pooling_arch
@@ -299,17 +299,15 @@ class RblnPlatform(Platform):
             cls._validate_dynamic_kv_config(vllm_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            vllm_config.additional_config = build_rbln_config(
-                vllm_config.additional_config
-            )
-            set_rbln_config(vllm_config.additional_config)
+            rbln_config = build_rbln_config(vllm_config.additional_config)
+            vllm_config.additional_config = rbln_config
 
             if vllm_config.lora_config is not None:
                 raise ValueError("LoRA is not supported on RBLN.")
 
             cls.validate_and_setup_prerequisite(vllm_config)
 
-            if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
+            if rbln_config.enforce_model_fp32:
                 if model_config.dtype != torch.float32:
                     # FIXME(RBLN): force model dtype into fp32 for graph compilation
                     original_dtype = model_config.dtype
@@ -344,7 +342,7 @@ class RblnPlatform(Platform):
             # only reader of the flag, and on the optimum path the refusal
             # below is the whole story.
             if scheduler_config.async_scheduling and not (
-                envs.VLLM_RBLN_USE_DEVICE_TENSOR and envs.VLLM_RBLN_SAMPLER
+                envs.VLLM_RBLN_USE_DEVICE_TENSOR and rbln_config.sampler
             ):
                 logger.warning(
                     "Disabling asynchronous scheduling: it requires "
@@ -353,7 +351,7 @@ class RblnPlatform(Platform):
                     "which puts the sampler on the device so those tokens never "
                     "reach the host mid-step. Running synchronously.",
                     int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
-                    int(envs.VLLM_RBLN_SAMPLER),
+                    int(rbln_config.sampler),
                 )
                 scheduler_config.async_scheduling = False
 
@@ -665,6 +663,8 @@ class RblnPlatform(Platform):
 
     @classmethod
     def validate_and_setup_prerequisite(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.config import RBLNConfig
+
         scheduler_config = vllm_config.scheduler_config
         if not scheduler_config.enable_chunked_prefill:
             raise ValueError(
@@ -717,10 +717,11 @@ class RblnPlatform(Platform):
                     "when DP enabled."
                 )
 
+            rbln_config: RBLNConfig = vllm_config.additional_config
             if (
                 parallel_config.data_parallel_size > 1
                 or parallel_config.enable_expert_parallel
-            ) and not envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
+            ) and not rbln_config.use_moe_tokens_mask:
                 raise ValueError(
                     "VLLM_RBLN_USE_MOE_TOKENS_MASK is required when DP or EP enabled: "
                     "the mask marks padded tokens introduced by DP multicast. "

@@ -20,7 +20,7 @@ from vllm.distributed import get_dp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
-from vllm_rbln import envs
+from vllm_rbln.config import get_rbln_config
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.layers.fused_moe import all2all
 from vllm_rbln.model_executor.layers.fused_moe.utils import get_tokens_mask
@@ -93,11 +93,15 @@ class RBLNMoERunner(MoERunner):
         # --- #41184 remap: top_k lives on moe_config ---
         self.top_k = self.moe_config.experts_per_token
 
-        use_dispatch_all2all = envs.VLLM_RBLN_DISPATCH_ALL2ALL
-        use_combine_all2all = envs.VLLM_RBLN_COMBINE_ALL2ALL
+        # `MoERunner.__init__` is upstream's signature, so the section comes
+        # from the config the model is being built under.
+        rbln_config = get_rbln_config()
+        self.use_dispatch_all2all = rbln_config.dispatch_all2all
+        self.use_combine_all2all = rbln_config.combine_all2all
+        self.use_moe_tokens_mask = rbln_config.use_moe_tokens_mask
 
         if self.moe_parallel_config.dp_size > 1 and (
-            use_dispatch_all2all or use_combine_all2all
+            self.use_dispatch_all2all or self.use_combine_all2all
         ):
             R = self.moe_parallel_config.dp_size
             E = self.global_num_experts
@@ -114,8 +118,8 @@ class RBLNMoERunner(MoERunner):
                 "(dispatch=%s, combine=%s): "
                 "R=%s, E=%s, "
                 "send_mask=%s",
-                use_dispatch_all2all,
-                use_combine_all2all,
+                self.use_dispatch_all2all,
+                self.use_combine_all2all,
                 R,
                 E,
                 self.send_mask.shape,
@@ -149,7 +153,7 @@ class RBLNMoERunner(MoERunner):
                     hidden_flat, (0, 0, 0, max_pad - t), value=0.0
                 )  # [max_pad, H]
 
-            if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
+            if self.use_dispatch_all2all:
                 # --- Router DP path: local routing → all_gather logits ---
                 router_logits = router(hidden_states)
                 router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
@@ -283,8 +287,7 @@ class RBLNMoERunner(MoERunner):
                     masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
             # Apply token mask to zero out padded positions per DP rank
-            use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-            if use_moe_tokens_mask:
+            if self.use_moe_tokens_mask:
                 tokens_mask = get_tokens_mask(
                     max_pad,
                     device=masked_routing_weights.device,
@@ -298,7 +301,7 @@ class RBLNMoERunner(MoERunner):
                 masked_routing_weights = masked_routing_weights * tokens_mask
 
             # --- Pre-compute routing logit slices (used by all2all) ---
-            if envs.VLLM_RBLN_DISPATCH_ALL2ALL or envs.VLLM_RBLN_COMBINE_ALL2ALL:
+            if self.use_dispatch_all2all or self.use_combine_all2all:
                 # all_routing_3d: [E, R, max_pad] for CCL send/receive kernels
                 all_routing_3d = masked_routing_weights.reshape(E, R, max_pad)
 
@@ -320,7 +323,7 @@ class RBLNMoERunner(MoERunner):
                 send_mask = self.send_mask.to(masked_routing_weights.dtype)
 
             # --- Step 4: Dispatch tokens across DP ranks ---
-            if envs.VLLM_RBLN_DISPATCH_ALL2ALL:
+            if self.use_dispatch_all2all:
                 # --- all2all dispatch path ---
                 # hidden_flat: [max_pad, H] (already padded above)
 
@@ -360,7 +363,7 @@ class RBLNMoERunner(MoERunner):
             )
 
             # --- Step 6: Combine partial results and extract this rank's output ---
-            if envs.VLLM_RBLN_COMBINE_ALL2ALL:
+            if self.use_combine_all2all:
                 # --- all2all combine path ---
                 # MoE output: [R*max_pad, H] → [R, max_pad, H]
                 combine_3d = final_hidden_states.reshape(R, max_pad, H_dim)
@@ -513,8 +516,7 @@ class RBLNMoERunner(MoERunner):
                 masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
                 masked_routing_weights.scatter_(0, selected_experts, topk_weights)
 
-        use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-        if use_moe_tokens_mask:
+        if self.use_moe_tokens_mask:
             tokens_mask = get_tokens_mask(
                 num_tokens,
                 device=masked_routing_weights.device,

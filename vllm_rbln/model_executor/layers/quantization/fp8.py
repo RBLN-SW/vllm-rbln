@@ -45,6 +45,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
 
+        from vllm_rbln.config import get_rbln_config
+
+        self.use_w8a8 = get_rbln_config().use_w8a8
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -327,9 +331,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             :, scale_intermediate_size:, :
         ]
 
-        from vllm_rbln import envs
-
-        if envs.VLLM_RBLN_USE_W8A8:
+        if self.use_w8a8:
             # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k)
             # group along K and hand both the fp8 tensor and the per-(token,
             # K-block) scale to the W8A8 MoE custom op.

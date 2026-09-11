@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.v1.worker.rbln_worker as wm
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import RblnPlatform
 from vllm_rbln.v1.worker.rbln_worker import (
     RBLNWorker,
@@ -69,7 +70,9 @@ def _make_vllm_config(
         cache_config=SimpleNamespace(gpu_memory_utilization=0.9, num_gpu_blocks=None),
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
-        additional_config=additional_config if additional_config is not None else {},
+        additional_config=(
+            additional_config if additional_config is not None else RBLNConfig()
+        ),
     )
 
 
@@ -140,6 +143,7 @@ def make_worker(monkeypatch):
             data_parallel_rank_local=data_parallel_rank_local,
             world_size_across_dp=wsd,
             assigned_physical_gpu_ids=assigned_physical_gpu_ids,
+            additional_config=RBLNConfig(num_devices_per_local_rank=num_devices),
         )
         # MultiprocExecutor.worker_main publishes the mapping in every worker
         # process before the worker is built, so a test that supplies one must
@@ -171,9 +175,6 @@ def make_worker(monkeypatch):
                     RblnPlatform.device_id_to_physical_device_id
                 ),
             ),
-        )
-        monkeypatch.setattr(
-            wm.envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", num_devices
         )
         monkeypatch.setattr(wm, "has_torch_rbln", has_torch_rbln)
         return RBLNWorker(
@@ -239,16 +240,6 @@ class TestConformance:
         override = list(inspect.signature(RBLNWorker.load_model).parameters)
         assert "load_dummy_weights" in base
         assert override == ["self"]
-
-
-class TestConfigResolution:
-    def test_additional_config_reaches_the_worker(self, make_worker):
-        # The worker receives an already-built VllmConfig, so __init__ is the
-        # only place the section can be resolved. No env var is involved.
-        from vllm_rbln.config import get_rbln_config
-
-        make_worker(vllm_config=_make_vllm_config(additional_config={"sampler": False}))
-        assert get_rbln_config().sampler is False
 
 
 class TestInitDeviceEnv:
@@ -608,11 +599,12 @@ class TestCompileOrWarmUpModel:
         data_parallel_size=1,
     ):
         vcfg = _make_vllm_config(
-            enforce_eager=enforce_eager, data_parallel_size=data_parallel_size
+            enforce_eager=enforce_eager,
+            data_parallel_size=data_parallel_size,
+            additional_config=RBLNConfig(compile_model=compile_model),
         )
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
-        monkeypatch.setattr(wm.envs, "VLLM_RBLN_COMPILE_MODEL", compile_model)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_ENABLE_WARM_UP", warm_up)
         monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: False)
         monkeypatch.setattr(wm, "set_random_seed", lambda s: None)

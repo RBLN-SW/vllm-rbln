@@ -111,6 +111,7 @@ from vllm_rbln.compilation import (
     create_compile_context,
     set_compile_stage,
 )
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
@@ -246,6 +247,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        self.rbln_config: RBLNConfig = vllm_config.additional_config
 
         # Step phase; see is_prefill for authority and lifecycle.
         self._is_prefill_step: bool = False
@@ -288,7 +290,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
-        if envs.VLLM_RBLN_SAMPLER:
+        if self.rbln_config.sampler:
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
@@ -361,6 +363,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.compile_context,
                 self.speculative_config,
                 self.device,
+                use_rbln_sampler=self.rbln_config.sampler,
             )
 
         self.num_spec_tokens = 0
@@ -387,7 +390,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
         logitsprocs_builder = (
-            build_rbln_logitsprocs if envs.VLLM_RBLN_SAMPLER else build_logitsprocs
+            build_rbln_logitsprocs if self.rbln_config.sampler else build_logitsprocs
         )
 
         logitsprocs = logitsprocs_builder(
@@ -461,14 +464,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # per-PP-stage decode batch (max_num_seqs // pp_size) -- the same ceiling
         # the scheduler's admission cap uses -- not the raw max_num_seqs.
         self.bucketing_manager = get_bucketing_manager(
-            envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY,
+            self.rbln_config.decode_batch_bucket_strategy,
             max_batch_size=decode_batch_size(
                 self.max_num_reqs, self.parallel_config.pipeline_parallel_size
             ),
-            min_batch_size=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MIN,
-            step=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_STEP,
-            limit=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT,
-            manual_buckets=envs.VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS,
+            min_batch_size=self.rbln_config.decode_batch_bucket_min,
+            step=self.rbln_config.decode_batch_bucket_step,
+            limit=self.rbln_config.decode_batch_bucket_limit,
+            manual_buckets=self.rbln_config.decode_batch_bucket_manual_buckets,
         )
         logger.info(
             "Using %s. Decode batch buckets: %s",
@@ -478,14 +481,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         self.specialized_moe_decode = (
             parallel_config.data_parallel_size > 1
-            and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
+            and self.rbln_config.specialize_moe_decode
         )
         # The batched dynamic decode kernel (REBEL CR13, or any device with
         # VLLM_RBLN_BATCH_ATTN_OPT) processes the first valid_batch[p] rows of
         # partition p and early-exits on the rest, which is only correct when
         # rows are sorted by descending sequence length.
         self.sort_batch_by_length = (
-            current_platform.is_cr13() or envs.VLLM_RBLN_BATCH_ATTN_OPT
+            current_platform.is_cr13() or self.rbln_config.batch_attn_opt
         )
 
         # Static, so the per-step decision only has to supply this step's counts.
@@ -1313,7 +1316,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 **staging,
             )
         else:
-            if envs.VLLM_RBLN_SAMPLER:
+            if self.rbln_config.sampler:
                 bucket = self.bucketing_manager.max_batch_size
                 spec_decode_metadata = _pad_spec_decode_metadata(
                     spec_decode_metadata, bucket
@@ -2204,7 +2207,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             return hidden_states, logits, combined_hidden_states
 
-        if self.model_config.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+        if self.model_config.enforce_eager or not self.rbln_config.compile_model:
             self.model_executable = model_wrapper
             self.compute_logits = self.model.compute_logits
         else:
@@ -2214,7 +2217,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                num_devices=self.rbln_config.num_devices_per_local_rank,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
@@ -2232,7 +2235,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                num_devices=self.rbln_config.num_devices_per_local_rank,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
@@ -2795,7 +2798,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             device = (
                 "cpu"
-                if not envs.VLLM_RBLN_COMPILE_MODEL
+                if not self.rbln_config.compile_model
                 else self.device
                 if USE_DEVICE_TENSOR
                 else "meta"
@@ -3024,7 +3027,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if (
             not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
+            and self.rbln_config.compile_model
         ):
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
@@ -3070,7 +3073,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize KV cache based on `kv_cache_config`."""
-        if envs.VLLM_RBLN_SUB_BLOCK_CACHE and (
+        if self.rbln_config.sub_block_cache and (
             len(kv_cache_config.kv_cache_groups) > 1
         ):
             raise NotImplementedError(
@@ -3343,7 +3346,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.speculative_config is None
             or self.num_spec_tokens <= 0
             or self.is_pooling_model
-            or not envs.VLLM_RBLN_SAMPLER
+            or not self.rbln_config.sampler
         ):
             return
 
@@ -3479,7 +3482,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if (
             not USE_DEVICE_TENSOR
             and not self.model_config.enforce_eager
-            and envs.VLLM_RBLN_COMPILE_MODEL
+            and self.rbln_config.compile_model
         ):
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (VLLM_RBLN_USE_VLLM_MODEL).

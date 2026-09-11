@@ -30,6 +30,7 @@ from vllm_rbln.compilation import (
     build_process_group_dict,
     compile,
 )
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import USE_DEVICE_TENSOR
@@ -434,9 +435,10 @@ class RBLNEagleProposer(EagleProposer):
             # the logits too.
             return hidden_states, torch.ops.rbln.argmax(logits)
 
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         if (
             self.vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
+            or not rbln_config.compile_model
         ):
             self.model_executable = model_wrapper
         else:
@@ -445,7 +447,7 @@ class RBLNEagleProposer(EagleProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.runner.compile_context,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                num_devices=rbln_config.num_devices_per_local_rank,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,

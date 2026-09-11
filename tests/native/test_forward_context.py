@@ -23,10 +23,14 @@ import torch
 import vllm.forward_context as vfc
 
 import vllm_rbln.forward_context as fc
+from vllm_rbln.config import RBLNConfig
 
 
-def _cfg(dp_size: int):
-    return SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=dp_size))
+def _cfg(dp_size: int, *, moe_mask: bool = True):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+        additional_config=RBLNConfig(use_moe_tokens_mask=moe_mask),
+    )
 
 
 class TestMake:
@@ -104,7 +108,6 @@ def captured(monkeypatch):
     monkeypatch.setattr(
         fc.current_platform, "set_additional_forward_context", fake_additional
     )
-    monkeypatch.setattr(fc.envs, "VLLM_RBLN_USE_MOE_TOKENS_MASK", False)
     return calls
 
 
@@ -120,10 +123,11 @@ class TestDpMetadataGating:
         ],
     )
     def test_builds_dp_metadata_only_when_gated(
-        self, monkeypatch, captured, dp_size, moe_mask, attn, num_tokens, expect_dp
+        self, captured, dp_size, moe_mask, attn, num_tokens, expect_dp
     ):
-        monkeypatch.setattr(fc.envs, "VLLM_RBLN_USE_MOE_TOKENS_MASK", moe_mask)
-        with fc.set_forward_context(attn, _cfg(dp_size), num_tokens=num_tokens):
+        with fc.set_forward_context(
+            attn, _cfg(dp_size, moe_mask=moe_mask), num_tokens=num_tokens
+        ):
             pass
         dp_arg = captured["create"][0]["dp"]
         if expect_dp:

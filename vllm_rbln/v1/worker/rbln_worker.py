@@ -71,7 +71,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation.backends import set_compile_stage
-from vllm_rbln.config import build_rbln_config, set_rbln_config
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
@@ -170,9 +170,6 @@ class RBLNWorker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
-        # Before _init_device_env(), which reads device-count options.
-        set_rbln_config(build_rbln_config(vllm_config.additional_config))
-
         self._init_device_env()
 
         self._rbln_host_threads_before_compile_ready = False
@@ -210,8 +207,9 @@ class RBLNWorker(WorkerBase):
         pass
 
     def _init_device_env(self) -> None:
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         env_var = current_platform.device_control_env_var
-        num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
+        num_devices = rbln_config.num_devices_per_local_rank
 
         dp_rank = self.parallel_config.data_parallel_rank_local or 0
         slot = dp_rank * self.parallel_config.world_size + self.local_rank
@@ -399,11 +397,13 @@ class RBLNWorker(WorkerBase):
 
         logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         estimate_kwargs = dict(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
+            num_devices_per_local_rank=rbln_config.num_devices_per_local_rank,
         )
 
         speculative_config = self.speculative_config
@@ -530,7 +530,8 @@ class RBLNWorker(WorkerBase):
         """Why the compile and warm-up will be skipped, or None if they will run."""
         if self.model_config.enforce_eager:
             return "enforce_eager is set"
-        if not envs.VLLM_RBLN_COMPILE_MODEL:
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        if not rbln_config.compile_model:
             return "VLLM_RBLN_COMPILE_MODEL is off"
         if not envs.VLLM_RBLN_ENABLE_WARM_UP:
             return "VLLM_RBLN_ENABLE_WARM_UP is off"

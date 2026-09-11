@@ -70,8 +70,8 @@ def make_builder(
     layer_names: tuple[str, ...] = ("model.layers.0.self_attn",),
     device: str = "cpu",
 ) -> Any:
-    """Construct the real builder. is_causal is read from
-    VLLM_RBLN_FLASH_CAUSAL_ATTN at __init__, so set it before calling."""
+    """Construct the real builder. is_causal comes from `vllm_config`, so pass a
+    config built with `flash_causal_attn` off to get the non-causal builder."""
     from vllm.config import set_current_vllm_config
 
     from vllm_rbln.v1.attention.backends.flash_attention import (

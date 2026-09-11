@@ -41,16 +41,11 @@ from .utils import create_allowed_token_ids
 DEVICE = "cpu"
 
 
-@pytest.fixture(autouse=True)
-def use_torch_rejection_sampler(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
-
-
 @pytest.fixture
 def rejection_sampler():
     mock_sampler = Mock(spec=Sampler)
     mock_sampler.logprobs_mode = "raw_logprobs"
-    return RBLNRejectionSampler(mock_sampler)
+    return RBLNRejectionSampler(mock_sampler, use_rbln_sampler=False)
 
 
 def make_synthetic_rejection_sampler(
@@ -58,9 +53,9 @@ def make_synthetic_rejection_sampler(
 ) -> RBLNRejectionSampler:
     """Build an RBLNRejectionSampler (Torch impl) in synthetic-acceptance mode.
 
-    The autouse `use_torch_rejection_sampler` fixture forces VLLM_RBLN_SAMPLER=0,
-    so this exercises TorchRejectionSamplerImpl — the only impl that supports
-    synthetic mode (the NPU impl asserts against it).
+    Built with `use_rbln_sampler=False`, so this exercises
+    TorchRejectionSamplerImpl — the only impl that supports synthetic mode (the
+    NPU impl asserts against it).
 
     `conditional_rates` are the per-position conditional rates the kernels
     compare uniform samples against (c_i in vllm's synthetic mode). A rate of
@@ -69,7 +64,7 @@ def make_synthetic_rejection_sampler(
     """
     mock_sampler = Mock(spec=Sampler)
     mock_sampler.logprobs_mode = "raw_logprobs"
-    sampler = RBLNRejectionSampler(mock_sampler)
+    sampler = RBLNRejectionSampler(mock_sampler, use_rbln_sampler=False)
     sampler.synthetic_conditional_rates = torch.tensor(
         conditional_rates, dtype=torch.float32, device=DEVICE
     )
@@ -525,7 +520,7 @@ def estimate_rejection_sampling_pdf(
     """
     mock_sampler = Mock(spec=Sampler)
     mock_sampler.logprobs_mode = "raw_logprobs"
-    rejection_sampler = RBLNRejectionSampler(mock_sampler)
+    rejection_sampler = RBLNRejectionSampler(mock_sampler, use_rbln_sampler=False)
     num_tokens = num_samples * k
     # Repeat draft probs num_samples * k times.
     draft_probs = draft_probs.reshape(1, 1, vocab_size).repeat(num_samples, k, 1)
@@ -1007,19 +1002,22 @@ def test_placeholder_draft_random_non_synthetic(rejection_sampler):
     assert torch.equal(output.sampled_token_ids, expected)
 
 
-def test_npu_impl_refuses_synthetic_mode(monkeypatch):
-    """The NPU impl (VLLM_RBLN_SAMPLER=1) must fail fast on synthetic mode.
+def test_npu_impl_refuses_synthetic_mode():
+    """The NPU impl must fail fast on synthetic mode.
 
     The NPU `rbln::rejection_sample` primitive ignores synthetic rates, so
     RBLNRejectionSampler asserts against it at construction (before the impl is
     even compiled) rather than silently sampling normally.
     """
-    # Overrides the autouse use_torch_rejection_sampler fixture (=0).
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
     mock_sampler = Mock(spec=Sampler)
     mock_sampler.logprobs_mode = "raw_logprobs"
     spec_config = Mock()
     spec_config.rejection_sample_method = "synthetic"
     spec_config.synthetic_acceptance_rates = [0.5, 0.5]
     with pytest.raises(AssertionError):
-        RBLNRejectionSampler(mock_sampler, spec_config=spec_config, device="cpu")
+        RBLNRejectionSampler(
+            mock_sampler,
+            spec_config=spec_config,
+            device="cpu",
+            use_rbln_sampler=True,
+        )

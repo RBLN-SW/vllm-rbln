@@ -40,6 +40,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
@@ -288,9 +289,10 @@ class TestPadDepad:
 
 class TestSamplePadding:
     @staticmethod
-    def _runner(rejection_output: SamplerOutput):
+    def _runner(rejection_output: SamplerOutput, *, sampler: bool):
         rejection_sampler = MagicMock(return_value=rejection_output)
         runner = _make_runner_stub(
+            rbln_config=RBLNConfig(sampler=sampler),
             _is_prefill_step=False,
             use_async_scheduling=False,
             input_batch=SimpleNamespace(
@@ -305,26 +307,24 @@ class TestSamplePadding:
         )
         return runner, rejection_sampler
 
-    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", True)
+    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self):
         output = SamplerOutput(
             sampled_token_ids=torch.zeros((4, 3), dtype=torch.int32),
             logprobs_tensors=None,
         )
-        runner, rejection_sampler = self._runner(output)
+        runner, rejection_sampler = self._runner(output, sampler=True)
 
         runner._sample(torch.zeros((4, 10)), _spec_decode_metadata([1, 1]))
 
         padded_metadata = rejection_sampler.call_args.args[0]
         assert len(padded_metadata.num_draft_tokens) == 4
 
-    def test_torch_rejection_sampler_keeps_live_batch_metadata(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", False)
+    def test_torch_rejection_sampler_keeps_live_batch_metadata(self):
         output = SamplerOutput(
             sampled_token_ids=torch.zeros((2, 3), dtype=torch.int32),
             logprobs_tensors=None,
         )
-        runner, rejection_sampler = self._runner(output)
+        runner, rejection_sampler = self._runner(output, sampler=False)
         spec_decode_metadata = _spec_decode_metadata([1, 1])
         sampling_metadata = runner.input_batch.sampling_metadata
 
@@ -334,10 +334,10 @@ class TestSamplePadding:
         assert rejection_sampler.call_args.args[3] is sampling_metadata
 
 
-def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
-    monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", True)
+def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
     rejection_sample = MagicMock()
     runner = _make_runner_stub(
+        rbln_config=RBLNConfig(sampler=True),
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
@@ -780,7 +780,7 @@ class TestDummyRunPadding:
 
 class TestProcessKvCacheCopyOps:
     # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
-    # and VLLM_RBLN_COMPILE_MODEL. Forced deterministically via monkeypatch.
+    # and compile_model. Forced deterministically.
     def test_eager_copy_non_mla(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)  # -> eager path
         # non-MLA layout: (2, num_blocks, heads, 1, block_tokens, dim).
@@ -812,7 +812,6 @@ class TestProcessKvCacheCopyOps:
 
     def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         calls = []
         runtime = SimpleNamespace(
             _copy_kv_cache=lambda src, dst, nt: calls.append((src, dst, nt))
@@ -821,6 +820,7 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
+            rbln_config=RBLNConfig(),
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
         assert calls == [(5, 6, 4)]
@@ -866,10 +866,6 @@ def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None):
 class TestUpdateStates:
     # Request-state bookkeeping on a real InputBatch; scheduler_output is
     # duck-typed since every access is an attribute or index read.
-    @pytest.fixture(autouse=True)
-    def _config(self, rbln_config):
-        rbln_config()
-
     @staticmethod
     def _runner(monkeypatch, *, input_batch, requests=None):
         monkeypatch.setattr(
@@ -1069,14 +1065,15 @@ class TestAllocateKvCacheTensors:
             ],
         )
 
-    def _runner(self):
+    def _runner(self, *, compile_model=True):
         return _make_runner_stub(
-            device=torch.device("cpu"), runner_only_attn_layers=set()
+            device=torch.device("cpu"),
+            runner_only_attn_layers=set(),
+            rbln_config=RBLNConfig(compile_model=compile_model),
         )
 
-    def test_cpu_when_not_compiling(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+    def test_cpu_when_not_compiling(self):
+        raw = self._runner(compile_model=False)._allocate_kv_cache_tensors(self._cfg())
         assert set(raw) == {"l0", "l1", "l2"}
         assert raw["l0"].device.type == "cpu"
         # Layers sharing a pool share the same buffer object.
@@ -1084,13 +1081,11 @@ class TestAllocateKvCacheTensors:
         assert raw["l0"] is not raw["l2"]
 
     def test_meta_when_compiling_without_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "meta"
 
     def test_self_device_when_compiling_with_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here

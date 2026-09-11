@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
 from tests.native.vllm_config import local_model_path
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import (
     RBLN_DEFAULT_MAX_NUM_SEQS,
     RblnPlatform,
@@ -201,20 +203,20 @@ class TestRejectedConfigs:
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
 
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
-    def test_dp_and_ep_need_the_moe_tokens_mask(self, monkeypatch, reconfigure, ranks):
-        monkeypatch.setattr(platform.envs, "VLLM_RBLN_USE_MOE_TOKENS_MASK", False)
+    def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_MOE_TOKENS_MASK"):
-            reconfigure(_ranks(**ranks))
+            reconfigure(_ranks(moe_tokens_mask=False, **ranks))
 
-    def test_tp_inherits_neither_dp_rule(self, monkeypatch, reconfigure):
+    def test_tp_inherits_neither_dp_rule(self, reconfigure):
         # Both rules guard padding introduced by DP multicast, so TP alone must
         # pass even with the mask off and an indivisible budget.
-        monkeypatch.setattr(platform.envs, "VLLM_RBLN_USE_MOE_TOKENS_MASK", False)
-        reconfigure(_ranks(tensor_parallel_size=2, max_num_seqs=5))
+        reconfigure(
+            _ranks(tensor_parallel_size=2, max_num_seqs=5, moe_tokens_mask=False)
+        )
 
     def test_moe_tokens_mask_defaults_on(self):
-        # The error above calls 1 the default; a flipped default breaks DP.
-        assert platform.envs.VLLM_RBLN_USE_MOE_TOKENS_MASK is True
+        # The error above calls it the default; a flipped default breaks DP.
+        assert RBLNConfig().use_moe_tokens_mask is True
 
 
 def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int = 2):
@@ -241,7 +243,13 @@ def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int
     return mutate
 
 
-def _ranks(*, ep: bool = False, max_num_seqs: int | None = None, **parallel):
+def _ranks(
+    *,
+    ep: bool = False,
+    max_num_seqs: int | None = None,
+    moe_tokens_mask: bool | None = None,
+    **parallel,
+):
     """A mutator that widens a config to more ranks."""
 
     def mutate(config: VllmConfig) -> None:
@@ -251,6 +259,10 @@ def _ranks(*, ep: bool = False, max_num_seqs: int | None = None, **parallel):
             config.parallel_config.enable_expert_parallel = True
         if max_num_seqs is not None:
             config.scheduler_config.max_num_seqs = max_num_seqs
+        if moe_tokens_mask is not None:
+            config.additional_config = replace(
+                config.additional_config, use_moe_tokens_mask=moe_tokens_mask
+            )
 
     return mutate
 
@@ -287,11 +299,8 @@ class TestDtype:
         )
         assert config.model_config.dtype == torch.float32
 
-    def test_enforce_fp32_overrides_a_supported_dtype(self, monkeypatch, reconfigure):
-        monkeypatch.setattr(platform.envs, "VLLM_RBLN_ENFORCE_MODEL_FP32", True)
-        config = reconfigure(
-            lambda config: setattr(config.model_config, "dtype", torch.float16)
-        )
+    def test_enforce_fp32_overrides_a_supported_dtype(self):
+        config = _build(dtype="float16", additional_config={"enforce_model_fp32": True})
         assert config.model_config.dtype == torch.float32
 
 
@@ -308,17 +317,17 @@ class TestWorkerAndScheduler:
             == "pkg.mod.MyWorker"
         )
 
-    def test_scheduler_is_replaced_unconditionally(self, monkeypatch, reconfigure):
+    def test_scheduler_is_replaced_unconditionally(self, reconfigure):
         # Unlike worker_cls there is no "auto" guard: whatever was asked for is
         # overwritten. Reading the expectation back off the config under test
         # would agree with whatever the platform decided, so the carriers are
         # pinned off and the sync scheduler named outright.
-        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
-        config = reconfigure(
-            lambda config: setattr(
-                config.scheduler_config, "scheduler_cls", "pkg.mod.MyScheduler"
-            )
-        )
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.scheduler_cls = "pkg.mod.MyScheduler"
+            config.additional_config = replace(config.additional_config, sampler=False)
+
+        config = reconfigure(mutate)
         assert (
             config.scheduler_config.scheduler_cls
             == "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"

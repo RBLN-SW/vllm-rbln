@@ -28,8 +28,9 @@ Resolution order, highest first:
      applies. `_ENV_PROBE` lists the names that break the pattern.
   3. the field default
 
-Most call sites still read `envs.py` directly. They move over one subsystem
-at a time.
+`envs.py` still carries the variables and their parsing. The options that stay
+there rather than move -- a patch condition reads two of them before this config
+exists, and the rest are bring-up knobs -- are not fields here.
 """
 
 import argparse
@@ -65,20 +66,8 @@ class RBLNConfig:
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
     possible."""
 
-    compile_strict_mode: bool = False
-    """Compile with torch.compile's strict mode, which fails on a graph break
-    instead of falling back to eager."""
-
-    num_hidden_layers: int = 0
-    """Build only the first N decoder layers and leave the rest as
-    `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
-    truncation."""
-
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
-
-    use_dynamic_kv_cache: bool = False
-    """Size the KV cache from the compiled artifact instead of the estimate."""
 
     flash_causal_attn: bool = True
     """Use flash attention for causal attention."""
@@ -120,11 +109,6 @@ class RBLNConfig:
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
-    nixl_swa_view_opt: bool = False
-    """Publish a second SWA-sized descriptor range alongside the Full-sized
-    range at the same NIXL base addresses, so SWA groups transfer only
-    `sliding_window` bytes per block over RDMA."""
-
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
@@ -140,11 +124,9 @@ class RBLNConfig:
 
         ignored_factors = {
             # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. The rest change what runs, not what is built.
+            # the bundle. Sub-block caching changes what runs, not what is built.
             "sampler",
-            "compile_strict_mode",
             "sub_block_cache",
-            "nixl_swa_view_opt",
         }
         return hash_factors(get_hash_factors(self, ignored_factors))
 
@@ -224,50 +206,47 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
 
     if shadowed:
         logger.warning_once(
-            "Ignoring the environment variables for %s; the CLI value wins.",
+            "Both the environment and additional_config set %s; RBLNConfig "
+            "takes the additional_config value.",
             ", ".join(shadowed),
         )
 
-    return RBLNConfig(**overrides)
+    resolved = RBLNConfig(**overrides)
 
-
-_rbln_config: RBLNConfig | None = None
-
-
-def set_rbln_config(config: RBLNConfig) -> None:
-    """Publish the resolved config for this process.
-
-    Each process does this at its own entry point. A worker and EngineCore
-    receive an already-built `VllmConfig`, so its `__post_init__` -- where the
-    platform hook runs -- does not run again there.
-    """
-    global _rbln_config
-    _rbln_config = config
-
+    # Upstream's `non-default args` covers what the CLI was given, but not what
+    # the environment resolved to, and `VllmConfig.__str__` leaves
+    # additional_config out entirely. This is the only record of the values a
+    # run actually used.
     defaults = RBLNConfig()
     changed = {
-        f.name: getattr(config, f.name)
+        f.name: getattr(resolved, f.name)
         for f in _FIELDS
-        if getattr(config, f.name) != getattr(defaults, f.name)
+        if getattr(resolved, f.name) != getattr(defaults, f.name)
     }
     logger.info("RBLN config: %s", changed or "all defaults")
 
+    return resolved
+
 
 def get_rbln_config() -> RBLNConfig:
-    """The resolved RBLN config for this process.
+    """The RBLN section of the config the current model is being built under.
 
-    There is deliberately no fallback to the environment. A child process
-    inherits env vars but not `--rbln-*` values, so a fallback would be right
-    when the option came from the environment and wrong when it came from the
-    command line.
+    For code that cannot reach a `vllm_config` of its own -- a free function, or
+    a constructor whose signature upstream owns. Every such call site runs
+    inside `set_current_vllm_config`, which upstream opens around worker start-up,
+    device init and model construction. Read `vllm_config.additional_config`
+    directly wherever one is in hand.
     """
-    if _rbln_config is None:
+    from vllm.config import get_current_vllm_config
+
+    rbln_config = get_current_vllm_config().additional_config
+    if not isinstance(rbln_config, RBLNConfig):
         raise RuntimeError(
-            "RBLNConfig was never resolved in this process. Call "
-            "set_rbln_config(build_rbln_config(vllm_config.additional_config)) "
-            "from this process's entry point."
+            "additional_config is not an RBLNConfig; "
+            "check_and_update_config resolves it on the vLLM-native path, so "
+            f"this is the optimum-rbln path or an unbuilt config: {rbln_config!r}"
         )
-    return _rbln_config
+    return rbln_config
 
 
 # `from_cli_args` only copies dataclass fields, so a `--rbln-*` flag cannot

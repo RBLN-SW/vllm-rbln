@@ -378,28 +378,14 @@ environment_variables = {
 # Partition for the mega-cache config signature: COMPILE vars are hashed into
 # the bundle key, NON_COMPILE vars are ignored. test_mega_cache.py asserts the
 # two sets exactly cover environment_variables — classify every new var here.
+# An `RBLNConfig` field goes in NON_COMPILE: `RBLNConfig.compute_hash()` already
+# keys the bundle on the resolved value, whichever route supplied it.
 RBLN_COMPILE_ENV = frozenset(
     {
         "VLLM_RBLN_USE_VLLM_MODEL",
-        "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
-        "VLLM_RBLN_COMPILE_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
-        "VLLM_RBLN_ENFORCE_MODEL_FP32",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-        "VLLM_RBLN_FLASH_CAUSAL_ATTN",
-        "VLLM_RBLN_BATCH_ATTN_OPT",
-        "VLLM_RBLN_USE_CUSTOM_KERNEL",
-        "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
-        "VLLM_RBLN_USE_MOE_TOKENS_MASK",
-        "VLLM_RBLN_DISPATCH_ALL2ALL",
-        "VLLM_RBLN_COMBINE_ALL2ALL",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
-        "VLLM_RBLN_USE_W8A8",
     }
 )
 
@@ -418,6 +404,23 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_AUTO_PORT",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
         "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
+        # RBLNConfig fields: the config hash keys the bundle on these
+        "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
+        "VLLM_RBLN_COMPILE_MODEL",
+        "VLLM_RBLN_ENFORCE_MODEL_FP32",
+        "VLLM_RBLN_FLASH_CAUSAL_ATTN",
+        "VLLM_RBLN_BATCH_ATTN_OPT",
+        "VLLM_RBLN_USE_CUSTOM_KERNEL",
+        "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
+        "VLLM_RBLN_USE_MOE_TOKENS_MASK",
+        "VLLM_RBLN_DISPATCH_ALL2ALL",
+        "VLLM_RBLN_COMBINE_ALL2ALL",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
+        "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
+        "VLLM_RBLN_USE_W8A8",
     }
 )
 

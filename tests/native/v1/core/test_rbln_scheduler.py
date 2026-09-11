@@ -48,12 +48,9 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
-    def test_sub_block_size_defaults_to_max_num_batched_tokens(self, monkeypatch):
-        # With VLLM_RBLN_SUB_BLOCK_CACHE and no explicit sub_block_size, the
+    def test_sub_block_size_defaults_to_max_num_batched_tokens(self):
+        # sub_block_cache is on by default, so with no explicit sub_block_size the
         # scheduler uses max_num_batched_tokens as the sub_block_size.
-        import vllm_rbln.envs as envs
-
-        monkeypatch.setattr(envs, "VLLM_RBLN_SUB_BLOCK_CACHE", True)
         sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,
@@ -63,19 +60,16 @@ class TestSchedulerInit:
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
 
-    def test_additional_config_reaches_the_scheduler(self):
-        # EngineCore receives an already-built VllmConfig, so __init__ is the
-        # only place the section can be resolved. No env var is involved.
-        from vllm_rbln.config import get_rbln_config
-
-        create_rbln_scheduler(
+    def test_additional_config_turns_sub_block_caching_off(self):
+        # Eligible otherwise, so the plain manager is the option's doing.
+        sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,
             max_num_batched_tokens=128,
             max_model_len=2048,
             additional_config={"sub_block_cache": False},
         )
-        assert get_rbln_config().sub_block_cache is False
+        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.

@@ -17,12 +17,18 @@
 from __future__ import annotations
 
 import dataclasses
+import pathlib
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_rbln.config import _ENV_PROBE, _GROUP_TITLE, RBLNConfig, build_rbln_config
+from vllm_rbln.config import (
+    _ENV_PROBE,
+    _GROUP_TITLE,
+    RBLNConfig,
+    build_rbln_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -84,11 +90,14 @@ def test_flags_reach_the_config(parser):
 def test_coexists_with_additional_config(parser):
     """The dotted form is appended at the end of argv, so it must merge."""
     args = parser.parse_args(
-        ["--rbln-use-w8a8", "--additional-config.num_hidden_layers", "2"]
+        ["--rbln-use-w8a8", "--additional-config.decode_batch_bucket_limit", "2"]
     )
-    assert args.additional_config == {"use_w8a8": True, "num_hidden_layers": 2}
+    assert args.additional_config == {
+        "use_w8a8": True,
+        "decode_batch_bucket_limit": 2,
+    }
     config = build_rbln_config(args.additional_config)
-    assert (config.use_w8a8, config.num_hidden_layers) == (True, 2)
+    assert (config.use_w8a8, config.decode_batch_bucket_limit) == (True, 2)
 
 
 def test_json_form_is_equivalent(parser):
@@ -132,13 +141,27 @@ def test_manual_strategy_needs_buckets():
         RBLNConfig(decode_batch_bucket_strategy="manual")
 
 
-def test_unresolved_config_raises(monkeypatch):
-    """No silent env fallback: a process that never resolved one must fail."""
-    from vllm_rbln import config as config_module
+def test_get_rbln_config_needs_the_current_config_context():
+    """It reads the config the model is being built under, so there has to be one."""
+    from vllm_rbln.config import get_rbln_config
 
-    monkeypatch.setattr(config_module, "_rbln_config", None)
-    with pytest.raises(RuntimeError, match="never resolved in this process"):
-        config_module.get_rbln_config()
+    with pytest.raises(AssertionError, match="Current vLLM config is not set"):
+        get_rbln_config()
+
+
+def test_get_rbln_config_rejects_a_config_that_is_not_ours():
+    """The optimum-rbln path leaves a dict there, and nothing resolves it."""
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+
+    from vllm_rbln.config import get_rbln_config
+
+    with (
+        set_current_vllm_config(SimpleNamespace(additional_config={})),
+        pytest.raises(RuntimeError, match="not an RBLNConfig"),
+    ):
+        get_rbln_config()
 
 
 def test_json_values_are_coerced():
@@ -157,8 +180,43 @@ def test_invalid_value_is_rejected():
         build_rbln_config({"use_w8a8": "junk"})
 
 
+def test_no_field_is_read_from_the_environment():
+    """A field here is the source, so nothing on this path may read its variable.
+
+    `envs.py` resolves the variable into the field; a reader that goes around
+    that would ignore `--rbln-*` and `additional_config`. The options that stay
+    in `envs.py` are not fields, so they are exempt by construction.
+
+    `build_rbln_config` only runs on the vLLM-native path, so the optimum-rbln
+    path's own readers are outside the claim.
+    """
+    import vllm_rbln
+
+    root = pathlib.Path(vllm_rbln.__file__).parent
+    optimum_owned = ("utils/optimum/", "model_executor/models/optimum/")
+    sources = "\n".join(
+        path.read_text()
+        for path in root.rglob("*.py")
+        if (rel := path.relative_to(root).as_posix()) not in ("envs.py", "config.py")
+        and not rel.startswith(optimum_owned)
+        and not path.name.startswith("optimum_")
+    )
+    assert not [
+        f.name
+        for f in dataclasses.fields(RBLNConfig)
+        if f"envs.VLLM_RBLN_{f.name.upper()}" in sources
+    ]
+
+
 def test_only_compile_fields_change_the_hash():
-    """`mega_cache` uses this for its bundle key, via VllmConfig."""
+    """`mega_cache` uses this for its bundle key, via VllmConfig.
+
+    A str and a list among the values, since they have to survive
+    normalize_value() to reach the key at all.
+    """
     base = RBLNConfig().compute_hash()
     assert RBLNConfig(sampler=False).compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
+    assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
+    buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
+    assert buckets.compute_hash() != base

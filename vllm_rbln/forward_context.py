@@ -29,7 +29,7 @@ from vllm.forward_context import (
 )
 from vllm.platforms import current_platform
 
-from vllm_rbln import envs
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -94,10 +94,11 @@ def set_forward_context(
     if need_to_track_batchsize:
         vfc.forward_start_time = time.perf_counter()
 
+    rbln_config: RBLNConfig = vllm_config.additional_config
     dp_metadata: DPMetadata | None = None
     if (
         vllm_config.parallel_config.data_parallel_size > 1
-        or envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
+        or rbln_config.use_moe_tokens_mask
     ) and (attn_metadata is not None or num_tokens is not None):
         dp_metadata = RBLNDPMetadata.make(
             vllm_config.parallel_config,

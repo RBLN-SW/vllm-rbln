@@ -351,6 +351,7 @@ def estimate_available_memory(
     buffer: int | None = None,
     num_runtimes: int = 2,
     gpu_memory_utilization: float = 0.9,
+    num_devices_per_local_rank: int = 1,
 ) -> int:
     # We are finding max_num_blocks(x) that satisfies the following equation:
 
@@ -392,12 +393,12 @@ def estimate_available_memory(
         ATOM_DRAM_NBYTES = 16 * 2**30
         ATOM_SYS_DRAM_NBYTES = 288 * 2**20
         # consider RSD size for ATOM
-        rsd_size = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
+        rsd_size = num_devices_per_local_rank
         available_dram_bytes = rsd_size * (ATOM_DRAM_NBYTES - ATOM_SYS_DRAM_NBYTES)
         # ATOM - basic data type fp16
         default_bits_per_param = 16
     elif "cr" in device_name:
-        assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
+        assert num_devices_per_local_rank == 1
         # REBEL - RBLN-CR[xxx]
         REBEL_CHIPLET_SIZE = 4
         # single device == Quad chiplet

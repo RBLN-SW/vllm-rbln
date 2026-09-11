@@ -14,8 +14,6 @@
 
 import torch
 
-from vllm_rbln import envs
-
 from ..ops import triton_sliding_window_attention_naive  # noqa: F401
 
 
@@ -29,9 +27,12 @@ def sliding_window_attention_naive_prefill(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    *,
+    compile_model: bool,
+    use_custom_kernel: bool,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+    if compile_model:
+        if use_custom_kernel:
             return torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill(
                 q,
                 k,
@@ -71,9 +72,12 @@ def sliding_window_attention_naive_decode(
     block_tables: torch.Tensor,
     attn_mask: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
+    *,
+    compile_model: bool,
+    use_custom_kernel: bool,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+    if compile_model:
+        if use_custom_kernel:
             return torch.ops.rbln_triton_ops.sliding_window_attention_naive_decode(
                 q,
                 k,

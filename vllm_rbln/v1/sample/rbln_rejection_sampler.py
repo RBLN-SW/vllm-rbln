@@ -54,6 +54,8 @@ class RBLNRejectionSampler(RejectionSampler):
         compile_context: "CompileContext | None" = None,
         spec_config: "SpeculativeConfig | None" = None,
         device: torch.device | None = None,
+        *,
+        use_rbln_sampler: bool,
     ):
         super().__init__(sampler, spec_config, device)
 
@@ -66,7 +68,7 @@ class RBLNRejectionSampler(RejectionSampler):
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
 
-        if envs.VLLM_RBLN_SAMPLER:
+        if use_rbln_sampler:
             assert not self.synthetic_mode, (
                 "RBLNRejectionSampler does not support synthetic rejection "
                 "sampling (rejection_sample_method='synthetic'). Use "
@@ -74,7 +76,7 @@ class RBLNRejectionSampler(RejectionSampler):
             )
         self.impl = (
             RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
-            if envs.VLLM_RBLN_SAMPLER
+            if use_rbln_sampler
             else TorchRejectionSamplerImpl()
         )
 

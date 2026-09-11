@@ -40,6 +40,7 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.compilation import build_process_group_dict, compile
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.kv_cache_bindings import (
@@ -86,9 +87,10 @@ class RBLNDFlashProposer(DFlashProposer):
     def __init__(self, vllm_config, device: torch.device, runner=None):
         # Checked before the base class does any work.
         self._require_single_sequence(vllm_config.scheduler_config)
+        rbln_config: RBLNConfig = vllm_config.additional_config
         if (
             vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
+            or not rbln_config.compile_model
         ):
             # The attention ops are pattern stubs the compiler replaces, so an
             # eager context write would silently write nothing.
@@ -304,11 +306,12 @@ class RBLNDFlashProposer(DFlashProposer):
             # NOTE(RBLN): the greedy pick belongs in the graph.
             return torch.ops.rbln.argmax(logits)
 
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         compile_kwargs = dict(
             dynamic=False,
             fullgraph=True,
             compile_context=self.runner.compile_context,
-            num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+            num_devices=rbln_config.num_devices_per_local_rank,
             model_trace_method="export" if USE_DEVICE_TENSOR else "",
             process_group_dict=build_process_group_dict(),
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,

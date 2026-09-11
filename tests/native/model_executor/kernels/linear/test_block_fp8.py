@@ -22,9 +22,10 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 from vllm.model_executor.kernels.linear.scaled_mm import Fp8BlockScaledMMLinearKernel
 
-import vllm_rbln.envs as envs
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.model_executor.kernels.linear.block_fp8 import (
     RBLNW8A8BlockFp8LinearKernel,
     RBLNW8A16BlockFp8LinearKernel,
@@ -50,6 +51,14 @@ def _base_can_implement_ok():
         Fp8BlockScaledMMLinearKernel,
         "can_implement",
         classmethod(lambda cls, config: (True, None)),
+    )
+
+
+def _w8a8_requested(requested: bool):
+    # Kernel selection reads the section off the config the model is built
+    # under, which is the context upstream opens around model construction.
+    return set_current_vllm_config(
+        SimpleNamespace(additional_config=RBLNConfig(use_w8a8=requested))
     )
 
 
@@ -228,34 +237,30 @@ class TestCheckShape:
 
 
 class TestCanImplement:
-    def test_w8a16_applies_unless_w8a8_requested(self, monkeypatch):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A8", False)
-        with _base_can_implement_ok():
+    def test_w8a16_applies_unless_w8a8_requested(self):
+        with _base_can_implement_ok(), _w8a8_requested(False):
             ok, _ = RBLNW8A16BlockFp8LinearKernel.can_implement(
                 _config(block_n=4, block_k=4)
             )
         assert ok is True
 
-    def test_w8a16_rejected_when_w8a8_requested(self, monkeypatch):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A8", True)
-        with _base_can_implement_ok():
+    def test_w8a16_rejected_when_w8a8_requested(self):
+        with _base_can_implement_ok(), _w8a8_requested(True):
             ok, reason = RBLNW8A16BlockFp8LinearKernel.can_implement(
                 _config(block_n=4, block_k=4)
             )
         assert ok is False
         assert reason is not None and "W8A16" in reason
 
-    def test_w8a8_applies_when_requested(self, monkeypatch):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A8", True)
-        with _base_can_implement_ok():
+    def test_w8a8_applies_when_requested(self):
+        with _base_can_implement_ok(), _w8a8_requested(True):
             ok, _ = RBLNW8A8BlockFp8LinearKernel.can_implement(
                 _config(block_n=4, block_k=4)
             )
         assert ok is True
 
-    def test_w8a8_rejected_by_default(self, monkeypatch):
-        monkeypatch.setattr(envs, "VLLM_RBLN_USE_W8A8", False)
-        with _base_can_implement_ok():
+    def test_w8a8_rejected_by_default(self):
+        with _base_can_implement_ok(), _w8a8_requested(False):
             ok, reason = RBLNW8A8BlockFp8LinearKernel.can_implement(
                 _config(block_n=4, block_k=4)
             )

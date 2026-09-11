@@ -34,6 +34,7 @@ import pytest
 import torch
 
 import vllm_rbln.v1.spec_decode.dflash as dflash_module
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 
 BLOCK_SIZE = 1024
@@ -276,10 +277,11 @@ class TestPlatformRefusals:
     discards it."""
 
     @staticmethod
-    def _config(max_num_seqs=1, enforce_eager=False):
+    def _config(max_num_seqs=1, enforce_eager=False, compile_model=True):
         return SimpleNamespace(
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
             speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
+            additional_config=RBLNConfig(compile_model=compile_model),
         )
 
     def _construct(self):
@@ -293,10 +295,9 @@ class TestPlatformRefusals:
         with pytest.raises(NotImplementedError, match="cannot run eager"):
             RBLNDFlashProposer(self._config(enforce_eager=True), torch.device("cpu"))
 
-    def test_compile_disabled_is_refused(self, monkeypatch):
-        monkeypatch.setattr(dflash_module.envs, "VLLM_RBLN_COMPILE_MODEL", False)
+    def test_compile_disabled_is_refused(self):
         with pytest.raises(NotImplementedError, match="cannot run eager"):
-            self._construct()
+            RBLNDFlashProposer(self._config(compile_model=False), torch.device("cpu"))
 
     def test_host_visible_cache_is_required(self, monkeypatch):
         """Without device tensors the cache is on `meta` and the context write
