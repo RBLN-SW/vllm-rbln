@@ -688,6 +688,28 @@ def test_running_the_hook_twice_changes_nothing(configured, reconfigure):
     )
 
 
+@pytest.mark.parametrize("backend", [None, "mp", "uni", "ray", "external_launcher"])
+def test_executor_backend_warning_preserves_selection(reconfigure, caplog, backend):
+    caplog.clear()
+    config = reconfigure(
+        lambda config: setattr(
+            config.parallel_config, "distributed_executor_backend", backend
+        )
+    )
+    assert config.parallel_config.distributed_executor_backend == backend
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == platform.logger.name
+        and "distributed executor backend" in record.getMessage()
+    ]
+    if backend in ("ray", "external_launcher"):
+        assert len(messages) == 1
+        assert "Keeping the selected" in messages[0]
+    else:
+        assert messages == []
+
+
 class TestKnownGaps:
     """Behaviour pinned as-is because it looks unintended; see
     docs/test_note.log."""
@@ -703,12 +725,6 @@ class TestKnownGaps:
         )
         assert RblnPlatform._uses_sliding_window(config.model_config.hf_config)
         assert config.cache_config.enable_prefix_caching is True
-
-    def test_a_non_mp_executor_backend_is_only_warned_about(self, configured):
-        # The warning says "fallback to mp" but nothing assigns, and vLLM's own
-        # default for world_size 1 is "uni" -- so it fires on every single-process
-        # run and Executor.get_class still builds a UniProcExecutor.
-        assert configured.parallel_config.distributed_executor_backend == "uni"
 
 
 class TestDynamicKvConfig:
