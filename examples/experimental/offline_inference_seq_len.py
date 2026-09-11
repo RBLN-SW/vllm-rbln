@@ -20,15 +20,13 @@ The prompt is built from token ids, so its length is exactly
 
 The three parameters place the sequence relative to the SWA kernel block
 (= sliding window; 128 for gpt-oss): e.g. --num-prompt-blocks 2
---prompt-extra 18 starts decode at seq = 274, past the window, so
-PROBE_KERNEL_INPUTS=1 shows the local view with real block columns instead
-of the folded-back [x, x].
+--prompt-extra 18 starts decode at seq = 274, where the window spans two
+blocks and the first one is already behind it.
 """
 
 import argparse
 
 from vllm import LLM, SamplingParams, TokensPrompt
-
 
 PROMPT_TEXT = (
     "The sliding window attention mechanism restricts each token to attend "
@@ -44,6 +42,7 @@ PROMPT_TEXT = (
     "masks out any key that falls outside the window or beyond the current "
     "position. "
 )
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
