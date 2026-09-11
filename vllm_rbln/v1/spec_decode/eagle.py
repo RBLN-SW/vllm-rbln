@@ -60,7 +60,13 @@ class RBLNEagleProposer(EagleProposer):
         device: torch.device,
         runner: "RBLNModelRunner",
     ):
-        super().__init__(vllm_config, device, runner)
+        # The parent's ctor gets "cpu", so its bookkeeping -- input_ids,
+        # positions, hidden_states, backup ids -- lives on the host: torch-rbln
+        # runs int/bool eager ops through a CPU fallback. Whatever reads
+        # `self.device` afterwards (attention metadata builders, input stager)
+        # still gets the NPU, where the draft model itself keeps running.
+        super().__init__(vllm_config, torch.device("cpu"), runner)
+        self.device = device
 
         if self.supports_mm_inputs:
             raise NotImplementedError
@@ -76,7 +82,6 @@ class RBLNEagleProposer(EagleProposer):
             )
 
         self.runner = runner
-        self.arange_cpu = torch.arange(self.arange.shape[0], dtype=torch.int32)
         self.input_stager = InputStager(device)
         # Populated from the draft model in `load_model`. None means the draft
         # head shares the target vocabulary, so `propose()` maps no ids.
@@ -100,6 +105,8 @@ class RBLNEagleProposer(EagleProposer):
         assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens = target_token_ids.shape[0]
+        if token_indices_to_sample is None:
+            token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
 
         assert self.runner is not None
         is_prefill = self.runner.is_prefill
@@ -141,7 +148,6 @@ class RBLNEagleProposer(EagleProposer):
                 token_indices_to_sample=token_indices_to_sample,
                 target_token_ids=target_token_ids,
                 next_token_ids=next_token_ids,
-                cad=common_attn_metadata,
             )
         )
         inputs_embeds = None
@@ -167,10 +173,7 @@ class RBLNEagleProposer(EagleProposer):
             draft_tokens_ids = self._to_target_token_ids(draft_ids[:num_reqs])
             return draft_tokens_ids.view(-1, 1)
 
-        assert token_indices_to_sample_padded is not None
-        positions = target_positions[
-            token_indices_to_sample_padded.to(target_positions.device)
-        ]
+        positions = target_positions[token_indices_to_sample]
 
         # `hidden_states` is deliberately not gathered here -- #821 moved
         # that gather inside `model_wrapper`. Doing it again would index an
@@ -195,8 +198,8 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange_cpu[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1]
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -284,6 +287,8 @@ class RBLNEagleProposer(EagleProposer):
         Equivalent to upstream's scatter-then-argmax for a monotonic mapping:
         both pick the same winner, and on an exact tie both pick the lowest id.
         """
+        # A graph output: the one D2H of a draft pass, the rest stays on the host.
+        draft_token_ids = draft_token_ids.cpu()
         d2t = self.draft_id_to_target_id
         if d2t is None:
             return draft_token_ids.long().clone()
@@ -308,16 +313,17 @@ class RBLNEagleProposer(EagleProposer):
             dtype=np.int32,
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        backup_tokens_gpu = self.backup_next_token_ids.gpu
+        backup_tokens = self.backup_next_token_ids.gpu
 
         assert discard_request_mask.dtype == torch.bool
-        assert backup_tokens_gpu.dtype == torch.int32
+        assert backup_tokens.dtype == torch.int32
 
         batch_size = sampled_token_ids.shape[0]
+        sampled_token_ids = sampled_token_ids.to(backup_tokens.device)
         return eagle_prepare_next_token_padded(
             sampled_token_ids,
             discard_request_mask[:batch_size],
-            backup_tokens_gpu[:batch_size],
+            backup_tokens[:batch_size],
             gpu_input_batch.vocab_size,
         )
 
@@ -369,6 +375,8 @@ class RBLNEagleProposer(EagleProposer):
         super().load_model(target_model)
 
         self.draft_id_to_target_id = getattr(self.model, "draft_id_to_target_id", None)
+        if self.draft_id_to_target_id is not None:
+            self.draft_id_to_target_id = self.draft_id_to_target_id.cpu()
 
         # Fused MoE is the only reader of the step's padded token dimension, so a
         # draft without it runs no collective of its own -- which is what lets an
@@ -531,8 +539,7 @@ class RBLNEagleProposer(EagleProposer):
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
         token_indices_to_sample = (
-            torch.arange(num_reqs, device=self.device, dtype=torch.int32)
-            * num_tokens_per_req
+            torch.arange(num_reqs, dtype=torch.int32) * num_tokens_per_req
         )
         input_ids, positions, hidden_states, token_indices_to_sample_padded = (
             self._preprocess(
@@ -568,8 +575,8 @@ class RBLNEagleProposer(EagleProposer):
 
         common_attn_metadata.num_actual_tokens = num_reqs
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange_cpu[: num_reqs + 1]
-        common_attn_metadata.query_start_loc_cpu = self.arange_cpu[: num_reqs + 1]
+        common_attn_metadata.query_start_loc = self.arange[: num_reqs + 1]
+        common_attn_metadata.query_start_loc_cpu = self.arange[: num_reqs + 1]
         common_attn_metadata.seq_lens += 1
 
         batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
@@ -670,16 +677,11 @@ class RBLNEagleProposer(EagleProposer):
         token_indices_to_sample: torch.Tensor | None = None,
         target_token_ids: torch.Tensor | None = None,
         next_token_ids: torch.Tensor | None = None,
-        cad: CommonAttentionMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if target_token_ids is not None:
             assert next_token_ids is not None
+            assert token_indices_to_sample is not None
             assert num_input_tokens == target_token_ids.shape[0]
-
-            if token_indices_to_sample is None:
-                assert cad is not None
-                token_indices_to_sample = cad.query_start_loc[1:] - 1
-            token_indices_to_sample = token_indices_to_sample.to(self.device)
 
             self.input_ids[: num_input_tokens - 1] = target_token_ids[1:]
             self.input_ids[token_indices_to_sample] = next_token_ids

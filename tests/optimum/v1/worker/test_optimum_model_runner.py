@@ -29,11 +29,15 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.sample.metadata import SamplingMetadata
 
 import vllm_rbln.v1.worker.optimum_model_runner as runner_module
+from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumMultimodalMixin,
+)
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
@@ -126,6 +130,15 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
     ).all()
 
 
+class _MultimodalModel(RBLNOptimumMultimodalMixin):
+    def __init__(self, rbln_config, language_model):
+        self.model = SimpleNamespace(rbln_config=rbln_config)
+        self._language_model = language_model
+
+    def get_language_model(self):
+        return self._language_model
+
+
 @pytest.mark.parametrize(
     (
         "top_level_requires_sort",
@@ -142,10 +155,9 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
 def test_should_sort_batch_by_length_checks_language_submodule(
     top_level_requires_sort, language_model_requires_sort, expected
 ):
-    rbln_config = SimpleNamespace(requires_batch_sort=top_level_requires_sort)
-    model = SimpleNamespace(
-        model=SimpleNamespace(rbln_config=rbln_config),
-        get_language_model=lambda: SimpleNamespace(
+    model = _MultimodalModel(
+        rbln_config=SimpleNamespace(requires_batch_sort=top_level_requires_sort),
+        language_model=SimpleNamespace(
             rbln_config=SimpleNamespace(
                 requires_batch_sort=language_model_requires_sort
             )
@@ -153,6 +165,19 @@ def test_should_sort_batch_by_length_checks_language_submodule(
     )
 
     assert RBLNOptimumModelRunner._should_sort_batch_by_length(model) is expected
+
+
+def test_should_sort_batch_by_length_skips_a_model_without_the_multimodal_mixin():
+    """Whisper inherits SupportsMultiModal directly, so upstream's
+    get_language_model raises. The probe only consults a language model
+    through RBLNOptimumMultimodalMixin."""
+
+    class _WhisperLike(torch.nn.Module, SupportsMultiModal):
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(rbln_config=SimpleNamespace())
+
+    assert RBLNOptimumModelRunner._should_sort_batch_by_length(_WhisperLike()) is False
 
 
 @pytest.mark.parametrize(

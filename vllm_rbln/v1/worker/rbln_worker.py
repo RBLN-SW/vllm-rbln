@@ -55,10 +55,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
-from vllm.platforms.interface import (
-    get_assigned_physical_gpu_ids,
-    set_assigned_physical_gpu_ids,
-)
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
@@ -217,24 +213,23 @@ class RBLNWorker(WorkerBase):
         env_var = current_platform.device_control_env_var
         num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
 
-        # UniProcExecutor never publishes the mapping, so publish it here rather
-        # than only reading it.
-        assigned = self.parallel_config.assigned_physical_gpu_ids
-        if assigned and get_assigned_physical_gpu_ids() is None:
-            set_assigned_physical_gpu_ids(assigned)
-
-        first = self.local_rank * num_devices
+        dp_rank = self.parallel_config.data_parallel_rank_local or 0
+        slot = dp_rank * self.parallel_config.world_size + self.local_rank
+        first = slot * num_devices
+        # The visible variant, because every worker process is handed a data
+        # parallel mapping of one device per rank that the logical variant
+        # prefers (MultiprocExecutor.worker_main), and a rank owning
+        # num_devices NPUs cannot be described by one entry.
         try:
             selected = [
-                current_platform.device_id_to_physical_device_id(first + offset)
+                current_platform.visible_device_id_to_physical_device_id(first + offset)
                 for offset in range(num_devices)
             ]
         except IndexError as e:
             raise ValueError(
-                f"local rank {self.local_rank} needs {num_devices} NPU(s) from "
-                f"index {first} of {env_var}="
-                f"{os.environ.get(env_var, '')!r}, or of the data parallel "
-                f"mapping when one is in effect. One entry per NPU is expected."
+                f"rank slot {slot} needs {num_devices} NPU(s) from index "
+                f"{first} of {env_var}={os.environ.get(env_var, '')!r}. "
+                "One entry per NPU is expected."
             ) from e
 
         selected_devices = ",".join(str(device) for device in selected)

@@ -2,7 +2,7 @@
 
 Requirements:
 - Linux x86_64 with access to the internal network (Nexus)
-- Python **3.12** for this dev workflow (`rebel-compiler` nightly wheels are currently cp312-only; the package itself targets 3.10-3.13)
+- Python **3.12** for this dev workflow (every CI lane syncs on 3.12; the package itself targets 3.10-3.14)
 - uv **>= 0.11.25** (`uv self update`) — enforced via `required-version` in `pyproject.toml`. Older uv writes `uv.lock` in a different serialization (repeats the `tool.uv.environments` marker on every dependency), so re-locking with it produces a ~900-line noise diff.
 
 The Nexus index requires your **LDAP account** credentials (set once, e.g. in your shell profile):
