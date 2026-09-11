@@ -88,13 +88,12 @@ class TestSignatureComposition:
         assert mega_cache.config_signature(_stub_config()) != before
 
 
-# Variables the built graph depends on; one per resolved type, since what has to
-# survive is the round trip through normalize_value()/hash_factors().
+# Variables the built graph depends on and RBLNConfig does not carry, so this
+# is the only route into the key. One per type still on this route, since what
+# has to survive is the round trip through normalize_value()/hash_factors().
 GRAPH_ENV = [
     ("VLLM_RBLN_NUM_HIDDEN_LAYERS", "0", "4"),  # int
-    ("VLLM_RBLN_USE_W8A8", "0", "1"),  # bool
-    ("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "exponential", "linear"),  # str
-    ("VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS", "1,2,4", "1,2,4,8"),  # list
+    ("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0", "1"),  # bool
 ]
 
 # Variables that must not move it. Each value differs from that variable's
@@ -134,6 +133,25 @@ class TestSignatureEnv:
         first = self._sig()
         monkeypatch.setenv(name, after)
         assert self._sig() != first
+
+    def test_flag_and_variable_share_one_bundle(self, monkeypatch):
+        """A flag and its variable resolve to one config, so to one bundle.
+
+        `_stub_config` stands in for `VllmConfig.compute_hash()`, which folds
+        the `RBLNConfig` hash into its own.
+        """
+        from vllm_rbln.config import build_rbln_config
+
+        monkeypatch.setenv("VLLM_RBLN_USE_W8A8", "1")
+        via_env = build_rbln_config(None)
+        env_sig = mega_cache.config_signature(_stub_config(via_env.compute_hash()))
+
+        monkeypatch.delenv("VLLM_RBLN_USE_W8A8")
+        via_flag = build_rbln_config({"use_w8a8": True})
+        flag_sig = mega_cache.config_signature(_stub_config(via_flag.compute_hash()))
+
+        assert via_env == via_flag
+        assert env_sig == flag_sig
 
     @pytest.mark.parametrize(("name", "value"), RUNTIME_ENV)
     def test_runtime_env_invariant(self, monkeypatch, name, value):

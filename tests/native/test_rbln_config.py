@@ -209,7 +209,14 @@ def test_no_field_is_read_from_the_environment():
 
 
 def test_only_compile_fields_change_the_hash():
-    """`mega_cache` uses this for its bundle key, via VllmConfig."""
+    """`mega_cache` uses this for its bundle key, via VllmConfig.
+
+    A str and a list among the values, since they have to survive
+    normalize_value() to reach the key at all.
+    """
     base = RBLNConfig().compute_hash()
     assert RBLNConfig(sampler=False).compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
+    assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
+    buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
+    assert buckets.compute_hash() != base
