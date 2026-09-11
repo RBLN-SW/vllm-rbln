@@ -44,7 +44,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 from vllm_rbln import envs
-from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
@@ -295,9 +294,6 @@ def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
     """Why the compile and warm-up will be skipped, or None if they will run."""
     if vllm_config.model_config.enforce_eager:
         return "enforce_eager is set"
-    rbln_config: RBLNConfig = vllm_config.additional_config
-    if not rbln_config.compile_model:
-        return "--no-rbln-compile-model is set"
     if not envs.VLLM_RBLN_ENABLE_WARM_UP:
         return "VLLM_RBLN_ENABLE_WARM_UP is off"
     return None

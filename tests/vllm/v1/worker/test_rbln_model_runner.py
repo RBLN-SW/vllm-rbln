@@ -953,8 +953,8 @@ class TestDummyRunFlushesTheDeferredLoad:
 
 
 class TestProcessKvCacheCopyOps:
-    # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
-    # and compile_model. Forced deterministically.
+    # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager.
+    # Forced deterministically.
     @pytest.mark.parametrize(
         "block_axis, shape",
         [(0, (4, 2, 1, 1, 8, 2)), (1, (2, 4, 1, 1, 8, 2))],
@@ -1315,8 +1315,8 @@ class TestUsesFixedDecodeWindow:
 
 
 class TestAllocateKvCacheTensors:
-    # Device selection: "cpu" if not compiling, else self.device if device-tensor,
-    # else "meta". The mapping/validation logic is exercised on CPU.
+    # Device selection: self.device if device-tensor, else "meta". The
+    # mapping/validation logic is exercised on CPU.
     @staticmethod
     def _cfg():
         return SimpleNamespace(
@@ -1330,27 +1330,21 @@ class TestAllocateKvCacheTensors:
             ],
         )
 
-    def _runner(self, *, compile_model=True):
+    def _runner(self):
         return _make_runner_stub(
-            device=torch.device("cpu"),
-            runner_only_attn_layers=set(),
-            rbln_config=RBLNConfig(compile_model=compile_model),
+            device=torch.device("cpu"), runner_only_attn_layers=set()
         )
 
-    def test_cpu_when_not_compiling(self):
-        raw = self._runner(compile_model=False)._allocate_kv_cache_tensors(self._cfg())
+    def test_meta_without_device_tensor(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert set(raw) == {"l0", "l1", "l2"}
-        assert raw["l0"].device.type == "cpu"
+        assert raw["l0"].device.type == "meta"
         # Layers sharing a pool share the same buffer object.
         assert raw["l0"] is raw["l1"]
         assert raw["l0"] is not raw["l2"]
 
-    def test_meta_when_compiling_without_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert raw["l0"].device.type == "meta"
-
-    def test_self_device_when_compiling_with_device_tensor(self, monkeypatch):
+    def test_self_device_with_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here

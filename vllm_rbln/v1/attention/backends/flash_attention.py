@@ -373,7 +373,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
     ) -> None:
         vllm_config = get_current_vllm_config()
         rbln_config: RBLNConfig = vllm_config.additional_config
-        self.compile_model = rbln_config.compile_model
         self.use_custom_kernel = rbln_config.use_custom_kernel
         self.enforce_eager = vllm_config.model_config.enforce_eager
         self.device = vllm_config.device_config.device
@@ -571,7 +570,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
-                    compile_model=self.compile_model,
                 )
             else:
                 assert self.sliding_window == kv_cache.size(-2), (
@@ -591,7 +589,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.local_block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -608,7 +605,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         if self.is_batch_attention_opt and b_size > 1
                         else None,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
 
@@ -624,7 +620,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -637,7 +632,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
             else:
@@ -661,7 +655,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         k_quantize_scale,
                         v_quantize_scale,
                         cache_dtype,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -677,7 +670,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         k_quantize_scale,
                         v_quantize_scale,
                         cache_dtype,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
         else:
@@ -693,7 +685,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -707,7 +698,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
             else:
@@ -722,7 +712,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -736,13 +725,12 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
 
         # 2. attention output reshape for attention backend return
         # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch*L,H*4,D]
-        if self.enforce_eager or not self.compile_model:
+        if self.enforce_eager:
             attn_output = attn_output.reshape(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)
