@@ -74,16 +74,22 @@ class TestShardReadPath:
         assert descs.size == 0
 
     @staticmethod
-    def _read_worker(pp_size):
+    def _read_worker(pp_size, peer_tp_size=1, local_pp=1):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._remote_pp_size = {"eng": pp_size}
-        # Full-model decode: every stage overlaps. Decode-PP subsets this (see
-        # test_reads_only_overlapping_stages).
+        # Full-model decode against a TP1 peer: every stage overlaps. Decode-PP
+        # subsets this (see test_reads_only_overlapping_stages), and a wider
+        # peer splits a stage across ranks instead.
         w._overlapping_ranks = {"eng": list(range(pp_size))}
         # The read notification carries how many of us read each producer rank,
         # which counts our pipeline ranks too (see _xfer_notif_id).
         w.vllm_config = MagicMock()
-        w.vllm_config.parallel_config.pipeline_parallel_size = 1
+        w.vllm_config.parallel_config.pipeline_parallel_size = local_pp
+        # Upstream reads both on the read path it hands us: start_load_kv
+        # converts to kernel block ids, and _read_blocks_for_req checks the
+        # bidirectional turn-2 expiry before delegating.
+        w._physical_blocks_per_logical_kv_block = 1
+        w._bidirectional_kv_xfer_enabled = False
         w._has_mamba = False  # non-Mamba scope: _apply_prefix_caching end-trims
         w.world_size = 1
         w.num_blocks = 8
@@ -104,15 +110,19 @@ class TestShardReadPath:
         w._shard_descs_per_block = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
-        w._remote_agents = {"eng": {r: f"agent{r}" for r in range(pp_size)}}
+        w._remote_agents = {
+            "eng": {divmod(r, peer_tp_size): f"agent{r}" for r in range(pp_size)}
+        }
         topo = MagicMock()
         topo.get_engine_info.return_value = MagicMock(
-            remote_tp_size=1, remote_block_size=16, remote_physical_blocks_per_logical=1
+            remote_tp_size=peer_tp_size,
+            remote_block_size=16,
+            remote_physical_blocks_per_logical=1,
         )
         topo.tp_ratio.return_value = 1
         topo.block_size_ratio.return_value = 1
         w.transfer_topo = topo
-        w._logical_to_remote_kernel_block_ids = lambda ids, _n: ids
+        w._logical_to_kernel_block_ids = lambda ids, _n: ids
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.make_prepped_xfer.side_effect = lambda *a, **k: object()
         return w
@@ -168,6 +178,29 @@ class TestShardReadPath:
         assert w.nixl_wrapper.send_notif.call_count == 2
         assert len(w._recving_transfers["r0"]) == 0
 
+    def test_the_read_notification_counts_our_stages(self):
+        # The parametrized case below pins this arithmetic; what this pins is
+        # the call site asking for the stage factor at all. The other cases
+        # that reach it run one local stage, where asking changes nothing.
+        w = self._read_worker(pp_size=2, local_pp=4)
+
+        w._read_blocks_for_req("r0", self._meta([], [[3, 4]]))
+
+        assert {
+            c.kwargs["notif_msg"] for c in w.nixl_wrapper.send_notif.call_args_list
+        } == {b"r0:2"}
+
+    def test_the_agent_lookup_splits_the_flat_rank_by_the_peers_tp_size(self):
+        # Everywhere else the peer is TP1, where dividing by its TP size is a
+        # no-op and the wrong divisor 1 goes unnoticed. Here flat rank 1 is the
+        # peer's (pp 0, tp 1), so the two shards share a stage.
+        w = self._read_worker(pp_size=2, peer_tp_size=2)
+        w._read_blocks_for_req("r0", self._meta([], [[3, 4]]))
+        assert [c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list] == [
+            "agent0",
+            "agent1",
+        ]
+
     def test_a_dropped_notification_still_reaches_the_other_stages(self):
         # One notif per stage is new here -- upstream sends one -- so a stage
         # that throws must not take the rest with it. The peer whose notif was
@@ -220,6 +253,9 @@ class TestShardReadPath:
             (1, 1, 1, 1, 1),  # one to one
             (4, 1, 1, 1, 4),  # TP fan-out: 4 of us read the one producer rank
             (1, 4, 1, 1, 1),  # TP fan-in: we alone read each producer rank
+            # The only row where both TP degrees exceed 1, so the only one whose
+            # count divides by anything rather than falling to the max(1, ...).
+            (4, 2, 1, 1, 2),  # partial fan-out: 2 of us per producer rank
             (1, 1, 4, 1, 4),  # PP fan-out: our 4 stages read the one rank
             (1, 4, 4, 1, 4),  # both: fan-in leaves 1 per rank, times 4 stages
             (4, 1, 4, 1, 16),  # both fanning out
@@ -297,7 +333,7 @@ class TestUpstreamReachesTheOverride:
         # Upstream's start_load_kv calls _read_blocks_for_req; if that call
         # moves, every transfer falls back to the whole-engine path.
         w = TestShardReadPath._read_worker(pp_size=2)
-        w._logical_to_kernel_block_ids = lambda ids: ids
+        w._logical_to_kernel_block_ids = lambda ids, _n: ids
         w._handshake_lock = threading.RLock()
         w._ready_requests = queue.Queue()
         meta = TestShardReadPath._meta([[1, 2]], [[3, 4]])
@@ -317,7 +353,6 @@ class TestUpstreamReachesTheOverride:
         w._sw_ratio = 2
         w._group_specs = [_sliding_window_spec()]
         w.num_regions = 2
-        w._physical_blocks_per_logical_kv_block = 1
         w.engine_id = "local"
         w.src_xfer_handles_by_block_size = {16: 900}
         w.block_size = 16

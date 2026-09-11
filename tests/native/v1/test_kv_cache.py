@@ -79,12 +79,12 @@ class TestRBLNSlidingWindowSpec:
 
 class TestRBLNSlidingWindowManager:
     def test_num_blocks_to_allocate_is_one_when_empty(self):
-        assert _manager().get_num_blocks_to_allocate("r", 10, [], 0, 10) == 1
+        assert _manager().get_num_blocks_to_allocate("r", 10, [], 0, 0, 10) == 1
 
     def test_num_blocks_to_allocate_is_zero_when_present(self):
         m = _manager()
         m.req_to_blocks["r"] = [object()]
-        assert m.get_num_blocks_to_allocate("r", 10, [], 0, 10) == 0
+        assert m.get_num_blocks_to_allocate("r", 10, [], 0, 0, 10) == 0
 
     def test_allocate_new_blocks_first_call_allocates_one(self):
         pool = _pool()
@@ -135,7 +135,8 @@ class TestRBLNSlidingWindowManager:
             m.allocate_external_computed_blocks("r", 0, 5)
 
     def test_find_longest_cache_hit_returns_empty_per_group(self):
-        # Prefix caching disabled: one empty list per kv_cache_group_id.
+        # Prefix caching disabled: one empty list per kv_cache_group_id, and a
+        # hit length of zero to go with it.
         hits = RBLNSlidingWindowManager.find_longest_cache_hit(
             block_hashes=None,
             max_length=0,
@@ -145,7 +146,7 @@ class TestRBLNSlidingWindowManager:
             drop_eagle_block=False,
             alignment_tokens=None,
         )
-        assert hits == ([], [], [])
+        assert hits == (([], [], []), 0)
 
     def test_get_num_common_prefix_blocks_is_zero(self):
         assert _manager().get_num_common_prefix_blocks("r") == 0
@@ -204,7 +205,7 @@ class TestCoordinatorExternalTokens:
         return get_kv_cache_coordinator(
             kv_cache_config=config,
             max_model_len=block_size * 32,
-            max_num_batched_tokens=512,
+            max_in_flight_tokens=512,
             use_eagle=False,
             enable_caching=False,
             enable_kv_cache_events=False,
@@ -238,4 +239,76 @@ class TestCoordinatorExternalTokens:
             "r", num_tokens=ext + 1, num_tokens_main_model=ext + 1
         )
         assert new[0] == []
+        assert len(coord.single_type_managers[0].req_to_blocks["r"]) == 1
+
+
+class TestCoordinatorCallsTheOverrides:
+    """Drive the coordinator so every override runs with the arguments the
+    pinned vllm passes and answers in the shape it unpacks. Prefix caching
+    stays on in the config -- this manager is what makes a sliding-window group
+    report no hit -- so the lookup really does reach us."""
+
+    def _coordinator(self, block_size=16, sliding_window=16, num_blocks=8):
+        from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.kv_cache_interface import (
+            KVCacheConfig,
+            KVCacheGroupSpec,
+            KVCacheTensor,
+        )
+
+        from vllm_rbln.platform import RblnPlatform
+
+        register_all_kvcache_specs(None)
+        RblnPlatform.register_custom_kv_cache_specs(None)
+        swa = _spec(block_size=block_size, sliding_window=sliding_window)
+        config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(size=swa.page_size_bytes * num_blocks, shared_by=["l0"])
+            ],
+            kv_cache_groups=[KVCacheGroupSpec(["l0"], swa)],
+        )
+        return get_kv_cache_coordinator(
+            kv_cache_config=config,
+            max_model_len=block_size * 32,
+            max_in_flight_tokens=512,
+            use_eagle=False,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            scheduler_block_size=block_size,
+            hash_block_size=block_size,
+        )
+
+    def test_lookup_through_the_coordinator_reports_no_hit(self):
+        coord = self._coordinator()
+        assert isinstance(coord.single_type_managers[0], RBLNSlidingWindowManager)
+        # (per-group blocks, hit length, uncached shared prefix)
+        assert coord.find_longest_cache_hit([], 64) == (([],), 0, 0)
+
+    def test_blocks_to_allocate_through_the_coordinator_is_one(self):
+        coord = self._coordinator()
+        assert (
+            coord.get_num_blocks_to_allocate(
+                request_id="r",
+                num_tokens=1024,
+                new_computed_blocks=([],),
+                num_encoder_tokens=0,
+                total_computed_tokens=0,
+                num_local_computed_tokens=0,
+                num_tokens_main_model=1024,
+            )
+            == 1
+        )
+
+    def test_remove_skipped_blocks_through_the_coordinator_is_a_noop(self):
+        # The in-place ring buffer never skips a block; what matters is that
+        # the call lands.
+        coord = self._coordinator()
+        coord.allocate_new_blocks("r", num_tokens=1024, num_tokens_main_model=1024)
+        coord.remove_skipped_blocks("r", 512, 1024)
         assert len(coord.single_type_managers[0].req_to_blocks["r"]) == 1

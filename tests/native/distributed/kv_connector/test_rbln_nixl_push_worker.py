@@ -194,7 +194,9 @@ class TestPerShardWrite:
         w._remote_pp_size = {"eng": 1}
         w._overlapping_ranks = {"eng": list(range(ranks))}
         w.vllm_config = MagicMock()
-        w.vllm_config.parallel_config.pipeline_parallel_size = 1
+        # A pipelined producer (PP4 -> TP1 push), so a write path that counted
+        # its stages would say so on the wire.
+        w.vllm_config.parallel_config.pipeline_parallel_size = 4
         w.world_size = 1
         w.num_blocks = 8
         w.dst_num_blocks = {"eng": 8}
@@ -215,7 +217,7 @@ class TestPerShardWrite:
         )
         topo.block_size_ratio.return_value = 1
         w.transfer_topo = topo
-        w._logical_to_remote_kernel_block_ids = lambda ids, _n: ids
+        w._logical_to_kernel_block_ids = lambda ids, _n: ids
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.make_prepped_xfer.side_effect = lambda *a, **k: object()
         return w
@@ -293,7 +295,8 @@ class TestPerShardWrite:
             for c in worker.nixl_wrapper.make_prepped_xfer.call_args_list
         }
         # world_size 1 against a TP-1 peer: one writer, so the count divides
-        # out to one on the far side.
+        # out to one on the far side -- and our four stages stay out of it,
+        # because that far side multiplies them back in itself.
         assert notifs == {b"r0:1"}
 
     def test_a_partial_prefix_hit_keeps_our_matching_tail(self):
@@ -391,143 +394,103 @@ class TestTrimToConsumerBlocks:
         assert "registered 2 block(s)" in msg and "the 1 this producer holds" in msg
 
 
-class TestWriterCountAccounting:
-    """The consumer must not settle a request while some writer is still going.
+class TestWriterCompletionAccounting:
+    """0.26 counts a pushed request's writers itself, so this side must not.
 
-    The count rides in the notification scaled by this side's TP, so the same
-    field also has to keep working for a transfer the upstream path submitted.
+    Upstream settles on ``pp_size * producers_per_consumer`` notifications and
+    reads the producer's TP out of the notification. A count of our own on top
+    of that held all but one back, and a pipeline factor in the payload was
+    multiplied by the peer's ``pp_size`` a second time -- either one leaves the
+    request waiting for notifications that never come.
     """
 
-    def test_the_counter_survives_a_request_it_has_not_seen(self, monkeypatch):
-        # The one place __init__ runs: every other test here builds the worker
-        # with object.__new__ and hands the counter in already made, so a plain
-        # dict would pass all of them and KeyError on the first notification.
-        monkeypatch.setattr(RblnNixlWorkerBase, "__init__", lambda self, *a: None)
-        worker = RblnNixlPushConnectorWorker(MagicMock(), "eng", MagicMock())
-        worker.shutdown = lambda: None  # the writer state __del__ reaches is absent
-        worker._writer_counts_by_req["r0"] += 1
-        assert worker._writer_counts_by_req == {"r0": 1}
-
     @staticmethod
-    def _receiving_worker(world_size):
+    def _receiving_worker(world_size, pp_size):
         w = _push_worker()
         w.world_size = world_size
-        w._writer_counts_by_req = defaultdict(int)
         w._reqs_to_send = {}
         w._reqs_to_process = set()
-        w._recving_metadata = {"r0": object()}
+        w._recving_metadata = {"r0": SimpleNamespace(pp_size=pp_size)}
+        w._recving_transfers = {}
+        w.consumer_notification_counts_by_req = defaultdict(int)
         w._pending_completion_notifs = queue.Queue()
+        w.transfer_topo = MagicMock()
         return w
 
-    @pytest.fixture
-    def handed_through(self, monkeypatch):
-        """What reaches upstream, in order."""
-        seen = []
+    @staticmethod
+    def _writer_notif(*, producer_tp, consumer_tp):
+        """What a producer of that shape writes, from the write path itself.
 
-        def fake_base(self):
-            while True:
-                try:
-                    seen.append(self._pending_completion_notifs.get_nowait())
-                except queue.Empty:
-                    return set()
+        A literal here would let the two halves drift apart again -- that they
+        cannot disagree unseen is the point.
+        """
+        w = _push_worker()
+        w.world_size = producer_tp
+        w.vllm_config = MagicMock()
+        return w._xfer_notif_id("eng", "r0", consumer_tp, count_stages=False)
 
-        monkeypatch.setattr(NixlPushConnectorWorker, "_get_new_notifs", fake_base)
-        return seen
-
-    def test_only_the_last_of_four_writers_reaches_the_base(self, handed_through):
-        # Four peer ranks writing into this one: upstream settles on whatever it
-        # sees, so it may see exactly one notification.
-        worker = self._receiving_worker(world_size=1)
-        for _ in range(4):
-            worker._pending_completion_notifs.put(b"r0:4")
-
-        worker._get_new_notifs()
-
-        assert handed_through == [b"r0:4"]
-
-    def test_the_count_carries_across_steps(self, handed_through):
-        # Writers finish whenever they finish; the tally has to survive the
-        # steps in between.
-        worker = self._receiving_worker(world_size=1)
-        for _ in range(3):
-            worker._pending_completion_notifs.put(b"r0:4")
-        worker._get_new_notifs()
-        assert handed_through == []
-
-        worker._pending_completion_notifs.put(b"r0:4")
-        worker._get_new_notifs()
-        assert handed_through == [b"r0:4"]
-
-    def test_a_single_writer_is_passed_straight_through(self, handed_through):
-        # Equal TP with no pipeline: the upstream path submits it and puts its
-        # own tensor-parallel size in the notification, which divides out to one.
-        worker = self._receiving_worker(world_size=4)
-        worker._pending_completion_notifs.put(b"r0:4")
-
-        worker._get_new_notifs()
-
-        assert handed_through == [b"r0:4"]
-
-    @pytest.mark.parametrize(
-        "notif, reason",
-        [
-            (b"HB:engine-1", "heartbeat"),
-            (b"other:4", "not a request we are receiving"),
-        ],
-    )
-    def test_notifications_the_base_owns_are_untouched(
-        self, handed_through, notif, reason
-    ):
-        worker = self._receiving_worker(world_size=1)
+    @staticmethod
+    def _feed(worker, notif):
+        """One notification in, upstream's own done-report out."""
         worker._pending_completion_notifs.put(notif)
-
         worker._get_new_notifs()
+        return worker._pop_done_transfers(worker._recving_transfers)
 
-        assert handed_through == [notif], reason
-        assert worker._writer_counts_by_req == {}
+    def test_a_pipelined_producer_settles_on_its_last_stage(self):
+        # Four stages write into this one rank; upstream expects pp_size * 1.
+        worker = self._receiving_worker(world_size=1, pp_size=4)
+        notif = self._writer_notif(producer_tp=1, consumer_tp=1)
 
-    def test_our_own_outbound_request_is_left_to_the_base(self, handed_through):
-        # A request this rank is sending is upstream's own accounting, even
-        # though the notification looks identical.
-        worker = self._receiving_worker(world_size=1)
-        worker._reqs_to_process = {"r0"}
-        worker._pending_completion_notifs.put(b"r0:4")
+        assert [self._feed(worker, notif) for _ in range(4)] == [
+            set(),
+            set(),
+            set(),
+            {"r0"},
+        ]
 
-        worker._get_new_notifs()
+    def test_a_wider_producer_settles_on_its_last_rank(self):
+        # Four producer ranks per consumer rank, no pipeline: pp_size 1 * 4.
+        worker = self._receiving_worker(world_size=1, pp_size=1)
+        notif = self._writer_notif(producer_tp=4, consumer_tp=1)
 
-        assert handed_through == [b"r0:4"]
-        assert worker._writer_counts_by_req == {}
+        assert [self._feed(worker, notif) for _ in range(4)] == [
+            set(),
+            set(),
+            set(),
+            {"r0"},
+        ]
 
-    def test_upstreams_own_get_finished_is_what_reaches_the_filter(self):
-        # Same reason as the submission path's entry-point case: a direct call
-        # would survive upstream renaming the hook.
-        worker = self._receiving_worker(world_size=1)
-        worker.transfer_topo = MagicMock()
-        worker._recving_transfers = {}
-        worker._failed_recv_reqs = queue.Queue()
-        worker._pop_done_transfers = lambda _transfers: set()
-        worker._pending_completion_notifs.put(b"r0:2")
 
-        done_sending, _ = NixlBaseConnectorWorker.get_finished(worker)
+class TestNotifIdStageFactor:
+    """The read path counts our stages into the payload, the write path cannot.
 
-        # Two writers, one report: held back, and the tally advanced.
-        assert done_sending == set()
-        assert worker._writer_counts_by_req["r0"] == 1
+    Upstream's read side takes the payload as a plain consumer count; its write
+    side multiplies the peer's own ``pp_size`` back in.
+    """
 
-    def test_a_finished_request_drops_its_tally(self, monkeypatch):
-        # A retry reuses the request id, so a leftover partial count would
-        # settle it early.
-        worker = self._receiving_worker(world_size=1)
-        worker._writer_counts_by_req["r0"] = 2
-        monkeypatch.setattr(
-            NixlPushConnectorWorker,
-            "get_finished",
-            lambda self: (set(), {"r0"}),
-        )
+    @staticmethod
+    def _worker(local_pp, remote_pp, world_size=1):
+        w = _push_worker()
+        w.world_size = world_size
+        w._remote_pp_size = {"eng": remote_pp}
+        w.vllm_config = MagicMock()
+        w.vllm_config.parallel_config.pipeline_parallel_size = local_pp
+        return w
 
-        worker.get_finished()
+    def test_the_write_path_leaves_the_stages_to_upstream(self):
+        worker = self._worker(local_pp=4, remote_pp=1)
 
-        assert worker._writer_counts_by_req == {}
+        assert worker._xfer_notif_id("eng", "r0", 1, count_stages=False) == b"r0:1"
+
+    def test_the_read_path_still_carries_them(self):
+        worker = self._worker(local_pp=4, remote_pp=1)
+
+        assert worker._xfer_notif_id("eng", "r0", 1) == b"r0:4"
+
+    def test_a_wider_local_tp_is_scaled_either_way(self):
+        worker = self._worker(local_pp=1, remote_pp=1, world_size=4)
+
+        assert worker._xfer_notif_id("eng", "r0", 1, count_stages=False) == b"r0:4"
 
 
 class TestSaveBeforeWriteInvariant:
@@ -739,7 +702,6 @@ class TestTheThreeListsAgree:
         topo = MagicMock()
         topo.total_num_kv_heads = 8
         topo.tp_size = 1
-        topo.is_kv_layout_blocks_first = False
         topo.tp_ratio.return_value = -4
         w.transfer_topo = topo
         w.get_backend_aware_kv_block_len = lambda **kw: 512

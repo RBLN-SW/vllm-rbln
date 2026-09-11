@@ -22,6 +22,7 @@ import types
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.config import CacheConfig
@@ -369,22 +370,27 @@ class TestSwaViewDelegation:
         assert worker.add_remote_agent(MagicMock(engine_id="peer"), 2, 4) == "agent"
         assert calls == [(2, 4)]
 
-    def test_add_remote_agent_is_idempotent_on_rehandshake(self, monkeypatch):
-        # With SWA active, a remote already handshaked returns its cached name
-        # without re-registering (no super() / topology work).
+    def test_add_remote_agent_returns_the_cached_name_for_a_known_pair(
+        self, monkeypatch
+    ):
+        # The SWA branch's half of the cache check upstream keeps behind a TODO.
+        # Nothing reaches it today -- the agent map is empty until a handshake
+        # returns -- so this pins the lookup, not a retry path.
         worker = _build_worker(
             monkeypatch,
             swa_view_opt=True,
             specs=[_sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        worker._remote_agents = {"peer": {0: "cached-name"}}
+        # Flat rank 1 of a TP2 peer is its (pp 0, tp 1): no pipelining, which
+        # this branch refuses, and not a palindrome, which would pass reversed.
+        worker._remote_agents = {"peer": {(0, 1): "cached-name"}}
         super_calls = []
         monkeypatch.setattr(
             NixlBaseConnectorWorker,
             "add_remote_agent",
             lambda self, *a, **k: super_calls.append(1),
         )
-        result = worker.add_remote_agent(MagicMock(engine_id="peer"), 0, 1)
+        result = worker.add_remote_agent(MagicMock(engine_id="peer"), 1, 2)
         assert result == "cached-name"
         assert super_calls == []
 
@@ -493,7 +499,7 @@ def _patch_worker_nixl_symbols(topo, *, mamba_spec=None, uniform_spec=None):
     msgspec_mock.msgpack.Encoder.return_value.encode.return_value = b"meta"
     return patch.multiple(
         wm,
-        TransferTopology=MagicMock(return_value=topo),
+        RblnTransferTopology=MagicMock(return_value=topo),
         compute_nixl_compatibility_hash=MagicMock(return_value="hash"),
         MambaSpec=mamba_spec or type("MambaSpec", (), {}),
         UniformTypeKVCacheSpecs=uniform_spec or type("UniformTypeKVCacheSpecs", (), {}),
@@ -540,7 +546,7 @@ class TestRegisterKvCachesImpl:
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=False,
+            virtually_split_kv_in_blocks=False,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -592,9 +598,9 @@ class TestRegisterKvCachesImpl:
             worker.src_xfer_handles_by_block_size[worker.block_size] == "local-handle"
         )
 
-    def test_layout_blocks_first_doubles_region_count(self, monkeypatch):
-        # is_kv_layout_blocks_first flips the region count to 2x (K and V share a
-        # region tensor), which cascades into num_descs.
+    def test_a_split_kv_state_doubles_the_region_count(self, monkeypatch):
+        # A Mamba state indexes two regions per block, which doubles the count
+        # and cascades into num_descs.
         worker = _prep_impl_worker(monkeypatch)
         spec = _impl_layer_spec()
         worker._layer_specs = {"l0": spec, "l1": spec}
@@ -608,7 +614,7 @@ class TestRegisterKvCachesImpl:
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=True,
+            virtually_split_kv_in_blocks=True,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -648,7 +654,7 @@ class TestRegisterKvCachesImpl:
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=False,
+            virtually_split_kv_in_blocks=False,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -690,7 +696,7 @@ class TestRegisterKvCachesImpl:
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=False,
+            virtually_split_kv_in_blocks=False,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -722,7 +728,7 @@ class TestRegisterKvCachesImpl:
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=False,
+            virtually_split_kv_in_blocks=False,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -736,7 +742,7 @@ class TestRegisterKvCachesImpl:
         ):
             mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
             worker._register_kv_caches_impl(kv_caches)
-            cast(MagicMock, wm.TransferTopology).assert_called_once_with(
+            cast(MagicMock, wm.RblnTransferTopology).assert_called_once_with(
                 tp_rank=0,
                 tp_size=1,
                 block_size=64,
@@ -764,7 +770,7 @@ class TestRegisterKvCachesImpl:
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
-        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=False)
+        topo = MagicMock(virtually_split_kv_in_blocks=False, _cross_layers_blocks=False)
         topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
 
         with (
@@ -788,7 +794,7 @@ class TestRegisterKvCachesImpl:
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
-        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=True)
+        topo = MagicMock(virtually_split_kv_in_blocks=False, _cross_layers_blocks=True)
         topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
 
         with (
@@ -824,7 +830,7 @@ class TestRegisterKvCachesImpl:
         fake = _fake_nixl_rbln(
             _impl_xfer_result(base_addrs=[0x20000, 0x30000], block_lens=[4096, 4096])
         )
-        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=False)
+        topo = MagicMock(virtually_split_kv_in_blocks=False, _cross_layers_blocks=False)
         topo.get_transfer_cache_regions.side_effect = _one_region
 
         with (
@@ -848,14 +854,18 @@ class TestRegisterLocalXferHandlerSwa:
         worker._has_mamba = False
         worker.tp_rank = 0
         worker.device_id = 0
-        worker.transfer_topo = MagicMock(is_kv_layout_blocks_first=False)
+        worker.transfer_topo = MagicMock(virtually_split_kv_in_blocks=False)
         worker.kv_caches_base_addr = {worker.engine_id: {0: [0x1000, 0x2000]}}
         worker.block_len_per_layer = [256, 256]
         worker.nixl_memory_type = "DRAM"
         worker.nixl_wrapper = MagicMock()
 
         with patch.object(worker, "get_backend_aware_kv_block_len", return_value=256):
-            worker.register_local_xfer_handler(64)  # block_size_ratio == 1
+            _, blocks = worker.register_local_xfer_handler(64)  # block_size_ratio 1
+
+        # This return becomes src_blocks_data, which upstream's hetero-TP split
+        # reads with .tolist(); a list of triples would not survive that.
+        assert (blocks.shape, blocks.dtype) == ((16, 3), np.uint64)
 
         worker.nixl_wrapper.get_xfer_descs.assert_called_once()
         blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
@@ -887,6 +897,22 @@ def _remote_agent_meta():
 class TestAddRemoteAgentSwa:
     # The remote engine must be registered and its TPMapping built before any
     # topology lookup, or get_engine_info() KeyErrors.
+    def test_a_mamba_worker_is_refused(self, monkeypatch):
+        # The SWA tail builds Full-only descriptors, so a conv/ssm pair has no
+        # shape here. Nothing else in add_remote_agent says so.
+        worker = _build_worker(monkeypatch, num_blocks=4, block_size=64)
+        worker._sw_ratio = 2
+        worker._has_mamba = True
+        worker.transfer_topo = MagicMock()
+        worker._remote_agents = {}
+        worker.nixl_wrapper = MagicMock()
+
+        with (
+            patch.object(worker, "_register_remote_engine_prelude"),
+            pytest.raises(AssertionError, match="Mamba"),
+        ):
+            worker.add_remote_agent(_remote_agent_meta(), 0, 1)
+
     def test_registers_remote_engine_before_topology_lookups(self, monkeypatch):
         worker = _build_worker(monkeypatch, num_blocks=4, block_size=64)
         worker._sw_ratio = 2
@@ -896,7 +922,7 @@ class TestAddRemoteAgentSwa:
         worker._group_spec_types = ()
         worker.nixl_memory_type = "DRAM"
 
-        topo = MagicMock(is_kv_layout_blocks_first=False)
+        topo = MagicMock(virtually_split_kv_in_blocks=False)
         topo.block_size_ratio.return_value = 1
         topo.tp_ratio.return_value = 1
         topo.is_kv_replicated.return_value = True
@@ -965,7 +991,7 @@ class TestAddRemoteAgentSwa:
         worker._group_spec_types = ()
         worker.nixl_memory_type = "DRAM"
 
-        topo = MagicMock(is_kv_layout_blocks_first=False)
+        topo = MagicMock(virtually_split_kv_in_blocks=False)
         topo.block_size_ratio.return_value = 2
         topo.tp_ratio.return_value = 1
         topo.is_kv_replicated.return_value = True

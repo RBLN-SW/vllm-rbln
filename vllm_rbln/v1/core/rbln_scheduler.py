@@ -545,9 +545,15 @@ class RBLNScheduler(Scheduler):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens (full-block matches only).
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    (
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        # Junction to pin (Marconi-style APC) so its
+                        # sparse-retention state (Mamba block / sliding-window
+                        # tail) survives retention and serves a later hit; 0
+                        # if no uncached shared prefix was detected.
+                        request.shared_prefix_boundary,
+                    ) = self.kv_cache_manager.get_computed_blocks(request)
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -732,10 +738,13 @@ class RBLNScheduler(Scheduler):
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens,
-                    num_new_computed_tokens=(
-                        num_new_local_computed_tokens + num_sub_block_tokens
-                    ),
+                    # Sub-block tokens count as tokens to compute, never as
+                    # computed: upstream contracts the computed count to
+                    # len(new_computed_blocks) * block_size, and a count that is
+                    # not block-aligned tells it the tail block is shared, so it
+                    # CoWs a block we never handed it. Only the sum is used.
+                    num_new_tokens + num_sub_block_tokens,
+                    num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,

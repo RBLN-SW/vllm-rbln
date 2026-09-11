@@ -62,7 +62,7 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         )
         remote_block_size = remote_info.remote_block_size
 
-        meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
+        meta.remote.block_ids = self._logical_to_kernel_block_ids(
             meta.remote.block_ids, remote_info.remote_physical_blocks_per_logical
         )
         remote_block_ids = meta.remote.block_ids
@@ -106,7 +106,11 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         handles: list[int] = []
         for global_rank in self._overlapping_ranks[engine_id]:
             if prefix_hit:
-                agent_name = self._remote_agents[engine_id][global_rank]
+                # Stages are tracked by the flat rank, agents by the pair it
+                # decomposes into (see add_remote_agent).
+                agent_name = self._remote_agents[engine_id][
+                    divmod(global_rank, remote_info.remote_tp_size)
+                ]
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
                 except Exception as e:

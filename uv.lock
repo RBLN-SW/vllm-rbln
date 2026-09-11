@@ -530,15 +530,6 @@ wheels = [
 ]
 
 [[package]]
-name = "diskcache"
-version = "5.6.3"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/diskcache/5.6.3/diskcache-5.6.3.tar.gz", hash = "sha256:2c3a3fa2743d8535d832ec61c2054a1641f41775aa7c556758a109941e33e4fc" }
-wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/diskcache/5.6.3/diskcache-5.6.3-py3-none-any.whl", hash = "sha256:5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19" },
-]
-
-[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -2998,8 +2989,8 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.24.0+cpu"
-source = { registry = "https://wheels.vllm.ai/0.24.0/cpu" }
+version = "0.26.0+cpu"
+source = { registry = "https://wheels.vllm.ai/0.26.0/cpu" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -3009,7 +3000,6 @@ dependencies = [
     { name = "cloudpickle" },
     { name = "compressed-tensors" },
     { name = "depyf" },
-    { name = "diskcache" },
     { name = "einops" },
     { name = "fastapi", extra = ["standard"] },
     { name = "filelock" },
@@ -3060,6 +3050,7 @@ dependencies = [
     { name = "tokenizers" },
     { name = "torch" },
     { name = "torchaudio" },
+    { name = "torchcodec" },
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -3068,7 +3059,7 @@ dependencies = [
     { name = "xgrammar" },
 ]
 wheels = [
-    { url = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/vllm-0.24.0%2Bcpu-cp38-abi3-manylinux_2_34_x86_64.whl" },
+    { url = "https://wheels.vllm.ai/568afb3a13806beb53bb2e6bd518269357b237c0/vllm-0.26.0%2Bcpu-cp38-abi3-manylinux_2_34_x86_64.whl" },
 ]
 
 [[package]]
@@ -3142,7 +3133,7 @@ requires-dist = [
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "vllm", specifier = "==0.24.0+cpu", index = "https://wheels.vllm.ai/0.24.0/cpu" },
+    { name = "vllm", specifier = "==0.26.0+cpu", index = "https://wheels.vllm.ai/0.26.0/cpu" },
 ]
 provides-extras = ["test", "build", "dev", "runtime"]
 
