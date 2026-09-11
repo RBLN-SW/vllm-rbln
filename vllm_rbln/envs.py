@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
+    VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR: bool = True
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
@@ -268,6 +269,11 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Disable only for debugging worker failures without terminating mp workers.
+    "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR": lambda: os.environ.get(
+        "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", "1"
+    ).lower()
+    not in ("0", "false", "no"),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
@@ -405,6 +411,7 @@ RBLN_COMPILE_ENV = frozenset(
 
 RBLN_NON_COMPILE_ENV = frozenset(
     {
+        "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR",
         # sampler graphs compile with use_cache=False, never enter the bundle
         "VLLM_RBLN_SAMPLER",
         "VLLM_RBLN_COMPILE_STRICT_MODE",

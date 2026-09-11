@@ -88,6 +88,7 @@ from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
     estimate_model_kernel_size,
+    fail_fast_on_device_error,
     get_rbln_planned_affinity_cpu_count,
     read_rbln_card_dram_total_bytes,
     read_rbln_card_dram_used_bytes,
@@ -1163,6 +1164,7 @@ class RBLNWorker(WorkerBase):
         return self.model_runner.get_supported_tasks()
 
     @torch.inference_mode()
+    @fail_fast_on_device_error
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1174,6 +1176,7 @@ class RBLNWorker(WorkerBase):
         get_pp_group().send_tensor_dict(tensors)
 
     @torch.inference_mode()
+    @fail_fast_on_device_error
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1261,6 +1264,7 @@ class RBLNWorker(WorkerBase):
                 return
             self.profiler.stop()
 
+    @fail_fast_on_device_error
     def execute_dummy_batch(self) -> None:
         # Serving-time DP-idle step: this rank has no real work. Run a non-warmup
         # dummy (warmup=False) so it contributes a minimal (num_reqs=1, qlen=1)

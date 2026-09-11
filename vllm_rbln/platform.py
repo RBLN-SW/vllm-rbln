@@ -551,15 +551,10 @@ class RblnPlatform(Platform):
             cls.disable_unsupported_prefix_caching(vllm_config)
             sync_vllm_and_optimum(vllm_config)
 
-        if (
-            parallel_config.distributed_executor_backend is not None
-            and parallel_config.distributed_executor_backend != "mp"
-        ):
+        if parallel_config.distributed_executor_backend not in (None, "mp", "uni"):
             logger.warning(
-                (
-                    "%s is not supported on RBLN, fallback to mp "
-                    "distributed executor backend."
-                ),
+                "%s is not supported on RBLN. Keeping the selected distributed "
+                "executor backend; use 'mp' for supported multi-worker execution.",
                 parallel_config.distributed_executor_backend,
             )
 

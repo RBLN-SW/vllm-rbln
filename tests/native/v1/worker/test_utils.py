@@ -45,6 +45,7 @@ from vllm_rbln.v1.worker.utils import (
     divide_by_chiplet_replication,
     estimate_available_memory,
     estimate_model_kernel_size,
+    fail_fast_on_device_error,
     get_autobind_cpu_ids,
     get_kv_cache_names,
     get_rbln_owned_card_indices,
@@ -59,6 +60,93 @@ from vllm_rbln.v1.worker.utils import (
 )
 
 _GB = 2**30
+
+
+class TestFailFastOnDeviceError:
+    @pytest.fixture
+    def exit_codes(self, monkeypatch):
+        codes = []
+
+        def fake_exit(code):
+            codes.append(code)
+            raise SystemExit(code)
+
+        monkeypatch.setattr(worker_utils.os, "_exit", fake_exit)
+        monkeypatch.delenv("VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", raising=False)
+        return codes
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("SysError(125): SubmitJob() failed"),
+            RuntimeError("SysError(5): Failed to WaitForCompletion"),
+            RuntimeError("Logical device rbln: 1 is not assigned"),
+            ValueError("software error"),
+        ],
+    )
+    def test_mp_worker_exits_on_any_exception(self, exit_codes, error):
+        @fail_fast_on_device_error
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(
+            parallel_config=SimpleNamespace(distributed_executor_backend="mp")
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            step(worker)
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
+
+    @pytest.mark.parametrize("backend", ["mp", "uni"])
+    def test_success_is_unchanged(self, exit_codes, backend):
+        @fail_fast_on_device_error
+        def step(worker, value, *, offset):
+            return value + offset
+
+        worker = SimpleNamespace(
+            parallel_config=SimpleNamespace(distributed_executor_backend=backend)
+        )
+        assert step(worker, 3, offset=4) == 7
+        assert exit_codes == []
+
+    @pytest.mark.parametrize(
+        ("backend", "setting"),
+        [
+            ("uni", "1"),
+            ("ray", "1"),
+            ("external_launcher", "1"),
+            ("mp", "0"),
+            ("mp", "FALSE"),
+            ("mp", "no"),
+        ],
+    )
+    def test_exception_propagates_without_exit(
+        self, monkeypatch, exit_codes, backend, setting
+    ):
+        error = RuntimeError("worker step failed")
+
+        @fail_fast_on_device_error
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(
+            parallel_config=SimpleNamespace(distributed_executor_backend=backend)
+        )
+        monkeypatch.setenv("VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", setting)
+        with pytest.raises(RuntimeError) as excinfo:
+            step(worker)
+        assert excinfo.value is error
+        assert exit_codes == []
+
+    def test_logging_failure_does_not_prevent_exit(self, monkeypatch, exit_codes):
+        def broken_log(*args, **kwargs):
+            raise OSError("log unavailable")
+
+        monkeypatch.setattr(worker_utils.logger, "error", broken_log)
+        with pytest.raises(SystemExit) as excinfo:
+            worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
 
 
 def _make_model_config(
