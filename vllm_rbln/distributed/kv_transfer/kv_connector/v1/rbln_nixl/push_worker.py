@@ -12,13 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import queue
 import threading
 import time
-from collections import defaultdict
 from typing import TYPE_CHECKING
 
-from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
 )
@@ -36,7 +33,6 @@ if TYPE_CHECKING:
         NixlConnectorMetadata,
         ReqMeta,
     )
-    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
@@ -47,20 +43,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     The producer drives the transfer here, so the peer this rank hands its
     metadata to is the consumer rather than the other way round. Pairing does
     not care -- it describes what two peers hold -- so what belongs here is the
-    write: which peers to issue it against, the writer thread that issues it,
-    and the count a consumer settles a request by.
+    write: which peers to issue it against and the writer thread that issues it.
     """
 
     _writes_into_peer = True
-
-    def __init__(
-        self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
-    ) -> None:
-        super().__init__(vllm_config, engine_id, kv_cache_config)
-
-        # Completion notifications seen per request being received, counted
-        # against the number of writers the peer put in them.
-        self._writer_counts_by_req: defaultdict[str, int] = defaultdict(int)
 
     def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
         """Hand this step's work to the writer, once the KV it names is settled.
@@ -108,59 +94,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         )
         self._push_writer_thread.start()
         logger.info("nixl-push-writer thread started (rank=%d)", self.tp_rank)
-
-    def _get_new_notifs(self) -> set[str]:
-        """Hold a request back until every writer of it has reported.
-
-        NOTE(RBLN): upstream settles a pushed request on the FIRST completion
-        notification, which is right only while one peer rank writes the whole
-        thing. Several do as soon as either axis is cut finer on their side, and
-        the rest of them are still writing -- host staging would copy a
-        half-filled buffer to the device. Each writer's notification carries the
-        count (see `_xfer_notif_id`), so drop all but the last one and let
-        upstream settle the request on that.
-        """
-        for notif in self._drain_completion_notifs():
-            if self._writer_still_pending(notif):
-                continue
-            self._pending_completion_notifs.put(notif)
-        return super()._get_new_notifs()
-
-    def _drain_completion_notifs(self) -> list[bytes]:
-        notifs = []
-        while True:
-            try:
-                notifs.append(self._pending_completion_notifs.get_nowait())
-            except queue.Empty:
-                return notifs
-
-    def _writer_still_pending(self, notif: bytes) -> bool:
-        """Whether this notification leaves a request short of its writers.
-
-        False for anything upstream has to see itself: heartbeats, our own
-        outbound accounting, and a request we are not receiving.
-        """
-        msg = notif.decode("utf-8")
-        if msg.startswith("HB:"):
-            return False
-        req_id, count = msg.rsplit(":", 1)
-        if req_id in self._reqs_to_send or req_id in self._reqs_to_process:
-            return False
-        if req_id not in self._recving_metadata:
-            return False
-        # The peer scales the count by our tensor-parallel size, the unit
-        # upstream divides by on the other direction (see `_xfer_notif_id`).
-        writers = max(1, int(count) // self.world_size)
-        self._writer_counts_by_req[req_id] += 1
-        return self._writer_counts_by_req[req_id] < writers
-
-    def get_finished(self) -> tuple[set[str], set[str]]:
-        done_sending, done_recving = super().get_finished()
-        # Both completion and failure land here, and a retried request must not
-        # inherit a partial count.
-        for req_id in done_recving:
-            self._writer_counts_by_req.pop(req_id, None)
-        return done_sending, done_recving
 
     def _xfer_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         """Write this request's blocks, one transfer per paired peer rank.
@@ -210,7 +143,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         remote_block_ids = meta.remote.block_ids
         local_block_ids = meta.local_physical_block_ids
         notif_id = self._xfer_notif_id(
-            engine_id, meta.remote.request_id, remote_info.remote_tp_size
+            engine_id,
+            meta.remote.request_id,
+            remote_info.remote_tp_size,
+            count_stages=False,
         )
 
         local_block_ids = self._trim_to_consumer_blocks(

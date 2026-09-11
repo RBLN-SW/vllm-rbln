@@ -20,7 +20,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
-    KVConnectorHandshakeMetadata,
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -104,30 +103,6 @@ class RblnNixlConnectorBase(NixlBaseConnector, SupportsKVCacheRegistrationFinali
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.connector_scheduler = None
         self.connector_worker = None
-
-    def set_xfer_handshake_metadata_pp_aware(
-        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
-    ) -> None:
-        """Serve every producer shard, including pipeline-parallel stages.
-
-        Upstream rejects `pp_rank > 0` and keys the side channel by `tp_rank`
-        alone, so PP stages would overwrite each other. Flatten to the rank a
-        peer actually asks for in `_nixl_handshake`, using this engine's
-        `tp_size`; at `pp_size == 1` that is upstream's key again.
-        """
-        tp_size = self._vllm_config.parallel_config.tensor_parallel_size
-        flattened: dict[int, KVConnectorHandshakeMetadata] = {}
-        for (pp_rank, tp_rank), rank_metadata in metadata.items():
-            flat_rank = pp_rank * tp_size + tp_rank
-            if flat_rank in flattened:
-                raise ValueError(
-                    "Duplicate handshake metadata for flat rank "
-                    f"{flat_rank} (pp_rank={pp_rank}, tp_rank={tp_rank}); "
-                    f"tensor_parallel_size={tp_size} disagrees with the ranks "
-                    "reported by the workers."
-                )
-            flattened[flat_rank] = rank_metadata
-        self.set_xfer_handshake_metadata(flattened)
 
     def finalize_kv_cache_registration(self) -> None:
         """Run the worker's deferred NIXL registration after warm-up
