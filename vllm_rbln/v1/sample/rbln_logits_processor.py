@@ -87,8 +87,18 @@ class RBLNMinPLogitsProcessor(MinPLogitsProcessor):
     min_p: torch.Tensor
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.min_p_count and self.min_p.dtype != logits.dtype:
-            self.min_p = self.min_p.to(logits.dtype)
+        if not self.min_p_count:
+            return logits
+
+        # update_state sizes min_p to the live request count, but on decode the
+        # native runner hands the sampler logits padded to the batch bucket.
+        # A min_p of 0 makes the padded rows no-ops.
+        pad = logits.shape[0] - self.min_p.shape[0]
+        assert pad >= 0
+        min_p = self.min_p
+        if pad:
+            min_p = torch.cat([min_p, min_p.new_zeros(pad, 1)])
+        self.min_p = min_p.to(logits.dtype)
         return super().apply(logits)
 
 
