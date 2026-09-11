@@ -1859,7 +1859,9 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
 
         A plain attribute suffices: upstream reaches those two methods only from
         registration and from a handshake, and runs handshakes one at a time on a
-        single-worker executor, so no second view is ever live.
+        single-worker executor. Registration cannot overlap one either:
+        `finalize_kv_cache_registration` runs during worker warm-up, before a
+        request exists to start a handshake. So no second view is ever live.
         """
         prev = self._viewed_region_ids
         self._viewed_region_ids = region_ids
