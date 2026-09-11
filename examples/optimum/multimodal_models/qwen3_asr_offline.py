@@ -76,9 +76,9 @@ def generate_prompts(
 
 
 def main(
-    num_input_prompt: int = 1,
-    model: str = "Qwen/Qwen3-ASR-0.6B",
-    max_num_seqs: int = 1,
+    num_input_prompt: int = 12,
+    model: str = "Qwen/Qwen3-ASR-0.6B-hf",
+    max_num_seqs: int = 4,
     language: str | None = "en",
     max_tokens: int = 448,
 ):
@@ -95,6 +95,7 @@ def main(
         limit_mm_per_prompt={"audio": 1},
         max_num_seqs=max_num_seqs,
         block_size=4096,
+        max_model_len=8192,
     )
 
     sampling_params = SamplingParams(
