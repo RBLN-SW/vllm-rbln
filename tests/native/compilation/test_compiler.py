@@ -38,12 +38,17 @@ def _dynamo_isolation():
     cfg = torch._dynamo.config
     saved = (
         cfg.inline_inbuilt_nn_modules,
-        cfg.cache_size_limit,
+        cfg.recompile_limit,
+        cfg.accumulated_recompile_limit,
         compiler._DYNAMO_CONFIGURED,
     )
     yield
-    cfg.inline_inbuilt_nn_modules, cfg.cache_size_limit = saved[0], saved[1]
-    compiler._DYNAMO_CONFIGURED = saved[2]
+    (
+        cfg.inline_inbuilt_nn_modules,
+        cfg.recompile_limit,
+        cfg.accumulated_recompile_limit,
+    ) = saved[:3]
+    compiler._DYNAMO_CONFIGURED = saved[3]
 
 
 @pytest.fixture
@@ -201,13 +206,15 @@ class TestCompileOptions:
 class TestEnsureTorchDynamoConfigured:
     def test_sets_rbln_flags(self):
         # Applies the RBLN dynamo settings (nn.Module params must not become
-        # graph inputs; larger cache size limit).
+        # graph inputs; both recompile limits raised).
         compiler._DYNAMO_CONFIGURED = False
         torch._dynamo.config.inline_inbuilt_nn_modules = True
-        torch._dynamo.config.cache_size_limit = 8
+        torch._dynamo.config.recompile_limit = 8
+        torch._dynamo.config.accumulated_recompile_limit = 8
         compiler._ensure_torch_dynamo_configured()
         assert torch._dynamo.config.inline_inbuilt_nn_modules is False
-        assert torch._dynamo.config.cache_size_limit == 64
+        assert torch._dynamo.config.recompile_limit == 256
+        assert torch._dynamo.config.accumulated_recompile_limit == 256
 
     def test_idempotent(self):
         # After the first call the guard makes further calls no-ops.

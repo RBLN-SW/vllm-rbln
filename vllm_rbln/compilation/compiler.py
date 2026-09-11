@@ -38,7 +38,8 @@ def _ensure_torch_dynamo_configured() -> None:
     # To prevent nn.modules parameters to be modmel input, set false.
     # If this flag is set, nn.modules parameters are treated as model input.
     torch._dynamo.config.inline_inbuilt_nn_modules = False
-    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.recompile_limit = 256
+    torch._dynamo.config.accumulated_recompile_limit = 256
 
     _DYNAMO_CONFIGURED = True
 
