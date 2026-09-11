@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
+
 import numpy as np
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -26,6 +28,35 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
 )
 
 
+def _chunk_desc_ids(
+    *,
+    start: int,
+    positions: np.ndarray,
+    num_blocks: int,
+    block_id: int,
+    per_block: int,
+    grid: tuple[int, int],
+    chunk_span: tuple[int, int],
+) -> np.ndarray:
+    """Descriptor ids for chunks `[lo, hi)` of one block, in `positions`.
+
+    `start` is where the chunk range begins: one whole-block range before it on
+    a shard's lists, two on the whole-engine lists where a sliding window's
+    view sits in between. That offset is the only thing the two callers differ
+    in, so the arithmetic lives here -- an index computed one way and a
+    descriptor emitted the other lands on bytes nothing reports.
+    """
+    runs, chunks = grid
+    lo, hi = chunk_span
+    within = (
+        np.arange(per_block, dtype=np.int64)[:, None, None] * (runs * chunks)
+        + np.arange(runs, dtype=np.int64)[None, :, None] * chunks
+        + np.arange(lo, hi, dtype=np.int64)[None, None, :]
+    ).ravel()
+    starts = start + (positions * num_blocks + block_id) * per_block * runs * chunks
+    return (starts[:, None] + within[None, :]).ravel()
+
+
 class RblnNixlTransferMixin(RblnNixlWorkerState):
     """Issuing one transfer: which descriptors a request needs, and how a
     completion is named.
@@ -34,6 +65,36 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
     produces the region table and the handshake produces the pairing, both once,
     and this reads what they left.
     """
+
+    @contextmanager
+    def _tail_viewed_as(self, valid_tokens: int | None, prompt_blocks: int):
+        """Park how far a request's last block is filled, for upstream's call.
+
+        `_compute_desc_ids` is what selects the descriptors, and it takes block
+        ids and nothing else -- upstream's signature, with no room for a token
+        count. A plain attribute suffices: one transfer reaches it twice, both
+        synchronously, and a worker moves one request at a time on one thread
+        (the read path on the worker's, the write path on the single writer's).
+        """
+        prev = self._request_tail
+        self._request_tail = (valid_tokens, prompt_blocks)
+        try:
+            yield
+        finally:
+            self._request_tail = prev
+
+    def _prompt_blocks(self, block_ids: BlockIds) -> int:
+        """How many blocks the request holds, read off the group a chunk cuts.
+
+        A sliding-window group's list is clipped to its own window, so summing
+        the groups describes no request. Chunk mode registers against exactly
+        one full-attention group, which is the one the token count describes.
+        """
+        return next(
+            len(group)
+            for g, group in enumerate(block_ids)
+            if not isinstance(self._group_specs[g], SlidingWindowSpec)
+        )
 
     def _compute_desc_ids(
         self,
@@ -64,14 +125,46 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
 
         region_ids = np.arange(self.num_regions)[:, None]
         num_full_descs = self.num_regions * num_blocks
+        # One number for the whole request, whichever list this call is for.
+        tail = self._request_tail
+        needed = (
+            None
+            if tail is None or self._chunk_grid is None
+            else self._tail_chunks(
+                tail[1], tail[0], chunks_per_span=self._chunk_grid[1]
+            )
+        )
         all_descs: list[np.ndarray] = []
         for g, group in enumerate(block_ids):
             if not group:
                 continue
             is_sw = isinstance(self._group_specs[g], SlidingWindowSpec)
-            offset = num_full_descs if is_sw else 0
             group_arr = np.asarray(group)[None, :]
-            all_descs.append((region_ids * num_blocks + group_arr + offset).flatten())
+            if is_sw:
+                # A window's group keeps every block whole: its descriptor is
+                # the window, so there is no unwritten tail inside it.
+                all_descs.append(
+                    (region_ids * num_blocks + group_arr + num_full_descs).flatten()
+                )
+                continue
+            if needed is None:
+                all_descs.append((region_ids * num_blocks + group_arr).flatten())
+                continue
+            # The last block leaves the whole-block range and comes back as the
+            # chunks that hold tokens, from the third range.
+            assert self._chunk_grid is not None
+            all_descs.append((region_ids * num_blocks + group_arr[:, :-1]).flatten())
+            all_descs.append(
+                _chunk_desc_ids(
+                    start=2 * num_full_descs,
+                    positions=np.arange(self.num_regions, dtype=np.int64),
+                    num_blocks=num_blocks,
+                    block_id=group[-1],
+                    per_block=1,
+                    grid=self._chunk_grid,
+                    chunk_span=(0, needed),
+                )
+            )
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
 
     def _get_block_descs_ids_for_shard(
@@ -154,20 +247,20 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             )
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block.get((engine_id, global_rank), 1)
-        # Where the chunk range starts: the whole-block range covers every
-        # region, block and piece once.
-        whole = len(region_group_ids) * num_blocks * per_block
-        per_chunk_block = per_block * runs * chunks
-        within = (
-            np.arange(per_block, dtype=np.int64)[:, None, None] * (runs * chunks)
-            + np.arange(runs, dtype=np.int64)[None, :, None] * chunks
-            + np.arange(lo, hi, dtype=np.int64)[None, None, :]
-        ).ravel()
         positions = np.arange(len(region_group_ids), dtype=np.int64)
         if span_ix is not None:
             positions = positions[positions % self._kv_areas == span_ix]
-        starts = whole + (positions * num_blocks + block_id) * per_chunk_block
-        return (starts[:, None] + within[None, :]).ravel()
+        return _chunk_desc_ids(
+            # Where the chunk range starts: the whole-block range covers every
+            # region, block and piece once.
+            start=len(region_group_ids) * num_blocks * per_block,
+            positions=positions,
+            num_blocks=num_blocks,
+            block_id=block_id,
+            per_block=per_block,
+            grid=grid,
+            chunk_span=chunk_span,
+        )
 
     def _tail_chunks(
         self,
