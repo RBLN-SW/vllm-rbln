@@ -1944,7 +1944,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if spec_config is not None:
             self.finalize_kv_connector()
 
-        kv_dump.maybe_dump(self)
+        kv_dump.maybe_dump(self, scheduler_output)
 
         # self.kv_connector_output may be modified during drafting.
         kv_connector_output = self.kv_connector_output

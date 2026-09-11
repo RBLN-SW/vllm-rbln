@@ -23,6 +23,7 @@ from vllm_rbln.v1.worker import kv_dump
 
 NUM_BLOCKS, NUM_HEADS, BLOCK_SIZE, HEAD_DIM = 33, 8, 64, 128
 VALID_LEN, NUM_LAYERS = 5, 3
+STALE_BLOCK = 7  # row 0's leftover block, never written
 
 
 class FlashBackend:
@@ -56,10 +57,18 @@ class IndexerBackend:
         return (num_blocks, block_size, head_size)
 
 
+SCHEDULED_ROW = 2  # never row 0: the input batch persists and row 0 goes stale
+
+
 def _runner(block_id, backend=FlashBackend, spec_block_size=BLOCK_SIZE):
-    """A stand-in for RBLNModelRunner holding one request in a prefill step."""
+    """A stand-in for RBLNModelRunner in a prefill step.
+
+    Row 0 holds a request from an earlier wave whose block was freed, so a dump
+    that reads row 0 instead of the scheduled request reads an empty block.
+    """
     rows = np.zeros((4, 4), dtype=np.int32)
-    rows[0, 0] = block_id
+    rows[0, 0] = STALE_BLOCK
+    rows[SCHEDULED_ROW, 0] = block_id
     names = [f"layers.{i}.attn" for i in range(NUM_LAYERS)]
     block_axis, token_axis = backend.axes
 
@@ -80,24 +89,31 @@ def _runner(block_id, backend=FlashBackend, spec_block_size=BLOCK_SIZE):
         layer_names=names,
         kv_cache_spec=types.SimpleNamespace(block_size=spec_block_size),
     )
+    seq_lens = torch.zeros(4, dtype=torch.int32)
+    seq_lens[0] = 999
+    seq_lens[SCHEDULED_ROW] = VALID_LEN
     return types.SimpleNamespace(
         is_prefill=True,
         input_batch=types.SimpleNamespace(
-            num_reqs=1,
-            req_ids=["req-0"],
+            num_reqs=SCHEDULED_ROW + 1,
+            req_ids=["stale-0", "stale-1", "req-0", "stale-3"],
+            req_id_to_index={"stale-0": 0, "req-0": SCHEDULED_ROW},
             block_table=[
                 types.SimpleNamespace(block_table=types.SimpleNamespace(np=rows))
             ],
         ),
-        seq_lens=torch.tensor([VALID_LEN, 0, 0, 0], dtype=torch.int32),
+        seq_lens=seq_lens,
         kv_cache_names=names,
         kv_caches=kv_caches,
         attn_groups=[[group]],
     )
 
 
-def _step(total_num_scheduled_tokens):
-    return types.SimpleNamespace(total_num_scheduled_tokens=total_num_scheduled_tokens)
+def _step(total_num_scheduled_tokens, scheduled="req-0"):
+    return types.SimpleNamespace(
+        total_num_scheduled_tokens=total_num_scheduled_tokens,
+        num_scheduled_tokens={scheduled: VALID_LEN} if scheduled else {},
+    )
 
 
 @pytest.fixture
@@ -127,33 +143,33 @@ def test_axes_come_from_the_backend(backend):
 
 
 def test_dumps_once_per_wave(dump_dir):
-    kv_dump.maybe_dump(_runner(14))
-    kv_dump.maybe_dump(_runner(14))
+    kv_dump.maybe_dump(_runner(14), _step(VALID_LEN))
+    kv_dump.maybe_dump(_runner(14), _step(VALID_LEN))
     assert len(_dumps(dump_dir)) == 1
 
     kv_dump.note_step(_step(0))
-    kv_dump.maybe_dump(_runner(18))
+    kv_dump.maybe_dump(_runner(18), _step(VALID_LEN))
     assert len(_dumps(dump_dir)) == 2
 
 
 def test_block_follows_the_request_not_the_index(dump_dir):
-    kv_dump.maybe_dump(_runner(14))
+    kv_dump.maybe_dump(_runner(14), _step(VALID_LEN))
     kv_dump.note_step(_step(0))
-    kv_dump.maybe_dump(_runner(18))
+    kv_dump.maybe_dump(_runner(18), _step(VALID_LEN))
     assert _dumps(dump_dir) == ["kv_r0_w001_blk14.npz", "kv_r0_w002_blk18.npz"]
 
 
 def test_a_busy_step_does_not_rearm(dump_dir):
-    kv_dump.maybe_dump(_runner(14))
+    kv_dump.maybe_dump(_runner(14), _step(VALID_LEN))
     kv_dump.note_step(_step(64))
-    kv_dump.maybe_dump(_runner(9))
+    kv_dump.maybe_dump(_runner(9), _step(VALID_LEN))
     assert len(_dumps(dump_dir)) == 1
 
 
 def test_decode_steps_never_dump(dump_dir):
     runner = _runner(14)
     runner.is_prefill = False
-    kv_dump.maybe_dump(runner)
+    kv_dump.maybe_dump(runner, _step(VALID_LEN))
     assert _dumps(dump_dir) == []
 
 
@@ -165,7 +181,7 @@ def test_decode_steps_never_dump(dump_dir):
     ],
 )
 def test_slice_matches_the_backend_layout(dump_dir, backend, expected_shape):
-    kv_dump.maybe_dump(_runner(18, backend=backend))
+    kv_dump.maybe_dump(_runner(18, backend=backend), _step(VALID_LEN))
     dumped = np.load(dump_dir / "kv_r0_w001_blk18.npz")
     assert sorted(dumped.files) == [f"layers.{i}.attn" for i in range(NUM_LAYERS)]
     assert dumped["layers.1.attn"].shape == expected_shape
@@ -173,7 +189,7 @@ def test_slice_matches_the_backend_layout(dump_dir, backend, expected_shape):
 
 
 def test_all_layers_by_default(dump_dir):
-    kv_dump.maybe_dump(_runner(18))
+    kv_dump.maybe_dump(_runner(18), _step(VALID_LEN))
     dumped = np.load(dump_dir / "kv_r0_w001_blk18.npz")
     assert len(dumped.files) == NUM_LAYERS
 
@@ -188,7 +204,7 @@ def test_all_layers_by_default(dump_dir):
 )
 def test_layer_selection(dump_dir, monkeypatch, selection, expected):
     monkeypatch.setenv("VLLM_RBLN_KV_DUMP_LAYERS", selection)
-    kv_dump.maybe_dump(_runner(18))
+    kv_dump.maybe_dump(_runner(18), _step(VALID_LEN))
     dumped = np.load(dump_dir / "kv_r0_w001_blk18.npz")
     assert sorted(dumped.files) == sorted(expected)
     meta = json.loads((dump_dir / "kv_r0_w001_blk18.json").read_text())
@@ -198,18 +214,35 @@ def test_layer_selection(dump_dir, monkeypatch, selection, expected):
 def test_a_layer_index_out_of_range_is_an_error(dump_dir, monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_KV_DUMP_LAYERS", str(NUM_LAYERS))
     with pytest.raises(AssertionError, match="outside the"):
-        kv_dump.maybe_dump(_runner(18))
+        kv_dump.maybe_dump(_runner(18), _step(VALID_LEN))
 
 
 def test_hybrid_block_layers_are_skipped_not_misaddressed(dump_dir):
-    kv_dump.maybe_dump(_runner(18, spec_block_size=BLOCK_SIZE * 2))
+    kv_dump.maybe_dump(_runner(18, spec_block_size=BLOCK_SIZE * 2), _step(VALID_LEN))
     meta = json.loads((dump_dir / "kv_r0_w001_blk18.json").read_text())
     assert meta["layer_names"] == []
     assert len(meta["hybrid_layers_skipped"]) == NUM_LAYERS
 
 
+def test_reads_the_scheduled_request_not_row_zero(dump_dir):
+    """Row 0 is a freed request from an earlier wave; its block reads back empty."""
+    kv_dump.maybe_dump(_runner(18), _step(VALID_LEN))
+    assert _dumps(dump_dir) == ["kv_r0_w001_blk18.npz"]
+    dumped = np.load(dump_dir / "kv_r0_w001_blk18.npz")
+    assert (dumped["layers.0.attn"] != 0).all()
+    meta = json.loads((dump_dir / "kv_r0_w001_blk18.json").read_text())
+    assert meta["req_id"] == "req-0"
+
+
+def test_a_step_scheduling_several_requests_is_an_error(dump_dir):
+    step = _step(VALID_LEN)
+    step.num_scheduled_tokens["another"] = VALID_LEN
+    with pytest.raises(AssertionError, match="scheduled 2 requests"):
+        kv_dump.maybe_dump(_runner(18), step)
+
+
 def test_metadata_sidecar(dump_dir):
-    kv_dump.maybe_dump(_runner(18))
+    kv_dump.maybe_dump(_runner(18), _step(VALID_LEN))
     meta = json.loads((dump_dir / "kv_r0_w001_blk18.json").read_text())
     assert meta["block_id"] == 18
     assert meta["valid_len"] == VALID_LEN
@@ -220,7 +253,7 @@ def test_metadata_sidecar(dump_dir):
 
 def test_max_caps_the_dumps(dump_dir):
     kv_dump._state["dumped"] = 64
-    kv_dump.maybe_dump(_runner(14))
+    kv_dump.maybe_dump(_runner(14), _step(VALID_LEN))
     assert _dumps(dump_dir) == []
 
 
@@ -228,12 +261,12 @@ def test_unset_dir_is_inert(tmp_path, monkeypatch):
     monkeypatch.delenv("VLLM_RBLN_KV_DUMP_DIR", raising=False)
     kv_dump._state.update(armed=True, wave=0, dumped=0, off=None)
     kv_dump.note_step(_step(0))
-    kv_dump.maybe_dump(_runner(14))
+    kv_dump.maybe_dump(_runner(14), _step(VALID_LEN))
     assert list(tmp_path.iterdir()) == []
 
 
 def test_a_request_with_no_block_is_an_error(dump_dir):
     runner = _runner(14)
-    runner.input_batch.block_table[0].block_table.np[0, 0] = 0
+    runner.input_batch.block_table[0].block_table.np[SCHEDULED_ROW, 0] = 0
     with pytest.raises(AssertionError, match="holding no block"):
-        kv_dump.maybe_dump(runner)
+        kv_dump.maybe_dump(runner, _step(VALID_LEN))

@@ -58,7 +58,7 @@ def note_step(scheduler_output) -> None:
         _state["armed"] = True
 
 
-def maybe_dump(runner) -> None:
+def maybe_dump(runner, scheduler_output) -> None:
     """Dump if this is the first prefill step of a wave. Call from sample_tokens.
 
     Not from execute_model: that only dispatches the target forward, and with
@@ -73,7 +73,7 @@ def maybe_dump(runner) -> None:
         return
     _state["armed"] = False
     _state["wave"] += 1
-    _dump(runner, _state["wave"])
+    _dump(runner, scheduler_output, _state["wave"])
     _state["dumped"] += 1
 
 
@@ -90,11 +90,16 @@ def block_and_token_axes(backend) -> tuple[int, int]:
     return shape.index(101), shape.index(103)
 
 
-def _dump(runner, wave: int) -> None:
+def _dump(runner, scheduler_output, wave: int) -> None:
     from vllm.distributed.parallel_state import get_dp_group
 
-    req_index = 0
-    req_id = runner.input_batch.req_ids[req_index]
+    # The request this step prefilled, not row 0: the input batch persists across
+    # waves, so row 0 holds whatever request landed there earlier, whose blocks
+    # have since been freed and read back empty.
+    scheduled = list(scheduler_output.num_scheduled_tokens)
+    assert len(scheduled) == 1, f"a prefill step scheduled {len(scheduled)} requests"
+    req_id = scheduled[0]
+    req_index = runner.input_batch.req_id_to_index[req_id]
     row = runner.input_batch.block_table[0].block_table.np[req_index]
     held = row[row != 0]
     assert held.size, f"request {req_id} reached the forward holding no block"
