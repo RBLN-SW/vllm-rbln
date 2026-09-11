@@ -12,24 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Unit coverage: how a consumer pairs with the peers it handshakes.
-#
-# The handshake fan-out over a peer's shards, and the two axes each shard is
-# paired on -- the layers it owns and the KV heads its chiplet areas hold. The
-# ZMQ side-channel and add_remote_agent are mocked, so none of it needs a live
-# NIXL peer or nixl-rbln.
+# Unit coverage: the handshake and what it establishes about a peer -- among
+# other things the fan-out over its shards, the two axes each shard is paired
+# on, upstream's calling convention, and the clock offset it estimates. The ZMQ
+# side-channel and add_remote_agent are mocked, so none of it needs a live NIXL
+# peer or nixl-rbln.
 
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import msgspec
+import numpy as np
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlAgentMetadata,
     NixlBaseConnectorWorker,
     NixlPullConnectorWorker,
+    NixlPushConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
@@ -104,10 +107,21 @@ def _agent_meta(**overrides):
     return RblnNixlAgentMetadata(**fields)
 
 
+class _FakeClock:
+    """Scripted ``perf_counter``: the handshake reads it twice per query."""
+
+    def __init__(self, ticks):
+        self._ticks = list(ticks)
+
+    def perf_counter(self):
+        return self._ticks.pop(0)
+
+
 class _FakeSock:
-    # ZMQ REQ stand-in: replies to (GET_META_MSG, rank) with rank's payload.
-    #
-    # TP is 1 in these tests, so global_rank == pp_rank.
+    # Stands in for the listener at nixl/base_scheduler.py. An unpublished pair
+    # takes the real one down -- it indexes its metadata dict with no guard --
+    # and the caller then sees only a timeout; this raises in the caller instead,
+    # so the bad pair surfaces where it was asked for.
 
     def __init__(
         self,
@@ -117,13 +131,20 @@ class _FakeSock:
         compat="HASH",
         layers_per_stage=1,
         stage_layers=None,
+        tp_size=1,
+        peer_stamps=None,
     ):
         self.pp_size = pp_size
+        self.tp_size = tp_size
+        # What the peer echoes from ITS process clock, in query order. A real
+        # peer's origin is unrelated to ours; that unknown is what the midpoint
+        # and the lowest-RTT rule exist to absorb.
+        self.peer_stamps = list(peer_stamps) if peer_stamps is not None else None
         self.engine_id = engine_id
         self.compat = compat
         self.layers_per_stage = layers_per_stage
         # Optional per-stage layer-name lists (for uneven splits); indexed by
-        # global_rank. When None, stages advertise a uniform layers_per_stage.
+        # pp_rank, since layer ownership is a function of the stage alone.
         self.stage_layers = stage_layers
         self.queried = []
         self._last = None
@@ -132,12 +153,14 @@ class _FakeSock:
         pass
 
     def send(self, msg):
-        _, rank = msgspec.msgpack.decode(msg)
-        self.queried.append(rank)
-        self._last = rank
+        _, pp_rank, tp_rank = msgspec.msgpack.decode(msg)
+        if not (0 <= pp_rank < self.pp_size and 0 <= tp_rank < self.tp_size):
+            raise KeyError((pp_rank, tp_rank))
+        self.queried.append(pp_rank * self.tp_size + tp_rank)
+        self._last = pp_rank
 
-    def recv(self):
-        return _encode_payload(
+    def recv_multipart(self):
+        payload = _encode_payload(
             self._last,
             self.pp_size,
             engine_id=self.engine_id,
@@ -147,6 +170,12 @@ class _FakeSock:
                 self.stage_layers[self._last] if self.stage_layers is not None else None
             ),
         )
+        stamp = (
+            self.peer_stamps.pop(0)
+            if self.peer_stamps is not None
+            else time.perf_counter()
+        )
+        return [payload, msgspec.msgpack.encode(stamp)]
 
 
 def _make_worker(
@@ -157,8 +186,9 @@ def _make_worker(
     tp_ratio=1,
     host_buffer=True,
     has_swa=None,
+    cls=RblnNixlPullConnectorWorker,
 ):
-    w = object.__new__(RblnNixlPullConnectorWorker)
+    w = object.__new__(cls)
     # Host staging closes the D2D-only paths -- head matching and fan-in -- so
     # it is the default and a D2D shape has to ask for the device buffer.
     w.use_host_buffer = host_buffer
@@ -189,7 +219,7 @@ def _make_worker(
 
 
 @contextmanager
-def _patched_socket(sock):
+def _patched_socket(sock, clock=None):
     @contextmanager
     def fake_zmq_ctx(_type, _path):
         yield sock
@@ -198,6 +228,7 @@ def _patched_socket(sock):
         patch.object(W, "zmq_ctx", fake_zmq_ctx),
         patch.object(W, "make_zmq_path", lambda *a: "tcp://x"),
         patch.object(W, "current_platform", MagicMock()),
+        patch.object(W, "time", clock if clock is not None else time),
     ):
         yield
 
@@ -207,18 +238,132 @@ def _handshake(worker, sock, *, remote_tp_size=1, engine_id="eng"):
         return worker._nixl_handshake("h", 1234, remote_tp_size, engine_id)
 
 
+class TestUpstreamReachesTheHandshake:
+    # The other handshake tests here reach _nixl_handshake through a helper
+    # that calls it directly, which cannot see the calling convention. 0.26
+    # submits it to its own executor with six positional arguments and unpacks
+    # an (agents, clock_offset) pair.
+
+    @staticmethod
+    def _worker(cls=RblnNixlPullConnectorWorker):
+        w = _make_worker(cls=cls)
+        w._evict_stale_engines = lambda: None
+        w._handshake_lock = threading.RLock()
+        w._handshake_futures = {}
+        w._handshake_initiation_executor = ThreadPoolExecutor(max_workers=1)
+        w._remote_agents = {}
+        w._engine_clock_offset = {}
+        w._engine_last_active = {}
+        w._log_failure = MagicMock()
+        # This stand-in holds no NIXL state, and __del__ runs shutdown().
+        w.shutdown = w._handshake_initiation_executor.shutdown
+        return w
+
+    def test_ensure_handshake_publishes_the_agents_and_the_offset_midpoint(self):
+        # The offset is the peer's stamp minus the MIDPOINT of the round trip:
+        # the reply was stamped somewhere inside it and the midpoint is the
+        # least-wrong guess. Stage 0 spans 0..10 locally, so a peer stamp of
+        # 105 means the peer's clock reads 100 ahead of ours.
+        sock = _FakeSock(pp_size=2, peer_stamps=[105.0, 1005.0])
+        clock = _FakeClock([0.0, 10.0, 1000.0, 1010.0])
+        w = self._worker()
+
+        with _patched_socket(sock, clock):
+            fut = NixlBaseConnectorWorker._ensure_handshake(w, "eng", "h", 1234, 1)
+            fut.result()
+
+        assert w._remote_agents["eng"] == {(0, 0): "agent-0", (1, 0): "agent-1"}
+        assert w._engine_clock_offset["eng"] == pytest.approx(100.0)
+        w._log_failure.assert_not_called()
+
+    def test_the_lowest_rtt_sample_decides_the_offset(self):
+        # Two stages disagree on the offset because their round trips differ.
+        # The shorter trip pins the peer's stamp more tightly, so it wins --
+        # taking the longer one would import that trip's whole hop cost.
+        sock = _FakeSock(pp_size=2, peer_stamps=[150.0, 1002.0])
+        # Stage 0: 0..100 (slow, midpoint 50 -> offset 100).
+        # Stage 1: 1000..1002 (fast, midpoint 1001 -> offset 1).
+        clock = _FakeClock([0.0, 100.0, 1000.0, 1002.0])
+        w = self._worker()
+
+        with _patched_socket(sock, clock):
+            fut = NixlBaseConnectorWorker._ensure_handshake(w, "eng", "h", 1234, 1)
+            fut.result()
+
+        assert w._engine_clock_offset["eng"] == pytest.approx(1.0)
+
+    def test_the_push_writer_reaches_it_and_unpacks_the_pair(self):
+        # P's first write to a decode engine goes through upstream's blocking
+        # _ensure_d_handshake, which unpacks (agents, clock_offset). A dict of
+        # two shards, as here, unpacks into its own keys instead of raising, so
+        # the engine would store an int where an agent map belongs.
+        sock = _FakeSock(pp_size=2)
+        w = self._worker(cls=RblnNixlPushConnectorWorker)
+
+        with _patched_socket(sock):
+            assert NixlPushConnectorWorker._ensure_d_handshake(
+                w, "eng", "h", 1234, 1, "req-0"
+            )
+
+        assert w._remote_agents["eng"] == {(0, 0): "agent-0", (1, 0): "agent-1"}
+
+    def test_a_peer_whose_pipeline_size_contradicts_the_caller_is_refused(self):
+        # Push mode's decode side is told the producer's pipeline size by the
+        # router. If the producer then reports a different one, one of the two
+        # is describing another engine and pairing them would read from a stage
+        # that does not exist.
+        sock = _FakeSock(pp_size=2)
+        w = self._worker()
+
+        with _patched_socket(sock):
+            fut = NixlBaseConnectorWorker._ensure_handshake(
+                w, "eng", "h", 1234, 1, 3, True
+            )
+            with pytest.raises(RuntimeError, match="pipeline size 3, peer reports 2"):
+                fut.result()
+
+        assert "eng" not in w._remote_agents
+
+    def test_a_notif_only_peer_skips_descriptor_setup(self):
+        # Push mode's decode side never addresses the producer's memory, so
+        # upstream asks for agents alone; registering descriptors for a stage
+        # this rank cannot read would pair lists of different lengths.
+        sock = _FakeSock(pp_size=2)
+        w = self._worker()
+        w._add_notif_only_remote_agent = MagicMock(side_effect=["n0", "n1"])
+
+        with _patched_socket(sock):
+            fut = NixlBaseConnectorWorker._ensure_handshake(
+                w, "eng", "h", 1234, 2, 2, True
+            )
+            fut.result()
+
+        assert w._remote_agents["eng"] == {(0, 0): "n0", (1, 0): "n1"}
+        # Upstream builds the engine's EngineTransferInfo out of this
+        # argument, so what reaches it has to be the peer's tensor-parallel
+        # size and not ours.
+        assert [c.args[1] for c in w._add_notif_only_remote_agent.call_args_list] == [
+            2,
+            2,
+        ]
+        w.add_remote_agent.assert_not_called()
+        w._register_shard_xfer_state.assert_not_called()
+        assert w._overlapping_ranks == {"eng": []}
+
+
 class TestPpHandshakeFanout:
     @pytest.mark.parametrize("pp_size", [1, 2, 3])
-    def test_every_stage_is_queried_once_and_keyed_by_global_rank(self, pp_size):
+    def test_every_stage_is_queried_once_and_keyed_by_its_pair(self, pp_size):
         # The fan-out from one stage up. pp_size comes from the pp_rank-0 shard,
         # so that shard must not be queried twice; at pp_size 1 the whole thing
-        # reduces to upstream's single-shard shape, keyed by tp_rank.
+        # reduces to upstream's single-shard shape, whose pair is (0, tp_rank).
         w = _make_worker()
         sock = _FakeSock(pp_size=pp_size)
 
         result = _handshake(w, sock)
 
-        assert result == {r: f"agent-{r}" for r in range(pp_size)}
+        agents, _ = result
+        assert agents == {(r, 0): f"agent-{r}" for r in range(pp_size)}
         assert sock.queried == list(range(pp_size))
         assert sock.queried.count(0) == 1  # bootstrap reused, not re-queried
         assert w.add_remote_agent.call_count == pp_size
@@ -256,7 +401,7 @@ class TestPpHandshakeFanout:
 
         result = _handshake(w, sock)
 
-        assert result == {1: "agent-1"}
+        assert result[0] == {(1, 0): "agent-1"}
         assert [c.args[1] for c in w.add_remote_agent.call_args_list] == [1]
         assert set(w._remote_shard_layer_names["eng"]) == {0, 1}  # both enumerated
         assert w._overlapping_ranks["eng"] == [1]
@@ -434,16 +579,88 @@ class TestPpHandshakeFanout:
         w._peer_head_split = lambda *a, **k: 2
         w._fan_in_peer_areas = MagicMock(return_value=[0])
 
-        _handshake(w, _FakeSock(pp_size=2), remote_tp_size=2)
+        _handshake(w, _FakeSock(pp_size=2, tp_size=2), remote_tp_size=2)
 
-        # The last stage is global rank 2 of a TP2 peer, i.e. its tp_rank 0,
-        # and it advertises layer.2.
-        assert w._fan_in_peer_areas.call_args.args == (0, 2)
-        assert w._add_remote_agent_head_matched.call_args.kwargs[
-            "registered_layer_names"
-        ] == ("layer.2",)
+        # Both stages are the peer's tp_rank 0 -- the head band comes from that,
+        # not from the flat rank they are keyed by -- and stage i owns layer.i.
+        assert w._fan_in_peer_areas.call_args_list == [call(0, 2), call(0, 2)]
+        assert [
+            c.kwargs["registered_layer_names"]
+            for c in w._add_remote_agent_head_matched.call_args_list
+        ] == [("layer.0",), ("layer.1",)]
         kwargs = w._register_shard_xfer_state.call_args.kwargs
         assert (kwargs["split"], kwargs["replica_fanout"]) == (2, 1)
+
+    def test_the_head_band_follows_the_tp_rank_across_a_wider_peer(self):
+        # Every other test in this class talks to tp_rank 0 alone, which cannot
+        # tell the peer's TP rank from the constant 0. Here the consumer reads
+        # from both of a TP2 peer's ranks, so the two bands must differ.
+        w = _make_worker(tp_ratio=-2, tp_target_ranks=(0, 1), host_buffer=False)
+        w.local_seen_layer_names = ["layer.0"]
+        w.num_regions = 1
+        w._add_remote_agent_head_matched = MagicMock(side_effect=["a0", "a1"])
+        w._peer_head_split = lambda *a, **k: 1
+        w._fan_in_peer_areas = MagicMock(return_value=[0])
+
+        agents, _ = _handshake(w, _FakeSock(pp_size=1, tp_size=2), remote_tp_size=2)
+
+        assert w._fan_in_peer_areas.call_args_list == [call(0, 2), call(1, 2)]
+        # The head-matched branch publishes under the pair too, and this is
+        # the only shape here whose TP component is non-zero.
+        assert agents == {(0, 0): "a0", (0, 1): "a1"}
+
+    def test_a_notif_only_peer_is_still_refused_a_wider_pipelined_tp(self):
+        # The guard sits above the notif_agents_only branch, so it holds on the
+        # one shape where its reasoning is about work this rank will not do.
+        # (That it reads the peer's report rather than the caller's hint is not
+        # visible here -- the two agree on this branch -- but from the default
+        # hint in test_pp_with_larger_peer_tp_raises.)
+        w = _make_worker(tp_target_ranks=(0,), tp_ratio=-2)
+
+        with (
+            _patched_socket(_FakeSock(pp_size=2)),
+            pytest.raises(RuntimeError, match="larger tensor-parallel size"),
+        ):
+            w._nixl_handshake("h", 1234, 4, "eng", 2, True)
+
+    def test_both_sides_pipelined_is_allowed_on_the_pull_side(self):
+        # The shape the push-side guard below must not take with it: reading,
+        # this rank counts its own stages, so a pipeline on each side pairs
+        # stage for stage and both are registered.
+        w = _make_worker()
+        w.vllm_config.parallel_config.pipeline_parallel_size = 2
+
+        agents, _ = _handshake(w, _FakeSock(pp_size=2))
+
+        assert agents == {(0, 0): "agent-0", (1, 0): "agent-1"}
+        assert w._overlapping_ranks["eng"] == [0, 1]
+
+    def test_a_pipelined_consumer_on_the_push_side_is_refused(self):
+        # Upstream's completion count is the producer's pp times the producers
+        # per consumer rank; nothing in it stands for our stages, so a consumer
+        # split into them waits for notifications that never come. Upstream
+        # refuses this too, but only under kv_role=kv_consumer, and the
+        # launcher runs kv_both.
+        w = _make_worker()
+        w.vllm_config.parallel_config.pipeline_parallel_size = 2
+
+        with (
+            _patched_socket(_FakeSock(pp_size=2)),
+            pytest.raises(RuntimeError, match="pipelined consumer"),
+        ):
+            w._nixl_handshake("h", 1234, 1, "eng", 2, True)
+
+    def test_a_pipelined_consumer_is_fine_when_the_producer_is_not(self):
+        # The count is right whenever the producer has one stage: every rank of
+        # ours is written by that stage and waits for exactly one notification.
+        w = _make_worker()
+        w.vllm_config.parallel_config.pipeline_parallel_size = 2
+        w._add_notif_only_remote_agent = MagicMock(return_value="n0")
+
+        with _patched_socket(_FakeSock(pp_size=1)):
+            agents, _ = w._nixl_handshake("h", 1234, 1, "eng", 1, True)
+
+        assert agents == {(0, 0): "n0"}
 
     def test_a_split_region_alone_forces_the_per_shard_path(self):
         # Companion to test_a_finer_peer_alone_forces_the_per_shard_path: here
@@ -570,7 +787,6 @@ class TestShardLocalRegions:
         w.kv_caches_base_addr = {"eng": {0: [1000 * i for i in range(8)]}}
         w.block_len_per_layer = [64] * 8
         w.transfer_topo = MagicMock()
-        w.transfer_topo.is_kv_layout_blocks_first = False
         w.get_backend_aware_kv_block_len = MagicMock(return_value=64)
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.prep_xfer_dlist.return_value = 42
@@ -586,14 +802,15 @@ class TestShardLocalRegions:
         handle, blocks = w._register_shard_local_xfer_handler(16, ("l2", "l3"))
 
         assert handle == 42
-        # shard regions [4,5,6,7] x num_blocks 4 = 16 descriptors.
-        assert len(blocks) == 16
+        # shard regions [4,5,6,7] x num_blocks 4 = 16 descriptors, as the Nx3
+        # uint64 array upstream's hetero-TP split reads back.
+        assert (blocks.shape, blocks.dtype) == ((16, 3), np.uint64)
         # first desc: region 4 base addr (4000), block 0.
-        assert blocks[0] == (4000, 64, 0)
+        assert blocks[0].tolist() == [4000, 64, 0]
         # block 1 of region 4: base + 1*stride(64).
-        assert blocks[1] == (4000 + 64, 64, 0)
+        assert blocks[1].tolist() == [4000 + 64, 64, 0]
         # regions used are exactly the shard's (no addr below 4000).
-        assert min(a for a, _, _ in blocks) == 4000
+        assert blocks[:, 0].min() == 4000
 
     def test_register_local_xfer_handler_routes_to_the_shard_path(self):
         # Dispatch to the shard path: no SWA view opt, layer names present. Miss
@@ -1959,16 +2176,18 @@ class TestHeadMatchedAgentRegistration:
         assert areas.call_args.args[0] == 1
 
     def test_a_shard_already_registered_is_not_registered_again(self):
-        # This path returns before upstream's own idempotence guard, so it
-        # carries its own. Without it a re-handshake -- which the retry after a
-        # partial one is -- hands NIXL a second agent for a rank it already has.
+        # Mirrors upstream's own cache check, which it keeps behind a TODO for
+        # a refresh path neither side has yet: within one handshake the engine's
+        # agent map is still empty, so today nothing reaches this.
         w = object.__new__(RblnNixlPullConnectorWorker)
-        w._remote_agents = {"eng": {3: "already"}}
+        # Flat rank 2 of a TP2 peer is its (pp 1, tp 0) -- not a palindrome, so
+        # the pair's order has to be right and not merely its members.
+        w._remote_agents = {"eng": {(1, 0): "already"}}
         w.nixl_wrapper = MagicMock()
         meta = MagicMock()
         meta.engine_id = "eng"
 
-        assert w._add_remote_agent_head_matched(meta, 3, 2) == "already"
+        assert w._add_remote_agent_head_matched(meta, 2, 2) == "already"
         w.nixl_wrapper.add_remote_agent.assert_not_called()
 
     def test_a_peer_with_a_different_tp_degree_is_routed_to_head_matching(self):
