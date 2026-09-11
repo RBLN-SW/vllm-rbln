@@ -58,6 +58,7 @@ def _encode_payload(
     compat="HASH",
     layers_per_stage=1,
     layer_names=None,
+    kv_slices=1,
 ):
     if layer_names is None:
         layer_names = [
@@ -78,6 +79,7 @@ def _encode_payload(
         pp_rank=pp_rank,
         pp_size=pp_size,
         registered_layer_names=list(layer_names),
+        kv_slices=kv_slices,
     )
     payload = NixlHandshakePayload(
         compatibility_hash=compat,
@@ -119,6 +121,7 @@ class _FakeSock:
         compat="HASH",
         layers_per_stage=1,
         stage_layers=None,
+        kv_slices=1,
     ):
         self.pp_size = pp_size
         self.engine_id = engine_id
@@ -127,6 +130,7 @@ class _FakeSock:
         # Optional per-stage layer-name lists (for uneven splits); indexed by
         # global_rank. When None, stages advertise a uniform layers_per_stage.
         self.stage_layers = stage_layers
+        self.kv_slices = kv_slices
         self.queried = []
         self._last = None
 
@@ -148,6 +152,7 @@ class _FakeSock:
             layer_names=(
                 self.stage_layers[self._last] if self.stage_layers is not None else None
             ),
+            kv_slices=self.kv_slices,
         )
 
 
@@ -1197,6 +1202,13 @@ class TestHeadBandMatching:
         with pytest.raises(RuntimeError, match=message) as e:
             RblnNixlPullConnectorWorker._slice_head_bounds(*args, side=side)
         assert side in str(e.value)
+
+    def test_a_peer_advertising_no_slices_is_refused_on_arrival(self):
+        # The per-region refusal that names the side runs after the divisions,
+        # so without this the operator gets a ZeroDivisionError instead.
+        w = _make_worker()
+        with pytest.raises(RuntimeError, match="advertises 0 logical slice"):
+            _handshake(w, _FakeSock(pp_size=1, kv_slices=0))
 
     def test_offset_into_coarser_remote_area(self):
         """P TP1 -> D TP4: the peer's area holds 2 heads, we want one of them,

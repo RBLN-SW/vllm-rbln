@@ -638,6 +638,10 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # arithmetic and the region-pairing guard.
         self._kv_areas = xfer.n_shards
         self._kv_slices = xfer.slices
+        # Downstream divides by this.
+        assert self._kv_slices > 0, (
+            f"the plugin reported {self._kv_slices} logical slice(s) per shard"
+        )
 
         # A head axis of extent one cannot be cut, so the compiler replicates
         # instead and more than one slice there has no other explanation. Above
@@ -1493,6 +1497,13 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             raise RuntimeError(
                 "Remote NIXL agent engine ID mismatch. "
                 f"Expected {expected_engine_id}, received {metadata.engine_id}."
+            )
+        # Refused on arrival, not where it is first divided by.
+        if metadata.kv_slices <= 0:
+            raise RuntimeError(
+                f"RBLN NIXL: the peer advertises {metadata.kv_slices} logical "
+                "slice(s) per shard; the compiler cuts a shard's heads into at "
+                "least one, and the descriptor arithmetic divides by this count."
             )
         return metadata
 
