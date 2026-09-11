@@ -1629,8 +1629,8 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.3a4"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+version = "0.11.3a6"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
     { name = "diffusers" },
@@ -1642,9 +1642,9 @@ dependencies = [
     { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a4/optimum_rbln-0.11.3a4.tar.gz", hash = "sha256:45bcf23fce6d85df26930dd55e18bd1b35ca6ecef57441a05dc082ed8764f33b" }
+sdist = { url = "https://files.pythonhosted.org/packages/84/35/84cfc698aad10e330a3b87bcfeccfc4a9eddef596b21b31263e1837ae006/optimum_rbln-0.11.3a6.tar.gz", hash = "sha256:30e2a4aa821a073c6e52279746abd5c2edbea667de953ddabee54cc5cbbefe12", size = 658264, upload-time = "2026-09-10T04:11:51.918Z" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a4/optimum_rbln-0.11.3a4-py3-none-any.whl", hash = "sha256:22bf329f64406d3dc5c064d7d10168534c52e28ba5a835a5a6d39d4134c483d7" },
+    { url = "https://files.pythonhosted.org/packages/31/10/3c5c8b270f6284742253e5cce59e52a28e46753da61d73da864491392421/optimum_rbln-0.11.3a6-py3-none-any.whl", hash = "sha256:f850841f619dc36b62b324728d775d0f726cff36faad68539e9338e5dd72645d", size = 678795, upload-time = "2026-09-10T04:11:49.669Z" },
 ]
 
 [[package]]
@@ -3122,7 +3122,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
-    { name = "optimum-rbln", specifier = ">=0.11.3a4,<0.11.4" },
+    { name = "optimum-rbln", specifier = ">=0.11.3a6,<0.11.4" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
