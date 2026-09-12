@@ -250,11 +250,6 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
-            # vLLM's hf_config is not forwarded: for some model_types (e.g.
-            # qwen3_asr) it is a vLLM-private class transformers' model cannot
-            # read. Only the layer count crosses over, as HF config kwargs, so
-            # an hf_overrides={"num_hidden_layers": N} smoke compile still
-            # shrinks. layer_types rides along: HF revalidates it per layer.
             text_config = hf_config.get_text_config()
             layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
             if hasattr(text_config, "layer_types"):
