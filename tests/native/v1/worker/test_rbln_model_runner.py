@@ -41,6 +41,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.sample import WARM_UP_CONFIGS
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
 from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
@@ -348,6 +349,9 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
         max_num_reqs=8,
+        input_batch=SimpleNamespace(
+            top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
+        ),
         rejection_sampler=SimpleNamespace(
             impl=SimpleNamespace(rejection_sample=rejection_sample)
         ),
@@ -355,10 +359,12 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
 
     runner._warmup_sampler_decode_batches()
 
-    # One call per bonus-token graph -- logits argmaxed (all-greedy step), logits
-    # drawn with top-k/top-p (random step), pre-sampled ids (logprobs) -- all at
-    # the same batch bound.
-    assert rejection_sample.call_count == 3
+    # Ids (logprobs), the all-greedy argmax, and every top-k/top-p pattern, all
+    # at the batch bound; tensor patterns twice, as a buffer view and as the
+    # torch.cat `_pad_rows` builds below the bound.
+    random_configs = [c for c in WARM_UP_CONFIGS if not c["all_greedy"]]
+    filtered = [c for c in random_configs if "top_k" in c or "top_p" in c]
+    assert rejection_sample.call_count == 2 + len(random_configs) + len(filtered)
     for call in rejection_sample.call_args_list:
         assert len(call.args[1]) == 4
     variants = [
@@ -366,14 +372,37 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
             call.args[6] is None,
             call.kwargs["bonus_logits"] is None,
             call.args[7].all_greedy,
+            call.args[7].top_k is None,
+            call.args[7].top_p is None,
         )
         for call in rejection_sample.call_args_list
     ]
-    assert sorted(variants) == [
-        (False, True, True),
-        (True, False, False),
-        (True, False, True),
+    assert sorted(variants) == sorted(
+        [
+            (False, True, True, True, True),
+            (True, False, True, True, True),
+        ]
+        + [
+            (True, False, False, "top_k" not in c, "top_p" not in c)
+            for c in random_configs + filtered
+        ]
+    )
+    for call in rejection_sample.call_args_list:
+        md = call.args[7]
+        assert (md.temperature is None) == md.all_greedy
+        for buffer, t in (
+            (runner.input_batch.top_k, md.top_k),
+            (runner.input_batch.top_p, md.top_p),
+        ):
+            if t is None:
+                continue
+            assert t.shape == (4,) and t.dtype == buffer.dtype
+    views = [
+        call.args[7].top_p.data_ptr() == runner.input_batch.top_p.data_ptr()
+        for call in rejection_sample.call_args_list
+        if call.args[7].top_p is not None
     ]
+    assert sorted(views) == [False, False, True, True]
 
 
 class TestPredicates:
