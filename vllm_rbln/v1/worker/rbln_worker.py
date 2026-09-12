@@ -299,11 +299,14 @@ class RBLNWorker(WorkerBase):
         )
 
         spec_enabled = self.speculative_config is not None
-        num_decode_query_lens = 2 if spec_enabled else 1
+        variable_decode_query_lens = (
+            spec_enabled and not self.model_runner.uses_fixed_decode_window
+        )
+        num_decode_query_lens = 2 if variable_decode_query_lens else 1
         num_runtimes = 1 + decode_batch_buckets_count * num_decode_query_lens
         if has_specialized_moe_decode:
             num_runtimes += num_decode_query_lens
-            if spec_enabled:
+            if variable_decode_query_lens:
                 num_runtimes += 1
 
         ratio: float = 1.0

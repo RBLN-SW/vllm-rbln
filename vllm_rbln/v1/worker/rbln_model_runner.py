@@ -859,7 +859,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # cheap. An ngram-style drafter finds no match often enough that padding
         # every one of those steps would cost more than the extra graph.
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-        if self.uses_fixed_decode_window and not self.is_prefill:
+        window_fixed = not self.is_prefill and (
+            self.uses_fixed_decode_window
+            or (self.num_spec_tokens > 0 and use_spec_decode)
+        )
+        if window_fixed:
             query_lengths = np.full(num_reqs, self.num_spec_tokens + 1, dtype=np.int32)
             slack = query_lengths - logical_num_tokens
 
@@ -880,8 +884,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # this is the invariant the padding split exists to keep. It holds
             # because the front takes at most the tokens already used in the
             # block and the scheduler clamped the logical advance to what is
-            # left of it, which is also why the window never has to grow past
-            # the assert above.
+            # left of it, so both edges of the window stay inside one block.
             window_start = num_computed - front_pad
             assert np.array_equal(
                 window_start // block_size,
@@ -918,8 +921,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
+        lookup_positions = positions_np
+        if window_fixed:
+            logical_end = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                + logical_num_tokens
+                - 1
+            )
+            lookup_positions = np.minimum(positions_np, logical_end[req_indices])
         token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            lookup_positions + req_indices * self.input_batch.token_ids_cpu.shape[1]
         )
         token_indices_tensor = torch.from_numpy(token_indices)
 
@@ -960,11 +971,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = (
-                self.query_start_loc[1 : num_reqs + 1]
-                - 1
-                - self.decode_back_pad[:num_reqs]
-            )
+            logits_indices = self.query_start_loc[1 : num_reqs + 1] - 1
+            if window_fixed:
+                logits_indices = logits_indices - self.decode_back_pad[:num_reqs]
             spec_decode_metadata = None
         else:
             # Get the number of draft tokens for each request.
@@ -986,7 +995,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 ):
                     num_decode_draft_tokens[req_idx] = len(draft_token_ids)
             spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens - back_pad
+                num_draft_tokens,
+                cu_num_tokens - back_pad if window_fixed else cu_num_tokens,
             )
             logits_indices = spec_decode_metadata.logits_indices
 
@@ -1852,7 +1862,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
-            if not self.is_prefill and spec_decode_metadata is not None:
+
+            if not self.is_prefill and (
+                spec_decode_metadata is not None or self.uses_fixed_decode_window
+            ):
                 logits = logits[logits_indices]
 
         self.execute_model_state = ExecuteModelState(
@@ -2130,8 +2143,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     common_attn_metadata,
                     spec_decode_metadata,
                     valid_sampled_tokens_count,
-                    back_pad,
                 )
+                token_indices_to_sample = token_indices_to_sample - back_pad
                 total_num_tokens = common_attn_metadata.num_actual_tokens
                 target_token_ids = self.input_ids[:total_num_tokens]
                 target_positions = self.positions[:total_num_tokens]
@@ -2472,6 +2485,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         is_idle), then adopts the busy-decided shape and runs the same compiled
         graph the busy ranks run.
         """
+        if warmup and not is_prefill and self.uses_fixed_decode_window:
+            num_tokens_per_req = max(num_tokens_per_req, self.num_spec_tokens + 1)
         num_tokens = num_tokens_per_req * num_reqs
         assert num_reqs <= self.max_num_reqs
 
@@ -3126,9 +3141,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
             )
 
-        if self.uses_fixed_decode_window:
-            # The fixed decode window is placed inside one KV block, so the
-            # sequence's last block has to be able to hold it. A block-aligned
+        if self.num_spec_tokens > 0:
             # max_model_len always can; a shorter remainder cannot, and the
             # window would then have to run past max_model_len.
             window = self.num_spec_tokens + 1
@@ -3251,17 +3264,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     @property
     def uses_fixed_decode_window(self) -> bool:
-        """Whether decode stages a fixed num_spec_tokens + 1 query.
+        """Whether *every* decode step stages a num_spec_tokens + 1 query."""
 
-        See the window construction in `_prepare_inputs`. A model-based drafter
-        proposes on every step, so a decode step that carries no draft is the
-        exception; an ngram-style one misses often, and padding every miss out to
-        the full window would cost more than the extra compiled shape.
-        """
         return (
-            self.num_spec_tokens > 0
-            and self.speculative_config is not None
-            and self.speculative_config.use_eagle()
+            self.speculative_config is not None
+            and self.num_spec_tokens > 0
+            and self.speculative_config.method in ("eagle", "eagle3", "mtp")
         )
 
     @property

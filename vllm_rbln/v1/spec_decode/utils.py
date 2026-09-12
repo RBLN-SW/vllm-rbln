@@ -69,8 +69,6 @@ def eagle_prepare_inputs_padded(
     valid_sampled_tokens_count: torch.Tensor,
     # [num_reqs + 1]
     query_start_loc: torch.Tensor,
-    # [num_reqs]
-    back_pad: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     This function computes the token index to sample for each request, taking into
@@ -78,10 +76,6 @@ def eagle_prepare_inputs_padded(
     (which is one more than the number of accepted tokens). It also returns the
     number of rejected tokens for each request to match upstream's padded EAGLE
     input preparation contract.
-
-    `back_pad` is the slots the target staged behind each request's scheduled
-    tokens, so the walk back from the query's last slot starts at the last
-    scheduled one.
     """
     num_draft_tokens = cu_num_draft_tokens - torch.nn.functional.pad(
         cu_num_draft_tokens[:-1], (1, 0)
@@ -93,8 +87,8 @@ def eagle_prepare_inputs_padded(
         num_draft_tokens + 1 - valid_sampled_tokens_count,
         torch.zeros_like(valid_sampled_tokens_count),
     ).to(torch.int32)
-    token_indices_to_sample = (
-        query_start_loc[1:] - 1 - back_pad - num_rejected_tokens
-    ).to(torch.int32)
+    token_indices_to_sample = (query_start_loc[1:] - 1 - num_rejected_tokens).to(
+        torch.int32
+    )
 
     return token_indices_to_sample, num_rejected_tokens

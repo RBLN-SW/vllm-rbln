@@ -325,7 +325,6 @@ class RBLNEagleProposer(EagleProposer):
         common_attn_metadata: CommonAttentionMetadata,
         spec_decode_metadata: SpecDecodeMetadata,
         valid_sampled_tokens_count: torch.Tensor,
-        back_pad: torch.Tensor,
     ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor]:
         """
         This function is used to prepare the inputs for speculative decoding
@@ -338,7 +337,6 @@ class RBLNEagleProposer(EagleProposer):
             spec_decode_metadata.cu_num_draft_tokens,
             valid_sampled_tokens_count,
             common_attn_metadata.query_start_loc,
-            back_pad,
         )
 
         query_start_loc = common_attn_metadata.query_start_loc

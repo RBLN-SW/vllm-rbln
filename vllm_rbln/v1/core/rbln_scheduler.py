@@ -218,6 +218,7 @@ class RBLNScheduler(Scheduler):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        unsafe_backfill_req_ids: set[str] = set()
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -315,17 +316,23 @@ class RBLNScheduler(Scheduler):
                     request, num_new_tokens
                 )
 
-            # NOTE(RBLN): A decode query is written as one contiguous KV window,
-            # so the logical advance may not straddle a KV block. With a
-            # model-based drafter the runner then stages a fixed
-            # num_spec_tokens + 1 window around these tokens, padding in front of
-            # them or behind them as the block allows; the others run the clamped
-            # length as-is.
+            # NOTE(RBLN): A decode query is written as one contiguous KV window.
+            # Keep the fixed num_spec_tokens + 1 query only when the required
+            # backfill prefix stays within the current KV block. If it would reach into
+            # the previous block, remember this request and force the finalized decode
+            # batch to single-token decode only if this request remains scheduled.
             if self.num_spec_tokens > 0 and not is_prefill(request):
-                remaining_in_block = self.block_size - (
-                    request.num_computed_tokens % self.block_size
-                )
+                tokens_used_in_block = request.num_computed_tokens % self.block_size
+                remaining_in_block = self.block_size - tokens_used_in_block
                 num_new_tokens = min(remaining_in_block, num_new_tokens)
+
+                if num_new_tokens > 0:
+                    required_backfill = max(
+                        0, self.num_spec_tokens + 1 - num_new_tokens
+                    )
+                    if required_backfill > tokens_used_in_block:
+                        unsafe_backfill_req_ids.add(request.request_id)
+                        num_new_tokens = 1
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -853,6 +860,19 @@ class RBLNScheduler(Scheduler):
                         f"decode-ready request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
                     )
+                    # NOTE(RBLN): This path skips the running-loop backfill guard.
+                    # A decode-ready req enters as a single-token decode (new_n==1,
+                    # asserted above) that the runner backfills to num_spec+1; if the
+                    # num_spec past tokens don't fit the current block the backfill
+                    # would cross into the previous one -> mark unsafe so the batch
+                    # drops to no-spec.
+                    if self.num_spec_tokens > 0:
+                        tokens_used_in_block = (
+                            request.num_computed_tokens % self.block_size
+                        )
+                        required_backfill = self.num_spec_tokens  # (num_spec+1)-1
+                        if required_backfill > tokens_used_in_block:
+                            unsafe_backfill_req_ids.add(request.request_id)
                     # NOTE(RBLN): this decode-ready request has just joined the
                     # decode batch (any route -- full remote-KV match or full
                     # local prefix-cache match), so count it against the shared
@@ -897,6 +917,30 @@ class RBLNScheduler(Scheduler):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+
+        # NOTE(RBLN): The runner chooses the full-spec query path from
+        # scheduled_spec_decode_tokens. If any finally scheduled decode request cannot
+        # safely backfill within its current block, force the whole scheduled decode
+        # batch to qlen=1 by trimming logical advance and clearing drafts.
+        scheduled_running_req_ids = {req.request_id for req in scheduled_running_reqs}
+        # NOTE(RBLN): Also cover decode-ready reqs that joined via the
+        # not-is_prefill path above (new/resumed: remote-KV or prefix-cache
+        # matches): an unsafe one must force the batch to no-spec too. True
+        # prefill new reqs never enter unsafe_backfill_req_ids, so widening the
+        # set is a no-op for them.
+        scheduled_running_req_ids |= {
+            req.request_id
+            for req in itertools.chain(scheduled_new_reqs, scheduled_resumed_reqs)
+        }
+        if unsafe_backfill_req_ids & scheduled_running_req_ids:
+            for req in scheduled_running_reqs:
+                req_id = req.request_id
+
+                if (old_n := num_scheduled_tokens[req_id]) > 1:
+                    token_budget += old_n - 1
+                    num_scheduled_tokens[req_id] = 1
+
+                scheduled_spec_decode_tokens.pop(req_id, None)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
