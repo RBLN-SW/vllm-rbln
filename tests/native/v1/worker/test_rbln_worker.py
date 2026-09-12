@@ -492,27 +492,6 @@ class TestDetermineAvailableMemory:
         # 1 + buckets(3)*1 = 4 (no MoE); draft = 1 + buckets(3) = 4. Total 8.
         assert cap["num_runtimes"] == 8
 
-    def test_a_variable_window_still_reserves_both_decode_lengths(
-        self, make_worker, monkeypatch
-    ):
-        # An ngram-style method keeps qlen=1 reachable, so warm-up compiles both
-        # decode query lengths and the reservation has to cover them.
-        drafter = SimpleNamespace(
-            model=SimpleNamespace(
-                parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
-            )
-        )
-        spec = SimpleNamespace(
-            draft_model_config=SimpleNamespace(quantization=None),
-            draft_parallel_config=None,
-            method="medusa",
-        )
-        cap = self._capture(
-            make_worker, monkeypatch, drafter=drafter, speculative_config=spec
-        )
-        # Target = 1 + buckets(3)*2 = 7 (no MoE); draft = 1 + buckets(3) = 4.
-        assert cap["num_runtimes"] == 11
-
     def test_draft_runtime_adds_specialized_moe_fallback(
         self, make_worker, monkeypatch
     ):

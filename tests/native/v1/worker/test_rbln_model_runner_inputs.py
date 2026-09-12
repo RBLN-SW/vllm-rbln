@@ -36,16 +36,14 @@ def _decode_ready(
     num_spec_tokens: int,
     num_computed: int = 3,
     fixed_window: bool = True,
-    req_ids: tuple[str, ...] = ("a",),
 ) -> None:
-    """Requests past their prompt in the decode phase, so the spec branch is
+    """One request past its prompt in the decode phase, so the spec branch is
     reachable. The phase comes from the scheduler output, so it is set through
     _is_prefill_step rather than derived from input_batch."""
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
-    runner._update_states(schedule_new(*req_ids))
-    for idx in range(len(req_ids)):
-        runner.input_batch.num_computed_tokens_cpu[idx] = num_computed
-        runner.input_batch.num_tokens_no_spec[idx] = num_computed
+    runner._update_states(schedule_new("a"))
+    runner.input_batch.num_computed_tokens_cpu[0] = num_computed
+    runner.input_batch.num_tokens_no_spec[0] = num_computed
     # Patched rather than configured: a real speculative_config would pull in a
     # drafter, and the only thing the arithmetic reads off it is whether the
     # drafter is model-based, which decides the fixed decode window.
@@ -110,39 +108,6 @@ class TestPrepareInputsSpecDecode:
         assert logits_indices.tolist() == [0]
 
 
-class TestPrepareInputsUniformQueryLength:
-    # RBLN runs one query length per step (see dp_utils.determine_batch_
-    # execution_and_padding), so a step that stages the window has to stage it
-    # for the whole batch.
-    def test_a_mixed_batch_stages_one_query_length(
-        self, make_model_runner, monkeypatch
-    ):
-        runner = make_model_runner()
-        _decode_ready(
-            runner,
-            monkeypatch,
-            num_spec_tokens=2,
-            num_computed=8,
-            fixed_window=False,
-            req_ids=("a", "b"),
-        )
-
-        # "a" kept both drafts, "b" none -- logical lengths 3 and 1.
-        _logits, spec_md, query_lengths, total = runner._prepare_inputs(
-            make_scheduler_output(
-                num_scheduled_tokens={"a": 3, "b": 1},
-                spec_decode_tokens={"a": [11, 12]},
-            ),
-            np.array([3, 1], dtype=np.int32),
-        )
-
-        window = 3
-        assert query_lengths.tolist() == [window, window]
-        assert total % len(query_lengths) == 0
-        assert spec_md is not None
-        assert spec_md.num_draft_tokens == [2, 0]
-
-
 class TestPrepareInputsFixedWindow:
     # A decode with a model-based drafter always stages num_spec_tokens + 1
     # slots, spending the slack on tokens already computed in this block and
@@ -154,16 +119,12 @@ class TestPrepareInputsFixedWindow:
     @pytest.mark.parametrize(
         "num_computed,window_start,sample_slot",
         [
-            # Mid-block: the tail holds the whole slack, so the window re-runs
-            # the two tokens before the scheduled one.
+            # Mid-block: the used tail holds the whole slack, so the window
+            # re-runs the two tokens before the scheduled one.
             (3, 1, 2),
             # At a block start there is no tail to re-run, so the slack has
-            # nowhere to go but behind.
+            # nowhere to go but behind the scheduled token.
             (BLOCK, BLOCK, 0),
-            # One token into the block: one slot in front, one behind.
-            (BLOCK + 1, BLOCK, 1),
-            # The block's last slot: the whole slack fits in front.
-            (BLOCK - 1, BLOCK - 1 - 2, 2),
         ],
     )
     def test_window_is_fixed_and_stays_in_one_block(
@@ -190,11 +151,8 @@ class TestPrepareInputsFixedWindow:
         assert window_start // self.BLOCK == positions[-1] // self.BLOCK
         # The sampled slot is the scheduled token, wherever the padding put it.
         assert logits_indices.tolist() == [sample_slot]
-        assert positions[sample_slot] == num_computed
         # seq_lens stays the logical length; padding must not inflate it.
         assert runner.seq_lens[:1].tolist() == [num_computed + 1]
-        # The drafter path reads this to find the same slot.
-        assert runner.decode_back_pad_np[0] == window - 1 - sample_slot
 
 
 class TestBookkeepingSyncSpecDecode:

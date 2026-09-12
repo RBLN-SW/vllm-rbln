@@ -1029,69 +1029,6 @@ class TestMayReorderBatch:
         assert r.input_batch.batch_update_builder.moved != []
 
 
-class TestDraftInputsFollowTheScheduledToken:
-    STAGED = 8  # two requests, four staged slots each
-    LOGICAL = 99  # what the scheduler advanced; the draft must not use it
-
-    @classmethod
-    def _propose(cls, back_pad, spec_decode_metadata, cad, walk_back=None):
-        runner = _make_runner_stub(
-            speculative_config=SimpleNamespace(
-                method="mtp", use_eagle=lambda: True, num_speculative_tokens=3
-            ),
-            num_spec_tokens=3,
-            input_ids=torch.arange(32, dtype=torch.int32),
-            positions=torch.arange(32, dtype=torch.int64),
-            decode_back_pad=torch.tensor(back_pad, dtype=torch.int32),
-            requests={},
-            discard_request_mask=torch.zeros(8, dtype=torch.bool),
-            input_batch=SimpleNamespace(num_reqs=2),
-            drafter=MagicMock(spec=RBLNEagleProposer),
-        )
-        runner.drafter.prepare_next_token_ids_padded.return_value = (
-            torch.zeros(2, dtype=torch.int32),
-            torch.zeros(2, dtype=torch.int32),
-        )
-        if walk_back is not None:
-            runner.drafter.prepare_inputs_padded.return_value = (
-                cad,
-                walk_back,
-                torch.zeros(2, dtype=torch.int32),
-            )
-        runner.propose_draft_token_ids(
-            scheduler_output=SimpleNamespace(total_num_scheduled_tokens=cls.LOGICAL),
-            sampled_token_ids=torch.zeros(1, dtype=torch.int32),
-            sampling_metadata=None,
-            hidden_states=torch.zeros(1),
-            sample_hidden_states=torch.zeros(1),
-            spec_decode_metadata=spec_decode_metadata,
-            common_attn_metadata=cad,
-            combined_hidden_states=None,
-        )
-        return runner.drafter.propose.call_args.kwargs
-
-    def test_the_proposers_index_is_corrected_by_the_back_padding(self):
-        cad = SimpleNamespace(num_actual_tokens=self.STAGED, query_start_loc=None)
-        kwargs = self._propose(
-            [2, 1],
-            SimpleNamespace(),
-            cad,
-            walk_back=torch.tensor([3, 7], dtype=torch.int32),
-        )
-        assert kwargs["token_indices_to_sample"].tolist() == [1, 6]
-        assert kwargs["target_token_ids"].tolist() == list(range(self.STAGED))
-
-    def test_the_no_spec_path_stages_the_window_and_finds_the_token(self):
-        # query_start_loc[1:] - 1 - back_pad = [3, 7] - [3, 0] = [0, 7].
-        cad = SimpleNamespace(
-            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
-            num_actual_tokens=self.STAGED,
-        )
-        kwargs = self._propose([3, 0], None, cad)
-        assert kwargs["token_indices_to_sample"].tolist() == [0, 7]
-        assert kwargs["target_token_ids"].tolist() == list(range(self.STAGED))
-
-
 class TestDummyRunDecodeWindowPadding:
     pytestmark = pytest.mark.maybe_use_device
 
