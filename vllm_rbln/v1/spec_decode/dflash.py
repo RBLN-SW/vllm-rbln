@@ -47,6 +47,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
+from vllm_rbln.v1.worker.dp_utils import determine_batch_execution_and_padding
 
 
 class RBLNDFlashProposer(DFlashProposer):
@@ -62,30 +63,16 @@ class RBLNDFlashProposer(DFlashProposer):
     draft_has_moe = False
 
     @staticmethod
-    def _require_single_sequence(scheduler_config) -> None:
-        """DFlash loses acceptance on a wider decode batch. Cause unidentified."""
-        if scheduler_config.max_num_seqs > 1:
-            raise NotImplementedError(
-                "DFlash speculative decoding requires --max-num-seqs 1; got "
-                f"{scheduler_config.max_num_seqs}. A wider decode batch "
-                "silently collapses acceptance to below the no-speculation "
-                "baseline."
-            )
-
-    @staticmethod
     def _require_dense_drafter(draft_model) -> None:
-        """Fused MoE reads the token dimension `_run_query_pass` does not pad."""
+        """Fused MoE would require DP-idle ranks to join the draft collectives."""
         if any(isinstance(module, MoERunner) for module in draft_model.modules()):
             raise NotImplementedError(
                 "The DFlash drafter cannot carry fused MoE on RBLN: the draft "
-                "pass runs at this rank's own token count rather than the "
-                "padded batch the DP ranks agreed on, so its expert dimension "
-                "would disagree with its peers' and hang the group."
+                "pass skips DP-idle ranks, so a busy rank's expert collective "
+                "would wait for peers that never join it."
             )
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
-        # Checked before the base class does any work.
-        self._require_single_sequence(vllm_config.scheduler_config)
         if (
             vllm_config.speculative_config.enforce_eager
             or not envs.VLLM_RBLN_COMPILE_MODEL
@@ -190,8 +177,9 @@ class RBLNDFlashProposer(DFlashProposer):
             ctx_starts,
             valid_ctx_lens,
         )
-        # One draft id per mask position, so the flat result holds
-        # `num_reqs * num_speculative_tokens` ids -- not one per request.
+        # One draft id per mask position: the flat result holds
+        # `num_reqs_padded * num_speculative_tokens` ids, real rows first, so
+        # the leading `num_reqs * num_speculative_tokens` are the drafts.
         draft_ids = draft_ids[: num_reqs * self.num_speculative_tokens].view(
             num_reqs, self.num_speculative_tokens
         )
@@ -746,31 +734,70 @@ class RBLNDFlashProposer(DFlashProposer):
             torch.int64
         )
 
+        # Use the target's decode bucket so warmup covers every query shape and
+        # target/drafter batch asymmetry cannot degrade acceptance. Real rows
+        # lead; the caller discards the padded tail.
+        batch_desc, num_tokens_across_dp = self._determine_batch_execution_and_padding(
+            num_reqs, num_query_total, False, first_pass=False
+        )
+        num_reqs_padded = batch_desc.num_reqs_padded
+        status = self.runner.dp_status
+        if status is not None and not status.is_prefill[self.dp_rank]:
+            # A DP peer's phase or batch can widen target verification beyond
+            # this dense drafter's local bucket. Replay the target's pure shape
+            # decision from the published status, without another collective.
+            target_batch, _ = determine_batch_execution_and_padding(
+                cfg=self.runner.shape_config,
+                num_reqs=num_reqs,
+                num_tokens=status.num_tokens[self.dp_rank],
+                is_prefill=False,
+                status=status,
+            )
+            assert target_batch is not None
+            num_reqs_padded = target_batch.num_reqs_padded
+        num_query_total_padded = num_reqs_padded * num_query_per_req
+        assert num_query_total_padded <= self.max_num_tokens, (
+            f"the {num_reqs_padded}-request decode bucket needs "
+            f"{num_query_total_padded} draft query tokens, more than the "
+            f"{self.max_num_tokens}-token buffers: every decode bucket times "
+            f"{num_query_per_req} has to fit max_num_batched_tokens"
+        )
+        if num_query_total_padded > num_query_total:
+            # Padded rows hold whatever the previous step left in the buffers.
+            # They attend to nothing and their drafts are dropped, but define
+            # them anyway so the padded graph's inputs are reproducible.
+            self.input_ids[num_query_total:num_query_total_padded] = (
+                self.parallel_drafting_token_id
+            )
+            self.positions[num_query_total:num_query_total_padded] = 0
+
         per_layer = self._build_draft_attn_metadata(
             query_cad,
             block_starts,
             num_reqs,
-            num_reqs,
-        )
-        # `RBLNDPMetadata.make` requires this to be None off the DP path.
-        _, num_tokens_across_dp = self._determine_batch_execution_and_padding(
-            num_reqs, num_query_total, False, first_pass=False
+            num_reqs_padded,
         )
         with set_forward_context(
             per_layer,
             self.vllm_config,
             num_tokens=num_query_total,
             num_tokens_across_dp=num_tokens_across_dp,
+            # The dense drafter has no expert collective; its token dimension
+            # follows the query batch, independently of the target's query length.
             num_padded_tokens=(
-                num_query_total if num_tokens_across_dp is not None else None
+                num_query_total_padded if num_tokens_across_dp is not None else None
             ),
             **build_kv_cache_forward_context_kwargs(self.runner.kv_cache_bases),
         ):
             return self.model_executable(
-                input_ids=self.input_ids[:num_query_total].view(num_reqs, -1),
-                positions=self.positions[:num_query_total].view(num_reqs, -1),
+                input_ids=self.input_ids[:num_query_total_padded].view(
+                    num_reqs_padded, -1
+                ),
+                positions=self.positions[:num_query_total_padded].view(
+                    num_reqs_padded, -1
+                ),
                 token_indices_to_sample=self._sample_indices(
-                    num_reqs, num_query_per_req
+                    num_reqs_padded, num_query_per_req
                 ),
             )
 
