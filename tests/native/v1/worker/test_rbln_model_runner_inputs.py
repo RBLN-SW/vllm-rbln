@@ -113,10 +113,7 @@ class TestPrepareInputsSpecDecode:
 class TestPrepareInputsUniformQueryLength:
     # RBLN runs one query length per step (see dp_utils.determine_batch_
     # execution_and_padding), so a step that stages the window has to stage it
-    # for the whole batch. An ngram-style drafter is where this bites: it can
-    # propose k tokens for one request and none for its neighbour, and running
-    # each at its own logical length would hand the shape decision a batch it
-    # cannot describe.
+    # for the whole batch.
     def test_a_mixed_batch_stages_one_query_length(
         self, make_model_runner, monkeypatch
     ):
@@ -141,10 +138,7 @@ class TestPrepareInputsUniformQueryLength:
 
         window = 3
         assert query_lengths.tolist() == [window, window]
-        # What the shape decision asserts: num_tokens is a multiple of num_reqs.
         assert total % len(query_lengths) == 0
-        # "b" had no draft, so its whole slack is padding; the scheduled token
-        # still has to be the sampled slot.
         assert spec_md is not None
         assert spec_md.num_draft_tokens == [2, 0]
 

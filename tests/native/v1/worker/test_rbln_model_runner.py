@@ -1030,8 +1030,6 @@ class TestMayReorderBatch:
 
 
 class TestDraftInputsFollowTheScheduledToken:
-    # Both drafter paths walk back from the staged query's last slot, which back
-    # padding leaves un-scheduled, so the runner shifts them by that padding.
     STAGED = 8  # two requests, four staged slots each
     LOGICAL = 99  # what the scheduler advanced; the draft must not use it
 
@@ -1095,9 +1093,6 @@ class TestDraftInputsFollowTheScheduledToken:
 
 
 class TestDummyRunDecodeWindowPadding:
-    # make_model_runner builds a real Attention, so these open the NPU --
-    # the marker is what runs them in a fresh process instead of pinning
-    # this session's device.
     pytestmark = pytest.mark.maybe_use_device
 
     NUM_REQS = 2
