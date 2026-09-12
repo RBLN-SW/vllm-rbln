@@ -673,9 +673,6 @@ class RBLNEagleProposer(EagleProposer):
         if target_token_ids is not None:
             assert next_token_ids is not None
             assert num_input_tokens == target_token_ids.shape[0]
-            # Deriving this from query_start_loc would land on the query's last
-            # slot, which back padding no longer guarantees is the last
-            # scheduled token, so the caller owns it.
             assert token_indices_to_sample is not None
             token_indices_to_sample = token_indices_to_sample.to(self.device)
 

@@ -36,20 +36,24 @@ def _decode_ready(
     num_spec_tokens: int,
     num_computed: int = 3,
     fixed_window: bool = True,
+    req_ids: tuple[str, ...] = ("a",),
 ) -> None:
-    """One request past its prompt in the decode phase, so the spec branch is
+    """Requests past their prompt in the decode phase, so the spec branch is
     reachable. The phase comes from the scheduler output, so it is set through
     _is_prefill_step rather than derived from input_batch."""
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
-    runner._update_states(schedule_new("a"))
-    runner.input_batch.num_computed_tokens_cpu[0] = num_computed
-    runner.input_batch.num_tokens_no_spec[0] = num_computed
+    runner._update_states(schedule_new(*req_ids))
+    for idx in range(len(req_ids)):
+        runner.input_batch.num_computed_tokens_cpu[idx] = num_computed
+        runner.input_batch.num_tokens_no_spec[idx] = num_computed
     # Patched rather than configured: a real speculative_config would pull in a
     # drafter, and the only thing the arithmetic reads off it is whether the
     # drafter is model-based, which decides the fixed decode window.
     monkeypatch.setattr(runner, "num_spec_tokens", num_spec_tokens)
     monkeypatch.setattr(
-        runner, "speculative_config", SimpleNamespace(use_eagle=lambda: fixed_window)
+        runner,
+        "speculative_config",
+        SimpleNamespace(method="mtp" if fixed_window else "ngram"),
     )
     runner._is_prefill_step = False
     assert runner.is_prefill is False
@@ -60,7 +64,8 @@ class TestPrepareInputsSpecDecode:
         self, make_model_runner, monkeypatch
     ):
         # 1 real + 1 draft = 2 logical tokens, but the decode query is fixed at
-        # num_spec_tokens + 1 = 3, so one already-computed token is backfilled.
+        # num_spec_tokens + 1 = 3, so one slot is padded. Mid-block the used tail
+        # absorbs it, so the window re-runs the token before the scheduled ones.
         runner = make_model_runner()
         _decode_ready(runner, monkeypatch, num_spec_tokens=2)
 
@@ -73,7 +78,7 @@ class TestPrepareInputsSpecDecode:
 
         assert query_lengths.tolist() == [3]
         assert total == 3
-        # Positions start one token earlier (num_computed 3 - backfill 1).
+        # Slot 0 re-runs position 2; the scheduled tokens land in slots 1 and 2.
         assert runner.positions[:3].tolist() == [2, 3, 4]
         # seq_lens follows the logical count (3 + 2), not the padded query
         # length, or attention would read a KV slot this step never wrote.
@@ -105,23 +110,66 @@ class TestPrepareInputsSpecDecode:
         assert logits_indices.tolist() == [0]
 
 
+class TestPrepareInputsUniformQueryLength:
+    # RBLN runs one query length per step (see dp_utils.determine_batch_
+    # execution_and_padding), so a step that stages the window has to stage it
+    # for the whole batch. An ngram-style drafter is where this bites: it can
+    # propose k tokens for one request and none for its neighbour, and running
+    # each at its own logical length would hand the shape decision a batch it
+    # cannot describe.
+    def test_a_mixed_batch_stages_one_query_length(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        _decode_ready(
+            runner,
+            monkeypatch,
+            num_spec_tokens=2,
+            num_computed=8,
+            fixed_window=False,
+            req_ids=("a", "b"),
+        )
+
+        # "a" kept both drafts, "b" none -- logical lengths 3 and 1.
+        _logits, spec_md, query_lengths, total = runner._prepare_inputs(
+            make_scheduler_output(
+                num_scheduled_tokens={"a": 3, "b": 1},
+                spec_decode_tokens={"a": [11, 12]},
+            ),
+            np.array([3, 1], dtype=np.int32),
+        )
+
+        window = 3
+        assert query_lengths.tolist() == [window, window]
+        # What the shape decision asserts: num_tokens is a multiple of num_reqs.
+        assert total % len(query_lengths) == 0
+        # "b" had no draft, so its whole slack is padding; the scheduled token
+        # still has to be the sampled slot.
+        assert spec_md is not None
+        assert spec_md.num_draft_tokens == [2, 0]
+
+
 class TestPrepareInputsFixedWindow:
     # A decode with a model-based drafter always stages num_spec_tokens + 1
-    # slots, taking the slack in front of the scheduled token as far as the
-    # block allows and behind it for the rest. Everything downstream has to
-    # follow the token, not the window.
+    # slots, spending the slack on tokens already computed in this block and
+    # putting whatever the block's used tail cannot absorb behind the scheduled
+    # token. Everything downstream has to follow the token, not the window.
     BLOCK = 1024
     NUM_SPEC = 2
 
     @pytest.mark.parametrize(
         "num_computed,window_start,sample_slot",
         [
-            # Mid-block: both slack slots fit in front of the token.
+            # Mid-block: the tail holds the whole slack, so the window re-runs
+            # the two tokens before the scheduled one.
             (3, 1, 2),
-            # At a block start: nothing to re-run, so all of it goes behind.
+            # At a block start there is no tail to re-run, so the slack has
+            # nowhere to go but behind.
             (BLOCK, BLOCK, 0),
-            # One computed token in the block: one in front, one behind.
+            # One token into the block: one slot in front, one behind.
             (BLOCK + 1, BLOCK, 1),
+            # The block's last slot: the whole slack fits in front.
+            (BLOCK - 1, BLOCK - 1 - 2, 2),
         ],
     )
     def test_window_is_fixed_and_stays_in_one_block(
@@ -141,9 +189,7 @@ class TestPrepareInputsFixedWindow:
             np.array([1], dtype=np.int32),
         )
 
-        assert spec_md is None
         assert query_lengths.tolist() == [window]
-        assert total == window
         positions = runner.positions[:window].tolist()
         assert positions == list(range(window_start, window_start + window))
         # The invariant the split exists for: one write range, one block.

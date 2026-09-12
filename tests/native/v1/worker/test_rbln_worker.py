@@ -376,6 +376,7 @@ class TestDetermineAvailableMemory:
         hf_config=None,
         params=None,
         specialized_moe_decode=False,
+        uses_fixed_decode_window=False,
         decode_buckets=3,
         drafter=None,
         speculative_config=None,
@@ -399,6 +400,7 @@ class TestDetermineAvailableMemory:
                 decode_batch_buckets_count=decode_buckets
             ),
             drafter=drafter,
+            uses_fixed_decode_window=uses_fixed_decode_window,
         )
         worker.determine_available_memory()
         return captured
@@ -478,12 +480,37 @@ class TestDetermineAvailableMemory:
             method="eagle",
         )
         cap = self._capture(
-            make_worker, monkeypatch, drafter=drafter, speculative_config=spec
+            make_worker,
+            monkeypatch,
+            drafter=drafter,
+            speculative_config=spec,
+            uses_fixed_decode_window=True,
         )
         assert "kernel_size" in cap
         assert "n_model_bytes" not in cap
-        # Spec on: target = 1 + buckets(3)*num_decode_query_lens(2) = 7 (no MoE);
-        # draft = 1 + buckets(3) = 4. Total 11.
+        # A fixed decode window compiles one decode query length: target =
+        # 1 + buckets(3)*1 = 4 (no MoE); draft = 1 + buckets(3) = 4. Total 8.
+        assert cap["num_runtimes"] == 8
+
+    def test_a_variable_window_still_reserves_both_decode_lengths(
+        self, make_worker, monkeypatch
+    ):
+        # An ngram-style method keeps qlen=1 reachable, so warm-up compiles both
+        # decode query lengths and the reservation has to cover them.
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
+            )
+        )
+        spec = SimpleNamespace(
+            draft_model_config=SimpleNamespace(quantization=None),
+            draft_parallel_config=None,
+            method="medusa",
+        )
+        cap = self._capture(
+            make_worker, monkeypatch, drafter=drafter, speculative_config=spec
+        )
+        # Target = 1 + buckets(3)*2 = 7 (no MoE); draft = 1 + buckets(3) = 4.
         assert cap["num_runtimes"] == 11
 
     def test_draft_runtime_adds_specialized_moe_fallback(
@@ -491,8 +518,8 @@ class TestDetermineAvailableMemory:
     ):
         # The specialized-MoE-decode fallback re-runs the top bucket at a different
         # num_padded_tokens, so it adds one draft graph.
-        # Target = 1 + buckets(3)*2 + (2 + 1) = 10; draft = 1 + buckets(3) + 1 = 5;
-        # total 15.
+        # Target = 1 + buckets(3)*1 + 1 = 5; draft = 1 + buckets(3) + 1 = 5;
+        # total 10.
         drafter = SimpleNamespace(
             model=SimpleNamespace(
                 parameters=lambda: iter([torch.zeros(20, dtype=torch.float16)])
@@ -509,8 +536,9 @@ class TestDetermineAvailableMemory:
             drafter=drafter,
             speculative_config=spec,
             specialized_moe_decode=True,
+            uses_fixed_decode_window=True,
         )
-        assert cap["num_runtimes"] == 15
+        assert cap["num_runtimes"] == 10
 
     def test_draft_quantization_rejected(self, make_worker, monkeypatch):
         drafter = SimpleNamespace(
@@ -525,7 +553,11 @@ class TestDetermineAvailableMemory:
         )
         with pytest.raises(ValueError, match="draft model quantization"):
             self._capture(
-                make_worker, monkeypatch, drafter=drafter, speculative_config=spec
+                make_worker,
+                monkeypatch,
+                drafter=drafter,
+                speculative_config=spec,
+                uses_fixed_decode_window=True,
             )
 
 

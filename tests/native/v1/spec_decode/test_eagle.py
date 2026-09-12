@@ -232,7 +232,6 @@ class TestPrepareInputsPadded:
             common_attn_metadata=cad,
             spec_decode_metadata=spec_md,
             valid_sampled_tokens_count=valid_count,
-            back_pad=torch.zeros(3, dtype=torch.int32),
         )
         assert num_rejected.cpu().tolist() == [1, 0, 2]
         assert token_indices.cpu().tolist() == [1, 5, 6]

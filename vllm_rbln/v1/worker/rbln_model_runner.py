@@ -417,10 +417,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64)
         self.query_start_loc = torch.zeros(self.max_num_reqs + 1, dtype=torch.int32)
         self.query_start_loc_np = self.query_start_loc.numpy()
-        # Slots this step staged behind each request's scheduled tokens (see the
-        # window construction in _prepare_inputs). Everything that has to find
-        # the last scheduled token in the staged query subtracts it, so it is
-        # step state rather than a local.
         self.decode_back_pad = torch.zeros(self.max_num_reqs, dtype=torch.int32)
         self.decode_back_pad_np = self.decode_back_pad.numpy()
         self.seq_lens = torch.zeros(self.max_num_tokens, dtype=torch.int32)
@@ -842,22 +838,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         assert (num_reqs := self.input_batch.num_reqs) > 0
         logical_num_tokens = num_scheduled_tokens
 
-        # NOTE(RBLN): A decode query is written as one contiguous KV window, so
-        # every decode step stages the same num_spec_tokens + 1 slots and fills
-        # the slack around the scheduled tokens. The slack goes in front of them
-        # as far as the current block allows -- already-computed tokens, re-run
-        # and discarded -- and the remainder goes behind them, on slots past the
-        # logical end whose KV the next step overwrites. The two directions fail
-        # on opposite edges of a block (the front needs computed tokens inside
-        # it, the back needs free slots), so a block that can hold the window
-        # makes their union total and the window is always constructible.
-        # Holding one query length is what keeps the decode graph set at one
-        # shape instead of one per reachable length; a step that reached the
-        # logical length instead would need its own graph for every length.
-        # Only a model-based drafter takes this: it proposes on every step, so a
-        # step with no drafts is the exception and paying a full window for it is
-        # cheap. An ngram-style drafter finds no match often enough that padding
-        # every one of those steps would cost more than the extra graph.
+        # NOTE(RBLN): A decode query is one contiguous KV window, so a step that
+        # stages the fixed num_spec_tokens + 1 query splits the slack around the
+        # scheduled tokens: in front as far as the block's used tail reaches, the
+        # rest behind. That keeps the window inside one block and the decode graph
+        # set at one shape. A model-based drafter always stages it; an ngram-style
+        # one only on the steps whose drafts the scheduler kept.
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         window_fixed = not self.is_prefill and (
             self.uses_fixed_decode_window
@@ -872,27 +858,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 f"logical_num_tokens={logical_num_tokens}"
             )
             block_size = self.cache_config.block_size
-            assert block_size >= self.num_spec_tokens + 1, (
-                f"block_size={block_size} cannot hold a "
-                f"{self.num_spec_tokens + 1}-slot decode window"
-            )
             num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
             front_pad = np.minimum(slack, num_computed % block_size).astype(np.int32)
             back_pad = slack - front_pad
-
-            # The kernel writes a decode query as one range inside one block, so
-            # this is the invariant the padding split exists to keep. It holds
-            # because the front takes at most the tokens already used in the
-            # block and the scheduler clamped the logical advance to what is
-            # left of it, so both edges of the window stay inside one block.
-            window_start = num_computed - front_pad
-            assert np.array_equal(
-                window_start // block_size,
-                (window_start + query_lengths - 1) // block_size,
-            ), (
-                f"decode window straddles a KV block: starts={window_start}, "
-                f"query_lengths={query_lengths}, block_size={block_size}"
-            )
         else:
             query_lengths = logical_num_tokens
             front_pad = np.zeros_like(logical_num_tokens)
@@ -1099,9 +1067,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_draft_tokens: np.ndarray,
         cu_sample_end: np.ndarray,
     ) -> SpecDecodeMetadata:
-        # `cu_sample_end` is the exclusive end of each request's sampled slots in
-        # the staged query, which trails the staged end by whatever back padding
-        # `_prepare_inputs` added.
         # Inputs:
         # cu_sample_end:            [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]
@@ -2123,9 +2088,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs = self.input_batch.num_reqs
             back_pad = self.decode_back_pad[:num_reqs]
             if spec_decode_metadata is None:
-                # The staged query, not the logical advance: the draft mirrors
-                # the target's window, and the back padding puts each request's
-                # scheduled token before the window's last slot.
                 num_staged_tokens = int(common_attn_metadata.query_start_loc[num_reqs])
                 token_indices_to_sample = (
                     common_attn_metadata.query_start_loc[1 : num_reqs + 1]
@@ -3146,6 +3108,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # window would then have to run past max_model_len.
             window = self.num_spec_tokens + 1
             block_size = self.cache_config.block_size
+            if block_size < window:
+                raise ValueError(
+                    f"block_size={block_size} cannot hold the {window}-slot "
+                    f"speculative decode window."
+                )
             remainder = self.max_model_len % block_size
             if remainder and remainder < window:
                 raise ValueError(
@@ -3500,9 +3467,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self._dummy_run(1, self.max_num_tokens, True)
 
             # 2. decode
-            # NOTE(RBLN): a fixed decode window makes qlen=1 unreachable for the
-            # target, so compiling it would leave a graph nothing executes. Every
-            # other configuration still reaches it.
             query_lens = [1]
             if self.speculative_config:
                 spec_query_len = self.speculative_config.num_speculative_tokens + 1

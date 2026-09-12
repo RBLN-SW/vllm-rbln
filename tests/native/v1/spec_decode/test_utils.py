@@ -101,7 +101,7 @@ class TestEaglePrepareInputsPadded:
         query_start_loc = _t([0, 3, 6, 9])
 
         token_indices, num_rejected = eagle_prepare_inputs_padded(
-            cu_num_draft, valid_count, query_start_loc, _t([0, 0, 0])
+            cu_num_draft, valid_count, query_start_loc
         )
         # rejected = (2+1) - valid = [1, 0, 2]; index = qsl[1:]-1-rejected.
         assert num_rejected.cpu().tolist() == [1, 0, 2]
@@ -115,26 +115,11 @@ class TestEaglePrepareInputsPadded:
         query_start_loc = _t([0, 1, 4])
 
         token_indices, num_rejected = eagle_prepare_inputs_padded(
-            cu_num_draft, valid_count, query_start_loc, _t([0, 0])
+            cu_num_draft, valid_count, query_start_loc
         )
         # req0: no draft -> 0; req1: (3+1)-2 = 2.
         assert num_rejected.cpu().tolist() == [0, 2]
         assert token_indices.cpu().tolist() == [0, 1]
-
-    def test_back_padding_shifts_the_index_off_the_padded_slots(self):
-        # The target staged 2 slots behind req0's scheduled tokens and 1 behind
-        # req1's, so the walk back starts at the last scheduled token, not at
-        # the query's last slot.
-        cu_num_draft = _t([2, 4])
-        valid_count = _t([2, 3])
-        query_start_loc = _t([0, 5, 10])
-
-        token_indices, num_rejected = eagle_prepare_inputs_padded(
-            cu_num_draft, valid_count, query_start_loc, _t([2, 1])
-        )
-        # rejected = [1, 0]; index = qsl[1:] - 1 - back_pad - rejected.
-        assert num_rejected.cpu().tolist() == [1, 0]
-        assert token_indices.cpu().tolist() == [1, 8]
 
     def test_cumulative_counts_are_differenced_per_request(self):
         # cu = [3, 5, 10] must yield per-request drafts [3, 2, 5], not the raw
@@ -144,7 +129,7 @@ class TestEaglePrepareInputsPadded:
         query_start_loc = _t([0, 3, 5, 10])
 
         token_indices, num_rejected = eagle_prepare_inputs_padded(
-            cu_num_draft, valid_count, query_start_loc, _t([0, 0, 0])
+            cu_num_draft, valid_count, query_start_loc
         )
         # rejected = [3+1-2, 2+1-1, 5+1-4] = [2, 2, 2].
         assert num_rejected.cpu().tolist() == [2, 2, 2]

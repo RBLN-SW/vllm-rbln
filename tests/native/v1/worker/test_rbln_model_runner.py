@@ -282,7 +282,6 @@ class TestPadDepad:
                 padded.cu_num_draft_tokens,
                 torch.tensor([2, 2], dtype=torch.int32),
                 torch.tensor([0, 2, 4], dtype=torch.int32),
-                torch.zeros(2, dtype=torch.int32),
             )
 
 
@@ -983,85 +982,6 @@ class TestCalcSpecDecodeMetadata:
         assert md.bonus_logits_indices.tolist() == [0, 1]
 
 
-class TestPrepareInputsFixedWindow:
-    # _prepare_inputs stages a fixed num_spec_tokens + 1 decode window and fills
-    # the slack in front of the scheduled tokens as far as the block allows, then
-    # behind them. `logits_indices` has to follow the tokens, not the window.
-    BLOCK = 16
-    NUM_SPEC = 3
-
-    def _runner(self, num_computed):
-        runner = _make_runner_stub(
-            num_spec_tokens=self.NUM_SPEC,
-            speculative_config=SimpleNamespace(use_eagle=lambda: True),
-            cache_config=SimpleNamespace(block_size=self.BLOCK),
-            arange_np=np.arange(8),
-            positions=torch.zeros(64, dtype=torch.int64),
-            input_ids=torch.zeros(64, dtype=torch.int32),
-            query_start_loc=torch.zeros(9, dtype=torch.int32),
-            decode_back_pad=torch.zeros(8, dtype=torch.int32),
-            seq_lens_np=np.zeros(8, dtype=np.int32),
-            discard_request_mask=torch.zeros(8, dtype=torch.bool),
-            device=torch.device("cpu"),
-            requests={"0": SimpleNamespace(num_tokens=num_computed + 1)},
-        )
-        runner.is_prefill = False
-        runner.query_start_loc_np = runner.query_start_loc.numpy()
-        runner.decode_back_pad_np = runner.decode_back_pad.numpy()
-        runner.input_batch = SimpleNamespace(
-            num_reqs=1,
-            num_computed_tokens_cpu=np.array([num_computed], dtype=np.int32),
-            token_ids_cpu=np.zeros((1, 64), dtype=np.int32),
-            token_ids_cpu_tensor=torch.zeros(1, 64, dtype=torch.int32),
-            req_id_to_index={"0": 0},
-            num_prompt_tokens=np.array([1], dtype=np.int32),
-            req_ids=["0"],
-        )
-        return runner
-
-    def _prepare(self, num_computed):
-        runner = self._runner(num_computed)
-        scheduler_output = SimpleNamespace(
-            total_num_scheduled_tokens=1,
-            scheduled_spec_decode_tokens={},
-        )
-        logits_indices, _, query_lengths, total = runner._prepare_inputs(
-            scheduler_output, np.array([1], dtype=np.int32)
-        )
-        return runner, logits_indices, query_lengths, total
-
-    @pytest.mark.parametrize(
-        "num_computed,window_start,sample_slot",
-        [
-            # Mid-block: all three slack slots fit in front of the token.
-            (10, 7, 3),
-            # At a block start: nothing to re-run, so all of it goes behind.
-            (16, 16, 0),
-            # One computed token in the block: one in front, two behind.
-            (17, 16, 1),
-        ],
-    )
-    def test_window_is_fixed_and_stays_in_the_block(
-        self, num_computed, window_start, sample_slot
-    ):
-        runner, logits_indices, query_lengths, total = self._prepare(num_computed)
-        window = self.NUM_SPEC + 1
-
-        assert query_lengths.tolist() == [window]
-        assert total == window
-        positions = runner.positions.numpy()[:window].tolist()
-        assert positions == list(range(window_start, window_start + window))
-        # The whole point of the split: one write range, one block.
-        assert window_start // self.BLOCK == positions[-1] // self.BLOCK
-        # The sampled slot is the scheduled token, wherever the padding put it.
-        assert logits_indices.tolist() == [sample_slot]
-        assert positions[sample_slot] == num_computed
-        # seq_lens stays the logical length; the padding must not inflate it.
-        assert runner.seq_lens_np[0] == num_computed + 1
-        # The drafter path reads this to find the same slot.
-        assert runner.decode_back_pad_np[0] == window - 1 - sample_slot
-
-
 class TestMayReorderBatch:
     # Stable descending sort by num_tokens_no_spec, applied in place. Uses a real
     # InputBatch; scheduler_output is unused by the sort path, so None is passed.
@@ -1109,33 +1029,138 @@ class TestMayReorderBatch:
         assert r.input_batch.batch_update_builder.moved != []
 
 
+class TestDraftInputsFollowTheScheduledToken:
+    # Both drafter paths walk back from the staged query's last slot, which back
+    # padding leaves un-scheduled, so the runner shifts them by that padding.
+    STAGED = 8  # two requests, four staged slots each
+    LOGICAL = 99  # what the scheduler advanced; the draft must not use it
+
+    @classmethod
+    def _propose(cls, back_pad, spec_decode_metadata, cad, walk_back=None):
+        runner = _make_runner_stub(
+            speculative_config=SimpleNamespace(
+                method="mtp", use_eagle=lambda: True, num_speculative_tokens=3
+            ),
+            num_spec_tokens=3,
+            input_ids=torch.arange(32, dtype=torch.int32),
+            positions=torch.arange(32, dtype=torch.int64),
+            decode_back_pad=torch.tensor(back_pad, dtype=torch.int32),
+            requests={},
+            discard_request_mask=torch.zeros(8, dtype=torch.bool),
+            input_batch=SimpleNamespace(num_reqs=2),
+            drafter=MagicMock(spec=RBLNEagleProposer),
+        )
+        runner.drafter.prepare_next_token_ids_padded.return_value = (
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        )
+        if walk_back is not None:
+            runner.drafter.prepare_inputs_padded.return_value = (
+                cad,
+                walk_back,
+                torch.zeros(2, dtype=torch.int32),
+            )
+        runner.propose_draft_token_ids(
+            scheduler_output=SimpleNamespace(total_num_scheduled_tokens=cls.LOGICAL),
+            sampled_token_ids=torch.zeros(1, dtype=torch.int32),
+            sampling_metadata=None,
+            hidden_states=torch.zeros(1),
+            sample_hidden_states=torch.zeros(1),
+            spec_decode_metadata=spec_decode_metadata,
+            common_attn_metadata=cad,
+            combined_hidden_states=None,
+        )
+        return runner.drafter.propose.call_args.kwargs
+
+    def test_the_proposers_index_is_corrected_by_the_back_padding(self):
+        cad = SimpleNamespace(num_actual_tokens=self.STAGED, query_start_loc=None)
+        kwargs = self._propose(
+            [2, 1],
+            SimpleNamespace(),
+            cad,
+            walk_back=torch.tensor([3, 7], dtype=torch.int32),
+        )
+        assert kwargs["token_indices_to_sample"].tolist() == [1, 6]
+        assert kwargs["target_token_ids"].tolist() == list(range(self.STAGED))
+
+    def test_the_no_spec_path_stages_the_window_and_finds_the_token(self):
+        # query_start_loc[1:] - 1 - back_pad = [3, 7] - [3, 0] = [0, 7].
+        cad = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+            num_actual_tokens=self.STAGED,
+        )
+        kwargs = self._propose([3, 0], None, cad)
+        assert kwargs["token_indices_to_sample"].tolist() == [0, 7]
+        assert kwargs["target_token_ids"].tolist() == list(range(self.STAGED))
+
+
+class TestDummyRunDecodeWindowPadding:
+    # make_model_runner builds a real Attention, so these open the NPU --
+    # the marker is what runs them in a fresh process instead of pinning
+    # this session's device.
+    pytestmark = pytest.mark.maybe_use_device
+
+    NUM_REQS = 2
+    NUM_SPEC = 3
+
+    @pytest.mark.parametrize(
+        "fixed_window,warmup,expected_tokens",
+        [
+            # The window is the only decode shape warm-up compiles, so a shorter
+            # request has to be padded out to it.
+            (True, True, 1 + NUM_SPEC),
+            # An ngram-style drafter compiles qlen=1 too; nothing to pad to.
+            (False, True, 1),
+            # Not warm-up: the DP idle entry must stay minimal so it does not
+            # drive the shape decision the busy ranks make.
+            (True, False, 1),
+        ],
+    )
+    def test_only_a_warm_up_with_a_fixed_window_pads(
+        self, make_model_runner, monkeypatch, fixed_window, warmup, expected_tokens
+    ):
+        runner = make_model_runner()
+        monkeypatch.setattr(runner, "num_spec_tokens", self.NUM_SPEC)
+        monkeypatch.setattr(type(runner), "uses_fixed_decode_window", fixed_window)
+        seen: list = []
+        monkeypatch.setattr(
+            runner,
+            "_determine_batch_execution_and_padding",
+            lambda num_reqs, num_tokens, is_idle, **kw: (seen.append(num_tokens))
+            or (None, None, None),
+        )
+
+        runner._dummy_run(self.NUM_REQS, 1, False, warmup=warmup)
+
+        assert seen == [self.NUM_REQS * expected_tokens]
+
+
 class TestFixedDecodeWindowConfig:
     # The fixed decode window is placed inside one KV block, so the sequence's
     # last block has to be able to hold it. A max_model_len whose remainder is
     # shorter than the window has no valid placement there, and is refused at
     # load rather than a step into serving.
     @staticmethod
-    def _runner(max_model_len, num_spec_tokens):
-        runner = _make_runner_stub(
+    def _runner(max_model_len, num_spec_tokens, block_size=1024):
+        return _make_runner_stub(
             max_model_len=max_model_len,
             num_spec_tokens=num_spec_tokens,
-            speculative_config=SimpleNamespace(use_eagle=lambda: True),
-            cache_config=SimpleNamespace(block_size=1024),
+            speculative_config=SimpleNamespace(method="mtp"),
+            cache_config=SimpleNamespace(block_size=block_size),
         )
-        return runner
 
-    def test_a_last_block_too_short_for_the_window_is_refused(self):
-        runner = self._runner(1024 * 4 + 2, 3)
+    @pytest.mark.parametrize(
+        "max_model_len,block_size",
+        [
+            (1024 * 4 + 2, 1024),  # last block leaves 2 of the 4 slots
+            (1024 * 4, 2),  # no block can hold the window at all
+        ],
+    )
+    def test_a_block_too_short_for_the_window_is_refused(
+        self, max_model_len, block_size
+    ):
+        runner = self._runner(max_model_len, 3, block_size)
         with pytest.raises(ValueError, match="cannot hold the 4-slot"):
-            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
-
-    @pytest.mark.parametrize("max_model_len", [1024 * 4, 1024 * 4 + 4, 1024 * 4 + 900])
-    def test_a_last_block_that_fits_is_accepted(self, max_model_len):
-        # Block-aligned, exactly the window, and a long remainder all pass the
-        # check; the raise is the only thing under test, so the call is expected
-        # to fail later on the stub's missing state.
-        runner = self._runner(max_model_len, 3)
-        with pytest.raises(AttributeError):
             runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
 
 
@@ -1400,7 +1425,7 @@ class TestDummyRunDraftParticipation:
         attrs = dict(
             max_num_tokens=64,
             max_num_reqs=8,
-            speculative_config=SimpleNamespace(),
+            speculative_config=SimpleNamespace(method="eagle"),
             num_spec_tokens=cls.NUM_SPEC,
             query_start_loc_np=np.zeros(16, dtype=np.int32),
             input_ids=torch.zeros(64, dtype=torch.int32),
@@ -1458,18 +1483,18 @@ class TestDummyRunDraftParticipation:
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
         drafter.dummy_run.assert_called_once_with(1, 1, False)
 
-    @pytest.mark.parametrize("query_len", [1, 1 + NUM_SPEC])
-    def test_warmup_compiles_the_draft_at_every_query_length(
-        self, monkeypatch, query_len
+    @pytest.mark.parametrize("requested", [1, 1 + NUM_SPEC])
+    def test_warmup_compiles_the_draft_at_the_window_length(
+        self, monkeypatch, requested
     ):
-        # Both decode lengths reach the draft. Query length 1 is the one a step
-        # forced to no-spec runs, and compiling only the spec length leaves that
-        # step to compile its own graph while it serves.
+        # The window is the only decode length this config compiles, so a warm-up
+        # dummy asking for a shorter decode query reaches the draft padded out to
+        # it rather than at a length nothing compiled.
         runner, drafter = self._runner(monkeypatch, has_drafter=True)
-        runner._dummy_run(2, query_len, is_prefill=False, warmup=True)
+        runner._dummy_run(2, requested, is_prefill=False, warmup=True)
         # warmup path keeps the num_padded_tokens kwarg (draft's own pad target).
         drafter.dummy_run.assert_called_once_with(
-            2, query_len, False, num_padded_tokens=None
+            2, 1 + self.NUM_SPEC, False, num_padded_tokens=None
         )
 
     def test_no_drafter_skips_cleanly(self, monkeypatch):
