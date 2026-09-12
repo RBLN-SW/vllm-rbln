@@ -73,6 +73,10 @@ _RBLN_MULTIMODAL_MODELS = {
         "qwen3_5",
         "RBLNQwen3_5ForConditionalGeneration",
     ),
+    "Qwen3ASRForConditionalGeneration": (
+        "qwen3_asr",
+        "RBLNQwen3ASRForConditionalGeneration",
+    ),
     "Exaone4_5_ForConditionalGeneration": (
         "exaone4_5",
         "RBLNExaone4_5_ForConditionalGeneration",
