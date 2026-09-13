@@ -421,6 +421,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.seq_lens_np = self.seq_lens.numpy()
         self.discard_request_mask = torch.zeros(self.max_num_reqs, dtype=torch.bool)
         self.intermediate_tensors_dict: dict[tuple[int, int], IntermediateTensors] = {}
+        # Where a PP recv lands, so it never rebinds the pinned graph input above.
+        self.recv_landing_dict: dict[tuple[int, int], IntermediateTensors] = {}
         self.input_stager = InputStager(self.device)
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
@@ -1614,6 +1616,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.intermediate_tensors_dict[key] = tensors
         return tensors
 
+    def _create_or_get_recv_landing(
+        self, graph_input: IntermediateTensors, num_reqs_padded: int, query_len: int
+    ) -> IntermediateTensors:
+        """Flat staging tensors a PP recv writes into, one set per input shape."""
+
+        key = (num_reqs_padded, query_len)
+        if (landing := self.recv_landing_dict.get(key)) is None:
+            landing = IntermediateTensors(
+                {
+                    name: torch.empty(t.shape, dtype=t.dtype, device=t.device)
+                    for name, t in graph_input.items()
+                }
+            )
+            self.recv_landing_dict[key] = landing
+        return landing
+
     def recv_intermediate_tensors(self) -> IntermediateTensors:
         """Receive the previous PP stage's output into this stage's tensors.
 
@@ -1621,6 +1639,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         except that the upstream version allocates a new empty tensor on every call.
         Here we instead reuse buffers via _create_or_get_intermediate_tensors, keeping
         the graph input pinned to a fixed tensor.
+
+        The recv lands in a staging tensor and is copied into that pinned input, because
+        rcclRecv rebinds its target as one flat device area. Receiving into the input
+        would drop the layout the graph reads, and a pinned buffer is never re-staged.
         """
         pp_group = get_pp_group()
         src = (pp_group.rank_in_group - 1) % pp_group.world_size
@@ -1650,14 +1672,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if self.device == torch.device("cpu")
             else pp_group.device_group
         )
+        landing = self._create_or_get_recv_landing(
+            intermediate_tensors, num_reqs_padded, query_len
+        )
         handles = [
-            torch.distributed.irecv(
-                intermediate_tensors[name], src=pp_group.ranks[src], group=group
-            )
+            torch.distributed.irecv(landing[name], src=pp_group.ranks[src], group=group)
             for name, _ in recv_metadata_list
         ]
         for handle in handles:
             handle.wait()
+
+        for name, _ in recv_metadata_list:
+            intermediate_tensors[name].copy_(landing[name])
 
         return intermediate_tensors
 
@@ -2501,6 +2527,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         else:
             intermediate_tensors = self._create_or_get_intermediate_tensors(
                 batch_desc.num_reqs_padded, query_len
+            )
+            # Claim the staging buffer here too, so the first recv of a shape does
+            # not pay its allocation on the critical path.
+            self._create_or_get_recv_landing(
+                intermediate_tensors, batch_desc.num_reqs_padded, query_len
             )
 
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
