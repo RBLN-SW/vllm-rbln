@@ -198,7 +198,7 @@ class RBLNFlashAttentionMetadataBuilder(
         self.swa_appends = isinstance(
             kv_cache_spec, SlidingWindowSpec
         ) and not isinstance(kv_cache_spec, RBLNSlidingWindowSpec)
-        if self.swa_appends and envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        if self.swa_appends and self.use_custom_kernel:
             raise NotImplementedError(
                 "Sliding window attention is not supported with "
                 "VLLM_RBLN_USE_CUSTOM_KERNEL=1 and "
@@ -558,7 +558,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
-                    self.compile_model,
+                    compile_model=self.compile_model,
                 )
             else:
                 assert self.sliding_window == kv_cache.size(-2), (

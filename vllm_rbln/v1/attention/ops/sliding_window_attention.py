@@ -118,7 +118,7 @@ def sliding_window_attention_v1(
     window_size: int,
     sinks: torch.Tensor | None = None,
     *,
-    compile_model: bool
+    compile_model: bool,
 ) -> torch.Tensor:
     if compile_model:
         return torch.ops.rbln_custom_ops.sliding_window_attention_v1(

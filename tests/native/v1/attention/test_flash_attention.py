@@ -62,7 +62,7 @@ def _cam(*, num_reqs, query_start_loc, seq_lens, block_table):
 
 
 def _unexpected(name: str):
-    def called(*args):
+    def called(*args, **kwargs):
         raise AssertionError(f"{name} must not be reached")
 
     return called
@@ -461,11 +461,11 @@ class TestBuildSlidingWindowAppend:
         builder = make_builder(cfg, sliding_window=4, appends_kv=False)
         assert not builder.swa_appends
 
-    def test_custom_kernel_is_rejected(self, cfg, custom_kernel_on):
+    def test_custom_kernel_is_rejected(self, cfg_custom_kernel):
         # rbln_triton_ops carries no sliding_window_attention_v1, so the group
         # cannot be built at all rather than failing at the first forward.
         with pytest.raises(NotImplementedError, match="MULTI_BLOCK_ATTN"):
-            make_builder(cfg, sliding_window=4)
+            make_builder(cfg_custom_kernel, sliding_window=4)
 
 
 class TestBuildOutputAssembly:
@@ -669,7 +669,7 @@ class TestForwardSlidingWindow:
         b_size = metadata.seq_lens.shape[0]
         recorded = []
 
-        def record(*args):
+        def record(*args, **kwargs):
             recorded.append(args)
             return torch.zeros(b_size, self.HEADS, 1, 1, self.DIM)
 
