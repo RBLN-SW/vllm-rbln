@@ -442,14 +442,14 @@ class TestBuildSlidingWindowAppend:
                 assert swa_value == full_value
 
     def test_the_shift_spec_does_not_append(self, cfg):
-        # The flag follows the spec class, which is what the env var picks.
+        # The flag follows the spec class, which is what the device picks.
         builder = make_builder(cfg, sliding_window=4, appends_kv=False)
         assert not builder.swa_appends
 
     def test_custom_kernel_is_rejected(self, cfg, custom_kernel_on):
         # rbln_triton_ops carries no sliding_window_attention_v1, so the group
         # cannot be built at all rather than failing at the first forward.
-        with pytest.raises(NotImplementedError, match="MULTI_BLOCK_ATTN"):
+        with pytest.raises(NotImplementedError, match="sliding_window_attention_v1"):
             make_builder(cfg, sliding_window=4)
 
 

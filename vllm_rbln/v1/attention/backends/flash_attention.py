@@ -196,9 +196,8 @@ class RBLNFlashAttentionMetadataBuilder(
         ) and not isinstance(kv_cache_spec, RBLNSlidingWindowSpec)
         if self.swa_appends and envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
             raise NotImplementedError(
-                "Sliding window attention is not supported with "
-                "VLLM_RBLN_USE_CUSTOM_KERNEL=1 and "
-                "VLLM_RBLN_USE_MULTI_BLOCK_ATTN=1: rbln_triton_ops has no "
+                "Sliding window attention on REBEL CR13 is not supported with "
+                "VLLM_RBLN_USE_CUSTOM_KERNEL=1: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
 
