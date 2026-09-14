@@ -553,6 +553,7 @@ class TestDetermineAvailableMemory:
                 decode_batch_buckets_count=decode_buckets
             ),
             drafter=drafter,
+            get_kv_cache_spec=lambda: {},
         )
         worker.determine_available_memory()
         return captured
@@ -575,6 +576,38 @@ class TestDetermineAvailableMemory:
         )
         cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
         assert cap["chiplet_memory"] is snapshot
+
+    def test_dynamic_kv_raises_a_short_estimate_to_one_request(
+        self, make_worker, monkeypatch, caplog
+    ):
+        # vllm refuses a pool below one max-length request against the
+        # estimate; under the flag the estimate is only the compile placeholder.
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True
+        )
+        monkeypatch.setattr(
+            wm.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: True),
+            raising=False,
+        )
+        vcfg = _make_vllm_config()
+        worker = make_worker(vllm_config=vcfg, device_name="RBLN-CR13")
+        worker.device = torch.device("cpu")
+        monkeypatch.setattr(wm, "estimate_available_memory", lambda **kw: 999)
+        monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
+        worker.speculative_config = None
+        spec = SimpleNamespace(max_memory_usage_bytes=lambda cfg: 4000)
+        worker.model_runner = SimpleNamespace(
+            model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
+            specialized_moe_decode=False,
+            bucketing_manager=SimpleNamespace(decode_batch_buckets_count=3),
+            drafter=None,
+            get_kv_cache_spec=lambda: {"a": spec, "b": spec},
+        )
+        with caplog.at_level("WARNING"):
+            assert worker.determine_available_memory() == 8000
+        assert "short of one max-length request" in caplog.text
 
     def test_dynamic_kv_dry_run_keeps_the_formula(self, make_worker, monkeypatch):
         snapshot = {(0, 0): wm.ChipletMemory(total=100, used=40)}

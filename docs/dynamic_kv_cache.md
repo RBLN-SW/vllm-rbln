@@ -90,6 +90,12 @@ Use a separate `VLLM_CACHE_ROOT` per configuration. The compile cache hash does
 not include dynamism, so a static and a dynamic build of the same model share one
 signature and can replay each other's codegen.
 
+When the pre-compile estimate falls short of one max-length request, it is
+raised to exactly that with a warning instead of letting vllm refuse the compile:
+under the flag the estimate is only the placeholder the model is compiled with,
+and the count the device can hold is sized after warm-up, where a pool below one
+request is refused with the same message.
+
 ### Dry run
 
 `VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN=1` (on its own; it implies the flag) keeps every count

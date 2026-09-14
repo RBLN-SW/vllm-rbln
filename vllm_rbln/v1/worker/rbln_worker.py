@@ -527,6 +527,25 @@ class RBLNWorker(WorkerBase):
 
         available_memory_estimate = estimate_available_memory(**estimate_kwargs)
 
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+            one_request = sum(
+                spec.max_memory_usage_bytes(self.vllm_config)
+                for spec in self.get_kv_cache_spec().values()
+            )
+            if available_memory_estimate < one_request:
+                # vllm refuses a pool below one max-length request against this
+                # estimate; here it is only the compile placeholder, and the
+                # count the device can hold is sized after warm-up.
+                logger.warning(
+                    "[Dynamic KV] the pre-compile estimate (%.2f GiB) is short of one "
+                    "max-length request (%.2f GiB); raising it to that so the compile "
+                    "proceeds. The pool is sized from the device after warm-up and "
+                    "refused there if one request does not fit.",
+                    available_memory_estimate / 1024**3,
+                    one_request / 1024**3,
+                )
+                available_memory_estimate = one_request
+
         logger.info(
             "available_memory_estimate = %.2f GiB", available_memory_estimate / 1024**3
         )
