@@ -27,14 +27,21 @@ steps:
     command:
       - "uv tool run pre-commit run --all-files --hook-stage manual --show-diff-on-failure"
 
-  - label: ":lock: dependency bounds"
+  - label: ":package: packaging guards"
     notify:
     - github_commit_status:
-        context: "[OB] dependency bounds"
+        context: "[OB] packaging guards"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *uv_secrets
     command:
-      - "uv run --no-project --python 3.12 --with pytest --with packaging python -m pytest tests/test_packaging_bounds.py -q"
+      - |
+        uv run --no-project --python 3.12 \
+          --with pytest \
+          --with packaging \
+          python -m pytest \
+            tests/test_packaging_bounds.py \
+            tests/test_python_support.py \
+            -q
 
   # All gates must pass before the heavy test pipelines are even uploaded.
   - wait: ~
