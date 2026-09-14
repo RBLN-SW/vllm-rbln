@@ -934,7 +934,8 @@ class RBLNWorker(WorkerBase):
             budget = int(memory.total * self.cache_config.gpu_memory_utilization)
             parts.append(
                 f"{node}:{chiplet}(expected={expected} measured={memory.used} "
-                f"diff={memory.used - expected:+d} budget_left={budget - memory.used:+d})"
+                f"diff={memory.used - expected:+d} "
+                f"budget_left={budget - memory.used:+d})"
             )
         logger.info(
             "[Dynamic KV] fit check after reallocating to %d blocks, %s snapshot: %s",
