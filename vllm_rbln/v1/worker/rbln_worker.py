@@ -20,6 +20,7 @@ import re
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
+from dataclasses import dataclass
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +82,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.utils import sub_block_size_in_use
 from vllm_rbln.v1.worker.kv_placement import (
     ChipletMemory,
     KvGrowth,
@@ -111,6 +113,21 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+
+
+@dataclass(frozen=True)
+class KvSizing:
+    """One rank's placement-based count: the blocks that fit, the per-unit fit
+    behind it, the hint the programs were traced with and the growth they
+    imply. `if_resident` is the count if the compile-time cache stays resident,
+    reported only when it could not be released first."""
+
+    num_blocks: int
+    fits: dict[Unit, UnitFit]
+    hint_blocks: int
+    growth: KvGrowth
+    if_resident: int | None = None
+
 
 # Trace hint for the mark_dynamic'd KV dim, not a capacity: dynamo specializes
 # a smaller dim away, and below this artifacts abort on device at larger
@@ -756,21 +773,16 @@ class RBLNWorker(WorkerBase):
 
     def _kv_copy_stream_reserve_bytes(self) -> int:
         """Per-chiplet bytes to keep out of the KV budget when the scheduler
-        will run sub-block prefix caching (the same predicate `RBLNScheduler`
-        uses)."""
-        if not self.cache_config.enable_prefix_caching:
-            return 0
-        if not build_rbln_config(self.vllm_config.additional_config).sub_block_cache:
-            return 0
-        # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
-        from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
-
-        sub_block_size = self.scheduler_config.max_num_batched_tokens
-        if not RBLNKVCacheManager.can_use_sub_block_caching(
-            self.model_runner.kv_cache_config, sub_block_size
-        ):
-            return 0
-        return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES
+        will run sub-block prefix caching."""
+        in_use = sub_block_size_in_use(
+            enable_prefix_caching=self.cache_config.enable_prefix_caching,
+            sub_block_cache=build_rbln_config(
+                self.vllm_config.additional_config
+            ).sub_block_cache,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            kv_cache_config=self.model_runner.kv_cache_config,
+        )
+        return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES if in_use is not None else 0
 
     def compute_dynamic_kv_num_blocks(self) -> int | None:
         """How many KV blocks fit this device, from the compiled placement and a
@@ -817,11 +829,7 @@ class RBLNWorker(WorkerBase):
 
         if dry_run:
             try:
-                num_blocks, fits, hint_blocks, growth, if_resident = (
-                    self._dynamic_kv_num_blocks_from_placement(
-                        release_compile_cache=False
-                    )
-                )
+                sizing = self._propose_kv_size()
             except RuntimeError as exc:
                 logger.warning(
                     "[Dynamic KV] dry run: the count could not be computed (%s); "
@@ -829,27 +837,13 @@ class RBLNWorker(WorkerBase):
                     exc,
                 )
                 return None
-            self._log_dynamic_kv_dry_run(
-                num_blocks, fits, hint_blocks, growth, if_resident
-            )
+            self._log_dynamic_kv_dry_run(sizing)
             return None
-        num_blocks, _, _, _, _ = self._dynamic_kv_num_blocks_from_placement(
-            release_compile_cache=True
-        )
-        return num_blocks
+        return self._size_kv_and_release().num_blocks
 
-    def _dynamic_kv_num_blocks_from_placement(
-        self, *, release_compile_cache: bool
-    ) -> tuple[int, dict[Unit, UnitFit], int, KvGrowth, int | None]:
-        """The count that fits, the per-unit fit behind it, the hint the
-        programs were traced with, the growth they imply, and -- when the
-        compile cache could not be released first -- the count if that cache
-        stays resident.
-
-        Releasing before the snapshot measures what the runtime hands back
-        instead of assuming it; a dry run must not touch the cache, so it
-        subtracts the cache's bytes and reports both readings.
-        """
+    def _kv_growth_from_programs(self) -> tuple[KvGrowth, int, torch.device]:
+        """The KV growth the captured programs' placements imply, the hint they
+        were traced with, and the device they run on."""
         programs = list(self._dynamic_kv_programs)
         groups = select_kv_input_groups(programs)
         hint_blocks = self.model_runner.kv_cache_config.num_blocks
@@ -867,14 +861,20 @@ class RBLNWorker(WorkerBase):
             )
         specs = [spec for group_specs, _ in groups for spec in group_specs]
         growth = kv_growth(specs, hint_blocks)
-
         program = groups[0][1]
         device = program.device if program.device is not None else self.device
-        if release_compile_cache:
-            self._release_kv_cache_tensors(self.model_runner.kv_cache_config)
-            kv_resident: dict[Unit, int] = {}
-        else:
-            kv_resident = growth.allocated_at(hint_blocks)
+        return growth, hint_blocks, device
+
+    def _size_kv_from_snapshot(
+        self,
+        growth: KvGrowth,
+        device: torch.device,
+        *,
+        kv_resident: Mapping[Unit, int],
+    ) -> tuple[int, dict[Unit, UnitFit], dict[Unit, ChipletMemory], int]:
+        """Snapshot the device and size against it; `kv_resident` is what the
+        snapshot still holds of the KV cache. Also returns the snapshot and the
+        reserve so a second reading can be taken from the same sample."""
         snapshot, source = self._dynamic_kv_memory_snapshot(device)
         logger.info(
             "[Dynamic KV] %s memory snapshot of %s: %s",
@@ -925,16 +925,35 @@ class RBLNWorker(WorkerBase):
         self._dynamic_kv_expected_used = {
             unit: fits[unit].base + predicted[unit] for unit in predicted
         }
-        if_resident = None
-        if not release_compile_cache:
-            if_resident, _ = max_num_blocks(
-                snapshot,
-                growth,
-                gpu_memory_utilization=gmu,
-                kv_resident={},
-                reserve_bytes=reserve_bytes,
-            )
-        return num_blocks, fits, hint_blocks, growth, if_resident
+        return num_blocks, fits, snapshot, reserve_bytes
+
+    def _size_kv_and_release(self) -> KvSizing:
+        """Release the compile-time cache, then size from a snapshot of what the
+        runtime actually handed back. The worker holds no KV cache afterwards
+        until `apply_dynamic_kv_num_blocks` reallocates."""
+        growth, hint_blocks, device = self._kv_growth_from_programs()
+        self._release_kv_cache_tensors(self.model_runner.kv_cache_config)
+        num_blocks, fits, _, _ = self._size_kv_from_snapshot(
+            growth, device, kv_resident={}
+        )
+        return KvSizing(num_blocks, fits, hint_blocks, growth)
+
+    def _propose_kv_size(self) -> KvSizing:
+        """Size without touching the cache: the compile-time cache stays
+        resident, so its modelled bytes are subtracted, and the count if the
+        runtime kept them is reported alongside."""
+        growth, hint_blocks, device = self._kv_growth_from_programs()
+        num_blocks, fits, snapshot, reserve_bytes = self._size_kv_from_snapshot(
+            growth, device, kv_resident=growth.allocated_at(hint_blocks)
+        )
+        if_resident, _ = max_num_blocks(
+            snapshot,
+            growth,
+            gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
+            kv_resident={},
+            reserve_bytes=reserve_bytes,
+        )
+        return KvSizing(num_blocks, fits, hint_blocks, growth, if_resident)
 
     def _log_dynamic_kv_fit_check(self, num_blocks: int) -> None:
         """Measured `used` against what the sizing predicted, once the resized
@@ -959,17 +978,17 @@ class RBLNWorker(WorkerBase):
             " ".join(parts),
         )
 
-    def _log_dynamic_kv_dry_run(
-        self,
-        num_blocks: int,
-        fits: Mapping[Unit, UnitFit],
-        current: int,
-        growth: KvGrowth,
-        if_resident: int | None,
-    ) -> None:
-        """How the `current` blocks vllm sized sit in each chiplet's budget, and
-        how full each chiplet would be at the `num_blocks` this feature would
-        pick. Resizes nothing."""
+    def _log_dynamic_kv_dry_run(self, sizing: KvSizing) -> None:
+        """How the blocks vllm sized sit in each chiplet's budget, and how full
+        each chiplet would be at the count this feature would pick. Resizes
+        nothing."""
+        num_blocks, fits, current, growth, if_resident = (
+            sizing.num_blocks,
+            sizing.fits,
+            sizing.hint_blocks,
+            sizing.growth,
+            sizing.if_resident,
+        )
         now = growth.allocated_at(current)
         proposed = growth.allocated_at(num_blocks)
         per_unit = []
@@ -1014,7 +1033,7 @@ class RBLNWorker(WorkerBase):
         self._kv_blocks_before_shrink = None
 
         current = self.model_runner.kv_cache_config.num_blocks
-        if target == current:
+        if target == current and self.model_runner.kv_caches:
             # The latch already describes reality, so no reset is needed either.
             logger.info(
                 "[Dynamic KV] KV cache already holds %d blocks; nothing to reallocate.",

@@ -641,6 +641,14 @@ class RblnPlatform(Platform):
             )
 
         if vllm_config.kv_transfer_config is not None:
+            if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
+                logger.warning(
+                    "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN with a KV transfer "
+                    "connector: the dry run only reports, so the connector's "
+                    "registrations stay valid; enabling the resize itself is "
+                    "refused."
+                )
+                return
             raise ValueError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
                 "transfer connector; the resize invalidates its registrations."

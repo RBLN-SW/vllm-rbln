@@ -776,6 +776,15 @@ class TestDynamicKvConfig:
                 self._cfg(kv_transfer_config=SimpleNamespace())
             )
 
+    def test_a_kv_transfer_connector_is_allowed_in_a_dry_run(self, monkeypatch, caplog):
+        # The dry run never reallocates, so the connector's registrations hold.
+        monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "1")
+        with caplog.at_level("WARNING"):
+            RblnPlatform._validate_dynamic_kv_config(
+                self._cfg(kv_transfer_config=SimpleNamespace())
+            )
+        assert "dry run only reports" in caplog.text
+
     def test_device_tensor_off_is_refused(self):
         with (
             patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),

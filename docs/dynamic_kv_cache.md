@@ -110,9 +110,12 @@ carry the result:
   the budget on that chiplet. Nothing is allocated at `n`; the real mode's fit
   check line is what validates the prediction.
 
-Unsupported configurations are refused in a dry run too, since the refusals
-guard the dynamic compile itself. A sizing failure after warm-up (no placement,
-no fit) is logged as a warning instead of raised.
+The dry run is for the vLLM-native path (`VLLM_RBLN_USE_VLLM_MODEL=1`,
+`VLLM_RBLN_USE_DEVICE_TENSOR=1`): those two refusals guard the dynamic compile
+itself, so they hold in a dry run too. A KV transfer connector is only refused by
+the real mode, since it is the reallocation that invalidates the connector's
+registrations; the dry run logs a warning and reports as usual. A sizing failure
+after warm-up (no placement, no fit) is logged as a warning instead of raised.
 
 ## Unsupported Configurations
 
@@ -121,7 +124,7 @@ when it is off. Run with `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` to use them.
 
 | Configuration | Why |
 | --- | --- |
-| KV transfer connectors | The connector registers the KV cache's physical views during warm-up, and the reallocation invalidates them. |
+| KV transfer connectors | The connector registers the KV cache's physical views during warm-up, and the reallocation invalidates them. A dry run does not reallocate and is allowed. |
 | Cross-layer KV sharing | The compiler admits a dynamic KV input through view ops into several paged naive attention calls (`paged_flash_causal_attention_naive_*`, `paged_sliding_window_attention_naive_*`), which is how a deduped base shared by a full and a sliding-window layer (gpt-oss) compiles; the same view feeding two layers' attention calls is not admitted. |
 
 ## When Start-up Refuses

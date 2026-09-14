@@ -150,6 +150,20 @@ class TestBuildKvCacheBaseBindings:
         assert got.permute_order == (1, 0)
         assert got.select_index == 2
 
+    def test_dynamic_scale_is_taken_after_the_dtype_view(self):
+        # materialize reads the extent after .view(view_dtype); a uint8 base
+        # viewed as bf16 halves its trailing dim, so the scale must be taken
+        # from the viewed shape or the view comes out twice too small.
+        base = torch.zeros(4, 16, dtype=torch.uint8)
+        info = KVCacheViewInfo(
+            view_shape=(4, 8), view_dtype=torch.bfloat16, dynamic_axis=1
+        )
+        _, view_infos = build_kv_cache_base_bindings(
+            {_layer(0): base}, {_layer(0): info}
+        )
+        assert view_infos[0].dynamic_scale == (1, 1)
+        assert materialize_kv_cache_view([base], view_infos[0]).shape == (4, 8)
+
     def test_mixed_shared_and_distinct_storage(self):
         # Two layers aliasing one base plus an independent third: guards the
         # dedup <-> index interaction the pure cases cannot.

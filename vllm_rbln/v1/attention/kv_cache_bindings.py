@@ -74,11 +74,14 @@ def build_kv_cache_base_bindings(
         view_info = kv_cache_view_infos_by_layer[layer_name]
         if view_info.dynamic_axis is not None and view_info.view_shape is not None:
             axis = view_info.dynamic_axis
+            # materialize_kv_cache_view reads the extent after the dtype view.
+            as_viewed = base_tensors[base_index]
+            if view_info.view_dtype is not None:
+                as_viewed = as_viewed.view(view_info.view_dtype)
             view_info = replace(
                 view_info,
                 dynamic_scale=_reduced_ratio(
-                    view_info.view_shape[axis],
-                    int(base_tensors[base_index].shape[axis]),
+                    view_info.view_shape[axis], int(as_viewed.shape[axis])
                 ),
             )
         view_infos.append(replace(view_info, base_index=base_index))

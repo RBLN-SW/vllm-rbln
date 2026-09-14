@@ -192,6 +192,18 @@ def make_worker(monkeypatch):
     return _make
 
 
+def _bind_sizing(worker) -> None:
+    """Give a SimpleNamespace worker the real placement-sizing methods."""
+    for name in (
+        "_kv_growth_from_programs",
+        "_size_kv_from_snapshot",
+        "_size_kv_and_release",
+        "_propose_kv_size",
+    ):
+        method = getattr(RBLNWorker, name)
+        setattr(worker, name, lambda *a, _m=method, **kw: _m(worker, *a, **kw))
+
+
 class CustomMultiprocExecutor(MultiprocExecutor):
     pass
 
@@ -1100,9 +1112,7 @@ class TestComputeDynamicKvNumBlocks:
             _kv_copy_stream_reserve_bytes=lambda: 0,
             _release_kv_cache_tensors=lambda cfg: None,
         )
-        worker._dynamic_kv_num_blocks_from_placement = lambda **kw: (
-            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker, **kw)
-        )
+        _bind_sizing(worker)
         return worker
 
     def _snapshot(self, used):
@@ -1154,9 +1164,7 @@ class TestComputeDynamicKvNumBlocks:
         worker._log_dynamic_kv_dry_run = lambda *args: (
             RBLNWorker._log_dynamic_kv_dry_run(worker, *args)
         )
-        worker._dynamic_kv_num_blocks_from_placement = lambda **kw: (
-            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker, **kw)
-        )
+        _bind_sizing(worker)
         with (
             patch(
                 "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
@@ -1635,9 +1643,7 @@ class TestDynamicKvFailuresRaise:
             _dynamic_kv_programs=list(programs),
             _release_kv_cache_tensors=lambda cfg: None,
         )
-        worker._dynamic_kv_num_blocks_from_placement = lambda **kw: (
-            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker, **kw)
-        )
+        _bind_sizing(worker)
         return worker
 
     @pytest.fixture(autouse=True)
@@ -1736,7 +1742,8 @@ class TestApplyResizesThenMaterializes:
         worker = SimpleNamespace(
             _kv_blocks_before_shrink=before_shrink,
             model_runner=SimpleNamespace(
-                kv_cache_config=SimpleNamespace(num_blocks=current)
+                kv_cache_config=SimpleNamespace(num_blocks=current),
+                kv_caches=[object()],
             ),
             _reallocate_kv_cache=lambda target: calls.append(("realloc", target)),
             _materialize_kv_cache=lambda: calls.append(("materialize",)),
@@ -1794,6 +1801,15 @@ class TestApplyResizesThenMaterializes:
         worker, calls = self._worker(before_shrink=4, current=4)
         assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, 4) == 4
         assert calls == []
+
+    def test_a_matching_count_still_reallocates_a_released_cache(self):
+        # Release-first sizing leaves the worker with no KV cache; landing on
+        # the compile hint must not skip the realloc, or the first forward has
+        # nothing bound.
+        worker, calls = self._worker(before_shrink=4, current=4)
+        worker.model_runner.kv_caches = []
+        assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, 4) == 4
+        assert calls == [("realloc", 4), ("materialize",)]
 
     def test_nothing_pending_returns_none(self):
         worker, calls = self._worker(before_shrink=None)

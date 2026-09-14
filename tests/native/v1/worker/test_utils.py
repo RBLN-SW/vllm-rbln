@@ -642,6 +642,13 @@ class TestEstimateAvailableMemory:
         snapshot = self._snapshot([_GB] * 4)
         assert self._measured(snapshot) > self._measured(snapshot, buffer=4 * _GB)
 
+    def test_chiplet_memory_must_cover_one_rank_s_chiplets(self, rbln):
+        # The downstream terms are written for one quad-chiplet card; a snapshot
+        # of another size would scale the budget by the wrong factor.
+        rbln("RBLN-CR13", rsd=1)
+        with pytest.raises(ValueError, match="covers 8 chiplet"):
+            self._measured(self._snapshot([_GB] * 8))
+
     def test_chiplet_memory_full_chiplet_raises(self, rbln):
         rbln("RBLN-CR13", rsd=1)
         with pytest.raises(MemoryError):

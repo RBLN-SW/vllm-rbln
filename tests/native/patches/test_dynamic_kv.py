@@ -180,3 +180,24 @@ def test_groups_sharing_the_pool_are_summed():
     # full: 4; sliding: cdiv(127 + 512, 8192) + 1 = 2 -> 6 for one request;
     # a decode step: 1 + (cdiv(128, 8192) + 1) = 3.
     assert (minimum.one_request, minimum.decode_batch, minimum.needed) == (6, 3, 7)
+
+
+def test_a_window_spec_without_the_admission_method_is_loud():
+    # A vLLM rename must not degrade the per-sequence term to one block.
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    class _Renamed(SlidingWindowSpec):
+        max_admission_blocks_per_request = None  # type: ignore[assignment]
+
+        def __init__(self):
+            pass
+
+        @property
+        def page_size_bytes(self):
+            return 1 << 20
+
+        def max_memory_usage_bytes(self, cfg):
+            return 4 << 20
+
+    with pytest.raises(AttributeError, match="max_admission_blocks_per_request"):
+        minimum_kv_blocks(_config(8192, 32768), _kv(0, _Renamed()))

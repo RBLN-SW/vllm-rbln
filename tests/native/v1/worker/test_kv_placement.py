@@ -327,6 +327,22 @@ class TestMaxNumBlocks:
         assert n == 15 * 512 + 4
         assert fits[(1, 0)].base == 20 * self.GIB - 8 * 2**20
 
+    def test_the_answer_is_the_largest_count_that_fits(self):
+        # Odd bases so the linear bound over-shoots the allocator's rounding.
+        growth = self._growth()
+        snapshot = self._snapshot(
+            {
+                unit: 10 * self.GIB + 777_777 * (i + 1)
+                for i, unit in enumerate(growth.per_block)
+            }
+        )
+        n, fits = max_num_blocks(
+            snapshot, growth, gpu_memory_utilization=1.0, kv_resident={}
+        )
+        room = {unit: fits[unit].budget - fits[unit].base for unit in fits}
+        assert all(growth.allocated_at(n)[u] <= room[u] for u in room)
+        assert any(growth.allocated_at(n + 1)[u] > room[u] for u in room)
+
     def test_each_shard_is_counted_at_the_allocator_s_block_size(self):
         # One KV head per shard: 512 KiB per block. 2 blocks (1 MiB) take a
         # 2 MiB small block, 3 blocks (1.5 MiB) a 20 MiB medium block, and 40

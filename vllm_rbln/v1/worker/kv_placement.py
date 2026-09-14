@@ -384,11 +384,16 @@ def max_num_blocks(
         allocated = growth.allocated_at(n)
         return all(allocated[unit] <= room[unit] for unit in room)
 
-    # The allocator's rounding can cost a few blocks below the linear answer;
-    # walk down until the reserved total fits everywhere.
-    num_blocks = min(linear.values())
-    while num_blocks > 0 and not fits_all(num_blocks):
-        num_blocks -= 1
+    # fits_all is monotone in n: the allocator's rounding costs a few blocks
+    # below the linear bound, so bisect for the largest n that fits.
+    low, high = 0, min(linear.values())
+    while low < high:
+        mid = (low + high + 1) // 2
+        if fits_all(mid):
+            low = mid
+        else:
+            high = mid - 1
+    num_blocks = low
 
     fits: dict[Unit, UnitFit] = {}
     for unit, per_block in sorted(growth.per_block.items()):

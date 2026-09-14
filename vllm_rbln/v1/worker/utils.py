@@ -33,6 +33,7 @@ from vllm.utils.cpu_resource_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ChunkedLocalAttentionSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
@@ -319,6 +320,14 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
         spec = group.kv_cache_spec
         one_request += spec.max_memory_usage_bytes(vllm_config) // spec.page_size_bytes
         admission = getattr(spec, "max_admission_blocks_per_request", None)
+        if admission is None and isinstance(
+            spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)
+        ):
+            raise AttributeError(
+                f"{type(spec).__name__} no longer exposes "
+                "max_admission_blocks_per_request; the per-sequence minimum "
+                "would silently fall back to one block."
+            )
         per_seq += (
             admission(max_num_batched_tokens=1, max_model_len=max_model_len)
             if admission is not None
@@ -527,7 +536,13 @@ def estimate_available_memory(
             for unit, memory in chiplet_memory.items()
         }
         tightest = min(budgets, key=budgets.__getitem__)
-        available_dram_bytes = budgets[tightest] * len(budgets)
+        if len(budgets) != rsd_size:
+            raise ValueError(
+                f"the memory snapshot covers {len(budgets)} chiplet(s) but the "
+                f"estimate is written for {rsd_size}; the snapshot must cover "
+                "exactly the chiplets one rank's KV cache spans."
+            )
+        available_dram_bytes = budgets[tightest] * rsd_size
         logger.info(
             "per-chiplet KV budget: %s; tightest %s leaves %.3f GiB x %d chiplets "
             "= %.3f GiB",
