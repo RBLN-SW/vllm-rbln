@@ -71,6 +71,7 @@ def _wire_runner(proposer, *, num_reqs):
         kv_cache_view_infos=[],
         shape_config=_shape_config(),
         dp_status=None,
+        decode_back_pad=torch.zeros(num_reqs, dtype=torch.int32),
     )
     proposer.draft_attn_groups = [
         SimpleNamespace(
