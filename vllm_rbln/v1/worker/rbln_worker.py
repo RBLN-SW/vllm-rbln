@@ -827,7 +827,6 @@ class RBLNWorker(WorkerBase):
                 )
                 return None
             self._log_dynamic_kv_dry_run(num_blocks, fits, hint_blocks, growth)
-            self._probe_dynamic_kv_num_blocks(num_blocks, hint_blocks)
             return None
         num_blocks, _, _, _ = self._dynamic_kv_num_blocks_from_placement()
         return num_blocks
@@ -922,29 +921,6 @@ class RBLNWorker(WorkerBase):
             unit: fits[unit].base + predicted[unit] for unit in predicted
         }
         return num_blocks, fits, hint_blocks, growth
-
-    def _probe_dynamic_kv_num_blocks(self, num_blocks: int, current: int) -> None:
-        """Dry run only: allocate the proposed cache once, run a decode step on
-        it and log the fit check, then put the current cache back."""
-        if num_blocks == current:
-            return
-        try:
-            self._reallocate_kv_cache(num_blocks)
-            self._materialize_kv_cache()
-            self._log_dynamic_kv_fit_check(num_blocks)
-        except RuntimeError as exc:
-            logger.warning(
-                "[Dynamic KV] dry run: the proposed %d blocks could not be allocated "
-                "and run (%s); the count stays at %d.",
-                num_blocks,
-                exc,
-                current,
-            )
-        finally:
-            self._reallocate_kv_cache(current)
-            logger.info(
-                "[Dynamic KV] dry run: probe done, KV cache back at %d blocks.", current
-            )
 
     def _log_dynamic_kv_fit_check(self, num_blocks: int) -> None:
         """Measured `used` against what the sizing predicted, once the resized
