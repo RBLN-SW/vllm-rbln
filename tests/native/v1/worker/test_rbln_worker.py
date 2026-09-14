@@ -1735,6 +1735,8 @@ class TestApplyResizesThenMaterializes:
             ),
             _reallocate_kv_cache=lambda target: calls.append(("realloc", target)),
             _materialize_kv_cache=lambda: calls.append(("materialize",)),
+            _dynamic_kv_expected_used={},
+            _log_dynamic_kv_fit_check=lambda n: calls.append(("check", n)),
         )
         return worker, calls
 
@@ -1743,6 +1745,25 @@ class TestApplyResizesThenMaterializes:
         assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, 1368) == 1368
         assert calls == [("realloc", 1368), ("materialize",)]
         assert worker._kv_blocks_before_shrink is None
+
+    def test_a_computed_count_is_checked_against_the_prediction(self):
+        worker, calls = self._worker()
+        worker._dynamic_kv_expected_used = {(0, 0): 123}
+        assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, 1368) == 1368
+        assert calls == [("realloc", 1368), ("materialize",), ("check", 1368)]
+
+    def test_the_fit_check_reports_measured_against_expected(self, caplog):
+        snapshot = {(0, 0): wm.ChipletMemory(total=1000, used=460)}
+        worker = SimpleNamespace(
+            device=torch.device("cpu"),
+            cache_config=SimpleNamespace(gpu_memory_utilization=0.5),
+            _dynamic_kv_expected_used={(0, 0): 450, (0, 1): 7},
+            _dynamic_kv_memory_snapshot=lambda device: (snapshot, "driver"),
+        )
+        with caplog.at_level("INFO"):
+            RBLNWorker._log_dynamic_kv_fit_check(worker, 58)
+        assert "0:0(expected=450 measured=460 diff=+10 budget_left=+40)" in caplog.text
+        assert "0:1(expected=7 measured=?)" in caplog.text
 
     def test_none_restores_the_pre_shrink_count(self):
         worker, calls = self._worker()

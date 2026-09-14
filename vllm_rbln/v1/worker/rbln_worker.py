@@ -196,6 +196,8 @@ class RBLNWorker(WorkerBase):
         self._kv_blocks_before_shrink: int | None = None
         # Programs warm-up built, captured for the dynamic-KV sizing.
         self._dynamic_kv_programs: list[Any] = []
+        # Per-unit `used` the sizing predicts once the cache is reallocated.
+        self._dynamic_kv_expected_used: dict[Unit, int] = {}
         # Other tenants' device DRAM, sampled before this worker allocates
         # anything. Card-scope; only the allocator-snapshot fallback reads it.
         self._foreign_dram_used_bytes = 0
@@ -914,7 +916,32 @@ class RBLNWorker(WorkerBase):
             {f"{n}:{c}": b for (n, c), b in sorted(predicted.items())},
             sum(predicted.values()),
         )
+        self._dynamic_kv_expected_used = {
+            unit: fits[unit].base + predicted[unit] for unit in predicted
+        }
         return num_blocks, fits, hint_blocks, growth
+
+    def _log_dynamic_kv_fit_check(self, num_blocks: int) -> None:
+        """Measured `used` against what the sizing predicted, once the resized
+        cache is physically allocated; the allocator's behaviour shows up here."""
+        snapshot, source = self._dynamic_kv_memory_snapshot(self.device)
+        parts = []
+        for (node, chiplet), expected in sorted(self._dynamic_kv_expected_used.items()):
+            memory = snapshot.get((node, chiplet))
+            if memory is None:
+                parts.append(f"{node}:{chiplet}(expected={expected} measured=?)")
+                continue
+            budget = int(memory.total * self.cache_config.gpu_memory_utilization)
+            parts.append(
+                f"{node}:{chiplet}(expected={expected} measured={memory.used} "
+                f"diff={memory.used - expected:+d} budget_left={budget - memory.used:+d})"
+            )
+        logger.info(
+            "[Dynamic KV] fit check after reallocating to %d blocks, %s snapshot: %s",
+            num_blocks,
+            source,
+            " ".join(parts),
+        )
 
     def _log_dynamic_kv_dry_run(
         self,
@@ -983,6 +1010,8 @@ class RBLNWorker(WorkerBase):
             )
         self._reallocate_kv_cache(target)
         self._materialize_kv_cache()
+        if n is not None and self._dynamic_kv_expected_used:
+            self._log_dynamic_kv_fit_check(target)
         return target
 
     def _materialize_kv_cache(self) -> None:
