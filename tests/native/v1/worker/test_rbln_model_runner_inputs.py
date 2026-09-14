@@ -86,12 +86,7 @@ class TestPrepareInputsSpecDecode:
         assert spec_md.num_draft_tokens == [1]
         assert logits_indices.tolist() == spec_md.logits_indices.tolist()
 
-    def test_an_ngram_style_drafter_runs_the_logical_length(
-        self, make_model_runner, monkeypatch
-    ):
-        # Without a model-based drafter the window is not fixed: an ngram-style
-        # proposer misses often, and padding every miss out to the full window
-        # would cost more than the extra compiled shape.
+    def test_drafter_runs_the_logical_length(self, make_model_runner, monkeypatch):
         runner = make_model_runner()
         _decode_ready(runner, monkeypatch, num_spec_tokens=2, fixed_window=False)
 
@@ -147,11 +142,8 @@ class TestPrepareInputsFixedWindow:
         assert query_lengths.tolist() == [window]
         positions = runner.positions[:window].tolist()
         assert positions == list(range(window_start, window_start + window))
-        # The invariant the split exists for: one write range, one block.
         assert window_start // self.BLOCK == positions[-1] // self.BLOCK
-        # The sampled slot is the scheduled token, wherever the padding put it.
         assert logits_indices.tolist() == [sample_slot]
-        # seq_lens stays the logical length; padding must not inflate it.
         assert runner.seq_lens[:1].tolist() == [num_computed + 1]
 
 

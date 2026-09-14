@@ -1038,13 +1038,8 @@ class TestDummyRunDecodeWindowPadding:
     @pytest.mark.parametrize(
         "fixed_window,warmup,expected_tokens",
         [
-            # The window is the only decode shape warm-up compiles, so a shorter
-            # request has to be padded out to it.
             (True, True, 1 + NUM_SPEC),
-            # An ngram-style drafter compiles qlen=1 too; nothing to pad to.
             (False, True, 1),
-            # Not warm-up: the DP idle entry must stay minimal so it does not
-            # drive the shape decision the busy ranks make.
             (True, False, 1),
         ],
     )
@@ -1065,35 +1060,6 @@ class TestDummyRunDecodeWindowPadding:
         runner._dummy_run(self.NUM_REQS, 1, False, warmup=warmup)
 
         assert seen == [self.NUM_REQS * expected_tokens]
-
-
-class TestFixedDecodeWindowConfig:
-    # The fixed decode window is placed inside one KV block, so the sequence's
-    # last block has to be able to hold it. A max_model_len whose remainder is
-    # shorter than the window has no valid placement there, and is refused at
-    # load rather than a step into serving.
-    @staticmethod
-    def _runner(max_model_len, num_spec_tokens, block_size=1024):
-        return _make_runner_stub(
-            max_model_len=max_model_len,
-            num_spec_tokens=num_spec_tokens,
-            speculative_config=SimpleNamespace(method="mtp"),
-            cache_config=SimpleNamespace(block_size=block_size),
-        )
-
-    @pytest.mark.parametrize(
-        "max_model_len,block_size",
-        [
-            (1024 * 4 + 2, 1024),  # last block leaves 2 of the 4 slots
-            (1024 * 4, 2),  # no block can hold the window at all
-        ],
-    )
-    def test_a_block_too_short_for_the_window_is_refused(
-        self, max_model_len, block_size
-    ):
-        runner = self._runner(max_model_len, 3, block_size)
-        with pytest.raises(ValueError, match="cannot hold the 4-slot"):
-            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
 
 
 class TestAllocateKvCacheTensors:

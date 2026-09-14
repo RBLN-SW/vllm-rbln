@@ -841,9 +841,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(RBLN): A decode query is one contiguous KV window, so a step that
         # stages the fixed num_spec_tokens + 1 query splits the slack around the
         # scheduled tokens: in front as far as the block's used tail reaches, the
-        # rest behind. That keeps the window inside one block and the decode graph
-        # set at one shape. A model-based drafter always stages it; an ngram-style
-        # one only on the steps whose drafts the scheduler kept.
+        # rest behind.
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         window_fixed = not self.is_prefill and (
             self.uses_fixed_decode_window
@@ -3496,7 +3494,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                 if self.speculative_config and not self.uses_fixed_decode_window:
                     # Cover DP-asymmetric decode where a peer runs spec decode.
-                    # A fixed window has no such asymmetry: no rank runs qlen=1.
                     self._dummy_run(
                         num_req,
                         1,
