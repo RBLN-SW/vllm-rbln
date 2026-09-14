@@ -962,12 +962,17 @@ class RBLNWorker(WorkerBase):
                 f"{node}:{chiplet}(kv_now={kv_now} base={fit.base} budget={fit.budget} "
                 f"headroom={headroom} = {headroom // fit.per_block:+d} blocks)"
             )
+        needed = -(-self.model_config.max_model_len // self.cache_config.block_size)
         logger.warning(
             "[Dynamic KV] dry run: vllm sized %d blocks, this feature would set %d "
-            "(%+d). Per (node, chiplet): %s. Nothing is resized.",
+            "(%+d); one request of max_model_len=%d needs %d blocks, so the count "
+            "%s. Per (node, chiplet): %s. Nothing is resized.",
             current,
             num_blocks,
             num_blocks - current,
+            self.model_config.max_model_len,
+            needed,
+            "would be accepted" if num_blocks >= needed else "would be REFUSED",
             " ".join(per_unit),
         )
 

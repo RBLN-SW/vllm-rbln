@@ -1140,6 +1140,8 @@ class TestComputeDynamicKvNumBlocks:
         worker.cache_config.num_gpu_blocks_override = current
         worker._kv_blocks_before_shrink = None
         worker.model_runner.kv_cache_config.num_blocks = current
+        worker.model_config = SimpleNamespace(max_model_len=8192)
+        worker.cache_config.block_size = 1024
         worker._log_dynamic_kv_dry_run = lambda *args: (
             RBLNWorker._log_dynamic_kv_dry_run(worker, *args)
         )
@@ -1158,6 +1160,7 @@ class TestComputeDynamicKvNumBlocks:
         assert (
             "vllm sized 200 blocks, this feature would set 2560 (+2360)" in caplog.text
         )
+        assert "needs 8 blocks, so the count would be accepted" in caplog.text
         assert "headroom=" in caplog.text
 
     def test_a_dry_run_that_cannot_size_warns_instead_of_raising(self, caplog):
