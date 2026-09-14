@@ -849,8 +849,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # rest behind.
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         window_fixed = not self.is_prefill and (
-            self.uses_fixed_decode_window
-            or (self.num_spec_tokens > 0 and use_spec_decode)
+            self.uses_fixed_decode_window or use_spec_decode
         )
         if window_fixed:
             query_lengths = np.full(num_reqs, self.num_spec_tokens + 1, dtype=np.int32)
@@ -987,6 +986,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         max_query_len: int,
         num_reqs_padded: int,
         logits_indices: torch.Tensor | None = None,
+        back_pad: torch.Tensor | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1056,6 +1056,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     positions=self.positions,
                     is_prefill=self.is_prefill,
                     batch_pad=num_reqs_padded,
+                    back_pad=back_pad,
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -1763,6 +1764,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     num_reqs=num_reqs,
                     num_reqs_padded=batch_desc.num_reqs_padded,
                     logits_indices=logits_indices,
+                    back_pad=self.decode_back_pad,
                 )
             )
 
@@ -3246,11 +3248,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def uses_fixed_decode_window(self) -> bool:
         """Whether *every* decode step stages a num_spec_tokens + 1 query."""
 
-        return (
-            self.speculative_config is not None
-            and self.num_spec_tokens > 0
-            and self.speculative_config.method in ("eagle", "eagle3", "mtp")
-        )
+        if self.speculative_config is None:
+            return False
+        return self.speculative_config.method in ("eagle", "eagle3", "mtp")
 
     @property
     def is_prefill(self) -> bool:
