@@ -1083,12 +1083,12 @@ class TestDummyRunDecodeWindowPadding:
         monkeypatch.setattr(runner, "num_spec_tokens", self.NUM_SPEC)
         monkeypatch.setattr(type(runner), "uses_fixed_decode_window", fixed_window)
         seen: list = []
-        monkeypatch.setattr(
-            runner,
-            "_determine_batch_execution_and_padding",
-            lambda num_reqs, num_tokens, is_idle, **kw: (seen.append(num_tokens))
-            or (None, None, None),
-        )
+
+        def record(num_reqs, num_tokens, is_idle, **kw):
+            seen.append(num_tokens)
+            return None, None, None
+
+        monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", record)
 
         runner._dummy_run(self.NUM_REQS, 1, False, warmup=warmup)
 
