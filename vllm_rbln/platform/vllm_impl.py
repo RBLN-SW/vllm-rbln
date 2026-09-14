@@ -44,6 +44,39 @@ def patch_upstream() -> None:
 
     apply_registrations()
     apply_registered_patches()
+    _normalize_axk1_model_type()
+
+
+def _normalize_axk1_model_type() -> None:
+    """Keep A.X-K1 checkpoints on the MLA path after vLLM lowercased the type.
+
+    vllm-project/vllm#49727 (in 0.26.0) renamed the model type from ``AXK1``
+    to ``axk1`` in ``_CONFIG_REGISTRY`` and in the ``is_deepseek_mla``
+    allow-list. SKT's released checkpoints still say ``AXK1`` (config.json
+    and the bundled ``configuration_axk1.py``), and with trust_remote_code
+    they load their own config class, so the type stays uppercase,
+    ``is_deepseek_mla`` is False and ``use_mla`` follows. The model then
+    caches K/V per head instead of the MLA latent -- ~2.9 GiB per
+    1024-token block instead of 68.6 MiB -- and the KV pool collapses
+    (185 blocks -> 17 on a.x-k1-519b-fp8, dp8/CR13).
+
+    TODO: drop once the checkpoints ship ``model_type: axk1``.
+    """
+    from vllm.config import model as vllm_model_config
+
+    if getattr(vllm_model_config, "_rbln_axk1_get_config_patched", False):
+        return
+
+    orig_get_config = vllm_model_config.get_config
+
+    def get_config(*args, **kwargs):
+        config = orig_get_config(*args, **kwargs)
+        if getattr(config, "model_type", None) == "AXK1":
+            config.model_type = "axk1"
+        return config
+
+    vllm_model_config.get_config = get_config
+    vllm_model_config._rbln_axk1_get_config_patched = True
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
