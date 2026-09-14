@@ -389,23 +389,34 @@ class RBLNSampler(VLLMSampler):
         return LogprobsTensors(indices, logprobs, token_ranks)
 
 
+# Each config is designed to trigger exactly one dynamo specialization, so the
+# number of compiled sampler graphs per batch size equals len(WARM_UP_CONFIGS).
+# `dynamic=False` makes dynamo specialize on whether `k` and `p` are None, so
+# each row below is its own graph:
+#
+#   compiled function          inputs                       warm-up config
+#   rbln_greedy_sample         logits                       greedy
+#   rbln_top_k_top_p_sample    logits, temperature          multinomial
+#   rbln_top_k_top_p_sample    logits, temperature, p       topp
+#   rbln_top_k_top_p_sample    logits, temperature, k       topk
+#   rbln_top_k_top_p_sample    logits, temperature, k, p    topp_topk
 WARM_UP_CONFIGS: list[dict[str, Any]] = [
     {
-        "name": "no_penalty_greedy",
+        "name": "greedy",
         "no_penalties": True,
         "all_greedy": True,
         "all_random": False,
         "temperature": 0.0,
     },
     {
-        "name": "no_penalty_random",
+        "name": "random",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topp",
+        "name": "topp",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
@@ -413,7 +424,7 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topk",
+        "name": "topk",
         "no_penalties": True,
         "all_greedy": False,
         "all_random": True,
@@ -421,52 +432,8 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "temperature": 0.5,
     },
     {
-        "name": "no_penalty_topp_topk",
+        "name": "topp_topk",
         "no_penalties": True,
-        "all_greedy": False,
-        "all_random": True,
-        "top_p": 0.9,
-        "top_k": 1.0,
-        "temperature": 0.5,
-    },
-    {
-        "name": "penalty_greedy",
-        "no_penalties": False,
-        "frequency_penalties": 0.1,
-        "presence_penalties": 0.1,
-        "repetition_penalties": 1.0,
-        "all_greedy": True,
-        "all_random": False,
-        "temperature": 0.0,
-    },
-    {
-        "name": "penalty_topp",
-        "no_penalties": False,
-        "frequency_penalties": 0.1,
-        "presence_penalties": 0.1,
-        "repetition_penalties": 1.0,
-        "all_greedy": False,
-        "all_random": True,
-        "top_p": 0.9,
-        "temperature": 0.5,
-    },
-    {
-        "name": "penalty_topk",
-        "no_penalties": False,
-        "frequency_penalties": 0.1,
-        "presence_penalties": 0.1,
-        "repetition_penalties": 1.0,
-        "all_greedy": False,
-        "all_random": True,
-        "top_k": 1.0,
-        "temperature": 0.5,
-    },
-    {
-        "name": "penalty_topp_topk",
-        "no_penalties": False,
-        "frequency_penalties": 0.1,
-        "presence_penalties": 0.1,
-        "repetition_penalties": 1.0,
         "all_greedy": False,
         "all_random": True,
         "top_p": 0.9,

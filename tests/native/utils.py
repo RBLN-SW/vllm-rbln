@@ -242,6 +242,22 @@ def rbln_device_count() -> int:
     return len(visible) or len(glob.glob(_RBLN_DEVICE_NODES))
 
 
+@functools.cache
+def host_chip() -> str | None:
+    """The chip this host reports, or None when it cannot be resolved (an
+    NPU-less host) -- filter nothing then, rather than skip everything.
+
+    Safe to call in the parent, unlike opening a device: a name query leaves no
+    /dev/rbln* fd behind, and a child still resolves it afterwards. Resolving it
+    here is what keeps a wrong-chip spec from ever spawning."""
+    from vllm_rbln.platform import RblnPlatform
+
+    try:
+        return RblnPlatform.get_device_name().strip().upper()
+    except Exception:
+        return None
+
+
 def devices_needed(engine_kwargs: dict, rsd: int = 1) -> int:
     """NPUs an engine built with ``engine_kwargs`` will occupy. Mirrors
     RBLNWorker._init_device_env: DP ranks do not share, and every rank of

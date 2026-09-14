@@ -54,7 +54,7 @@ def on_chip(monkeypatch):
     # The resolver, not its cache: patching the lookup keeps the real one's
     # memoization out of the test's way.
     def use(chip):
-        monkeypatch.setattr(conftest, "_host_chip", lambda: chip)
+        monkeypatch.setattr(conftest, "host_chip", lambda: chip)
 
     return use
 

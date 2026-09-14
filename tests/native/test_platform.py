@@ -538,6 +538,19 @@ class TestDeviceName:
         with pytest.raises(RuntimeError, match="RBLN_FORCE_NPU_NAME"):
             RblnPlatform.get_device_name()
 
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("RBLN-CR13", True),
+            (" rbln-cr13 ", True),
+            ("RBLN-CR03", False),
+            ("RBLN-CA25", False),
+        ],
+    )
+    def test_is_cr13_matches_the_exact_soc_name(self, monkeypatch, name, expected):
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
+        assert RblnPlatform.is_cr13() is expected
+
 
 class TestAdditionalForwardContext:
     def test_kv_cache_bases_passes_through(self):

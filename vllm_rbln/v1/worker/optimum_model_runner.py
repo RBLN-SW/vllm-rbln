@@ -259,6 +259,7 @@ class RBLNOptimumModelRunner(
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.enable_prefix_caching = cache_config.enable_prefix_caching
         self.seq_lens = np.zeros(self.max_num_reqs, dtype=np.int32)
+        self.sort_batch_by_length = False
 
         # self.uniform_decode_query_len = 1
 
@@ -303,6 +304,17 @@ class RBLNOptimumModelRunner(
         ec = getattr(self.vllm_config, "ec_transfer_config", None)
         return ec is not None and ec.is_ec_producer and not ec.is_ec_consumer
 
+    @staticmethod
+    def _should_sort_batch_by_length(model: nn.Module) -> bool:
+        rbln_config = model.model.rbln_config
+        if getattr(rbln_config, "requires_batch_sort", False):
+            return True
+
+        if not isinstance(model, RBLNOptimumMultimodalMixin):
+            return False
+        language_model = model.get_language_model()
+        return bool(getattr(language_model.rbln_config, "requires_batch_sort", False))
+
     @instrument(span_name="Loading (RBLN)")
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
@@ -314,6 +326,7 @@ class RBLNOptimumModelRunner(
             "during model conversion."
         )
         self.use_optimum_lora = getattr(self.model.model.rbln_config, "use_lora", None)
+        self.sort_batch_by_length = self._should_sort_batch_by_length(self.model)
         if self.lora_config and not self.use_optimum_lora:
             raise RuntimeError(
                 "The compiled model is for LoRA."
@@ -1108,14 +1121,8 @@ class RBLNOptimumModelRunner(
             self.input_batch.refresh_metadata()
 
     def _may_reorder_batch(self, scheduler_output: "RBLNSchedulerOutput") -> None:
-        """Reorder requests in the persistent batch by descending sequence length.
-
-        Enabled by `VLLM_RBLN_SORT_BATCH=1`. Required for the batched dynamic
-        decode kernel (VLLM_RBLN_BATCH_ATTN_OPT) to early-exit on shorter
-        sequences per partition — the kernel processes the first valid_batch[p]
-        rows for partition p, which is only correct when rows are sorted long→short.
-        """
-        if not envs.VLLM_RBLN_SORT_BATCH:
+        """Reorder requests in the persistent batch by descending sequence length."""
+        if not self.sort_batch_by_length:
             return
         if self.input_batch.num_reqs <= 1:
             return
@@ -1517,8 +1524,18 @@ class RBLNOptimumModelRunner(
                     (bucket_size, self.model_config.get_vocab_size()),
                     dtype=self.dtype,
                 )
-        torch._dynamo.config.recompile_limit = len(self.bucket_sizes) * len(
-            WARM_UP_CONFIGS
+
+        num_buckets = len(self.bucket_sizes)
+        greedy_configs = sum(1 for c in WARM_UP_CONFIGS if c["all_greedy"])
+        topk_topp_configs = len(WARM_UP_CONFIGS) - greedy_configs
+        busiest_fn_configs = max(greedy_configs, topk_topp_configs)
+
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit, busiest_fn_configs * num_buckets
+        )
+        torch._dynamo.config.accumulated_recompile_limit = max(
+            torch._dynamo.config.accumulated_recompile_limit,
+            len(WARM_UP_CONFIGS) * num_buckets,
         )
 
     @torch.inference_mode

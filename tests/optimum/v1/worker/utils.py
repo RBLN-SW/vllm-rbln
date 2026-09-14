@@ -101,6 +101,7 @@ def _schedule_new_request(
     outer_block_ids: list[int],
     new_computed_tokens: int = 0,
     token_ids: list[int] | None = None,
+    token_ids_by_req: dict[str, list[int]] | None = None,
     finished_req_ids: list[str] | None = None,
     new_computed_blocks: list[int] | None = None,
     preempted_req_ids: list[str] | None = None,
@@ -114,10 +115,13 @@ def _schedule_new_request(
         token_ids = [1, 2, 3]
     outer_block_ids = torch.tensor([outer_block_ids])
     for req_id in req_ids:
+        request_token_ids = (
+            token_ids_by_req.get(req_id, token_ids) if token_ids_by_req else token_ids
+        )
         new_reqs.append(
             NewRequestData(
                 req_id=req_id,
-                prompt_token_ids=token_ids,
+                prompt_token_ids=request_token_ids,
                 mm_features=[],
                 sampling_params=SamplingParams(),
                 pooling_params=None,
@@ -126,7 +130,7 @@ def _schedule_new_request(
                 lora_request=None,
             )
         )
-        num_scheduled_tokens[req_id] = len(token_ids)
+        num_scheduled_tokens[req_id] = len(request_token_ids)
         total_num_scheduled_tokens += num_scheduled_tokens[req_id]
 
     return RBLNSchedulerOutput(

@@ -37,7 +37,7 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import Request
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, GrammarOutput, NewRequestData
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -54,6 +54,10 @@ from ..worker.utils import (
 
 DEVICE = current_platform.device_type
 
+# Appending output tokens to a Request hashes each completed block, which
+# needs the module-level NONE_HASH seeded first.
+init_none_hash(sha256)
+
 
 def make_request(
     request_id: str,
@@ -66,6 +70,8 @@ def make_request(
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
+    allowed_token_ids: list[int] | None = None,
+    bad_words_token_ids: list[list[int]] | None = None,
     block_size: int = IB_SIZE,
     hash_fn: Callable = sha256,
     mm_positions: list[PlaceholderRange] | None = None,
@@ -110,7 +116,12 @@ def make_request(
         stop_token_ids=stop_token_ids,
         logit_bias=logit_bias,
         min_p=min_p,
+        allowed_token_ids=allowed_token_ids,
     )
+    if bad_words_token_ids is not None:
+        # The engine's processor normally tokenizes SamplingParams.bad_words
+        # into this field; there is no tokenizer here, so set it directly.
+        sampling_params._bad_words_token_ids = bad_words_token_ids
 
     return Request(
         request_id=request_id,
@@ -260,6 +271,55 @@ def _schedule_cached_reqs(
         dummy_block=None,
         cache_slot_id_dict={req.request_id: i for i, req in enumerate(reqs)},
     )
+
+
+def prefill_requests(runner, reqs: list[Request]):
+    """Prefill each request on its own step and mark its prompt computed.
+
+    The token sampled at prefill is the request's first output token, so it
+    is fed back like run_decode_steps does — the first decode step's
+    penalties must already see it. Returns one ModelRunnerOutput per request.
+    """
+    outputs = []
+    for i, req in enumerate(reqs):
+        scheduler_output = _schedule_new_request_from_request(
+            req, block_ids=([i],), outer_block_ids=[i]
+        )
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        sampled = output.sampled_token_ids[output.req_ids.index(req.request_id)]
+        req.append_output_token_ids(sampled)
+        req.num_computed_tokens = len(req.prompt_token_ids)
+        outputs.append(output)
+    return outputs
+
+
+def run_decode_steps(runner, reqs: list[Request], num_steps: int):
+    """Run `num_steps` decode steps, feeding each step's sampled tokens back.
+
+    The runner grows its internal per-request output_token_ids on its own in
+    sample_tokens; this helper plays the scheduler's part, advancing
+    num_computed_tokens and output_token_ids on the test-side Request objects
+    so SamplingMetadata.output_token_ids grows across steps as in production.
+    Returns one ModelRunnerOutput per step.
+    """
+    outputs = []
+    for _ in range(num_steps):
+        scheduler_output = _schedule_cached_reqs(reqs, new_block_ids=[None] * len(reqs))
+        runner.execute_model(scheduler_output)
+        output = runner.sample_tokens(grammar_output=None)
+        for req in reqs:
+            sampled = output.sampled_token_ids[output.req_ids.index(req.request_id)]
+            req.append_output_token_ids(sampled)
+            req.num_computed_tokens += len(sampled)
+        outputs.append(output)
+    return outputs
+
+
+def sampled_token(output, req_id: str) -> int:
+    """The single token an output holds for `req_id`."""
+    (token,) = output.sampled_token_ids[output.req_ids.index(req_id)]
+    return token
 
 
 def create_model_runner(

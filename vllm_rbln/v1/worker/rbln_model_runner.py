@@ -43,6 +43,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -110,7 +111,6 @@ from vllm_rbln.compilation import (
     create_compile_context,
     set_compile_stage,
 )
-from vllm_rbln.config import get_rbln_config
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
@@ -482,6 +482,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             parallel_config.data_parallel_size > 1
             and envs.VLLM_RBLN_SPECIALIZE_MOE_DECODE
         )
+        # The batched dynamic decode kernel (REBEL CR13, or any device with
+        # VLLM_RBLN_BATCH_ATTN_OPT) processes the first valid_batch[p] rows of
+        # partition p and early-exits on the rest, which is only correct when
+        # rows are sorted by descending sequence length.
+        self.sort_batch_by_length = (
+            current_platform.is_cr13() or envs.VLLM_RBLN_BATCH_ATTN_OPT
+        )
 
         # Static, so the per-step decision only has to supply this step's counts.
         self.shape_config = ShapeConfig(
@@ -541,13 +548,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         return model_kwargs
 
     def _may_reorder_batch(self, scheduler_output: RBLNSchedulerOutput) -> None:
-        # NOTE(RBLN): Unlike upstream GPUModelRunner, we do not split mixed batches
-        # into decode / extend / prefill regions here. The RBLN execution path assumes
-        # a homogeneous batch phase and therefore does not use scheduler_output-based
-        # phase classification. Instead, we perform a stable sort by current sequence
-        # length (num_tokens_no_spec, descending).
+        # Upstream splits the batch into decode / prefill regions here. RBLN batches
+        # are single-phase, so instead this is a stable sort by descending sequence
+        # length, done only when sort_batch_by_length (resolved in __init__) is set.
         if (
-            not get_rbln_config().sort_batch
+            not self.sort_batch_by_length
             or len(self.kv_cache_config.kv_cache_groups) == 0
         ):
             return
@@ -1116,8 +1121,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        # Host tensor; the rejection sampler copies it into its graph inputs.
         draft_token_ids = self.input_ids[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1].to(self.device)
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -2500,6 +2506,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_reqs_padded=batch_desc.num_reqs_padded,
         )
 
+        if is_idle:
+            # Only the real path writes these persistent buffers, so slicing them
+            # here would feed this rank its previous request's last token id and
+            # position. An idle rank still joins the expert all-gather, so those
+            # stale values enter the collective and cost the whole group device
+            # time on every step.
+            self.input_ids[:num_tokens].zero_()
+            self.positions[:num_tokens].zero_()
+
         input_ids = self.input_ids[:num_tokens]
         inputs_embeds = None
         positions = self.positions[:num_tokens]
@@ -3406,8 +3421,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_tokens = batch_size * num_spec
         num_draft_tokens = [num_spec] * batch_size
         draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
-        target_probs = torch.zeros(
-            num_tokens, vocab_size, dtype=torch.float32, device=self.device
+        target_logits = torch.zeros(
+            num_tokens, vocab_size, dtype=self.dtype, device=self.device
         )
         cu_num_draft_tokens = torch.arange(
             num_spec,
@@ -3416,8 +3431,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dtype=torch.int32,
             device=self.device,
         )
-        bonus_token_ids = torch.zeros(
-            batch_size, 1, dtype=torch.int64, device=self.device
+        bonus_logits = torch.zeros(
+            batch_size, vocab_size, dtype=self.dtype, device=self.device
         )
         dummy_sampling_metadata = SamplingMetadata(
             temperature=None,
@@ -3438,17 +3453,26 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs=LogitsProcessors(),
             spec_token_ids=[[] for _ in range(batch_size)],
         )
-        logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
-        self.rejection_sampler.impl.rejection_sample(
-            draft_token_ids,
-            num_draft_tokens,
-            num_spec,
-            cu_num_draft_tokens,
-            None,
-            target_probs,
-            bonus_token_ids,
-            dummy_sampling_metadata,
+        # int32, as the bonus sampler's ops return it.
+        bonus_token_ids = torch.zeros(
+            batch_size, 1, dtype=torch.int32, device=self.device
         )
+        logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
+        for bonus_token_ids_in, bonus_logits_in in (
+            (None, bonus_logits),
+            (bonus_token_ids, None),
+        ):
+            self.rejection_sampler.impl.rejection_sample(
+                draft_token_ids,
+                num_draft_tokens,
+                num_spec,
+                cu_num_draft_tokens,
+                None,
+                target_logits,
+                bonus_token_ids_in,
+                dummy_sampling_metadata,
+                bonus_logits=bonus_logits_in,
+            )
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a

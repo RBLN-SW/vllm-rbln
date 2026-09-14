@@ -128,6 +128,10 @@ class RblnPlatform(Platform):
             )
         return device_name
 
+    @classmethod
+    def is_cr13(cls) -> bool:
+        return cls.get_device_name().strip().upper() == "RBLN-CR13"
+
     @staticmethod
     def inference_mode():
         return torch.no_grad()

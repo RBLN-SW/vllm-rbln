@@ -20,7 +20,6 @@ from tests.native.model_specs import ATOM, REBEL, CompileModelSpec
 
 OPT_ENVS = {
     "VLLM_RBLN_BATCH_ATTN_OPT": "1",
-    "VLLM_RBLN_SORT_BATCH": "1",
 }
 
 _QWEN3_30B_A3B_BASE = CompileModelSpec(
@@ -33,6 +32,17 @@ _QWEN3_30B_A3B_BASE = CompileModelSpec(
         "enable_expert_parallel": True,
     },
     OPT_ENVS,
+)
+_QWEN1_5_MOE_A2_7B_BASE = CompileModelSpec(
+    "Qwen/Qwen1.5-MoE-A2.7B",
+    {
+        "max_num_seqs": 1,
+        "max_model_len": 8192,
+        "block_size": 4096,
+        "enable_expert_parallel": True,
+    },
+    OPT_ENVS,
+    chips=ATOM,
 )
 _MINIMAX_BASE = CompileModelSpec(
     "MiniMaxAI/MiniMax-M2.7",
@@ -52,18 +62,11 @@ MODELS: list[CompileModelSpec] = [
     _QWEN3_30B_A3B_BASE.variant(
         tensor_parallel_size=4, enable_expert_parallel=False, chips=REBEL
     ),
-    CompileModelSpec(
-        "Qwen/Qwen1.5-MoE-A2.7B",
-        {
-            "max_num_seqs": 1,
-            "max_model_len": 8192,
-            "block_size": 4096,
-            "tensor_parallel_size": 8,
-            "enable_expert_parallel": True,
-        },
-        OPT_ENVS,
+    _QWEN1_5_MOE_A2_7B_BASE.variant(tensor_parallel_size=8, rsd=4),
+    _QWEN1_5_MOE_A2_7B_BASE.variant(
+        tensor_parallel_size=2,
+        data_parallel_size=2,
         rsd=4,
-        chips=ATOM,
     ),
     CompileModelSpec(
         "openai/gpt-oss-20b",

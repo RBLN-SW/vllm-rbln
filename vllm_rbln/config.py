@@ -89,9 +89,6 @@ class RBLNConfig:
     use_custom_kernel: bool = False
     """Use the custom RBLN kernels."""
 
-    sort_batch: bool = False
-    """Sort requests within a batch before the forward pass."""
-
     sub_block_cache: bool = True
     """Enable sub-block prefix caching. The sub-block size equals
     max_num_batched_tokens (the prefill chunk size)."""
@@ -146,7 +143,6 @@ class RBLNConfig:
             # the bundle. The rest change what runs, not what is built.
             "sampler",
             "compile_strict_mode",
-            "sort_batch",
             "sub_block_cache",
             "nixl_swa_view_opt",
         }
