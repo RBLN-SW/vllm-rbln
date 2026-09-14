@@ -19,10 +19,50 @@ from types import SimpleNamespace
 
 import pytest
 
+import vllm_rbln.patches.dynamic_kv as dk
 from vllm_rbln.patches.dynamic_kv import (
     assert_kv_cache_fits_one_request,
     resolve_rank_num_blocks,
 )
+
+
+class TestOverrideBranch:
+    """`--num-gpu-blocks-override` keeps the pool, but a dry run still asks the
+    workers for their report."""
+
+    @staticmethod
+    def _engine(calls):
+        return SimpleNamespace(
+            model_executor=SimpleNamespace(
+                collective_rpc=lambda method, args=(): calls.append(method) or [None]
+            )
+        )
+
+    @staticmethod
+    def _config():
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks_override=26, num_gpu_blocks=26)
+        )
+
+    def _run(self, monkeypatch, *, dry_run):
+        calls: list = []
+        kv_cache_config = SimpleNamespace(num_blocks=26)
+        monkeypatch.setattr(
+            dk,
+            "engine_core_original_initialize_kv_caches",
+            lambda self, cfg: kv_cache_config,
+        )
+        monkeypatch.setattr(dk.envs, "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", dry_run)
+        out = dk.patched_initialize_kv_caches(self._engine(calls), self._config())
+        assert out is kv_cache_config
+        assert out.num_blocks == 26
+        return calls
+
+    def test_the_override_alone_skips_the_workers(self, monkeypatch):
+        assert self._run(monkeypatch, dry_run=False) == []
+
+    def test_a_dry_run_still_collects_the_report(self, monkeypatch):
+        assert self._run(monkeypatch, dry_run=True) == ["compute_dynamic_kv_num_blocks"]
 
 
 class TestResolveRankNumBlocks:

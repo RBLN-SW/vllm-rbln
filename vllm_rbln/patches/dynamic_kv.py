@@ -69,6 +69,16 @@ def patched_initialize_kv_caches(
     # The worker gates on the override too, so nothing has been resized here.
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
+        if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
+            # The workers report the count they would have picked; the pool stays.
+            self.model_executor.collective_rpc("compute_dynamic_kv_num_blocks")
+            logger.warning(
+                "dynamic KV cache: dry run under --num-gpu-blocks-override=%d; the "
+                "block pool stays at %d.",
+                override,
+                kv_cache_config.num_blocks,
+            )
+            return kv_cache_config
         # WARNING: two features that each size the KV cache are on, one ignored.
         logger.warning(
             "dynamic KV cache: --num-gpu-blocks-override=%d wins over "
