@@ -47,7 +47,7 @@ DEVICE = current_platform.device_type
 
 
 # TODO add tests for both `enable_prefix_caching = True` and `False`
-def get_vllm_config(async_scheduling=False):
+def get_vllm_config(async_scheduling=False, optimum_config: dict | None = None):
     scheduler_config = SchedulerConfig(
         max_num_seqs=10,
         max_num_batched_tokens=128,
@@ -70,17 +70,16 @@ def get_vllm_config(async_scheduling=False):
         scheduler_config=scheduler_config,
         additional_config={
             "prefix_block_size": 4,
-            "rbln_config": {
+            "optimum_overrides": {
                 "prefill_chunk_size": 4,
             },
+            **(optimum_config or {}),
         },
     )
     return vllm_config
 
 
-@pytest.fixture
-def model_runner():
-    vllm_config = get_vllm_config()
+def make_model_runner(vllm_config):
     with set_current_vllm_config(vllm_config, check_compile=False):
         temp_file = tempfile.mkstemp()[1]
         init_distributed_environment(
@@ -97,6 +96,18 @@ def model_runner():
     runner = RBLNOptimumModelRunner(vllm_config, DEVICE)
     fake_load_model(runner)
     return runner
+
+
+@pytest.fixture
+def model_runner():
+    return make_model_runner(get_vllm_config())
+
+
+def test_sampler_choice_comes_from_additional_config():
+    """An `additional_config` entry reaches the runner, not only the
+    variable. The platform resolves the entry when VllmConfig is built."""
+    runner = make_model_runner(get_vllm_config(optimum_config={"sampler": False}))
+    assert runner.use_rbln_sampler is False
 
 
 def _is_req_scheduled(model_runner, req_id: str) -> bool:

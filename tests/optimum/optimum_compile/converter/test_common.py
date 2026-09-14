@@ -16,8 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.converter.common import (
-    USER_MAX_NUM_BATCHED_TOKENS_KEY,
     apply_user_prefill_chunk_size,
     get_user_max_num_batched_tokens,
     is_chunked_prefill_arch,
@@ -39,7 +39,7 @@ def _vllm_config(
     max_num_seqs: int = 4,
     max_num_batched_tokens: int = 0,
     max_source_positions: int | None = None,
-    additional_config: dict | None = None,
+    additional_config: OptimumRBLNConfig | None = None,
 ) -> SimpleNamespace:
     hf_config = SimpleNamespace(architectures=[arch])
     if max_source_positions is not None:
@@ -70,18 +70,14 @@ class TestIsChunkedPrefillArch:
 
 
 class TestGetUserMaxNumBatchedTokens:
-    def test_none_when_no_additional_config(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config=None)
-        assert get_user_max_num_batched_tokens(cfg) is None
-
     def test_none_when_unset(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
+        cfg = _vllm_config(arch=DECODER_ARCH, additional_config=OptimumRBLNConfig())
         assert get_user_max_num_batched_tokens(cfg) is None
 
     def test_returns_stashed_value(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+            additional_config=OptimumRBLNConfig(user_max_num_batched_tokens=512),
         )
         assert get_user_max_num_batched_tokens(cfg) == 512
 
@@ -124,14 +120,14 @@ class TestApplyUserPrefillChunkSize:
     def test_noop_for_pooling(self):
         cfg = _vllm_config(
             arch=POOLING_ARCH,
-            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+            additional_config=OptimumRBLNConfig(user_max_num_batched_tokens=512),
         )
         params = RBLNParams(prefill_chunk_size=128)
         apply_user_prefill_chunk_size(cfg, params, precompiled=False)
         assert params.prefill_chunk_size == 128
 
     def test_noop_when_user_unset(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
+        cfg = _vllm_config(arch=DECODER_ARCH, additional_config=OptimumRBLNConfig())
         params = RBLNParams(prefill_chunk_size=128)
         apply_user_prefill_chunk_size(cfg, params, precompiled=False)
         assert params.prefill_chunk_size == 128
@@ -139,7 +135,7 @@ class TestApplyUserPrefillChunkSize:
     def test_compile_path_folds_user_value(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+            additional_config=OptimumRBLNConfig(user_max_num_batched_tokens=512),
         )
         params = RBLNParams(prefill_chunk_size=128)
         apply_user_prefill_chunk_size(cfg, params, precompiled=False)
@@ -148,7 +144,7 @@ class TestApplyUserPrefillChunkSize:
     def test_compile_path_conflict_with_rbln_override(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+            additional_config=OptimumRBLNConfig(user_max_num_batched_tokens=512),
         )
         params = RBLNParams(prefill_chunk_size=256)
         with pytest.raises(ValueError, match="Conflicting prefill chunk size"):
@@ -159,7 +155,7 @@ class TestApplyUserPrefillChunkSize:
     def test_precompiled_conflict_raises(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 512},
+            additional_config=OptimumRBLNConfig(user_max_num_batched_tokens=512),
         )
         params = RBLNParams(prefill_chunk_size=128)
         with pytest.raises(ValueError, match="conflicts with the compiled"):
@@ -168,7 +164,7 @@ class TestApplyUserPrefillChunkSize:
     def test_precompiled_match_ok(self):
         cfg = _vllm_config(
             arch=DECODER_ARCH,
-            additional_config={USER_MAX_NUM_BATCHED_TOKENS_KEY: 128},
+            additional_config=OptimumRBLNConfig(user_max_num_batched_tokens=128),
         )
         params = RBLNParams(prefill_chunk_size=128)
         apply_user_prefill_chunk_size(cfg, params, precompiled=True)
@@ -177,11 +173,11 @@ class TestApplyUserPrefillChunkSize:
 
 class TestStoreImagePrefillChunkSize:
     def test_stores_buckets(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
+        cfg = _vllm_config(arch=DECODER_ARCH, additional_config=OptimumRBLNConfig())
         store_image_prefill_chunk_size(cfg, [1152, 640, 384])
-        assert cfg.additional_config["image_prefill_chunk_size"] == [1152, 640, 384]
+        assert cfg.additional_config.image_prefill_chunk_size == [1152, 640, 384]
 
     def test_noop_when_none(self):
-        cfg = _vllm_config(arch=DECODER_ARCH, additional_config={})
+        cfg = _vllm_config(arch=DECODER_ARCH, additional_config=OptimumRBLNConfig())
         store_image_prefill_chunk_size(cfg, None)
-        assert "image_prefill_chunk_size" not in cfg.additional_config
+        assert cfg.additional_config.image_prefill_chunk_size is None
