@@ -3386,22 +3386,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs=LogitsProcessors(),
             spec_token_ids=[[] for _ in range(batch_size)],
         )
+
+        variants: list[tuple[dict, SamplingMetadata]] = []
         # int32, as the bonus sampler's ops return it.
         bonus_token_ids = torch.zeros(
             batch_size, 1, dtype=torch.int32, device=self.device
         )
+
         logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
         # One graph per top_k/top_p None-pattern (the sampler's WARM_UP_CONFIGS)
         # plus the one fed bonus token ids (logprobs).
-        variants = [({"bonus_token_ids": bonus_token_ids}, dummy_sampling_metadata)]
+        variants.append(({"bonus_token_ids": bonus_token_ids}, dummy_sampling_metadata))
         for config in WARM_UP_CONFIGS:
-            all_greedy = config["all_greedy"]
             metadata = dataclasses.replace(
                 dummy_sampling_metadata,
-                all_greedy=all_greedy,
+                all_greedy=config["all_greedy"],
                 all_random=config["all_random"],
                 temperature=None
-                if all_greedy
+                if config["all_greedy"]
                 else torch.ones(batch_size, dtype=self.dtype, device=self.device),
                 top_p=_dummy_tensor_view(
                     self.input_batch.top_p, batch_size, config.get("top_p")
@@ -3411,6 +3413,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 ),
             )
             variants.append(({"bonus_logits": bonus_logits}, metadata))
+
             if batch_size > 1 and (metadata.top_p, metadata.top_k) != (None, None):
                 # A batch below the bound arrives through `_pad_rows`'s torch.cat,
                 # not a buffer view.
@@ -3549,9 +3552,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 def _dummy_tensor_view(
     buffer: torch.Tensor, num_reqs: int, value: int | float | None
 ) -> torch.Tensor | None:
-    """A view of the persistent buffer, as a real step feeds: dynamo guards the
-    dispatch key set, which a fresh tensor made under inference_mode lacks.
-    """
+    """A view of the persistent buffer, as a real step feeds"""
     if value is None:
         return None
     view = buffer[:num_reqs]
