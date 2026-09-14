@@ -60,6 +60,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -94,6 +96,7 @@ from vllm_rbln.v1.worker.utils import (
     rescale_kv_cache_config,
     set_cpu_affinity,
     set_omp_num_threads,
+    worker_fail_fast,
 )
 
 logger = init_logger(__name__)
@@ -169,6 +172,7 @@ class RBLNWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        self.fail_fast = issubclass(Executor.get_class(vllm_config), MultiprocExecutor)
 
         # Before _init_device_env(), which reads device-count options.
         set_rbln_config(build_rbln_config(vllm_config.additional_config))
@@ -1166,6 +1170,7 @@ class RBLNWorker(WorkerBase):
         return self.model_runner.get_supported_tasks()
 
     @torch.inference_mode()
+    @worker_fail_fast
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1177,6 +1182,7 @@ class RBLNWorker(WorkerBase):
         get_pp_group().send_tensor_dict(tensors)
 
     @torch.inference_mode()
+    @worker_fail_fast
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1264,6 +1270,7 @@ class RBLNWorker(WorkerBase):
                 return
             self.profiler.stop()
 
+    @worker_fail_fast
     def execute_dummy_batch(self) -> None:
         # Serving-time DP-idle step: this rank has no real work. Run a non-warmup
         # dummy (warmup=False) so it contributes a minimal (num_reqs=1, qlen=1)

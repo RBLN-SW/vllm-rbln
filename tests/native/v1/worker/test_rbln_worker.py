@@ -18,18 +18,21 @@
 
 import inspect
 import os
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 import vllm.platforms.interface as platform_interface
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.v1.worker.rbln_worker as wm
+import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.platform import RblnPlatform
 from vllm_rbln.v1.worker.rbln_worker import (
     RBLNWorker,
@@ -49,10 +52,12 @@ def _make_vllm_config(
     enforce_eager=False,
     profiler=None,
     additional_config=None,
+    backend="uni",
 ):
     return SimpleNamespace(
         profiler_config=SimpleNamespace(profiler=profiler),
         parallel_config=SimpleNamespace(
+            distributed_executor_backend=backend,
             world_size=world_size,
             tensor_parallel_size=world_size,
             pipeline_parallel_size=1,
@@ -185,6 +190,86 @@ def make_worker(monkeypatch):
         )
 
     return _make
+
+
+class CustomMultiprocExecutor(MultiprocExecutor):
+    pass
+
+
+class TestWorkerFailFast:
+    @pytest.mark.parametrize(
+        ("backend", "ray_v2", "disabled", "should_exit"),
+        [
+            pytest.param("mp", None, "0", True, id="mp"),
+            pytest.param("mp", None, "1", False, id="disabled"),
+            pytest.param("uni", None, "0", False, id="uni"),
+            pytest.param("external_launcher", None, "0", False, id="external"),
+            pytest.param(CustomMultiprocExecutor, None, "0", True, id="custom-class"),
+            pytest.param(
+                f"{__name__}.CustomMultiprocExecutor",
+                None,
+                "0",
+                True,
+                id="custom-qualname",
+            ),
+            pytest.param("ray", None, "0", True, id="ray-default"),
+            pytest.param("ray", "0", "0", False, id="ray-legacy"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("method", "runner_method", "args"),
+        [
+            (
+                "execute_model",
+                "execute_model",
+                (SimpleNamespace(total_num_scheduled_tokens=0),),
+            ),
+            ("sample_tokens", "sample_tokens", (None,)),
+            ("execute_dummy_batch", "_dummy_run", ()),
+        ],
+    )
+    def test_step_failure_uses_executor_policy(
+        self,
+        make_worker,
+        monkeypatch,
+        backend,
+        ray_v2,
+        disabled,
+        should_exit,
+        method,
+        runner_method,
+        args,
+    ):
+        monkeypatch.delenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", raising=False)
+        if ray_v2 is not None:
+            monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", ray_v2)
+        if backend == "ray" and ray_v2 is None:
+            # Ray is optional. Substitute its module, keeping Executor.get_class
+            # and the worker's classification and exception handling real.
+            monkeypatch.setitem(
+                sys.modules,
+                "vllm.v1.executor.ray_executor_v2",
+                SimpleNamespace(RayExecutorV2=CustomMultiprocExecutor),
+            )
+        worker = make_worker(vllm_config=_make_vllm_config(backend=backend))
+        error = RuntimeError("worker step failed")
+        step = Mock(side_effect=error)
+        worker.model_runner = SimpleNamespace(**{runner_method: step})
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", disabled)
+        exit_process = Mock(side_effect=SystemExit(70))
+        monkeypatch.setattr(worker_utils.os, "_exit", exit_process)
+
+        with pytest.raises(SystemExit if should_exit else RuntimeError) as excinfo:
+            getattr(worker, method)(*args)
+
+        step.assert_called_once()
+        if should_exit:
+            exit_process.assert_called_once_with(70)
+            assert isinstance(excinfo.value, SystemExit)
+            assert excinfo.value.code == 70
+        else:
+            exit_process.assert_not_called()
+            assert excinfo.value is error
 
 
 class TestConformance:

@@ -30,7 +30,7 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
         self,
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
-        max_num_batched_tokens: int,
+        max_in_flight_tokens: int,
         use_eagle: bool,
         enable_caching: bool,
         enable_kv_cache_events: bool,
@@ -70,7 +70,7 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
-                max_num_batched_tokens=max_num_batched_tokens,
+                max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
