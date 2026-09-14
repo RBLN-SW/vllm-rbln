@@ -18,11 +18,13 @@
 
 import queue
 import threading
+import time
 from collections import defaultdict
 from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlBaseConnectorWorker,
     NixlPullConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
@@ -96,6 +98,8 @@ class TestShardReadPath:
         w._recving_metadata = {}
         w._invalid_block_ids = queue.Queue()
         w._failed_recv_reqs = queue.Queue()
+        w._engines_to_rehandshake = set()
+        w._reconnect_backoff = {}
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
         # single group, 2 regions per shard
@@ -105,6 +109,11 @@ class TestShardReadPath:
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
         w._remote_agents = {"eng": {r: f"agent{r}" for r in range(pp_size)}}
+        # What dropping an unreachable engine releases.
+        w._borrowed_src_handles = set()
+        w._remote_shard_layer_names = {}
+        w.kv_caches_base_addr = {"eng": [0]}
+        w.tp_mappings = {"eng": MagicMock()}
         topo = MagicMock()
         topo.get_engine_info.return_value = MagicMock(
             remote_tp_size=1, remote_block_size=16, remote_physical_blocks_per_logical=1
@@ -373,6 +382,97 @@ class TestUpstreamReachesTheOverride:
         # upstream's own formula can produce.
         ids = w.nixl_wrapper.make_prepped_xfer.call_args.args[2]
         assert min(ids) >= w.num_regions * w.dst_num_blocks["eng"]
+
+
+class TestUnreachableEngineReconnect:
+    # A peer whose link dies stays in _remote_agents -- every read refreshes
+    # its TTL on the way to failing -- so upstream never re-dials it and this
+    # consumer recomputes forever.
+
+    @staticmethod
+    def _polling_worker():
+        w = TestShardReadPath._read_worker(pp_size=2)
+        w.tp_rank = 0
+        w._reqs_to_send = {}
+        w.nixl_wrapper.get_new_notifs.return_value = {}
+        w.nixl_wrapper.make_prepped_xfer.side_effect = [1, 2]
+        meta = TestShardReadPath._meta([[1, 2]], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+        w._read_blocks_for_req("r0", meta)
+        return w
+
+    def test_a_dead_peer_is_dropped_so_the_next_request_re_handshakes(self):
+        w = self._polling_worker()
+        w.nixl_wrapper.check_xfer_state.return_value = "ERR"
+        w.get_finished()
+        assert "eng" not in w._remote_agents
+        assert w._engines_to_rehandshake == set()
+
+    def test_the_drop_waits_for_the_engines_handles_to_drain(self):
+        # Releasing a descriptor list under a live handle would fault the
+        # agent, so a straggler holds the drop back a poll.
+        w = self._polling_worker()
+        w.nixl_wrapper.check_xfer_state.side_effect = (
+            lambda h: "ERR" if h == 1 else "PROC"
+        )
+        w.get_finished()
+        assert "eng" in w._remote_agents
+
+        w.nixl_wrapper.check_xfer_state.side_effect = None
+        w.nixl_wrapper.check_xfer_state.return_value = "ERR"
+        w.get_finished()
+        assert "eng" not in w._remote_agents
+
+    def test_a_failed_handshake_with_no_local_blocks_still_reports(self):
+        # A full local prefix hit leaves local_block_ids empty. Indexing it
+        # raised inside the future's callback, so the request was never
+        # reported failed and the engine answered the client with a 500.
+        w = TestShardReadPath._read_worker(pp_size=2)
+        meta = TestShardReadPath._meta([], [[3, 4]])
+        meta.local_block_ids = []
+        w._recving_metadata["r0"] = meta
+
+        w._handle_failed_transfer("r0", None)
+
+        assert w._failed_recv_reqs.get_nowait() == "r0"
+        assert w._invalid_block_ids.empty()
+        assert w._engines_to_rehandshake == {"eng"}
+
+    def test_a_down_peer_never_makes_a_request_wait_for_the_dial(self, monkeypatch):
+        # The dial to a dead peer costs upstream's side-channel timeout, so a
+        # request fails now and recomputes while the probe runs behind it. Once
+        # the peer answers, requests and heartbeats take the upstream path.
+        w = TestShardReadPath._read_worker(pp_size=2)
+        w._remote_agents = {}
+        dial = MagicMock(return_value=None)
+        monkeypatch.setattr(NixlBaseConnectorWorker, "_ensure_handshake", dial)
+        w._reconnect_backoff["eng"] = (2, time.perf_counter() + 10)
+
+        with pytest.raises(RuntimeError):
+            w._ensure_handshake("eng", "host", 1234, 1).result()
+        assert dial.call_count == 0
+
+        w._reconnect_backoff["eng"] = (2, time.perf_counter() - 1)
+        with pytest.raises(RuntimeError):
+            w._ensure_handshake("eng", "host", 1234, 1).result()
+        assert dial.call_count == 1
+
+        w._remote_agents = {"eng": {0: "agent0"}}
+        assert w._ensure_handshake("eng", "host", 1234, 1) is None
+
+    def test_only_a_failed_probe_lengthens_the_backoff(self):
+        w = self._polling_worker()
+        w._handle_failed_transfer("r0", None)
+        first = w._reconnect_backoff["eng"]
+        # The first failure probes at once; a sibling rank is the same outage.
+        assert first[1] <= time.perf_counter()
+        w._handle_failed_transfer("r0", None)
+        assert w._reconnect_backoff["eng"] == first
+
+        # The drop clears the mark, so the next failure is a probe's outcome.
+        w._engines_to_rehandshake.discard("eng")
+        w._handle_failed_transfer("r0", None)
+        assert w._reconnect_backoff["eng"][1] > time.perf_counter()
 
 
 class TestReadMarksTheEngineActive:
