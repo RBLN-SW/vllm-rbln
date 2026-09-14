@@ -109,7 +109,6 @@ class ExecuteModelState(NamedTuple):
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
     hidden_states: torch.Tensor
-    sample_hidden_states: torch.Tensor
     is_prompt: bool
     ec_connector_output: "ECConnectorOutput | None" = None
 
@@ -458,7 +457,6 @@ class RBLNOptimumModelRunner(
                         token_count=0,
                         # the performance of sampler doesn't depend on token count
                     )
-                sample_hidden_states = hidden_states.clone()
 
             with record_function_or_nullcontext("rbln_model_runner: postprocess"):
                 if self.is_pooling_model:
@@ -473,7 +471,6 @@ class RBLNOptimumModelRunner(
             scheduler_output=scheduler_output,
             logits=logits,
             hidden_states=hidden_states,
-            sample_hidden_states=sample_hidden_states,
             is_prompt=model_input.is_prompt,
             ec_connector_output=ec_connector_output,
         )
@@ -1588,7 +1585,6 @@ class RBLNOptimumModelRunner(
             scheduler_output,
             logits,
             hidden_states,
-            sample_hidden_states,
             is_prompt,
             ec_connector_output,
         ) = self.execute_model_state
