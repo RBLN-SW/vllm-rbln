@@ -1167,6 +1167,10 @@ class TestComputeDynamicKvNumBlocks:
         assert "needs 9 (one request 8, decode batch 1, +1 null block)" in caplog.text
         assert "would be accepted" in caplog.text
         assert "headroom=" in caplog.text
+        # 2560 blocks of 2 MiB on top of the 30 GiB base fill the 35 GiB budget.
+        assert (
+            "at 2560 blocks: used=37580963840 budget_left=0 total_left=0" in caplog.text
+        )
 
     def test_a_dry_run_that_cannot_size_warns_instead_of_raising(self, caplog):
         worker = self._worker(programs=[_program([])], snapshot=self._snapshot([0] * 4))

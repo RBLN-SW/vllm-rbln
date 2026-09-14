@@ -952,16 +952,22 @@ class RBLNWorker(WorkerBase):
         current: int,
         growth: KvGrowth,
     ) -> None:
-        """How the `current` blocks vllm sized sit in each chiplet's budget next
-        to the `num_blocks` this feature would pick. Resizes nothing."""
-        allocated = growth.allocated_at(current)
+        """How the `current` blocks vllm sized sit in each chiplet's budget, and
+        how full each chiplet would be at the `num_blocks` this feature would
+        pick. Resizes nothing."""
+        now = growth.allocated_at(current)
+        proposed = growth.allocated_at(num_blocks)
         per_unit = []
         for (node, chiplet), fit in sorted(fits.items()):
-            kv_now = allocated[(node, chiplet)]
-            headroom = fit.budget - fit.base - kv_now
+            unit = (node, chiplet)
+            headroom = fit.budget - fit.base - now[unit]
+            at_proposed = fit.base + proposed[unit]
             per_unit.append(
-                f"{node}:{chiplet}(kv_now={kv_now} base={fit.base} budget={fit.budget} "
-                f"headroom={headroom} = {headroom // fit.per_block:+d} blocks)"
+                f"{node}:{chiplet}(kv_now={now[unit]} base={fit.base} "
+                f"budget={fit.budget} headroom={headroom} = "
+                f"{headroom // fit.per_block:+d} blocks; at {num_blocks} blocks: "
+                f"used={at_proposed} budget_left={fit.budget - at_proposed} "
+                f"total_left={fit.total - at_proposed})"
             )
         minimum = minimum_kv_blocks(self.vllm_config, self.model_runner.kv_cache_config)
         logger.warning(

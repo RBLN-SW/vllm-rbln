@@ -100,9 +100,12 @@ carry the result:
   estimate at, next to the whole-card formula that is kept;
 - after warm-up, `dry run: vllm sized N blocks, this feature would set n (+/-d)`
   with, per `(node, chiplet)`, the bytes the current `N` blocks take, the non-KV
-  base, the budget, and the headroom left in bytes and blocks. A negative
-  headroom means the current count already exceeds `total * gpu_memory_utilization`
-  on that chiplet.
+  base, the budget, the headroom left in bytes and blocks, and what `n` would
+  do: the predicted `used` at `n`, `budget_left` against
+  `total * gpu_memory_utilization` and `total_left` against the chiplet's
+  physical DRAM. A negative headroom means the current count already exceeds
+  the budget on that chiplet. Nothing is allocated at `n`; the real mode's fit
+  check line is what validates the prediction.
 
 Unsupported configurations are refused in a dry run too, since the refusals
 guard the dynamic compile itself. A sizing failure after warm-up (no placement,
