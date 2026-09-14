@@ -762,9 +762,8 @@ class TestDynamicKvConfig:
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL=1"):
             RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
-    def test_mla_is_rejected(self):
-        with pytest.raises(ValueError, match="MLA"):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
+    def test_mla_passes(self):
+        RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
 
     def test_speculative_decoding_passes(self):
         RblnPlatform._validate_dynamic_kv_config(

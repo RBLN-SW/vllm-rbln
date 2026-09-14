@@ -14,6 +14,7 @@
 
 import re
 import types
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_base_bindings,
     build_kv_cache_forward_context_kwargs,
+    kv_cache_dynamic_axis,
     materialize_kv_cache_view,
     validate_shared_attention_kv_cache_contiguity,
 )
@@ -37,6 +39,63 @@ def _layer(i: int) -> str:
     # A layer name extract_layer_index() parses to `i` (single integer, has
     # "attn"). Used as the dict keys the helpers order and group by.
     return f"model.layers.{i}.self_attn"
+
+
+class TestKvCacheDynamicAxis:
+    """The dynamic axis is read off the backend's shape, not assumed."""
+
+    @staticmethod
+    def _spec():
+        return SimpleNamespace(num_kv_heads=8, head_size=128)
+
+    def test_paged_layout_grows_along_dim_1(self):
+        backend = SimpleNamespace(
+            get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (
+                2,
+                n,
+                h,
+                1,
+                bs,
+                hd,
+            )
+        )
+        assert (
+            kv_cache_dynamic_axis(backend, 4, 1024, self._spec(), "auto", range(6)) == 1
+        )
+
+    def test_mla_layout_grows_along_dim_0(self):
+        backend = SimpleNamespace(
+            get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (n, bs, hd)
+        )
+        assert (
+            kv_cache_dynamic_axis(backend, 4, 1024, self._spec(), "auto", range(3)) == 0
+        )
+
+    def test_the_stride_order_moves_the_axis(self):
+        backend = SimpleNamespace(
+            get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (
+                2,
+                n,
+                h,
+                1,
+                bs,
+                hd,
+            )
+        )
+        # Stored as [h, 2, n, ...]: num_blocks lands on dim 2.
+        assert (
+            kv_cache_dynamic_axis(
+                backend, 4, 1024, self._spec(), "auto", (2, 0, 1, 3, 4, 5)
+            )
+            == 2
+        )
+
+    def test_a_shape_without_a_num_blocks_dim_is_refused(self):
+        backend = SimpleNamespace(
+            get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (2, h, bs, hd)
+        )
+        with pytest.raises(ValueError, match="exactly one dim"):
+            kv_cache_dynamic_axis(backend, 4, 1024, self._spec(), "auto", range(4))
 
 
 class TestStorageKey:

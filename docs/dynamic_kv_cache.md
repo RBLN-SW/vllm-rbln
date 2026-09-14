@@ -121,7 +121,7 @@ when it is off. Run with `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` to use them.
 
 | Configuration | Why |
 | --- | --- |
-| MLA models | `num_blocks` is dimension 0 of MLA's KV shape rather than dimension 1, so the worker's `mark_dynamic(dim=1)` would mark the wrong dim. `VLLM_MLA_DISABLE=1` also works. |
+| DSA indexer cache (DeepSeek-V3.2, AxK2) | The compiler does not admit a dynamic input into the sparse-attention indexer ops yet, so the compile refuses with `flows into op 'sparse_attn_deepseek_indexer'`. Plain MLA (DeepSeek-V3) is admitted: the dynamic axis is read off the backend's KV shape, dim 0 for MLA. |
 | KV transfer connectors | The connector registers the KV cache's physical views during warm-up, and the reallocation invalidates them. |
 | Cross-layer KV sharing | The compiler admits a dynamic KV input through view ops into several paged naive attention calls (`paged_flash_causal_attention_naive_*`, `paged_sliding_window_attention_naive_*`), which is how a deduped base shared by a full and a sliding-window layer (gpt-oss) compiles; the same view feeding two layers' attention calls is not admitted. |
 

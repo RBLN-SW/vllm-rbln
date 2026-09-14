@@ -633,12 +633,6 @@ class RblnPlatform(Platform):
                 "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
             )
 
-        if vllm_config.model_config.use_mla:
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
-                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
-            )
-
         if not USE_DEVICE_TENSOR:
             raise ValueError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "

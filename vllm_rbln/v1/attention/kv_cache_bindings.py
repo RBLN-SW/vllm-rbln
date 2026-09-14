@@ -14,6 +14,7 @@
 
 import math
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -83,6 +84,38 @@ def build_kv_cache_base_bindings(
         view_infos.append(replace(view_info, base_index=base_index))
 
     return base_tensors, view_infos
+
+
+def kv_cache_dynamic_axis(
+    attn_backend: Any,
+    kernel_num_blocks: int,
+    kernel_block_size: int,
+    kv_cache_spec: Any,
+    cache_dtype: str,
+    stride_order: Sequence[int],
+) -> int:
+    """The axis of the backend's KV shape (in stride order) that grows with
+    `num_blocks`: dim 1 for the `[2, num_blocks, ...]` paged layout, dim 0 for
+    MLA's `[num_blocks, block_size, latent]`."""
+
+    def shape(num_blocks: int) -> tuple[int, ...]:
+        raw = attn_backend.get_kv_cache_shape(
+            num_blocks,
+            kernel_block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=cache_dtype,
+        )
+        return tuple(raw[i] for i in stride_order)
+
+    at_n, at_n1 = shape(kernel_num_blocks), shape(kernel_num_blocks + 1)
+    axes = [i for i, (a, b) in enumerate(zip(at_n, at_n1)) if a != b]
+    if len(axes) != 1:
+        raise ValueError(
+            f"KV cache shape {at_n} does not grow along exactly one dim with "
+            f"num_blocks (changed dims: {axes})"
+        )
+    return axes[0]
 
 
 def _reduced_ratio(numerator: int, denominator: int) -> tuple[int, int]:
