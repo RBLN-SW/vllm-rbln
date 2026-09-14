@@ -803,3 +803,46 @@ class TestDflashTokenBudget:
             config.scheduler_config.max_num_scheduled_tokens = 8
 
         assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8
+
+
+class TestAxK1ModelType:
+    """A.X-K1 checkpoints say ``AXK1``; vLLM 0.26 only knows ``axk1``.
+
+    The whole MLA decision hangs off that string: ``is_deepseek_mla`` compares
+    ``model_type`` verbatim, so an unnormalized checkpoint silently caches K/V
+    per head instead of the MLA latent.
+    """
+
+    @pytest.fixture
+    def get_config(self, monkeypatch):
+        from vllm.config import model as vllm_model_config
+
+        configs: dict[str, object] = {}
+        monkeypatch.setattr(
+            vllm_model_config, "get_config", lambda model, **kw: configs[model]
+        )
+        monkeypatch.setattr(
+            vllm_model_config, "_rbln_axk1_get_config_patched", False, raising=False
+        )
+        RblnPlatform._normalize_axk1_model_type()
+
+        def load(model, config):
+            configs[model] = config
+            return vllm_model_config.get_config(model)
+
+        return load
+
+    def test_uppercase_checkpoint_type_is_normalized(self, get_config):
+        config = get_config("axk1", SimpleNamespace(model_type="AXK1"))
+        assert config.model_type == "axk1"
+
+    def test_other_model_types_are_untouched(self, get_config):
+        config = get_config("opt", SimpleNamespace(model_type="opt"))
+        assert config.model_type == "opt"
+
+    def test_patching_twice_does_not_stack_wrappers(self, get_config):
+        from vllm.config import model as vllm_model_config
+
+        wrapped = vllm_model_config.get_config
+        RblnPlatform._normalize_axk1_model_type()
+        assert vllm_model_config.get_config is wrapped
