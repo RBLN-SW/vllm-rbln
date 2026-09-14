@@ -28,9 +28,11 @@ compile-time cache, and after warm-up sizes the real cache from two measurements
   into `block_size / sliding_window` kernel blocks -- so each input's symbol is
   scaled by its compiled extent over the compile hint. Programs that bind a
   different set of KV tensors (a speculative drafter's) contribute their own
-  slope on top of the target's. The fit rounds every shard up to the 2 MiB
-  allocation granule, so a per-block shard size that is not a multiple of it
-  costs the few blocks the rounding takes below the linear answer.
+  slope on top of the target's. The fit counts every shard at the size the
+  runtime's caching allocator reserves for it (a request up to 1 MiB takes a
+  2 MiB block, up to 10 MiB a 20 MiB block, larger ones round up to 2 MiB), so
+  a shard size the rounding inflates costs the few blocks that takes below the
+  linear answer.
 - **Base** -- how many bytes are already spoken for on each chiplet. A per-chiplet
   memory snapshot is taken after the compile-time cache is released, so what
   the runtime does not hand back is measured as base rather than assumed away:
@@ -182,9 +184,10 @@ is not evidence that the block count came from the device.
   only the caching allocator; the runtime's direct allocations are covered by a
   fixed reserve and other tenants by a start-up sample spread evenly over the
   chiplets. Prefer a stack that answers `mem_get_info_per_chiplet()`.
-- **Allocator segments are not modelled.** The growth counts each shard rounded
-  up to 2 MiB; a caching allocator that reserves larger segments ahead of the
-  tensors shows up in the snapshot's `used`, not in the growth.
+- **Allocator packing is not modelled.** The growth counts each shard at its
+  own reserved size; blocks the allocator keeps cached for later reuse show up
+  in the snapshot's `used`, not in the growth, and the fit check line after the
+  reallocation is where a mismatch shows.
 - **The block count is not perfectly deterministic.** Repeated runs of the same
   configuration occasionally retain an extra arena per chiplet and land above the
   requested budget.

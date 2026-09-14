@@ -34,8 +34,26 @@ logger = init_logger(__name__)
 
 # `(node_id, chiplet_id)` -- the granularity device memory pools are carved at.
 Unit = tuple[int, int]
-# Device allocations are rounded up to this per tensor.
-KV_ALLOC_ALIGN_BYTES = 2 * 1024 * 1024
+# The runtime's caching allocator (rebel caching_allocator.h): a request up to
+# 1 MiB takes a 2 MiB block, up to 10 MiB a 20 MiB block, larger ones round up
+# to 2 MiB.
+_ALLOC_SMALL_MAX = 1 << 20
+_ALLOC_SMALL_BLOCK = 2 << 20
+_ALLOC_MEDIUM_MAX = 10 << 20
+_ALLOC_MEDIUM_BLOCK = 20 << 20
+_ALLOC_LARGE_ROUND = 2 << 20
+
+
+def allocation_size(nbytes: int) -> int:
+    """Device bytes the caching allocator reserves for a tensor of `nbytes`."""
+    if nbytes <= 0:
+        return 0
+    if nbytes <= _ALLOC_SMALL_MAX:
+        return _ALLOC_SMALL_BLOCK
+    if nbytes <= _ALLOC_MEDIUM_MAX:
+        return _ALLOC_MEDIUM_BLOCK
+    return -(-nbytes // _ALLOC_LARGE_ROUND) * _ALLOC_LARGE_ROUND
+
 
 _KEY_RE = re.compile(r"^npu\.(\d+)\.chiplet\.(\d+)\.(.+)$")
 _TRAILING_BITS_RE = re.compile(r"(\d+)$")
@@ -154,10 +172,10 @@ def dynamic_extent(spec: Any) -> int:
 
 
 def kv_bytes_per_unit(
-    specs: Iterable[Any], num_blocks: int, hint_blocks: int, *, align: int = 1
+    specs: Iterable[Any], num_blocks: int, hint_blocks: int, *, allocated: bool = False
 ) -> dict[Unit, int]:
-    """Bytes the KV inputs occupy on each (node, chiplet) at `num_blocks`, each
-    shard rounded up to `align`.
+    """Bytes the KV inputs occupy on each (node, chiplet) at `num_blocks`; with
+    `allocated`, what the caching allocator reserves for each shard instead.
 
     An input's dynamic dim counts *kernel* blocks, `dynamic_extent / hint_blocks`
     of them per manager block (a sliding-window layer splits each block into
@@ -181,7 +199,10 @@ def kv_bytes_per_unit(
                 eval_placement_dim(dim, symbol) for dim in shard.slice_shape
             )
             unit = (int(shard.node_id), int(shard.chiplet_id))
-            usage[unit] = usage.get(unit, 0) + -(-elems * itemsize // align) * align
+            nbytes = elems * itemsize
+            usage[unit] = usage.get(unit, 0) + (
+                allocation_size(nbytes) if allocated else nbytes
+            )
     return usage
 
 
@@ -198,9 +219,9 @@ class KvGrowth:
         return {unit: num_blocks * cost for unit, cost in self.per_block.items()}
 
     def allocated_at(self, num_blocks: int) -> dict[Unit, int]:
-        """`bytes_at` with every shard rounded up to the allocation granule."""
+        """`bytes_at` with every shard at the size the allocator reserves for it."""
         return kv_bytes_per_unit(
-            self.specs, num_blocks, self.hint_blocks, align=KV_ALLOC_ALIGN_BYTES
+            self.specs, num_blocks, self.hint_blocks, allocated=True
         )
 
 
@@ -337,8 +358,8 @@ def max_num_blocks(
     non-KV base is `used - kv_resident + reserve_bytes`, the reserve standing
     for device memory the runtime allocates only once requests flow; the answer
     satisfies `base + allocated(n) <= total * gpu_memory_utilization` on every
-    unit the KV cache grows on, `allocated` counting each shard rounded up to
-    the allocation granule. Units it does not touch are not sized here.
+    unit the KV cache grows on, `allocated` counting each shard at the size the
+    caching allocator reserves. Units it does not touch are not sized here.
     """
     if not 0 < gpu_memory_utilization <= 1:
         raise ValueError(
@@ -363,8 +384,8 @@ def max_num_blocks(
         allocated = growth.allocated_at(n)
         return all(allocated[unit] <= room[unit] for unit in room)
 
-    # Rounding each shard up to the granule can cost a few blocks below the
-    # linear answer; walk down until the rounded total fits everywhere.
+    # The allocator's rounding can cost a few blocks below the linear answer;
+    # walk down until the reserved total fits everywhere.
     num_blocks = min(linear.values())
     while num_blocks > 0 and not fits_all(num_blocks):
         num_blocks -= 1

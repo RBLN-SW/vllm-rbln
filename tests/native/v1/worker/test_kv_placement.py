@@ -327,21 +327,26 @@ class TestMaxNumBlocks:
         assert n == 15 * 512 + 4
         assert fits[(1, 0)].base == 20 * self.GIB - 8 * 2**20
 
-    def test_each_shard_is_rounded_up_to_the_allocation_granule(self):
-        # One KV head per shard: 512 KiB per block, so 3 blocks allocate 2 MiB.
+    def test_each_shard_is_counted_at_the_allocator_s_block_size(self):
+        # One KV head per shard: 512 KiB per block. 2 blocks (1 MiB) take a
+        # 2 MiB small block, 3 blocks (1.5 MiB) a 20 MiB medium block, and 40
+        # blocks (20 MiB) round to 2 MiB.
         thin = _placement(
             [2, S, 8, 1, 1024, 128], [_shard(0, 0, [2, S, 1, 1, 1024, 128])]
         )
         growth = kv_growth(_specs([thin]), hint_blocks=HINT)
         assert growth.bytes_at(3) == {(0, 0): 3 * 512 * 2**10}
-        assert growth.allocated_at(3) == {(0, 0): 2 * 2**20}
-        # 2.5 MiB of room fits 5 blocks linearly but only 4 once rounded.
+        assert growth.allocated_at(2) == {(0, 0): 2 * 2**20}
+        assert growth.allocated_at(3) == {(0, 0): 20 * 2**20}
+        assert growth.allocated_at(41) == {(0, 0): 22 * 2**20}
+        # 2.5 MiB of room fits 5 blocks linearly; 3..40 blocks reserve 20 MiB,
+        # so only 2 blocks (a 2 MiB block) actually fit.
         snapshot = self._snapshot({(0, 0): 35 * self.GIB - 5 * 512 * 2**10})
         n, fits = max_num_blocks(
             snapshot, growth, gpu_memory_utilization=1.0, kv_resident={}
         )
         assert fits[(0, 0)].num_blocks == 5
-        assert n == 4
+        assert n == 2
 
     def test_reserve_bytes_are_charged_as_base(self):
         growth = self._growth()

@@ -16,6 +16,7 @@
 import copy
 import gc
 import os
+import re
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -1104,18 +1105,41 @@ class RBLNWorker(WorkerBase):
 
         released = empty_rbln_device_caches()
         logical_bytes = sum(t.size for t in old_cfg.kv_cache_tensors)
-        # Not observable in-process; confirm from sysfs `dram_used` across the
-        # resize instead.
         logger.info(
             "[Dynamic KV] released the outgoing %d-block KV cache: "
             "outgoing_kv_logical_bytes=%d unbound_layers=%d kv_device_types=%s "
-            "allocator_cache_emptied=%s device_resident=%s",
+            "allocator_cache_emptied=%s device_resident=%s allocator_after=%s",
             old_cfg.num_blocks,
             logical_bytes,
             unbound,
             sorted(kv_device_types),
             released,
             was_device_resident,
+            self._allocator_state_per_chiplet(),
+        )
+
+    def _allocator_state_per_chiplet(self) -> str:
+        """`allocated/reserved` bytes this process's caching allocator holds per
+        chiplet, or why it could not be read; tells a block still allocated
+        (someone holds it) from one cached but not handed back."""
+        stats_fn = getattr(torch.rbln, "memory_stats_per_chiplet", None)
+        if stats_fn is None or torch.rbln.is_dummy_device():
+            return "unavailable"
+        try:
+            stats = stats_fn(self.device)
+        except RuntimeError as exc:
+            return f"unavailable ({exc})"
+        per_unit: dict[str, list[str]] = {}
+        for key, value in sorted(stats.items()):
+            match = re.match(
+                r"^npu\.(\d+)\.chiplet\.(\d+)\.(allocated|reserved)\.current$", key
+            )
+            if match:
+                per_unit.setdefault(f"{match.group(1)}:{match.group(2)}", []).append(
+                    f"{match.group(3)}={value}"
+                )
+        return " ".join(f"{u}({' '.join(v)})" for u, v in per_unit.items()) or repr(
+            stats
         )
 
     def _reallocate_kv_cache(self, new_num_blocks: int) -> None:
