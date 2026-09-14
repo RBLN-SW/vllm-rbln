@@ -32,7 +32,8 @@ compile-time cache, and after warm-up sizes the real cache from two measurements
   allocation granule, so a per-block shard size that is not a multiple of it
   costs the few blocks the rounding takes below the linear answer.
 - **Base** -- how many bytes are already spoken for on each chiplet. A per-chiplet
-  memory snapshot is taken with the compile-time cache resident:
+  memory snapshot is taken after the compile-time cache is released, so what
+  the runtime does not hand back is measured as base rather than assumed away:
   `torch.rbln.mem_get_info_per_chiplet()` (the driver's view, every process
   included) when the UMD/KMD provide it, otherwise this process's caching
   allocator (`torch.rbln.memory_stats_per_chiplet()`) plus a fixed reserve for the
@@ -172,13 +173,11 @@ is not evidence that the block count came from the device.
 
 ## Known Limitations
 
-- **`tensor_parallel_size >= 2` costs blocks.** The compile-time cache is not
-  returned to the driver on TP >= 2, and the process cannot observe that it was
-  not, so its bytes stay counted as base. The final count loses exactly the
-  compile hint. TP = 1 returns the cache and pays nothing.
-- **Data parallel with expert parallel is not charged.** The charge above is
-  conditional on `tensor_parallel_size > 1`, but a DP + EP run keeps the outgoing
-  cache resident at `tensor_parallel_size = 1`. The budget can be exceeded there.
+- **Whatever the runtime keeps of the compile-time cache costs blocks.** The
+  cache is released before the snapshot, so a runtime that does not hand it
+  back (observed on a DP + EP run, where the count dropped by exactly the
+  cache's size) is measured, not guessed. A dry run cannot release, so it
+  reports the count under both readings.
 - **The allocator snapshot is an approximation.** It sees only this process and
   only the caching allocator; the runtime's direct allocations are covered by a
   fixed reserve and other tenants by a start-up sample spread evenly over the

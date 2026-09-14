@@ -816,8 +816,10 @@ class RBLNWorker(WorkerBase):
 
         if dry_run:
             try:
-                num_blocks, fits, hint_blocks, growth = (
-                    self._dynamic_kv_num_blocks_from_placement()
+                num_blocks, fits, hint_blocks, growth, if_resident = (
+                    self._dynamic_kv_num_blocks_from_placement(
+                        release_compile_cache=False
+                    )
                 )
             except RuntimeError as exc:
                 logger.warning(
@@ -826,16 +828,27 @@ class RBLNWorker(WorkerBase):
                     exc,
                 )
                 return None
-            self._log_dynamic_kv_dry_run(num_blocks, fits, hint_blocks, growth)
+            self._log_dynamic_kv_dry_run(
+                num_blocks, fits, hint_blocks, growth, if_resident
+            )
             return None
-        num_blocks, _, _, _ = self._dynamic_kv_num_blocks_from_placement()
+        num_blocks, _, _, _, _ = self._dynamic_kv_num_blocks_from_placement(
+            release_compile_cache=True
+        )
         return num_blocks
 
     def _dynamic_kv_num_blocks_from_placement(
-        self,
-    ) -> tuple[int, dict[Unit, UnitFit], int, KvGrowth]:
+        self, *, release_compile_cache: bool
+    ) -> tuple[int, dict[Unit, UnitFit], int, KvGrowth, int | None]:
         """The count that fits, the per-unit fit behind it, the hint the
-        programs were traced with, and the growth they imply."""
+        programs were traced with, the growth they imply, and -- when the
+        compile cache could not be released first -- the count if that cache
+        stays resident.
+
+        Releasing before the snapshot measures what the runtime hands back
+        instead of assuming it; a dry run must not touch the cache, so it
+        subtracts the cache's bytes and reports both readings.
+        """
         programs = list(self._dynamic_kv_programs)
         groups = select_kv_input_groups(programs)
         hint_blocks = self.model_runner.kv_cache_config.num_blocks
@@ -856,6 +869,11 @@ class RBLNWorker(WorkerBase):
 
         program = groups[0][1]
         device = program.device if program.device is not None else self.device
+        if release_compile_cache:
+            self._release_kv_cache_tensors(self.model_runner.kv_cache_config)
+            kv_resident: dict[Unit, int] = {}
+        else:
+            kv_resident = growth.allocated_at(hint_blocks)
         snapshot, source = self._dynamic_kv_memory_snapshot(device)
         logger.info(
             "[Dynamic KV] %s memory snapshot of %s: %s",
@@ -863,20 +881,6 @@ class RBLNWorker(WorkerBase):
             device,
             {f"{n}:{c}": (m.total, m.used) for (n, c), m in sorted(snapshot.items())},
         )
-
-        # `used` includes the compile-time KV cache. TP=1 gives it back at the
-        # reallocation, so it is not base; TP>=2 does not, and the process cannot
-        # observe that it did not, so it stays charged. DP+EP keeps it resident
-        # at tp_size=1 and slips through; see docs/dynamic_kv_cache.md.
-        tp_size = self.parallel_config.tensor_parallel_size
-        kv_resident = growth.allocated_at(hint_blocks) if tp_size <= 1 else {}
-        if tp_size > 1:
-            logger.info(
-                "[Dynamic KV] tp=%d keeps the %d-block compile cache resident; "
-                "charged as base. Expect fewer blocks than TP=1.",
-                tp_size,
-                hint_blocks,
-            )
 
         reserve_bytes = self._kv_copy_stream_reserve_bytes()
         if reserve_bytes:
@@ -920,7 +924,16 @@ class RBLNWorker(WorkerBase):
         self._dynamic_kv_expected_used = {
             unit: fits[unit].base + predicted[unit] for unit in predicted
         }
-        return num_blocks, fits, hint_blocks, growth
+        if_resident = None
+        if not release_compile_cache:
+            if_resident, _ = max_num_blocks(
+                snapshot,
+                growth,
+                gpu_memory_utilization=gmu,
+                kv_resident={},
+                reserve_bytes=reserve_bytes,
+            )
+        return num_blocks, fits, hint_blocks, growth, if_resident
 
     def _log_dynamic_kv_fit_check(self, num_blocks: int) -> None:
         """Measured `used` against what the sizing predicted, once the resized
@@ -951,6 +964,7 @@ class RBLNWorker(WorkerBase):
         fits: Mapping[Unit, UnitFit],
         current: int,
         growth: KvGrowth,
+        if_resident: int | None,
     ) -> None:
         """How the `current` blocks vllm sized sit in each chiplet's budget, and
         how full each chiplet would be at the `num_blocks` this feature would
@@ -972,11 +986,13 @@ class RBLNWorker(WorkerBase):
         minimum = minimum_kv_blocks(self.vllm_config, self.model_runner.kv_cache_config)
         logger.warning(
             "[Dynamic KV] dry run: vllm sized %d blocks, this feature would set %d "
-            "(%+d); the pool needs %d (one request %d, decode batch %d, +1 null "
+            "(%+d) if the runtime hands the current cache back, %s if it stays "
+            "resident; the pool needs %d (one request %d, decode batch %d, +1 null "
             "block), so the count %s. Per (node, chiplet): %s. Nothing is resized.",
             current,
             num_blocks,
             num_blocks - current,
+            if_resident,
             minimum.needed,
             minimum.one_request,
             minimum.decode_batch,
@@ -1126,8 +1142,10 @@ class RBLNWorker(WorkerBase):
         )
         mr.kv_cache_config = new_cfg
         # Order is load-bearing: see `_release_kv_cache_tensors`. It also does
-        # the `mr.kv_caches = []` that the rebind reassigns.
-        self._release_kv_cache_tensors(old_cfg)
+        # the `mr.kv_caches = []` that the rebind reassigns. The sizing has
+        # usually released the compile cache already, to measure after it.
+        if mr.kv_caches:
+            self._release_kv_cache_tensors(old_cfg)
         # Re-applies mark_dynamic and rebinds the KV caches itself.
         mr.initialize_kv_cache_tensors(new_cfg, mr._kernel_block_sizes)
 

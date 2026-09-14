@@ -1098,9 +1098,10 @@ class TestComputeDynamicKvNumBlocks:
             _dynamic_kv_programs=list(programs),
             _dynamic_kv_memory_snapshot=lambda device: (snapshot, "stub"),
             _kv_copy_stream_reserve_bytes=lambda: 0,
+            _release_kv_cache_tensors=lambda cfg: None,
         )
-        worker._dynamic_kv_num_blocks_from_placement = lambda: (
-            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker)
+        worker._dynamic_kv_num_blocks_from_placement = lambda **kw: (
+            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker, **kw)
         )
         return worker
 
@@ -1110,24 +1111,28 @@ class TestComputeDynamicKvNumBlocks:
             for c, u in enumerate(used)
         }
 
-    def test_the_heaviest_chiplet_decides_and_the_resident_cache_is_not_base(self):
-        # Two layers -> 2 MiB per block per chiplet; 8 MiB resident at the hint.
+    def test_the_heaviest_chiplet_decides_after_the_compile_cache_is_released(self):
+        # Two layers -> 2 MiB per block per chiplet.
         programs = [
             _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
             _program([HEAD_SPLIT, HEAD_SPLIT], name="0/1"),
             _program([], name="0/2"),
         ]
-        resident = 8 * 2**20
-        used = [
-            5 * self.GIB + resident,
-            30 * self.GIB + resident,
-            1 * self.GIB + resident,
-            0 + resident,
-        ]
+        used = [5 * self.GIB, 30 * self.GIB, 1 * self.GIB, 0]
+        order: list = []
         worker = self._worker(programs=programs, snapshot=self._snapshot(used))
+        worker._release_kv_cache_tensors = lambda cfg: order.append("release")
+        snapshot = worker._dynamic_kv_memory_snapshot
+
+        def recording_snapshot(device):
+            order.append("snapshot")
+            return snapshot(device)
+
+        worker._dynamic_kv_memory_snapshot = recording_snapshot
         n = RBLNWorker.compute_dynamic_kv_num_blocks(worker)
-        # chiplet 1: (35 GiB - 30 GiB) / 2 MiB = 2560 blocks
+        # chiplet 1: (35 GiB - 30 GiB) / 2 MiB = 2560 blocks, nothing subtracted
         assert n == 5 * 512
+        assert order == ["release", "snapshot"]
 
     def test_a_dry_run_reports_and_resizes_nothing(self, caplog, monkeypatch):
         current = 200
@@ -1149,8 +1154,8 @@ class TestComputeDynamicKvNumBlocks:
         worker._log_dynamic_kv_dry_run = lambda *args: (
             RBLNWorker._log_dynamic_kv_dry_run(worker, *args)
         )
-        worker._dynamic_kv_num_blocks_from_placement = lambda: (
-            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker)
+        worker._dynamic_kv_num_blocks_from_placement = lambda **kw: (
+            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker, **kw)
         )
         with (
             patch(
@@ -1160,9 +1165,12 @@ class TestComputeDynamicKvNumBlocks:
             caplog.at_level("WARNING"),
         ):
             assert RBLNWorker.compute_dynamic_kv_num_blocks(worker) is None
-        # (35 GiB - 30 GiB) / 2 MiB = 2560 blocks would fit; 200 are in use.
+        # (35 GiB - 30 GiB) / 2 MiB = 2560 blocks if the 200 in use come back,
+        # 2360 if their 400 MiB stay resident.
         assert (
-            "vllm sized 200 blocks, this feature would set 2560 (+2360)" in caplog.text
+            "vllm sized 200 blocks, this feature would set 2560 (+2360) if the "
+            "runtime hands the current cache back, 2360 if it stays resident"
+            in caplog.text
         )
         assert "needs 9 (one request 8, decode batch 1, +1 null block)" in caplog.text
         assert "would be accepted" in caplog.text
@@ -1187,39 +1195,23 @@ class TestComputeDynamicKvNumBlocks:
 
     def test_the_copy_stream_reserve_comes_off_every_chiplet(self):
         programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
-        resident = 8 * 2**20
         worker = self._worker(
-            programs=programs,
-            snapshot=self._snapshot([30 * self.GIB + resident] * 4),
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
         )
         worker._kv_copy_stream_reserve_bytes = lambda: 64 * 2**20
         # (35 GiB - 30 GiB - 64 MiB) / 2 MiB = 2560 - 32 blocks
         assert RBLNWorker.compute_dynamic_kv_num_blocks(worker) == 5 * 512 - 32
 
-    def test_tp2_keeps_the_compile_cache_charged(self):
-        programs = [_program([HEAD_SPLIT])]
-        used = [4 * PER_BLOCK_PER_CHIPLET] * 4  # only the 4-block compile cache
-        snapshot = self._snapshot(used)
-        tp1 = RBLNWorker.compute_dynamic_kv_num_blocks(
-            self._worker(programs=programs, snapshot=snapshot, tp_size=1)
-        )
-        tp2 = RBLNWorker.compute_dynamic_kv_num_blocks(
-            self._worker(programs=programs, snapshot=snapshot, tp_size=2)
-        )
-        assert tp1 == 35 * 1024
-        # The resident cache stays charged as base: exactly the hint is lost.
-        assert tp1 - tp2 == self.HINT
-
     def test_gpu_memory_utilization_bounds_the_budget(self):
         programs = [_program([HEAD_SPLIT])]
-        snapshot = self._snapshot([4 * PER_BLOCK_PER_CHIPLET] * 4)
+        # The snapshot is taken after the compile cache is released: base 0.
+        snapshot = self._snapshot([0] * 4)
         full = RBLNWorker.compute_dynamic_kv_num_blocks(
             self._worker(programs=programs, snapshot=snapshot, gmu=1.0)
         )
         half = RBLNWorker.compute_dynamic_kv_num_blocks(
             self._worker(programs=programs, snapshot=snapshot, gmu=0.5)
         )
-        # The resident 4 MiB is given back, so the base is 0 on every chiplet.
         assert full == 35 * 1024
         assert half == full // 2
 
@@ -1641,9 +1633,10 @@ class TestDynamicKvFailuresRaise:
                 kv_cache_config=SimpleNamespace(num_blocks=211)
             ),
             _dynamic_kv_programs=list(programs),
+            _release_kv_cache_tensors=lambda cfg: None,
         )
-        worker._dynamic_kv_num_blocks_from_placement = lambda: (
-            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker)
+        worker._dynamic_kv_num_blocks_from_placement = lambda **kw: (
+            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker, **kw)
         )
         return worker
 
