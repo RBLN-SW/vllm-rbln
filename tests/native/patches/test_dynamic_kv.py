@@ -21,9 +21,10 @@ import pytest
 
 import vllm_rbln.patches.dynamic_kv as dk
 from vllm_rbln.patches.dynamic_kv import (
-    assert_kv_cache_fits_one_request,
+    assert_kv_cache_minimum,
     resolve_rank_num_blocks,
 )
+from vllm_rbln.v1.worker.utils import minimum_kv_blocks
 
 
 class TestOverrideBranch:
@@ -77,49 +78,105 @@ class TestResolveRankNumBlocks:
             resolve_rank_num_blocks([274, None])
 
 
-def _config(block_size, max_model_len):
+def _cdiv(a, b):
+    return -(-a // b)
+
+
+def _config(block_size, max_model_len, max_num_seqs=1, max_num_batched_tokens=512):
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
         model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens
+        ),
     )
 
 
-def _kv(num_blocks):
-    return SimpleNamespace(num_blocks=num_blocks)
+def _full_spec(block_size, page=1 << 20):
+    return SimpleNamespace(
+        page_size_bytes=page,
+        max_memory_usage_bytes=lambda cfg: (
+            _cdiv(cfg.model_config.max_model_len, block_size) * page
+        ),
+    )
+
+
+def _swa_spec(block_size, window, page=1 << 20):
+    def admission(max_num_batched_tokens, max_model_len):
+        return (
+            _cdiv(min(window - 1 + max_num_batched_tokens, max_model_len), block_size)
+            + 1
+        )
+
+    return SimpleNamespace(
+        page_size_bytes=page,
+        max_admission_blocks_per_request=admission,
+        max_memory_usage_bytes=lambda cfg: (
+            admission(
+                cfg.scheduler_config.max_num_batched_tokens,
+                cfg.model_config.max_model_len,
+            )
+            * page
+        ),
+    )
+
+
+def _kv(num_blocks, *specs):
+    return SimpleNamespace(
+        num_blocks=num_blocks,
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in specs],
+    )
 
 
 @pytest.mark.parametrize(
     ("block_size", "max_model_len", "num_blocks"),
     [
-        (1024, 32768, 32),  # exactly one request
-        (1024, 32768, 33),  # one to spare
-        (8192, 32768, 4),  # exactly one request, larger blocks
+        (1024, 32768, 33),  # exactly one request plus the null block
+        (1024, 32768, 34),  # one to spare
+        (8192, 32768, 5),  # larger blocks
         (1024, 32768, 1548),  # a real measured answer
-        (128, 1000, 8),  # cdiv rounds up: 1000/128 -> 8
+        (128, 1000, 9),  # cdiv rounds up: 1000/128 -> 8, +1 null
     ],
 )
 def test_accepts_a_pool_that_fits(block_size, max_model_len, num_blocks):
-    assert_kv_cache_fits_one_request(
-        _config(block_size, max_model_len), _kv(num_blocks)
+    assert_kv_cache_minimum(
+        _config(block_size, max_model_len), _kv(num_blocks, _full_spec(block_size))
     )
 
 
 @pytest.mark.parametrize(
     ("block_size", "max_model_len", "num_blocks", "needed"),
     [
-        (1024, 32768, 31, 32),  # one block short
-        (1024, 32768, 1, 32),
-        (8192, 32768, 3, 4),
-        (128, 1000, 7, 8),  # the rounded-up block is required
+        (1024, 32768, 32, 33),  # forgets the null block
+        (1024, 32768, 1, 33),
+        (8192, 32768, 4, 5),
+        (128, 1000, 8, 9),  # the rounded-up block is required
     ],
 )
 def test_rejects_a_pool_that_cannot_hold_one_request(
     block_size, max_model_len, num_blocks, needed
 ):
     with pytest.raises(ValueError, match=f"needs {needed}") as excinfo:
-        assert_kv_cache_fits_one_request(
-            _config(block_size, max_model_len), _kv(num_blocks)
+        assert_kv_cache_minimum(
+            _config(block_size, max_model_len), _kv(num_blocks, _full_spec(block_size))
         )
     # The message has to be actionable, like the upstream one it restores.
     assert str(num_blocks) in str(excinfo.value)
     assert "max_model_len" in str(excinfo.value)
+
+
+def test_a_decode_batch_can_need_more_than_one_request():
+    # 64 sequences at one block each beat the 4 blocks a single request takes.
+    minimum = minimum_kv_blocks(
+        _config(8192, 32768, max_num_seqs=64), _kv(0, _full_spec(8192))
+    )
+    assert (minimum.one_request, minimum.decode_batch, minimum.needed) == (4, 64, 65)
+
+
+def test_groups_sharing_the_pool_are_summed():
+    # gpt-oss shape: a full group and a 128-token sliding window group at 8192.
+    cfg = _config(8192, 32768, max_num_seqs=1, max_num_batched_tokens=512)
+    minimum = minimum_kv_blocks(cfg, _kv(0, _full_spec(8192), _swa_spec(8192, 128)))
+    # full: 4; sliding: cdiv(127 + 512, 8192) + 1 = 2 -> 6 for one request;
+    # a decode step: 1 + (cdiv(128, 8192) + 1) = 3.
+    assert (minimum.one_request, minimum.decode_batch, minimum.needed) == (6, 3, 7)

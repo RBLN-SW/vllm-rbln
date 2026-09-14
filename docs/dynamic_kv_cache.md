@@ -144,6 +144,11 @@ would serve from the pre-compile estimate this feature exists to replace.
   inputs of the same shapes and dtypes with different shard layouts, i.e. the
   same tensors placed two ways; the runtime would re-place the cache on every
   switch.
+- **The count cannot hold one request or one decode batch.** After the resize
+  the pool must hold `1 + max(one request, max_num_seqs decode steps)` blocks,
+  the 1 being the null block, summed over the KV cache groups that share the
+  pool; a sliding-window group counts vLLM's per-request admission blocks (the
+  window plus one unaligned block) rather than the whole context.
 - **No KV block fits.** On some chiplet the non-KV base already exceeds
   `total * gpu_memory_utilization`. Raise `--gpu-memory-utilization`, or give the
   model more devices.

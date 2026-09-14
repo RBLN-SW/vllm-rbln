@@ -98,6 +98,7 @@ from vllm_rbln.v1.worker.utils import (
     estimate_available_memory,
     estimate_model_kernel_size,
     get_rbln_planned_affinity_cpu_count,
+    minimum_kv_blocks,
     read_rbln_card_dram_used_bytes,
     rescale_kv_cache_config,
     set_cpu_affinity,
@@ -962,17 +963,18 @@ class RBLNWorker(WorkerBase):
                 f"{node}:{chiplet}(kv_now={kv_now} base={fit.base} budget={fit.budget} "
                 f"headroom={headroom} = {headroom // fit.per_block:+d} blocks)"
             )
-        needed = -(-self.model_config.max_model_len // self.cache_config.block_size)
+        minimum = minimum_kv_blocks(self.vllm_config, self.model_runner.kv_cache_config)
         logger.warning(
             "[Dynamic KV] dry run: vllm sized %d blocks, this feature would set %d "
-            "(%+d); one request of max_model_len=%d needs %d blocks, so the count "
-            "%s. Per (node, chiplet): %s. Nothing is resized.",
+            "(%+d); the pool needs %d (one request %d, decode batch %d, +1 null "
+            "block), so the count %s. Per (node, chiplet): %s. Nothing is resized.",
             current,
             num_blocks,
             num_blocks - current,
-            self.model_config.max_model_len,
-            needed,
-            "would be accepted" if num_blocks >= needed else "would be REFUSED",
+            minimum.needed,
+            minimum.one_request,
+            minimum.decode_batch,
+            "would be accepted" if num_blocks >= minimum.needed else "would be REFUSED",
             " ".join(per_unit),
         )
 

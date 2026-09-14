@@ -21,14 +21,13 @@
 from typing import Any
 
 from vllm.config import VllmConfig
-from vllm.utils.math_utils import cdiv
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.registry import register_patch
-from vllm_rbln.v1.worker.utils import rescale_kv_cache_config
+from vllm_rbln.v1.worker.utils import minimum_kv_blocks, rescale_kv_cache_config
 
 logger = init_logger(__name__)
 
@@ -118,29 +117,32 @@ def patched_initialize_kv_caches(
         old_num_blocks,
         num_blocks,
     )
-    assert_kv_cache_fits_one_request(vllm_config, kv_cache_config)
+    assert_kv_cache_minimum(vllm_config, kv_cache_config)
     _log_gpu_kv_cache_size(vllm_config, kv_cache_config)
     return kv_cache_config
 
 
-def assert_kv_cache_fits_one_request(
+def assert_kv_cache_minimum(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
-    """Fail loudly when the resized pool cannot hold a single max-length request."""
+    """Fail loudly when the resized pool cannot hold one max-length request or
+    one full decode batch."""
     # NOTE(RBLN): upstream's `check_enough_kv_cache_memory` runs against the
     # pre-compile estimate and nothing re-checks the number substituted here, so
     # without this the server starts and then rejects every request.
-    block_size = vllm_config.cache_config.block_size
-    max_model_len = vllm_config.model_config.max_model_len
-    needed = cdiv(max_model_len, block_size)
-    if kv_cache_config.num_blocks >= needed:
+    minimum = minimum_kv_blocks(vllm_config, kv_cache_config)
+    if kv_cache_config.num_blocks >= minimum.needed:
         return
     raise ValueError(
-        f"The KV cache sized from the compiled profile holds "
-        f"{kv_cache_config.num_blocks} blocks, but a single request of "
-        f"max_model_len={max_model_len} needs {needed} at block_size="
-        f"{block_size}. Reduce max_model_len, raise gpu_memory_utilization, or "
-        f"give the model more devices."
+        f"The KV cache sized from the compiled placement holds "
+        f"{kv_cache_config.num_blocks} blocks, but it needs {minimum.needed}: "
+        f"{minimum.one_request} for one request of max_model_len="
+        f"{vllm_config.model_config.max_model_len} across "
+        f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), "
+        f"{minimum.decode_batch} for max_num_seqs="
+        f"{vllm_config.scheduler_config.max_num_seqs} decode steps, plus the null "
+        "block. Reduce max_model_len or max_num_seqs, raise "
+        "gpu_memory_utilization, or give the model more devices."
     )
 
 

@@ -1129,7 +1129,7 @@ class TestComputeDynamicKvNumBlocks:
         # chiplet 1: (35 GiB - 30 GiB) / 2 MiB = 2560 blocks
         assert n == 5 * 512
 
-    def test_a_dry_run_reports_and_resizes_nothing(self, caplog):
+    def test_a_dry_run_reports_and_resizes_nothing(self, caplog, monkeypatch):
         current = 200
         programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0", extent=current)]
         resident = current * 2 * 2**20
@@ -1140,8 +1140,12 @@ class TestComputeDynamicKvNumBlocks:
         worker.cache_config.num_gpu_blocks_override = current
         worker._kv_blocks_before_shrink = None
         worker.model_runner.kv_cache_config.num_blocks = current
-        worker.model_config = SimpleNamespace(max_model_len=8192)
-        worker.cache_config.block_size = 1024
+        worker.vllm_config = SimpleNamespace()
+        monkeypatch.setattr(
+            wm,
+            "minimum_kv_blocks",
+            lambda cfg, kv: SimpleNamespace(one_request=8, decode_batch=1, needed=9),
+        )
         worker._log_dynamic_kv_dry_run = lambda *args: (
             RBLNWorker._log_dynamic_kv_dry_run(worker, *args)
         )
@@ -1160,7 +1164,8 @@ class TestComputeDynamicKvNumBlocks:
         assert (
             "vllm sized 200 blocks, this feature would set 2560 (+2360)" in caplog.text
         )
-        assert "needs 8 blocks, so the count would be accepted" in caplog.text
+        assert "needs 9 (one request 8, decode batch 1, +1 null block)" in caplog.text
+        assert "would be accepted" in caplog.text
         assert "headroom=" in caplog.text
 
     def test_a_dry_run_that_cannot_size_warns_instead_of_raising(self, caplog):

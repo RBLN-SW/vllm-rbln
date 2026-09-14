@@ -18,12 +18,13 @@ import os
 import platform
 from collections import defaultdict
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
-from vllm.config import ModelConfig, ParallelConfig
+from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
@@ -288,6 +289,45 @@ def read_rbln_card_dram_used_bytes() -> int:
         if (value := _read_card_attr_int(card_index, "dram_used")) is not None
     ]
     return max(used, default=0)
+
+
+@dataclass(frozen=True)
+class KvMinimum:
+    """The fewest blocks a KV cache pool can serve with, summed over the KV
+    cache groups that share it."""
+
+    one_request: int
+    decode_batch: int
+
+    @property
+    def needed(self) -> int:
+        # +1: the block pool keeps block 0 as the null block.
+        return 1 + max(self.one_request, self.decode_batch)
+
+
+def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
+    """Blocks one max-length request and one full decode batch need.
+
+    Per group, vLLM's own per-request admission figure (a sliding-window group
+    counts its window plus the unaligned block); the groups draw from one pool,
+    so the sum is what a request takes.
+    """
+    max_model_len = vllm_config.model_config.max_model_len
+    one_request = 0
+    per_seq = 0
+    for group in cfg.kv_cache_groups:
+        spec = group.kv_cache_spec
+        one_request += spec.max_memory_usage_bytes(vllm_config) // spec.page_size_bytes
+        admission = getattr(spec, "max_admission_blocks_per_request", None)
+        per_seq += (
+            admission(max_num_batched_tokens=1, max_model_len=max_model_len)
+            if admission is not None
+            else 1
+        )
+    return KvMinimum(
+        one_request=one_request,
+        decode_batch=vllm_config.scheduler_config.max_num_seqs * per_seq,
+    )
 
 
 def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
