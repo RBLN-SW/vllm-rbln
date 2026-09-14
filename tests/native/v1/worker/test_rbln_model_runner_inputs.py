@@ -24,7 +24,11 @@ import torch
 from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
-from tests.native.v1.worker.utils import make_scheduler_output, schedule_new
+from tests.native.v1.worker.utils import (
+    make_scheduler_output,
+    make_speculative_config,
+    schedule_new,
+)
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -51,7 +55,7 @@ def _decode_ready(
     monkeypatch.setattr(
         runner,
         "speculative_config",
-        SimpleNamespace(method="mtp" if fixed_window else "ngram"),
+        make_speculative_config("mtp" if fixed_window else "ngram"),
     )
     runner._is_prefill_step = False
     assert runner.is_prefill is False
@@ -145,6 +149,34 @@ class TestPrepareInputsFixedWindow:
         assert window_start // self.BLOCK == positions[-1] // self.BLOCK
         assert logits_indices.tolist() == [sample_slot]
         assert runner.seq_lens[:1].tolist() == [num_computed + 1]
+
+    def test_kept_drafts_at_a_block_start_sample_before_the_back_padding(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        _decode_ready(
+            runner, monkeypatch, num_spec_tokens=self.NUM_SPEC, num_computed=self.BLOCK
+        )
+        window = self.NUM_SPEC + 1
+
+        logits_indices, spec_md, query_lengths, total = runner._prepare_inputs(
+            make_scheduler_output(
+                num_scheduled_tokens={"a": 2}, spec_decode_tokens={"a": [11]}
+            ),
+            np.array([2], dtype=np.int32),
+        )
+
+        assert query_lengths.tolist() == [window]
+        assert total == window
+        positions = runner.positions[:window].tolist()
+        assert positions == [self.BLOCK, self.BLOCK + 1, self.BLOCK + 2]
+        assert runner.decode_back_pad_np[0] == 1
+
+        assert spec_md is not None
+        assert spec_md.num_draft_tokens == [1]
+        assert spec_md.logits_indices.tolist() == [0, 1]
+        assert logits_indices.tolist() == [0, 1]
+        assert runner.seq_lens[:1].tolist() == [self.BLOCK + 2]
 
 
 class TestBookkeepingSyncSpecDecode:

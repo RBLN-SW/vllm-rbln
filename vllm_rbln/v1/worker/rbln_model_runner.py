@@ -3248,7 +3248,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if self.speculative_config is None:
             return False
-        return self.speculative_config.method in ("eagle", "eagle3", "mtp")
+        return self.speculative_config.use_eagle()
 
     @property
     def is_prefill(self) -> bool:

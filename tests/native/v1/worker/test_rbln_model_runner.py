@@ -40,6 +40,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
+from tests.native.v1.worker.utils import make_speculative_config
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
@@ -1095,13 +1096,35 @@ class TestDummyRunDecodeWindowPadding:
         assert seen == [self.NUM_REQS * expected_tokens]
 
 
+class TestUsesFixedDecodeWindow:
+    @pytest.mark.parametrize(
+        "method, expected",
+        [
+            ("eagle", True),
+            ("eagle3", True),
+            ("mtp", True),
+            ("ngram", False),
+            ("suffix", False),
+            ("medusa", False),
+            ("dflash", True),
+        ],
+    )
+    def test_only_a_model_based_drafter_fixes_the_window(self, method, expected):
+        runner = _make_runner_stub(speculative_config=make_speculative_config(method))
+        assert runner.uses_fixed_decode_window is expected
+
+    def test_no_speculative_config_has_no_window(self):
+        runner = _make_runner_stub(speculative_config=None)
+        assert runner.uses_fixed_decode_window is False
+
+
 class TestFixedDecodeWindowConfig:
     @staticmethod
     def _runner(max_model_len, num_spec_tokens, block_size=1024, method="mtp"):
         return _make_runner_stub(
             max_model_len=max_model_len,
             num_spec_tokens=num_spec_tokens,
-            speculative_config=SimpleNamespace(method=method),
+            speculative_config=make_speculative_config(method),
             cache_config=SimpleNamespace(block_size=block_size),
         )
 
@@ -1396,7 +1419,7 @@ class TestDummyRunDraftParticipation:
         attrs = dict(
             max_num_tokens=64,
             max_num_reqs=8,
-            speculative_config=SimpleNamespace(method="eagle"),
+            speculative_config=make_speculative_config("eagle"),
             num_spec_tokens=cls.NUM_SPEC,
             query_start_loc_np=np.zeros(16, dtype=np.int32),
             input_ids=torch.zeros(64, dtype=torch.int32),
