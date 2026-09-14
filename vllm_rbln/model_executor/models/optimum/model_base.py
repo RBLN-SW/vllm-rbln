@@ -320,11 +320,12 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
         of the decoder's full batch.
         """
         num_reqs = cache_slot_ids.shape[0]
-        if self.use_multiple_decoder:
-            return select_bucket_size(num_reqs, self.decoder_batch_sizes), slice(
-                0, num_reqs
-            )
-        return self.decoder_batch_size, slice(0, num_reqs)
+        padded_batch_size = (
+            select_bucket_size(num_reqs, self.decoder_batch_sizes)
+            if self.use_multiple_decoder
+            else self.decoder_batch_size
+        )
+        return padded_batch_size, slice(0, num_reqs)
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder

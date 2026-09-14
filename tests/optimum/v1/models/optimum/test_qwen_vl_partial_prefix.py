@@ -88,6 +88,63 @@ def _qwen3_self():
     return obj
 
 
+class TestDecodePositionEmbed:
+    @staticmethod
+    def _qwen_vl_with_recording_rotary(recorded: dict) -> QwenVL:
+        # The base class is abstract; Qwen3-VL inherits this method unchanged.
+        obj = Qwen3VL.__new__(Qwen3VL)
+
+        def fake_position_embeddings(hidden_states, position_ids):
+            recorded["position_ids"] = position_ids
+            # cos/sin stand-in carrying the position: [2, num_reqs, 1, 1].
+            return position_ids[0].view(1, -1, 1, 1).expand(2, -1, -1, -1).clone()
+
+        obj.model = types.SimpleNamespace(
+            _get_position_embeddings=fake_position_embeddings,
+            rbln_config=types.SimpleNamespace(dtype=torch.float32),
+        )
+        return obj
+
+    def test_pinned_rows_are_embedded_in_one_call_and_scattered_back(self):
+        # B sits on row 1 at position 5, A on row 0 at position 7; the step runs
+        # them as [B, A]. Every request's position goes through the rotary
+        # embedding at once, and each lands back on its own row.
+        recorded: dict = {}
+        obj = self._qwen_vl_with_recording_rotary(recorded)
+        model_input = types.SimpleNamespace(
+            running_requests_ids=["B", "A"],
+            padded_batch_size=2,
+            batch_rows=torch.tensor([1, 0]),
+            input_positions=torch.tensor([[7], [5]], dtype=torch.int32),
+        )
+
+        out = obj.compute_decode_position_embed(model_input, {"A": 2.0, "B": -1.0})
+
+        position_ids = recorded["position_ids"]
+        assert position_ids.shape == (3, 2, 1)
+        assert position_ids[0, :, 0].tolist() == [4.0, 9.0]  # B: 5-1, A: 7+2
+        assert torch.equal(position_ids[0], position_ids[1])
+        assert torch.equal(position_ids[0], position_ids[2])
+        assert out.shape == (2, 2, 1, 1)
+        assert out[0, 1, 0, 0] == 4.0 and out[0, 0, 0, 0] == 9.0
+
+    def test_running_order_rows_leave_the_padding_rows_zero(self):
+        recorded: dict = {}
+        obj = self._qwen_vl_with_recording_rotary(recorded)
+        model_input = types.SimpleNamespace(
+            running_requests_ids=["A", "B"],
+            padded_batch_size=4,
+            batch_rows=slice(0, 2),
+            input_positions=torch.tensor([[7], [5], [0], [0]], dtype=torch.int32),
+        )
+
+        out = obj.compute_decode_position_embed(model_input, {"A": 2.0, "B": -1.0})
+
+        assert recorded["position_ids"].shape == (3, 2, 1)
+        assert out[0, :2, 0, 0].tolist() == [9.0, 4.0]
+        assert (out[:, 2:] == 0).all()
+
+
 class TestMmEmbedTailStarts:
     def test_split_image_and_uncached_image(self):
         # imgA pads [15, 411) is split by the boundary at 384 -> its tail starts

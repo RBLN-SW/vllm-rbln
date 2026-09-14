@@ -503,22 +503,19 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         row, zeros in the padding rows. Mirrors upstream vLLM's
         ``get_next_input_positions_tensor``.
         """
-        cache_position = model_input.input_positions
-        running_requests_ids = model_input.running_requests_ids
         rows = model_input.batch_rows
-        row_ids = torch.arange(model_input.padded_batch_size)[rows].tolist()
-
-        position_embeds = []
-        for row, request_id in zip(row_ids, running_requests_ids):
-            delta = cache_position[row] + mrope_position_deltas[request_id]
-            position_ids = torch.arange(1).view(1, -1)
-            position_ids = position_ids.add(delta)
-            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-            position_embed = self.model._get_position_embeddings(
-                torch.zeros(1, dtype=self.dtype), position_ids
-            )
-            position_embeds.append(position_embed)
-        embeds = torch.cat(position_embeds, dim=1)
+        deltas = torch.tensor(
+            [
+                mrope_position_deltas[req_id]
+                for req_id in model_input.running_requests_ids
+            ]
+        )
+        positions = model_input.input_positions[rows, 0] + deltas
+        # [num_reqs] -> [3, num_reqs, 1]: one position, repeated on the 3 MRoPE axes.
+        position_ids = positions.view(1, -1, 1).expand(3, -1, -1)
+        embeds = self.model._get_position_embeddings(
+            torch.zeros(1, dtype=self.dtype), position_ids
+        )
 
         shape = list(embeds.shape)
         shape[1] = model_input.padded_batch_size
