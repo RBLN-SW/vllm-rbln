@@ -67,6 +67,10 @@ def _push_worker():
     # the shape the pairing predicates read before an engine is registered.
     w.use_host_buffer = False
     w._sw_ratio = None
+    # get_finished() reaches the peer-recovery bookkeeping on the way through.
+    w._engines_to_rehandshake = set()
+    w._reconnect_backoff = {}
+    w._recving_transfers = {}
     # __init__ never ran, so the writer state shutdown() reaches through
     # __del__ is absent; silence it rather than leak an unraisable at GC.
     w.shutdown = lambda: None

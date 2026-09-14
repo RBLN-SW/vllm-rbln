@@ -15,6 +15,7 @@
 import time
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -74,6 +75,10 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+# A peer that stays down is re-dialled on this backoff, not once per request.
+_RECONNECT_BASE_S = 5.0
+_RECONNECT_CAP_S = 30.0
 
 
 def _as_descs(blocks_data: list[tuple[int, int, int]]) -> np.ndarray:
@@ -201,6 +206,10 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # engine_id -> the producer stages (flat global ranks) whose layers this
         # rank owns; the per-shard transfer path walks exactly these.
         self._overlapping_ranks: defaultdict[str, list[int]] = defaultdict(list)
+        # Peers whose transfer failed: dropped once their handles drain,
+        # then probed in the background on (failed probes, next probe).
+        self._engines_to_rehandshake: set[str] = set()
+        self._reconnect_backoff: dict[str, tuple[int, float]] = {}
         # Per producer shard, a local xfer dlist scoped to that shard's local
         # region subset, keyed by (engine_id, global_rank, block_size); and the
         # shard's per-region KV-group ids, keyed by (engine_id, global_rank).
@@ -2363,8 +2372,8 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             peers *= max(1, local_pp // remote_pp)
         return f"{remote_request_id}:{peers * remote_tp_size}".encode()
 
-    # TODO(vllm-project/vllm#54518): delete both overrides once a pinned vLLM
-    # carries eb74fbb3.
+    # TODO(vllm-project/vllm#54518): delete _pop_done_transfers, and the
+    # report-once guard below, once a pinned vLLM carries eb74fbb3.
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
         # A request that failed in an earlier poll was already reported through
         # _failed_recv_reqs and get_finished() popped its metadata; the poll
@@ -2377,9 +2386,70 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # poll. The first failure reports the request; the later ones are left
         # with the handle cleanup only.
         if (meta := self._recving_metadata.get(req_id)) is not None:
-            if not self._is_hma_required:
+            # A full local prefix hit leaves nothing to invalidate.
+            if not self._is_hma_required and meta.local_block_ids:
                 self._invalid_block_ids.put(set(meta.local_block_ids[0]))
             self._failed_recv_reqs.put(req_id)
+            assert meta.remote is not None
+            self._mark_unreachable(meta.remote.engine_id)
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
+
+    def _mark_unreachable(self, engine_id: str) -> None:
+        # Only the first failure after a probe is that probe's outcome; the
+        # sibling ranks and the requests behind them are one outage. A failure
+        # long after the last one is a new outage, and probes at once.
+        probes, probe_at = self._reconnect_backoff.get(engine_id, (0, 0.0))
+        now = time.perf_counter()
+        if engine_id not in self._engines_to_rehandshake and now >= probe_at:
+            if now > probe_at + _RECONNECT_CAP_S:
+                probes = 0
+            delay = min(_RECONNECT_BASE_S * probes, _RECONNECT_CAP_S)
+            self._reconnect_backoff[engine_id] = (probes + 1, now + delay)
+        self._engines_to_rehandshake.add(engine_id)
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        done = super().get_finished()
+        # Upstream re-dials only an engine it does not know, and a dead peer
+        # stays known: every read refreshes its TTL on the way to failing. Drop
+        # it, but not under a live handle, nor one whose owner is unknown.
+        # Nothing is pending on the healthy path, and the scan is per step.
+        if self._engines_to_rehandshake:
+            busy: set[str | None] = set()
+            for req_id, handles in self._recving_transfers.items():
+                if handles:
+                    meta = self._recving_metadata.get(req_id)
+                    busy.add(meta.remote.engine_id if meta and meta.remote else None)
+            if None not in busy:
+                for engine_id in self._engines_to_rehandshake.difference(busy):
+                    if engine_id in self._remote_agents:
+                        self._cleanup_remote_engine(engine_id, log_eviction=False)
+                        logger.warning(
+                            "Re-handshaking unreachable engine %s.", engine_id
+                        )
+                self._engines_to_rehandshake.intersection_update(busy)
+        return done
+
+    def _ensure_handshake(
+        self,
+        engine_id: str,
+        host: str,
+        port: int,
+        tp_size: int,
+        pp_size: int = 1,
+        notif_agents_only: bool = False,
+    ) -> Future[tuple[dict[tuple[int, int], str], float]] | None:
+        # A down peer owes no request the dial's timeout: probe in the
+        # background and fail this one now, so it recomputes at once and a
+        # later one finds the peer handshaked.
+        _, probe_at = self._reconnect_backoff.get(engine_id, (0, 0.0))
+        now = time.perf_counter()
+        args = (engine_id, host, port, tp_size, pp_size, notif_agents_only)
+        if engine_id in self._remote_agents or now > probe_at + _RECONNECT_CAP_S:
+            return super()._ensure_handshake(*args)
+        if now >= probe_at:
+            super()._ensure_handshake(*args)
+        deferred: Future[tuple[dict[tuple[int, int], str], float]] = Future()
+        deferred.set_exception(RuntimeError(f"engine {engine_id} is down"))
+        return deferred
