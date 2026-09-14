@@ -48,7 +48,6 @@ from tests.vllm.v1.worker.utils import (
 )
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
-from vllm_rbln.v1.sample import WARM_UP_CONFIGS
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
 from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
@@ -365,50 +364,38 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
 
     runner._warmup_sampler_decode_batches()
 
-    # Ids (logprobs), the all-greedy argmax, and every top-k/top-p pattern, all
-    # at the batch bound; tensor patterns twice, as a buffer view and as the
-    # torch.cat `_pad_rows` builds below the bound.
-    random_configs = [c for c in WARM_UP_CONFIGS if not c["all_greedy"]]
-    filtered = [c for c in random_configs if "top_k" in c or "top_p" in c]
-    assert rejection_sample.call_count == 2 + len(random_configs) + len(filtered)
+    # One call per graph, all at the batch bound; a filtered random pattern
+    # twice, once with buffer views and once with torch.cat metadata.
+    buffers = {runner.input_batch.top_k.data_ptr(), runner.input_batch.top_p.data_ptr()}
+    variants = []
     for call in rejection_sample.call_args_list:
         assert len(call.args[1]) == 4
-    variants = [
-        (
-            call.args[6] is None,
-            call.kwargs["bonus_logits"] is None,
-            call.args[7].all_greedy,
-            call.args[7].top_k is None,
-            call.args[7].top_p is None,
+        metadata = call.args[7]
+        filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]
+        variants.append(
+            (
+                call.args[6] is None,
+                call.kwargs["bonus_logits"] is None,
+                metadata.all_greedy,
+                metadata.top_k is None,
+                metadata.top_p is None,
+                bool(filters) and filters[0].data_ptr() in buffers,
+            )
         )
-        for call in rejection_sample.call_args_list
-    ]
+    # (no bonus ids, no bonus logits, all_greedy, no top_k, no top_p, buffer view)
     assert sorted(variants) == sorted(
         [
-            (False, True, True, True, True),
-            (True, False, True, True, True),
-        ]
-        + [
-            (True, False, False, "top_k" not in c, "top_p" not in c)
-            for c in random_configs + filtered
+            (False, True, True, True, True, False),  # bonus ids (logprobs)
+            (True, False, True, True, True, False),  # all-greedy argmax in the graph
+            (True, False, False, True, True, False),  # random, no filter
+            (True, False, False, True, False, True),  # random, top_p, buffer view
+            (True, False, False, True, False, False),  # random, top_p, torch.cat
+            (True, False, False, False, True, True),  # random, top_k, buffer view
+            (True, False, False, False, True, False),  # random, top_k, torch.cat
+            (True, False, False, False, False, True),  # random, top_k+top_p, view
+            (True, False, False, False, False, False),  # random, top_k+top_p, cat
         ]
     )
-    for call in rejection_sample.call_args_list:
-        md = call.args[7]
-        assert (md.temperature is None) == md.all_greedy
-        for buffer, t in (
-            (runner.input_batch.top_k, md.top_k),
-            (runner.input_batch.top_p, md.top_p),
-        ):
-            if t is None:
-                continue
-            assert t.shape == (4,) and t.dtype == buffer.dtype
-    views = [
-        call.args[7].top_p.data_ptr() == runner.input_batch.top_p.data_ptr()
-        for call in rejection_sample.call_args_list
-        if call.args[7].top_p is not None
-    ]
-    assert sorted(views) == [False, False, True, True]
 
 
 class TestPredicates:

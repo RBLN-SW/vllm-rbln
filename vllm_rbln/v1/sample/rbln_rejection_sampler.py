@@ -117,17 +117,15 @@ class RBLNRejectionSampler(RejectionSampler):
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
-        # Both selections create new storage, so they are safe to update in
-        # place; `index_select` is the cheaper gather on the device.
+        # Indexing with a tensor creates new storage, so both slices below are
+        # safe to update in place.
         assert logits is not None
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         raw_target_logits = torch.index_select(logits, 0, target_logits_indices)
 
         output_logprobs_requested = sampling_metadata.max_num_logprobs is not None
         bonus_token_ids = None
-        # The graph draws the bonus token unless logprobs need the sampler's
-        # logits or an active argmax-invariant processor (min-p) reshapes the
-        # rows before the draw; the activity test is `RBLNSampler.sample`'s.
+
         bonus_in_graph = (
             isinstance(self.impl, RBLNRejectionSamplerImpl)
             and not output_logprobs_requested
@@ -483,8 +481,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 vocab_size,
                 device,
             )
-            # The metadata tensors also feed the bonus sampler's graph; a
-            # graph's inputs must be its own buffers.
+
             if top_k is not None:
                 top_k = bufs["top_k"].copy_(top_k)
             if top_p is not None:
@@ -504,7 +501,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                     temperature,
                 )
             if bonus_logits is not None:
-                # Per-row temperature for the in-graph bonus draw.
                 bonus_temperature = bufs["bonus_temperature"]
                 bonus_temperature.copy_(temperature)
             if padded_len == N:
@@ -646,7 +642,7 @@ def rbln_rejection_sample(
         positions_k1 == num_draft_tokens.unsqueeze(1)
     )
     if bonus_logits is not None and bonus_temperature is not None:
-        # The bonus sampler's draw; a greedy row's top_k == 1 makes it an argmax.
+        # The bonus sampler's draw;
         bonus_probs = torch.softmax(
             bonus_logits / bonus_temperature.unsqueeze(1), dim=-1
         )
