@@ -1149,6 +1149,7 @@ class TestComputeDynamicKvNumBlocks:
         worker._log_dynamic_kv_dry_run = lambda *args: (
             RBLNWorker._log_dynamic_kv_dry_run(worker, *args)
         )
+        worker._probe_dynamic_kv_num_blocks = lambda n, current: None
         worker._dynamic_kv_num_blocks_from_placement = lambda: (
             RBLNWorker._dynamic_kv_num_blocks_from_placement(worker)
         )
@@ -1167,6 +1168,39 @@ class TestComputeDynamicKvNumBlocks:
         assert "needs 9 (one request 8, decode batch 1, +1 null block)" in caplog.text
         assert "would be accepted" in caplog.text
         assert "headroom=" in caplog.text
+
+    def test_a_dry_run_probes_the_proposed_count_and_restores(self):
+        calls: list = []
+        worker = SimpleNamespace(
+            _reallocate_kv_cache=lambda n: calls.append(("realloc", n)),
+            _materialize_kv_cache=lambda: calls.append(("materialize",)),
+            _log_dynamic_kv_fit_check=lambda n: calls.append(("check", n)),
+        )
+        RBLNWorker._probe_dynamic_kv_num_blocks(worker, 58, 26)
+        assert calls == [
+            ("realloc", 58),
+            ("materialize",),
+            ("check", 58),
+            ("realloc", 26),
+        ]
+
+    def test_a_failed_probe_restores_and_warns(self, caplog):
+        calls: list = []
+
+        def boom(n):
+            calls.append(("realloc", n))
+            if n == 58:
+                raise RuntimeError("out of device memory")
+
+        worker = SimpleNamespace(
+            _reallocate_kv_cache=boom,
+            _materialize_kv_cache=lambda: calls.append(("materialize",)),
+            _log_dynamic_kv_fit_check=lambda n: calls.append(("check", n)),
+        )
+        with caplog.at_level("WARNING"):
+            RBLNWorker._probe_dynamic_kv_num_blocks(worker, 58, 26)
+        assert calls == [("realloc", 58), ("realloc", 26)]
+        assert "could not be allocated and run" in caplog.text
 
     def test_a_dry_run_that_cannot_size_warns_instead_of_raising(self, caplog):
         worker = self._worker(programs=[_program([])], snapshot=self._snapshot([0] * 4))

@@ -103,6 +103,10 @@ carry the result:
   base, the budget, and the headroom left in bytes and blocks. A negative
   headroom means the current count already exceeds `total * gpu_memory_utilization`
   on that chiplet.
+- then a probe: the cache is reallocated at `n` once, a decode step runs on it,
+  and the fit check line (`expected` vs `measured` per chiplet, `budget_left`)
+  shows how full each chiplet really is at the proposed count; the cache is put
+  back at `N` afterwards. A probe that cannot allocate or run is a warning.
 
 Unsupported configurations are refused in a dry run too, since the refusals
 guard the dynamic compile itself. A sizing failure after warm-up (no placement,
