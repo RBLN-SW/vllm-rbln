@@ -507,10 +507,11 @@ class RBLNOptimumModelRunner(
 
     @staticmethod
     def mask_block_table(block_ids: torch.Tensor, num_blocks: int) -> torch.Tensor:
-        """Mask (pad) unused block slots in-place.
+        """Shift a block-table row to compiler ids and zero its unused tail.
 
-        Sets entries beyond `num_blocks` to 0. Padding must be a valid block id:
-        the attention kernel reads every slot of a live partition.
+        Slots from index `num_blocks` on are set to compiler block 0. Padding must
+        be a valid block id: the attention kernel reads every slot of a live
+        partition.
         """
         if num_blocks < 0:
             raise ValueError("num_blocks must be >= 0")

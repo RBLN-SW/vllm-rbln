@@ -134,9 +134,8 @@ def test_mask_block_table_fills_unused_slots_with_zero():
 
     out = RBLNOptimumModelRunner.mask_block_table(block_ids, num_blocks=4)
 
-    # Shifted to compiler ids; the tail is 0, never -1: the in-memory attention
-    # kernel reads block_table[row, p] for every row of a live partition, and a
-    # -1 there is an out-of-range KV-cache DMA.
+    # Shifted to compiler ids; the unused tail is compiler block 0, a valid
+    # block, because the attention kernel reads every slot of a live partition.
     assert out.tolist() == [6, 8, 11, 14, 0, 0, 0, 0]
 
 
