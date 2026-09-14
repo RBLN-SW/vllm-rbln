@@ -42,9 +42,8 @@ class KVCacheViewInfo:
     view_shape: tuple[int, ...] | None = None
     permute_order: tuple[int, ...] | None = None
     select_index: int | None = None
-    # Axis of `view_shape` derived from the base at view time, so a base whose
-    # num_blocks is dynamic is not specialized by the static shape. The extent
-    # is base.shape[axis] * num / den with (num, den) = dynamic_scale.
+    # Axis of `view_shape` taken from the base at view time, scaled by
+    # dynamic_scale = (num, den), so a dynamic num_blocks is not specialized.
     dynamic_axis: int | None = None
     dynamic_scale: tuple[int, int] = (1, 1)
 

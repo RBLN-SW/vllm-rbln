@@ -247,9 +247,8 @@ def sub_block_size_in_use(
     kv_cache_config: KVCacheConfig,
     sub_block_size: int | None = None,
 ) -> int | None:
-    """The sub-block size prefix caching runs at, or None when the scheduler
-    stays on vLLM's manager. The default sub-block is the prefill chunk
-    (`max_num_batched_tokens`), so one prefill never spans two blocks."""
+    """The sub-block size prefix caching runs at (default: the prefill chunk),
+    or None when the scheduler stays on vLLM's manager."""
     # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
     from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 

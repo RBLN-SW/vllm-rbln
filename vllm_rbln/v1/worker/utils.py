@@ -239,13 +239,8 @@ def _read_card_attr_int(card_index: int, attr: str) -> int | None:
 
 
 def rbln_device_dram_total_bytes() -> int | None:
-    """Device DRAM capacity in bytes from `torch.rbln.get_device_properties()`,
-    or None when it cannot be answered.
-
-    Clamped to `REBEL_DRAM_NBYTES` here rather than at the call sites, because
-    they size real allocations from this number. The query does not claim the
-    device, so it is safe before the runtime initializes.
-    """
+    """Device DRAM capacity from `torch.rbln.get_device_properties()`, clamped
+    to `REBEL_DRAM_NBYTES`; None when it cannot be answered."""
     try:
         import torch.rbln
     except ImportError:
@@ -294,8 +289,7 @@ def read_rbln_card_dram_used_bytes() -> int:
 
 @dataclass(frozen=True)
 class KvMinimum:
-    """The fewest blocks a KV cache pool can serve with, summed over the KV
-    cache groups that share it."""
+    """The fewest blocks a KV cache pool can serve with."""
 
     one_request: int
     decode_batch: int
@@ -307,12 +301,8 @@ class KvMinimum:
 
 
 def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
-    """Blocks one max-length request and one full decode batch need.
-
-    Per group, vLLM's own per-request admission figure (a sliding-window group
-    counts its window plus the unaligned block); the groups draw from one pool,
-    so the sum is what a request takes.
-    """
+    """Blocks one max-length request and one full decode batch need, summed over
+    the groups sharing the pool."""
     max_model_len = vllm_config.model_config.max_model_len
     one_request = 0
     per_seq = 0
@@ -507,8 +497,7 @@ def estimate_available_memory(
         rsd_size = REBEL_CHIPLET_SIZE
         available_dram_bytes = REBEL_DRAM_NBYTES
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            # Flag-gated: reading the device would tie the default path's KV
-            # size to a driver release, which is not this feature's to decide.
+            # Flag-gated: the default path's estimate must not depend on the driver.
             device_dram_total = rbln_device_dram_total_bytes()
             if device_dram_total is None:
                 logger.debug(

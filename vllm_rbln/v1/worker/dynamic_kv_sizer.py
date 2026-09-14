@@ -11,13 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Placement-based sizing of the KV cache (`VLLM_RBLN_USE_DYNAMIC_KV_CACHE`).
-
-The worker compiles against a small KV cache, captures the programs warm-up
-builds, sizes the pool from their placement and a per-chiplet memory snapshot,
-and reallocates. This module is that state machine; `kv_placement` holds the
-arithmetic and the worker keeps only the hooks that call in here.
-"""
+"""Placement-based sizing of the KV cache (`VLLM_RBLN_USE_DYNAMIC_KV_CACHE`):
+the state machine; `kv_placement` holds the arithmetic."""
 
 import copy
 import gc
@@ -73,10 +68,8 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class KvSizing:
-    """One rank's placement-based count: the blocks that fit, the per-unit fit
-    behind it, the hint the programs were traced with and the growth they
-    imply. `if_resident` is the count if the compile-time cache stays resident,
-    reported only when it could not be released first."""
+    """One rank's count and the fit behind it; `if_resident` only when the
+    compile-time cache could not be released first."""
 
     num_blocks: int
     fits: dict[Unit, UnitFit]
@@ -85,15 +78,12 @@ class KvSizing:
     if_resident: int | None = None
 
 
-# Trace hint for the mark_dynamic'd KV dim, not a capacity: dynamo specializes
-# a smaller dim away, and below this artifacts abort on device at larger
-# max_num_batched_tokens.
+# Trace hint for the mark_dynamic'd KV dim, not a capacity; dynamo specializes
+# a smaller dim away.
 COMPILE_KV_CACHE_NUM_BLOCKS = 4
-# Allocator-snapshot fallback only: device memory the caching allocator never
-# sees (the runtime's direct allocations, e.g. command streams).
+# Allocator-snapshot fallback only: runtime allocations the allocator never sees.
 DYNAMIC_KV_ALLOCATOR_RESERVE_BYTES = 48 * 1024 * 1024
-# Sub-block prefix caching copies partial blocks with command streams the
-# runtime uploads per request; keep this much per chiplet out of the KV budget.
+# Per chiplet, for the copy command streams sub-block prefix caching uploads.
 DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES = 64 * 1024 * 1024
 
 
@@ -107,9 +97,8 @@ def kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
 
 def empty_rbln_device_caches() -> bool:
     """Return every *free* block the rbln caching allocator holds to the driver."""
-    # NOTE(RBLN): the allocator otherwise releases cached blocks only as a retry
-    # after an allocation fails, so freed bytes keep counting in sysfs
-    # `dram_used`. Never raises: this runs during start-up.
+    # The allocator otherwise releases cached blocks only after a failed
+    # allocation, so freed bytes keep counting in `dram_used`. Never raises.
     if not has_torch_rbln:
         return False
     try:
@@ -140,23 +129,15 @@ def empty_rbln_device_caches() -> bool:
 
 class DynamicKvSizer:
     """The worker's dynamic-KV state machine: shrink -> capture -> snapshot ->
-    size -> release -> reallocate -> materialize -> check.
-
-    Holds the latch (`kv_blocks_before_shrink`), the captured programs and the
-    predicted usage; reads the worker's configs, model runner and device.
-    """
+    size -> release -> reallocate -> materialize -> check."""
 
     def __init__(self, worker: "RBLNWorker") -> None:
         self.worker = worker
-        # num_blocks vLLM sized the cache with, stashed while it is shrunk for
-        # the compile. None when no shrink is pending.
+        # The count vLLM sized, held while the cache is shrunk for the compile.
         self.kv_blocks_before_shrink: int | None = None
-        # Programs warm-up built, captured for the sizing.
         self.programs: list[Any] = []
-        # Per-unit `used` the sizing predicts once the cache is reallocated.
         self.expected_used: dict[Unit, int] = {}
-        # Other tenants' device DRAM, sampled before this worker allocates
-        # anything. Card-scope; only the allocator-snapshot fallback reads it.
+        # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
         self.foreign_dram_used_bytes = 0
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             self.foreign_dram_used_bytes = read_rbln_card_dram_used_bytes()
@@ -203,11 +184,8 @@ class DynamicKvSizer:
         )
 
     def pre_compile_estimate(self, estimate_kwargs: dict[str, Any]) -> int:
-        """The KV bytes vllm sizes the compile-time cache from: the whole-card
-        formula fed the per-chiplet snapshot on a real device, and never below
-        one max-length request, since under the flag the estimate is only the
-        placeholder the model is compiled with and the device sizes the pool
-        after warm-up."""
+        """The bytes vllm sizes the compile-time cache from: the estimate fed
+        the per-chiplet snapshot on a real device, floored at one request."""
         if not torch.rbln.is_dummy_device():
             snapshot, source = self.memory_snapshot(self.device)
             if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
@@ -236,8 +214,8 @@ class DynamicKvSizer:
             for spec in self.worker.get_kv_cache_spec().values()
         )
         if estimate < one_request:
-            # vllm refuses a pool below one max-length request against this
-            # estimate; the count the device can hold is sized after warm-up.
+            # vllm refuses a pool below one request against this estimate; the
+            # real count is sized from the device after warm-up.
             logger.warning(
                 "[Dynamic KV] the pre-compile estimate (%.2f GiB) is short of one "
                 "max-length request (%.2f GiB); raising it to that so the compile "
@@ -250,17 +228,13 @@ class DynamicKvSizer:
         return estimate
 
     def shrink_for_compile(self, kv_cache_config: KVCacheConfig) -> KVCacheConfig:
-        """Return a small-KV-cache copy of the config, or it unchanged.
-
-        The cache allocated here is what `warmup_model()` traces, so its
-        `num_blocks` becomes the hint of the `mark_dynamic`'d dim.
-        """
+        """A small-KV-cache copy of the config, or it unchanged; its
+        `num_blocks` is the hint warm-up traces the dynamic dim with."""
         if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
             return kv_cache_config
         skip_reason = self.worker._compile_and_warmup_skip_reason()
         if skip_reason is not None:
-            # Nothing compiles, so no artifact carries a profile: shrinking
-            # anyway would set the latch and then find no runtimes to resize.
+            # Nothing compiles, so a shrink would set the latch with nothing to resize.
             logger.warning(
                 "[Dynamic KV] compile/warm-up is skipped (%s), so the cache stays "
                 "at the estimated %d blocks and this feature does nothing for "
@@ -287,9 +261,8 @@ class DynamicKvSizer:
             return kv_cache_config
         compile_num_blocks = COMPILE_KV_CACHE_NUM_BLOCKS
         if compile_num_blocks >= kv_cache_config.num_blocks:
-            # Cancelling the shrink cancels the resize too, so serving on would
-            # leave the run on the pre-compile estimate -- #42 reproducing
-            # silently, with nobody having asked for it. Refuse instead.
+            # No shrink means no resize: the run would silently serve the
+            # pre-compile estimate. Refuse instead.
             raise RuntimeError(
                 f"the {compile_num_blocks}-block compile hint is not below the "
                 f"{kv_cache_config.num_blocks} blocks vllm estimated, so there is "
@@ -308,14 +281,9 @@ class DynamicKvSizer:
         return shrunk
 
     def assert_attention_layout(self) -> None:
-        """Guard: every attention layer must dispatch to a paged naive kernel the
-        compiler admits a dynamic KV input for (flash causal or sliding window).
-
-        i.e. `is_causal` True and `is_normal` False; `is_normal` becomes True
-        when `block_size == max_model_len`. Lives in the worker, not platform
-        config validation: `get_layers_from_vllm_config` reads
-        `static_forward_context`, which only the model build fills.
-        """
+        """Every attention layer must dispatch to a paged causal or sliding-window
+        naive kernel (`is_causal`, not `is_normal`). Runs here, not in platform
+        validation: the layers exist only after the model build."""
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         offenders: list[str] = []
         for layer_name, layer in attn_layers.items():
@@ -335,13 +303,12 @@ class DynamicKvSizer:
             )
 
     def assert_cache_layout(self) -> None:
-        """Guard: the KV bindings must satisfy the compiler's dynamic-input rules."""
-        # NOTE(RBLN): reads state `initialize_kv_cache` fills, so moving it
-        # earlier makes it pass vacuously.
+        """The KV bindings must satisfy the compiler's dynamic-input rules; reads
+        state `initialize_kv_cache` fills."""
         mr = self.model_runner
 
-        # NOTE(RBLN): the compiler admits a dynamic input through view ops into
-        # several paged attention calls, but not the same view into two calls.
+        # The compiler admits a dynamic input through view ops into several
+        # attention calls, but not the same view into two calls.
         if mr.shared_kv_cache_layers:
             raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support cross-layer KV "
@@ -361,12 +328,7 @@ class DynamicKvSizer:
         return torch.rbln.capture_programs()
 
     def collect_runtimes(self) -> list[Any]:
-        """Every rbln runtime warm-up built; each KV-holding one binds a slice of
-        the KV cache.
-
-        Spec decode, the only other producer of KV-holding runtimes, is refused
-        under this flag.
-        """
+        """Every rbln runtime warm-up built, deduplicated across programs."""
         runtimes: list[Any] = []
         seen: set[int] = set()
         for program in self.programs:
@@ -380,13 +342,8 @@ class DynamicKvSizer:
     def memory_snapshot(
         self, device: torch.device
     ) -> tuple[dict[Unit, ChipletMemory], str]:
-        """Per-(node, chiplet) `(total, used)` of the device, and where it came from.
-
-        The driver's figures (`mem_get_info_per_chiplet`) see every process and
-        every allocation. Without them -- an older UMD/KMD or torch_rbln -- this
-        process's caching allocator stands in, topped up with the reserve and the
-        other tenants' usage sampled at init.
-        """
+        """Per-(node, chiplet) `(total, used)` and its source: the driver, or
+        this process's allocator plus the reserve and the foreign usage."""
         rbln = torch.rbln
         query = getattr(rbln, "mem_get_info_per_chiplet", None)
         if query is not None:
@@ -404,8 +361,7 @@ class DynamicKvSizer:
                 "[Dynamic KV] this torch_rbln has no mem_get_info_per_chiplet(); "
                 "sizing from this process's allocator instead."
             )
-        # The runtime hands cached-but-free blocks back only on a failed
-        # allocation, so they would otherwise count as used here.
+        # Cached-but-free blocks would otherwise count as used.
         rbln.empty_cache(device)
         memory_per_chiplet = int(rbln.get_device_properties(device).memory_per_chiplet)
         snapshot = snapshot_from_allocator(
@@ -438,13 +394,8 @@ class DynamicKvSizer:
         return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES if in_use is not None else 0
 
     def compute_num_blocks(self) -> int | None:
-        """How many KV blocks fit this device, from the compiled placement and a
-        memory snapshot taken with the compile-time cache resident.
-
-        Runs after warm-up and reallocates nothing; the engine takes the minimum
-        across ranks and hands it back through `apply_num_blocks`.
-        None means the path is not in play.
-        """
+        """How many KV blocks fit this device, from the placement and a memory
+        snapshot. Reallocates nothing; None means the path is not in play."""
         dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
         if not dry_run and self.cache_config.num_gpu_blocks_override is not None:
             logger.info(
@@ -469,8 +420,7 @@ class DynamicKvSizer:
             return None
 
         if torch.rbln.is_dummy_device():
-            # A compile-only run has no device memory to size against; the
-            # count stays at the estimate and the device run sizes for real.
+            # Compile-only: no device memory to size against.
             logger.warning(
                 "[Dynamic KV] RBLN_DUMMY_DEVICE is set, so there is no device to "
                 "measure; keeping the %d blocks vllm estimated for this compile-only "
@@ -500,7 +450,6 @@ class DynamicKvSizer:
         programs = list(self.programs)
         groups = select_kv_input_groups(programs)
         hint_blocks = self.model_runner.kv_cache_config.num_blocks
-        # The only record of the per-shard extents.
         for group_specs, group_program in groups:
             logger.info(
                 "[Dynamic KV] KV placement from %s (%d program(s) captured, %d KV "
@@ -526,8 +475,7 @@ class DynamicKvSizer:
         kv_resident: Mapping[Unit, int],
     ) -> tuple[int, dict[Unit, UnitFit], dict[Unit, ChipletMemory], int]:
         """Snapshot the device and size against it; `kv_resident` is what the
-        snapshot still holds of the KV cache. Also returns the snapshot and the
-        reserve so a second reading can be taken from the same sample."""
+        snapshot still holds of the KV cache."""
         snapshot, source = self.memory_snapshot(device)
         logger.info(
             "[Dynamic KV] %s memory snapshot of %s: %s",
@@ -581,9 +529,8 @@ class DynamicKvSizer:
         return num_blocks, fits, snapshot, reserve_bytes
 
     def _size_kv_and_release(self) -> KvSizing:
-        """Release the compile-time cache, then size from a snapshot of what the
-        runtime actually handed back. The worker holds no KV cache afterwards
-        until `apply_num_blocks` reallocates."""
+        """Release the compile-time cache, then size from what the runtime
+        actually handed back; no KV cache is bound until `apply_num_blocks`."""
         growth, hint_blocks, device = self._kv_growth_from_programs()
         self.release_kv_cache_tensors(self.model_runner.kv_cache_config)
         num_blocks, fits, _, _ = self._size_kv_from_snapshot(
@@ -592,9 +539,8 @@ class DynamicKvSizer:
         return KvSizing(num_blocks, fits, hint_blocks, growth)
 
     def _propose_kv_size(self) -> KvSizing:
-        """Size without touching the cache: the compile-time cache stays
-        resident, so its modelled bytes are subtracted, and the count if the
-        runtime kept them is reported alongside."""
+        """Size without touching the cache, reporting the count under both
+        readings of the resident compile-time cache."""
         growth, hint_blocks, device = self._kv_growth_from_programs()
         num_blocks, fits, snapshot, reserve_bytes = self._size_kv_from_snapshot(
             growth, device, kv_resident=growth.allocated_at(hint_blocks)
@@ -609,8 +555,8 @@ class DynamicKvSizer:
         return KvSizing(num_blocks, fits, hint_blocks, growth, if_resident)
 
     def log_fit_check(self, num_blocks: int) -> None:
-        """Measured `used` against what the sizing predicted, once the resized
-        cache is physically allocated; the allocator's behaviour shows up here."""
+        """Measured `used` against the prediction, once the resized cache is
+        physically allocated."""
         snapshot, source = self.memory_snapshot(self.device)
         parts = []
         for (node, chiplet), expected in sorted(self.expected_used.items()):
@@ -632,9 +578,8 @@ class DynamicKvSizer:
         )
 
     def log_dry_run(self, sizing: KvSizing) -> None:
-        """How the blocks vllm sized sit in each chiplet's budget, and how full
-        each chiplet would be at the count this feature would pick. Resizes
-        nothing."""
+        """The dry-run report: today's count against each chiplet's budget and
+        the count this feature would pick."""
         num_blocks, fits, current, growth, if_resident = (
             sizing.num_blocks,
             sizing.fits,
@@ -674,11 +619,8 @@ class DynamicKvSizer:
         )
 
     def apply_num_blocks(self, n: int | None) -> int | None:
-        """Resize the KV cache to the block count the engine settled on.
-
-        `n` is None when no usable count was computed; the pre-shrink number is
-        put back then, or the server would serve from the tiny compile cache.
-        """
+        """Resize the KV cache to the count the engine settled on; None puts the
+        pre-shrink count back."""
         before_shrink = self.kv_blocks_before_shrink
         target = before_shrink if n is None else n
         if target is None:
@@ -687,7 +629,6 @@ class DynamicKvSizer:
 
         current = self.model_runner.kv_cache_config.num_blocks
         if target == current and self.model_runner.kv_caches:
-            # The latch already describes reality, so no reset is needed either.
             logger.info(
                 "[Dynamic KV] KV cache already holds %d blocks; nothing to reallocate.",
                 target,
@@ -696,8 +637,7 @@ class DynamicKvSizer:
 
         if n is None:
             if torch.rbln.is_dummy_device():
-                # The dummy UMD still enforces its memory limit; nothing runs
-                # after warm-up here, so the compile cache is enough.
+                # The dummy UMD still enforces its limit; nothing runs after warm-up.
                 logger.info(
                     "[Dynamic KV] compile-only run: keeping the %d-block compile "
                     "cache instead of the %d blocks vllm estimated.",
@@ -718,44 +658,29 @@ class DynamicKvSizer:
         return target
 
     def materialize(self) -> None:
-        """One decode step so the resized pool is paid for at boot, not by a user.
-
-        The reallocation leaves physical allocation to the next forward, which
-        would otherwise land on the first request.
-        """
-        # The smallest decode bucket warmup already compiled: no new graph.
+        """One decode step so the pool's physical allocation lands at boot, not
+        on the first request."""
         num_reqs = min(self.model_runner.bucketing_manager.decode_batch_buckets)
         with set_compile_stage("warmup"), self.model_runner.offload_context():
             self.model_runner._dummy_run(num_reqs, 1, False)
 
     def release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
-        """Drop every reference to the outgoing KV cache and free its device DRAM.
-
-        Called *before* the replacement is allocated. Otherwise the old tensors
-        outlive the free, the allocator keeps their blocks reserved, and the
-        peak is base + old + new rather than base + max(old, new).
-        """
+        """Drop every reference to the outgoing KV cache and free its device DRAM
+        before the replacement is allocated, or the peak is base + old + new."""
         mr = self.model_runner
 
-        # Read residency from the tensors, not from the env, and before they go.
         kv_device_types = {kv_cache.device.type for kv_cache in mr.kv_caches}
         was_device_resident = bool(kv_device_types - {"meta", "cpu"})
 
-        # NOTE(RBLN): the rebind (initialize_kv_cache_tensors) reassigns
-        # kv_caches and kv_cache_names from one ordered name list and rebuilds
-        # kv_cache_bases, so drop all three stale bindings together before the
-        # reallocation.
+        # The rebind reassigns all three from one ordered name list.
         mr.kv_caches = []
         mr.kv_cache_bases = []
         mr.kv_cache_names = []
 
-        # NOTE(RBLN): the rebind also parks each layer's view on the Attention
-        # module; the next bind overwrites it only *after* the new tensors
-        # exist, which is the window this closes.
+        # Each layer's view is parked on its Attention module; the next bind
+        # overwrites it only after the new tensors exist.
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
-        # `KVCacheTensor.shared_by` is the same list `_allocate_kv_cache_tensors`
-        # keys its output on, so this is exactly the set of bound layers.
         for layer_name in dict.fromkeys(
             name for t in old_cfg.kv_cache_tensors for name in t.shared_by
         ):
@@ -771,8 +696,7 @@ class DynamicKvSizer:
             layer.kv_cache = None
             unbound += 1
 
-        # NOTE(RBLN): every per-layer tensor is a view and keeps its base alive,
-        # so a reference cycle would defer the free past the new allocation.
+        # A reference cycle would defer the free past the new allocation.
         gc.collect()
 
         released = empty_rbln_device_caches()
@@ -791,9 +715,8 @@ class DynamicKvSizer:
         )
 
     def allocator_state_per_chiplet(self) -> str:
-        """`allocated/reserved` bytes this process's caching allocator holds per
-        chiplet, or why it could not be read; tells a block still allocated
-        (someone holds it) from one cached but not handed back."""
+        """`allocated/reserved` per chiplet from this process's allocator, or
+        why it could not be read."""
         stats_fn = getattr(torch.rbln, "memory_stats_per_chiplet", None)
         if stats_fn is None or torch.rbln.is_dummy_device():
             return "unavailable"
@@ -815,14 +738,10 @@ class DynamicKvSizer:
         )
 
     def reallocate(self, new_num_blocks: int) -> None:
-        """Rebuild only the KV cache *tensors* at `new_num_blocks`.
-
-        No recompilation happens because the affected dim is `mark_dynamic`'d;
-        the physical allocation happens on the next forward.
-        """
-        # NOTE(RBLN): `initialize_kv_cache()` must not be re-run --
-        # `initialize_attn_backend` asserts `len(self.attn_groups) == 0`, and the
-        # backends and input batch depend on block_size, not num_blocks.
+        """Rebuild only the KV cache tensors at `new_num_blocks`; the dim is
+        `mark_dynamic`'d, so nothing recompiles."""
+        # Not `initialize_kv_cache()`: `initialize_attn_backend` asserts the
+        # attn groups are empty, and nothing there depends on num_blocks.
         mr = self.model_runner
         old_cfg = mr.kv_cache_config
         old_num_blocks = old_cfg.num_blocks
@@ -837,18 +756,14 @@ class DynamicKvSizer:
             new_num_blocks,
         )
         mr.kv_cache_config = new_cfg
-        # Order is load-bearing: see `release_kv_cache_tensors`. It also does
-        # the `mr.kv_caches = []` that the rebind reassigns. The sizing has
-        # usually released the compile cache already, to measure after it.
+        # Release before allocating (see `release_kv_cache_tensors`); the
+        # sizing has usually done it already.
         if mr.kv_caches:
             self.release_kv_cache_tensors(old_cfg)
-        # Re-applies mark_dynamic and rebinds the KV caches itself.
         mr.initialize_kv_cache_tensors(new_cfg, mr._kernel_block_sizes)
 
-        # NOTE(RBLN): warm-up latched the adaptive buffer sizes at the old
-        # num_blocks; without this clear, the next forward raises 'variable dim
-        # changed after adaptive buffers were fixed'. No getattr: a missing
-        # symbol must fail here, not on the first request.
+        # Warm-up latched the adaptive buffer sizes at the old num_blocks;
+        # without this the next forward raises "variable dim changed".
         runtimes = self.collect_runtimes()
         for runtime in runtimes:
             runtime.reset_adaptive_buffers()

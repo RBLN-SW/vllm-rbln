@@ -11,14 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Size the KV cache from the compiled programs' device placement.
-
-Two questions, two sources. *How many bytes does one more block cost on each
-chiplet* is a compile-time contract: every dynamic-shape input of a program
-carries a `PhysicalPlacement` whose shard extents are expressions over the
-dynamic dim. *How many bytes are already spoken for on each chiplet* is runtime
-state, read from a per-chiplet memory snapshot after warm-up.
-"""
+"""Size the KV cache from the compiled programs' device placement: the per-block
+cost per chiplet comes from each dynamic input's `PhysicalPlacement`, the bytes
+already spoken for from a per-chiplet memory snapshot."""
 
 from __future__ import annotations
 
@@ -33,13 +28,10 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-# `(node_id, chiplet_id)` -- the granularity device memory pools are carved at.
+# `(node_id, chiplet_id)`: the granularity of the device memory pools.
 Unit = tuple[int, int]
-# The runtime's caching allocator (rebel caching_allocator.cc): requests are
-# rounded to 4 KiB and served best-fit from the pool's free blocks; a miss maps
-# a new segment of 2 MiB (request <= 1 MiB), 20 MiB (<= 10 MiB) or the request
-# rounded up to 2 MiB. The block is split when the remainder is >= 512 B in the
-# small pool or > 1 MiB in the large pool, so several requests share a segment.
+# rebel runtime caching_allocator.h constants; `allocator_reserved` replays its
+# best-fit + split behaviour, under which several requests share a segment.
 _ALLOC_MIN_BLOCK = 4096
 _ALLOC_SMALL_MAX = 1 << 20
 _ALLOC_SMALL_BLOCK = 2 << 20
@@ -49,8 +41,7 @@ _ALLOC_LARGE_ROUND = 2 << 20
 
 
 def allocation_size(nbytes: int) -> int:
-    """Segment the caching allocator maps for a request of `nbytes` that no free
-    block can serve."""
+    """Segment the caching allocator maps for a request no free block serves."""
     if nbytes <= 0:
         return 0
     if nbytes <= _ALLOC_SMALL_MAX:
@@ -62,8 +53,7 @@ def allocation_size(nbytes: int) -> int:
 
 def allocator_reserved(requests: Iterable[int]) -> int:
     """Device bytes the caching allocator holds after serving `requests` in
-    order with nothing freed in between: the segments it maps, with the
-    remainder of a split block serving later requests of the same pool."""
+    order: mapped segments, with split remainders serving later requests."""
     free: dict[bool, list[int]] = {True: [], False: []}
     reserved = 0
     for nbytes in requests:
@@ -92,11 +82,8 @@ _TRAILING_BITS_RE = re.compile(r"(\d+)$")
 
 
 def eval_placement_dim(dim: Any, num_blocks: int) -> int:
-    """Evaluate one `PlacementDim` with every dynamic-shape variable bound to
-    `num_blocks`.
-
-    Only `num_blocks` can be marked dynamic, so every symbol is that count.
-    """
+    """Evaluate one `PlacementDim` with every symbol bound to `num_blocks`, the
+    only dim ever marked dynamic."""
     if isinstance(dim, bool):
         raise ValueError(f"placement dim cannot be a bool: {dim!r}")
     if isinstance(dim, int):
@@ -148,17 +135,10 @@ def _input_key(spec: Any) -> tuple:
 
 
 def select_kv_input_groups(programs: Sequence[Any]) -> list[tuple[list[Any], Any]]:
-    """The distinct sets of KV inputs the programs bind, one `(specs, program)`
-    per set, in first-seen order.
-
-    Only the KV caches are marked dynamic, so a program's dynamic-shape inputs
-    are exactly its KV inputs; a static program (compute_logits) has none. The
-    target's prefill and decode programs bind the same tensors and so agree on
-    the placement; a speculative drafter's programs bind their own tensors and
-    form a second set, which the sizing adds on top. Two programs whose inputs
-    match in shape and dtype but not in shards are the same tensors placed two
-    ways -- the runtime would re-place the cache on every switch -- and refuse.
-    """
+    """The distinct sets of KV inputs the programs bind (the target's, a
+    drafter's), one `(specs, program)` each, in first-seen order. Inputs matching
+    in shape and dtype but not in shards are the same tensors placed two ways,
+    and refuse."""
     groups: dict[tuple, tuple[list[Any], Any]] = {}
     fingerprints: dict[tuple, tuple] = {}
     for program in programs:
@@ -206,13 +186,9 @@ def dynamic_extent(spec: Any) -> int:
 def kv_requests_per_unit(
     specs: Iterable[Any], num_blocks: int, hint_blocks: int
 ) -> dict[Unit, list[int]]:
-    """Bytes of each KV shard on each (node, chiplet) at `num_blocks`, in the
-    order the shards are allocated.
-
-    An input's dynamic dim counts *kernel* blocks, `dynamic_extent / hint_blocks`
-    of them per manager block (a sliding-window layer splits each block into
-    `block_size / sliding_window`), so its symbol is bound to that multiple.
-    """
+    """Bytes of each KV shard on each (node, chiplet) at `num_blocks`, in
+    allocation order. A dynamic dim counts kernel blocks, so its symbol is bound
+    to `num_blocks * dynamic_extent / hint_blocks`."""
     if hint_blocks <= 0:
         raise ValueError(f"hint_blocks must be positive, got {hint_blocks}")
     requests: dict[Unit, list[int]] = {}
@@ -269,12 +245,8 @@ class KvGrowth:
 
 
 def kv_growth(specs: Sequence[Any], hint_blocks: int) -> KvGrowth:
-    """Per-block growth per unit, checked to be linear through the origin.
-
-    The compiler refuses to pad, transform or shard a dynamic dim, which is what
-    makes shard bytes exactly `num_blocks * per_block`. The check turns a future
-    relaxation of that rule into a start-up error instead of a wrong size.
-    """
+    """Per-block growth per unit, checked to be linear through the origin (the
+    compiler does not pad or transform a dynamic dim)."""
     at_zero = kv_bytes_per_unit(specs, 0, hint_blocks)
     at_one = kv_bytes_per_unit(specs, 1, hint_blocks)
     per_block = {
@@ -346,13 +318,8 @@ def snapshot_from_allocator(
     foreign_card_used_bytes: int,
     reserve_bytes: int,
 ) -> dict[Unit, ChipletMemory]:
-    """From `torch.rbln.memory_stats_per_chiplet()`: this process's caching
-    allocator only.
-
-    Two things the allocator cannot see are added back: other tenants' usage,
-    sampled card-wide before this worker allocated and spread evenly, and a
-    fixed reserve for the runtime's own direct allocations (command streams).
-    """
+    """From `torch.rbln.memory_stats_per_chiplet()`: this process's allocator,
+    plus the other tenants' usage spread evenly and the runtime reserve."""
     reserved = _per_unit(stats, "reserved.current")
     if not reserved:
         raise RuntimeError(
@@ -395,15 +362,8 @@ def max_num_blocks(
     kv_resident: Mapping[Unit, int],
     reserve_bytes: int = 0,
 ) -> tuple[int, dict[Unit, UnitFit]]:
-    """Largest `num_blocks` whose KV cache fits every chiplet's budget.
-
-    `used` was sampled with the KV cache resident at `kv_resident` bytes, so the
-    non-KV base is `used - kv_resident + reserve_bytes`, the reserve standing
-    for device memory the runtime allocates only once requests flow; the answer
-    satisfies `base + allocated(n) <= total * gpu_memory_utilization` on every
-    unit the KV cache grows on, `allocated` counting each shard at the size the
-    caching allocator reserves. Units it does not touch are not sized here.
-    """
+    """Largest `num_blocks` with `base + allocated(n) <= total * gmu` on every
+    unit the KV cache grows on, `base = used - kv_resident + reserve_bytes`."""
     if not 0 < gpu_memory_utilization <= 1:
         raise ValueError(
             f"gpu_memory_utilization must be in (0, 1], got {gpu_memory_utilization}"
@@ -427,8 +387,7 @@ def max_num_blocks(
         allocated = growth.allocated_at(n)
         return all(allocated[unit] <= room[unit] for unit in room)
 
-    # fits_all is monotone in n: the allocator's rounding costs a few blocks
-    # below the linear bound, so bisect for the largest n that fits.
+    # fits_all is monotone in n; bisect below the linear bound.
     low, high = 0, min(linear.values())
     while low < high:
         mid = (low + high + 1) // 2
@@ -465,8 +424,7 @@ def format_fits(fits: Mapping[Unit, UnitFit]) -> str:
 
 
 def format_placements(specs: Iterable[Any]) -> str:
-    """One line per KV input, field by field so the record survives compiler
-    builds; the only record of the per-shard extents."""
+    """One line per KV input; the only record of the per-shard extents."""
     lines = []
     for spec in specs:
         placement = spec.physical_placement
