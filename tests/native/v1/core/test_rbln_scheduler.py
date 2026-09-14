@@ -199,7 +199,7 @@ class TestTrySubBlockMatch:
         # match.num_tokens >= external -> match wins (ties favor local copy).
         sched = self._seeded_scheduler()
         query = make_request("q", list(range(8)) + [100] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         match, n = sched._try_sub_block_match(query, local, 8)
         assert match is not None
         assert n == 8
@@ -209,14 +209,14 @@ class TestTrySubBlockMatch:
         # external > match -> the match is released and (None, 0) returned.
         sched = self._seeded_scheduler()
         query = make_request("q", list(range(8)) + [100] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         assert sched._try_sub_block_match(query, local, 12) == (None, 0)
 
     def test_no_match_returns_none(self):
         # No sub-block match at all -> (None, 0).
         sched = self._seeded_scheduler()
         query = make_request("q", [500] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         assert sched._try_sub_block_match(query, local, 0) == (None, 0)
 
 

@@ -16,12 +16,20 @@
 # which the scheduler mutates in place, and the writeback queue, which the main
 # thread drains a step later.
 
+import os
+import subprocess
+import sys
+import textwrap
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from vllm.v1.outputs import ModelRunnerOutput
 
+import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.v1.worker.async_output import (
     AsyncRBLNModelRunnerOutput,
     PendingTokenWriteback,
@@ -42,7 +50,7 @@ def _output(req_ids):
     )
 
 
-def _async_output(tokens, *, invalid_req_indices=()):
+def _async_output(tokens, *, invalid_req_indices=(), fail_fast=False):
     req_ids = [f"r{i}" for i in range(len(tokens))]
     queue: PendingTokenWriteback = deque()
     async_out = AsyncRBLNModelRunnerOutput(
@@ -53,11 +61,88 @@ def _async_output(tokens, *, invalid_req_indices=()):
         req_ids=req_ids,
         placeholder_pos={req_id: 3 for req_id in req_ids},
         logprobs_tensors=None,
+        fail_fast=fail_fast,
     )
     return async_out, queue
 
 
 class TestGetOutput:
+    @pytest.mark.parametrize("failure_stage", ["copy", "logprobs"])
+    @pytest.mark.parametrize(
+        ("fail_fast", "disabled", "should_exit"),
+        [
+            (True, "0", True),
+            (True, "1", False),
+            (False, "0", False),
+        ],
+    )
+    def test_output_thread_failure_uses_worker_exit_policy(
+        self, monkeypatch, failure_stage, fail_fast, disabled, should_exit
+    ):
+        async_out, _ = _async_output([[7]], fail_fast=fail_fast)
+        error = RuntimeError("device output failed")
+        if failure_stage == "copy":
+            monkeypatch.setattr(
+                async_out._sampled_token_ids_cpu, "copy_", Mock(side_effect=error)
+            )
+        else:
+            async_out._logprobs_tensors = SimpleNamespace(
+                tolists=Mock(side_effect=error)
+            )
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", disabled)
+        exit_codes = []
+
+        def fake_exit(code):
+            exit_codes.append(code)
+            raise SystemExit(code)
+
+        monkeypatch.setattr(worker_utils.os, "_exit", fake_exit)
+        expected = SystemExit if should_exit else RuntimeError
+        with (
+            ThreadPoolExecutor(max_workers=1) as pool,
+            pytest.raises(expected) as excinfo,
+        ):
+            pool.submit(async_out.get_output).result(timeout=5)
+        if should_exit:
+            assert exit_codes == [70]
+            assert excinfo.value.code == 70
+        else:
+            assert exit_codes == []
+            assert excinfo.value is error
+
+    def test_output_thread_failure_terminates_the_process(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent("""
+                    from threading import Thread
+                    from unittest.mock import Mock
+
+                    from tests.native.v1.worker.test_async_output import _async_output
+
+                    output, _ = _async_output([[7]], fail_fast=True)
+                    output._sampled_token_ids_cpu.copy_ = Mock(
+                        side_effect=RuntimeError("subprocess output copy failed")
+                    )
+                    thread = Thread(target=output.get_output, daemon=True)
+                    thread.start()
+                    thread.join(timeout=10)
+                    raise SystemExit(1)
+                """),
+            ],
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(sys.path),
+                "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": "0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert result.returncode == 70, result.stdout + result.stderr
+        assert "subprocess output copy failed" in result.stdout + result.stderr
+
     def test_returns_the_sampled_tokens(self):
         async_out, _ = _async_output([[7], [8]])
         assert async_out.get_output().sampled_token_ids == [[7], [8]]

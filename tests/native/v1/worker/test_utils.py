@@ -58,9 +58,109 @@ from vllm_rbln.v1.worker.utils import (
     reorder_input_batch,
     set_cpu_affinity,
     set_omp_num_threads,
+    worker_fail_fast,
 )
 
 _GB = 2**30
+
+
+class TestWorkerFailFast:
+    @pytest.fixture
+    def exit_codes(self, monkeypatch):
+        codes = []
+
+        def fake_exit(code):
+            codes.append(code)
+            raise SystemExit(code)
+
+        monkeypatch.setattr(worker_utils.os, "_exit", fake_exit)
+        monkeypatch.delenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", raising=False)
+        return codes
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("SysError(125): SubmitJob() failed"),
+            RuntimeError("SysError(5): Failed to WaitForCompletion"),
+            RuntimeError("Logical device rbln: 1 is not assigned"),
+            ValueError("software error"),
+        ],
+    )
+    def test_mp_worker_exits_on_any_exception(self, exit_codes, error):
+        @worker_fail_fast
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(fail_fast=True)
+        with pytest.raises(SystemExit) as excinfo:
+            step(worker)
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
+
+    @pytest.mark.parametrize("fail_fast", [True, False])
+    def test_success_is_unchanged(self, exit_codes, fail_fast):
+        @worker_fail_fast
+        def step(worker, value, *, offset):
+            return value + offset
+
+        worker = SimpleNamespace(fail_fast=fail_fast)
+        assert step(worker, 3, offset=4) == 7
+        assert exit_codes == []
+
+    @pytest.mark.parametrize(
+        ("fail_fast", "setting"),
+        [
+            (False, "0"),
+            (True, "1"),
+            (True, "TRUE"),
+        ],
+    )
+    def test_exception_propagates_without_exit(
+        self, monkeypatch, exit_codes, fail_fast, setting
+    ):
+        error = RuntimeError("worker step failed")
+
+        @worker_fail_fast
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(fail_fast=fail_fast)
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", setting)
+        with pytest.raises(RuntimeError) as excinfo:
+            step(worker)
+        assert excinfo.value is error
+        assert exit_codes == []
+
+    @pytest.mark.parametrize("setting", ["0", "FALSE", "no", "", "flase"])
+    def test_toggle_is_read_on_each_call(self, monkeypatch, exit_codes, setting):
+        error = RuntimeError("worker step failed")
+
+        @worker_fail_fast
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(fail_fast=True)
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "1")
+        with pytest.raises(RuntimeError) as excinfo:
+            step(worker)
+        assert excinfo.value is error
+        assert exit_codes == []
+
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", setting)
+        with pytest.raises(SystemExit) as exitinfo:
+            step(worker)
+        assert exitinfo.value.code == 70
+        assert exit_codes == [70]
+
+    def test_logging_failure_does_not_prevent_exit(self, monkeypatch, exit_codes):
+        def broken_log(*args, **kwargs):
+            raise OSError("log unavailable")
+
+        monkeypatch.setattr(worker_utils.logger, "error", broken_log)
+        with pytest.raises(SystemExit) as excinfo:
+            worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
 
 
 def _make_model_config(
