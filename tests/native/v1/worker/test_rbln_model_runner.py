@@ -1162,7 +1162,7 @@ class TestUsesFixedDecodeWindow:
             ("ngram", False),
             ("suffix", False),
             ("medusa", False),
-            ("dflash", True),
+            ("dflash", False),
         ],
     )
     def test_only_a_model_based_drafter_fixes_the_window(self, method, expected):

@@ -3254,7 +3254,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if self.speculative_config is None:
             return False
-        return self.speculative_config.use_eagle()
+        # Not `use_eagle()`: that also covers dflash, whose `propose` ignores
+        # `token_indices_to_sample` and reads the sampled slot off
+        # `query_start_loc`, so the runner's back_pad correction never reaches
+        # it and the window's padding would be drafted from. Reserving one
+        # decode query length for it would also leave its qlen=1 graph out.
+        return self.speculative_config.method in ("eagle", "eagle3", "mtp")
 
     @property
     def is_prefill(self) -> bool:
