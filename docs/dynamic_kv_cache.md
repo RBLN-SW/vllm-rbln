@@ -62,9 +62,12 @@ Key components:
 
 - `vllm_rbln.v1.worker.kv_placement` evaluates the placements into per-chiplet
   growth, parses the memory snapshots, and solves for the block count.
-- `RBLNWorker` feeds the per-chiplet snapshot into the pre-compile estimate,
-  shrinks the cache before the compile, captures the programs warm-up builds,
-  takes the snapshot again, and reallocates the KV tensors at the answer.
+- `vllm_rbln.v1.worker.dynamic_kv_sizer.DynamicKvSizer` is the state machine
+  the worker delegates to: it feeds the per-chiplet snapshot into the pre-compile
+  estimate, shrinks the cache before the compile, captures the programs warm-up
+  builds, takes the snapshot again, and reallocates the KV tensors at the answer.
+  `RBLNWorker` keeps only the hooks that call it (config initialisation,
+  warm-up, and the two RPC targets the engine patch invokes).
 - `vllm_rbln.patches.dynamic_kv` hands the new block count to the scheduler's
   block pool, which was otherwise sized from the pre-compile estimate.
 
@@ -84,7 +87,7 @@ export VLLM_CACHE_ROOT=<a fresh directory>
 
 That is the whole public surface. The number of blocks the cache is shrunk to for
 the compile is a module constant
-(`vllm_rbln.v1.worker.rbln_worker.COMPILE_KV_CACHE_NUM_BLOCKS`) and cannot be set
+(`vllm_rbln.v1.worker.dynamic_kv_sizer.COMPILE_KV_CACHE_NUM_BLOCKS`) and cannot be set
 from the environment. It is a trace hint for the dynamic dimension, not a
 capacity: the count that ends up in service comes from the placement and the
 snapshot.
