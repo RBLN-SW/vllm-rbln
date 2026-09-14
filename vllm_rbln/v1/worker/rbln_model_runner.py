@@ -3119,8 +3119,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
         if self.num_spec_tokens > 0:
-            # max_model_len always can; a shorter remainder cannot, and the
-            # window would then have to run past max_model_len.
             window = self.num_spec_tokens + 1
             block_size = self.cache_config.block_size
             if block_size < window:
@@ -3129,7 +3127,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     f"speculative decode window."
                 )
             remainder = self.max_model_len % block_size
-            if remainder and remainder < window:
+            if self.uses_fixed_decode_window and remainder and remainder < window:
                 raise ValueError(
                     f"max_model_len={self.max_model_len} leaves {remainder} "
                     f"token(s) in its last KV block, which cannot hold the "
