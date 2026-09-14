@@ -37,7 +37,7 @@ NUM_BLOCKS = MAX_MODEL_LEN // OB_SIZE * MAX_NUM_SEQ + 1
 
 class MockModelWrapper(nn.Module, RBLNOptimumDecoderMixin):
     """Stands in for an optimum decoder model: the runner reads the decode
-    batch layout (decoder_batch_size, the bucket ladder, decode_batch_rows)
+    batch layout (decoder_batch_size, the bucket ladder, decode_layout)
     from the real mixin methods; forward is faked per test."""
 
     class MockModel:

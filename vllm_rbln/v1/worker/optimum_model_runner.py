@@ -438,12 +438,7 @@ class RBLNOptimumModelRunner(
                 if not model_input.is_prompt:
                     # The decode graph returns every row of the padded batch;
                     # keep the running requests' rows in running order.
-                    if model_input.batch_rows is None:
-                        hidden_states = hidden_states[
-                            : len(model_input.running_requests_ids)
-                        ]
-                    else:
-                        hidden_states = hidden_states[model_input.batch_rows]
+                    hidden_states = hidden_states[model_input.batch_rows]
                 if (
                     envs.VLLM_RBLN_METRICS
                     and self.model_performance_tracker is not None
@@ -699,6 +694,7 @@ class RBLNOptimumModelRunner(
             block_tables=block_table.to(torch.int16),
             running_requests_ids=[req_id],
             padded_batch_size=1,
+            batch_rows=slice(0, 1),
             is_prompt=True,
             multi_modal_kwargs=batched_mm_inputs,
             dummy_block=scheduler_output.dummy_block,
@@ -749,14 +745,7 @@ class RBLNOptimumModelRunner(
             dtype=torch.int16,
         )
 
-        batch_rows = self.model.decode_batch_rows(cache_slot_ids, block_tables)
-        rows: torch.Tensor | slice
-        if batch_rows is None:
-            padded_batch_size = self.model.decode_padded_batch_size(num_reqs)
-            rows = slice(0, num_reqs)
-        else:
-            padded_batch_size = self.model.decoder_batch_size
-            rows = batch_rows
+        padded_batch_size, rows = self.model.decode_layout(cache_slot_ids, block_tables)
 
         input_tokens = torch.zeros(padded_batch_size, 1, dtype=torch.int64)
         input_tokens[rows, 0] = torch.tensor(tokens, dtype=torch.int64)
@@ -798,7 +787,7 @@ class RBLNOptimumModelRunner(
             padded_batch_size=padded_batch_size,
             is_prompt=False,
             dummy_block=scheduler_output.dummy_block,
-            batch_rows=batch_rows,
+            batch_rows=rows,
             cache_slot_ids=padded_cache_slot_ids,
         )
 

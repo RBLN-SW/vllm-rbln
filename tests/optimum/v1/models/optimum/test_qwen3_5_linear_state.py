@@ -48,16 +48,18 @@ class TestDecodeLayoutWiring:
         # forward test supplies it via a mocked model instead of setting it here.
         return obj
 
-    def test_decode_batch_rows_are_the_cache_slots(self):
+    def test_decode_layout_pins_the_cache_slots_in_the_full_batch(self):
         # The runner asks the model where each running request sits in the
-        # decode batch; Qwen3.5 pins it to its scheduler-assigned cache slot.
+        # decode batch; Qwen3.5 pins it to its scheduler-assigned cache slot
+        # and always runs the full decoder batch.
         obj = self._bare_qwen3_5(max_batch_size=4)
 
-        rows = obj.decode_batch_rows(
+        padded_batch_size, rows = obj.decode_layout(
             torch.tensor([1, 0], dtype=torch.int16),
             torch.tensor([[10], [11]], dtype=torch.int16),
         )
 
+        assert padded_batch_size == 4
         assert rows.dtype == torch.long
         assert rows.tolist() == [1, 0]
 

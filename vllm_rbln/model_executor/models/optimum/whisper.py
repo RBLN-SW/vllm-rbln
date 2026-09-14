@@ -208,12 +208,12 @@ class RBLNOptimumWhisperForConditionalGeneration(
         self.dec_max_seq_len = self.model_config.max_model_len
         self.dec_lengths = [0] * self.batch_size
 
-    def decode_batch_rows(
+    def decode_layout(
         self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[int, torch.Tensor]:
         # The decoder KV cache holds one block per batch row, so a request's
         # block id is its row.
-        return block_tables.flatten().to(torch.long)
+        return self.decoder_batch_size, block_tables.flatten().to(torch.long)
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         is_prompt = model_input.is_prompt
@@ -285,7 +285,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
             return decoder_output.logits[valid_block_ids]
 
         valid_block_ids = model_input.batch_rows
-        assert valid_block_ids is not None
+        assert isinstance(valid_block_ids, torch.Tensor)
         # Whisper tracks decoder positions itself in dec_lengths.
         decoder_cache_position = torch.zeros(
             model_input.padded_batch_size, 1, dtype=torch.int32

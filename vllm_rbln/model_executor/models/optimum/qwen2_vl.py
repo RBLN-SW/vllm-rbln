@@ -505,16 +505,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         """
         cache_position = model_input.input_positions
         running_requests_ids = model_input.running_requests_ids
-        rows: torch.Tensor | slice = (
-            slice(0, len(running_requests_ids))
-            if model_input.batch_rows is None
-            else model_input.batch_rows
-        )
-        row_ids = (
-            range(len(running_requests_ids))
-            if model_input.batch_rows is None
-            else model_input.batch_rows.tolist()
-        )
+        rows = model_input.batch_rows
+        row_ids = torch.arange(model_input.padded_batch_size)[rows].tolist()
 
         position_embeds = []
         for row, request_id in zip(row_ids, running_requests_ids):

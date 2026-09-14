@@ -433,7 +433,7 @@ def test_prepare_decode_pads_running_order_to_the_decoder_batch(model_runner):
     model_input = model_runner._prepare_decode(_decode_step(["r0", "r1"], [0, 3]))
 
     assert model_input.padded_batch_size == batch
-    assert model_input.batch_rows is None
+    assert model_input.batch_rows == slice(0, 2)
     assert model_input.input_tokens.dtype == torch.int64
     assert model_input.input_tokens[:2, 0].tolist() == [1, 3]
     assert model_input.input_positions.dtype == torch.int32
@@ -465,8 +465,9 @@ def test_prepare_decode_pads_with_the_scheduler_scratch_block(model_runner):
 def test_prepare_decode_pins_rows_the_model_names(model_runner):
     _two_running_requests(model_runner)
     # A model with per-row on-device state pins each request to its cache slot.
-    model_runner.model.decode_batch_rows = lambda slots, block_tables: slots.to(
-        torch.long
+    model_runner.model.decode_layout = lambda slots, block_tables: (
+        model_runner.model.decoder_batch_size,
+        slots.to(torch.long),
     )
 
     model_input = model_runner._prepare_decode(_decode_step(["r0", "r1"], [3, 0]))
@@ -497,8 +498,9 @@ def test_execute_model_keeps_the_running_rows_of_the_padded_decode_batch(
 def test_execute_model_gathers_the_rows_the_model_pinned(model_runner):
     _two_running_requests(model_runner)
     _stamp_rows_forward(model_runner)
-    model_runner.model.decode_batch_rows = lambda slots, block_tables: slots.to(
-        torch.long
+    model_runner.model.decode_layout = lambda slots, block_tables: (
+        model_runner.model.decoder_batch_size,
+        slots.to(torch.long),
     )
 
     model_runner.execute_model(_decode_scheduler_output(["r0", "r1"], [3, 0]))
