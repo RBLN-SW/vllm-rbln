@@ -28,11 +28,14 @@ compile-time cache, and after warm-up sizes the real cache from two measurements
   into `block_size / sliding_window` kernel blocks -- so each input's symbol is
   scaled by its compiled extent over the compile hint. Programs that bind a
   different set of KV tensors (a speculative drafter's) contribute their own
-  slope on top of the target's. The fit counts every shard at the size the
-  runtime's caching allocator reserves for it (a request up to 1 MiB takes a
-  2 MiB block, up to 10 MiB a 20 MiB block, larger ones round up to 2 MiB), so
-  a shard size the rounding inflates costs the few blocks that takes below the
-  linear answer.
+  slope on top of the target's. The fit counts the shards at what the runtime's
+  caching allocator reserves for them, replayed the way it allocates: requests
+  are rounded to 4 KiB and served best-fit from free blocks, a miss maps a
+  2 MiB segment (request up to 1 MiB), a 20 MiB segment (up to 10 MiB) or the
+  request rounded up to 2 MiB, and a split block's remainder serves later
+  requests of the same pool. Many mid-size shards therefore share segments
+  (DeepSeek-V3.2's 61 indexer shards of 4.85 MB take 16 segments, not 61), and
+  the rounding costs at most a few blocks below the linear answer.
 - **Base** -- how many bytes are already spoken for on each chiplet. A per-chiplet
   memory snapshot is taken after the compile-time cache is released, so what
   the runtime does not hand back is measured as base rather than assumed away:

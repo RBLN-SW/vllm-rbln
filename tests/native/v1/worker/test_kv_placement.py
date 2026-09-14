@@ -25,6 +25,7 @@ import pytest
 
 from vllm_rbln.v1.worker.kv_placement import (
     ChipletMemory,
+    allocator_reserved,
     dynamic_extent,
     eval_placement_dim,
     kv_bytes_per_unit,
@@ -363,6 +364,20 @@ class TestMaxNumBlocks:
         )
         assert fits[(0, 0)].num_blocks == 5
         assert n == 2
+
+    def test_shards_share_the_allocator_s_segments(self):
+        # 61 indexer shards of ~4.85 MB each (DeepSeek-V3.2 at 74 blocks): one
+        # 20 MiB segment serves four of them, so the reserve is 16 segments,
+        # not 61. A shard-per-segment model overshot the device by 1.1 GiB.
+        MIB = 2**20
+        assert allocator_reserved([5 * MIB] * 4) == 20 * MIB
+        assert allocator_reserved([5 * MIB] * 5) == 40 * MIB
+        assert allocator_reserved([100 * 2**10] * 20) == 2 * MIB
+        assert allocator_reserved([21 * MIB + 1]) == 22 * MIB
+        # Remainders under 1 MiB are not split off in the large pool: 19 MiB
+        # takes the whole 20 MiB segment and the next request maps its own.
+        assert allocator_reserved([9 * MIB, 9 * MIB, 3 * MIB]) == 40 * MIB
+        assert allocator_reserved([4_850_000] * 61) == 16 * 20 * MIB
 
     def test_reserve_bytes_are_charged_as_base(self):
         growth = self._growth()

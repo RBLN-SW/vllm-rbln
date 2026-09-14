@@ -22,6 +22,7 @@ state, read from a per-chiplet memory snapshot after warm-up.
 
 from __future__ import annotations
 
+import bisect
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -34,9 +35,12 @@ logger = init_logger(__name__)
 
 # `(node_id, chiplet_id)` -- the granularity device memory pools are carved at.
 Unit = tuple[int, int]
-# The runtime's caching allocator (rebel caching_allocator.h): a request up to
-# 1 MiB takes a 2 MiB block, up to 10 MiB a 20 MiB block, larger ones round up
-# to 2 MiB.
+# The runtime's caching allocator (rebel caching_allocator.cc): requests are
+# rounded to 4 KiB and served best-fit from the pool's free blocks; a miss maps
+# a new segment of 2 MiB (request <= 1 MiB), 20 MiB (<= 10 MiB) or the request
+# rounded up to 2 MiB. The block is split when the remainder is >= 512 B in the
+# small pool or > 1 MiB in the large pool, so several requests share a segment.
+_ALLOC_MIN_BLOCK = 4096
 _ALLOC_SMALL_MAX = 1 << 20
 _ALLOC_SMALL_BLOCK = 2 << 20
 _ALLOC_MEDIUM_MAX = 10 << 20
@@ -45,7 +49,8 @@ _ALLOC_LARGE_ROUND = 2 << 20
 
 
 def allocation_size(nbytes: int) -> int:
-    """Device bytes the caching allocator reserves for a tensor of `nbytes`."""
+    """Segment the caching allocator maps for a request of `nbytes` that no free
+    block can serve."""
     if nbytes <= 0:
         return 0
     if nbytes <= _ALLOC_SMALL_MAX:
@@ -53,6 +58,33 @@ def allocation_size(nbytes: int) -> int:
     if nbytes <= _ALLOC_MEDIUM_MAX:
         return _ALLOC_MEDIUM_BLOCK
     return -(-nbytes // _ALLOC_LARGE_ROUND) * _ALLOC_LARGE_ROUND
+
+
+def allocator_reserved(requests: Iterable[int]) -> int:
+    """Device bytes the caching allocator holds after serving `requests` in
+    order with nothing freed in between: the segments it maps, with the
+    remainder of a split block serving later requests of the same pool."""
+    free: dict[bool, list[int]] = {True: [], False: []}
+    reserved = 0
+    for nbytes in requests:
+        if nbytes <= 0:
+            continue
+        size = -(-nbytes // _ALLOC_MIN_BLOCK) * _ALLOC_MIN_BLOCK
+        small = size <= _ALLOC_SMALL_MAX
+        pool = free[small]
+        at = bisect.bisect_left(pool, size)
+        if at < len(pool):
+            block = pool.pop(at)
+        else:
+            block = allocation_size(size)
+            reserved += block
+        remainder = block - size
+        splits = (
+            remainder >= _ALLOC_MIN_BLOCK if small else remainder > _ALLOC_SMALL_MAX
+        )
+        if splits:
+            bisect.insort(pool, remainder)
+    return reserved
 
 
 _KEY_RE = re.compile(r"^npu\.(\d+)\.chiplet\.(\d+)\.(.+)$")
@@ -171,11 +203,11 @@ def dynamic_extent(spec: Any) -> int:
     raise ValueError(f"input {spec.name!r} has a placement but no dynamic dim")
 
 
-def kv_bytes_per_unit(
-    specs: Iterable[Any], num_blocks: int, hint_blocks: int, *, allocated: bool = False
-) -> dict[Unit, int]:
-    """Bytes the KV inputs occupy on each (node, chiplet) at `num_blocks`; with
-    `allocated`, what the caching allocator reserves for each shard instead.
+def kv_requests_per_unit(
+    specs: Iterable[Any], num_blocks: int, hint_blocks: int
+) -> dict[Unit, list[int]]:
+    """Bytes of each KV shard on each (node, chiplet) at `num_blocks`, in the
+    order the shards are allocated.
 
     An input's dynamic dim counts *kernel* blocks, `dynamic_extent / hint_blocks`
     of them per manager block (a sliding-window layer splits each block into
@@ -183,7 +215,7 @@ def kv_bytes_per_unit(
     """
     if hint_blocks <= 0:
         raise ValueError(f"hint_blocks must be positive, got {hint_blocks}")
-    usage: dict[Unit, int] = {}
+    requests: dict[Unit, list[int]] = {}
     for spec in specs:
         placement = spec.physical_placement
         extent = dynamic_extent(spec)
@@ -199,11 +231,18 @@ def kv_bytes_per_unit(
                 eval_placement_dim(dim, symbol) for dim in shard.slice_shape
             )
             unit = (int(shard.node_id), int(shard.chiplet_id))
-            nbytes = elems * itemsize
-            usage[unit] = usage.get(unit, 0) + (
-                allocation_size(nbytes) if allocated else nbytes
-            )
-    return usage
+            requests.setdefault(unit, []).append(elems * itemsize)
+    return requests
+
+
+def kv_bytes_per_unit(
+    specs: Iterable[Any], num_blocks: int, hint_blocks: int
+) -> dict[Unit, int]:
+    """Bytes the KV inputs occupy on each (node, chiplet) at `num_blocks`."""
+    return {
+        unit: sum(shards)
+        for unit, shards in kv_requests_per_unit(specs, num_blocks, hint_blocks).items()
+    }
 
 
 @dataclass(frozen=True)
@@ -219,10 +258,14 @@ class KvGrowth:
         return {unit: num_blocks * cost for unit, cost in self.per_block.items()}
 
     def allocated_at(self, num_blocks: int) -> dict[Unit, int]:
-        """`bytes_at` with every shard at the size the allocator reserves for it."""
-        return kv_bytes_per_unit(
-            self.specs, num_blocks, self.hint_blocks, allocated=True
-        )
+        """What the caching allocator reserves on each unit for the shards
+        `bytes_at` counts."""
+        return {
+            unit: allocator_reserved(shards)
+            for unit, shards in kv_requests_per_unit(
+                self.specs, num_blocks, self.hint_blocks
+            ).items()
+        }
 
 
 def kv_growth(specs: Sequence[Any], hint_blocks: int) -> KvGrowth:
