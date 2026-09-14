@@ -20,8 +20,29 @@
 # `getattr(module, "register")` raises, and vLLM falls back to CpuPlatform.
 
 
+class _Axk2FrozenModuleFinder:
+    _FILES = {
+        "vllm.transformers_utils.configs.axk2": "_skt_config.py",
+        "vllm.model_executor.models.axk2": "_skt_model.py",
+    }
+
+    def find_spec(self, fullname, path=None, target=None):
+        filename = self._FILES.get(fullname)
+        if filename is None:
+            return None
+        import importlib.util
+        import os
+
+        location = os.path.join(os.path.dirname(__file__), "patches", "axk2", filename)
+        return importlib.util.spec_from_file_location(fullname, location)
+
+
 def register():
     """Register the RBLN platform."""
+    import sys
+
+    if not any(isinstance(f, _Axk2FrozenModuleFinder) for f in sys.meta_path):
+        sys.meta_path.append(_Axk2FrozenModuleFinder())
     return "vllm_rbln.platform.RblnPlatform"
 
 
