@@ -45,7 +45,6 @@ from vllm_rbln.v1.worker.utils import (
     divide_by_chiplet_replication,
     estimate_available_memory,
     estimate_model_kernel_size,
-    fail_fast_on_device_error,
     get_autobind_cpu_ids,
     get_kv_cache_names,
     get_rbln_owned_card_indices,
@@ -57,12 +56,13 @@ from vllm_rbln.v1.worker.utils import (
     reorder_input_batch,
     set_cpu_affinity,
     set_omp_num_threads,
+    worker_fail_fast,
 )
 
 _GB = 2**30
 
 
-class TestFailFastOnDeviceError:
+class TestWorkerFailFast:
     @pytest.fixture
     def exit_codes(self, monkeypatch):
         codes = []
@@ -72,7 +72,7 @@ class TestFailFastOnDeviceError:
             raise SystemExit(code)
 
         monkeypatch.setattr(worker_utils.os, "_exit", fake_exit)
-        monkeypatch.delenv("VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", raising=False)
+        monkeypatch.delenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", raising=False)
         return codes
 
     @pytest.mark.parametrize(
@@ -85,58 +85,70 @@ class TestFailFastOnDeviceError:
         ],
     )
     def test_mp_worker_exits_on_any_exception(self, exit_codes, error):
-        @fail_fast_on_device_error
+        @worker_fail_fast
         def step(worker):
             raise error
 
-        worker = SimpleNamespace(
-            parallel_config=SimpleNamespace(distributed_executor_backend="mp")
-        )
+        worker = SimpleNamespace(fail_fast=True)
         with pytest.raises(SystemExit) as excinfo:
             step(worker)
         assert excinfo.value.code == 70
         assert exit_codes == [70]
 
-    @pytest.mark.parametrize("backend", ["mp", "uni"])
-    def test_success_is_unchanged(self, exit_codes, backend):
-        @fail_fast_on_device_error
+    @pytest.mark.parametrize("fail_fast", [True, False])
+    def test_success_is_unchanged(self, exit_codes, fail_fast):
+        @worker_fail_fast
         def step(worker, value, *, offset):
             return value + offset
 
-        worker = SimpleNamespace(
-            parallel_config=SimpleNamespace(distributed_executor_backend=backend)
-        )
+        worker = SimpleNamespace(fail_fast=fail_fast)
         assert step(worker, 3, offset=4) == 7
         assert exit_codes == []
 
     @pytest.mark.parametrize(
-        ("backend", "setting"),
+        ("fail_fast", "setting"),
         [
-            ("uni", "1"),
-            ("ray", "1"),
-            ("external_launcher", "1"),
-            ("mp", "0"),
-            ("mp", "FALSE"),
-            ("mp", "no"),
+            (False, "0"),
+            (True, "1"),
+            (True, "TRUE"),
         ],
     )
     def test_exception_propagates_without_exit(
-        self, monkeypatch, exit_codes, backend, setting
+        self, monkeypatch, exit_codes, fail_fast, setting
     ):
         error = RuntimeError("worker step failed")
 
-        @fail_fast_on_device_error
+        @worker_fail_fast
         def step(worker):
             raise error
 
-        worker = SimpleNamespace(
-            parallel_config=SimpleNamespace(distributed_executor_backend=backend)
-        )
-        monkeypatch.setenv("VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", setting)
+        worker = SimpleNamespace(fail_fast=fail_fast)
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", setting)
         with pytest.raises(RuntimeError) as excinfo:
             step(worker)
         assert excinfo.value is error
         assert exit_codes == []
+
+    @pytest.mark.parametrize("setting", ["0", "FALSE", "no", "", "flase"])
+    def test_toggle_is_read_on_each_call(self, monkeypatch, exit_codes, setting):
+        error = RuntimeError("worker step failed")
+
+        @worker_fail_fast
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(fail_fast=True)
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "1")
+        with pytest.raises(RuntimeError) as excinfo:
+            step(worker)
+        assert excinfo.value is error
+        assert exit_codes == []
+
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", setting)
+        with pytest.raises(SystemExit) as exitinfo:
+            step(worker)
+        assert exitinfo.value.code == 70
+        assert exit_codes == [70]
 
     def test_logging_failure_does_not_prevent_exit(self, monkeypatch, exit_codes):
         def broken_log(*args, **kwargs):

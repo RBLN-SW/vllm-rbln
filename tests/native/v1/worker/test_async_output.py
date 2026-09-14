@@ -50,7 +50,7 @@ def _output(req_ids):
     )
 
 
-def _async_output(tokens, *, invalid_req_indices=(), backend="uni"):
+def _async_output(tokens, *, invalid_req_indices=(), fail_fast=False):
     req_ids = [f"r{i}" for i in range(len(tokens))]
     queue: PendingTokenWriteback = deque()
     async_out = AsyncRBLNModelRunnerOutput(
@@ -61,7 +61,7 @@ def _async_output(tokens, *, invalid_req_indices=(), backend="uni"):
         req_ids=req_ids,
         placeholder_pos={req_id: 3 for req_id in req_ids},
         logprobs_tensors=None,
-        parallel_config=SimpleNamespace(distributed_executor_backend=backend),
+        fail_fast=fail_fast,
     )
     return async_out, queue
 
@@ -69,19 +69,17 @@ def _async_output(tokens, *, invalid_req_indices=(), backend="uni"):
 class TestGetOutput:
     @pytest.mark.parametrize("failure_stage", ["copy", "logprobs"])
     @pytest.mark.parametrize(
-        ("backend", "enabled", "should_exit"),
+        ("fail_fast", "disabled", "should_exit"),
         [
-            ("mp", "1", True),
-            ("mp", "0", False),
-            ("uni", "1", False),
-            ("ray", "1", False),
-            ("external_launcher", "1", False),
+            (True, "0", True),
+            (True, "1", False),
+            (False, "0", False),
         ],
     )
     def test_output_thread_failure_uses_worker_exit_policy(
-        self, monkeypatch, failure_stage, backend, enabled, should_exit
+        self, monkeypatch, failure_stage, fail_fast, disabled, should_exit
     ):
-        async_out, _ = _async_output([[7]], backend=backend)
+        async_out, _ = _async_output([[7]], fail_fast=fail_fast)
         error = RuntimeError("device output failed")
         if failure_stage == "copy":
             monkeypatch.setattr(
@@ -91,7 +89,7 @@ class TestGetOutput:
             async_out._logprobs_tensors = SimpleNamespace(
                 tolists=Mock(side_effect=error)
             )
-        monkeypatch.setenv("VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", enabled)
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", disabled)
         exit_codes = []
 
         def fake_exit(code):
@@ -123,7 +121,7 @@ class TestGetOutput:
 
                     from tests.native.v1.worker.test_async_output import _async_output
 
-                    output, _ = _async_output([[7]], backend="mp")
+                    output, _ = _async_output([[7]], fail_fast=True)
                     output._sampled_token_ids_cpu.copy_ = Mock(
                         side_effect=RuntimeError("subprocess output copy failed")
                     )
@@ -136,7 +134,7 @@ class TestGetOutput:
             env={
                 **os.environ,
                 "PYTHONPATH": os.pathsep.join(sys.path),
-                "VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR": "1",
+                "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": "0",
             },
             capture_output=True,
             text=True,

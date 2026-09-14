@@ -61,6 +61,8 @@ from vllm.v1.core.sched.output import (
     GrammarOutput,
     NewRequestData,
 )
+from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
@@ -237,6 +239,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         device: torch.device,
     ) -> None:
         self.vllm_config = vllm_config
+        self.fail_fast = issubclass(Executor.get_class(vllm_config), MultiprocExecutor)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         # self.offload_config = vllm_config.offload_config
@@ -1967,7 +1970,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_ids=list(self.input_batch.req_ids),
             placeholder_pos=dict(self._placeholder_pos),
             logprobs_tensors=self._async_logprobs_tensors,
-            parallel_config=self.parallel_config,
+            fail_fast=self.fail_fast,
         )
         return async_output
 

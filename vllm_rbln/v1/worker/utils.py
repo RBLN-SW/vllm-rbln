@@ -49,13 +49,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _F = TypeVar("_F", bound=Callable[..., Any])
-WORKER_DEVICE_FAILURE_EXIT_CODE = 70
+# EX_SOFTWARE: an unhandled worker error, not the device's error number.
+_FAIL_FAST_EXIT_CODE = 70
 
 
 def abort_worker(exc: Exception, *, where: str) -> NoReturn:
-    """Skip device cleanup even if logging raises.
+    """Exit without device cleanup when logging returns or raises.
 
-    Logging can still block on handler locks or I/O.
+    No exit deadline is guaranteed if logging blocks on a handler lock or I/O.
     """
     try:
         logger.error(
@@ -65,30 +66,28 @@ def abort_worker(exc: Exception, *, where: str) -> NoReturn:
             where,
             type(exc).__name__,
             exc,
-            WORKER_DEVICE_FAILURE_EXIT_CODE,
+            _FAIL_FAST_EXIT_CODE,
             exc_info=exc,
         )
     finally:
         # StreamHandler flushes each record; avoid shutdown's handler locks.
-        os._exit(WORKER_DEVICE_FAILURE_EXIT_CODE)
+        os._exit(_FAIL_FAST_EXIT_CODE)
 
 
-def fail_fast_on_device_error(function: _F) -> _F:
-    """Terminate mp workers when an operation raises.
+def worker_fail_fast(function: _F) -> _F:
+    """Terminate MultiprocExecutor workers when an operation raises.
 
-    The receiver must expose parallel_config. Hard exits are limited to mp;
-    Ray is unsupported on RBLN. Other executors propagate the exception.
+    The receiver's fail_fast flag is resolved from its executor at initialization,
+    including RayExecutorV2. In-process executors propagate the exception.
     """
 
     @wraps(function)
     def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        fail_fast = self.fail_fast and not envs.VLLM_RBLN_DISABLE_WORKER_FAIL_FAST
         try:
             return function(self, *args, **kwargs)
         except Exception as exc:
-            if (
-                self.parallel_config.distributed_executor_backend == "mp"
-                and envs.VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR
-            ):
+            if fail_fast:
                 abort_worker(exc, where=function.__qualname__)
             raise
 

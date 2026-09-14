@@ -100,7 +100,7 @@ GRAPH_ENV = [
 # Variables that must not move it. Each value differs from that variable's
 # default, so the row cannot pass by probing with the default itself.
 RUNTIME_ENV = [
-    ("VLLM_RBLN_FAIL_FAST_ON_DEVICE_ERROR", "0"),
+    ("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "1"),
     # Sampler graphs compile with use_cache=False, so they never enter a bundle.
     ("VLLM_RBLN_SAMPLER", "0"),
     # Must stay out, or a bundle compiled on a CPU host misses on the NPU host.

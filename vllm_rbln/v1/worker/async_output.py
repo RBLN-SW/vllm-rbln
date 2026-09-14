@@ -14,18 +14,17 @@
 
 """The ModelRunnerOutput async scheduling hands back before its tokens exist.
 
-The runner returns one of these instead of a ModelRunnerOutput. With the mp
-executor, vLLM calls get_output() on the worker's async output thread, once
+The runner returns one of these instead of a ModelRunnerOutput. MultiprocExecutor
+and its subclasses call get_output() on the worker's async output thread, once
 the next forward is already in flight.
 """
 
 from collections import deque
 
 import torch
-from vllm.config import ParallelConfig
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 
-from vllm_rbln.v1.worker.utils import fail_fast_on_device_error
+from vllm_rbln.v1.worker.utils import worker_fail_fast
 
 # Queued by get_output() on the output thread, drained by the main thread in
 # RBLNModelRunner._apply_pending_token_writeback: the step's request ids, its
@@ -43,10 +42,9 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         req_ids: list[str],
         placeholder_pos: dict[str, int],
         logprobs_tensors: LogprobsTensors | None,
-        parallel_config: ParallelConfig,
+        fail_fast: bool,
     ):
-        # Public to satisfy the shared fail_fast_on_device_error contract.
-        self.parallel_config = parallel_config
+        self.fail_fast = fail_fast
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
         # For the token_ids_cpu write-back, applied by the main thread.
@@ -67,11 +65,11 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # them to the host mid-step and serialises what async just decoupled.
         self._logprobs_tensors = logprobs_tensors
 
-    @fail_fast_on_device_error
+    @worker_fail_fast
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
-        Blocks until the copy finishes. Runs on mp's worker async output thread.
+        Blocks until the copy finishes; the executor decides which thread calls it.
         InferenceMode is thread-local, hence off here, and updating
         _sampled_token_ids_cpu - an inference tensor allocated
         under sample_tokens - in place with it off is a hard error.

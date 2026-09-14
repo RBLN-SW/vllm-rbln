@@ -688,6 +688,16 @@ def test_running_the_hook_twice_changes_nothing(configured, reconfigure):
     )
 
 
+def test_default_single_worker_uses_uni_without_warning(caplog):
+    config = _build()
+    assert config.parallel_config.distributed_executor_backend == "uni"
+    assert not any(
+        record.name == platform.logger.name
+        and "distributed executor backend" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 @pytest.mark.parametrize("backend", [None, "mp", "uni", "ray", "external_launcher"])
 def test_executor_backend_warning_preserves_selection(reconfigure, caplog, backend):
     caplog.clear()
