@@ -114,14 +114,6 @@ Unsupported configurations are refused in a dry run too, since the refusals
 guard the dynamic compile itself. A sizing failure after warm-up (no placement,
 no fit) is logged as a warning instead of raised.
 
-## Requirements on the stack
-
-| Component | Needed for | Without it |
-| --- | --- | --- |
-| rebel-compiler with `TensorProfile.physical_placement` (rebellions-sw/rebel_compiler#13555) | growth | the programs carry no placement and start-up refuses |
-| torch-rbln `capture_programs()` (#242, #260) and `get_device_properties()` (#252) | reaching the programs; the per-chiplet capacity | start-up refuses |
-| torch-rbln `mem_get_info_per_chiplet()` (#259) over a UMD/KMD that answer the device memory query | the driver snapshot | warns and falls back to the allocator snapshot (#191) |
-
 ## Unsupported Configurations
 
 The following are rejected at start-up when the flag is on, and are unaffected
