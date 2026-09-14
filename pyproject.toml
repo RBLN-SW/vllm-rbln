@@ -39,7 +39,7 @@ dependencies = [
     "pyyaml",
     "datasets>=4.0.0",
     "qwen_vl_utils",
-    "vllm==0.26.0+cpu",
+    "vllm @ https://pypi.rebellions.in/api/package/vllm/vllm-0.26.1.dev1+gedba279ba.cpu-cp38-abi3-linux_x86_64.whl",
     "fastapi[standard]<0.137",
     "torch",
     "torchvision",
@@ -166,20 +166,29 @@ module = [
 ignore_errors = true
 
 [tool.uv]
-# 0.11.25 changed lockfile serialization (redundant `environments` markers factored
-# out into `supported-markers`, astral-sh/uv#19933); older uv re-locking writes them
-# all back inline, producing a ~900-line noise diff. Gate every uv command on >= 0.11.25.
-required-version = ">=0.11.25"
+# Re-lock only with uv >= 0.11.25: older uv rewrites the lockfile serialization
+# (astral-sh/uv#19933) into a ~900-line noise diff. Not enforced via required-version
+# because CI images ship older uv and only run `uv pip install` (never re-lock).
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
-# pypi.rebellions.in is intentionally NOT registered: packages appear/disappear
+# pypi.rebellions.in is intentionally NOT used for resolution (the explicit+unmapped
+# entry below is a credential anchor only): packages appear/disappear
 # there independently of dev/main, so a full lock refresh could pin versions that
 # must not be used. Install packages from it ad-hoc via --extra-index-url instead
-# (see DEVELOPMENT.md).
+# (see DEVELOPMENT.md). The ax-k1-fp8 vllm build below is a direct URL for the same
+# reason — registering the index would move every package there, and mapping
+# `vllm` to it would drag consumers' released vllm onto it too.
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
+
+[[tool.uv.index]]
+# Never resolved from (explicit, no source mapping); exists so
+# UV_INDEX_REBELLIONS_USERNAME/PASSWORD authenticate the direct-URL vllm wheel above.
+name = "rebellions"
+url = "https://pypi.rebellions.in/"
+explicit = true
 
 [[tool.uv.index]]
 name = "vllm-cpu"
@@ -200,7 +209,6 @@ name = "rbln-release"
 url = "https://pypi.rbln.ai/simple/"
 
 [tool.uv.sources]
-vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
