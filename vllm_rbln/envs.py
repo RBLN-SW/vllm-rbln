@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
+    VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN: bool = False
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -286,6 +287,13 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # With the flag above: compute and log the block count, resize nothing
+    "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()
+            in ("true", "1")
+        )
+    ),
     # --- ATTENTION ---
     # Use flash attention for causal attention
     "VLLM_RBLN_FLASH_CAUSAL_ATTN": (
@@ -397,6 +405,7 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_USE_DEVICE_TENSOR",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+        "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",

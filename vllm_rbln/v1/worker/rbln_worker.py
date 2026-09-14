@@ -17,6 +17,7 @@ import copy
 import gc
 import os
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any
@@ -80,11 +81,12 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.kv_placement import (
     ChipletMemory,
     Unit,
+    UnitFit,
     format_fits,
     format_placements,
     kv_growth,
     max_num_blocks,
-    select_kv_inputs,
+    select_kv_input_groups,
     snapshot_from_allocator,
     snapshot_from_driver,
 )
@@ -477,12 +479,25 @@ class RBLNWorker(WorkerBase):
 
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE and not torch.rbln.is_dummy_device():
             snapshot, source = self._dynamic_kv_memory_snapshot(self.device)
-            estimate_kwargs["chiplet_memory"] = snapshot
-            logger.info(
-                "[Dynamic KV] pre-compile estimate from the %s memory snapshot of %s.",
-                source,
-                self.device,
-            )
+            if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
+                measured = estimate_available_memory(
+                    **estimate_kwargs, chiplet_memory=snapshot
+                )
+                logger.info(
+                    "[Dynamic KV] dry run: the %s memory snapshot of %s would put the "
+                    "pre-compile estimate at %.2f GiB; keeping the whole-card formula.",
+                    source,
+                    self.device,
+                    measured / 1024**3,
+                )
+            else:
+                estimate_kwargs["chiplet_memory"] = snapshot
+                logger.info(
+                    "[Dynamic KV] pre-compile estimate from the %s memory snapshot of "
+                    "%s.",
+                    source,
+                    self.device,
+                )
 
         available_memory_estimate = estimate_available_memory(**estimate_kwargs)
 
@@ -576,6 +591,13 @@ class RBLNWorker(WorkerBase):
             )
             return kv_cache_config
         override = self.cache_config.num_gpu_blocks_override
+        if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
+            logger.warning(
+                "[Dynamic KV] dry run: compiling at the %d blocks vllm sized; the "
+                "count this feature would pick is only logged after warm-up.",
+                kv_cache_config.num_blocks,
+            )
+            return kv_cache_config
         if override is not None:
             logger.warning(
                 "[Dynamic KV] --num-gpu-blocks-override=%d pins the count; no "
@@ -749,19 +771,26 @@ class RBLNWorker(WorkerBase):
         across ranks and hands it back through `apply_dynamic_kv_num_blocks`.
         None means the path is not in play.
         """
-        if self.cache_config.num_gpu_blocks_override is not None:
+        dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
+        if not dry_run and self.cache_config.num_gpu_blocks_override is not None:
             logger.info(
                 "[Dynamic KV] --num-gpu-blocks-override=%d is set; leaving the "
                 "KV cache alone.",
                 self.cache_config.num_gpu_blocks_override,
             )
             return None
-        if self._kv_blocks_before_shrink is None:
+        if not dry_run and self._kv_blocks_before_shrink is None:
             # The branch that cancelled the shrink already logged why.
             logger.warning(
                 "[Dynamic KV] the cache was not shrunk, so no placement is queried "
                 "and the count stays at the %d blocks vllm estimated.",
                 self.model_runner.kv_cache_config.num_blocks,
+            )
+            return None
+        if dry_run and not self._dynamic_kv_programs:
+            logger.warning(
+                "[Dynamic KV] dry run: no compiled program was captured, so there is "
+                "nothing to report."
             )
             return None
 
@@ -772,25 +801,30 @@ class RBLNWorker(WorkerBase):
                 "[Dynamic KV] RBLN_DUMMY_DEVICE is set, so there is no device to "
                 "measure; keeping the %d blocks vllm estimated for this compile-only "
                 "run.",
-                self._kv_blocks_before_shrink,
+                self._kv_blocks_before_shrink
+                or self.model_runner.kv_cache_config.num_blocks,
             )
             return None
 
         programs = list(self._dynamic_kv_programs)
-        specs, program = select_kv_inputs(programs)
+        groups = select_kv_input_groups(programs)
         hint_blocks = self.model_runner.kv_cache_config.num_blocks
         # The only record of the per-shard extents.
-        logger.info(
-            "[Dynamic KV] KV placement from %s (%d program(s) captured, %d dynamic "
-            "input(s), hint=%d blocks): %s",
-            program.name or "an unnamed program",
-            len(programs),
-            len(specs),
-            hint_blocks,
-            format_placements(specs),
-        )
+        for group_specs, group_program in groups:
+            logger.info(
+                "[Dynamic KV] KV placement from %s (%d program(s) captured, %d KV "
+                "input set(s), %d dynamic input(s) in this set, hint=%d blocks): %s",
+                group_program.name or "an unnamed program",
+                len(programs),
+                len(groups),
+                len(group_specs),
+                hint_blocks,
+                format_placements(group_specs),
+            )
+        specs = [spec for group_specs, _ in groups for spec in group_specs]
         growth = kv_growth(specs, hint_blocks)
 
+        program = groups[0][1]
         device = program.device if program.device is not None else self.device
         snapshot, source = self._dynamic_kv_memory_snapshot(device)
         logger.info(
@@ -853,7 +887,32 @@ class RBLNWorker(WorkerBase):
             {f"{n}:{c}": b for (n, c), b in sorted(predicted.items())},
             sum(predicted.values()),
         )
+        if dry_run:
+            self._log_dynamic_kv_dry_run(num_blocks, fits, hint_blocks)
+            return None
         return num_blocks
+
+    def _log_dynamic_kv_dry_run(
+        self, num_blocks: int, fits: Mapping[Unit, UnitFit], current: int
+    ) -> None:
+        """How the `current` blocks vllm sized sit in each chiplet's budget next
+        to the `num_blocks` this feature would pick. Resizes nothing."""
+        per_unit = []
+        for (node, chiplet), fit in sorted(fits.items()):
+            kv_now = current * fit.per_block
+            headroom = fit.budget - fit.base - kv_now
+            per_unit.append(
+                f"{node}:{chiplet}(kv_now={kv_now} base={fit.base} budget={fit.budget} "
+                f"headroom={headroom} = {headroom // fit.per_block:+d} blocks)"
+            )
+        logger.warning(
+            "[Dynamic KV] dry run: vllm sized %d blocks, this feature would set %d "
+            "(%+d). Per (node, chiplet): %s. Nothing is resized.",
+            current,
+            num_blocks,
+            num_blocks - current,
+            " ".join(per_unit),
+        )
 
     def apply_dynamic_kv_num_blocks(self, n: int | None) -> int | None:
         """Resize the KV cache to the block count the engine settled on.

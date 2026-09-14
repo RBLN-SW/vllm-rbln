@@ -740,11 +740,10 @@ class TestDynamicKvConfig:
         with pytest.raises(ValueError, match="MLA"):
             RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
 
-    def test_speculative_decoding_is_rejected(self):
-        with pytest.raises(ValueError, match="speculative"):
-            RblnPlatform._validate_dynamic_kv_config(
-                self._cfg(speculative_config=SimpleNamespace())
-            )
+    def test_speculative_decoding_passes(self):
+        RblnPlatform._validate_dynamic_kv_config(
+            self._cfg(speculative_config=SimpleNamespace())
+        )
 
     def test_a_kv_transfer_connector_is_rejected(self):
         with pytest.raises(ValueError, match="KV transfer"):

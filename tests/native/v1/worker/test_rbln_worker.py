@@ -437,9 +437,14 @@ class TestDetermineAvailableMemory:
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
         worker.device = torch.device("cpu")
         captured: dict = {}
-        monkeypatch.setattr(
-            wm, "estimate_available_memory", lambda **kw: captured.update(kw) or 999
-        )
+
+        def record(**kw):
+            # The dry run calls twice; the last call is the one whose result counts.
+            captured.clear()
+            captured.update(kw)
+            return 999
+
+        monkeypatch.setattr(wm, "estimate_available_memory", record)
         monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
         # WorkerBase always carries the field; None is what no spec decode means.
         worker.speculative_config = speculative_config
@@ -474,6 +479,29 @@ class TestDetermineAvailableMemory:
         )
         cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
         assert cap["chiplet_memory"] is snapshot
+
+    def test_dynamic_kv_dry_run_keeps_the_formula(self, make_worker, monkeypatch):
+        snapshot = {(0, 0): wm.ChipletMemory(total=100, used=40)}
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True
+        )
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
+            True,
+        )
+        monkeypatch.setattr(
+            wm.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: False),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wm.RBLNWorker,
+            "_dynamic_kv_memory_snapshot",
+            lambda self, device: (snapshot, "driver"),
+        )
+        cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
+        assert "chiplet_memory" not in cap
 
     def test_dynamic_kv_skips_the_snapshot_on_a_dummy_device(
         self, make_worker, monkeypatch
@@ -933,11 +961,11 @@ HEAD_SPLIT = _placement(tuple(_shard(0, c, (2, S0, 2, 1, 1024, 128)) for c in ra
 PER_BLOCK_PER_CHIPLET = 2**20
 
 
-def _program(placements, name="0/0", runtime=None, device=None):
+def _program(placements, name="0/0", runtime=None, device=None, extent=4):
     specs = (SimpleNamespace(name="ids", shape=(1,), physical_placement=None),) + tuple(
         SimpleNamespace(
             name=f"kv.{i}",
-            shape=tuple(4 if not isinstance(d, int) else d for d in p.shape),
+            shape=tuple(extent if not isinstance(d, int) else d for d in p.shape),
             physical_placement=p,
         )
         for i, p in enumerate(placements)
@@ -1012,6 +1040,34 @@ class TestComputeDynamicKvNumBlocks:
         n = RBLNWorker.compute_dynamic_kv_num_blocks(worker)
         # chiplet 1: (35 GiB - 30 GiB) / 2 MiB = 2560 blocks
         assert n == 5 * 512
+
+    def test_a_dry_run_reports_and_resizes_nothing(self, caplog):
+        current = 200
+        programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0", extent=current)]
+        resident = current * 2 * 2**20
+        worker = self._worker(
+            programs=programs,
+            snapshot=self._snapshot([30 * self.GIB + resident] * 4),
+        )
+        worker.cache_config.num_gpu_blocks_override = current
+        worker._kv_blocks_before_shrink = None
+        worker.model_runner.kv_cache_config.num_blocks = current
+        worker._log_dynamic_kv_dry_run = lambda *args: (
+            RBLNWorker._log_dynamic_kv_dry_run(worker, *args)
+        )
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
+                True,
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            assert RBLNWorker.compute_dynamic_kv_num_blocks(worker) is None
+        # (35 GiB - 30 GiB) / 2 MiB = 2560 blocks would fit; 200 are in use.
+        assert (
+            "vllm sized 200 blocks, this feature would set 2560 (+2360)" in caplog.text
+        )
+        assert "headroom=" in caplog.text
 
     def test_the_copy_stream_reserve_comes_off_every_chiplet(self):
         programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
@@ -1308,6 +1364,20 @@ class TestMaybeShrinkKvCacheForCompile:
         assert out is config
         assert worker._kv_blocks_before_shrink is None
         assert "[Dynamic KV]" not in caplog.text
+
+    def test_a_dry_run_compiles_at_the_sized_count(self, caplog):
+        config = self._config()
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
+                True,
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            worker, out = self._shrink(config)
+        assert out is config
+        assert worker._kv_blocks_before_shrink is None
+        assert "dry run" in caplog.text
 
     def test_a_pinned_block_count_cancels_the_shrink(self, caplog):
         config = self._config()

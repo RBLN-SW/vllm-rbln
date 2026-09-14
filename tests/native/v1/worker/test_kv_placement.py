@@ -31,7 +31,7 @@ from vllm_rbln.v1.worker.kv_placement import (
     kv_growth,
     max_num_blocks,
     placement_itemsize,
-    select_kv_inputs,
+    select_kv_input_groups,
     snapshot_from_allocator,
     snapshot_from_driver,
 )
@@ -213,11 +213,11 @@ class TestGrowth:
         assert set(growth.per_block) == {(0, 0)}
 
 
-class TestSelectKvInputs:
+class TestSelectKvInputGroups:
     def test_static_programs_are_skipped(self):
         logits = _program([], name="0/2")
         decode = _program([HEAD_SHARDED], name="0/1")
-        specs, program = select_kv_inputs([logits, decode])
+        [(specs, program)] = select_kv_input_groups([logits, decode])
         assert program is decode
         assert [s.physical_placement for s in specs] == [HEAD_SHARDED]
 
@@ -225,34 +225,37 @@ class TestSelectKvInputs:
         """prefill and every decode bucket bind the same KV tensors."""
         prefill = _program([HEAD_SHARDED, HEAD_SHARDED], name="0/0")
         decode = _program([HEAD_SHARDED, HEAD_SHARDED], name="0/1", statics=3)
-        specs, _ = select_kv_inputs([prefill, decode])
+        [(specs, _)] = select_kv_input_groups([prefill, decode])
         assert len(specs) == 2
 
     def test_shard_order_does_not_matter(self):
         flipped = _placement(HEAD_SHARDED.shape, tuple(reversed(HEAD_SHARDED.shards)))
-        select_kv_inputs([_program([HEAD_SHARDED]), _program([flipped])])
+        groups = select_kv_input_groups([_program([HEAD_SHARDED]), _program([flipped])])
+        assert len(groups) == 1
 
-    def test_a_different_layout_is_refused(self):
-        with pytest.raises(RuntimeError, match="disagree"):
-            select_kv_inputs([_program([HEAD_SHARDED]), _program([REPLICATED])])
+    def test_a_drafter_binding_its_own_tensors_is_a_second_group(self):
+        """A speculative drafter's programs bind fewer, separate KV tensors."""
+        target = _program([HEAD_SHARDED, HEAD_SHARDED], name="0/0")
+        drafter = _program([HEAD_SHARDED], name="1/0")
+        groups = select_kv_input_groups([target, drafter, target])
+        assert [len(specs) for specs, _ in groups] == [2, 1]
+        assert [program.name for _, program in groups] == ["0/0", "1/0"]
 
-    def test_a_different_compiled_extent_is_refused(self):
+    def test_the_same_tensors_placed_two_ways_are_refused(self):
         with pytest.raises(RuntimeError, match="disagree"):
-            select_kv_inputs(
-                [_program([HEAD_SHARDED]), _program([HEAD_SHARDED], extent=2 * HINT)]
-            )
+            select_kv_input_groups([_program([HEAD_SHARDED]), _program([REPLICATED])])
 
-    def test_a_different_input_count_is_refused(self):
-        with pytest.raises(RuntimeError, match="disagree"):
-            select_kv_inputs(
-                [_program([HEAD_SHARDED]), _program([HEAD_SHARDED, HEAD_SHARDED])]
-            )
+    def test_a_different_compiled_extent_is_another_tensor(self):
+        groups = select_kv_input_groups(
+            [_program([HEAD_SHARDED]), _program([HEAD_SHARDED], extent=2 * HINT)]
+        )
+        assert len(groups) == 2
 
     def test_no_dynamic_input_anywhere_names_the_cache_root(self):
         with pytest.raises(RuntimeError, match="VLLM_CACHE_ROOT"):
-            select_kv_inputs([_program([]), _program([])])
+            select_kv_input_groups([_program([]), _program([])])
         with pytest.raises(RuntimeError, match="none of the 0"):
-            select_kv_inputs([])
+            select_kv_input_groups([])
 
 
 class TestSnapshots:

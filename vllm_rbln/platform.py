@@ -620,12 +620,6 @@ class RblnPlatform(Platform):
                 "Run with the flag off, or with VLLM_MLA_DISABLE=1."
             )
 
-        if vllm_config.speculative_config is not None:
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
-                "decoding; the merged profiles cannot be attributed per artifact."
-            )
-
         if not USE_DEVICE_TENSOR:
             raise ValueError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "

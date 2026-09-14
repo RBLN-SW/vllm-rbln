@@ -75,13 +75,17 @@ def placement_itemsize(dtype: str) -> int:
     return -(-bits // 8)
 
 
+def _tensor_fingerprint(spec: Any) -> tuple:
+    """What a KV input looks like regardless of how it is sharded."""
+    placement = spec.physical_placement
+    return (tuple(spec.shape), tuple(placement.shape), str(placement.dtype))
+
+
 def _input_key(spec: Any) -> tuple:
     """Order-independent identity of a KV input, for comparing programs."""
     placement = spec.physical_placement
     return (
-        tuple(spec.shape),
-        tuple(placement.shape),
-        str(placement.dtype),
+        *_tensor_fingerprint(spec),
         tuple(
             sorted(
                 (int(s.node_id), int(s.chiplet_id), tuple(s.slice_shape))
@@ -91,42 +95,46 @@ def _input_key(spec: Any) -> tuple:
     )
 
 
-def select_kv_inputs(programs: Sequence[Any]) -> tuple[list[Any], Any]:
-    """The KV input specs every KV-holding program agrees on, and that program.
+def select_kv_input_groups(programs: Sequence[Any]) -> list[tuple[list[Any], Any]]:
+    """The distinct sets of KV inputs the programs bind, one `(specs, program)`
+    per set, in first-seen order.
 
     Only the KV caches are marked dynamic, so a program's dynamic-shape inputs
-    are exactly its KV inputs; a static program (compute_logits) has none. Every
-    KV-holding program binds the *same* physical tensors, so their dynamic inputs
-    must describe the same layout: two layouts would make the runtime re-place
-    the cache on every switch. Refuse rather than pick one.
+    are exactly its KV inputs; a static program (compute_logits) has none. The
+    target's prefill and decode programs bind the same tensors and so agree on
+    the placement; a speculative drafter's programs bind their own tensors and
+    form a second set, which the sizing adds on top. Two programs whose inputs
+    match in shape and dtype but not in shards are the same tensors placed two
+    ways -- the runtime would re-place the cache on every switch -- and refuse.
     """
-    chosen: list[Any] | None = None
-    chosen_program: Any = None
-    chosen_key: list[tuple] | None = None
+    groups: dict[tuple, tuple[list[Any], Any]] = {}
+    fingerprints: dict[tuple, tuple] = {}
     for program in programs:
         specs = [
             spec for spec in program.input_specs if spec.physical_placement is not None
         ]
         if not specs:
             continue
-        key = sorted(_input_key(spec) for spec in specs)
-        if chosen is None:
-            chosen, chosen_program, chosen_key = specs, program, key
+        key = tuple(sorted(_input_key(spec) for spec in specs))
+        if key in groups:
             continue
-        if key != chosen_key:
+        fingerprint = tuple(sorted(_tensor_fingerprint(spec) for spec in specs))
+        if fingerprint in fingerprints:
+            other = groups[fingerprints[fingerprint]][1]
             raise RuntimeError(
                 "compiled programs disagree on the KV cache placement: "
-                f"{_program_name(chosen_program)} has {len(chosen)} dynamic "
-                f"input(s) and {_program_name(program)} has {len(specs)}, "
-                "or their shard layouts differ. A KV tensor can only hold one "
-                "placement at a time."
+                f"{_program_name(other)} and {_program_name(program)} bind the "
+                f"same {len(specs)} KV input(s) with different shard layouts. A KV "
+                "tensor can only hold one placement at a time."
             )
-    if chosen is None:
+        groups[key] = (specs, program)
+        fingerprints[fingerprint] = key
+    if not groups:
         raise RuntimeError(
             f"none of the {len(programs)} compiled program(s) carries a dynamic-shape "
             "KV input; was VLLM_CACHE_ROOT replaying a static build?"
         )
-    return chosen, chosen_program
+    return list(groups.values())
 
 
 def _program_name(program: Any) -> str:
