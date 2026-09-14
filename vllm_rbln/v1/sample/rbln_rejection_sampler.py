@@ -440,6 +440,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 ),
                 "counts": torch.zeros(batch_size, dtype=torch.int32, device=device),
                 "bonus_temperature": torch.ones(batch_size, dtype=dtype, device=device),
+                "top_k": torch.zeros(batch_size, dtype=torch.int32, device=device),
+                "top_p": torch.ones(batch_size, dtype=torch.float32, device=device),
             }
 
         # Pad the packed inputs to the fixed [B*K] length the op wants. Rows past
@@ -479,6 +481,12 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 vocab_size,
                 device,
             )
+            # The metadata tensors also feed the bonus sampler's graph; a
+            # graph's inputs must be its own buffers.
+            if top_k is not None:
+                top_k = bufs["top_k"].copy_(top_k)
+            if top_p is not None:
+                top_p = bufs["top_p"].copy_(top_p)
 
         # NOTE(RBLN): Per-row temperature for the divide inside the graph. Padding
         # and greedy rows must carry 1.0 -- a 0 would divide by zero.
