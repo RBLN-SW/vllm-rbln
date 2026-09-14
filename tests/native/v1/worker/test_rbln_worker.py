@@ -1000,7 +1000,7 @@ class TestComputeDynamicKvNumBlocks:
             yield
 
     def _worker(self, *, programs, snapshot, tp_size=1, gmu=1.0):
-        return SimpleNamespace(
+        worker = SimpleNamespace(
             rank=0,
             device=torch.device("cpu"),
             cache_config=SimpleNamespace(
@@ -1015,6 +1015,10 @@ class TestComputeDynamicKvNumBlocks:
             _dynamic_kv_memory_snapshot=lambda device: (snapshot, "stub"),
             _kv_copy_stream_reserve_bytes=lambda: 0,
         )
+        worker._dynamic_kv_num_blocks_from_placement = lambda: (
+            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker)
+        )
+        return worker
 
     def _snapshot(self, used):
         return {
@@ -1055,6 +1059,9 @@ class TestComputeDynamicKvNumBlocks:
         worker._log_dynamic_kv_dry_run = lambda *args: (
             RBLNWorker._log_dynamic_kv_dry_run(worker, *args)
         )
+        worker._dynamic_kv_num_blocks_from_placement = lambda: (
+            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker)
+        )
         with (
             patch(
                 "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
@@ -1068,6 +1075,19 @@ class TestComputeDynamicKvNumBlocks:
             "vllm sized 200 blocks, this feature would set 2560 (+2360)" in caplog.text
         )
         assert "headroom=" in caplog.text
+
+    def test_a_dry_run_that_cannot_size_warns_instead_of_raising(self, caplog):
+        worker = self._worker(programs=[_program([])], snapshot=self._snapshot([0] * 4))
+        worker._kv_blocks_before_shrink = None
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
+                True,
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            assert RBLNWorker.compute_dynamic_kv_num_blocks(worker) is None
+        assert "could not be computed" in caplog.text
 
     def test_the_copy_stream_reserve_comes_off_every_chiplet(self):
         programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
@@ -1517,7 +1537,7 @@ class TestDynamicKvFailuresRaise:
 
     @staticmethod
     def _worker(*, shrunk=True, override=None, programs=()):
-        return SimpleNamespace(
+        worker = SimpleNamespace(
             rank=0,
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
             _kv_blocks_before_shrink=211 if shrunk else None,
@@ -1526,6 +1546,10 @@ class TestDynamicKvFailuresRaise:
             ),
             _dynamic_kv_programs=list(programs),
         )
+        worker._dynamic_kv_num_blocks_from_placement = lambda: (
+            RBLNWorker._dynamic_kv_num_blocks_from_placement(worker)
+        )
+        return worker
 
     @pytest.fixture(autouse=True)
     def _real_device(self):

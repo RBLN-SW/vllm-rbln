@@ -65,7 +65,7 @@ Key components:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `0` | Size the KV cache from the compiled placement and the device instead of the pre-compile estimate. Off means the estimate, exactly as before. |
-| `VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN` | `0` | With the flag above: compute the count and log how the count vllm sized fits each chiplet, but resize nothing. For trying the feature on an existing matrix before switching it on. |
+| `VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN` | `0` | Compute the count and log how the count vllm sized fits each chiplet, but resize nothing. Implies the flag above, so it is the only variable a trial run needs. |
 
 ```bash
 export VLLM_RBLN_USE_VLLM_MODEL=1
@@ -87,7 +87,7 @@ signature and can replay each other's codegen.
 
 ### Dry run
 
-`VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN=1` together with the flag keeps every count
+`VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN=1` (on its own; it implies the flag) keeps every count
 as it is today -- the pre-compile estimate or `--num-gpu-blocks-override`, whichever
 vllm would have used -- and only reports. The KV dim is still marked dynamic,
 since that is what makes the compiled programs carry a placement, but the cache is
@@ -103,7 +103,8 @@ carry the result:
   on that chiplet.
 
 Unsupported configurations are refused in a dry run too, since the refusals
-guard the dynamic compile itself.
+guard the dynamic compile itself. A sizing failure after warm-up (no placement,
+no fit) is logged as a warning instead of raised.
 
 ## Requirements on the stack
 

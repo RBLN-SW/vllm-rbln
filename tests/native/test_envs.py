@@ -339,6 +339,13 @@ def test_unknown_variable_raises():
         getattr(envs, "VLLM_RBLN_NOT_A_REAL_VARIABLE")  # noqa: B009
 
 
+def test_dynamic_kv_dry_run_implies_the_flag(monkeypatch):
+    monkeypatch.delenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", raising=False)
+    monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "1")
+    assert envs.environment_variables["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"]() is True
+    assert envs.environment_variables["VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN"]() is True
+
+
 def test_dynamic_kv_cache_is_opt_in(monkeypatch):
     # The flag is read during compile, so a non-False default would change the
     # compiled artifact for every existing deployment.

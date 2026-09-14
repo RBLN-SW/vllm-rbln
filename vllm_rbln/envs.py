@@ -280,14 +280,17 @@ environment_variables = {
         )
     ),
     # --- DYNAMIC KV CACHE ---
-    # Size the KV cache from the compiled artifact instead of the estimate
+    # Size the KV cache from the compiled artifact instead of the estimate.
+    # The dry-run variable below implies it.
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
             in ("true", "1")
+            or os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()
+            in ("true", "1")
         )
     ),
-    # With the flag above: compute and log the block count, resize nothing
+    # Compute and log the block count, resize nothing
     "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN": (
         lambda: (
             os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()

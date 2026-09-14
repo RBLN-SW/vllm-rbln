@@ -806,6 +806,28 @@ class RBLNWorker(WorkerBase):
             )
             return None
 
+        if dry_run:
+            try:
+                num_blocks, fits, hint_blocks = (
+                    self._dynamic_kv_num_blocks_from_placement()
+                )
+            except RuntimeError as exc:
+                logger.warning(
+                    "[Dynamic KV] dry run: the count could not be computed (%s); "
+                    "nothing is resized.",
+                    exc,
+                )
+                return None
+            self._log_dynamic_kv_dry_run(num_blocks, fits, hint_blocks)
+            return None
+        num_blocks, _, _ = self._dynamic_kv_num_blocks_from_placement()
+        return num_blocks
+
+    def _dynamic_kv_num_blocks_from_placement(
+        self,
+    ) -> tuple[int, dict[Unit, UnitFit], int]:
+        """The count that fits, the per-unit fit behind it, and the hint the
+        programs were traced with."""
         programs = list(self._dynamic_kv_programs)
         groups = select_kv_input_groups(programs)
         hint_blocks = self.model_runner.kv_cache_config.num_blocks
@@ -887,10 +909,7 @@ class RBLNWorker(WorkerBase):
             {f"{n}:{c}": b for (n, c), b in sorted(predicted.items())},
             sum(predicted.values()),
         )
-        if dry_run:
-            self._log_dynamic_kv_dry_run(num_blocks, fits, hint_blocks)
-            return None
-        return num_blocks
+        return num_blocks, fits, hint_blocks
 
     def _log_dynamic_kv_dry_run(
         self, num_blocks: int, fits: Mapping[Unit, UnitFit], current: int
