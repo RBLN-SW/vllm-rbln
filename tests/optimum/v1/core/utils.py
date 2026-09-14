@@ -101,7 +101,7 @@ def create_scheduler(
         structured_outputs_config=structured_outputs_config,
         additional_config={
             "prefix_block_size": block_size,
-            "rbln_config": {
+            "optimum_overrides": {
                 "prefill_chunk_size": block_size,
             },
         },

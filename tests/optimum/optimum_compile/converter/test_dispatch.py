@@ -16,16 +16,15 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_rbln.utils.optimum.converter.common import (
-    USER_MAX_NUM_BATCHED_TOKENS_KEY,
-)
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
 
 
-def _vllm_config(user_max_num_batched_tokens=None, dtype=torch.bfloat16):
-    additional_config = {}
-    if user_max_num_batched_tokens is not None:
-        additional_config[USER_MAX_NUM_BATCHED_TOKENS_KEY] = user_max_num_batched_tokens
+def _vllm_config(user_max_num_batched_tokens=None, dtype=torch.bfloat16, num_devices=1):
+    additional_config = OptimumRBLNConfig(
+        num_devices_per_local_rank=num_devices,
+        user_max_num_batched_tokens=user_max_num_batched_tokens,
+    )
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="meta-llama/Llama-3.1-8B", max_model_len=8192, dtype=dtype
@@ -58,3 +57,10 @@ class TestGenerateModelPathName:
         name_bf16 = _generate_model_path_name(_vllm_config(dtype=torch.bfloat16))
         name_fp32 = _generate_model_path_name(_vllm_config(dtype=torch.float32))
         assert name_bf16 != name_fp32
+
+    def test_num_devices_comes_from_optimum_config(self, monkeypatch):
+        """The key reads the resolved config, not the variable behind it."""
+        monkeypatch.setenv("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", "1")
+        name_1 = _generate_model_path_name(_vllm_config(num_devices=1))
+        name_2 = _generate_model_path_name(_vllm_config(num_devices=2))
+        assert name_1 != name_2

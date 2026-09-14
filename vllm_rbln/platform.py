@@ -203,10 +203,6 @@ class RblnPlatform(Platform):
         """
         from vllm.engine.arg_utils import EngineArgs
 
-        from vllm_rbln.utils.optimum.converter.common import (
-            USER_MAX_NUM_BATCHED_TOKENS_KEY,
-        )
-
         if getattr(EngineArgs, "_rbln_user_mnbt_patched", False):
             return
 
@@ -214,9 +210,11 @@ class RblnPlatform(Platform):
 
         def _set_default_max_num_seqs_and_batched_tokens_args(self, *args, **kwargs):
             # Runs before the value is resolved from None to its default.
+            # Still a dict here. build_optimum_rbln_config turns the key into
+            # the OptimumRBLNConfig field of the same name.
             if self.additional_config is None:
                 self.additional_config = {}
-            self.additional_config[USER_MAX_NUM_BATCHED_TOKENS_KEY] = (
+            self.additional_config["user_max_num_batched_tokens"] = (
                 self.max_num_batched_tokens
             )
             return orig_set_defaults(self, *args, **kwargs)
@@ -271,14 +269,19 @@ class RblnPlatform(Platform):
             if action.dest == "block_size":
                 action.choices = None  # Override choices
 
-        if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            from vllm_rbln.config import add_rbln_cli_args
+        from vllm_rbln.config import OptimumRBLNConfig, RBLNConfig, add_rbln_cli_args
 
-            add_rbln_cli_args(parser)
+        add_rbln_cli_args(
+            parser, RBLNConfig if envs.VLLM_RBLN_USE_VLLM_MODEL else OptimumRBLNConfig
+        )
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.config import build_rbln_config, set_rbln_config
+        from vllm_rbln.config import (
+            build_optimum_rbln_config,
+            build_rbln_config,
+            set_rbln_config,
+        )
         from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
         from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
         from vllm_rbln.utils.optimum.registry import is_pooling_arch
@@ -503,6 +506,10 @@ class RblnPlatform(Platform):
                 model_config.disable_cascade_attn = True
 
         else:
+            vllm_config.additional_config = build_optimum_rbln_config(
+                vllm_config.additional_config
+            )
+
             if forces_fp32_dtype(vllm_config.model_config):
                 model_config.dtype = torch.float32
 

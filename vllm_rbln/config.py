@@ -18,14 +18,16 @@ On this path the config *is* `VllmConfig.additional_config`, which
 `check_and_update_config` replaces with the resolved object. Being a
 `VllmConfig` field is what carries it to every worker in the config pickle,
 and what makes `VllmConfig.compute_hash()` call our `compute_hash`.
-`platform.py` gates all of it on `VLLM_RBLN_USE_VLLM_MODEL=1`.
+`OptimumRBLNConfig` does the same for the optimum-rbln path; `platform.py`
+picks the class from `VLLM_RBLN_USE_VLLM_MODEL`.
 
 Resolution order, highest first:
 
-  1. `additional_config`, an `RBLNConfig` or a dict of field names. The
+  1. `additional_config`, an instance or a dict of field names. The
      `--rbln-*` flags write into it.
   2. `VLLM_RBLN_<FIELD>`, read through `envs.py` so the parsing there still
-     applies. `_ENV_PROBE` lists the names that break the pattern.
+     applies, for the fields that have such a variable. `_ENV_PROBE` lists the
+     names that break the pattern.
   3. the field default
 
 Most call sites still read `envs.py` directly. They move over one subsystem
@@ -34,8 +36,8 @@ at a time.
 
 import argparse
 import os
-from dataclasses import field, fields
-from typing import TYPE_CHECKING, Any, Literal
+from dataclasses import Field, field, fields
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
 from vllm.config.utils import config as vllm_config_dataclass
 
@@ -48,84 +50,101 @@ logger = init_logger(__name__)
 
 _GROUP_TITLE = "RBLNConfig"
 
+ModelImpl = Literal["vllm", "optimum"]
 DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
+
+_VLLM = {"model_impl": "vllm"}
+_INTERNAL = {"internal": True}
 
 
 @vllm_config_dataclass
 class RBLNConfig:
     """RBLN NPU options for the vLLM-native model path."""
 
+    model_impl: ClassVar[ModelImpl] = "vllm"
+
+    # ====================================================================
+    # Shared with OptimumRBLNConfig
+    # ====================================================================
     num_devices_per_local_rank: int = 1
-    """Number of NPU devices assigned to each local rank."""
+    """Number of NPU devices assigned to each local rank. Under `optimum` a
+    pre-compiled model overrides this with the value it was compiled for."""
 
     sampler: bool = True
     """Use the customized RBLN sampler."""
 
-    compile_model: bool = True
+    # ====================================================================
+    # vllm only
+    # ====================================================================
+    compile_model: bool = field(default=True, metadata=_VLLM)
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
     possible."""
 
-    compile_strict_mode: bool = False
+    compile_strict_mode: bool = field(default=False, metadata=_VLLM)
     """Compile with torch.compile's strict mode, which fails on a graph break
     instead of falling back to eager."""
 
-    num_hidden_layers: int = 0
+    num_hidden_layers: int = field(default=0, metadata=_VLLM)
     """Build only the first N decoder layers and leave the rest as
     `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
     truncation."""
 
-    enforce_model_fp32: bool = False
+    enforce_model_fp32: bool = field(default=False, metadata=_VLLM)
     """Force the model dtype to fp32 instead of model_config.dtype."""
 
-    use_dynamic_kv_cache: bool = False
+    use_dynamic_kv_cache: bool = field(default=False, metadata=_VLLM)
     """Size the KV cache from the compiled artifact instead of the estimate."""
 
-    flash_causal_attn: bool = True
+    flash_causal_attn: bool = field(default=True, metadata=_VLLM)
     """Use flash attention for causal attention."""
 
-    batch_attn_opt: bool = False
+    batch_attn_opt: bool = field(default=False, metadata=_VLLM)
     """Use the batch attention optimization for paged attention."""
 
-    use_custom_kernel: bool = False
+    use_custom_kernel: bool = field(default=False, metadata=_VLLM)
     """Use the custom RBLN kernels."""
 
-    sub_block_cache: bool = True
+    sub_block_cache: bool = field(default=True, metadata=_VLLM)
     """Enable sub-block prefix caching. The sub-block size equals
     max_num_batched_tokens (the prefill chunk size)."""
 
-    specialize_moe_decode: bool = True
+    specialize_moe_decode: bool = field(default=True, metadata=_VLLM)
     """Specialize the case where every instance is at the decode stage."""
 
-    use_moe_tokens_mask: bool = True
+    use_moe_tokens_mask: bool = field(default=True, metadata=_VLLM)
     """Apply the tokens mask to the MoE expert kernel."""
 
-    dispatch_all2all: bool = False
+    dispatch_all2all: bool = field(default=False, metadata=_VLLM)
     """Use all2all dispatch instead of all-gather for MoE DP dispatch."""
 
-    combine_all2all: bool = False
+    combine_all2all: bool = field(default=False, metadata=_VLLM)
     """Use all2all combine instead of reduce-scatter for MoE DP combine."""
 
-    decode_batch_bucket_strategy: DecodeBatchBucketStrategy = "exponential"
+    decode_batch_bucket_strategy: DecodeBatchBucketStrategy = field(
+        default="exponential", metadata=_VLLM
+    )
     """How the decode batch buckets are laid out."""
 
-    decode_batch_bucket_min: int = 1
+    decode_batch_bucket_min: int = field(default=1, metadata=_VLLM)
     """Smallest decode batch bucket."""
 
-    decode_batch_bucket_step: int = 2
+    decode_batch_bucket_step: int = field(default=2, metadata=_VLLM)
     """Step between decode batch buckets."""
 
-    decode_batch_bucket_limit: int = 1
+    decode_batch_bucket_limit: int = field(default=1, metadata=_VLLM)
     """Largest decode batch bucket."""
 
-    decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
+    decode_batch_bucket_manual_buckets: list[int] = field(
+        default_factory=list, metadata=_VLLM
+    )
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
-    nixl_swa_view_opt: bool = False
+    nixl_swa_view_opt: bool = field(default=False, metadata=_VLLM)
     """Publish a second SWA-sized descriptor range alongside the Full-sized
     range at the same NIXL base addresses, so SWA groups transfer only
     `sliding_window` bytes per block over RDMA."""
 
-    use_w8a8: bool = False
+    use_w8a8: bool = field(default=False, metadata=_VLLM)
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
 
@@ -161,9 +180,74 @@ class RBLNConfig:
             )
 
 
-# `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
-# without vllm installed, so it cannot see that this makes a dataclass.
-_FIELDS = fields(RBLNConfig)  # type: ignore[arg-type]
+@vllm_config_dataclass
+class OptimumRBLNConfig(RBLNConfig):
+    """RBLN NPU options for the optimum-rbln model path.
+
+    The shared fields of `RBLNConfig` plus the ones below. The `_VLLM` fields
+    are inherited but neither settable nor shown on this path."""
+
+    model_impl: ClassVar[ModelImpl] = "optimum"
+
+    # ====================================================================
+    # Given by the user
+    # ====================================================================
+    optimum_overrides: dict[str, Any] = field(default_factory=dict)
+    """Entries for optimum-rbln's model config (its `rbln_config`), laid over
+    what vllm-rbln derives from the vLLM settings when the model is compiled.
+    With a pre-compiled model only the `device` entries apply."""
+
+    prefix_block_size: int | None = None
+    """Block size of the prefix cache. Defaults to the prefill chunk size."""
+
+    # ====================================================================
+    # Written by the platform hook and the config sync. Not user-facing, and
+    # overwritten if given.
+    # ====================================================================
+    user_max_num_batched_tokens: int | None = field(default=None, metadata=_INTERNAL)
+    """`--max-num-batched-tokens` as the user gave it, copied here by the
+    platform hook before vLLM fills in its default. Under `optimum` it is the
+    prefill chunk size to compile."""
+
+    cached_model_path: str | None = field(default=None, metadata=_INTERNAL)
+    """Where the compile cache holds, or will put, this model's artifact."""
+
+    attn_block_size: int | None = field(default=None, metadata=_INTERNAL)
+    """The KV-cache block size (`kvcache_block_size`), when prefix caching
+    splits it from cache_config.block_size. Copied out of `rbln_config` or the
+    artifact for the processes that have no RBLNParams of their own."""
+
+    num_blocks_override: int | None = field(default=None, metadata=_INTERNAL)
+    """cache_config.num_gpu_blocks_override as given, before the prefix-cache
+    block ratio is applied."""
+
+    num_blocks_synced: bool = field(default=False, metadata=_INTERNAL)
+    """Set once num_gpu_blocks is derived from the compiled model, so the
+    second run of the sync in EngineCore does not derive it again."""
+
+    image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_INTERNAL)
+    """Image-prefill buckets (gemma3/gemma4), read by the scheduler, which has
+    no RBLNParams of its own."""
+
+
+_Config = TypeVar("_Config", bound=RBLNConfig)
+
+
+def _fields_of(cls: type[RBLNConfig]) -> list["Field[Any]"]:
+    """The fields `additional_config` may set for `cls`: its own, and the
+    inherited ones not marked `_VLLM`, i.e. for another `model_impl`."""
+    # `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
+    # without vllm installed, so it cannot see that this makes a dataclass.
+    return [
+        f
+        for f in fields(cls)  # type: ignore[arg-type]
+        if f.metadata.get("model_impl", cls.model_impl) == cls.model_impl
+    ]
+
+
+# TODO(vllm-rbln>=0.12.0): delete. Former additional_config keys, still accepted
+# with a warning.
+_RENAMED_KEYS = {"rbln_config": "optimum_overrides"}
 
 
 # Which env name means "the user set this field". It is VLLM_RBLN_<FIELD>
@@ -178,12 +262,14 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
 }
 
 
-def _env_overrides() -> dict[str, Any]:
+def _env_overrides(cls: type[RBLNConfig]) -> dict[str, Any]:
     from vllm_rbln import envs
 
     overrides: dict[str, Any] = {}
-    for f in _FIELDS:
+    for f in _fields_of(cls):
         env_name = f"VLLM_RBLN_{f.name.upper()}"
+        if env_name not in envs.environment_variables:
+            continue
         for probe in _ENV_PROBE.get(f.name, (env_name,)):
             if probe in os.environ:
                 overrides[f.name] = getattr(envs, env_name)
@@ -191,34 +277,44 @@ def _env_overrides() -> dict[str, Any]:
     return overrides
 
 
-def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
-    """Resolve the RBLN config from `additional_config` and the environment.
+def _resolve(cls: type[_Config], additional_config: Any) -> _Config:
+    """Resolve a `cls` from `additional_config` and the environment.
 
-    An `RBLNConfig` is returned unchanged, so a process that receives one
-    cannot resolve it into something different.
+    An instance is returned unchanged, so a process that receives one cannot
+    resolve it into something different.
     """
-    if isinstance(additional_config, RBLNConfig):
+    if isinstance(additional_config, cls):
         return additional_config
 
     given: dict[str, Any] = additional_config or {}
     if not isinstance(given, dict):
         raise ValueError(
-            "additional_config must be an RBLNConfig or a mapping of its field "
-            f"names on the vLLM-native path, got {type(given).__name__}"
+            f"additional_config must be an {cls.__name__} or a mapping of its "
+            f"field names, got {type(given).__name__}"
         )
 
-    known = {f.name for f in _FIELDS}
+    for old, new in _RENAMED_KEYS.items():
+        if old in given:
+            logger.warning_once(
+                "additional_config[%r] is deprecated and will be removed in "
+                "0.12.0; use %r.",
+                old,
+                new,
+            )
+            given = {**given, new: given[old]}
+            del given[old]
+
+    known = {f.name for f in _fields_of(cls)}
     if unknown := sorted(set(given) - known):
         # `extra="forbid"` would catch these too, but its message talks about
         # keyword arguments. Upstream's --gdn-prefill-backend arrives this way:
         # arg_utils writes it into additional_config.
         raise ValueError(
-            f"additional_config takes only RBLNConfig fields on the "
-            f"vLLM-native path, and {unknown} are not fields. The fields are "
-            f"{sorted(known)}."
+            f"additional_config takes only {cls.__name__} fields, and {unknown} "
+            f"are not fields there. The fields are {sorted(known)}."
         )
 
-    overrides = _env_overrides()
+    overrides = _env_overrides(cls)
     shadowed = sorted(set(given) & set(overrides))
     overrides.update(given)
 
@@ -228,7 +324,17 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
             ", ".join(shadowed),
         )
 
-    return RBLNConfig(**overrides)
+    return cls(**overrides)
+
+
+def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
+    """Resolve the vLLM-native path's config from `additional_config`."""
+    return _resolve(RBLNConfig, additional_config)
+
+
+def build_optimum_rbln_config(additional_config: Any = None) -> OptimumRBLNConfig:
+    """Resolve the optimum-rbln path's config from `additional_config`."""
+    return _resolve(OptimumRBLNConfig, additional_config)
 
 
 _rbln_config: RBLNConfig | None = None
@@ -247,7 +353,7 @@ def set_rbln_config(config: RBLNConfig) -> None:
     defaults = RBLNConfig()
     changed = {
         f.name: getattr(config, f.name)
-        for f in _FIELDS
+        for f in fields(config)  # type: ignore[arg-type]
         if getattr(config, f.name) != getattr(defaults, f.name)
     }
     logger.info("RBLN config: %s", changed or "all defaults")
@@ -322,8 +428,8 @@ class _MergeAdditionalConfig(argparse.Action):
         _additional_config(namespace).update(values)
 
 
-def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
-    """Add the `RBLNConfig` group to `parser`. Safe to call twice.
+def add_rbln_cli_args(parser: "FlexibleArgumentParser", cls: type[RBLNConfig]) -> None:
+    """Add the `cls` group to `parser`. Safe to call twice.
 
     `RblnPlatform.pre_register_and_update(parser)` calls this from inside
     `AsyncEngineArgs.add_cli_args()`, before `parse_args()`. That is early
@@ -336,10 +442,12 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
 
     group = parser.add_argument_group(
         title=_GROUP_TITLE,
-        description=RBLNConfig.__doc__,
+        description=cls.__doc__,
     )
-    kwargs = get_kwargs(RBLNConfig)
-    for f in _FIELDS:
+    kwargs = get_kwargs(cls)
+    for f in _fields_of(cls):
+        if f.metadata.get("internal"):
+            continue
         field_kwargs = kwargs[f.name]
         is_bool = field_kwargs.pop("action", None) is argparse.BooleanOptionalAction
         group.add_argument(
