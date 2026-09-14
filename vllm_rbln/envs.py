@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
+    VLLM_RBLN_USE_MULTI_BLOCK_ATTN: bool = False
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     # --- MOE ---
@@ -304,6 +305,15 @@ environment_variables = {
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
         )
     ),
+    # Give a sliding-window layer several cache blocks and append into them,
+    # rather than one block whose contents the kernel shifts. Needs the
+    # sliding_window_attention_v1 kernel, which not every NPU carries.
+    "VLLM_RBLN_USE_MULTI_BLOCK_ATTN": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", "False").lower()
+            in ("true", "1")
+        )
+    ),
     # --- MODEL INPUT / SCHEDULING ---
     # Enable sub-block prefix caching.
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
@@ -390,6 +400,7 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",
+        "VLLM_RBLN_USE_MULTI_BLOCK_ATTN",
         "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
         "VLLM_RBLN_USE_MOE_TOKENS_MASK",
         "VLLM_RBLN_DISPATCH_ALL2ALL",

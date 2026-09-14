@@ -42,6 +42,8 @@ from . import (
     mla,
     modelopt_mixed_config,
     models_utils,
+    multi_connector,
+    multiproc_executor,
     oot,
     profiler,
     qwen2_moe,
