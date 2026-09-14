@@ -507,28 +507,25 @@ class RBLNOptimumModelRunner(
 
     @staticmethod
     def mask_block_table(block_ids: torch.Tensor, num_blocks: int) -> torch.Tensor:
-        """Shift vLLM block ids to compiler ids and fill the unused tail slots.
+        """Mask (pad) unused block slots in-place.
 
-        vLLM reserves block 0 as the null block, so valid ids start at 1; the
-        compiler counts from 0. Slots past `num_blocks` repeat the row's last
-        block instead of holding a sentinel: the in-memory attention kernel
-        gathers `block_table[row, p]` for every row of a group whenever partition
-        `p` is live for any row, so a -1 there is an out-of-range KV-cache DMA
-        (RBDMA bus_read_err, surfaced as SYS_TASK_ABORTED). The row's keys in
-        that partition are masked by index_list, so the repeated block is only
-        read, never attended to.
+        Sets entries beyond `num_blocks` to 0. The attention kernel reads every
+        slot of a live partition, so a -1 sentinel is an out-of-range DMA.
         """
-        if num_blocks < 1:
-            raise ValueError("a scheduled request owns at least one block")
+        if num_blocks < 0:
+            raise ValueError("num_blocks must be >= 0")
 
         if block_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError("block_ids must be int32 or int64")
 
+        # In V1, block ID 0 is reserved as a dummy "null_block",
+        # so valid blocks start from 1.
+        # The compiler, however, expects valid blocks to start from 0.
         block_ids = block_ids - 1
         max_blocks = block_ids.size(-1)
         k = min(num_blocks, max_blocks)
         if k < max_blocks:
-            block_ids[..., k:] = block_ids[..., k - 1 : k]
+            block_ids[..., k:] = 0
 
         return block_ids
 

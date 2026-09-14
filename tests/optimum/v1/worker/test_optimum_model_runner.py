@@ -128,16 +128,16 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
     ).all()
 
 
-def test_mask_block_table_fills_unused_slots_with_the_last_valid_block():
+def test_mask_block_table_fills_unused_slots_with_zero():
     # vLLM ids (1-based, 0 is the null block) for a request owning 4 of 8 slots.
     block_ids = torch.tensor([7, 9, 12, 15, 0, 0, 0, 0], dtype=torch.int32)
 
     out = RBLNOptimumModelRunner.mask_block_table(block_ids, num_blocks=4)
 
-    # Shifted to compiler ids; the tail repeats the row's last block, never -1: the
-    # in-memory attention kernel reads block_table[row, p] for every row of a live
-    # partition, and a -1 there is an out-of-range KV-cache DMA.
-    assert out.tolist() == [6, 8, 11, 14, 14, 14, 14, 14]
+    # Shifted to compiler ids; the tail is 0, never -1: the in-memory attention
+    # kernel reads block_table[row, p] for every row of a live partition, and a
+    # -1 there is an out-of-range KV-cache DMA.
+    assert out.tolist() == [6, 8, 11, 14, 0, 0, 0, 0]
 
 
 def test_mask_block_table_leaves_a_full_row_alone():
@@ -148,11 +148,11 @@ def test_mask_block_table_leaves_a_full_row_alone():
     assert out.tolist() == [6, 8, 11, 14]
 
 
-def test_mask_block_table_rejects_a_request_without_blocks():
-    block_ids = torch.tensor([0, 0, 0, 0], dtype=torch.int32)
+def test_mask_block_table_rejects_negative_num_blocks():
+    block_ids = torch.tensor([7, 9, 12, 15], dtype=torch.int32)
 
     with pytest.raises(ValueError):
-        RBLNOptimumModelRunner.mask_block_table(block_ids, num_blocks=0)
+        RBLNOptimumModelRunner.mask_block_table(block_ids, num_blocks=-1)
 
 
 class _MultimodalModel(RBLNOptimumMultimodalMixin):
