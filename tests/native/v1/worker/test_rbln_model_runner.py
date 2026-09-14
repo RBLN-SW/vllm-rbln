@@ -22,7 +22,7 @@ import contextlib
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
@@ -38,6 +38,8 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
+import vllm_rbln.v1.worker.utils as worker_utils
+from tests.native.v1.worker.utils import make_runner_config, schedule_new
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
@@ -389,6 +391,57 @@ class TestResolveBatchDescriptor:
         )._determine_batch_execution_and_padding(3, 30)
         assert batch_desc.num_tokens_padded is None
         assert across is None
+
+
+@pytest.mark.maybe_use_device
+@pytest.mark.parametrize(("backend", "should_exit"), [("mp", True), ("uni", False)])
+def test_async_output_inherits_runner_fail_fast_policy(
+    make_model_runner, monkeypatch, backend, should_exit
+):
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    config = make_runner_config(distributed_executor_backend=backend)
+    # The CPU lane disables async scheduling at platform setup. Exercise the
+    # deferred output path with CPU tensors after that setup has completed.
+    config.scheduler_config.async_scheduling = True
+    runner = make_model_runner(vllm_config=config)
+    scheduler_output = schedule_new("a")
+    runner._update_states(scheduler_output)
+    hidden_states = torch.zeros(1, 1)
+    runner.execute_model_state = ExecuteModelState(
+        scheduler_output, hidden_states, None, None, hidden_states, hidden_states, None
+    )
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        Mock(
+            return_value=SamplerOutput(
+                sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
+                logprobs_tensors=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_bookkeeping_sync",
+        Mock(return_value=(0, None, [], {}, ["a"], {"a": 0}, [])),
+    )
+    output = runner.sample_tokens(None)
+    error = RuntimeError("runner output copy failed")
+    monkeypatch.setattr(output._sampled_token_ids_cpu, "copy_", Mock(side_effect=error))
+    monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "0")
+    exit_process = Mock(side_effect=SystemExit(70))
+    monkeypatch.setattr(worker_utils.os, "_exit", exit_process)
+
+    with pytest.raises(SystemExit if should_exit else RuntimeError) as excinfo:
+        output.get_output()
+
+    if should_exit:
+        exit_process.assert_called_once_with(70)
+        assert isinstance(excinfo.value, SystemExit)
+        assert excinfo.value.code == 70
+    else:
+        exit_process.assert_not_called()
+        assert excinfo.value is error
 
 
 class TestShapeConfigWiring:
