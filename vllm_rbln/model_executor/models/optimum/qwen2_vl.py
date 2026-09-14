@@ -544,13 +544,12 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             ).logits
 
         self.model.decoder = self.model.decoders[model_input.padded_batch_size]
-        logits = self.model.decoder(
+        return self.model.decoder(
             inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
             cache_position=model_input.input_positions,
             position_embed=model_input.position_embed,
             block_tables=model_input.block_tables,
         ).logits
-        return logits[: len(model_input.running_requests_ids)]
 
 
 class RBLNOptimumQwen2_5_VLForConditionalGeneration(

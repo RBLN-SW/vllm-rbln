@@ -188,7 +188,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             model_input.input_positions,
             model_input.padded_batch_size,
         )
-        logits = self.model.language_model.decoder(
+        return self.model.language_model.decoder(
             input_ids=model_input.input_tokens,
             cache_position=cache_position,
             block_tables=model_input.block_tables,
@@ -196,7 +196,6 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             attention_mask=attention_mask,
             position_ids=position_ids,
         ).logits
-        return logits[: len(running_requests_ids)]
 
     def get_language_model(self):
         return self.model.language_model

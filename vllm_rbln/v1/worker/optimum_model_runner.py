@@ -436,6 +436,15 @@ class RBLNOptimumModelRunner(
                     with capture_ctx as model_reports:
                         model_input = self._build_forward_inputs(model_input)
                         hidden_states = self.model(model_input)
+                if not model_input.is_prompt:
+                    # The decode graph returns every row of the padded batch;
+                    # keep the running requests' rows in running order.
+                    if model_input.batch_rows is None:
+                        hidden_states = hidden_states[
+                            : len(model_input.running_requests_ids)
+                        ]
+                    else:
+                        hidden_states = hidden_states[model_input.batch_rows]
                 if (
                     envs.VLLM_RBLN_METRICS
                     and self.model_performance_tracker is not None

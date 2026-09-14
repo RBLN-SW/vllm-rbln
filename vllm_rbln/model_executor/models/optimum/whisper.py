@@ -280,30 +280,28 @@ class RBLNOptimumWhisperForConditionalGeneration(
                     block_tables=decoder_block_tables,
                 )
             self.dec_lengths[batch_idx] = len(token_sequence)
+            # The loop above pads the decoder batch itself, so only this
+            # request's row of the output is real.
+            return decoder_output.logits[valid_block_ids]
 
-        else:
-            valid_block_ids = model_input.batch_rows
-            assert valid_block_ids is not None
-            # Whisper tracks decoder positions itself in dec_lengths.
-            decoder_cache_position = torch.zeros(
-                model_input.padded_batch_size, 1, dtype=torch.int32
-            )
-            for batch_idx in valid_block_ids:
-                decoder_cache_position[batch_idx] = self.dec_lengths[batch_idx]
-                decoder_attention_mask[
-                    batch_idx, : decoder_cache_position[batch_idx] + 1
-                ] = 1
-                self.dec_lengths[batch_idx] += 1
-            decoder_output = self.model.decoder(
-                decoder_input_ids=model_input.input_tokens.contiguous(),
-                decoder_attention_mask=decoder_attention_mask,
-                cache_position=decoder_cache_position,
-                block_tables=model_input.block_tables,
-            )
-
-        lm_logits = decoder_output.logits
-        lm_logits = lm_logits[valid_block_ids]
-        return lm_logits
+        valid_block_ids = model_input.batch_rows
+        assert valid_block_ids is not None
+        # Whisper tracks decoder positions itself in dec_lengths.
+        decoder_cache_position = torch.zeros(
+            model_input.padded_batch_size, 1, dtype=torch.int32
+        )
+        for batch_idx in valid_block_ids:
+            decoder_cache_position[batch_idx] = self.dec_lengths[batch_idx]
+            decoder_attention_mask[
+                batch_idx, : decoder_cache_position[batch_idx] + 1
+            ] = 1
+            self.dec_lengths[batch_idx] += 1
+        return self.model.decoder(
+            decoder_input_ids=model_input.input_tokens.contiguous(),
+            decoder_attention_mask=decoder_attention_mask,
+            cache_position=decoder_cache_position,
+            block_tables=model_input.block_tables,
+        ).logits
 
     def _parse_and_validate_audio_input(self, **kwargs: object) -> WhisperAudioInputs:
         input_features = kwargs.pop("input_features", None)

@@ -377,6 +377,46 @@ def _decode_step(req_ids: list[str], cache_slot_ids: list[int], dummy_block=None
     )
 
 
+def _decode_scheduler_output(req_ids: list[str], cache_slot_ids: list[int]):
+    return RBLNSchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(
+            req_ids=req_ids,
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[None] * len(req_ids),
+            num_computed_tokens=[3] * len(req_ids),
+            num_output_tokens=[0] * len(req_ids),
+        ),
+        num_scheduled_tokens={req_id: 1 for req_id in req_ids},
+        total_num_scheduled_tokens=len(req_ids),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=0,
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        block_table_dict={
+            req_id: torch.tensor([index + 1]) for index, req_id in enumerate(req_ids)
+        },
+        cached_block_table=[],
+        cached_length=[],
+        dummy_block=None,
+        cache_slot_id_dict=dict(zip(req_ids, cache_slot_ids)),
+    )
+
+
+def _stamp_rows_forward(model_runner):
+    # Return the padded batch with each row's index in its first logit.
+    def forward(model_input, **kwargs):
+        vocab_size = model_runner.model_config.get_vocab_size()
+        logits = torch.zeros(model_input.padded_batch_size, 1, vocab_size)
+        logits[:, 0, 0] = torch.arange(model_input.padded_batch_size)
+        return logits
+
+    model_runner.model.forward = forward
+
+
 def _two_running_requests(model_runner):
     model_runner._update_states(
         _schedule_new_request("r0", "r1", block_ids=([1],), outer_block_ids=[0])
@@ -440,3 +480,28 @@ def test_prepare_decode_pins_rows_the_model_names(model_runner):
     assert model_input.cache_slot_ids[3, 0] == 3
     assert model_input.cache_slot_ids[0, 0] == 0
     assert model_input.block_tables[3, 0] != model_input.block_tables[1, 0]
+
+
+def test_execute_model_keeps_the_running_rows_of_the_padded_decode_batch(
+    model_runner,
+):
+    _two_running_requests(model_runner)
+    _stamp_rows_forward(model_runner)
+
+    model_runner.execute_model(_decode_scheduler_output(["r0", "r1"], [0, 3]))
+
+    logits = model_runner.execute_model_state.logits
+    assert logits[:, 0].tolist() == [0, 1]
+
+
+def test_execute_model_gathers_the_rows_the_model_pinned(model_runner):
+    _two_running_requests(model_runner)
+    _stamp_rows_forward(model_runner)
+    model_runner.model.decode_batch_rows = lambda slots, block_tables: slots.to(
+        torch.long
+    )
+
+    model_runner.execute_model(_decode_scheduler_output(["r0", "r1"], [3, 0]))
+
+    logits = model_runner.execute_model_state.logits
+    assert logits[:, 0].tolist() == [3, 0]

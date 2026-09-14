@@ -72,12 +72,11 @@ class RBLNOptimumIdefics3ForConditionalGeneration(
         self.model.text_model.decoder = self.model.text_model.decoders[
             model_input.padded_batch_size
         ]
-        logits = self.model.text_model.decoder(
+        return self.model.text_model.decoder(
             input_ids=model_input.input_tokens,
             cache_position=model_input.input_positions,
             block_tables=model_input.block_tables,
         ).logits
-        return logits[: len(model_input.running_requests_ids)]
 
     def get_language_model(self):
         return self.model.text_model

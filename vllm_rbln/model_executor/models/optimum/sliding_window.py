@@ -73,10 +73,9 @@ class RBLNOptimumSlidingWindowAttentionForCausalLM(
             ).logits
 
         self.model.decoder = self.model.decoders[model_input.padded_batch_size]
-        logits = self.model.decoder(
+        return self.model.decoder(
             input_ids=model_input.input_tokens,
             cache_position=model_input.input_positions,
             local_block_tables=cache_slot_ids,
             block_tables=block_tables,
         ).logits
-        return logits[: len(model_input.running_requests_ids)]

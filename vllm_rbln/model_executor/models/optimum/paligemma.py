@@ -78,14 +78,13 @@ class RBLNOptimumPaliGemmaForConditionalGeneration(
             self.model.rbln_config.language_model,
             model_input.input_positions,
         )
-        logits = self.model.language_model.decoder(
+        return self.model.language_model.decoder(
             input_ids=model_input.input_tokens,
             cache_position=model_input.input_positions,
             block_tables=model_input.block_tables,
             attention_mask=attention_mask,
             position_ids=position_ids,
         ).logits
-        return logits[: len(model_input.running_requests_ids)]
 
     def get_language_model(self):
         return self.model.language_model
