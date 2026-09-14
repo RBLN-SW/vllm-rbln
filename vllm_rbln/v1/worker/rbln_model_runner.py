@@ -3416,7 +3416,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
-        sig = mega_cache.config_signature(self.vllm_config)
+        sig = mega_cache.model_bundle_signature(self.vllm_config)
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             # 1. prefill

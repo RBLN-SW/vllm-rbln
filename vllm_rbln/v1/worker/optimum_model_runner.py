@@ -89,6 +89,7 @@ from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
+from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
@@ -1253,6 +1254,10 @@ class RBLNOptimumModelRunner(
 
                 clear_reqs(input_batch)
 
+        sig = mega_cache.sampler_bundle_signature(
+            self.input_batch.vocab_size, self.dtype, self.bucket_sizes
+        )
+        mega_cache.load("sampler", sig)
         for config in WARM_UP_CONFIGS:
             logger.info("Running dummy sampler config: %s", config["name"])
 
@@ -1267,6 +1272,7 @@ class RBLNOptimumModelRunner(
             )
 
             dummy_run_batches(config)
+        mega_cache.save("sampler", sig)
 
     def set_active_loras(self, input_batch: RBLNInputBatch, is_prefill: bool) -> None:
         num_reqs = self.input_batch.num_reqs

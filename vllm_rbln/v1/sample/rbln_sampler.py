@@ -113,9 +113,11 @@ def compile_sampler(
         mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
         use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
         global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
-        # FIXME: Currently, sampler ops do not support caching.
-        # Reusing seed buffer is not supported when the compiled sampler is loaded.
-        use_cache=False,
+        # TODO(temporary): cache sampler graphs on the optimum path only; the
+        # native path shares a model bundle not keyed on VLLM_RBLN_SAMPLER.
+        # Caching there too means keying sampler_bundle_signature on
+        # USE_DEVICE_TENSOR, which the compile options below read.
+        use_cache=not envs.VLLM_RBLN_USE_VLLM_MODEL,
     )
 
 
