@@ -2949,6 +2949,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
                         view_shape=kv_cache_shape,
                         permute_order=tuple(inv_order),
+                        dynamic_axis=1 if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE else None,
                     )
                 else:
                     raise NotImplementedError
@@ -3016,6 +3017,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_cache_view_infos,
             num_attn_module,
         )
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE and self.kv_cache_bases:
+            # Deduped bases are the graph inputs; the per-layer views are built
+            # inside the graph, where their mark is a no-op.
+            for base in self.kv_cache_bases:
+                torch._dynamo.mark_dynamic(base, 1)
+            logger.info(
+                "[Dynamic KV] mark_dynamic(kv_cache_base, dim=1) applied to %d "
+                "deduped base(s); shape=%s",
+                len(self.kv_cache_bases),
+                tuple(self.kv_cache_bases[0].shape),
+            )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
         forward_context = self.compilation_config.static_forward_context

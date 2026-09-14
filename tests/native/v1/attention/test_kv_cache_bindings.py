@@ -138,6 +138,48 @@ class TestMaterializeKvCacheView:
         assert torch.equal(out, expected)
         assert _storage_key(out) == _storage_key(flat)  # aliases the base
 
+    def test_dynamic_axis_is_scaled_from_the_base(self):
+        # The extent is derived from the base at view time so a dynamic base dim
+        # stays symbolic under dynamo; the shape comes out the same.
+        base = torch.zeros(2, 4, 8, 1, 16, 4)
+        finer = KVCacheViewInfo(
+            base_index=0,
+            view_shape=(2, 32, 8, 1, 2, 4),
+            dynamic_axis=1,
+            dynamic_scale=(8, 1),
+        )
+        out = materialize_kv_cache_view([base], finer)
+        assert out.shape == (2, 32, 8, 1, 2, 4)
+        assert _storage_key(out) == _storage_key(base)
+        coarser = KVCacheViewInfo(
+            base_index=0,
+            view_shape=(2, 1, 8, 1, 64, 4),
+            dynamic_axis=1,
+            dynamic_scale=(1, 4),
+        )
+        assert materialize_kv_cache_view([base], coarser).shape == (2, 1, 8, 1, 64, 4)
+
+    def test_bindings_record_the_view_to_base_scale(self):
+        # gpt-oss: layer 0 (windowed, 64 kernel blocks per block) types the base;
+        # the full layer's view is 1/64 of it, the windowed layer's is 1:1.
+        raw = torch.zeros(2 * 4 * 8 * 1 * 8192 * 4, dtype=torch.float16)
+        windowed = raw.view(2, 256, 8, 1, 128, 4)
+        full = raw.view(2, 4, 8, 1, 8192, 4)
+        bases = {_layer(0): windowed, _layer(1): full}
+        infos = {
+            _layer(0): KVCacheViewInfo(
+                view_shape=(2, 256, 8, 1, 128, 4), dynamic_axis=1
+            ),
+            _layer(1): KVCacheViewInfo(
+                view_shape=(2, 4, 8, 1, 8192, 4), dynamic_axis=1
+            ),
+        }
+        base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
+        assert base_tensors[0].shape[1] == 256
+        assert [vi.dynamic_scale for vi in view_infos] == [(1, 1), (1, 64)]
+        for vi in view_infos:
+            assert materialize_kv_cache_view(base_tensors, vi).shape == vi.view_shape
+
     def test_dtype_view_reinterprets_bytes(self):
         # view_dtype reinterprets the base storage as another same-width dtype
         # (used when the compiled cache dtype differs from the layer's).

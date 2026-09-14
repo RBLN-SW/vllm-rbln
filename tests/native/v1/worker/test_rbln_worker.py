@@ -18,7 +18,8 @@
 
 import inspect
 import os
-from contextlib import nullcontext
+import sys
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -434,6 +435,7 @@ class TestDetermineAvailableMemory:
         vcfg = _make_vllm_config(quantization=quantization)
         vcfg.model_config.hf_config = hf_config
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
+        worker.device = torch.device("cpu")
         captured: dict = {}
         monkeypatch.setattr(
             wm, "estimate_available_memory", lambda **kw: captured.update(kw) or 999
@@ -453,6 +455,47 @@ class TestDetermineAvailableMemory:
         )
         worker.determine_available_memory()
         return captured
+
+    def test_dynamic_kv_feeds_the_chiplet_snapshot(self, make_worker, monkeypatch):
+        snapshot = {(0, 0): wm.ChipletMemory(total=100, used=40)}
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True
+        )
+        monkeypatch.setattr(
+            wm.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: False),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wm.RBLNWorker,
+            "_dynamic_kv_memory_snapshot",
+            lambda self, device: (snapshot, "driver"),
+        )
+        cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
+        assert cap["chiplet_memory"] is snapshot
+
+    def test_dynamic_kv_skips_the_snapshot_on_a_dummy_device(
+        self, make_worker, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True
+        )
+        monkeypatch.setattr(
+            wm.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: True),
+            raising=False,
+        )
+        cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
+        assert "chiplet_memory" not in cap
+
+    def test_default_path_never_snapshots(self, make_worker, monkeypatch):
+        monkeypatch.setattr(
+            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", False
+        )
+        cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
+        assert "chiplet_memory" not in cap
 
     def test_num_runtimes_from_buckets_and_moe(self, make_worker, monkeypatch):
         cap = self._capture(
@@ -870,90 +913,335 @@ class TestHandshakeMetadata:
 
 
 # ---------------------------------------------------------------------------
-# Dynamic KV: the compile-time cache TP>=2 does not return
+# Dynamic KV: sizing from the compiled placement and a memory snapshot
 # ---------------------------------------------------------------------------
-class TestRetainedCompileKvCacheCharge:
-    """`_charge_retained_compile_kv_cache` keeps the budget from being spent
-    twice on TP>=2, where `_release_kv_cache_tensors` does not get the
-    compile-time cache back and cannot tell that it did not.
+S0 = ("symbol", "s0")
+
+
+def _shard(node, chiplet, shape):
+    return SimpleNamespace(node_id=node, chiplet_id=chiplet, slice_shape=tuple(shape))
+
+
+def _placement(shards):
+    return SimpleNamespace(
+        shape=(2, S0, 8, 1, 1024, 128), dtype="dlfloat16", shards=shards
+    )
+
+
+# 1 MiB per block per chiplet, one node, four chiplets (a head split of 8 KV heads).
+HEAD_SPLIT = _placement(tuple(_shard(0, c, (2, S0, 2, 1, 1024, 128)) for c in range(4)))
+PER_BLOCK_PER_CHIPLET = 2**20
+
+
+def _program(placements, name="0/0", runtime=None, device=None):
+    specs = (SimpleNamespace(name="ids", shape=(1,), physical_placement=None),) + tuple(
+        SimpleNamespace(
+            name=f"kv.{i}",
+            shape=tuple(4 if not isinstance(d, int) else d for d in p.shape),
+            physical_placement=p,
+        )
+        for i, p in enumerate(placements)
+    )
+    return SimpleNamespace(
+        name=name,
+        input_specs=specs,
+        runtime=runtime if runtime is not None else object(),
+        device=device,
+    )
+
+
+class TestComputeDynamicKvNumBlocks:
+    """`compute_dynamic_kv_num_blocks` = placement slope x memory snapshot.
+
+    The snapshot is stubbed at the worker seam (`_dynamic_kv_memory_snapshot`);
+    `TestDynamicKvMemorySnapshot` covers the seam itself.
     """
 
-    BUDGET_PER_CHIPLET = 33_772_535_808
+    GIB = 2**30
+    HINT = 4
+    TOTAL = 35 * GIB
 
-    @staticmethod
-    def _profile(regions):
-        from vllm_rbln.v1.worker.kv_profile import (
-            MergedKvCacheMemoryProfile,
-            MergedMemoryRegion,
-        )
+    @pytest.fixture(autouse=True)
+    def _real_device(self):
+        with patch.object(
+            wm.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: False),
+            create=True,
+        ):
+            yield
 
-        return MergedKvCacheMemoryProfile(
-            device_regions=[MergedMemoryRegion(*r) for r in regions]
-        )
-
-    @classmethod
-    def _budget(cls, num_chiplets=4):
-        return {0: {c: cls.BUDGET_PER_CHIPLET for c in range(num_chiplets)}}
-
-    @staticmethod
-    def _charge(fake_self_tp, resident_blocks, budget, merged):
-        # The charge reads the block count the runner actually allocated, not
-        # the env var: see `_charge_retained_compile_kv_cache`.
-        worker = SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=fake_self_tp),
-            model_runner=SimpleNamespace(
-                kv_cache_config=SimpleNamespace(num_blocks=resident_blocks)
+    def _worker(self, *, programs, snapshot, tp_size=1, gmu=1.0):
+        return SimpleNamespace(
+            rank=0,
+            device=torch.device("cpu"),
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=None, gpu_memory_utilization=gmu
             ),
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+            _kv_blocks_before_shrink=211,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=self.HINT)
+            ),
+            _dynamic_kv_programs=list(programs),
+            _dynamic_kv_memory_snapshot=lambda device: (snapshot, "stub"),
+            _kv_copy_stream_reserve_bytes=lambda: 0,
         )
-        return RBLNWorker._charge_retained_compile_kv_cache(worker, budget, merged)
 
-    # (node_id, chiplet_id, base_bytes, bytes_per_block, alignment)
-    MINIMAX_TP4EP = [(0, 0, 0, 65_011_712, 1)]
+    def _snapshot(self, used):
+        return {
+            (0, c): wm.ChipletMemory(total=self.TOTAL, used=u)
+            for c, u in enumerate(used)
+        }
 
-    def test_tp1_is_not_charged_because_the_cache_comes_back(self):
-        budget = self._budget()
-        out = self._charge(1, 8, budget, self._profile(self.MINIMAX_TP4EP))
-        assert out == budget
+    def test_the_heaviest_chiplet_decides_and_the_resident_cache_is_not_base(self):
+        # Two layers -> 2 MiB per block per chiplet; 8 MiB resident at the hint.
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/1"),
+            _program([], name="0/2"),
+        ]
+        resident = 8 * 2**20
+        used = [
+            5 * self.GIB + resident,
+            30 * self.GIB + resident,
+            1 * self.GIB + resident,
+            0 + resident,
+        ]
+        worker = self._worker(programs=programs, snapshot=self._snapshot(used))
+        n = RBLNWorker.compute_dynamic_kv_num_blocks(worker)
+        # chiplet 1: (35 GiB - 30 GiB) / 2 MiB = 2560 blocks
+        assert n == 5 * 512
 
-    def test_tp4_is_charged_on_the_chiplet_that_holds_the_growth(self):
-        out = self._charge(4, 8, self._budget(), self._profile(self.MINIMAX_TP4EP))
-
-        # The MiniMax TP4+EP profile puts every growth region on chiplet 0, so
-        # only chiplet 0 loses the 8 x 62 MiB the outgoing cache still holds.
-        assert out[0][0] == self.BUDGET_PER_CHIPLET - 8 * 65_011_712
-        for chiplet_id in (1, 2, 3):
-            assert out[0][chiplet_id] == self.BUDGET_PER_CHIPLET
-
-    def test_an_empty_cache_has_nothing_resident_to_charge(self):
-        budget = self._budget()
-        out = self._charge(4, 0, budget, self._profile(self.MINIMAX_TP4EP))
-        assert out == budget
-
-    def test_a_base_only_profile_is_not_charged(self):
-        budget = self._budget()
-        out = self._charge(4, 8, budget, self._profile([(0, 0, 1 << 30, 0, 1)]))
-        assert out == budget
-
-    def test_alignment_is_accounted_per_region(self):
-        # align_up(10059840 + 8*3000000) - align_up(10059840) at 2 MiB
-        # = 35651584 - 10485760, which is 1165824 more than 8 * 3000000.
-        out = self._charge(
-            4,
-            8,
-            self._budget(),
-            self._profile([(0, 0, 10_059_840, 3_000_000, 1 << 21)]),
+    def test_the_copy_stream_reserve_comes_off_every_chiplet(self):
+        programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
+        resident = 8 * 2**20
+        worker = self._worker(
+            programs=programs,
+            snapshot=self._snapshot([30 * self.GIB + resident] * 4),
         )
-        assert out[0][0] == self.BUDGET_PER_CHIPLET - 25_165_824
+        worker._kv_copy_stream_reserve_bytes = lambda: 64 * 2**20
+        # (35 GiB - 30 GiB - 64 MiB) / 2 MiB = 2560 - 32 blocks
+        assert RBLNWorker.compute_dynamic_kv_num_blocks(worker) == 5 * 512 - 32
 
-    def test_a_budget_the_retained_cache_exhausts_is_refused(self):
-        huge = [(0, 0, 0, self.BUDGET_PER_CHIPLET // 4, 1)]
-        with pytest.raises(RuntimeError, match="leaves no budget"):
-            self._charge(4, 8, self._budget(), self._profile(huge))
+    def test_tp2_keeps_the_compile_cache_charged(self):
+        programs = [_program([HEAD_SPLIT])]
+        used = [4 * PER_BLOCK_PER_CHIPLET] * 4  # only the 4-block compile cache
+        snapshot = self._snapshot(used)
+        tp1 = RBLNWorker.compute_dynamic_kv_num_blocks(
+            self._worker(programs=programs, snapshot=snapshot, tp_size=1)
+        )
+        tp2 = RBLNWorker.compute_dynamic_kv_num_blocks(
+            self._worker(programs=programs, snapshot=snapshot, tp_size=2)
+        )
+        assert tp1 == 35 * 1024
+        # The resident cache stays charged as base: exactly the hint is lost.
+        assert tp1 - tp2 == self.HINT
 
-    def test_the_caller_s_budget_is_not_mutated(self):
-        budget = self._budget()
-        self._charge(4, 8, budget, self._profile(self.MINIMAX_TP4EP))
-        assert budget[0][0] == self.BUDGET_PER_CHIPLET
+    def test_gpu_memory_utilization_bounds_the_budget(self):
+        programs = [_program([HEAD_SPLIT])]
+        snapshot = self._snapshot([4 * PER_BLOCK_PER_CHIPLET] * 4)
+        full = RBLNWorker.compute_dynamic_kv_num_blocks(
+            self._worker(programs=programs, snapshot=snapshot, gmu=1.0)
+        )
+        half = RBLNWorker.compute_dynamic_kv_num_blocks(
+            self._worker(programs=programs, snapshot=snapshot, gmu=0.5)
+        )
+        # The resident 4 MiB is given back, so the base is 0 on every chiplet.
+        assert full == 35 * 1024
+        assert half == full // 2
+
+    def test_the_snapshot_is_taken_on_the_program_s_device(self):
+        seen = []
+        programs = [_program([HEAD_SPLIT], device=torch.device("cpu", 3))]
+        worker = self._worker(programs=programs, snapshot=self._snapshot([0] * 4))
+
+        def snapshot(device):
+            seen.append(device)
+            return self._snapshot([0] * 4), "stub"
+
+        worker._dynamic_kv_memory_snapshot = snapshot
+        RBLNWorker.compute_dynamic_kv_num_blocks(worker)
+        assert seen == [torch.device("cpu", 3)]
+
+    def test_a_base_over_budget_is_refused_with_the_breakdown(self):
+        programs = [_program([HEAD_SPLIT])]
+        snapshot = self._snapshot([self.TOTAL, 0, 0, 0])
+        with pytest.raises(RuntimeError, match="no KV block fits") as exc:
+            RBLNWorker.compute_dynamic_kv_num_blocks(
+                self._worker(programs=programs, snapshot=snapshot, gmu=0.9)
+            )
+        assert "0:0(" in str(exc.value)
+
+    def test_a_dummy_device_keeps_the_estimate(self, caplog):
+        """The executor compiles under RBLN_DUMMY_DEVICE=1: nothing to measure,
+        so the pre-shrink count is restored instead of refusing the compile."""
+        programs = [_program([HEAD_SPLIT])]
+        worker = self._worker(programs=programs, snapshot=self._snapshot([0] * 4))
+        with (
+            patch.object(
+                wm.torch,
+                "rbln",
+                SimpleNamespace(is_dummy_device=lambda: True),
+                create=True,
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            assert RBLNWorker.compute_dynamic_kv_num_blocks(worker) is None
+        assert "RBLN_DUMMY_DEVICE" in caplog.text
+
+    def test_programs_that_disagree_on_the_layout_are_refused(self):
+        other = _placement((_shard(0, 0, (2, S0, 8, 1, 1024, 128)),))
+        programs = [_program([HEAD_SPLIT]), _program([other], name="0/1")]
+        with pytest.raises(RuntimeError, match="disagree"):
+            RBLNWorker.compute_dynamic_kv_num_blocks(
+                self._worker(programs=programs, snapshot=self._snapshot([0] * 4))
+            )
+
+
+class TestDynamicKvMemorySnapshot:
+    """`_dynamic_kv_memory_snapshot` prefers the driver's per-chiplet figures and
+    falls back to this process's allocator with the reserve and foreign usage
+    added back."""
+
+    DRIVER = {
+        "npu.0.chiplet.0.total": 100,
+        "npu.0.chiplet.0.used": 40,
+        "npu.0.chiplet.1.total": 100,
+        "npu.0.chiplet.1.used": 10,
+    }
+    ALLOCATOR = {
+        "npu.0.chiplet.0.reserved.current": 30,
+        "npu.0.chiplet.1.reserved.current": 5,
+    }
+
+    @staticmethod
+    def _worker(foreign=0):
+        return SimpleNamespace(_foreign_dram_used_bytes=foreign)
+
+    def _rbln(self, *, driver=None, driver_error=None, allocator=None, per_chiplet=100):
+        calls = []
+        rbln = SimpleNamespace(
+            empty_cache=lambda device: calls.append(("empty_cache", device)),
+            get_device_properties=lambda device: SimpleNamespace(
+                memory_per_chiplet=per_chiplet
+            ),
+            memory_stats_per_chiplet=lambda device: dict(allocator or {}),
+        )
+        if driver is not None or driver_error is not None:
+
+            def query(device):
+                if driver_error is not None:
+                    raise driver_error
+                return dict(driver)
+
+            rbln.mem_get_info_per_chiplet = query
+        return rbln, calls
+
+    def _snapshot(self, rbln, worker=None):
+        with patch.object(wm.torch, "rbln", rbln, create=True):
+            return RBLNWorker._dynamic_kv_memory_snapshot(
+                worker or self._worker(), torch.device("cpu")
+            )
+
+    def test_the_driver_wins_when_it_answers(self):
+        rbln, calls = self._rbln(driver=self.DRIVER, allocator=self.ALLOCATOR)
+        snapshot, source = self._snapshot(rbln)
+        assert source == "driver"
+        assert snapshot == {
+            (0, 0): wm.ChipletMemory(total=100, used=40),
+            (0, 1): wm.ChipletMemory(total=100, used=10),
+        }
+        assert calls == []
+
+    def test_an_old_driver_falls_back_to_the_allocator(self, caplog):
+        rbln, calls = self._rbln(
+            driver_error=RuntimeError("does not provide the query"),
+            allocator=self.ALLOCATOR,
+            per_chiplet=100,
+        )
+        with caplog.at_level("WARNING"):
+            snapshot, source = self._snapshot(rbln, self._worker(foreign=20))
+        assert source == "allocator"
+        reserve = wm.DYNAMIC_KV_ALLOCATOR_RESERVE_BYTES
+        assert snapshot == {
+            (0, 0): wm.ChipletMemory(total=100, used=30 + 10 + reserve),
+            (0, 1): wm.ChipletMemory(total=100, used=5 + 10 + reserve),
+        }
+        # Cached-but-free blocks would otherwise count as reserved.
+        assert calls == [("empty_cache", torch.device("cpu"))]
+        assert "sizing from this process's allocator" in caplog.text
+
+    def test_a_torch_rbln_without_the_query_falls_back_too(self, caplog):
+        rbln, _ = self._rbln(allocator=self.ALLOCATOR)
+        with caplog.at_level("WARNING"):
+            _, source = self._snapshot(rbln)
+        assert source == "allocator"
+        assert "no mem_get_info_per_chiplet" in caplog.text
+
+
+class TestWarmupCapturesPrograms:
+    """The programs warm-up builds are the only handle on the KV-holding
+    runtimes, so the capture has to wrap exactly the warm-up."""
+
+    def test_off_means_no_capture(self):
+        worker = SimpleNamespace()
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+                False,
+            ),
+            RBLNWorker._capture_dynamic_kv_programs(worker) as programs,
+        ):
+            pass
+        assert programs is None
+
+    def test_on_opens_torch_rbln_s_scope(self):
+        recorded = ["p0", "p1"]
+
+        @contextmanager
+        def fake_capture():
+            yield recorded
+
+        worker = SimpleNamespace()
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+                True,
+            ),
+            patch.object(wm, "has_torch_rbln", True),
+            patch.object(
+                wm.torch,
+                "rbln",
+                SimpleNamespace(capture_programs=fake_capture),
+                create=True,
+            ),
+            RBLNWorker._capture_dynamic_kv_programs(worker) as programs,
+        ):
+            pass
+        assert programs is recorded
+
+    def test_on_without_torch_rbln_refuses(self):
+        with (
+            patch(
+                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+                True,
+            ),
+            patch.object(wm, "has_torch_rbln", False),
+            pytest.raises(RuntimeError, match="capture_programs"),
+        ):
+            RBLNWorker._capture_dynamic_kv_programs(SimpleNamespace())
+
+    def test_runtimes_are_deduped_across_programs(self):
+        shared = object()
+        worker = SimpleNamespace(
+            _dynamic_kv_programs=[
+                _program([HEAD_SPLIT], runtime=shared),
+                _program([HEAD_SPLIT], runtime=shared),
+                _program([], runtime=object()),
+            ]
+        )
+        assert len(RBLNWorker._collect_dynamic_kv_runtimes(worker)) == 2
 
 
 class TestMaybeShrinkKvCacheForCompile:
@@ -1108,7 +1396,7 @@ class TestDynamicKvLayoutGuards:
             pytest.raises(RuntimeError) as exc,
         ):
             RBLNWorker._assert_dynamic_kv_attention_layout(worker)
-        assert "paged_flash_causal_attention_naive" in str(exc.value)
+        assert "paged causal or sliding-window naive kernel" in str(exc.value)
         assert "layer.0" in str(exc.value)
         assert "nothing to shrink" not in str(exc.value)
 
@@ -1120,16 +1408,28 @@ class TestDynamicKvLayoutGuards:
         ):
             RBLNWorker._assert_dynamic_kv_attention_layout(worker)
 
-    def test_deduped_bases_are_still_refused_after_the_split(self):
-        """Guards the split itself: moving this check earlier would make it see an
-        empty list and pass, so its refusal has to stay asserted."""
+    def test_a_sliding_window_layer_passes(self):
+        """gpt-oss alternates full and windowed layers; the compiler admits a
+        dynamic KV input on `paged_sliding_window_attention_naive_*` too."""
+        worker = SimpleNamespace(vllm_config=object())
+        with patch(
+            "vllm_rbln.v1.worker.rbln_worker.get_layers_from_vllm_config",
+            return_value={
+                "layer.0": self._layer(),
+                "layer.1": self._layer(sliding_window=128),
+            },
+        ):
+            RBLNWorker._assert_dynamic_kv_attention_layout(worker)
+
+    def test_deduped_bases_pass(self):
+        """gpt-oss shares one tensor between a full and a windowed layer; the
+        compiler takes the deduped base through both views."""
         worker = SimpleNamespace(
             model_runner=SimpleNamespace(
                 kv_cache_bases=[object()], shared_kv_cache_layers={}
             )
         )
-        with pytest.raises(RuntimeError, match="KV base deduplication"):
-            RBLNWorker._assert_dynamic_kv_cache_layout(worker)
+        RBLNWorker._assert_dynamic_kv_cache_layout(worker)
 
     def test_cross_layer_sharing_is_still_refused_after_the_split(self):
         worker = SimpleNamespace(
@@ -1146,7 +1446,7 @@ class TestDynamicKvFailuresRaise:
     would serve the pre-compile estimate. The gates before it stay a quiet None."""
 
     @staticmethod
-    def _worker(*, shrunk=True, override=None, runtimes=()):
+    def _worker(*, shrunk=True, override=None, programs=()):
         return SimpleNamespace(
             rank=0,
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
@@ -1154,29 +1454,34 @@ class TestDynamicKvFailuresRaise:
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(num_blocks=211)
             ),
-            _collect_dynamic_kv_runtimes=lambda: list(runtimes),
+            _dynamic_kv_programs=list(programs),
         )
 
-    def test_no_runtime_after_the_shrink_raises(self):
-        with pytest.raises(RuntimeError, match="not one of the 0"):
-            RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(runtimes=()))
+    @pytest.fixture(autouse=True)
+    def _real_device(self):
+        with patch.object(
+            wm.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: False),
+            create=True,
+        ):
+            yield
 
-    def test_no_profile_after_the_shrink_raises(self):
-        """Every runtime refusing the query is the documented static-artifact case.
+    def test_no_program_after_the_shrink_raises(self):
+        with pytest.raises(RuntimeError, match="none of the 0"):
+            RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(programs=()))
+
+    def test_no_dynamic_input_after_the_shrink_raises(self):
+        """Every program static is the documented replayed-static-build case.
 
         It used to log an error and boot on the estimate, which is the bug this
         feature exists to remove.
         """
-        runtime = SimpleNamespace(
-            _executor=SimpleNamespace(
-                kv_cache_memory_profile=lambda: (_ for _ in ()).throw(
-                    RuntimeError("no dynamic-shape variable")
-                )
-            )
-        )
         with pytest.raises(RuntimeError) as exc:
-            RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(runtimes=(runtime,)))
-        assert "did not return" in str(exc.value) or "not one of the" in str(exc.value)
+            RBLNWorker.compute_dynamic_kv_num_blocks(
+                self._worker(programs=(_program([]), _program([], name="0/1")))
+            )
+        assert "dynamic-shape KV input" in str(exc.value)
         assert "VLLM_CACHE_ROOT" in str(exc.value)
 
     def test_the_pre_shrink_gates_still_return_none(self):
@@ -1188,6 +1493,53 @@ class TestDynamicKvFailuresRaise:
         assert (
             RBLNWorker.compute_dynamic_kv_num_blocks(self._worker(shrunk=False)) is None
         )
+
+
+class TestKvCopyStreamReserve:
+    """The reserve follows the scheduler's own sub-block prefix caching predicate."""
+
+    @staticmethod
+    def _worker(*, prefix_caching=True, sub_block_cache=True):
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+            vllm_config=SimpleNamespace(
+                additional_config={"sub_block_cache": sub_block_cache}
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=512),
+            model_runner=SimpleNamespace(kv_cache_config=SimpleNamespace()),
+        )
+
+    @staticmethod
+    def _manager(monkeypatch, eligible):
+        fake = SimpleNamespace(
+            RBLNKVCacheManager=SimpleNamespace(
+                can_use_sub_block_caching=lambda cfg, sub_block_size: eligible
+            )
+        )
+        monkeypatch.setitem(
+            sys.modules, "vllm_rbln.v1.core.rbln_kv_cache_manager", fake
+        )
+
+    def test_reserved_when_the_scheduler_would_sub_block_cache(self, monkeypatch):
+        self._manager(monkeypatch, eligible=True)
+        assert (
+            RBLNWorker._kv_copy_stream_reserve_bytes(self._worker())
+            == wm.DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES
+        )
+
+    def test_nothing_without_prefix_caching(self, monkeypatch):
+        self._manager(monkeypatch, eligible=True)
+        worker = self._worker(prefix_caching=False)
+        assert RBLNWorker._kv_copy_stream_reserve_bytes(worker) == 0
+
+    def test_nothing_when_sub_block_cache_is_off(self, monkeypatch):
+        self._manager(monkeypatch, eligible=True)
+        worker = self._worker(sub_block_cache=False)
+        assert RBLNWorker._kv_copy_stream_reserve_bytes(worker) == 0
+
+    def test_nothing_when_the_config_is_ineligible(self, monkeypatch):
+        self._manager(monkeypatch, eligible=False)
+        assert RBLNWorker._kv_copy_stream_reserve_bytes(self._worker()) == 0
 
 
 class TestApplyResizesThenMaterializes:
@@ -1216,8 +1568,23 @@ class TestApplyResizesThenMaterializes:
 
     def test_none_restores_the_pre_shrink_count(self):
         worker, calls = self._worker()
-        assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, None) == 211
+        with patch.object(
+            wm.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: False),
+            create=True,
+        ):
+            assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, None) == 211
         assert calls == [("realloc", 211), ("materialize",)]
+
+    def test_none_on_a_dummy_device_keeps_the_compile_cache(self):
+        worker, calls = self._worker()
+        with patch.object(
+            wm.torch, "rbln", SimpleNamespace(is_dummy_device=lambda: True), create=True
+        ):
+            assert RBLNWorker.apply_dynamic_kv_num_blocks(worker, None) == 4
+        assert calls == []
+        assert worker._kv_blocks_before_shrink is None
 
     def test_a_matching_count_skips_both(self):
         worker, calls = self._worker(before_shrink=4, current=4)

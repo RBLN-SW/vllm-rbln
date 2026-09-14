@@ -17,7 +17,7 @@ import math
 import os
 import platform
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -41,6 +41,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -188,37 +189,42 @@ def _read_card_attr_int(card_index: int, attr: str) -> int | None:
         return None
 
 
-def read_rbln_card_dram_total_bytes() -> int | None:
-    """Per-card DRAM capacity in bytes, or None when sysfs is unavailable.
+def rbln_device_dram_total_bytes() -> int | None:
+    """Device DRAM capacity in bytes from `torch.rbln.get_device_properties()`,
+    or None when it cannot be answered.
 
-    Reads only the cards this process owns; a heterogeneous set is rejected
-    rather than averaged. Clamped to `REBEL_DRAM_NBYTES` here rather than at the
-    call sites, because both of them size real allocations from this number.
+    Clamped to `REBEL_DRAM_NBYTES` here rather than at the call sites, because
+    they size real allocations from this number. The query does not claim the
+    device, so it is safe before the runtime initializes.
     """
-    values: dict[int, int] = {}
-    for card_index in get_rbln_owned_card_indices():
-        value = _read_card_attr_int(card_index, "dram_total")
-        if value is not None and value > 0:
-            values[card_index] = value
-    if not values:
+    try:
+        import torch.rbln
+    except ImportError:
         return None
-    distinct = set(values.values())
-    if len(distinct) != 1:
-        raise RuntimeError(
-            "visible RBLN cards report different dram_total values "
-            f"({values}); a single per-chiplet DRAM budget cannot be derived."
-        )
-    dram_total = next(iter(distinct))
-    if dram_total > REBEL_DRAM_NBYTES:
+    if torch.rbln.is_dummy_device():
+        return None
+    try:
+        total = int(torch.rbln.get_device_properties().total_memory)
+    except RuntimeError as exc:
         logger.warning(
-            "sysfs reports %d bytes of card DRAM, more than the %d this build "
+            "torch.rbln.get_device_properties() failed: %s; falling back to the "
+            "built-in %d byte DRAM capacity.",
+            exc,
+            REBEL_DRAM_NBYTES,
+        )
+        return None
+    if total <= 0:
+        return None
+    if total > REBEL_DRAM_NBYTES:
+        logger.warning(
+            "the device reports %d bytes of DRAM, more than the %d this build "
             "assumes usable; clamping. Raise REBEL_DRAM_NBYTES if the card is "
             "genuinely larger.",
-            dram_total,
+            total,
             REBEL_DRAM_NBYTES,
         )
         return REBEL_DRAM_NBYTES
-    return dram_total
+    return total
 
 
 def read_rbln_card_dram_used_bytes() -> int:
@@ -351,6 +357,7 @@ def estimate_available_memory(
     buffer: int | None = None,
     num_runtimes: int = 2,
     gpu_memory_utilization: float = 0.9,
+    chiplet_memory: Mapping[Unit, ChipletMemory] | None = None,
 ) -> int:
     # We are finding max_num_blocks(x) that satisfies the following equation:
 
@@ -404,28 +411,17 @@ def estimate_available_memory(
         rsd_size = REBEL_CHIPLET_SIZE
         available_dram_bytes = REBEL_DRAM_NBYTES
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            # Flag-gated: reading the driver would tie the default path's KV
+            # Flag-gated: reading the device would tie the default path's KV
             # size to a driver release, which is not this feature's to decide.
-            try:
-                sysfs_dram_total = read_rbln_card_dram_total_bytes()
-            except RuntimeError as exc:
-                # The reader refuses on heterogeneous cards; this estimate only
-                # wants one card's capacity, so fall back rather than fail.
-                logger.warning(
-                    "%s; falling back to the built-in %d byte DRAM capacity.",
-                    exc,
-                    REBEL_DRAM_NBYTES,
-                )
-                sysfs_dram_total = None
-            if sysfs_dram_total is None:
+            device_dram_total = rbln_device_dram_total_bytes()
+            if device_dram_total is None:
                 logger.debug(
-                    "sysfs %s is unavailable; falling back to the built-in %d "
-                    "byte DRAM capacity.",
-                    RBLN_SYSFS_CLASS_DIR,
+                    "the device DRAM capacity is unavailable; falling back to the "
+                    "built-in %d byte DRAM capacity.",
                     REBEL_DRAM_NBYTES,
                 )
             else:
-                available_dram_bytes = sysfs_dram_total
+                available_dram_bytes = device_dram_total
         # FIXME(RBLN) - basic data type fp8 for REBEL, for now fp16
         default_bits_per_param = 16
     else:
@@ -434,7 +430,30 @@ def estimate_available_memory(
         )
 
     num_runtimes = num_runtimes * rsd_size
-    available_dram_bytes = int(available_dram_bytes * gpu_memory_utilization)
+    if chiplet_memory is None:
+        available_dram_bytes = int(available_dram_bytes * gpu_memory_utilization)
+    else:
+        # Budget the tightest chiplet and let every chiplet carry that much,
+        # since a block costs each the same. The weights are not resident yet.
+        budgets = {
+            unit: int(memory.total * gpu_memory_utilization) - memory.used
+            for unit, memory in chiplet_memory.items()
+        }
+        tightest = min(budgets, key=budgets.__getitem__)
+        available_dram_bytes = budgets[tightest] * len(budgets)
+        logger.info(
+            "per-chiplet KV budget: %s; tightest %s leaves %.3f GiB x %d chiplets "
+            "= %.3f GiB",
+            ", ".join(
+                f"{unit[0]}:{unit[1]}(total={m.total} used={m.used} "
+                f"budget={budgets[unit]})"
+                for unit, m in sorted(chiplet_memory.items())
+            ),
+            f"{tightest[0]}:{tightest[1]}",
+            budgets[tightest] / 2**30,
+            len(budgets),
+            available_dram_bytes / 2**30,
+        )
 
     def check_oom(available_dram_bytes: int) -> None:
         if available_dram_bytes <= 0:

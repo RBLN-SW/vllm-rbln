@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Any
@@ -40,6 +41,11 @@ class KVCacheViewInfo:
     view_shape: tuple[int, ...] | None = None
     permute_order: tuple[int, ...] | None = None
     select_index: int | None = None
+    # Axis of `view_shape` derived from the base at view time, so a base whose
+    # num_blocks is dynamic is not specialized by the static shape. The extent
+    # is base.shape[axis] * num / den with (num, den) = dynamic_scale.
+    dynamic_axis: int | None = None
+    dynamic_scale: tuple[int, int] = (1, 1)
 
 
 def build_kv_cache_base_bindings(
@@ -64,14 +70,24 @@ def build_kv_cache_base_bindings(
             base_index_by_storage[storage_key] = base_index
             base_tensors.append(base_tensor)
 
-        view_infos.append(
-            replace(
-                kv_cache_view_infos_by_layer[layer_name],
-                base_index=base_index,
+        view_info = kv_cache_view_infos_by_layer[layer_name]
+        if view_info.dynamic_axis is not None and view_info.view_shape is not None:
+            axis = view_info.dynamic_axis
+            view_info = replace(
+                view_info,
+                dynamic_scale=_reduced_ratio(
+                    view_info.view_shape[axis],
+                    int(base_tensors[base_index].shape[axis]),
+                ),
             )
-        )
+        view_infos.append(replace(view_info, base_index=base_index))
 
     return base_tensors, view_infos
+
+
+def _reduced_ratio(numerator: int, denominator: int) -> tuple[int, int]:
+    g = math.gcd(numerator, denominator)
+    return numerator // g, denominator // g
 
 
 def materialize_kv_cache_view(
@@ -82,7 +98,18 @@ def materialize_kv_cache_view(
     if view_info.view_dtype is not None:
         tensor = tensor.view(view_info.view_dtype)
     if view_info.view_shape is not None:
-        tensor = tensor.view(view_info.view_shape)
+        shape = list(view_info.view_shape)
+        if view_info.dynamic_axis is not None:
+            axis = view_info.dynamic_axis
+            num, den = view_info.dynamic_scale
+            extent = tensor.shape[axis]
+            if den > 1:
+                # Lets dynamo simplify extent // den; a -1 here leaves an
+                # unsimplified floordiv in every other dim.
+                torch._check(extent % den == 0)
+                extent = extent // den
+            shape[axis] = extent * num
+        tensor = tensor.view(shape)
     if view_info.permute_order is not None:
         tensor = tensor.permute(*view_info.permute_order)
     if view_info.select_index is not None:
