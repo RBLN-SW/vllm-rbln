@@ -34,6 +34,8 @@ logger = init_logger(__name__)
 
 # `(node_id, chiplet_id)` -- the granularity device memory pools are carved at.
 Unit = tuple[int, int]
+# Device allocations are rounded up to this per tensor.
+KV_ALLOC_ALIGN_BYTES = 2 * 1024 * 1024
 
 _KEY_RE = re.compile(r"^npu\.(\d+)\.chiplet\.(\d+)\.(.+)$")
 _TRAILING_BITS_RE = re.compile(r"(\d+)$")
@@ -152,9 +154,10 @@ def dynamic_extent(spec: Any) -> int:
 
 
 def kv_bytes_per_unit(
-    specs: Iterable[Any], num_blocks: int, hint_blocks: int
+    specs: Iterable[Any], num_blocks: int, hint_blocks: int, *, align: int = 1
 ) -> dict[Unit, int]:
-    """Bytes the KV inputs occupy on each (node, chiplet) at `num_blocks`.
+    """Bytes the KV inputs occupy on each (node, chiplet) at `num_blocks`, each
+    shard rounded up to `align`.
 
     An input's dynamic dim counts *kernel* blocks, `dynamic_extent / hint_blocks`
     of them per manager block (a sliding-window layer splits each block into
@@ -178,7 +181,7 @@ def kv_bytes_per_unit(
                 eval_placement_dim(dim, symbol) for dim in shard.slice_shape
             )
             unit = (int(shard.node_id), int(shard.chiplet_id))
-            usage[unit] = usage.get(unit, 0) + elems * itemsize
+            usage[unit] = usage.get(unit, 0) + -(-elems * itemsize // align) * align
     return usage
 
 
@@ -189,9 +192,16 @@ class KvGrowth:
     per_block: dict[Unit, int]
     hint_blocks: int
     num_inputs: int
+    specs: tuple[Any, ...]
 
     def bytes_at(self, num_blocks: int) -> dict[Unit, int]:
         return {unit: num_blocks * cost for unit, cost in self.per_block.items()}
+
+    def allocated_at(self, num_blocks: int) -> dict[Unit, int]:
+        """`bytes_at` with every shard rounded up to the allocation granule."""
+        return kv_bytes_per_unit(
+            self.specs, num_blocks, self.hint_blocks, align=KV_ALLOC_ALIGN_BYTES
+        )
 
 
 def kv_growth(specs: Sequence[Any], hint_blocks: int) -> KvGrowth:
@@ -226,7 +236,12 @@ def kv_growth(specs: Sequence[Any], hint_blocks: int) -> KvGrowth:
             f"(at 0: {offsets}, at {hint_blocks}: {at_hint}, expected "
             f"{expected}); the compiler's dynamic-input contract changed."
         )
-    return KvGrowth(per_block=per_block, hint_blocks=hint_blocks, num_inputs=len(specs))
+    return KvGrowth(
+        per_block=per_block,
+        hint_blocks=hint_blocks,
+        num_inputs=len(specs),
+        specs=tuple(specs),
+    )
 
 
 @dataclass(frozen=True)
@@ -321,8 +336,9 @@ def max_num_blocks(
     `used` was sampled with the KV cache resident at `kv_resident` bytes, so the
     non-KV base is `used - kv_resident + reserve_bytes`, the reserve standing
     for device memory the runtime allocates only once requests flow; the answer
-    satisfies `base + n * per_block <= total * gpu_memory_utilization` on every
-    unit the KV cache grows on. Units it does not touch are not sized here.
+    satisfies `base + allocated(n) <= total * gpu_memory_utilization` on every
+    unit the KV cache grows on, `allocated` counting each shard rounded up to
+    the allocation granule. Units it does not touch are not sized here.
     """
     if not 0 < gpu_memory_utilization <= 1:
         raise ValueError(
@@ -334,23 +350,38 @@ def max_num_blocks(
             f"the memory snapshot has no entry for (node, chiplet) {missing} that "
             f"the KV cache grows on (snapshot covers {sorted(snapshot)})."
         )
+    room: dict[Unit, int] = {}
+    linear: dict[Unit, int] = {}
+    for unit, per_block in growth.per_block.items():
+        mem = snapshot[unit]
+        budget = int(mem.total * gpu_memory_utilization)
+        base = mem.used - int(kv_resident.get(unit, 0)) + reserve_bytes
+        room[unit] = budget - base
+        linear[unit] = max(0, room[unit] // per_block)
+
+    def fits_all(n: int) -> bool:
+        allocated = growth.allocated_at(n)
+        return all(allocated[unit] <= room[unit] for unit in room)
+
+    # Rounding each shard up to the granule can cost a few blocks below the
+    # linear answer; walk down until the rounded total fits everywhere.
+    num_blocks = min(linear.values())
+    while num_blocks > 0 and not fits_all(num_blocks):
+        num_blocks -= 1
+
     fits: dict[Unit, UnitFit] = {}
     for unit, per_block in sorted(growth.per_block.items()):
         mem = snapshot[unit]
-        budget = int(mem.total * gpu_memory_utilization)
-        resident = int(kv_resident.get(unit, 0))
-        base = mem.used - resident + reserve_bytes
         fits[unit] = UnitFit(
             total=mem.total,
-            budget=budget,
+            budget=int(mem.total * gpu_memory_utilization),
             used=mem.used,
-            kv_resident=resident,
+            kv_resident=int(kv_resident.get(unit, 0)),
             reserve=reserve_bytes,
-            base=base,
+            base=mem.used - int(kv_resident.get(unit, 0)) + reserve_bytes,
             per_block=per_block,
-            num_blocks=max(0, (budget - base) // per_block),
+            num_blocks=linear[unit],
         )
-    num_blocks = min(fit.num_blocks for fit in fits.values())
     return num_blocks, fits
 
 

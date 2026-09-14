@@ -82,6 +82,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.kv_placement import (
     ChipletMemory,
+    KvGrowth,
     Unit,
     UnitFit,
     format_fits,
@@ -812,7 +813,7 @@ class RBLNWorker(WorkerBase):
 
         if dry_run:
             try:
-                num_blocks, fits, hint_blocks = (
+                num_blocks, fits, hint_blocks, growth = (
                     self._dynamic_kv_num_blocks_from_placement()
                 )
             except RuntimeError as exc:
@@ -822,16 +823,16 @@ class RBLNWorker(WorkerBase):
                     exc,
                 )
                 return None
-            self._log_dynamic_kv_dry_run(num_blocks, fits, hint_blocks)
+            self._log_dynamic_kv_dry_run(num_blocks, fits, hint_blocks, growth)
             return None
-        num_blocks, _, _ = self._dynamic_kv_num_blocks_from_placement()
+        num_blocks, _, _, _ = self._dynamic_kv_num_blocks_from_placement()
         return num_blocks
 
     def _dynamic_kv_num_blocks_from_placement(
         self,
-    ) -> tuple[int, dict[Unit, UnitFit], int]:
-        """The count that fits, the per-unit fit behind it, and the hint the
-        programs were traced with."""
+    ) -> tuple[int, dict[Unit, UnitFit], int, KvGrowth]:
+        """The count that fits, the per-unit fit behind it, the hint the
+        programs were traced with, and the growth they imply."""
         programs = list(self._dynamic_kv_programs)
         groups = select_kv_input_groups(programs)
         hint_blocks = self.model_runner.kv_cache_config.num_blocks
@@ -865,7 +866,7 @@ class RBLNWorker(WorkerBase):
         # observe that it did not, so it stays charged. DP+EP keeps it resident
         # at tp_size=1 and slips through; see docs/dynamic_kv_cache.md.
         tp_size = self.parallel_config.tensor_parallel_size
-        kv_resident = growth.bytes_at(hint_blocks) if tp_size <= 1 else {}
+        kv_resident = growth.allocated_at(hint_blocks) if tp_size <= 1 else {}
         if tp_size > 1:
             logger.info(
                 "[Dynamic KV] tp=%d keeps the %d-block compile cache resident; "
@@ -905,7 +906,7 @@ class RBLNWorker(WorkerBase):
                 f"{format_fits(fits)}. Raise --gpu-memory-utilization or give the "
                 "model more devices."
             )
-        predicted = growth.bytes_at(num_blocks)
+        predicted = growth.allocated_at(num_blocks)
         logger.info(
             "[Dynamic KV] predicted KV bytes per (node, chiplet) at %d blocks: %s "
             "total=%d",
@@ -913,16 +914,21 @@ class RBLNWorker(WorkerBase):
             {f"{n}:{c}": b for (n, c), b in sorted(predicted.items())},
             sum(predicted.values()),
         )
-        return num_blocks, fits, hint_blocks
+        return num_blocks, fits, hint_blocks, growth
 
     def _log_dynamic_kv_dry_run(
-        self, num_blocks: int, fits: Mapping[Unit, UnitFit], current: int
+        self,
+        num_blocks: int,
+        fits: Mapping[Unit, UnitFit],
+        current: int,
+        growth: KvGrowth,
     ) -> None:
         """How the `current` blocks vllm sized sit in each chiplet's budget next
         to the `num_blocks` this feature would pick. Resizes nothing."""
+        allocated = growth.allocated_at(current)
         per_unit = []
         for (node, chiplet), fit in sorted(fits.items()):
-            kv_now = current * fit.per_block
+            kv_now = allocated[(node, chiplet)]
             headroom = fit.budget - fit.base - kv_now
             per_unit.append(
                 f"{node}:{chiplet}(kv_now={kv_now} base={fit.base} budget={fit.budget} "
