@@ -32,6 +32,8 @@ except ImportError:
 
 import torch.distributed as dist
 import torch.nn as nn
+from rebel import flags as rbln_flags
+from rebel import profiler as rbln_profiler
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import (
     VllmConfig,
@@ -55,7 +57,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import TorchProfilerWrapper
+from vllm.profiler.wrapper import TorchProfilerWrapper, WorkerProfiler
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
@@ -149,6 +151,16 @@ def empty_rbln_device_caches() -> bool:
                 exc,
             )
     return device_count > 0
+
+
+class RblnProfilerWrapper(WorkerProfiler):
+    """Write the RBLN profiler trace at stop_profile."""
+
+    def _start(self) -> None:
+        rbln_profiler.start()
+
+    def _stop(self) -> None:
+        rbln_profiler.done()
 
 
 class RBLNWorker(WorkerBase):
@@ -1211,10 +1223,12 @@ class RBLNWorker(WorkerBase):
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
-        if self.profiler_config is None or self.profiler_config.profiler is None:
+        if self.profiler_config is None or (
+            self.profiler_config.profiler is None and not rbln_flags.RBLN_PROFILER
+        ):
             raise RuntimeError(
                 "Profiling is not enabled. Please set --profiler-config to enable "
-                "profiling. Example: "
+                "profiling, or RBLN_PROFILER=1 for the RBLN profiler alone. Example: "
                 "'--profiler-config.profiler=torch --profiler-config.torch_profiler_dir"
                 "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
             )
@@ -1249,6 +1263,9 @@ class RBLNWorker(WorkerBase):
                     logger.debug(
                         "Starting torch profiler with tarce name: %s", trace_name
                     )
+                elif profiler_type is None and rbln_flags.RBLN_PROFILER:
+                    self.profiler = RblnProfilerWrapper(self.profiler_config)
+                    logger.debug("Starting RBLN profiler on %s", rank_suffix)
                 else:
                     raise ValueError(
                         f"Invalid proifler value of {self.profiler_config.profiler}."
