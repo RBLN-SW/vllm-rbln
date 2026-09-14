@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
+    VLLM_RBLN_DISABLE_WORKER_FAIL_FAST: bool = False
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
+    VLLM_RBLN_USE_MULTI_BLOCK_ATTN: bool = False
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     # --- MOE ---
@@ -268,6 +270,11 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Disable only for debugging worker failures without terminating the worker.
+    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: os.environ.get(
+        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False"
+    ).lower()
+    in ("true", "1"),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
@@ -302,6 +309,15 @@ environment_variables = {
     "VLLM_RBLN_USE_CUSTOM_KERNEL": (
         lambda: (
             os.environ.get("RBLN_USE_CUSTOM_KERNEL", "False").lower() in ("true", "1")
+        )
+    ),
+    # Give a sliding-window layer several cache blocks and append into them,
+    # rather than one block whose contents the kernel shifts. Needs the
+    # sliding_window_attention_v1 kernel, which not every NPU carries.
+    "VLLM_RBLN_USE_MULTI_BLOCK_ATTN": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", "False").lower()
+            in ("true", "1")
         )
     ),
     # --- MODEL INPUT / SCHEDULING ---
@@ -390,6 +406,7 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",
+        "VLLM_RBLN_USE_MULTI_BLOCK_ATTN",
         "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
         "VLLM_RBLN_USE_MOE_TOKENS_MASK",
         "VLLM_RBLN_DISPATCH_ALL2ALL",
@@ -405,6 +422,7 @@ RBLN_COMPILE_ENV = frozenset(
 
 RBLN_NON_COMPILE_ENV = frozenset(
     {
+        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST",
         # sampler graphs compile with use_cache=False, never enter the bundle
         "VLLM_RBLN_SAMPLER",
         "VLLM_RBLN_COMPILE_STRICT_MODE",

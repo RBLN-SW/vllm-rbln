@@ -101,3 +101,32 @@ def sliding_window_attention_naive_decode(
             )
 
     raise NotImplementedError
+
+
+def sliding_window_attention_v1(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache: torch.Tensor,
+    seq_idx: torch.Tensor,
+    scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    window_size: int,
+    sinks: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if envs.VLLM_RBLN_COMPILE_MODEL:
+        return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
+            q,
+            k,
+            v,
+            kv_cache,
+            seq_idx,
+            scale,
+            block_tables,
+            window_size,
+            True,  # is_causal
+            None,  # attn_mask: derived from the window by the converter
+            sinks,
+        )
+
+    raise NotImplementedError

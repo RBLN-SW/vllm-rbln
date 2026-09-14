@@ -18,7 +18,8 @@ import os
 import platform
 from collections import defaultdict
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
@@ -34,18 +35,64 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+# EX_SOFTWARE: an unhandled worker error, not the device's error number.
+_FAIL_FAST_EXIT_CODE = 70
+
+
+def abort_worker(exc: Exception, *, where: str) -> NoReturn:
+    """Exit without device cleanup when logging returns or raises.
+
+    No exit deadline is guaranteed if logging blocks on a handler lock or I/O.
+    """
+    try:
+        logger.error(
+            "RBLN worker %d: %s raised %s: %s. Ending this worker process "
+            "with exit code %d so the executor detects the failure.",
+            os.getpid(),
+            where,
+            type(exc).__name__,
+            exc,
+            _FAIL_FAST_EXIT_CODE,
+            exc_info=exc,
+        )
+    finally:
+        # StreamHandler flushes each record; avoid shutdown's handler locks.
+        os._exit(_FAIL_FAST_EXIT_CODE)
+
+
+def worker_fail_fast(function: _F) -> _F:
+    """Terminate MultiprocExecutor workers when an operation raises.
+
+    The receiver's fail_fast flag is resolved from its executor at initialization,
+    including RayExecutorV2. In-process executors propagate the exception.
+    """
+
+    @wraps(function)
+    def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        fail_fast = self.fail_fast and not envs.VLLM_RBLN_DISABLE_WORKER_FAIL_FAST
+        try:
+            return function(self, *args, **kwargs)
+        except Exception as exc:
+            if fail_fast:
+                abort_worker(exc, where=function.__qualname__)
+            raise
+
+    return guarded  # type: ignore[return-value]
+
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
 # sysfs lists every card on the host, /dev only ours; reading sysfs by the raw
@@ -805,7 +852,10 @@ def prepare_kernel_block_sizes(
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
-        if isinstance(kv_cache_spec, RBLNSlidingWindowSpec):
+        if isinstance(kv_cache_spec, SlidingWindowSpec):
+            # Both sliding-window kernels address the cache in windows, not
+            # in the manager's blocks; upstream BlockTable rejects a block the
+            # window does not divide.
             kernel_block_sizes.append(kv_cache_spec.sliding_window)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
