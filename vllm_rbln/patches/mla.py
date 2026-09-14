@@ -21,6 +21,7 @@ import torch
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.utils import replace_parameter
 
 from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
@@ -227,6 +228,6 @@ def patched_mla_process_weights(self: MLAAttention, act_dtype: torch.dtype) -> N
     mla_attention_original_process_weights(self, act_dtype)
     # RBLN uses 4D weights for batched matmul: [1, N, P, L] / [1, N, L, V]
     if hasattr(self, "W_UK_T"):
-        self.W_UK_T = self.W_UK_T.unsqueeze(0)
+        replace_parameter(self, "W_UK_T", self.W_UK_T.unsqueeze(0))
     if hasattr(self, "W_UV"):
-        self.W_UV = self.W_UV.unsqueeze(0)
+        replace_parameter(self, "W_UV", self.W_UV.unsqueeze(0))

@@ -386,6 +386,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        placeholder_max_num_blocks = cdiv(self.max_model_len, placeholder_block_size)
         logitsprocs_builder = (
             build_rbln_logitsprocs if envs.VLLM_RBLN_SAMPLER else build_logitsprocs
         )
@@ -405,6 +406,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             vocab_size=model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
+            max_num_blocks_per_req=[placeholder_max_num_blocks],
             num_spec_tokens=self.num_spec_tokens,
             logitsprocs=logitsprocs,
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),

@@ -39,7 +39,7 @@ dependencies = [
     "pyyaml",
     "datasets>=4.0.0",
     "qwen_vl_utils",
-    "vllm==0.24.0+cpu",
+    "vllm==0.26.0+cpu",
     "fastapi[standard]<0.137",
     "torch",
     "torchvision",
@@ -183,7 +183,7 @@ prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prer
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.24.0/cpu"
+url = "https://wheels.vllm.ai/0.26.0/cpu"
 explicit = true
 
 [[tool.uv.index]]
