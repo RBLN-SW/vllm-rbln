@@ -24,9 +24,9 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_rbln.config import (
-    _ENV_PROBE,
     _GROUP_TITLE,
     RBLNConfig,
+    _env_source,
     build_rbln_config,
 )
 
@@ -35,7 +35,8 @@ from vllm_rbln.config import (
 def clean_env(monkeypatch):
     """conftest pins VLLM_RBLN_NUM_HIDDEN_LAYERS; start from the defaults."""
     for f in dataclasses.fields(RBLNConfig):
-        for name in _ENV_PROBE.get(f.name, (f"VLLM_RBLN_{f.name.upper()}",)):
+        _, probes = _env_source(f.name)
+        for name in probes:
             monkeypatch.delenv(name, raising=False)
 
 
@@ -215,7 +216,8 @@ def test_only_compile_fields_change_the_hash():
     normalize_value() to reach the key at all.
     """
     base = RBLNConfig().compute_hash()
-    assert RBLNConfig(sampler=False).compute_hash() == base
+    assert RBLNConfig(use_custom_sampler=False).compute_hash() == base
+    assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])

@@ -294,7 +294,7 @@ class TestSamplePadding:
     def _runner(rejection_output: SamplerOutput, *, sampler: bool):
         rejection_sampler = MagicMock(return_value=rejection_output)
         runner = _make_runner_stub(
-            rbln_config=RBLNConfig(sampler=sampler),
+            rbln_config=RBLNConfig(use_custom_sampler=sampler),
             _is_prefill_step=False,
             use_async_scheduling=False,
             input_batch=SimpleNamespace(
@@ -339,7 +339,7 @@ class TestSamplePadding:
 def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
     rejection_sample = MagicMock()
     runner = _make_runner_stub(
-        rbln_config=RBLNConfig(sampler=True),
+        rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
@@ -1047,7 +1047,7 @@ class TestSortBatchByLength:
     # __init__ enables the sort on REBEL CR13 and wherever
     # VLLM_RBLN_BATCH_ATTN_OPT is set; other parts keep the scheduler's order.
     @pytest.mark.parametrize(
-        ("is_cr13", "batch_attn_opt", "expected"),
+        ("is_cr13", "use_batch_attn_opt", "expected"),
         [
             (True, "0", True),
             (False, "0", False),
@@ -1055,10 +1055,10 @@ class TestSortBatchByLength:
         ],
     )
     def test_resolved_from_device_and_flag(
-        self, monkeypatch, make_model_runner, is_cr13, batch_attn_opt, expected
+        self, monkeypatch, make_model_runner, is_cr13, use_batch_attn_opt, expected
     ):
         monkeypatch.setattr(current_platform, "is_cr13", lambda: is_cr13)
-        monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", batch_attn_opt)
+        monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", use_batch_attn_opt)
         runner = make_model_runner(init_kv_cache=False)
         assert runner.sort_batch_by_length is expected
 

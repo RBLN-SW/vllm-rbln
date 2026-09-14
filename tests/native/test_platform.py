@@ -325,7 +325,9 @@ class TestWorkerAndScheduler:
 
         def mutate(config: VllmConfig) -> None:
             config.scheduler_config.scheduler_cls = "pkg.mod.MyScheduler"
-            config.additional_config = replace(config.additional_config, sampler=False)
+            config.additional_config = replace(
+                config.additional_config, use_custom_sampler=False
+            )
 
         config = reconfigure(mutate)
         assert (

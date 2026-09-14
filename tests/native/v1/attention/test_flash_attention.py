@@ -92,7 +92,7 @@ def cfg_noncausal():
     return make_vllm_config(
         max_model_len=MAX_LEN,
         max_num_batched_tokens=CHUNK,
-        additional_config={"flash_causal_attn": False},
+        additional_config={"use_flash_causal_attn": False},
     )
 
 
@@ -291,7 +291,7 @@ class TestBuildPrefillNonCausal:
                 max_model_len=MAX_LEN,
                 max_num_batched_tokens=CHUNK,
                 enforce_eager=True,
-                additional_config={"flash_causal_attn": False},
+                additional_config={"use_flash_causal_attn": False},
             )
             if eager
             else cfg_noncausal

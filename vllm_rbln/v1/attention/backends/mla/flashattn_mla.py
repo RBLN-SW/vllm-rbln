@@ -165,7 +165,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             )
 
         self.sliding_window = sliding_window
-        self.is_causal = rbln_config.flash_causal_attn
+        self.is_causal = rbln_config.use_flash_causal_attn
         self.scale_tensor = torch.tensor(scale, device=self.device)
 
     # -- stubs required by MLAAttentionImpl interface -----------------------

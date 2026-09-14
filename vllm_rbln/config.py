@@ -59,7 +59,7 @@ class RBLNConfig:
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
 
-    sampler: bool = True
+    use_custom_sampler: bool = True
     """Use the customized RBLN sampler."""
 
     compile_model: bool = True
@@ -69,16 +69,16 @@ class RBLNConfig:
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
 
-    flash_causal_attn: bool = True
+    use_flash_causal_attn: bool = True
     """Use flash attention for causal attention."""
 
-    batch_attn_opt: bool = False
+    use_batch_attn_opt: bool = False
     """Use the batch attention optimization for paged attention."""
 
     use_custom_kernel: bool = False
     """Use the custom RBLN kernels."""
 
-    sub_block_cache: bool = True
+    enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching. The sub-block size equals
     max_num_batched_tokens (the prefill chunk size)."""
 
@@ -88,10 +88,10 @@ class RBLNConfig:
     use_moe_tokens_mask: bool = True
     """Apply the tokens mask to the MoE expert kernel."""
 
-    dispatch_all2all: bool = False
+    use_all2all_dispatch: bool = False
     """Use all2all dispatch instead of all-gather for MoE DP dispatch."""
 
-    combine_all2all: bool = False
+    use_all2all_combine: bool = False
     """Use all2all combine instead of reduce-scatter for MoE DP combine."""
 
     decode_batch_bucket_strategy: DecodeBatchBucketStrategy = "exponential"
@@ -125,8 +125,8 @@ class RBLNConfig:
         ignored_factors = {
             # Sampler graphs compile with use_cache=False, so they never enter
             # the bundle. Sub-block caching changes what runs, not what is built.
-            "sampler",
-            "sub_block_cache",
+            "use_custom_sampler",
+            "enable_sub_block_cache",
         }
         return hash_factors(get_hash_factors(self, ignored_factors))
 
@@ -150,6 +150,16 @@ _FIELDS = fields(RBLNConfig)  # type: ignore[arg-type]
 
 # Which env name means "the user set this field". It is VLLM_RBLN_<FIELD>
 # unless listed here.
+# The envs.py attribute a renamed field reads. Goes away with the env vars.
+_ENV_NAME: dict[str, str] = {
+    "use_custom_sampler": "VLLM_RBLN_SAMPLER",
+    "use_flash_causal_attn": "VLLM_RBLN_FLASH_CAUSAL_ATTN",
+    "use_batch_attn_opt": "VLLM_RBLN_BATCH_ATTN_OPT",
+    "use_all2all_dispatch": "VLLM_RBLN_DISPATCH_ALL2ALL",
+    "use_all2all_combine": "VLLM_RBLN_COMBINE_ALL2ALL",
+    "enable_sub_block_cache": "VLLM_RBLN_SUB_BLOCK_CACHE",
+}
+
 _ENV_PROBE: dict[str, tuple[str, ...]] = {
     # `envs.py` still honors the deprecated VLLM_RBLN_TP_SIZE alias.
     "num_devices_per_local_rank": (
@@ -160,15 +170,22 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
 }
 
 
+def _env_source(field_name: str) -> tuple[str, tuple[str, ...]]:
+    """The envs.py attribute a field reads, and the os.environ names that mean
+    the user set it."""
+    attr = _ENV_NAME.get(field_name, f"VLLM_RBLN_{field_name.upper()}")
+    return attr, _ENV_PROBE.get(field_name, (attr,))
+
+
 def _env_overrides() -> dict[str, Any]:
     from vllm_rbln import envs
 
     overrides: dict[str, Any] = {}
     for f in _FIELDS:
-        env_name = f"VLLM_RBLN_{f.name.upper()}"
-        for probe in _ENV_PROBE.get(f.name, (env_name,)):
+        attr, probes = _env_source(f.name)
+        for probe in probes:
             if probe in os.environ:
-                overrides[f.name] = getattr(envs, env_name)
+                overrides[f.name] = getattr(envs, attr)
                 break
     return overrides
 

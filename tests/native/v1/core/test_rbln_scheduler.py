@@ -49,8 +49,8 @@ class TestSchedulerInit:
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_sub_block_size_defaults_to_max_num_batched_tokens(self):
-        # sub_block_cache is on by default, so with no explicit sub_block_size the
-        # scheduler uses max_num_batched_tokens as the sub_block_size.
+        # enable_sub_block_cache is on by default, so with no explicit
+        # sub_block_size the scheduler uses max_num_batched_tokens.
         sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,
@@ -67,7 +67,7 @@ class TestSchedulerInit:
             block_size=1024,
             max_num_batched_tokens=128,
             max_model_len=2048,
-            additional_config={"sub_block_cache": False},
+            additional_config={"enable_sub_block_cache": False},
         )
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 

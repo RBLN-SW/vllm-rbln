@@ -366,7 +366,7 @@ class RblnPlatform(Platform):
             # only reader of the flag, and on the optimum path the refusal
             # below is the whole story.
             if scheduler_config.async_scheduling and not (
-                envs.VLLM_RBLN_USE_DEVICE_TENSOR and rbln_config.sampler
+                envs.VLLM_RBLN_USE_DEVICE_TENSOR and rbln_config.use_custom_sampler
             ):
                 logger.warning(
                     "Disabling asynchronous scheduling: it requires "
@@ -375,7 +375,7 @@ class RblnPlatform(Platform):
                     "which puts the sampler on the device so those tokens never "
                     "reach the host mid-step. Running synchronously.",
                     int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
-                    int(rbln_config.sampler),
+                    int(rbln_config.use_custom_sampler),
                 )
                 scheduler_config.async_scheduling = False
 

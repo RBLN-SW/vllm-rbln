@@ -76,7 +76,7 @@ class RBLNScheduler(Scheduler):
         # when sub-block prefix caching is enabled.
         # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
         # so that each prefill does not span multiple blocks.
-        if sub_block_size is None and rbln_config.sub_block_cache:
+        if sub_block_size is None and rbln_config.enable_sub_block_cache:
             sub_block_size = self.scheduler_config.max_num_batched_tokens
         if (
             self.cache_config.enable_prefix_caching

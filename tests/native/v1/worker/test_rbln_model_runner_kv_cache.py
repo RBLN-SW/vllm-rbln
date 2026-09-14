@@ -65,7 +65,7 @@ class TestSubBlockCacheGuard:
         runner = make_model_runner(
             layers=("layer.0", "layer.1"),
             init_kv_cache=False,
-            additional_config={"sub_block_cache": False},
+            additional_config={"enable_sub_block_cache": False},
         )
         runner.initialize_kv_cache(
             make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])

@@ -96,8 +96,8 @@ class RBLNMoERunner(MoERunner):
         # `MoERunner.__init__` is upstream's signature, so the section comes
         # from the config the model is being built under.
         rbln_config = get_rbln_config()
-        self.use_dispatch_all2all = rbln_config.dispatch_all2all
-        self.use_combine_all2all = rbln_config.combine_all2all
+        self.use_dispatch_all2all = rbln_config.use_all2all_dispatch
+        self.use_combine_all2all = rbln_config.use_all2all_combine
         self.use_moe_tokens_mask = rbln_config.use_moe_tokens_mask
 
         if self.moe_parallel_config.dp_size > 1 and (

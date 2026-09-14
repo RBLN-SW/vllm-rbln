@@ -293,7 +293,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
-        if self.rbln_config.sampler:
+        if self.rbln_config.use_custom_sampler:
             self.sampler = RBLNSampler(
                 logprobs_mode=self.model_config.logprobs_mode,
                 compile_context=self.compile_context,
@@ -366,7 +366,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.compile_context,
                 self.speculative_config,
                 self.device,
-                use_rbln_sampler=self.rbln_config.sampler,
+                use_rbln_sampler=self.rbln_config.use_custom_sampler,
             )
 
         self.num_spec_tokens = 0
@@ -394,7 +394,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self._init_kernel_block_sizes = [placeholder_block_size]
         placeholder_max_num_blocks = cdiv(self.max_model_len, placeholder_block_size)
         logitsprocs_builder = (
-            build_rbln_logitsprocs if self.rbln_config.sampler else build_logitsprocs
+            build_rbln_logitsprocs
+            if self.rbln_config.use_custom_sampler
+            else build_logitsprocs
         )
 
         logitsprocs = logitsprocs_builder(
@@ -493,7 +495,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # partition p and early-exits on the rest, which is only correct when
         # rows are sorted by descending sequence length.
         self.sort_batch_by_length = (
-            current_platform.is_cr13() or self.rbln_config.batch_attn_opt
+            current_platform.is_cr13() or self.rbln_config.use_batch_attn_opt
         )
 
         # Static, so the per-step decision only has to supply this step's counts.
@@ -1322,7 +1324,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 **staging,
             )
         else:
-            if self.rbln_config.sampler:
+            if self.rbln_config.use_custom_sampler:
                 bucket = self.bucketing_manager.max_batch_size
                 spec_decode_metadata = _pad_spec_decode_metadata(
                     spec_decode_metadata, bucket
@@ -3080,7 +3082,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize KV cache based on `kv_cache_config`."""
-        if self.rbln_config.sub_block_cache and (
+        if self.rbln_config.enable_sub_block_cache and (
             len(kv_cache_config.kv_cache_groups) > 1
         ):
             raise NotImplementedError(
@@ -3353,7 +3355,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.speculative_config is None
             or self.num_spec_tokens <= 0
             or self.is_pooling_model
-            or not self.rbln_config.sampler
+            or not self.rbln_config.use_custom_sampler
         ):
             return
 

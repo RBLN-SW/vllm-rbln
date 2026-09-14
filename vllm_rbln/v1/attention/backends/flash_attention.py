@@ -191,7 +191,7 @@ class RBLNFlashAttentionMetadataBuilder(
         # the draft config only, so a non-causal drafter and a causal target
         # coexist in one process.
         self.is_causal = (
-            rbln_config.flash_causal_attn
+            rbln_config.use_flash_causal_attn
             and not vllm_config.attention_config.use_non_causal
         )
 
@@ -424,10 +424,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                 self.sinks = self.sinks[:, None]
 
         self.is_causal = (
-            rbln_config.flash_causal_attn
+            rbln_config.use_flash_causal_attn
             and not vllm_config.attention_config.use_non_causal
         )
-        self.is_batch_attention_opt = rbln_config.batch_attn_opt
+        self.is_batch_attention_opt = rbln_config.use_batch_attn_opt
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )

@@ -77,7 +77,7 @@ def make_builder(
     device: str = "cpu",
 ) -> Any:
     """Construct the real builder. is_causal comes from `vllm_config`, so pass a
-    config built with `flash_causal_attn` off to get the non-causal builder."""
+    config built with `use_flash_causal_attn` off to get the non-causal builder."""
     from vllm.config import set_current_vllm_config
 
     from vllm_rbln.v1.attention.backends.flash_attention import (
