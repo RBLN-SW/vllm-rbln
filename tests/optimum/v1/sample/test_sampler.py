@@ -155,9 +155,9 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
 
     # Greedy picks the stop token unless min_tokens masks it.
     def rigged_forward(model_input, **kwargs):
-        num_reqs = runner.input_batch.num_reqs
+        num_rows = model_input.padded_batch_size
         vocab_size = runner.model_config.get_vocab_size()
-        logits = torch.full((num_reqs, 1, vocab_size), -10.0, dtype=dtype)
+        logits = torch.full((num_rows, 1, vocab_size), -10.0, dtype=dtype)
         logits[..., stop_token_id] = 10.0
         logits[..., runner_up_token_id] = 5.0
         return logits
@@ -213,9 +213,9 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
     # The top token wins greedy sampling unless the +20 bias lifts the
     # biased token (5 + 20) above it (10).
     def rigged_forward(model_input, **kwargs):
-        num_reqs = runner.input_batch.num_reqs
+        num_rows = model_input.padded_batch_size
         vocab_size = runner.model_config.get_vocab_size()
-        logits = torch.full((num_reqs, 1, vocab_size), -10.0, dtype=dtype)
+        logits = torch.full((num_rows, 1, vocab_size), -10.0, dtype=dtype)
         logits[..., top_token_id] = 10.0
         logits[..., biased_token_id] = 5.0
         return logits
@@ -285,9 +285,9 @@ def test_forward_min_p_masks_low_probability_tokens(
     # tokens, so random sampling becomes deterministic only when min_p is
     # actually applied.
     def rigged_forward(model_input, **kwargs):
-        num_reqs = runner.input_batch.num_reqs
+        num_rows = model_input.padded_batch_size
         vocab_size = runner.model_config.get_vocab_size()
-        logits = torch.zeros((num_reqs, 1, vocab_size), dtype=dtype)
+        logits = torch.zeros((num_rows, 1, vocab_size), dtype=dtype)
         logits[..., top_token_id] = 8.0
         return logits
 
