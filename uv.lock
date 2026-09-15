@@ -3068,6 +3068,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "fastapi", extra = ["standard"] },
+    { name = "openai" },
     { name = "optimum-rbln" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils" },
@@ -3111,6 +3112,7 @@ requires-dist = [
     { name = "build", marker = "extra == 'build'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
+    { name = "openai", specifier = ">=2.25.0" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "optimum-rbln", specifier = ">=0.11.3a6,<0.11.4" },

@@ -334,6 +334,23 @@ def test_compile_env_partition_is_disjoint():
     assert not overlap, f"classified twice: {sorted(overlap)}"
 
 
+def test_config_fields_are_not_hashed_into_the_bundle_key():
+    """`RBLNConfig.compute_hash` already keys the bundle on a field's value.
+
+    Hashing the variable too keys it on how the value was supplied instead:
+    `--rbln-use-w8a8` and `VLLM_RBLN_USE_W8A8=1` build the same artifact, so
+    they must not land in different bundle directories. A field `compute_hash`
+    ignores does not change the artifact, so it has no claim on the key either.
+    """
+    import dataclasses
+
+    from vllm_rbln.config import RBLNConfig
+
+    fields = {f"VLLM_RBLN_{f.name.upper()}" for f in dataclasses.fields(RBLNConfig)}
+    double_keyed = envs.RBLN_COMPILE_ENV & fields
+    assert not double_keyed, f"keyed twice: {sorted(double_keyed)}"
+
+
 def test_unknown_variable_raises():
     with pytest.raises(AttributeError, match="VLLM_RBLN_NOT_A_REAL_VARIABLE"):
         getattr(envs, "VLLM_RBLN_NOT_A_REAL_VARIABLE")  # noqa: B009
