@@ -28,6 +28,7 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
     build_op_top_k_top_p,
 )
 from vllm_rbln.v1.sample.rbln_rejection_sampler import (
+    GREEDY_TEMPERATURE,
     PLACEHOLDER_TOKEN_ID,
     RBLNRejectionSamplerImpl,
 )
@@ -500,3 +501,49 @@ def test_requests_with_fewer_drafts_than_the_padded_length(impl):
         dtype=torch.int32,
     )
     assert torch.equal(output, expected)
+
+
+def test_random_step_draws_the_bonus_token_in_the_graph(impl):
+    """A random step hands the graph the bonus rows' logits too, and the graph
+    draws the bonus token under the row's own temperature, top_k and top_p.
+
+    Row 0 is a greedy request of the mixed batch (top_k == 1), so it must land
+    on its argmax every time. Row 1 spreads its mass over two tokens and must
+    reach both across the draws: an argmax would only ever pick the first.
+    """
+    metadata = make_sampling_metadata(
+        temperature=torch.tensor([GREEDY_TEMPERATURE, 1.0]),
+        all_greedy=False,
+        all_random=False,
+        top_k=torch.tensor([GREEDY_TOP_K, VOCAB_SIZE], dtype=torch.int32),
+        top_p=torch.tensor([GREEDY_TOP_P, 1.0]),
+    )
+    bonus_logits = torch.full((2, VOCAB_SIZE), -100.0)
+    bonus_logits[0, 6] = 0.0
+    bonus_logits[0, 1] = -1.0
+    bonus_logits[1, 2] = 0.0
+    bonus_logits[1, 5] = 0.0
+    # Peaked hard enough that every draft is accepted, so the bonus slot is
+    # always filled.
+    target_logits = make_target_probs([3, 5, 2, 4]) * 100
+
+    torch.manual_seed(0)
+    drawn = set()
+    for _ in range(32):
+        output = impl.rejection_sample(
+            draft_token_ids=torch.tensor([3, 5, 2, 4], dtype=torch.int32),
+            num_draft_tokens=[2, 2],
+            max_spec_len=NUM_SPEC_TOKENS,
+            cu_num_draft_tokens=torch.tensor([2, 4], dtype=torch.int32),
+            draft_probs=None,
+            target_logits=target_logits,
+            bonus_token_ids=None,
+            sampling_metadata=metadata,
+            bonus_logits=bonus_logits,
+        )
+        assert torch.equal(
+            output[:, :2], torch.tensor([[3, 5], [2, 4]], dtype=torch.int32)
+        )
+        assert int(output[0, 2]) == 6
+        drawn.add(int(output[1, 2]))
+    assert drawn == {2, 5}

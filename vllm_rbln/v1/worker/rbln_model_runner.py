@@ -136,7 +136,7 @@ from vllm_rbln.v1.core.utils import (
 )
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
-from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
+from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -1813,7 +1813,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             sample_hidden_states = hidden_states
             assert self.use_wrapped_compute_logits
             if not self.is_prefill and spec_decode_metadata is not None:
-                logits = logits[logits_indices]
+                num_rows = logits_indices.shape[0]
+                if int(logits_indices[-1]) == num_rows - 1:
+                    # Indices climbing from 0 end at num_rows - 1 only when the
+                    # sampled rows lead the batch; a view replaces the gather.
+                    logits = logits[:num_rows]
+                else:
+                    # `index_select` is the cheaper gather on the device.
+                    logits = torch.index_select(logits, 0, logits_indices)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -2561,30 +2568,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dtype=self.dtype,
         )
 
-        def dummy_tensor_view(
-            buffer: torch.Tensor, value: int | float | None
-        ) -> torch.Tensor | None:
-            """Warm-up stand-in for what a real step feeds: a view of the buffer.
-
-            Dynamo guards distinguish a view from a fresh allocation, so this follows
-            how the runtime builds its sampling metadata tensors -- `_pad_rows` hands
-            through a slice of the persistent buffer.
-            """
-            if value is None:
-                return None
-            view = buffer[:num_reqs]
-            view.fill_(value)
-            return view
-
         for config in WARM_UP_CONFIGS:
             dummy_metadata = SamplingMetadata(
-                temperature=dummy_tensor_view(
-                    self.input_batch.temperature, config.get("temperature")
+                temperature=_dummy_tensor_view(
+                    self.input_batch.temperature, num_reqs, config.get("temperature")
                 ),
                 all_greedy=config.get("all_greedy", True),
                 all_random=config.get("all_random", False),
-                top_p=dummy_tensor_view(self.input_batch.top_p, config.get("top_p")),
-                top_k=dummy_tensor_view(self.input_batch.top_k, config.get("top_k")),
+                top_p=_dummy_tensor_view(
+                    self.input_batch.top_p, num_reqs, config.get("top_p")
+                ),
+                top_k=_dummy_tensor_view(
+                    self.input_batch.top_k, num_reqs, config.get("top_k")
+                ),
                 generators={},
                 max_num_logprobs=None,
                 no_penalties=config.get("no_penalties", True),
@@ -2593,16 +2589,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
                 if not config.get("no_penalties", True)
                 else None,
-                frequency_penalties=dummy_tensor_view(
+                frequency_penalties=_dummy_tensor_view(
                     self.input_batch.frequency_penalties,
+                    num_reqs,
                     config.get("frequency_penalties", 0.1),
                 ),
-                presence_penalties=dummy_tensor_view(
+                presence_penalties=_dummy_tensor_view(
                     self.input_batch.presence_penalties,
+                    num_reqs,
                     config.get("presence_penalties", 0.1),
                 ),
-                repetition_penalties=dummy_tensor_view(
+                repetition_penalties=_dummy_tensor_view(
                     self.input_batch.repetition_penalties,
+                    num_reqs,
                     config.get("repetition_penalties", 0.1),
                 ),
                 output_token_ids=[],
@@ -3393,15 +3392,51 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs=LogitsProcessors(),
             spec_token_ids=[[] for _ in range(batch_size)],
         )
+
+        variants: list[tuple[dict, SamplingMetadata]] = []
         # int32, as the bonus sampler's ops return it.
         bonus_token_ids = torch.zeros(
             batch_size, 1, dtype=torch.int32, device=self.device
         )
+
         logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
-        for bonus_token_ids_in, bonus_logits_in in (
-            (None, bonus_logits),
-            (bonus_token_ids, None),
-        ):
+        # One graph per top_k/top_p None-pattern (the sampler's WARM_UP_CONFIGS)
+        # plus the one fed bonus token ids (logprobs).
+        variants.append(({"bonus_token_ids": bonus_token_ids}, dummy_sampling_metadata))
+        for config in WARM_UP_CONFIGS:
+            metadata = dataclasses.replace(
+                dummy_sampling_metadata,
+                all_greedy=config["all_greedy"],
+                all_random=config["all_random"],
+                temperature=None
+                if config["all_greedy"]
+                else torch.ones(batch_size, dtype=self.dtype, device=self.device),
+                top_p=_dummy_tensor_view(
+                    self.input_batch.top_p, batch_size, config.get("top_p")
+                ),
+                top_k=_dummy_tensor_view(
+                    self.input_batch.top_k, batch_size, config.get("top_k")
+                ),
+            )
+            variants.append(({"bonus_logits": bonus_logits}, metadata))
+
+            if batch_size > 1 and (metadata.top_p, metadata.top_k) != (None, None):
+                # A batch below the bound arrives through `_pad_rows`'s torch.cat,
+                # not a buffer view.
+                variants.append(
+                    (
+                        {"bonus_logits": bonus_logits},
+                        _pad_sampling_metadata(
+                            dataclasses.replace(
+                                metadata,
+                                top_p=_pad_rows(metadata.top_p, batch_size - 1),
+                                top_k=_pad_rows(metadata.top_k, batch_size - 1),
+                            ),
+                            batch_size,
+                        ),
+                    )
+                )
+        for bonus_kwargs, sampling_metadata in variants:
             self.rejection_sampler.impl.rejection_sample(
                 draft_token_ids,
                 num_draft_tokens,
@@ -3409,9 +3444,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 cu_num_draft_tokens,
                 None,
                 target_logits,
-                bonus_token_ids_in,
-                dummy_sampling_metadata,
-                bonus_logits=bonus_logits_in,
+                bonus_kwargs.get("bonus_token_ids"),
+                sampling_metadata,
+                bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
 
     def warmup_model(self) -> None:
@@ -3518,6 +3553,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     dsts.append(kv_cache[:, dst, :, :, :nt, :])
                     srcs.append(kv_cache[:, src, :, :, :nt, :])
         torch._foreach_copy_(dsts, srcs)
+
+
+def _dummy_tensor_view(
+    buffer: torch.Tensor, num_reqs: int, value: int | float | None
+) -> torch.Tensor | None:
+    """A view of the persistent buffer, as a real step feeds"""
+    if value is None:
+        return None
+    view = buffer[:num_reqs]
+    view.fill_(value)
+    return view
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:
