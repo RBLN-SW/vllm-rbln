@@ -622,32 +622,33 @@ class RblnPlatform(Platform):
     def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
         """Reject configurations the dynamic-KV path cannot size.
 
-        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
-        Configurations".
+        A dry run reports them instead: it changes nothing, so refusing would
+        stop a run that the flag off would have served. Reasons per shape:
+        docs/dynamic_kv_cache.md, "Unsupported Configurations".
         """
+        dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
+
+        def reject(message: str) -> None:
+            if dry_run:
+                logger.warning("dynamic KV cache dry run: %s", message)
+                return
+            raise ValueError(message)
+
         if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
                 "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
             )
 
         if not USE_DEVICE_TENSOR:
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
                 "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
                 "no dynamic KV dimension."
             )
 
         if vllm_config.kv_transfer_config is not None:
-            if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
-                logger.warning(
-                    "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN with a KV transfer "
-                    "connector: the dry run only reports, so the connector's "
-                    "registrations stay valid; enabling the resize itself is "
-                    "refused."
-                )
-                return
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
                 "transfer connector; the resize invalidates its registrations."
             )

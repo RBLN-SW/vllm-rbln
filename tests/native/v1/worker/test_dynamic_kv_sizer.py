@@ -441,6 +441,17 @@ class TestWarmupCapturesPrograms:
             pass
         assert programs is recorded
 
+    def test_a_dry_run_without_torch_rbln_reports_instead_of_refusing(self, caplog):
+        sizer = SimpleNamespace(mode=dks.DynamicKvMode.DRY_RUN)
+        with (
+            patch.object(dks, "has_torch_rbln", False),
+            caplog.at_level("WARNING"),
+            DynamicKvSizer.capture_programs(sizer) as programs,
+        ):
+            pass
+        assert programs is None
+        assert "dry run" in caplog.text
+
     def test_on_without_torch_rbln_refuses(self):
         with (
             patch.object(dks, "has_torch_rbln", False),

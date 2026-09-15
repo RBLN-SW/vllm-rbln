@@ -366,10 +366,16 @@ class DynamicKvSizer:
         if self.mode is DynamicKvMode.DISABLED:
             return nullcontext(None)
         if not has_torch_rbln:
-            raise RuntimeError(
+            message = (
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs torch_rbln's "
                 "capture_programs(); torch.rbln is not importable."
             )
+            if self.mode is DynamicKvMode.DRY_RUN:
+                # Nothing to capture means nothing to report, which the sizing
+                # step says; it must not stop a run the dry run cannot change.
+                logger.warning("[Dynamic KV] dry run: %s", message)
+                return nullcontext(None)
+            raise RuntimeError(message)
         return torch.rbln.capture_programs()
 
     def collect_runtimes(self) -> list[Any]:

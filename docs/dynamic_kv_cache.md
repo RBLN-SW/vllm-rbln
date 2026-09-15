@@ -125,14 +125,15 @@ carry the result:
   exceeds the budget on that chiplet. Nothing is allocated at `n`; the real mode's fit
   check line is what validates the prediction.
 
-The dry run is for the vLLM-native path (`VLLM_RBLN_USE_VLLM_MODEL=1`,
-`VLLM_RBLN_USE_DEVICE_TENSOR=1`): those two refusals guard the dynamic compile
-itself, so they hold in a dry run too. Everything a dry run cannot break is
-reported instead of refused, so the measurement is of the run that would have
-happened: a KV transfer connector (the reallocation is what invalidates its
-registrations), an attention layer that does not dispatch to a paged naive
-kernel, cross-layer KV sharing, and a sizing failure after warm-up (no placement,
-no fit) all log a warning and the run continues. The pre-compile estimate is
+A dry run refuses nothing. It changes nothing either, so a refusal would stop a
+run the flag off would have served; every shape is reported instead and the run
+continues. That covers the two the dynamic compile needs
+(`VLLM_RBLN_USE_VLLM_MODEL=1`, `VLLM_RBLN_USE_DEVICE_TENSOR=1`) and a
+`torch.rbln` without `capture_programs()` -- without them nothing is captured and
+the sizing step says so -- as well as a KV transfer connector (the reallocation
+is what invalidates its registrations), an attention layer that does not dispatch
+to a paged naive kernel, cross-layer KV sharing, and a sizing failure after
+warm-up (no placement, no fit). The pre-compile estimate is
 likewise left alone: the one-request floor above applies only when the cache is
 shrunk, and so do the exact chiplet-replication factor and the driver-read DRAM
 capacity, since every other mode serves that estimate rather than replacing it.
