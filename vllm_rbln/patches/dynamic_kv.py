@@ -21,6 +21,7 @@
 from typing import Any
 
 from vllm.config import VllmConfig
+from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -111,6 +112,11 @@ def patched_initialize_kv_caches(
     vllm_config.cache_config.num_gpu_blocks = num_blocks
     # The frontend picks this up on its own: EngineCoreReadyResponse is built
     # from cache_config.num_gpu_blocks after __init__ has finished.
+    # The capacity `_initialize_kv_caches` derived is the shrunk cache's, and
+    # nothing recomputes it after this point.
+    num_tokens, max_concurrency = get_kv_cache_capacity(vllm_config, kv_cache_config)
+    vllm_config.cache_config.kv_cache_size_tokens = num_tokens
+    vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
 
     logger.info(
         "dynamic KV cache: scheduler block pool resized %d -> %d blocks",
@@ -154,15 +160,12 @@ def _log_gpu_kv_cache_size(
     Upstream emits its line before warm-up and `info_once` will not repeat it,
     so these keep upstream's wording for whatever parses the first one.
     """
-    from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
-
     max_model_len = vllm_config.model_config.max_model_len
-    max_concurrency = get_max_concurrency_for_kv_cache_config(
-        vllm_config, kv_cache_config
-    )
+    num_tokens = vllm_config.cache_config.kv_cache_size_tokens
+    max_concurrency = vllm_config.cache_config.kv_cache_max_concurrency
     logger.info(
         "GPU KV cache size: %s tokens (num_blocks=%d, after the dynamic KV resize)",
-        f"{int(max_concurrency * max_model_len):,}",
+        f"{num_tokens:,}",
         kv_cache_config.num_blocks,
     )
     logger.info(
