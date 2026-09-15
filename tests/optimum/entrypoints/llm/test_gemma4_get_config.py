@@ -17,7 +17,9 @@ import pytest
 from transformers import Gemma4Config, OPTConfig
 from vllm.config import model as vllm_model_config
 
-from vllm_rbln.platform import RblnPlatform
+from vllm_rbln.platform.optimum_impl import (
+    _allow_gemma4_global_per_layer_attribute_access,
+)
 
 
 @pytest.fixture
@@ -30,7 +32,7 @@ def get_config(monkeypatch):
     monkeypatch.setattr(
         vllm_model_config, "_rbln_gemma4_get_config_patched", False, raising=False
     )
-    RblnPlatform._allow_gemma4_global_per_layer_attribute_access()
+    _allow_gemma4_global_per_layer_attribute_access()
 
     def load(model, config):
         configs[model] = config

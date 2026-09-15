@@ -38,7 +38,7 @@ They do not exist in `tests/optimum/`.
 
 The codebase already has a word for each of these. Use it, and do not reach for a synonym because the sentence reads better.
 
-- **model path** — which model implementation runs. The two are the **optimum-rbln path** and the **vLLM-native path**; `optimum` and `native` are the short forms. Not "backend", not "mode". `torch.compile` describes how the native path works and is not its name.
+- **model path** — which model implementation runs. The two are the **optimum-rbln path** and the **vLLM-native path**; `optimum` and `native` are the short forms in prose, while the modules implementing a path carry the `_impl` suffix (`platform/optimum_impl.py`, `platform/vllm_impl.py`). Not "backend", not "mode". `torch.compile` describes how the native path works and is not its name.
 - **suite** — a top-level test tree: `tests/native/`, `tests/optimum/`.
 - **lane** — a slice of a suite selected by a flag, a mark, or the device mode: the default lane, the `--model-compile` lane, the cpu and device lanes.
 
@@ -48,11 +48,11 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 | Path         | Owns                                                                        |
 | ------------ | --------------------------------------------------------------------------- |
-| optimum-rbln | `model_executor/models/optimum/`, `utils/optimum/`, `v1/worker/optimum_*.py` |
-| vLLM-native  | `patches/`, `compilation/`, `v1/worker/rbln_*.py`                            |
-| shared       | everything else                                                              |
+| optimum-rbln | `model_executor/models/optimum/`, `utils/optimum/`, `v1/worker/optimum_*.py`, `platform/optimum_impl.py` |
+| vLLM-native  | `patches/`, `compilation/`, `v1/worker/rbln_*.py`, `platform/vllm_impl.py` |
+| shared       | everything else |
 
-**`envs.py` defines the flag; only `__init__.py` and `platform.py` branch on it.** Do not branch on `VLLM_RBLN_USE_VLLM_MODEL` anywhere else. Path-specific code belongs in the module that path owns.
+**`envs.py` defines the flag; only `__init__.py` and `platform/__init__.py` branch on it.** Do not branch on `VLLM_RBLN_USE_VLLM_MODEL` anywhere else. Path-specific code belongs in the module that path owns.
 
 - Say which path or paths you changed in the PR description.
 - A change to one path must not alter the other. If it appears to need both, stop and ask before writing code.

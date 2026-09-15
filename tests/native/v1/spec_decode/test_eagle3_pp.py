@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.model_executor.models.minimax_m2 import MiniMaxM2Model
 
-from vllm_rbln.platform import RblnPlatform
+from vllm_rbln.platform.vllm_impl import _validate_eagle3_pp_config
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
     EAGLE3_PP_TARGET_ARCHS,
     eagle3_aux_hidden_states_enabled,
@@ -67,26 +67,26 @@ def test_the_allowlist_and_the_patched_forwards_agree():
 
 
 def test_a_supported_target_is_accepted():
-    RblnPlatform._validate_eagle3_pp_config(_config(SUPPORTED, 4))
+    _validate_eagle3_pp_config(_config(SUPPORTED, 4))
 
 
 def test_an_unsupported_target_is_rejected_at_startup():
     with pytest.raises(ValueError, match="EAGLE3 with pipeline_parallel_size"):
-        RblnPlatform._validate_eagle3_pp_config(_config(UNSUPPORTED, 2))
+        _validate_eagle3_pp_config(_config(UNSUPPORTED, 2))
 
 
 def test_an_unsupported_target_passes_when_aux_is_off():
     # With `use_aux_hidden_state` off nothing is captured anywhere, so upstream's
     # unpatched forward is harmless and the split is fine. Rejecting this would
     # block a configuration that works.
-    RblnPlatform._validate_eagle3_pp_config(
+    _validate_eagle3_pp_config(
         _config(UNSUPPORTED, 2, eagle_config={"use_aux_hidden_state": False})
     )
 
 
 @pytest.mark.parametrize("method", [None, "eagle", "ngram", "medusa"])
 def test_only_eagle3_is_gated(method):
-    RblnPlatform._validate_eagle3_pp_config(_config(UNSUPPORTED, 4, method=method))
+    _validate_eagle3_pp_config(_config(UNSUPPORTED, 4, method=method))
 
 
 @pytest.mark.parametrize(
