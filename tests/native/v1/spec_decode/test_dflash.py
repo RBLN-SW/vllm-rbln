@@ -158,8 +158,8 @@ class TestContextWriteContiguity:
 
     def _cache(self):
         return torch.zeros(
-            2,
             4,
+            2,
             self.NUM_KV_HEADS,
             1,
             BLOCK_SIZE,
@@ -170,7 +170,7 @@ class TestContextWriteContiguity:
     def test_all_heads_at_once_is_strided_on_both_sides(self):
         cache = self._cache()
         source = torch.zeros(6, self.NUM_KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
-        assert not cache[0, 1, :, 0, 3:9, :].is_contiguous()
+        assert not cache[1, 0, :, 0, 3:9, :].is_contiguous()
         assert not source[0:6].transpose(0, 1).is_contiguous()
 
     def test_per_head_is_contiguous_on_both_sides(self):
@@ -178,7 +178,7 @@ class TestContextWriteContiguity:
         # Head-major, which is the layout the compiled projection now emits.
         source = torch.zeros(self.NUM_KV_HEADS, 6, self.HEAD_DIM, dtype=torch.bfloat16)
         for head in range(self.NUM_KV_HEADS):
-            assert cache[0, 1, head, 0, 3:9, :].is_contiguous()
+            assert cache[1, 0, head, 0, 3:9, :].is_contiguous()
             assert source[head, 0:6, :].is_contiguous()
 
     def test_a_write_run_never_leaves_its_block(self):
