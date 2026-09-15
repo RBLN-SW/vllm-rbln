@@ -97,8 +97,9 @@ def kv_cache_dynamic_axis(
     stride_order: Sequence[int],
 ) -> int:
     """The axis of the backend's KV shape (in stride order) that grows with
-    `num_blocks`: dim 1 for the `[2, num_blocks, ...]` paged layout, dim 0 for
-    MLA's `[num_blocks, block_size, latent]`."""
+    `num_blocks`: dim 0 for the `[num_blocks, 2, ...]` paged layout and for
+    MLA's `[num_blocks, block_size, latent]`, wherever the stride order puts
+    it."""
 
     def shape(num_blocks: int) -> tuple[int, ...]:
         raw = attn_backend.get_kv_cache_shape(

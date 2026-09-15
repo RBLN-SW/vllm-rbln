@@ -48,11 +48,11 @@ class TestKvCacheDynamicAxis:
     def _spec():
         return SimpleNamespace(num_kv_heads=8, head_size=128)
 
-    def test_paged_layout_grows_along_dim_1(self):
+    def test_paged_layout_grows_along_dim_0(self):
         backend = SimpleNamespace(
             get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (
-                2,
                 n,
+                2,
                 h,
                 1,
                 bs,
@@ -60,7 +60,7 @@ class TestKvCacheDynamicAxis:
             )
         )
         assert (
-            kv_cache_dynamic_axis(backend, 4, 1024, self._spec(), "auto", range(6)) == 1
+            kv_cache_dynamic_axis(backend, 4, 1024, self._spec(), "auto", range(6)) == 0
         )
 
     def test_mla_layout_grows_along_dim_0(self):

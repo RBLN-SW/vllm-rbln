@@ -18,7 +18,6 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
-from functools import partial
 from typing import Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -3247,12 +3246,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 }
                 kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
-            kv_transfer_group.set_host_xfer_buffer_ops(
-                partial(
-                    copy_host_device_kv_blocks,
-                    use_mla=self.model_config.use_mla,
-                )
-            )
+            kv_transfer_group.set_host_xfer_buffer_ops(copy_host_device_kv_blocks)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3637,12 +3631,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dst = op.dst_block_id
             nt = op.num_tokens
             for kv_cache in self.kv_caches:
-                if self.model_config.use_mla:
-                    dsts.append(kv_cache[dst, :nt, :])
-                    srcs.append(kv_cache[src, :nt, :])
-                else:
-                    dsts.append(kv_cache[:, dst, :, :, :nt, :])
-                    srcs.append(kv_cache[:, src, :, :, :nt, :])
+                dsts.append(kv_cache[dst, ..., :nt, :])
+                srcs.append(kv_cache[src, ..., :nt, :])
         torch._foreach_copy_(dsts, srcs)
 
 

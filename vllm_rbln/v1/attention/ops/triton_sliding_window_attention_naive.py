@@ -110,31 +110,31 @@ def sliding_window_attention_naive_prefill(
         )
         k_cache_base_ptr = tl.make_block_ptr(
             base=kv_cache_base,
-            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            shape=(NUM_BLOCK, 2, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
             strides=(
-                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                2 * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
                 NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
                 WINDOW_SIZE * HEAD_DIM,
                 WINDOW_SIZE * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ),
-            offsets=(0, block_number, 0, 0, 0, 0),
+            offsets=(block_number, 0, 0, 0, 0, 0),
             block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
             order=(5, 4, 3, 2, 1, 0),
         )
         v_cache_base_ptr = tl.make_block_ptr(
             base=kv_cache_base,
-            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            shape=(NUM_BLOCK, 2, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
             strides=(
-                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                2 * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
                 NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
                 WINDOW_SIZE * HEAD_DIM,
                 WINDOW_SIZE * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ),
-            offsets=(1, block_number, 0, 0, 0, 0),
+            offsets=(block_number, 1, 0, 0, 0, 0),
             block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
             order=(5, 4, 3, 2, 1, 0),
         )
@@ -307,31 +307,31 @@ def sliding_window_attention_naive_decode(
         )
         k_cache_base_ptr = tl.make_block_ptr(
             base=kv_cache_base,
-            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            shape=(NUM_BLOCK, 2, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
             strides=(
-                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                2 * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
                 NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
                 WINDOW_SIZE * HEAD_DIM,
                 WINDOW_SIZE * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ),
-            offsets=(0, block_number, 0, 0, 0, 0),
+            offsets=(block_number, 0, 0, 0, 0, 0),
             block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
             order=(5, 4, 3, 2, 1, 0),
         )
         v_cache_base_ptr = tl.make_block_ptr(
             base=kv_cache_base,
-            shape=(2, NUM_BLOCK, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
+            shape=(NUM_BLOCK, 2, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
             strides=(
-                NUM_BLOCK * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
+                2 * NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
                 NUM_HEAD * WINDOW_SIZE * HEAD_DIM,
                 WINDOW_SIZE * HEAD_DIM,
                 WINDOW_SIZE * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ),
-            offsets=(1, block_number, 0, 0, 0, 0),
+            offsets=(block_number, 1, 0, 0, 0, 0),
             block_shape=(1, 1, NUM_HEAD, 1, WINDOW_SIZE, HEAD_DIM),
             order=(5, 4, 3, 2, 1, 0),
         )
@@ -461,7 +461,7 @@ def sliding_window_attention_naive_prefill_wrapper(
     QUERY_LEN = query.shape[-2]
     WINDOW_SIZE = kv_cache.shape[-2]
     NUM_BATCH = query.shape[0]
-    NUM_BLOCK = kv_cache.shape[1]
+    NUM_BLOCK = kv_cache.shape[0]
     DIM_BLOCK_TABLE = block_table.dim()
 
     params = [
@@ -536,7 +536,7 @@ def sliding_window_attention_naive_decode_wrapper(
     QUERY_LEN = query.shape[-2]
     WINDOW_SIZE = kv_cache.shape[-2]
     NUM_BATCH = query.shape[0]
-    NUM_BLOCK = kv_cache.shape[1]
+    NUM_BLOCK = kv_cache.shape[0]
     DIM_BLOCK_TABLE = block_table.dim()
 
     params = [
