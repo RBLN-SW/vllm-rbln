@@ -715,8 +715,24 @@ class TestDryRunOnlyObserves:
                 sizer(dks.DynamicKvMode.ACTIVE), {}
             )
             assert active == 8000
-            for mode in (dks.DynamicKvMode.DRY_RUN, dks.DynamicKvMode.PINNED):
+            for mode in (
+                dks.DynamicKvMode.DRY_RUN,
+                dks.DynamicKvMode.PINNED,
+                dks.DynamicKvMode.INERT,
+            ):
                 assert DynamicKvSizer.pre_compile_estimate(sizer(mode), {}) == 999
+
+    def test_the_flag_off_never_snapshots(self, monkeypatch):
+        """The DISABLED early return is the only thing keeping the default path
+        on the plain estimate instead of the per-chiplet snapshot."""
+        seen: list = []
+        monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 777)
+        sizer = SimpleNamespace(
+            mode=dks.DynamicKvMode.DISABLED,
+            memory_snapshot=lambda device: seen.append(device),
+        )
+        assert DynamicKvSizer.pre_compile_estimate(sizer, {}) == 777
+        assert seen == []
 
     def test_a_dry_run_reports_a_refused_attention_layout(self, caplog):
         sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.DRY_RUN)
