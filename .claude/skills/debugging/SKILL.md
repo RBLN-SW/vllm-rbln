@@ -16,7 +16,7 @@ Get a reproducer before changing anything, and narrow it to the smallest input a
 Check these before concluding anything, because each one makes a reproduction silently exercise something other than what you think:
 
 - **`tests/native/` scrubs `VLLM_RBLN_*`.** Exported values do not reach it; the session options are the only way in. A knob you "set" may never have applied.
-- **`--device-tensor` is session-wide.** `platform.py` resolves it at module scope, so a per-test attempt to change it does nothing and the test still passes.
+- **`--device-tensor` is session-wide.** `platform/__init__.py` resolves it at module scope, so a per-test attempt to change it does nothing and the test still passes.
 - **Marks decide the process.** `use_device` and `model_compile` items run in a spawned child. A failure that only appears in one of the two contexts is about the process, not the logic.
 
 ## 2. Make the evidence discriminate
@@ -53,7 +53,7 @@ Run the reproducer again, plus the tests around the code you touched, and read t
 - Does the same defect exist on the other path?
 - Does the fix change behavior on the other path?
 
-Only `__init__.py` and `platform.py` branch on the flag. If the fix seems to need a new `if envs.VLLM_RBLN_USE_VLLM_MODEL` anywhere else, the shape is wrong — stop and ask.
+Only `__init__.py` and `platform/__init__.py` branch on the flag. If the fix seems to need a new `if envs.VLLM_RBLN_USE_VLLM_MODEL` anywhere else, the shape is wrong — stop and ask.
 
 ## 7. Report the gaps
 

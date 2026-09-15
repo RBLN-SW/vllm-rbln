@@ -516,7 +516,7 @@ def _drop_envs_shadows():
 def _isolate_rbln_ctx_standalone():
     """Clear the one env var the code under test writes to the process env.
 
-    RblnPlatform.validate_and_setup_prerequisite sets RBLN_CTX_STANDALONE=1 for
+    vllm_impl._setup_runtime_env sets RBLN_CTX_STANDALONE=1 for
     any TP/DP/PP/EP config and never clears it. The rebel runtime reads it on
     every context creation, so one test building such a config leaves every later
     test -- and every spawned child, which inherits the env -- unable to register
