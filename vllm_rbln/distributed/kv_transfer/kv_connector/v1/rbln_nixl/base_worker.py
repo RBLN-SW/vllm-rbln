@@ -24,12 +24,12 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.handshake import (
     RblnNixlHandshakeMixin,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
+    connector_option,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.registration import (
     RblnNixlRegistrationMixin,
@@ -91,6 +91,13 @@ class RblnNixlWorkerBase(
         # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
+        if self.use_host_buffer and connector_option(vllm_config, "chunk_mode", False):
+            raise RuntimeError(
+                "RBLN NIXL: chunk_mode needs the descriptor "
+                "lists of the direct path; host staging registers one "
+                "full-shape buffer per layer and gives a narrowed peer a "
+                "handle upstream built, and a chunk range extends neither."
+            )
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
@@ -102,6 +109,9 @@ class RblnNixlWorkerBase(
         self._kv_slices: int = 1
         # And which axis they came from -- the two counts alone do not say.
         self._kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
+        # Whether a transfer may carry less than a whole block. What it
+        # leaves out is a token range of that block.
+        self._chunk_mode: bool = False
 
         # Model-wide counts, not this rank's share. None where the layer has
         # no head band (`_layer_kv_heads`).
@@ -134,6 +144,15 @@ class RblnNixlWorkerBase(
         # How many descriptors each of that shard's regions is cut into
         # (_head_split).
         self._shard_descs_per_block: dict[tuple[str, int], int] = {}
+        # Per peer shard, the grid its chunk range was built over, or None
+        # where its lists carry no such range. See `_shard_chunk_grid`.
+        self._shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None] = {}
+        # This engine's own grid, set once registration knows the geometry.
+        # None wherever a chunk is the whole span (see `_shard_chunk_grid`).
+        self._chunk_grid: tuple[int, int] | None = None
+        # How far the request being transferred fills its last block, parked
+        # for the length of one upstream call (`_tail_viewed_as`).
+        self._request_tail: tuple[int | None, int] | None = None
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.
         self.local_seen_layer_names: list[str] = []
@@ -161,7 +180,14 @@ class RblnNixlWorkerBase(
             isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
         self._sw_ratio: int | None = None
-        if self._has_swa and envs.VLLM_RBLN_NIXL_SWA_VIEW_OPT:
+        # Chunk mode turns the view opt on rather than asking for it. Its
+        # descriptor ranges are ours to extend only where `_sw_ratio` is set --
+        # `_compute_desc_ids` hands the whole list to upstream otherwise, and
+        # upstream's has no room for a second range, let alone a third.
+        swa_view_opt = connector_option(self.vllm_config, "swa_view_opt", False)
+        if self._has_swa and (
+            swa_view_opt or connector_option(self.vllm_config, "chunk_mode", False)
+        ):
             for spec in self._group_specs:
                 if not isinstance(spec, SlidingWindowSpec):
                     continue
@@ -182,12 +208,19 @@ class RblnNixlWorkerBase(
                 # key-only latent have not been combined.
                 if self.use_mla:
                     raise RuntimeError(
-                        "RBLN NIXL: VLLM_RBLN_NIXL_SWA_VIEW_OPT is not "
-                        "supported with a sliding-window MLA cache."
+                        "RBLN NIXL: the SWA descriptor view is not supported "
+                        "with a sliding-window MLA cache."
+                    )
+                if not swa_view_opt:
+                    logger.warning(
+                        "RBLN NIXL: chunk_mode turned the SWA view on "
+                        "over swa_view_opt=0 -- a "
+                        "chunk range extends that layout and has nowhere "
+                        "else to sit."
                     )
                 logger.info(
-                    "VLLM_RBLN_NIXL_SWA_VIEW_OPT=1: trimming SWA-group "
-                    "RDMA payload by 1/%d (sliding_window-sized descs "
-                    "alongside Full descs at shared base addrs).",
+                    "SWA view on: trimming SWA-group RDMA payload by 1/%d "
+                    "(sliding_window-sized descs alongside Full descs at "
+                    "shared base addrs).",
                     self._sw_ratio,
                 )
