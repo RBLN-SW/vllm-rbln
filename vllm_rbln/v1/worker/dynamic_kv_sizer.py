@@ -344,8 +344,7 @@ class DynamicKvSizer:
     ) -> tuple[dict[Unit, ChipletMemory], str]:
         """Per-(node, chiplet) `(total, used)` and its source: the driver, or
         this process's allocator plus the reserve and the foreign usage."""
-        rbln = torch.rbln
-        query = getattr(rbln, "mem_get_info_per_chiplet", None)
+        query = getattr(torch.rbln, "mem_get_info_per_chiplet", None)
         if query is not None:
             try:
                 return snapshot_from_driver(query(device)), "driver"
@@ -362,10 +361,12 @@ class DynamicKvSizer:
                 "sizing from this process's allocator instead."
             )
         # Cached-but-free blocks would otherwise count as used.
-        rbln.empty_cache(device)
-        memory_per_chiplet = int(rbln.get_device_properties(device).memory_per_chiplet)
+        torch.rbln.empty_cache(device)
+        memory_per_chiplet = int(
+            torch.rbln.get_device_properties(device).memory_per_chiplet
+        )
         snapshot = snapshot_from_allocator(
-            rbln.memory_stats_per_chiplet(device),
+            torch.rbln.memory_stats_per_chiplet(device),
             memory_per_chiplet=memory_per_chiplet,
             foreign_card_used_bytes=self.foreign_dram_used_bytes,
             reserve_bytes=DYNAMIC_KV_ALLOCATOR_RESERVE_BYTES,
