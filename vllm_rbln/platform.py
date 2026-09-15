@@ -805,25 +805,18 @@ class RblnPlatform(Platform):
             cls._disable_prefix_caching(vllm_config, "EC producer (encoder-only)")
             return
 
-        hf_config = vllm_config.model_config.hf_config
-        has_sliding_window = cls._uses_sliding_window(hf_config)
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
 
-        if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            if has_sliding_window:
-                cls._disable_prefix_caching(vllm_config, "sliding window models")
-
-        else:
-            # Prefix caching is supported only for decoder-only models for now.
-            model_config = vllm_config.model_config
-            if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
-                # Qwen3 pooling model does not support prefix caching for now.
-                cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
-            elif is_enc_dec_arch(hf_config):
-                cls._disable_prefix_caching(vllm_config, "encoder-decoder models")
-            elif is_pooling_arch(hf_config):
-                cls._disable_prefix_caching(vllm_config, "pooling models")
-            elif has_sliding_window:
-                cls._disable_prefix_caching(vllm_config, "sliding window models")
+        # Prefix caching is supported only for decoder-only models for now.
+        if is_qwen3_embedding(model_config) or is_qwen3_reranker(model_config):
+            cls._disable_prefix_caching(vllm_config, "Qwen3 pooling models")
+        elif is_enc_dec_arch(hf_config):
+            cls._disable_prefix_caching(vllm_config, "encoder-decoder models")
+        elif is_pooling_arch(hf_config):
+            cls._disable_prefix_caching(vllm_config, "pooling models")
+        elif cls._uses_sliding_window(hf_config):
+            cls._disable_prefix_caching(vllm_config, "sliding window models")
 
     @classmethod
     def get_punica_wrapper(cls) -> str:

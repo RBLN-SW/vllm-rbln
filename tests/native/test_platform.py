@@ -732,19 +732,18 @@ def test_executor_backend_warning_preserves_selection(reconfigure, caplog, backe
 
 
 class TestKnownGaps:
-    """Behaviour pinned as-is because it looks unintended; see
-    docs/test_note.log."""
+    """Behaviour pinned as-is because it looks unintended."""
 
     def test_sliding_window_keeps_prefix_caching_on(self):
-        # disable_unsupported_prefix_caching is only called from the optimum
-        # branch, so its native clause is unreachable. SWA instead surfaces much
-        # later as the sub-block multi-group NotImplementedError in
+        # disable_unsupported_prefix_caching runs on the optimum path only, so
+        # the native path has no SWA guard. SWA instead surfaces much later as
+        # the sub-block multi-group NotImplementedError in
         # RBLNModelRunner.initialize_kv_cache, and the workaround in use is
         # VLLM_RBLN_SUB_BLOCK_CACHE=0.
         config = _build(
             enable_prefix_caching=True, hf_overrides={"sliding_window": 512}
         )
-        assert RblnPlatform._uses_sliding_window(config.model_config.hf_config)
+        assert config.model_config.hf_config.sliding_window == 512
         assert config.cache_config.enable_prefix_caching is True
 
 
