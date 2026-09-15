@@ -35,8 +35,8 @@ exists, and the rest are bring-up knobs -- are not fields here.
 
 import argparse
 import os
-from dataclasses import field, fields
-from typing import TYPE_CHECKING, Any, Literal
+from dataclasses import Field, field, fields
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from vllm.config.utils import config as vllm_config_dataclass
 
@@ -148,9 +148,13 @@ class RBLNConfig(RBLNConfigBase):
             )
 
 
-# `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
-# without vllm installed, so it cannot see that this makes a dataclass.
-_FIELDS = fields(RBLNConfig)  # type: ignore[arg-type]
+_C = TypeVar("_C", bound=RBLNConfigBase)
+
+
+def _fields_of(cls: type[RBLNConfigBase]) -> tuple["Field[Any]", ...]:
+    # `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
+    # without vllm installed, so it cannot see that this makes a dataclass.
+    return fields(cls)  # type: ignore[arg-type]
 
 
 # Which env name means "the user set this field". It is VLLM_RBLN_<FIELD>
@@ -182,11 +186,11 @@ def _env_source(field_name: str) -> tuple[str, tuple[str, ...]]:
     return attr, _ENV_PROBE.get(field_name, (attr,))
 
 
-def _env_overrides() -> dict[str, Any]:
+def _env_overrides(cls: type[RBLNConfigBase]) -> dict[str, Any]:
     from vllm_rbln import envs
 
     overrides: dict[str, Any] = {}
-    for f in _FIELDS:
+    for f in _fields_of(cls):
         attr, probes = _env_source(f.name)
         for probe in probes:
             if probe in os.environ:
@@ -196,53 +200,57 @@ def _env_overrides() -> dict[str, Any]:
 
 
 def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
-    """Resolve the RBLN config from `additional_config` and the environment.
+    return _resolve(RBLNConfig, additional_config)
 
-    An `RBLNConfig` is returned unchanged, so a process that receives one
+
+def _resolve(cls: type[_C], additional_config: Any) -> _C:
+    """Resolve `cls` from `additional_config` and the environment.
+
+    A resolved config is returned unchanged, so a process that receives one
     cannot resolve it into something different.
     """
-    if isinstance(additional_config, RBLNConfig):
+    if isinstance(additional_config, cls):
         return additional_config
 
     given: dict[str, Any] = additional_config or {}
     if not isinstance(given, dict):
         raise ValueError(
-            "additional_config must be an RBLNConfig or a mapping of its field "
-            f"names on the vLLM-native path, got {type(given).__name__}"
+            f"additional_config must be a {cls.__name__} or a mapping of its "
+            f"field names, got {type(given).__name__}"
         )
 
-    known = {f.name for f in _FIELDS}
+    known = {f.name for f in _fields_of(cls)}
     if unknown := sorted(set(given) - known):
         # `extra="forbid"` would catch these too, but its message talks about
         # keyword arguments. Upstream's --gdn-prefill-backend arrives this way:
         # arg_utils writes it into additional_config.
         raise ValueError(
-            f"additional_config takes only RBLNConfig fields on the "
-            f"vLLM-native path, and {unknown} are not fields. The fields are "
-            f"{sorted(known)}."
+            f"additional_config takes only {cls.__name__} fields, and "
+            f"{unknown} are not fields. The fields are {sorted(known)}."
         )
 
-    overrides = _env_overrides()
+    overrides = _env_overrides(cls)
     shadowed = sorted(set(given) & set(overrides))
     overrides.update(given)
 
     if shadowed:
         logger.warning_once(
-            "Both the environment and additional_config set %s; RBLNConfig "
-            "takes the additional_config value.",
+            "Both the environment and additional_config set %s; %s takes the "
+            "additional_config value.",
             ", ".join(shadowed),
+            cls.__name__,
         )
 
-    resolved = RBLNConfig(**overrides)
+    resolved = cls(**overrides)
 
     # Upstream's `non-default args` covers what the CLI was given, but not what
     # the environment resolved to, and `VllmConfig.__str__` leaves
     # additional_config out entirely. This is the only record of the values a
     # run actually used.
-    defaults = RBLNConfig()
+    defaults = cls()
     changed = {
         f.name: getattr(resolved, f.name)
-        for f in _FIELDS
+        for f in _fields_of(cls)
         if getattr(resolved, f.name) != getattr(defaults, f.name)
     }
     logger.info("RBLN config: %s", changed or "all defaults")
@@ -323,8 +331,10 @@ class _MergeAdditionalConfig(argparse.Action):
         _additional_config(namespace).update(values)
 
 
-def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
-    """Add the `RBLNConfig` group to `parser`. Safe to call twice.
+def add_rbln_cli_args(
+    parser: "FlexibleArgumentParser", cls: type[RBLNConfigBase] = RBLNConfig
+) -> None:
+    """Add `cls`'s `--rbln-*` group to `parser`. Safe to call twice.
 
     `RblnPlatform.pre_register_and_update(parser)` calls this from inside
     `AsyncEngineArgs.add_cli_args()`, before `parse_args()`. That is early
@@ -337,10 +347,10 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
 
     group = parser.add_argument_group(
         title=_GROUP_TITLE,
-        description=RBLNConfig.__doc__,
+        description=cls.__doc__,
     )
-    kwargs = get_kwargs(RBLNConfig)
-    for f in _FIELDS:
+    kwargs = get_kwargs(cls)
+    for f in _fields_of(cls):
         field_kwargs = kwargs[f.name]
         is_bool = field_kwargs.pop("action", None) is argparse.BooleanOptionalAction
         group.add_argument(
