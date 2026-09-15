@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Unit coverage: the handshake and what it establishes about a peer -- among
-# other things the fan-out over its shards, the two axes each shard is paired
-# on, upstream's calling convention, and the clock offset it estimates. The ZMQ
-# side-channel and add_remote_agent are mocked, so none of it needs a live NIXL
-# peer or nixl-rbln.
+# Unit coverage: how a consumer pairs with the peers it handshakes, and what
+# else the handshake establishes -- upstream's calling convention and the clock
+# offset it estimates.
+#
+# The handshake fan-out over a peer's shards, and the two axes each shard is
+# paired on -- the layers it owns and what its chiplet areas hold, which is KV
+# heads only when the cache was cut on that axis. The ZMQ side-channel and
+# add_remote_agent are mocked, so none of it needs a live NIXL peer or nixl-rbln.
 
 import threading
 import time
@@ -40,6 +43,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as W
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    KVSplitAxis,
     RblnNixlAgentMetadata,
     rbln_compat_hash,
 )
@@ -958,6 +962,7 @@ class TestValidateRemoteAgentHandshake:
         w.pp_size = 1
         w._kv_areas = 1
         w._kv_slices = 1
+        w._kv_split_axis = KVSplitAxis.HEAD
         w._sw_ratio = None
         w._has_swa = False
         topo = MagicMock()
@@ -977,6 +982,7 @@ class TestValidateRemoteAgentHandshake:
         block_size=16,
         kv_areas=1,
         kv_slices=1,
+        kv_split_axis=KVSplitAxis.HEAD,
         n_layers=0,
     ):
         return _agent_meta(
@@ -986,8 +992,20 @@ class TestValidateRemoteAgentHandshake:
             block_size=block_size,
             kv_areas=kv_areas,
             kv_slices=kv_slices,
+            kv_split_axis=kv_split_axis,
             registered_layer_names=[f"l{i}" for i in range(n_layers)],
         )
+
+    def test_a_peer_on_another_axis_is_refused_through_the_entry_point(self):
+        # The guard's own cases call it directly, which says nothing about the
+        # entry point still calling it: deleting that one line kept the suite
+        # green. Equal TP, so no other refusal can account for the raise.
+        w = self._consumer(host_buffer=False)
+        with pytest.raises(RuntimeError, match="cut its KV cache on the NON_HEAD"):
+            w._validate_remote_agent_handshake(
+                self._meta(pp_size=1, n_regions=56, kv_split_axis=KVSplitAxis.NON_HEAD),
+                remote_tp_size=1,
+            )
 
     def test_pp_shard_wellformed_passes(self):
         # 28-layer model, PP2 -> each stage owns 14 layers = 28 regions,
@@ -1850,7 +1868,17 @@ class TestPublishHandshakeMetadata:
             physical_blocks_per_logical_kv_block=1,
         )
 
-    def _publish(self, *, pp_rank, pp_size, layer_names, areas=1, slices=1, cls=None):
+    def _publish(
+        self,
+        *,
+        pp_rank,
+        pp_size,
+        layer_names,
+        areas=1,
+        slices=1,
+        axis=KVSplitAxis.HEAD,
+        cls=None,
+    ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
         # __init__ never ran, so the writer state shutdown() reaches through
         # __del__ is absent; silence it rather than leak an unraisable at GC.
@@ -1870,6 +1898,7 @@ class TestPublishHandshakeMetadata:
         # permanent values (one logical region, never expanded per area).
         w._kv_areas = areas
         w._kv_slices = slices
+        w._kv_split_axis = axis
         pp_group = MagicMock()
         pp_group.rank_in_group = pp_rank
         pp_group.world_size = pp_size
@@ -1888,6 +1917,22 @@ class TestPublishHandshakeMetadata:
             cls=RblnNixlPushConnectorWorker,
         )
         assert w.compat_hash == rbln_compat_hash("BASE", writes_into_peer=True)
+
+    def test_advertises_the_split_axis(self):
+        # A consumer cannot derive it: the areas and slices it also receives are
+        # the same numbers under either axis (see TestSplitAxisConstraints).
+        w = self._publish(
+            pp_rank=0,
+            pp_size=1,
+            layer_names=["l0"],
+            areas=4,
+            slices=4,
+            axis=KVSplitAxis.NON_HEAD,
+        )
+        decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            w.xfer_handshake_metadata.agent_metadata_bytes
+        )
+        assert decoded.kv_split_axis is KVSplitAxis.NON_HEAD
 
     def test_advertises_chiplet_geometry(self):
         """Head-band matching on the consumer needs the producer's areas/slices;
@@ -2213,3 +2258,49 @@ class TestHeadMatchedAgentRegistration:
 
         assert head_matched.call_args.args == (meta, 1, 2)
         base.assert_not_called()
+
+
+class TestSplitAxisConstraints:
+    # The guard that reads the advertised axis. Every other check here compares
+    # counts; two peers can agree on every count and still mean different axes
+    # by them, which is the one thing a count cannot say.
+
+    @staticmethod
+    def _worker(*, axis, tp_ratio=1, host_buffer=False):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.use_host_buffer = host_buffer
+        w._kv_split_axis = axis
+        w._sw_ratio = None
+        topo = MagicMock()
+        topo.tp_size = 2
+        topo.tp_ratio.return_value = tp_ratio
+        w.transfer_topo = topo
+        return w
+
+    def test_a_peer_that_cut_another_axis_is_rejected(self):
+        w = self._worker(axis=KVSplitAxis.HEAD)
+        meta = _agent_meta(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
+        with pytest.raises(RuntimeError, match="cut its KV cache on the NON_HEAD"):
+            w._check_split_axis_constraints(meta, 2)
+
+    def test_a_context_cut_is_rejected_with_unequal_tp(self):
+        # The silent case: the head bands this peer would be matched by name
+        # ranges that no chiplet area holds, while every byte count still fits.
+        w = self._worker(axis=KVSplitAxis.NON_HEAD, tp_ratio=2)
+        meta = _agent_meta(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
+        with pytest.raises(RuntimeError, match="heterogeneous tensor parallelism"):
+            w._check_split_axis_constraints(meta, 1)
+
+    def test_a_context_cut_at_equal_tp_passes(self):
+        # Area k pairs with area k and no band is consulted, so the bytes are
+        # right; rejecting this would refuse the only shape that does work.
+        w = self._worker(axis=KVSplitAxis.NON_HEAD)
+        meta = _agent_meta(kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD)
+        w._check_split_axis_constraints(meta, 2)  # no raise
+
+    def test_host_bounce_is_exempt(self):
+        # Host staging registers one logical buffer per layer and never expands
+        # per area, so its HEAD default describes a peer of any axis.
+        w = self._worker(axis=KVSplitAxis.HEAD, tp_ratio=2, host_buffer=True)
+        meta = _agent_meta(kv_split_axis=KVSplitAxis.NON_HEAD)
+        w._check_split_axis_constraints(meta, 1)  # no raise
