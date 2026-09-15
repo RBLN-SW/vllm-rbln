@@ -28,13 +28,13 @@ if [ -z "${author}" ] || [ "${author}" = "null" ]; then
 fi
 echo "PR #${BUILDKITE_PULL_REQUEST} author: ${author}"
 
-query='{"query":"query { organization(login: \"rbln-sw\") { team1: team(slug: \"sw\") { members(first: 100) { nodes { login } } } team2: team(slug: \"fsw\") { members(first: 100) { nodes { login } } } } }"}'
+query='{"query":"query { organization(login: \"rbln-sw\") { team1: team(slug: \"sw\") { members(first: 100) { nodes { login } } } team2: team(slug: \"icp\") { members(first: 100) { nodes { login } } } } }"}'
 members=$(curl -fsS -H "${auth}" -H "Content-Type: application/json" -d "${query}" "${api}/graphql" \
   | jq -r '.data.organization.team1.members.nodes[].login, .data.organization.team2.members.nodes[].login' \
   | sort -u)
 
 if printf '%s\n' "${members}" | grep -qx "${author}"; then
-  echo "✅ ${author} is on the sw/fsw team -- allowed."
+  echo "✅ ${author} is on the sw/icp team -- allowed."
   exit 0
 fi
 
@@ -45,5 +45,5 @@ if [ "${code}" = "204" ]; then
   exit 0
 fi
 
-echo "❌ ${author} is neither an sw/fsw team member nor a collaborator -- blocking CI." >&2
+echo "❌ ${author} is neither an sw/icp team member nor a collaborator -- blocking CI." >&2
 exit 1
