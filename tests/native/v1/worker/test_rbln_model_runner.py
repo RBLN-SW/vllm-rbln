@@ -849,9 +849,9 @@ class TestProcessKvCacheCopyOps:
     # and compile_model. Forced deterministically.
     def test_eager_copy_non_mla(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)  # -> eager path
-        # non-MLA layout: (2, num_blocks, heads, 1, block_tokens, dim).
-        kv = torch.zeros(2, 4, 1, 1, 8, 2)
-        kv[:, 1, :, :, :, :] = 5.0  # source = block 1
+        # non-MLA layout: (num_blocks, 2, heads, 1, block_tokens, dim).
+        kv = torch.zeros(4, 2, 1, 1, 8, 2)
+        kv[1] = 5.0  # source = block 1
         r = _make_runner_stub(
             kv_caches=[kv],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
@@ -859,9 +859,10 @@ class TestProcessKvCacheCopyOps:
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         # First 3 token slots of dst block 2 now match src; the rest stay 0.
-        assert torch.equal(kv[:, 2, :, :, :3, :].cpu(), kv[:, 1, :, :, :3, :].cpu())
-        assert (kv[:, 2, :, :, :3, :] == 5.0).all()
-        assert (kv[:, 2, :, :, 3:, :] == 0.0).all()
+        # Both K and V move: a copy that kept the old axis would miss V.
+        assert torch.equal(kv[2, ..., :3, :].cpu(), kv[1, ..., :3, :].cpu())
+        assert (kv[2, ..., :3, :] == 5.0).all()
+        assert (kv[2, ..., 3:, :] == 0.0).all()
 
     def test_eager_copy_mla(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)

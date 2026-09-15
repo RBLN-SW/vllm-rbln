@@ -120,17 +120,17 @@ def flash_attention_naive_prefill(
             if rblib.partition_skip(block_offset) == False:  # noqa: E712
                 k_cache_ptr = tl.make_block_ptr(
                     base=kv_cache,
-                    shape=(2, B, H, 1, P, D),
-                    strides=(B * H * 1 * P * D, H * 1 * P * D, 1 * P * D, P * D, D, 1),
-                    offsets=(0, block_number, 0, 0, 0, 0),
+                    shape=(B, 2, H, 1, P, D),
+                    strides=(2 * H * 1 * P * D, H * 1 * P * D, 1 * P * D, P * D, D, 1),
+                    offsets=(block_number, 0, 0, 0, 0, 0),
                     block_shape=(1, 1, H, 1, P, D),
                     order=(5, 4, 3, 2, 1, 0),
                 )
                 v_cache_ptr = tl.make_block_ptr(
                     base=kv_cache,
-                    shape=(2, B, H, 1, P, D),
-                    strides=(B * H * 1 * P * D, H * 1 * P * D, 1 * P * D, P * D, D, 1),
-                    offsets=(1, block_number, 0, 0, 0, 0),
+                    shape=(B, 2, H, 1, P, D),
+                    strides=(2 * H * 1 * P * D, H * 1 * P * D, 1 * P * D, P * D, D, 1),
+                    offsets=(block_number, 1, 0, 0, 0, 0),
                     block_shape=(1, 1, H, 1, P, D),
                     order=(5, 4, 3, 2, 1, 0),
                 )
@@ -284,17 +284,17 @@ def flash_attention_naive_decode(
             if rblib.partition_skip(block_offset) == False:  # noqa: E712
                 k_cache_ptr = tl.make_block_ptr(
                     base=kv_cache,
-                    shape=(2, B, H, 1, P, D),
-                    strides=(B * H * 1 * P * D, H * 1 * P * D, 1 * P * D, P * D, D, 1),
-                    offsets=(0, block_number, 0, 0, 0, 0),
+                    shape=(B, 2, H, 1, P, D),
+                    strides=(2 * H * 1 * P * D, H * 1 * P * D, 1 * P * D, P * D, D, 1),
+                    offsets=(block_number, 0, 0, 0, 0, 0),
                     block_shape=(1, 1, H, 1, P, D),
                     order=(5, 4, 3, 2, 1, 0),
                 )
                 v_cache_ptr = tl.make_block_ptr(
                     base=kv_cache,
-                    shape=(2, B, H, 1, P, D),
-                    strides=(B * H * 1 * P * D, H * 1 * P * D, 1 * P * D, P * D, D, 1),
-                    offsets=(1, block_number, 0, 0, 0, 0),
+                    shape=(B, 2, H, 1, P, D),
+                    strides=(2 * H * 1 * P * D, H * 1 * P * D, 1 * P * D, P * D, D, 1),
+                    offsets=(block_number, 1, 0, 0, 0, 0),
                     block_shape=(1, 1, H, 1, P, D),
                     order=(5, 4, 3, 2, 1, 0),
                 )
@@ -385,7 +385,7 @@ def flash_attention_naive_prefill_wrapper(
     QUERY_LEN = query.shape[-2]
     PARTITION_SIZE = kv_cache.shape[-2]
     MAX_SEQ_LEN = mask.shape[-1]
-    NUM_BLOCK = kv_cache.shape[1]
+    NUM_BLOCK = kv_cache.shape[0]
     NUM_BATCH = query.shape[0]
     DIM_BLOCK_TABLE = block_table.dim()
 
@@ -447,7 +447,7 @@ def flash_attention_naive_decode_wrapper(
     QUERY_LEN = query.shape[-2]
     PARTITION_SIZE = kv_cache.shape[-2]
     MAX_SEQ_LEN = mask.shape[-1]
-    NUM_BLOCK = kv_cache.shape[1]
+    NUM_BLOCK = kv_cache.shape[0]
     NUM_BATCH = query.shape[0]
     DIM_BLOCK_TABLE = block_table.dim()
 

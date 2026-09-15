@@ -18,7 +18,6 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
-from functools import partial
 from typing import Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -3003,7 +3002,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
                         # Keeps num_blocks resizable after compile; the compiler
                         # allows one dynamic dim with a single attention use.
-                        torch._dynamo.mark_dynamic(kv_caches[layer_name], 1)
+                        torch._dynamo.mark_dynamic(kv_caches[layer_name], 0)
                         marked_layers.append(layer_name)
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
@@ -3015,7 +3014,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if marked_layers:
             logger.info(
-                "[Dynamic KV] mark_dynamic(kv_cache, dim=1) applied to %d layer(s); "
+                "[Dynamic KV] mark_dynamic(kv_cache, dim=0) applied to %d layer(s); "
                 "%s shape=%s",
                 len(marked_layers),
                 marked_layers[0],
@@ -3211,12 +3210,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 }
                 kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
-            kv_transfer_group.set_host_xfer_buffer_ops(
-                partial(
-                    copy_host_device_kv_blocks,
-                    use_mla=self.model_config.use_mla,
-                )
-            )
+            kv_transfer_group.set_host_xfer_buffer_ops(copy_host_device_kv_blocks)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3601,12 +3595,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dst = op.dst_block_id
             nt = op.num_tokens
             for kv_cache in self.kv_caches:
-                if self.model_config.use_mla:
-                    dsts.append(kv_cache[dst, :nt, :])
-                    srcs.append(kv_cache[src, :nt, :])
-                else:
-                    dsts.append(kv_cache[:, dst, :, :, :nt, :])
-                    srcs.append(kv_cache[:, src, :, :, :nt, :])
+                dsts.append(kv_cache[dst, ..., :nt, :])
+                srcs.append(kv_cache[src, ..., :nt, :])
         torch._foreach_copy_(dsts, srcs)
 
 

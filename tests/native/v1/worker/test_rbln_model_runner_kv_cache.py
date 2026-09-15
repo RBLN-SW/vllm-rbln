@@ -92,7 +92,7 @@ class TestReshapeKVCacheTensors:
         assert caches["layer.0"].is_contiguous()
         assert infos["layer.0"].permute_order == identity
 
-        # Blocks outermost instead of the K/V split.
+        # The K/V split outermost instead of blocks.
         order = (1, 0) + identity[2:]
         monkeypatch.setattr(
             runner.attn_groups[0][0].backend,
@@ -126,36 +126,6 @@ class TestKVCacheBaseBindings:
         runner = make_model_runner()
         assert runner.kv_cache_bases == []
         assert runner.kv_cache_view_infos == []
-
-
-class TestHostBufferCopyOp:
-    def test_the_copy_op_carries_the_model_s_mla_flag(
-        self, make_model_runner, monkeypatch
-    ):
-        # A host-staging connector moves blocks through the op registered here.
-        # MLA has no K/V split -- its cache is a 3D latent whose dim 0 is already
-        # blocks -- so a copy that loses the flag slices the wrong axis. The flag
-        # has a silent default, and dropping it leaves this suite green.
-        captured: list = []
-        seen: dict = {}
-        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
-        monkeypatch.setattr(
-            mr,
-            "get_kv_transfer_group",
-            lambda: SimpleNamespace(
-                register_kv_caches=lambda _caches: None,
-                set_host_xfer_buffer_ops=captured.append,
-            ),
-        )
-        monkeypatch.setattr(
-            mr, "copy_host_device_kv_blocks", lambda *a, **kw: seen.update(kw)
-        )
-
-        runner = make_model_runner(init_kv_cache=False)
-        monkeypatch.setattr(type(runner.model_config), "use_mla", True)
-        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
-        captured[0]({}, {}, [], [], "h2d")
-        assert seen == {"use_mla": True}
 
 
 class TestBuildAttentionMetadata:

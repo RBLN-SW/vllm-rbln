@@ -1001,14 +1001,12 @@ def copy_host_device_kv_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     direction: Literal["h2d", "d2h"],
-    *,
-    use_mla: bool = False,
 ) -> None:
     """Copy KV blocks between the host xfer buffer and the device KV cache.
 
-    Requires VLLM_RBLN_USE_DEVICE_TENSOR=1. Splits K/V (dim 0) first so each
-    per-block view is contiguous. MLA has no K/V level to split, and only
-    `use_mla` says so -- SSM/conv and cross-layer pools are 3D as well.
+    Requires VLLM_RBLN_USE_DEVICE_TENSOR=1. Every cache this sees -- attention,
+    MLA latent, SSM/conv -- carries blocks on dim 0, so one block is one
+    contiguous view.
     """
     if not src_kv_caches or not dst_kv_caches or not src_block_ids or not dst_block_ids:
         return
@@ -1024,15 +1022,7 @@ def copy_host_device_kv_blocks(
     srcs: list[torch.Tensor] = []
     for layer_name, dst_cache in dst_kv_caches.items():
         src_cache = src_kv_caches[layer_name]
-        if use_mla:
-            for idx in src_block_ids:
-                dsts.append(dst_cache[idx])
-                srcs.append(src_cache[idx])
-            continue
-        for kv in range(dst_cache.shape[0]):
-            dst_kv = dst_cache[kv]
-            src_kv = src_cache[kv]
-            for idx in src_block_ids:
-                dsts.append(dst_kv[idx])
-                srcs.append(src_kv[idx])
+        for idx in src_block_ids:
+            dsts.append(dst_cache[idx])
+            srcs.append(src_cache[idx])
     torch._foreach_copy_(dsts, srcs)

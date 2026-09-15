@@ -194,9 +194,9 @@ Before the forward pass, the model runner copies sub-block KV data:
 
 ```python
 # For each copy op targeting a specific group's layers:
-# kv_cache tensor (shape: 2, num_blocks, H, 1, block_size, D):
-kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
-    kv_cache[:, src_block_id, :, :, :num_tokens, :]
+# kv_cache tensor (shape: num_blocks, 2, H, 1, block_size, D):
+kv_cache[dst_block_id, ..., :num_tokens, :] = \
+    kv_cache[src_block_id, ..., :num_tokens, :]
 ```
 
 ### Block lifecycle

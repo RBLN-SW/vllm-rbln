@@ -114,11 +114,11 @@ class RBLNFlashAttentionBackend(AttentionBackend):
         # G - num_heads / num_kv_heads = 32/8 = 4
         # D - head_size
         # L - q_len
-        list of kv cache = [num_layer][kv=2]
-        kv_cache_shape= [B, H, 1, S, D]
+        list of kv cache = [num_layer]
+        kv_cache_shape= [B, kv=2, H, 1, S, D]
         query_shape   = [1, H, G, L, D]
         """
-        return (2, num_blocks, num_kv_heads, 1, block_size, head_size)
+        return (num_blocks, 2, num_kv_heads, 1, block_size, head_size)
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -478,11 +478,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             query:  shape = [num_tokens, num_heads, head_size]
             key:    shape = [num_tokens, num_kv_heads, head_size]
             value:  shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache shape= [2, num_blocks, num_kv_heads, 1,
+            kv_cache shape= [num_blocks, 2, num_kv_heads, 1,
                                 block_size, head_size]
 
         Shape that we expect:
-            kv_cache  = [2, num_blocks, num_kv_heads, 1, block_size, head_size]
+            kv_cache  = [num_blocks, 2, num_kv_heads, 1, block_size, head_size]
             key       = [1, num_kv_heads, 1, block_size, head_size]
             query     = [1, num_kv_heads, 4, query_len, head_size]
             key_t     = [1, num_kv_heads, 1, head_size, block_size]
@@ -533,7 +533,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # seq_lens, block_table, slot_mapping}
         # output = {attn_output}
         # q, k, v = [batch,H,G,L,D]
-        # key/value cache = [B,H,1,S,D]
+        # key/value cache = [B,kv=2,H,1,S,D]
         # mask  = [1,1,1,L,C]
         # o = [batch,H,G,L,D]
 

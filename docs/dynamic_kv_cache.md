@@ -54,7 +54,7 @@ when it is off. Run with `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` to use them.
 
 | Configuration | Why |
 | --- | --- |
-| MLA models | `num_blocks` is dimension 0 of MLA's KV shape rather than dimension 1, and MLA dispatches `paged_flash_causal_mla_naive_*`, which the compiler's dynamic-input validator does not admit. `VLLM_MLA_DISABLE=1` also works. |
+| MLA models | MLA dispatches `paged_flash_causal_mla_naive_*`, which the compiler's dynamic-input validator does not admit. `VLLM_MLA_DISABLE=1` also works. |
 | Speculative decoding | The drafter's profile is merged next to the target's, and the merge cannot tell an artifact re-reporting a shared KV tensor from one owning its own. |
 | KV transfer connectors | The connector registers the KV cache's physical views during warm-up, and the reallocation invalidates them. |
 | Sliding-window attention, cross-layer KV sharing, KV base deduplication | The compiler requires every dynamic KV input to reach exactly one `paged_flash_causal_attention_naive_{prefill,decode}` call. |
