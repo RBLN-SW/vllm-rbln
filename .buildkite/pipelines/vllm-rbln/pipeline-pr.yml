@@ -2,6 +2,8 @@ notify:
   - github_commit_status:
       context: "[OB] vLLM-RBLN pytest"
 
+dedicated: framework.sw
+
 env:
   UV_CACHE_DIR: "/root/.cache/uv"
   UV_LINK_MODE: "symlink"
