@@ -49,7 +49,7 @@ def pytest_configure(config):
 
 @pytest.fixture(autouse=True)
 def _isolate_rbln_ctx_standalone():
-    # `RblnPlatform.validate_and_setup_prerequisite` sets
+    # `vllm_impl._setup_runtime_env` sets
     # `RBLN_CTX_STANDALONE=1` in the process env whenever it sees a config
     # with TP/DP/PP/EP > 1, and never clears it. The flag is read by the
     # rebel runtime on every context creation, so once any test's

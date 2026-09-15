@@ -36,7 +36,7 @@ _if_changed: &if_changed
     - "uv.lock"
   exclude:
     - ".buildkite/pipelines/vllm-rbln/**"
-    - "tests/native/**"
+    - "tests/vllm/**"
     - "vllm_rbln/patches/**"
     - "vllm_rbln/compilation/**"
     - "vllm_rbln/v1/worker/rbln_*.py"
