@@ -46,6 +46,7 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
 
 # from vllm.utils import LazyLoader, is_pin_memory_available)
@@ -108,7 +109,6 @@ class ExecuteModelState(NamedTuple):
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
     hidden_states: torch.Tensor
-    sample_hidden_states: torch.Tensor
     is_prompt: bool
     ec_connector_output: "ECConnectorOutput | None" = None
 
@@ -239,7 +239,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
-            max_num_blocks_per_req=None,
+            max_num_blocks_per_req=[cdiv(self.max_model_len, cache_config.block_size)],
             logitsprocs=logitsprocs,
             num_spec_tokens=0,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
@@ -412,6 +412,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             model_start_time = time.perf_counter()
             with capture_ctx as model_reports:
                 hidden_states = self.model(model_input)
+            if not model_input.is_prompt:
+                # The decode graph returns every row of the padded batch;
+                # keep the running requests' rows in running order.
+                hidden_states = hidden_states[model_input.batch_rows]
             if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
                 collect_metrics(
                     self.model_performance_tracker,
@@ -422,7 +426,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     token_count=0,
                     # the performance of sampler doesn't depend on token count
                 )
-            sample_hidden_states = hidden_states.clone()
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             if self.is_pooling_model:
@@ -437,7 +440,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             scheduler_output=scheduler_output,
             logits=logits,
             hidden_states=hidden_states,
-            sample_hidden_states=sample_hidden_states,
             is_prompt=model_input.is_prompt,
             ec_connector_output=ec_connector_output,
         )
@@ -495,17 +497,13 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 ec_connector_output
             )
 
-    def mask_block_table(
-        self,
-        block_ids: torch.Tensor,
-        num_blocks: int,
-        *,
-        pad_value: int = -1,
-    ) -> torch.Tensor:
-        """Mask (pad) unused block slots in-place.
+    @staticmethod
+    def mask_block_table(block_ids: torch.Tensor, num_blocks: int) -> torch.Tensor:
+        """Shift a block-table row to compiler ids and zero its unused tail.
 
-        Sets entries beyond `num_blocks` to `pad_value`.
-        Use `pad_value=0` for v1 (dummy block id 0), or pass your own padding.
+        Slots from index `num_blocks` on are set to compiler block 0. Padding must
+        be a valid block id: the attention kernel reads every slot of a live
+        partition.
         """
         if num_blocks < 0:
             raise ValueError("num_blocks must be >= 0")
@@ -518,9 +516,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # The compiler, however, expects valid blocks to start from 0.
         block_ids = block_ids - 1
         max_blocks = block_ids.size(-1)
-        k = max(0, min(num_blocks, max_blocks))  # clamp to [0, max_blocks]
+        k = min(num_blocks, max_blocks)
         if k < max_blocks:
-            block_ids.narrow(-1, k, max_blocks - k).fill_(pad_value)
+            block_ids[..., k:] = 0
 
         return block_ids
 
@@ -683,6 +681,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             block_tables=block_table.to(torch.int16),
             running_requests_ids=[req_id],
             padded_batch_size=1,
+            batch_rows=slice(0, 1),
             is_prompt=True,
             multi_modal_kwargs=multi_modal_kwargs,
             mrope_positions=mrope_positions,
@@ -733,14 +732,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             dtype=torch.int16,
         )
 
-        batch_rows = self.model.decode_batch_rows(cache_slot_ids, block_tables)
-        rows: torch.Tensor | slice
-        if batch_rows is None:
-            padded_batch_size = self.model.decode_padded_batch_size(num_reqs)
-            rows = slice(0, num_reqs)
-        else:
-            padded_batch_size = self.model.decoder_batch_size
-            rows = batch_rows
+        padded_batch_size, rows = self.model.decode_layout(cache_slot_ids, block_tables)
 
         input_tokens = torch.zeros(padded_batch_size, 1, dtype=torch.int64)
         input_tokens[rows, 0] = torch.tensor(tokens, dtype=torch.int64)
@@ -791,7 +783,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             padded_batch_size=padded_batch_size,
             is_prompt=False,
             dummy_block=scheduler_output.dummy_block,
-            batch_rows=batch_rows,
+            batch_rows=rows,
             cache_slot_ids=padded_cache_slot_ids,
             mrope_positions=mrope_positions,
         )
@@ -1622,7 +1614,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             scheduler_output,
             logits,
             hidden_states,
-            sample_hidden_states,
             is_prompt,
             ec_connector_output,
         ) = self.execute_model_state

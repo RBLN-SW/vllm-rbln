@@ -103,6 +103,7 @@ def _prefill_input(tokens, mm_embeds, is_mm_embed):
         block_tables=torch.tensor([0], dtype=torch.int16),
         running_requests_ids=["r0"],
         padded_batch_size=1,
+        batch_rows=slice(0, 1),
         is_prompt=True,
         mm_embeds=mm_embeds,
         is_mm_embed=torch.tensor([is_mm_embed]),

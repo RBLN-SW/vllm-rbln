@@ -309,22 +309,23 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
 
         self.logits_processor = LogitsProcessor(vocab_size, logits_as_input=True)
 
-    def decode_batch_rows(
+    def decode_layout(
         self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
-    ) -> torch.Tensor | None:
-        """Row of each running request in the padded decode batch, or None to
-        lay the requests out in running order at rows [0, num_reqs).
+    ) -> tuple[int, slice | torch.Tensor]:
+        """Padded decode batch size and the row of each running request in it.
 
-        A model whose graph keeps per-row on-device state overrides this to pin
-        each request to its row; the runner then pads to the decoder's full
-        batch and scatters the inputs to those rows.
+        By default the requests sit in running order at rows [0, num_reqs) of
+        the smallest decoder bucket that fits. A model whose graph keeps
+        per-row on-device state overrides this to pin each request to its row
+        of the decoder's full batch.
         """
-        return None
-
-    def decode_padded_batch_size(self, num_reqs: int) -> int:
-        if self.use_multiple_decoder:
-            return select_bucket_size(num_reqs, self.decoder_batch_sizes)
-        return self.decoder_batch_size
+        num_reqs = cache_slot_ids.shape[0]
+        padded_batch_size = (
+            select_bucket_size(num_reqs, self.decoder_batch_sizes)
+            if self.use_multiple_decoder
+            else self.decoder_batch_size
+        )
+        return padded_batch_size, slice(0, num_reqs)
 
     def get_prefill_decoder(self) -> runtime_utils.RBLNRuntimeModel:
         return self.model.prefill_decoder

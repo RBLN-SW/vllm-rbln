@@ -37,6 +37,10 @@ class ModelInputForRBLN:
     running_requests_ids: list[str]
     # Decode batch the tensors are padded to; 1 for prefill.
     padded_batch_size: int
+    # Rows of the running requests in the padded batch, in running order: a
+    # slice when they sit at [0, num_reqs), a tensor when the model pins each
+    # request to a row (see decode_layout). Row 0 for prefill.
+    batch_rows: slice | torch.Tensor
     is_prompt: bool = False
     # Raw multimodal kwargs of this prefill's items, for models that encode
     # inside forward (Whisper). Others take their encoder output from mm_embeds.
@@ -51,10 +55,6 @@ class ModelInputForRBLN:
     # when the scheduler did not set one aside; the runner then picks a block
     # no running request uses.
     dummy_block: int | None = None
-    # Row of each running request in the padded decode batch, in running
-    # order. None when the rows are simply [0, num_reqs): only models that pin
-    # each request to a fixed row (see decode_batch_rows) get a tensor.
-    batch_rows: torch.Tensor | None = None
     # Scheduler-allocated rows of the per-sequence on-device caches
     # (sliding-window KV, linear-attention state): [1] for prefill,
     # [padded_batch_size, 1] for decode with padding rows pointing at a slot

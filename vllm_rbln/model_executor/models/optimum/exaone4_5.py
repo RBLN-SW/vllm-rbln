@@ -154,14 +154,13 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             ).logits
 
         self.model.decoder = self.model.decoders[model_input.padded_batch_size]
-        logits = self.model.decoder(
+        return self.model.decoder(
             input_ids=model_input.input_tokens,
             inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
             cache_position=model_input.input_positions,
             local_block_tables=cache_slot_ids,
             block_tables=block_tables,
         ).logits
-        return logits[: len(model_input.running_requests_ids)]
 
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Any | None:
         pixel_values = kwargs.pop("pixel_values", None)

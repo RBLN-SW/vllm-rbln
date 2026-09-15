@@ -96,17 +96,13 @@ class RBLNOptimumLlavaNextForConditionalGeneration(
                 model_input.padded_batch_size
             ]
 
-        logits = self._forward(
+        return self._forward(
             is_prefill=is_prompt,
             block_tables=model_input.block_tables,
             input_ids=model_input.input_tokens,
             inputs_embeds=model_input.inputs_embeds if is_prompt else None,
             cache_position=model_input.input_positions,
         )
-
-        if not is_prompt:
-            logits = logits[: len(model_input.running_requests_ids)]
-        return logits
 
     def get_language_model(self):
         return self.model.language_model

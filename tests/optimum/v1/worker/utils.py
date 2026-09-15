@@ -37,7 +37,7 @@ NUM_BLOCKS = MAX_MODEL_LEN // OB_SIZE * MAX_NUM_SEQ + 1
 
 class MockModelWrapper(nn.Module, RBLNOptimumDecoderMixin):
     """Stands in for an optimum decoder model: the runner reads the decode
-    batch layout (decoder_batch_size, the bucket ladder, decode_batch_rows)
+    batch layout (decoder_batch_size, the bucket ladder, decode_layout)
     from the real mixin methods; forward is faked per test."""
 
     class MockModel:
@@ -80,11 +80,9 @@ def fake_load_model(
     model_dtype = runner.model_config.dtype
 
     def fake_forward(model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        current_num_reqs = runner.input_batch.num_reqs
-        current_vocab_size = runner.model_config.get_vocab_size()
-
+        # Like the compiled graph, return every row of the padded batch.
         return torch.randn(
-            (current_num_reqs, 1, current_vocab_size),
+            (model_input.padded_batch_size, 1, runner.model_config.get_vocab_size()),
             dtype=model_dtype,
             device=runner.device,
         )

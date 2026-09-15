@@ -170,13 +170,13 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
     single tensor). It inherits the multimodal prefill path from Qwen2.5-VL.
     """
 
-    def decode_batch_rows(
+    def decode_layout(
         self, cache_slot_ids: torch.Tensor, block_tables: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[int, torch.Tensor]:
         # The GatedDeltaNet linear_attention conv/recurrent state is a fixed
         # [max_num_seqs] on-device cache indexed by batch row, so each request
         # is pinned to its scheduler-assigned cache slot for its lifetime.
-        return cache_slot_ids.to(torch.long)
+        return self.decoder_batch_size, cache_slot_ids.to(torch.long)
 
     def _video_rope_kwargs(
         self, video_features: list[MultiModalFeatureSpec]
@@ -198,8 +198,7 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         """Prefill writes one state row, named by ``batch_idx``; decode arrives
-        laid out by row (see decode_batch_rows) and the logits are gathered
-        back to running order."""
+        laid out by row (see decode_layout)."""
         if model_input.is_prompt:
             assert model_input.cache_slot_ids is not None
             return self.model.prefill_decoder(
@@ -210,12 +209,10 @@ class RBLNOptimumQwen3_5ForConditionalGeneration(
                 batch_idx=int(model_input.cache_slot_ids[0]),
             ).logits
 
-        assert model_input.batch_rows is not None
         self.model.decoder = self.model.decoders[model_input.padded_batch_size]
-        logits = self.model.decoder(
+        return self.model.decoder(
             inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
             cache_position=model_input.input_positions,
             position_embed=model_input.position_embed,
             block_tables=model_input.block_tables,
         ).logits
-        return logits[model_input.batch_rows]

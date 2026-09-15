@@ -61,6 +61,8 @@ from vllm.v1.core.sched.output import (
     GrammarOutput,
     NewRequestData,
 )
+from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
@@ -237,6 +239,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         device: torch.device,
     ) -> None:
         self.vllm_config = vllm_config
+        self.fail_fast = issubclass(Executor.get_class(vllm_config), MultiprocExecutor)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         # self.offload_config = vllm_config.offload_config
@@ -386,6 +389,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        placeholder_max_num_blocks = cdiv(self.max_model_len, placeholder_block_size)
         logitsprocs_builder = (
             build_rbln_logitsprocs if envs.VLLM_RBLN_SAMPLER else build_logitsprocs
         )
@@ -405,6 +409,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             vocab_size=model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],
+            max_num_blocks_per_req=[placeholder_max_num_blocks],
             num_spec_tokens=self.num_spec_tokens,
             logitsprocs=logitsprocs,
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
@@ -1968,6 +1973,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             req_ids=list(self.input_batch.req_ids),
             placeholder_pos=dict(self._placeholder_pos),
             logprobs_tensors=self._async_logprobs_tensors,
+            fail_fast=self.fail_fast,
         )
         return async_output
 
