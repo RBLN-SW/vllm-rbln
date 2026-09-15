@@ -21,19 +21,9 @@ outstanding at once. Upstream's fixed depth is smaller than that once the
 pipeline is deep enough, and the first stage then blocks in `acquire_write`
 instead of taking its next batch.
 
-Shutdown ordering: `MultiprocExecutor.shutdown` closes those same queues only
-after `_ensure_worker_termination` has walked the grace / SIGTERM / SIGKILL
-ladder. EngineCore's main thread is parked in `MessageQueue.acquire_read` on one
-of them, so for that whole window it cannot reach its fatal handler, does not
-publish `ENGINE_CORE_DEAD`, and the API server answers 200. Under DP the ranks
-that did not fault keep serving through it, so one fault yields a mix of
-successes and failures instead of failing everything.
-
-Closing the queues first collapses the window. `_ensure_worker_termination`
-still runs to completion, but the engine now races ahead of it, so `shutdown` is
-made re-entrant-blocking: a worker stuck in a collective dies only on the
-SIGKILL at the end of that wait, and an EngineCore process that exits before
-then orphans it with its NPU context open.
+Shutdown ordering: closing the response queues ahead of the termination wait
+lets the engine race ahead of that wait, so `shutdown` is made
+re-entrant-blocking. Each patch below carries its own reason.
 """
 
 import multiprocessing.connection
