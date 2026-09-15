@@ -27,6 +27,7 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
+from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 import vllm_rbln.envs as envs
@@ -192,10 +193,12 @@ class DynamicKvSizer:
         self.expected_used: dict[Unit, int] = {}
         # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
         self.foreign_dram_used_bytes = foreign_dram_used_bytes
+        device_env = current_platform.device_control_env_var
         logger.debug(
-            "foreign device DRAM at worker init: %d bytes (RBLN_VISIBLE_DEVICES=%s)",
+            "foreign device DRAM at worker init: %d bytes (%s=%s)",
             foreign_dram_used_bytes,
-            os.environ.get("RBLN_VISIBLE_DEVICES", ""),
+            device_env,
+            os.environ.get(device_env, ""),
         )
 
     @property
@@ -217,7 +220,7 @@ class DynamicKvSizer:
             return estimate_available_memory(**estimate_kwargs)
         if not torch.rbln.is_dummy_device():
             snapshot, source = self.memory_snapshot(self.device)
-            if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
+            if self.mode is DynamicKvMode.DRY_RUN:
                 measured = estimate_available_memory(
                     **estimate_kwargs, chiplet_memory=snapshot
                 )
@@ -495,6 +498,21 @@ class DynamicKvSizer:
                 format_placements(group_specs),
             )
         specs = [spec for group_specs, _ in groups for spec in group_specs]
+        # Groups are keyed by the whole input set, so two programs binding
+        # overlapping but unequal sets form two groups and the slope charges the
+        # shared tensors twice. InputSpec carries no tensor identity to dedupe
+        # by, so log what the slope is summed over next to what vllm allocated.
+        logger.info(
+            "[Dynamic KV] the slope is summed over %d KV input(s) in %d set(s); "
+            "vllm allocated %d KV cache tensor(s) for %d layer(s).",
+            len(specs),
+            len(groups),
+            len(self.model_runner.kv_cache_config.kv_cache_tensors),
+            sum(
+                len(t.shared_by)
+                for t in self.model_runner.kv_cache_config.kv_cache_tensors
+            ),
+        )
         growth = kv_growth(specs, hint_blocks)
         program = groups[0][1]
         device = program.device if program.device is not None else self.device

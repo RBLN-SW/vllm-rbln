@@ -59,6 +59,19 @@ def _program(placements, name="0/0", runtime=None, device=None, extent=4):
     )
 
 
+def _kv_cache_tensors_for(programs):
+    """One KVCacheTensor per KV input the grouping will charge; the sizer checks
+    the two counts agree."""
+    try:
+        groups = dks.select_kv_input_groups(list(programs))
+    except RuntimeError:
+        return []
+    return [
+        SimpleNamespace(shared_by=[f"layer.{i}"])
+        for i, _ in enumerate(s for g, _ in groups for s in g)
+    ]
+
+
 def _bind_sizing(sizer) -> None:
     """Give a SimpleNamespace sizer the real placement-sizing methods."""
     for name in (
@@ -104,7 +117,10 @@ class TestComputeDynamicKvNumBlocks:
             parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
             kv_blocks_before_shrink=211,
             model_runner=SimpleNamespace(
-                kv_cache_config=SimpleNamespace(num_blocks=self.HINT)
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=self.HINT,
+                    kv_cache_tensors=_kv_cache_tensors_for(programs),
+                )
             ),
             programs=list(programs),
             memory_snapshot=lambda device: (snapshot, "stub"),
@@ -251,6 +267,18 @@ class TestComputeDynamicKvNumBlocks:
         ):
             assert DynamicKvSizer.compute_num_blocks(sizer) is None
         assert "RBLN_DUMMY_DEVICE" in caplog.text
+
+    def test_what_the_slope_is_summed_over_is_logged(self, caplog):
+        """Overlapping but unequal KV sets form two groups and charge the shared
+        tensors twice; the counts have to be readable from the log."""
+        programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
+        sizer = self._sizer(
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+        )
+        with caplog.at_level("INFO"):
+            DynamicKvSizer.compute_num_blocks(sizer)
+        assert "summed over 2 KV input(s) in 1 set(s)" in caplog.text
+        assert "vllm allocated 2 KV cache tensor(s) for 2 layer(s)" in caplog.text
 
     def test_programs_that_disagree_on_the_layout_are_refused(self):
         other = _placement((_shard(0, 0, (2, S0, 8, 1, 1024, 128)),))
@@ -690,7 +718,9 @@ class TestDynamicKvFailuresRaise:
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
             kv_blocks_before_shrink=211 if shrunk else None,
             model_runner=SimpleNamespace(
-                kv_cache_config=SimpleNamespace(num_blocks=211)
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=211, kv_cache_tensors=_kv_cache_tensors_for(programs)
+                )
             ),
             programs=list(programs),
             release_kv_cache_tensors=lambda cfg: None,
