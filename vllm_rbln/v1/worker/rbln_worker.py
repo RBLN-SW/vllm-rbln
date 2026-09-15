@@ -171,8 +171,14 @@ class RBLNWorker(WorkerBase):
     def init_device(self) -> None:
         self.device = self.device_config.device
 
-        # Before the CCL backend comes up, so nothing of ours counts as foreign.
-        foreign_dram_used_bytes = read_rbln_card_dram_used_bytes()
+        # Before the CCL backend comes up, so nothing of ours counts as foreign;
+        # only the sizer's allocator fallback reads it, so the default path pays
+        # nothing.
+        foreign_dram_used_bytes = (
+            read_rbln_card_dram_used_bytes()
+            if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
+            else 0
+        )
 
         # Initialize the distributed environment.
         init_worker_distributed_environment(

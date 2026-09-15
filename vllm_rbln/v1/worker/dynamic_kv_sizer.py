@@ -22,9 +22,10 @@ from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
@@ -54,12 +55,8 @@ from vllm_rbln.v1.worker.utils import (
     rescale_kv_cache_config,
 )
 
-try:
-    import torch.rbln  # noqa: F401
-
-    has_torch_rbln = True
-except ImportError:
-    has_torch_rbln = False
+if TYPE_CHECKING:
+    from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 
 logger = init_logger(__name__)
 
@@ -137,8 +134,6 @@ def empty_rbln_device_caches() -> bool:
     """Return every *free* block the rbln caching allocator holds to the driver."""
     # The allocator otherwise releases cached blocks only after a failed
     # allocation, so freed bytes keep counting in `dram_used`. Never raises.
-    if not has_torch_rbln:
-        return False
     try:
         # NOTE(RBLN): is_available() raises on a malformed RBLN_* config.
         if not torch.rbln.is_available():
@@ -172,7 +167,7 @@ class DynamicKvSizer:
     def __init__(
         self,
         vllm_config: VllmConfig,
-        model_runner: Any,
+        model_runner: "RBLNModelRunner",
         foreign_dram_used_bytes: int,
     ) -> None:
         self.vllm_config = vllm_config
@@ -332,7 +327,7 @@ class DynamicKvSizer:
         """Every attention layer must dispatch to a paged causal or sliding-window
         naive kernel (`is_causal`, not `is_normal`). Runs here, not in platform
         validation: the layers exist only after the model build."""
-        if self.mode is DynamicKvMode.DISABLED:
+        if self.mode in (DynamicKvMode.DISABLED, DynamicKvMode.INERT):
             return
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         offenders: list[str] = []
@@ -356,7 +351,7 @@ class DynamicKvSizer:
     def assert_cache_layout(self) -> None:
         """The KV bindings must satisfy the compiler's dynamic-input rules; reads
         state `initialize_kv_cache` fills."""
-        if self.mode is DynamicKvMode.DISABLED:
+        if self.mode in (DynamicKvMode.DISABLED, DynamicKvMode.INERT):
             return
         mr = self.model_runner
 
@@ -374,18 +369,11 @@ class DynamicKvSizer:
         """Scope that records the programs warm-up builds, when the flag is on."""
         if self.mode is DynamicKvMode.DISABLED:
             return nullcontext(None)
-        capture = (
-            getattr(torch.rbln, "capture_programs", None) if has_torch_rbln else None
-        )
+        capture = getattr(torch.rbln, "capture_programs", None)
         if capture is None:
-            missing = (
-                "torch.rbln is not importable"
-                if not has_torch_rbln
-                else "this torch_rbln does not carry it"
-            )
             message = (
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs torch_rbln's "
-                f"capture_programs(); {missing}."
+                "capture_programs(); this torch_rbln does not carry it."
             )
             if self.mode is DynamicKvMode.DRY_RUN:
                 # Nothing to capture means nothing to report, which the sizing

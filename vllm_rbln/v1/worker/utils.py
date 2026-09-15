@@ -320,6 +320,11 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
     """Blocks one max-length request and one full decode batch need, summed over
     the groups sharing the pool."""
     max_model_len = vllm_config.model_config.max_model_len
+    in_flight_tokens = getattr(
+        vllm_config,
+        "max_in_flight_tokens",
+        vllm_config.scheduler_config.max_num_batched_tokens,
+    )
     one_request = 0
     per_seq = 0
     for group in cfg.kv_cache_groups:
@@ -338,7 +343,11 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
             )
         # Positional: the first parameter is max_num_batched_tokens before the
         # vllm bump and max_in_flight_tokens after it; the position is the same.
-        per_seq += admission(1, max_model_len) if admission is not None else 1
+        # The value has to be the runtime gate's, or the pool is sized against a
+        # smaller per-request peak than the scheduler later enforces.
+        per_seq += (
+            admission(in_flight_tokens, max_model_len) if admission is not None else 1
+        )
     return KvMinimum(
         one_request=one_request,
         decode_batch=vllm_config.scheduler_config.max_num_seqs * per_seq,

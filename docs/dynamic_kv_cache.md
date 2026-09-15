@@ -44,8 +44,10 @@ compile-time cache, and after warm-up sizes the real cache from two measurements
   allocator (`torch.rbln.memory_stats_per_chiplet()`) plus a fixed reserve for the
   runtime's direct allocations and the other tenants' usage sampled at start-up.
 
-The count is the tightest chiplet's
-`floor((total * gpu_memory_utilization - base) / per_block)`. When the
+The count starts at the tightest chiplet's
+`floor((total * gpu_memory_utilization - base) / per_block)` and `max_num_blocks`
+scans down from there: the allocator rounds each shard up to a segment size, so
+the linear figure is an upper bound, not the answer (see Growth below). When the
 scheduler will run sub-block prefix caching, `base` also carries a fixed
 per-chiplet reserve (`DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES`) for the command
 streams its partial-block copies upload once requests flow; it is independent
