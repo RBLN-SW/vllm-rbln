@@ -18,8 +18,6 @@
 
 import torch
 
-from vllm_rbln import envs
-
 
 def paged_flash_causal_mla_naive_prefill(
     q: torch.Tensor,
@@ -29,8 +27,10 @@ def paged_flash_causal_mla_naive_prefill(
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    compile_model: bool,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
+    if compile_model:
         return torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill(
             q,
             kv_c_normed,
@@ -52,8 +52,10 @@ def paged_flash_causal_mla_naive_decode(
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    compile_model: bool,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
+    if compile_model:
         return torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode(
             q,
             kv_c_normed,

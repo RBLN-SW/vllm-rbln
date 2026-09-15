@@ -512,17 +512,16 @@ class TestReorderInputBatch:
 class TestEstimateAvailableMemory:
     @pytest.fixture
     def rbln(self, monkeypatch):
-        # Mock only the environment inputs (device name + devices-per-rank).
-        def _set(device_name, rsd=1):
+        # Mock the one environment input left: the device name.
+        def _set(device_name):
             monkeypatch.setattr(
                 current_platform, "get_device_name", lambda: device_name
             )
-            monkeypatch.setattr(envs, "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", rsd)
 
         return _set
 
     def test_atom_exact(self, rbln):
-        rbln("RBLN-CA25", rsd=1)
+        rbln("RBLN-CA25")
         assert (
             estimate_available_memory(
                 _make_model_config(), _make_parallel_config(), kernel_size=_GB
@@ -531,7 +530,7 @@ class TestEstimateAvailableMemory:
         )
 
     def test_rebel_exact(self, rbln):
-        rbln("RBLN-CR13", rsd=1)
+        rbln("RBLN-CR13")
         assert (
             estimate_available_memory(
                 _make_model_config(), _make_parallel_config(), kernel_size=_GB
@@ -540,21 +539,24 @@ class TestEstimateAvailableMemory:
         )
 
     def test_rebel_requires_rsd_1(self, rbln):
-        rbln("RBLN-CR13", rsd=2)
+        rbln("RBLN-CR13")
         with pytest.raises(AssertionError):
             estimate_available_memory(
-                _make_model_config(), _make_parallel_config(), kernel_size=_GB
+                _make_model_config(),
+                _make_parallel_config(),
+                kernel_size=_GB,
+                num_devices_per_local_rank=2,
             )
 
     def test_unknown_device_raises(self, rbln):
-        rbln("RBLN-XX99", rsd=1)
+        rbln("RBLN-XX99")
         with pytest.raises(ValueError, match="invalid RBLN architecture"):
             estimate_available_memory(
                 _make_model_config(), _make_parallel_config(), kernel_size=_GB
             )
 
     def test_gpu_memory_utilization_effect(self, rbln):
-        rbln("RBLN-CA25", rsd=1)
+        rbln("RBLN-CA25")
         mc, pc = _make_model_config(), _make_parallel_config()
         high = estimate_available_memory(
             mc, pc, kernel_size=_GB, gpu_memory_utilization=0.9
@@ -565,7 +567,7 @@ class TestEstimateAvailableMemory:
         assert low < high
 
     def test_oom_raises_memory_error(self, rbln):
-        rbln("RBLN-CA25", rsd=1)
+        rbln("RBLN-CA25")
         with pytest.raises(MemoryError):
             estimate_available_memory(
                 _make_model_config(), _make_parallel_config(), kernel_size=100 * _GB
@@ -573,18 +575,24 @@ class TestEstimateAvailableMemory:
 
     def test_rsd_replicas_for_large_kv_heads(self, rbln):
         # num_kv_heads only feeds rsd_replicas = max(1, rsd // num_kv_heads).
-        rbln("RBLN-CA25", rsd=4)
+        rbln("RBLN-CA25")
         pc = _make_parallel_config()
         replica2 = estimate_available_memory(
-            _make_model_config(num_kv_heads=2), pc, kernel_size=_GB
+            _make_model_config(num_kv_heads=2),
+            pc,
+            kernel_size=_GB,
+            num_devices_per_local_rank=4,
         )
         replica1 = estimate_available_memory(
-            _make_model_config(num_kv_heads=8), pc, kernel_size=_GB
+            _make_model_config(num_kv_heads=8),
+            pc,
+            kernel_size=_GB,
+            num_devices_per_local_rank=4,
         )
         assert replica2 == replica1 // 2
 
     def test_buffer_default_vs_explicit(self, rbln):
-        rbln("RBLN-CA25", rsd=1)
+        rbln("RBLN-CA25")
         mc, pc = _make_model_config(), _make_parallel_config()
         default = estimate_available_memory(mc, pc, kernel_size=_GB)
         no_buffer = estimate_available_memory(mc, pc, kernel_size=_GB, buffer=0)
@@ -592,7 +600,7 @@ class TestEstimateAvailableMemory:
         assert no_buffer - default == 2**29
 
     def test_validation_combinations(self, rbln):
-        rbln("RBLN-CA25", rsd=1)
+        rbln("RBLN-CA25")
         mc, pc = _make_model_config(), _make_parallel_config()
         with pytest.raises(ValueError, match="cannot both be"):
             estimate_available_memory(mc, pc, kernel_size=_GB, n_model_params=1_000_000)
@@ -602,7 +610,7 @@ class TestEstimateAvailableMemory:
             estimate_available_memory(mc, pc, n_model_params=1_000_000)
 
     def test_estimates_kernel_when_not_given(self, rbln):
-        rbln("RBLN-CA25", rsd=1)
+        rbln("RBLN-CA25")
         result = estimate_available_memory(
             _make_model_config(), _make_parallel_config(), n_model_bytes=10 * _GB
         )
@@ -626,31 +634,31 @@ class TestEstimateAvailableMemory:
         )
 
     def test_chiplet_memory_budgets_the_tightest_chiplet(self, rbln):
-        rbln("RBLN-CR13", rsd=1)
+        rbln("RBLN-CR13")
         one_tight = self._measured(self._snapshot([3 * _GB, _GB, _GB, _GB]))
         all_tight = self._measured(self._snapshot([3 * _GB] * 4))
         all_loose = self._measured(self._snapshot([_GB] * 4))
         assert one_tight == all_tight < all_loose
 
     def test_chiplet_memory_still_charges_kernel_size(self, rbln):
-        rbln("RBLN-CR13", rsd=1)
+        rbln("RBLN-CR13")
         snapshot = self._snapshot([_GB] * 4)
         assert self._measured(snapshot) > self._measured(snapshot, kernel_size=5 * _GB)
 
     def test_chiplet_memory_still_charges_buffer(self, rbln):
-        rbln("RBLN-CR13", rsd=1)
+        rbln("RBLN-CR13")
         snapshot = self._snapshot([_GB] * 4)
         assert self._measured(snapshot) > self._measured(snapshot, buffer=4 * _GB)
 
     def test_chiplet_memory_must_cover_one_rank_s_chiplets(self, rbln):
         # The downstream terms are written for one quad-chiplet card; a snapshot
         # of another size would scale the budget by the wrong factor.
-        rbln("RBLN-CR13", rsd=1)
+        rbln("RBLN-CR13")
         with pytest.raises(ValueError, match="covers 8 chiplet"):
             self._measured(self._snapshot([_GB] * 8))
 
     def test_chiplet_memory_full_chiplet_raises(self, rbln):
-        rbln("RBLN-CR13", rsd=1)
+        rbln("RBLN-CR13")
         with pytest.raises(MemoryError):
             self._measured(self._snapshot([40 * _GB, _GB, _GB, _GB]))
 

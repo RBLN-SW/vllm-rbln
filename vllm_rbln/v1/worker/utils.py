@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 from vllm_rbln import envs
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
@@ -287,11 +288,12 @@ def read_rbln_card_dram_used_bytes() -> int:
     return max(used, default=0)
 
 
-def compile_and_warmup_skip_reason(model_config: ModelConfig) -> str | None:
+def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
     """Why the compile and warm-up will be skipped, or None if they will run."""
-    if model_config.enforce_eager:
+    if vllm_config.model_config.enforce_eager:
         return "enforce_eager is set"
-    if not envs.VLLM_RBLN_COMPILE_MODEL:
+    rbln_config: RBLNConfig = vllm_config.additional_config
+    if not rbln_config.compile_model:
         return "VLLM_RBLN_COMPILE_MODEL is off"
     if not envs.VLLM_RBLN_ENABLE_WARM_UP:
         return "VLLM_RBLN_ENABLE_WARM_UP is off"
@@ -454,6 +456,7 @@ def estimate_available_memory(
     buffer: int | None = None,
     num_runtimes: int = 2,
     gpu_memory_utilization: float = 0.9,
+    num_devices_per_local_rank: int = 1,
     chiplet_memory: Mapping[Unit, ChipletMemory] | None = None,
 ) -> int:
     # We are finding max_num_blocks(x) that satisfies the following equation:
@@ -496,12 +499,12 @@ def estimate_available_memory(
         ATOM_DRAM_NBYTES = 16 * 2**30
         ATOM_SYS_DRAM_NBYTES = 288 * 2**20
         # consider RSD size for ATOM
-        rsd_size = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
+        rsd_size = num_devices_per_local_rank
         available_dram_bytes = rsd_size * (ATOM_DRAM_NBYTES - ATOM_SYS_DRAM_NBYTES)
         # ATOM - basic data type fp16
         default_bits_per_param = 16
     elif "cr" in device_name:
-        assert envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK == 1
+        assert num_devices_per_local_rank == 1
         # REBEL - RBLN-CR[xxx]
         REBEL_CHIPLET_SIZE = 4
         # single device == Quad chiplet

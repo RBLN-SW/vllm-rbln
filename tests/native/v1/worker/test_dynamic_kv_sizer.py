@@ -681,7 +681,9 @@ class TestKvCopyStreamReserve:
         return SimpleNamespace(
             cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
             vllm_config=SimpleNamespace(
-                additional_config={"sub_block_cache": sub_block_cache}
+                additional_config=SimpleNamespace(
+                    enable_sub_block_cache=sub_block_cache
+                )
             ),
             scheduler_config=SimpleNamespace(max_num_batched_tokens=512),
             model_runner=SimpleNamespace(kv_cache_config=SimpleNamespace()),

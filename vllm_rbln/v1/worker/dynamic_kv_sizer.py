@@ -31,7 +31,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation.backends import set_compile_stage
-from vllm_rbln.config import build_rbln_config
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.utils import sub_block_size_in_use
 from vllm_rbln.v1.worker.kv_placement import (
@@ -176,9 +175,7 @@ class DynamicKvSizer:
             use_dynamic_kv=envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE,
             dry_run=envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN,
             num_gpu_blocks_override=self.cache_config.num_gpu_blocks_override,
-            compile_skip_reason=compile_and_warmup_skip_reason(
-                vllm_config.model_config
-            ),
+            compile_skip_reason=compile_and_warmup_skip_reason(vllm_config),
         )
         # The count vLLM sized, held while the cache is shrunk for the compile.
         self.kv_blocks_before_shrink: int | None = None
@@ -410,9 +407,7 @@ class DynamicKvSizer:
         will run sub-block prefix caching."""
         in_use = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
-            sub_block_cache=build_rbln_config(
-                self.vllm_config.additional_config
-            ).sub_block_cache,
+            sub_block_cache=self.vllm_config.additional_config.enable_sub_block_cache,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             kv_cache_config=self.model_runner.kv_cache_config,
         )

@@ -68,7 +68,7 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
-from vllm_rbln.config import build_rbln_config, set_rbln_config
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
@@ -111,9 +111,6 @@ class RBLNWorker(WorkerBase):
         )
         self.fail_fast = issubclass(Executor.get_class(vllm_config), MultiprocExecutor)
 
-        # Before _init_device_env(), which reads device-count options.
-        set_rbln_config(build_rbln_config(vllm_config.additional_config))
-
         self._init_device_env()
 
         self._rbln_host_threads_before_compile_ready = False
@@ -136,8 +133,9 @@ class RBLNWorker(WorkerBase):
         pass
 
     def _init_device_env(self) -> None:
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         env_var = current_platform.device_control_env_var
-        num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
+        num_devices = rbln_config.num_devices_per_local_rank
 
         dp_rank = self.parallel_config.data_parallel_rank_local or 0
         slot = dp_rank * self.parallel_config.world_size + self.local_rank
@@ -331,11 +329,13 @@ class RBLNWorker(WorkerBase):
 
         logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         estimate_kwargs = dict(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
+            num_devices_per_local_rank=rbln_config.num_devices_per_local_rank,
         )
 
         speculative_config = self.speculative_config
@@ -477,7 +477,7 @@ class RBLNWorker(WorkerBase):
         self._ensure_rbln_host_threads_before_compile()
 
         try:
-            if (skip := compile_and_warmup_skip_reason(self.model_config)) is not None:
+            if (skip := compile_and_warmup_skip_reason(self.vllm_config)) is not None:
                 logger.info("Skipping compile_or_warm_up_model (%s).", skip)
             else:
                 with self.dynamic_kv.capture_programs() as programs:
