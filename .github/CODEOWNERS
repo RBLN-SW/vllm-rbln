@@ -23,4 +23,4 @@
 /vllm_rbln/v1/worker/utils.py @rebel-cjlee @rebel-minkyu @rebel-eunji @rebel-jonghewk
 
 # test
-/tests/native @rebel-cjlee
+/tests/vllm @rebel-cjlee
