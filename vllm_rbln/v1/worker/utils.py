@@ -287,6 +287,17 @@ def read_rbln_card_dram_used_bytes() -> int:
     return max(used, default=0)
 
 
+def compile_and_warmup_skip_reason(model_config: ModelConfig) -> str | None:
+    """Why the compile and warm-up will be skipped, or None if they will run."""
+    if model_config.enforce_eager:
+        return "enforce_eager is set"
+    if not envs.VLLM_RBLN_COMPILE_MODEL:
+        return "VLLM_RBLN_COMPILE_MODEL is off"
+    if not envs.VLLM_RBLN_ENABLE_WARM_UP:
+        return "VLLM_RBLN_ENABLE_WARM_UP is off"
+    return None
+
+
 @dataclass(frozen=True)
 class KvMinimum:
     """The fewest blocks a KV cache pool can serve with."""

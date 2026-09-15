@@ -76,9 +76,10 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
-    estimate_available_memory,
+    compile_and_warmup_skip_reason,
     estimate_model_kernel_size,
     get_rbln_planned_affinity_cpu_count,
+    read_rbln_card_dram_used_bytes,
     set_cpu_affinity,
     set_omp_num_threads,
     worker_fail_fast,
@@ -117,8 +118,6 @@ class RBLNWorker(WorkerBase):
 
         self._rbln_host_threads_before_compile_ready = False
         self._rbln_cpu_affinity_applied = False
-
-        self.dynamic_kv = DynamicKvSizer(self)
 
         self.profiler: Any | None = None
         self.profiler_config = vllm_config.profiler_config
@@ -174,6 +173,9 @@ class RBLNWorker(WorkerBase):
     def init_device(self) -> None:
         self.device = self.device_config.device
 
+        # Before the CCL backend comes up, so nothing of ours counts as foreign.
+        foreign_dram_used_bytes = read_rbln_card_dram_used_bytes()
+
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config,
@@ -189,6 +191,9 @@ class RBLNWorker(WorkerBase):
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
             self.vllm_config, self.device
+        )
+        self.dynamic_kv = DynamicKvSizer(
+            self.vllm_config, self.model_runner, foreign_dram_used_bytes
         )
 
         if self.rank == 0:
@@ -394,12 +399,9 @@ class RBLNWorker(WorkerBase):
         else:
             estimate_kwargs["n_model_bytes"] = n_model_bytes
 
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            available_memory_estimate = self.dynamic_kv.pre_compile_estimate(
-                estimate_kwargs
-            )
-        else:
-            available_memory_estimate = estimate_available_memory(**estimate_kwargs)
+        available_memory_estimate = self.dynamic_kv.pre_compile_estimate(
+            estimate_kwargs
+        )
 
         logger.info(
             "available_memory_estimate = %.2f GiB", available_memory_estimate / 1024**3
@@ -447,16 +449,13 @@ class RBLNWorker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        dynamic_kv = envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
-        if dynamic_kv:
-            self.dynamic_kv.assert_attention_layout()
+        self.dynamic_kv.assert_attention_layout()
 
         self.model_runner.initialize_kv_cache(
             self.dynamic_kv.shrink_for_compile(kv_cache_config)
         )
 
-        if dynamic_kv:
-            self.dynamic_kv.assert_cache_layout()
+        self.dynamic_kv.assert_cache_layout()
 
     def compute_dynamic_kv_num_blocks(self) -> int | None:
         """RPC target of the engine's dynamic-KV patch; see
@@ -468,16 +467,6 @@ class RBLNWorker(WorkerBase):
         `DynamicKvSizer.apply_num_blocks`."""
         return self.dynamic_kv.apply_num_blocks(n)
 
-    def _compile_and_warmup_skip_reason(self) -> str | None:
-        """Why the compile and warm-up will be skipped, or None if they will run."""
-        if self.model_config.enforce_eager:
-            return "enforce_eager is set"
-        if not envs.VLLM_RBLN_COMPILE_MODEL:
-            return "VLLM_RBLN_COMPILE_MODEL is off"
-        if not envs.VLLM_RBLN_ENABLE_WARM_UP:
-            return "VLLM_RBLN_ENABLE_WARM_UP is off"
-        return None
-
     @instrument(span_name="Warmup (NPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # NOTE(RBLN): Manual timing since RBLN does not support @support_torch_compile.
@@ -488,7 +477,7 @@ class RBLNWorker(WorkerBase):
         self._ensure_rbln_host_threads_before_compile()
 
         try:
-            if (skip := self._compile_and_warmup_skip_reason()) is not None:
+            if (skip := compile_and_warmup_skip_reason(self.model_config)) is not None:
                 logger.info("Skipping compile_or_warm_up_model (%s).", skip)
             else:
                 with self.dynamic_kv.capture_programs() as programs:

@@ -58,6 +58,7 @@ def _make_vllm_config(
         profiler_config=SimpleNamespace(profiler=profiler),
         parallel_config=SimpleNamespace(
             distributed_executor_backend=backend,
+            rank=0,
             world_size=world_size,
             tensor_parallel_size=world_size,
             pipeline_parallel_size=1,
@@ -71,7 +72,11 @@ def _make_vllm_config(
         model_config=SimpleNamespace(
             quantization=quantization, enforce_eager=enforce_eager
         ),
-        cache_config=SimpleNamespace(gpu_memory_utilization=0.9, num_gpu_blocks=None),
+        cache_config=SimpleNamespace(
+            gpu_memory_utilization=0.9,
+            num_gpu_blocks=None,
+            num_gpu_blocks_override=None,
+        ),
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         additional_config=additional_config if additional_config is not None else {},
@@ -112,6 +117,13 @@ def _env_cleanup(monkeypatch):
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+def _attach_sizer(worker):
+    """`init_device` builds the sizer once the model runner exists; these tests
+    construct the worker directly, so they have to do the same."""
+    worker.dynamic_kv = dks.DynamicKvSizer(worker.vllm_config, worker.model_runner, 0)
+    return worker
 
 
 @pytest.fixture
@@ -528,7 +540,8 @@ class TestDetermineAvailableMemory:
             captured.update(kw)
             return 999
 
-        monkeypatch.setattr(wm, "estimate_available_memory", record)
+        # The worker hands the kwargs to the sizer, which is where the formula
+        # is called from on both the dynamic and the default path.
         monkeypatch.setattr(dks, "estimate_available_memory", record)
         monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
         # WorkerBase always carries the field; None is what no spec decode means.
@@ -544,6 +557,7 @@ class TestDetermineAvailableMemory:
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
         )
+        _attach_sizer(worker)
         worker.determine_available_memory()
         return captured
 
@@ -594,6 +608,7 @@ class TestDetermineAvailableMemory:
             drafter=None,
             get_kv_cache_spec=lambda: {"a": spec, "b": spec},
         )
+        _attach_sizer(worker)
         with caplog.at_level("WARNING"):
             assert worker.determine_available_memory() == 8000
         assert "short of one max-length request" in caplog.text
@@ -777,6 +792,7 @@ class TestInitializeFromConfig:
         worker.model_runner = SimpleNamespace(
             initialize_kv_cache=lambda cfg: init_calls.append(cfg)
         )
+        _attach_sizer(worker)
         kv_cfg = SimpleNamespace(num_blocks=123)
         worker.initialize_from_config(kv_cfg)
         assert worker.cache_config.num_gpu_blocks == 123
@@ -827,6 +843,7 @@ class TestCompileOrWarmUpModel:
             warmup_model=warmup,
             kv_cache_config=SimpleNamespace(num_blocks=10),
         )
+        _attach_sizer(worker)
         return worker, calls
 
     def test_skips_when_enforce_eager(self, make_worker, monkeypatch):

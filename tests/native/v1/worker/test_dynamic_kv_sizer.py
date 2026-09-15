@@ -96,6 +96,8 @@ class TestComputeDynamicKvNumBlocks:
         sizer = SimpleNamespace(
             rank=0,
             device=torch.device("cpu"),
+            mode=dks.DynamicKvMode.ACTIVE,
+            mode_reason=None,
             cache_config=SimpleNamespace(
                 num_gpu_blocks_override=None, gpu_memory_utilization=gmu
             ),
@@ -149,6 +151,7 @@ class TestComputeDynamicKvNumBlocks:
             programs=programs,
             snapshot=self._snapshot([30 * self.GIB + resident] * 4),
         )
+        sizer.mode = dks.DynamicKvMode.DRY_RUN
         sizer.cache_config.num_gpu_blocks_override = current
         sizer.kv_blocks_before_shrink = None
         sizer.model_runner.kv_cache_config.num_blocks = current
@@ -160,13 +163,7 @@ class TestComputeDynamicKvNumBlocks:
         )
         sizer.log_dry_run = lambda *args: (DynamicKvSizer.log_dry_run(sizer, *args))
         _bind_sizing(sizer)
-        with (
-            patch(
-                "vllm_rbln.v1.worker.dynamic_kv_sizer.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
-                True,
-            ),
-            caplog.at_level("WARNING"),
-        ):
+        with caplog.at_level("WARNING"):
             assert DynamicKvSizer.compute_num_blocks(sizer) is None
         # (35 GiB - 30 GiB) / 2 MiB = 2560 blocks if the 200 in use come back,
         # 2360 if their 400 MiB stay resident.
@@ -188,14 +185,9 @@ class TestComputeDynamicKvNumBlocks:
 
     def test_a_dry_run_that_cannot_size_warns_instead_of_raising(self, caplog):
         sizer = self._sizer(programs=[_program([])], snapshot=self._snapshot([0] * 4))
+        sizer.mode = dks.DynamicKvMode.DRY_RUN
         sizer.kv_blocks_before_shrink = None
-        with (
-            patch(
-                "vllm_rbln.v1.worker.dynamic_kv_sizer.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
-                True,
-            ),
-            caplog.at_level("WARNING"),
-        ):
+        with caplog.at_level("WARNING"):
             assert DynamicKvSizer.compute_num_blocks(sizer) is None
         assert "could not be computed" in caplog.text
 
@@ -350,19 +342,53 @@ class TestDynamicKvMemorySnapshot:
         assert "no mem_get_info_per_chiplet" in caplog.text
 
 
+class TestModeResolution:
+    """One decision at init: every input is static config or env, so the rest of
+    the sizer branches on the mode instead of re-reading them."""
+
+    @staticmethod
+    def _mode(**kwargs):
+        args = dict(
+            use_dynamic_kv=True,
+            dry_run=False,
+            num_gpu_blocks_override=None,
+            compile_skip_reason=None,
+        )
+        return dks.resolve_mode(**{**args, **kwargs})
+
+    def test_the_flag_off_disables_everything(self):
+        assert self._mode(use_dynamic_kv=False) == (dks.DynamicKvMode.DISABLED, None)
+
+    def test_a_skipped_compile_wins_over_the_dry_run_and_the_override(self):
+        assert self._mode(
+            compile_skip_reason="enforce_eager is set",
+            dry_run=True,
+            num_gpu_blocks_override=64,
+        ) == (dks.DynamicKvMode.INERT, "enforce_eager is set")
+
+    def test_a_dry_run_still_reports_under_an_override(self):
+        assert self._mode(dry_run=True, num_gpu_blocks_override=64) == (
+            dks.DynamicKvMode.DRY_RUN,
+            None,
+        )
+
+    def test_an_override_pins_the_count(self):
+        assert self._mode(num_gpu_blocks_override=64) == (
+            dks.DynamicKvMode.PINNED,
+            "--num-gpu-blocks-override=64",
+        )
+
+    def test_the_flag_alone_is_active(self):
+        assert self._mode() == (dks.DynamicKvMode.ACTIVE, None)
+
+
 class TestWarmupCapturesPrograms:
     """The programs warm-up builds are the only handle on the KV-holding
     runtimes, so the capture has to wrap exactly the warm-up."""
 
     def test_off_means_no_capture(self):
-        sizer = SimpleNamespace()
-        with (
-            patch(
-                "vllm_rbln.v1.worker.dynamic_kv_sizer.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-                False,
-            ),
-            DynamicKvSizer.capture_programs(sizer) as programs,
-        ):
+        sizer = SimpleNamespace(mode=dks.DynamicKvMode.DISABLED)
+        with DynamicKvSizer.capture_programs(sizer) as programs:
             pass
         assert programs is None
 
@@ -373,12 +399,8 @@ class TestWarmupCapturesPrograms:
         def fake_capture():
             yield recorded
 
-        sizer = SimpleNamespace()
+        sizer = SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE)
         with (
-            patch(
-                "vllm_rbln.v1.worker.dynamic_kv_sizer.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-                True,
-            ),
             patch.object(dks, "has_torch_rbln", True),
             patch.object(
                 dks.torch,
@@ -393,14 +415,12 @@ class TestWarmupCapturesPrograms:
 
     def test_on_without_torch_rbln_refuses(self):
         with (
-            patch(
-                "vllm_rbln.v1.worker.dynamic_kv_sizer.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-                True,
-            ),
             patch.object(dks, "has_torch_rbln", False),
             pytest.raises(RuntimeError, match="capture_programs"),
         ):
-            DynamicKvSizer.capture_programs(SimpleNamespace())
+            DynamicKvSizer.capture_programs(
+                SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE)
+            )
 
     def test_runtimes_are_deduped_across_programs(self):
         shared = object()
@@ -435,23 +455,22 @@ class TestMaybeShrinkKvCacheForCompile:
         )
 
     @staticmethod
-    def _shrink(config, *, dynamic=True, override=None, warmup_skipped=False):
-        # The flag is patched as a module attribute, not via os.environ: a
-        # setattr elsewhere would leave an attribute shadowing envs.__getattr__.
+    def _shrink(
+        config, *, dynamic=True, override=None, warmup_skipped=False, dry_run=False
+    ):
+        mode, reason = dks.resolve_mode(
+            use_dynamic_kv=dynamic,
+            dry_run=dry_run,
+            num_gpu_blocks_override=override,
+            compile_skip_reason="enforce_eager is set" if warmup_skipped else None,
+        )
         sizer = SimpleNamespace(
+            mode=mode,
+            mode_reason=reason,
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
             kv_blocks_before_shrink=None,
-            worker=SimpleNamespace(
-                _compile_and_warmup_skip_reason=lambda: (
-                    "enforce_eager is set" if warmup_skipped else None
-                )
-            ),
         )
-        with patch(
-            "vllm_rbln.v1.worker.dynamic_kv_sizer.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-            dynamic,
-        ):
-            out = DynamicKvSizer.shrink_for_compile(sizer, config)
+        out = DynamicKvSizer.shrink_for_compile(sizer, config)
         return sizer, out
 
     def test_the_flag_alone_shrinks_to_the_constant(self, caplog):
@@ -483,14 +502,8 @@ class TestMaybeShrinkKvCacheForCompile:
 
     def test_a_dry_run_compiles_at_the_sized_count(self, caplog):
         config = self._config()
-        with (
-            patch(
-                "vllm_rbln.v1.worker.dynamic_kv_sizer.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
-                True,
-            ),
-            caplog.at_level("WARNING"),
-        ):
-            sizer, out = self._shrink(config)
+        with caplog.at_level("WARNING"):
+            sizer, out = self._shrink(config, dry_run=True)
         assert out is config
         assert sizer.kv_blocks_before_shrink is None
         assert "dry run" in caplog.text
@@ -543,7 +556,7 @@ class TestDynamicKvLayoutGuards:
     def test_a_non_paged_causal_layer_is_refused_by_name(self):
         """`block_size == max_model_len` makes is_normal True -- and is also where
         the estimate can fall below the hint, so the wrong refusal could fire."""
-        sizer = SimpleNamespace(vllm_config=object())
+        sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.ACTIVE)
         with (
             patch(
                 "vllm_rbln.v1.worker.dynamic_kv_sizer.get_layers_from_vllm_config",
@@ -557,7 +570,7 @@ class TestDynamicKvLayoutGuards:
         assert "nothing to shrink" not in str(exc.value)
 
     def test_a_paged_causal_layer_passes(self):
-        sizer = SimpleNamespace(vllm_config=object())
+        sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.ACTIVE)
         with patch(
             "vllm_rbln.v1.worker.dynamic_kv_sizer.get_layers_from_vllm_config",
             return_value={"layer.0": self._layer()},
@@ -567,7 +580,7 @@ class TestDynamicKvLayoutGuards:
     def test_a_sliding_window_layer_passes(self):
         """gpt-oss alternates full and windowed layers; the compiler admits a
         dynamic KV input on `paged_sliding_window_attention_naive_*` too."""
-        sizer = SimpleNamespace(vllm_config=object())
+        sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.ACTIVE)
         with patch(
             "vllm_rbln.v1.worker.dynamic_kv_sizer.get_layers_from_vllm_config",
             return_value={
@@ -581,17 +594,19 @@ class TestDynamicKvLayoutGuards:
         """gpt-oss shares one tensor between a full and a windowed layer; the
         compiler takes the deduped base through both views."""
         sizer = SimpleNamespace(
+            mode=dks.DynamicKvMode.ACTIVE,
             model_runner=SimpleNamespace(
                 kv_cache_bases=[object()], shared_kv_cache_layers={}
-            )
+            ),
         )
         DynamicKvSizer.assert_cache_layout(sizer)
 
     def test_cross_layer_sharing_is_still_refused_after_the_split(self):
         sizer = SimpleNamespace(
+            mode=dks.DynamicKvMode.ACTIVE,
             model_runner=SimpleNamespace(
                 kv_cache_bases=[], shared_kv_cache_layers={"layer.1": "layer.0"}
-            )
+            ),
         )
         with pytest.raises(RuntimeError, match="cross-layer KV"):
             DynamicKvSizer.assert_cache_layout(sizer)
@@ -603,8 +618,16 @@ class TestDynamicKvFailuresRaise:
 
     @staticmethod
     def _sizer(*, shrunk=True, override=None, programs=()):
+        mode, reason = dks.resolve_mode(
+            use_dynamic_kv=True,
+            dry_run=False,
+            num_gpu_blocks_override=override,
+            compile_skip_reason=None if shrunk or override else "enforce_eager is set",
+        )
         sizer = SimpleNamespace(
             rank=0,
+            mode=mode,
+            mode_reason=reason,
             cache_config=SimpleNamespace(num_gpu_blocks_override=override),
             kv_blocks_before_shrink=211 if shrunk else None,
             model_runner=SimpleNamespace(
@@ -788,11 +811,12 @@ class TestApplyResizesThenMaterializes:
     def test_materialize_runs_the_smallest_compiled_decode_bucket(self):
         ran: list = []
         sizer = SimpleNamespace(
+            mode=dks.DynamicKvMode.ACTIVE,
             model_runner=SimpleNamespace(
                 bucketing_manager=SimpleNamespace(decode_batch_buckets=[8, 4, 16]),
                 offload_context=nullcontext,
                 _dummy_run=lambda *args: ran.append(args),
-            )
+            ),
         )
         DynamicKvSizer.materialize(sizer)
         assert ran == [(4, 1, False)]

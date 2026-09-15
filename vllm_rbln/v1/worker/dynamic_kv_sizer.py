@@ -21,10 +21,11 @@ import re
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from enum import Enum
+from typing import Any
 
 import torch
-from vllm.config import get_layers_from_vllm_config
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -47,9 +48,9 @@ from vllm_rbln.v1.worker.kv_placement import (
     snapshot_from_driver,
 )
 from vllm_rbln.v1.worker.utils import (
+    compile_and_warmup_skip_reason,
     estimate_available_memory,
     minimum_kv_blocks,
-    read_rbln_card_dram_used_bytes,
     rescale_kv_cache_config,
 )
 
@@ -60,10 +61,38 @@ try:
 except ImportError:
     has_torch_rbln = False
 
-if TYPE_CHECKING:
-    from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
-
 logger = init_logger(__name__)
+
+
+class DynamicKvMode(Enum):
+    DISABLED = "disabled"
+    INERT = "inert"
+    PINNED = "pinned"
+    DRY_RUN = "dry_run"
+    ACTIVE = "active"
+
+
+def resolve_mode(
+    *,
+    use_dynamic_kv: bool,
+    dry_run: bool,
+    num_gpu_blocks_override: int | None,
+    compile_skip_reason: str | None,
+) -> tuple[DynamicKvMode, str | None]:
+    """The mode and its reason. Every input is static config or env, so the
+    decision is final at init time."""
+    if not use_dynamic_kv:
+        return DynamicKvMode.DISABLED, None
+    if compile_skip_reason is not None:
+        return DynamicKvMode.INERT, compile_skip_reason
+    if dry_run:
+        return DynamicKvMode.DRY_RUN, None
+    if num_gpu_blocks_override is not None:
+        return (
+            DynamicKvMode.PINNED,
+            f"--num-gpu-blocks-override={num_gpu_blocks_override}",
+        )
+    return DynamicKvMode.ACTIVE, None
 
 
 @dataclass(frozen=True)
@@ -131,46 +160,37 @@ class DynamicKvSizer:
     """The worker's dynamic-KV state machine: shrink -> capture -> snapshot ->
     size -> release -> reallocate -> materialize -> check."""
 
-    def __init__(self, worker: "RBLNWorker") -> None:
-        self.worker = worker
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model_runner: Any,
+        foreign_dram_used_bytes: int,
+    ) -> None:
+        self.vllm_config = vllm_config
+        self.cache_config = vllm_config.cache_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.model_runner = model_runner
+        self.device: torch.device = vllm_config.device_config.device
+        self.rank: int = vllm_config.parallel_config.rank
+        self.mode, self.mode_reason = resolve_mode(
+            use_dynamic_kv=envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE,
+            dry_run=envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN,
+            num_gpu_blocks_override=self.cache_config.num_gpu_blocks_override,
+            compile_skip_reason=compile_and_warmup_skip_reason(
+                vllm_config.model_config
+            ),
+        )
         # The count vLLM sized, held while the cache is shrunk for the compile.
         self.kv_blocks_before_shrink: int | None = None
         self.programs: list[Any] = []
         self.expected_used: dict[Unit, int] = {}
         # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
-        self.foreign_dram_used_bytes = 0
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            self.foreign_dram_used_bytes = read_rbln_card_dram_used_bytes()
-            logger.debug(
-                "foreign device DRAM at worker init: %d bytes "
-                "(RBLN_VISIBLE_DEVICES=%s)",
-                self.foreign_dram_used_bytes,
-                os.environ.get("RBLN_VISIBLE_DEVICES", ""),
-            )
-
-    @property
-    def vllm_config(self):
-        return self.worker.vllm_config
-
-    @property
-    def cache_config(self):
-        return self.worker.cache_config
-
-    @property
-    def scheduler_config(self):
-        return self.worker.scheduler_config
-
-    @property
-    def model_runner(self):
-        return self.worker.model_runner
-
-    @property
-    def device(self) -> torch.device:
-        return self.worker.device
-
-    @property
-    def rank(self) -> int:
-        return self.worker.rank
+        self.foreign_dram_used_bytes = foreign_dram_used_bytes
+        logger.debug(
+            "foreign device DRAM at worker init: %d bytes (RBLN_VISIBLE_DEVICES=%s)",
+            foreign_dram_used_bytes,
+            os.environ.get("RBLN_VISIBLE_DEVICES", ""),
+        )
 
     @property
     def compiled_with_shrunk_cache(self) -> bool:
@@ -186,6 +206,8 @@ class DynamicKvSizer:
     def pre_compile_estimate(self, estimate_kwargs: dict[str, Any]) -> int:
         """The bytes vllm sizes the compile-time cache from: the estimate fed
         the per-chiplet snapshot on a real device, floored at one request."""
+        if self.mode is DynamicKvMode.DISABLED:
+            return estimate_available_memory(**estimate_kwargs)
         if not torch.rbln.is_dummy_device():
             snapshot, source = self.memory_snapshot(self.device)
             if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
@@ -211,7 +233,7 @@ class DynamicKvSizer:
         estimate = estimate_available_memory(**estimate_kwargs)
         one_request = sum(
             spec.max_memory_usage_bytes(self.vllm_config)
-            for spec in self.worker.get_kv_cache_spec().values()
+            for spec in self.model_runner.get_kv_cache_spec().values()
         )
         if estimate < one_request:
             # vllm refuses a pool below one request against this estimate; the
@@ -230,32 +252,30 @@ class DynamicKvSizer:
     def shrink_for_compile(self, kv_cache_config: KVCacheConfig) -> KVCacheConfig:
         """A small-KV-cache copy of the config, or it unchanged; its
         `num_blocks` is the hint warm-up traces the dynamic dim with."""
-        if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+        if self.mode is DynamicKvMode.DISABLED:
             return kv_cache_config
-        skip_reason = self.worker._compile_and_warmup_skip_reason()
-        if skip_reason is not None:
+        if self.mode is DynamicKvMode.INERT:
             # Nothing compiles, so a shrink would set the latch with nothing to resize.
             logger.warning(
                 "[Dynamic KV] compile/warm-up is skipped (%s), so the cache stays "
                 "at the estimated %d blocks and this feature does nothing for "
                 "this run.",
-                skip_reason,
+                self.mode_reason,
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
-        override = self.cache_config.num_gpu_blocks_override
-        if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
+        if self.mode is DynamicKvMode.DRY_RUN:
             logger.warning(
                 "[Dynamic KV] dry run: compiling at the %d blocks vllm sized; the "
                 "count this feature would pick is only logged after warm-up.",
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
-        if override is not None:
+        if self.mode is DynamicKvMode.PINNED:
             logger.warning(
-                "[Dynamic KV] --num-gpu-blocks-override=%d pins the count; no "
-                "shrink and no resize. Compiling at %d blocks.",
-                override,
+                "[Dynamic KV] %s pins the count; no shrink and no resize. "
+                "Compiling at %d blocks.",
+                self.mode_reason,
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
@@ -284,6 +304,8 @@ class DynamicKvSizer:
         """Every attention layer must dispatch to a paged causal or sliding-window
         naive kernel (`is_causal`, not `is_normal`). Runs here, not in platform
         validation: the layers exist only after the model build."""
+        if self.mode is DynamicKvMode.DISABLED:
+            return
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         offenders: list[str] = []
         for layer_name, layer in attn_layers.items():
@@ -305,6 +327,8 @@ class DynamicKvSizer:
     def assert_cache_layout(self) -> None:
         """The KV bindings must satisfy the compiler's dynamic-input rules; reads
         state `initialize_kv_cache` fills."""
+        if self.mode is DynamicKvMode.DISABLED:
+            return
         mr = self.model_runner
 
         # The compiler admits a dynamic input through view ops into several
@@ -318,7 +342,7 @@ class DynamicKvSizer:
 
     def capture_programs(self):
         """Scope that records the programs warm-up builds, when the flag is on."""
-        if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+        if self.mode is DynamicKvMode.DISABLED:
             return nullcontext(None)
         if not has_torch_rbln:
             raise RuntimeError(
@@ -397,14 +421,13 @@ class DynamicKvSizer:
     def compute_num_blocks(self) -> int | None:
         """How many KV blocks fit this device, from the placement and a memory
         snapshot. Reallocates nothing; None means the path is not in play."""
-        dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
-        if not dry_run and self.cache_config.num_gpu_blocks_override is not None:
+        if self.mode is DynamicKvMode.PINNED:
             logger.info(
-                "[Dynamic KV] --num-gpu-blocks-override=%d is set; leaving the "
-                "KV cache alone.",
-                self.cache_config.num_gpu_blocks_override,
+                "[Dynamic KV] %s is set; leaving the KV cache alone.",
+                self.mode_reason,
             )
             return None
+        dry_run = self.mode is DynamicKvMode.DRY_RUN
         if not dry_run and self.kv_blocks_before_shrink is None:
             # The branch that cancelled the shrink already logged why.
             logger.warning(
