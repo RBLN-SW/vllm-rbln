@@ -94,6 +94,15 @@ def resolve_mode(
     return DynamicKvMode.ACTIVE, None
 
 
+def refuse(mode: DynamicKvMode, message: str) -> None:
+    """Raise, or report and continue in a dry run: the dry run observes, it does
+    not decide whether a configuration boots."""
+    if mode is DynamicKvMode.DRY_RUN:
+        logger.warning("[Dynamic KV] dry run: %s", message)
+        return
+    raise RuntimeError(message)
+
+
 @dataclass(frozen=True)
 class KvSizing:
     """One rank's count and the fit behind it; `if_resident` only when the
@@ -202,7 +211,8 @@ class DynamicKvSizer:
 
     def pre_compile_estimate(self, estimate_kwargs: dict[str, Any]) -> int:
         """The bytes vllm sizes the compile-time cache from: the estimate fed
-        the per-chiplet snapshot on a real device, floored at one request."""
+        the per-chiplet snapshot on a real device, floored at one request when
+        the shrink makes that estimate a placeholder."""
         if self.mode is DynamicKvMode.DISABLED:
             return estimate_available_memory(**estimate_kwargs)
         if not torch.rbln.is_dummy_device():
@@ -232,9 +242,11 @@ class DynamicKvSizer:
             spec.max_memory_usage_bytes(self.vllm_config)
             for spec in self.model_runner.get_kv_cache_spec().values()
         )
-        if estimate < one_request:
+        if self.mode is DynamicKvMode.ACTIVE and estimate < one_request:
             # vllm refuses a pool below one request against this estimate; the
-            # real count is sized from the device after warm-up.
+            # real count is sized from the device after warm-up. Only under the
+            # shrink: every other mode serves this estimate, so raising it here
+            # would change the pool instead of reporting on it.
             logger.warning(
                 "[Dynamic KV] the pre-compile estimate (%.2f GiB) is short of one "
                 "max-length request (%.2f GiB); raising it to that so the compile "
@@ -314,11 +326,12 @@ class DynamicKvSizer:
                     f"{layer_name}(is_causal={is_causal}, is_normal={is_normal})"
                 )
         if offenders:
-            raise RuntimeError(
+            refuse(
+                self.mode,
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires every layer to dispatch "
                 "to a paged causal or sliding-window naive kernel. Offending: "
                 + ", ".join(offenders[:8])
-                + (f" (+{len(offenders) - 8} more)" if len(offenders) > 8 else "")
+                + (f" (+{len(offenders) - 8} more)" if len(offenders) > 8 else ""),
             )
 
     def assert_cache_layout(self) -> None:
@@ -331,10 +344,11 @@ class DynamicKvSizer:
         # The compiler admits a dynamic input through view ops into several
         # attention calls, but not the same view into two calls.
         if mr.shared_kv_cache_layers:
-            raise RuntimeError(
+            refuse(
+                self.mode,
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support cross-layer KV "
                 f"sharing, but {len(mr.shared_kv_cache_layers)} layer(s) reuse "
-                "another layer's KV cache."
+                "another layer's KV cache.",
             )
 
     def capture_programs(self):

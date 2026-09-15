@@ -612,6 +612,65 @@ class TestDynamicKvLayoutGuards:
             DynamicKvSizer.assert_cache_layout(sizer)
 
 
+class TestDryRunOnlyObserves:
+    """A dry run reports the count it would pick. It must not change whether the
+    run boots or what it compiles, or it measures a different run."""
+
+    def test_the_one_request_floor_is_only_for_the_shrunk_estimate(self, monkeypatch):
+        """The floor exists because the shrink makes the estimate a placeholder.
+        Every other mode serves this estimate, so raising it resizes the pool."""
+        spec = SimpleNamespace(max_memory_usage_bytes=lambda cfg: 4000)
+        monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 999)
+
+        def sizer(mode):
+            return SimpleNamespace(
+                mode=mode,
+                vllm_config=SimpleNamespace(),
+                model_runner=SimpleNamespace(
+                    get_kv_cache_spec=lambda: {"a": spec, "b": spec}
+                ),
+            )
+
+        with patch.object(
+            dks.torch,
+            "rbln",
+            SimpleNamespace(is_dummy_device=lambda: True),
+            create=True,
+        ):
+            active = DynamicKvSizer.pre_compile_estimate(
+                sizer(dks.DynamicKvMode.ACTIVE), {}
+            )
+            assert active == 8000
+            for mode in (dks.DynamicKvMode.DRY_RUN, dks.DynamicKvMode.PINNED):
+                assert DynamicKvSizer.pre_compile_estimate(sizer(mode), {}) == 999
+
+    def test_a_dry_run_reports_a_refused_attention_layout(self, caplog):
+        sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.DRY_RUN)
+        layer = SimpleNamespace(impl=SimpleNamespace(is_causal=None, is_normal=True))
+        with (
+            patch(
+                "vllm_rbln.v1.worker.dynamic_kv_sizer.get_layers_from_vllm_config",
+                return_value={"layer.0": layer},
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            DynamicKvSizer.assert_attention_layout(sizer)
+        assert "dry run" in caplog.text
+        assert "layer.0" in caplog.text
+
+    def test_a_dry_run_reports_cross_layer_sharing(self, caplog):
+        sizer = SimpleNamespace(
+            mode=dks.DynamicKvMode.DRY_RUN,
+            model_runner=SimpleNamespace(
+                kv_cache_bases=[], shared_kv_cache_layers={"layer.1": "layer.0"}
+            ),
+        )
+        with caplog.at_level("WARNING"):
+            DynamicKvSizer.assert_cache_layout(sizer)
+        assert "dry run" in caplog.text
+        assert "cross-layer KV" in caplog.text
+
+
 class TestDynamicKvFailuresRaise:
     """After the shrink, failing to size from the device must not boot: the run
     would serve the pre-compile estimate. The gates before it stay a quiet None."""

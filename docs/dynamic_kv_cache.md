@@ -98,9 +98,11 @@ signature and can replay each other's codegen.
 
 When the pre-compile estimate falls short of one max-length request, it is
 raised to exactly that with a warning instead of letting vllm refuse the compile:
-under the flag the estimate is only the placeholder the model is compiled with,
+under the shrink the estimate is only the placeholder the model is compiled with,
 and the count the device can hold is sized after warm-up, where a pool below one
-request is refused with the same message.
+request is refused with the same message. Only under the shrink -- a dry run, an
+override and a skipped compile all serve this estimate, so raising it there would
+change the pool rather than report on it.
 
 ### Dry run
 
@@ -125,10 +127,14 @@ carry the result:
 
 The dry run is for the vLLM-native path (`VLLM_RBLN_USE_VLLM_MODEL=1`,
 `VLLM_RBLN_USE_DEVICE_TENSOR=1`): those two refusals guard the dynamic compile
-itself, so they hold in a dry run too. A KV transfer connector is only refused by
-the real mode, since it is the reallocation that invalidates the connector's
-registrations; the dry run logs a warning and reports as usual. A sizing failure
-after warm-up (no placement, no fit) is logged as a warning instead of raised.
+itself, so they hold in a dry run too. Everything a dry run cannot break is
+reported instead of refused, so the measurement is of the run that would have
+happened: a KV transfer connector (the reallocation is what invalidates its
+registrations), an attention layer that does not dispatch to a paged naive
+kernel, cross-layer KV sharing, and a sizing failure after warm-up (no placement,
+no fit) all log a warning and the run continues. The pre-compile estimate is
+likewise left alone -- the one-request floor above applies only when the cache is
+shrunk, since every other mode serves that estimate rather than replacing it.
 
 ## Unsupported Configurations
 
@@ -138,7 +144,7 @@ when it is off. Run with `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` to use them.
 | Configuration | Why |
 | --- | --- |
 | KV transfer connectors | The connector registers the KV cache's physical views during warm-up, and the reallocation invalidates them. A dry run does not reallocate and is allowed. |
-| Cross-layer KV sharing | The compiler admits a dynamic KV input through view ops into several paged naive attention calls (`paged_flash_causal_attention_naive_*`, `paged_sliding_window_attention_naive_*`), which is how a deduped base shared by a full-attention and a sliding-window layer compiles; the same view feeding two layers' attention calls is not admitted. |
+| Cross-layer KV sharing | The compiler admits a dynamic KV input through view ops into several paged naive attention calls (`paged_flash_causal_attention_naive_*`, `paged_sliding_window_attention_naive_*`), which is how a deduped base shared by a full-attention and a sliding-window layer compiles; the same view feeding two layers' attention calls is not admitted. A dry run reports it instead. |
 
 ## When Start-up Refuses
 
