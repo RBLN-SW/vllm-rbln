@@ -31,6 +31,7 @@ from vllm.utils.cpu_resource_utils import (
     get_allowed_cpu_list,
     get_visible_memory_node,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -321,7 +322,9 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
     per_seq = 0
     for group in cfg.kv_cache_groups:
         spec = group.kv_cache_spec
-        one_request += spec.max_memory_usage_bytes(vllm_config) // spec.page_size_bytes
+        one_request += cdiv(
+            spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+        )
         admission = getattr(spec, "max_admission_blocks_per_request", None)
         if admission is None and isinstance(
             spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)
@@ -331,11 +334,9 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
                 "max_admission_blocks_per_request; the per-sequence minimum "
                 "would silently fall back to one block."
             )
-        per_seq += (
-            admission(max_num_batched_tokens=1, max_model_len=max_model_len)
-            if admission is not None
-            else 1
-        )
+        # Positional: the first parameter is max_num_batched_tokens before the
+        # vllm bump and max_in_flight_tokens after it; the position is the same.
+        per_seq += admission(1, max_model_len) if admission is not None else 1
     return KvMinimum(
         one_request=one_request,
         decode_batch=vllm_config.scheduler_config.max_num_seqs * per_seq,
