@@ -41,6 +41,7 @@ import threading
 import weakref
 from threading import Thread
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
@@ -50,9 +51,17 @@ from vllm_rbln.patches import register_patch
 
 logger = init_logger(__name__)
 
-# Bounds the engine's wait on the monitor thread: the configurable grace period
-# plus the 4 s SIGTERM wait upstream hardcodes, with slack.
-_TERMINATION_JOIN_TIMEOUT_S = 30.0
+# Upstream's `_ensure_worker_termination` waits the configurable grace period,
+# then 4 s after SIGTERM, then SIGKILLs. The engine's wait on that ladder is
+# derived from the same numbers when the wait begins, so raising the grace
+# period cannot leave the engine free to exit before the SIGKILL.
+_SIGTERM_WAIT_S = 4.0
+_JOIN_SLACK_S = 5.0
+
+
+def _termination_join_timeout_s() -> float:
+    return envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS + _SIGTERM_WAIT_S + _JOIN_SLACK_S
+
 
 _terminated_lock = threading.Lock()
 
@@ -106,11 +115,16 @@ def patched_shutdown(self: MultiprocExecutor) -> None:
             getattr(self, "_rbln_terminated", None) or threading.Event()
         )
         self._rbln_terminated = terminated
+        # Decided under the lock: the engine thread, woken by the failure
+        # callback, can arrive here while the monitor thread is still between
+        # creating the Event and setting the flag.
+        first_caller = not getattr(self, "shutting_down", False)
+        if first_caller:
+            self.shutting_down = True
 
-    if not getattr(self, "shutting_down", False):
+    if first_caller:
         workers = getattr(self, "workers", None)
         logger.debug("[shutdown] Executor: start worker_count=%d", len(workers or []))
-        self.shutting_down = True
 
         if workers:
             for w in workers:
@@ -129,7 +143,7 @@ def patched_shutdown(self: MultiprocExecutor) -> None:
                     w.worker_response_mq = None
 
             try:
-                MultiprocExecutor._ensure_worker_termination([w.proc for w in workers])
+                self._ensure_worker_termination([w.proc for w in workers])
             finally:
                 terminated.set()
         else:
@@ -139,11 +153,12 @@ def patched_shutdown(self: MultiprocExecutor) -> None:
         # Re-entrant call from EngineCore.shutdown() in the dying engine's
         # own `finally`, which now runs while the monitor thread is still
         # ending the workers. Wait, or the process exits before the SIGKILL.
-        if not terminated.wait(timeout=_TERMINATION_JOIN_TIMEOUT_S):
+        timeout_s = _termination_join_timeout_s()
+        if not terminated.wait(timeout=timeout_s):
             logger.warning(
                 "[shutdown] Executor: workers still being terminated after "
                 "%.0fs; continuing engine teardown",
-                _TERMINATION_JOIN_TIMEOUT_S,
+                timeout_s,
             )
 
     if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
