@@ -54,14 +54,19 @@ DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
 
 
 @vllm_config_dataclass
-class RBLNConfig:
-    """RBLN NPU options for the vllm model path."""
+class RBLNConfigBase:
+    """RBLN NPU options that are not specific to one model path."""
 
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
 
     use_custom_sampler: bool = True
     """Use the customized RBLN sampler."""
+
+
+@vllm_config_dataclass
+class RBLNConfig(RBLNConfigBase):
+    """RBLN NPU options for the vLLM-native model path."""
 
     compile_model: bool = True
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
