@@ -41,6 +41,15 @@ def _placement(shards):
 
 HEAD_SPLIT = _placement(tuple(_shard(0, c, (2, S0, 2, 1, 1024, 128)) for c in range(4)))
 
+# The same tensor as HEAD_SPLIT, bound by a second program: dynamo names the
+# symbol differently, which is what splits one tensor set into two groups.
+S1 = ("symbol", "s40")
+HEAD_SPLIT_S1 = SimpleNamespace(
+    shape=(2, S1, 8, 1, 1024, 128),
+    dtype="dlfloat16",
+    shards=tuple(_shard(0, c, (2, S1, 2, 1, 1024, 128)) for c in range(4)),
+)
+
 
 def _program(placements, name="0/0", runtime=None, device=None, extent=4):
     specs = (SimpleNamespace(name="ids", shape=(1,), physical_placement=None),) + tuple(
@@ -75,6 +84,7 @@ def _kv_cache_tensors_for(programs):
 def _bind_sizing(sizer) -> None:
     """Give a SimpleNamespace sizer the real placement-sizing methods."""
     sizer.log_release_shortfall = DynamicKvSizer.log_release_shortfall
+    sizer._specs_covering_tensors = DynamicKvSizer._specs_covering_tensors
     for name in (
         "_kv_growth_from_programs",
         "_size_kv_from_snapshot",
@@ -272,17 +282,55 @@ class TestComputeDynamicKvNumBlocks:
             assert DynamicKvSizer.compute_num_blocks(sizer) is None
         assert "RBLN_DUMMY_DEVICE" in caplog.text
 
-    def test_what_the_slope_is_summed_over_is_logged(self, caplog):
-        """Overlapping but unequal KV sets form two groups and charge the shared
-        tensors twice; the counts have to be readable from the log."""
+    def test_the_same_tensors_seen_twice_are_counted_once(self, caplog):
+        """Prefill and decode bind the same KV tensors, but dynamo names their
+        symbols differently, so they form two groups. Summing both would double
+        the slope and halve the count."""
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
+        ]
+        sizer = self._sizer(
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+        )
+        # Two programs, two groups, but vllm allocated two tensors, not four.
+        sizer.model_runner.kv_cache_config.kv_cache_tensors = [
+            SimpleNamespace(shared_by=["layer.0"]),
+            SimpleNamespace(shared_by=["layer.1"]),
+        ]
+        with caplog.at_level("INFO"):
+            n = DynamicKvSizer.compute_num_blocks(sizer)
+        assert "summed over 2 KV input(s) from 2 set(s)" in caplog.text
+        # 2 MiB per block, not 4: (35 - 30) GiB / 2 MiB.
+        assert n == 5 * 512
+
+    def test_disjoint_sets_are_summed(self, caplog):
+        """A target's and a drafter's KV are different tensors; the sum is the
+        answer."""
         programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
         sizer = self._sizer(
             programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
         )
         with caplog.at_level("INFO"):
             DynamicKvSizer.compute_num_blocks(sizer)
-        assert "summed over 2 KV input(s) in 1 set(s)" in caplog.text
+        assert "summed over 2 KV input(s) from 1 set(s)" in caplog.text
         assert "vllm allocated 2 KV cache tensor(s) for 2 layer(s)" in caplog.text
+
+    def test_a_count_that_matches_neither_reading_is_refused(self):
+        programs = [
+            _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
+            _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
+        ]
+        sizer = self._sizer(
+            programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
+        )
+        sizer.model_runner.kv_cache_config.kv_cache_tensors = [
+            SimpleNamespace(shared_by=["layer.0"]),
+            SimpleNamespace(shared_by=["layer.1"]),
+            SimpleNamespace(shared_by=["layer.2"]),
+        ]
+        with pytest.raises(RuntimeError, match="neither sum to nor"):
+            DynamicKvSizer.compute_num_blocks(sizer)
 
     def test_programs_that_disagree_on_the_layout_are_refused(self):
         other = _placement((_shard(0, 0, (2, S0, 8, 1, 1024, 128)),))

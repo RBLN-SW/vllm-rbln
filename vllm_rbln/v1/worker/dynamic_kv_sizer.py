@@ -523,26 +523,48 @@ class DynamicKvSizer:
                 hint_blocks,
                 format_placements(group_specs),
             )
-        specs = [spec for group_specs, _ in groups for spec in group_specs]
-        # Groups are keyed by the whole input set, so two programs binding
-        # overlapping but unequal sets form two groups and the slope charges the
-        # shared tensors twice. InputSpec carries no tensor identity to dedupe
-        # by, so log what the slope is summed over next to what vllm allocated.
+        tensors = self.model_runner.kv_cache_config.kv_cache_tensors
+        specs = self._specs_covering_tensors(groups, len(tensors))
         logger.info(
-            "[Dynamic KV] the slope is summed over %d KV input(s) in %d set(s); "
+            "[Dynamic KV] the slope is summed over %d KV input(s) from %d set(s); "
             "vllm allocated %d KV cache tensor(s) for %d layer(s).",
             len(specs),
             len(groups),
-            len(self.model_runner.kv_cache_config.kv_cache_tensors),
-            sum(
-                len(t.shared_by)
-                for t in self.model_runner.kv_cache_config.kv_cache_tensors
-            ),
+            len(tensors),
+            sum(len(t.shared_by) for t in tensors),
         )
         growth = kv_growth(specs, hint_blocks)
         program = groups[0][1]
         device = program.device if program.device is not None else self.device
         return growth, hint_blocks, device
+
+    @staticmethod
+    def _specs_covering_tensors(
+        groups: list[tuple[list[Any], Any]], num_tensors: int
+    ) -> list[Any]:
+        """The KV inputs the slope is summed over: every KV tensor once.
+
+        A group is one program's KV input set. Two programs binding the same
+        tensors (prefill and decode) form two groups, because dynamo names the
+        symbols and the arg positions differently; summing both would charge
+        every tensor twice. `InputSpec` carries no tensor identity, so the count
+        vllm allocated is what says which case this is.
+        """
+        flat = [spec for group_specs, _ in groups for spec in group_specs]
+        if len(flat) == num_tensors:
+            # Disjoint sets (a target's and a drafter's): the sum is the answer.
+            return flat
+        sizes = {len(group_specs) for group_specs, _ in groups}
+        if sizes == {num_tensors}:
+            # Every group already covers every tensor, so one of them is it.
+            return list(groups[0][0])
+        raise RuntimeError(
+            f"the compiled programs carry {len(flat)} KV input(s) across "
+            f"{len(groups)} set(s) of {sorted(sizes)}, which neither sum to nor "
+            f"individually match the {num_tensors} KV cache tensor(s) vllm "
+            "allocated. The placement cannot be attributed to tensors, so the "
+            "block count would be wrong."
+        )
 
     def _size_kv_from_snapshot(
         self,
