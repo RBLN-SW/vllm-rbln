@@ -182,6 +182,9 @@ class TestComputeDynamicKvNumBlocks:
         assert (
             "at 2560 blocks: used=37580963840 budget_left=0 total_left=0" in caplog.text
         )
+        # The fill is what the rollout reads: how full each chiplet ends up.
+        assert "= 100.0% of budget, 100.0% of DRAM)" in caplog.text
+        assert "now 86.8% of budget" in caplog.text
 
     def test_a_dry_run_that_cannot_size_warns_instead_of_raising(self, caplog):
         sizer = self._sizer(programs=[_program([])], snapshot=self._snapshot([0] * 4))

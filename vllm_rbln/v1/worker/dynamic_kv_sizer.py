@@ -589,6 +589,11 @@ class DynamicKvSizer:
         )
         now = growth.allocated_at(current)
         proposed = growth.allocated_at(num_blocks)
+
+        def pct(used: int, of: int) -> float:
+            # A dry run never fails the run, not even on a malformed snapshot.
+            return 100.0 * used / of if of else float("nan")
+
         per_unit = []
         for (node, chiplet), fit in sorted(fits.items()):
             unit = (node, chiplet)
@@ -597,9 +602,13 @@ class DynamicKvSizer:
             per_unit.append(
                 f"{node}:{chiplet}(kv_now={now[unit]} base={fit.base} "
                 f"budget={fit.budget} headroom={headroom} = "
-                f"{headroom // fit.per_block:+d} blocks; at {num_blocks} blocks: "
-                f"used={at_proposed} budget_left={fit.budget - at_proposed} "
-                f"total_left={fit.total - at_proposed})"
+                f"{headroom // fit.per_block:+d} blocks, now "
+                f"{pct(fit.base + now[unit], fit.budget):.1f}% of budget; "
+                f"at {num_blocks} blocks: used={at_proposed} "
+                f"budget_left={fit.budget - at_proposed} "
+                f"total_left={fit.total - at_proposed} = "
+                f"{pct(at_proposed, fit.budget):.1f}% of budget, "
+                f"{pct(at_proposed, fit.total):.1f}% of DRAM)"
             )
         minimum = minimum_kv_blocks(self.vllm_config, self.model_runner.kv_cache_config)
         logger.warning(

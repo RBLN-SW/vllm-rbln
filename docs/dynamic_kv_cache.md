@@ -115,11 +115,12 @@ carry the result:
   estimate at, next to the whole-card formula that is kept;
 - after warm-up, `dry run: vllm sized N blocks, this feature would set n (+/-d)`
   with, per `(node, chiplet)`, the bytes the current `N` blocks take, the non-KV
-  base, the budget, the headroom left in bytes and blocks, and what `n` would
-  do: the predicted `used` at `n`, `budget_left` against
-  `total * gpu_memory_utilization` and `total_left` against the chiplet's
-  physical DRAM. A negative headroom means the current count already exceeds
-  the budget on that chiplet. Nothing is allocated at `n`; the real mode's fit
+  base, the budget, the headroom left in bytes and blocks, how full the chiplet
+  is today as a percentage of the budget, and what `n` would do: the predicted
+  `used` at `n`, `budget_left` against `total * gpu_memory_utilization`,
+  `total_left` against the chiplet's physical DRAM, and the fill at `n` as a
+  percentage of both. A negative headroom means the current count already
+  exceeds the budget on that chiplet. Nothing is allocated at `n`; the real mode's fit
   check line is what validates the prediction.
 
 The dry run is for the vLLM-native path (`VLLM_RBLN_USE_VLLM_MODEL=1`,
