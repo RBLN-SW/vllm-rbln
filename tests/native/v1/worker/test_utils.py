@@ -1002,7 +1002,6 @@ class TestReplicationFactorIsGated:
         """
         mock_platform.get_device_name.return_value = "RBLN-CR03"
         mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
-        mock_envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE = dynamic_kv
 
         with patch(
             "vllm_rbln.v1.worker.utils.rbln_device_dram_total_bytes",
@@ -1013,6 +1012,7 @@ class TestReplicationFactorIsGated:
                 _make_parallel_config(tp_size=1),
                 kernel_size=self.KERNEL,
                 gpu_memory_utilization=0.9,
+                exact_dram=dynamic_kv,
             )
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")

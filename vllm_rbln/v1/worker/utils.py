@@ -459,6 +459,7 @@ def estimate_available_memory(
     gpu_memory_utilization: float = 0.9,
     num_devices_per_local_rank: int = 1,
     chiplet_memory: Mapping[Unit, ChipletMemory] | None = None,
+    exact_dram: bool = False,
 ) -> int:
     # We are finding max_num_blocks(x) that satisfies the following equation:
 
@@ -511,8 +512,9 @@ def estimate_available_memory(
         # single device == Quad chiplet
         rsd_size = REBEL_CHIPLET_SIZE
         available_dram_bytes = REBEL_DRAM_NBYTES
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            # Flag-gated: the default path's estimate must not depend on the driver.
+        if exact_dram:
+            # Caller-gated: the default path's estimate must not depend on the
+            # driver, and neither may a dry run, which only observes it.
             device_dram_total = rbln_device_dram_total_bytes()
             if device_dram_total is None:
                 logger.debug(
@@ -615,7 +617,7 @@ def estimate_available_memory(
         available_dram_bytes, num_key_value_heads, rsd_size
     )
     if released_dram_bytes != exact_dram_bytes:
-        # NOTE(RBLN): only the flag path acts on this, so only it warns. The
+        # NOTE(RBLN): only the exact path acts on this, so only it warns. The
         # default path keeps the released number and says so at debug level:
         # warning about an estimate this function is not changing reads as a
         # fault where there is none.
@@ -634,13 +636,11 @@ def estimate_available_memory(
             exact_dram_bytes / 2**30,
         )
         # One format string, two tails: `logger.*(a + b)` trips ruff G003.
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+        if exact_dram:
             logger.warning(disagreement, *args, " Using the exact figure.")
         else:
             logger.debug(disagreement, *args, " Keeping the released figure.")
-    available_dram_bytes = (
-        exact_dram_bytes if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE else released_dram_bytes
-    )
+    available_dram_bytes = exact_dram_bytes if exact_dram else released_dram_bytes
 
     check_oom(available_dram_bytes)
 

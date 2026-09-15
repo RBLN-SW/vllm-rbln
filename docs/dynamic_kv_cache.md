@@ -133,8 +133,13 @@ happened: a KV transfer connector (the reallocation is what invalidates its
 registrations), an attention layer that does not dispatch to a paged naive
 kernel, cross-layer KV sharing, and a sizing failure after warm-up (no placement,
 no fit) all log a warning and the run continues. The pre-compile estimate is
-likewise left alone -- the one-request floor above applies only when the cache is
-shrunk, since every other mode serves that estimate rather than replacing it.
+likewise left alone: the one-request floor above applies only when the cache is
+shrunk, and so do the exact chiplet-replication factor and the driver-read DRAM
+capacity, since every other mode serves that estimate rather than replacing it.
+A dry run therefore compiles at the count the flag off would have picked. What it
+still does differently is mark the KV dim dynamic -- without that the programs
+carry no placement and there is nothing to measure -- so the artifact is a
+dynamic build either way.
 
 ## Unsupported Configurations
 

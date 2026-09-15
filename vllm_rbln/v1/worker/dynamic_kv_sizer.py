@@ -218,11 +218,18 @@ class DynamicKvSizer:
         the shrink makes that estimate a placeholder."""
         if self.mode is DynamicKvMode.DISABLED:
             return estimate_available_memory(**estimate_kwargs)
+        # The exact DRAM figure and the driver's capacity are the resize's, not
+        # this estimate's: every other mode serves it as vllm sized it.
+        estimate_kwargs = {
+            **estimate_kwargs,
+            "exact_dram": self.mode is DynamicKvMode.ACTIVE,
+        }
         if not torch.rbln.is_dummy_device():
             snapshot, source = self.memory_snapshot(self.device)
             if self.mode is DynamicKvMode.DRY_RUN:
                 measured = estimate_available_memory(
-                    **estimate_kwargs, chiplet_memory=snapshot
+                    **{**estimate_kwargs, "exact_dram": True},
+                    chiplet_memory=snapshot,
                 )
                 logger.info(
                     "[Dynamic KV] dry run: the %s memory snapshot of %s would put the "
