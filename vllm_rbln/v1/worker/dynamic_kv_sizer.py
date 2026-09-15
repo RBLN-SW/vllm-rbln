@@ -191,6 +191,15 @@ class DynamicKvSizer:
         self.kv_blocks_before_shrink: int | None = None
         self.programs: list[Any] = []
         self.expected_used: dict[Unit, int] = {}
+        if (
+            self.mode is DynamicKvMode.DISABLED
+            and envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
+        ):
+            logger.warning(
+                "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN is set, but an explicit "
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0 keeps the feature off, so the "
+                "dry run reports nothing. Unset it to measure."
+            )
         # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
         self.foreign_dram_used_bytes = foreign_dram_used_bytes
         device_env = current_platform.device_control_env_var
@@ -365,10 +374,18 @@ class DynamicKvSizer:
         """Scope that records the programs warm-up builds, when the flag is on."""
         if self.mode is DynamicKvMode.DISABLED:
             return nullcontext(None)
-        if not has_torch_rbln:
+        capture = (
+            getattr(torch.rbln, "capture_programs", None) if has_torch_rbln else None
+        )
+        if capture is None:
+            missing = (
+                "torch.rbln is not importable"
+                if not has_torch_rbln
+                else "this torch_rbln does not carry it"
+            )
             message = (
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs torch_rbln's "
-                "capture_programs(); torch.rbln is not importable."
+                f"capture_programs(); {missing}."
             )
             if self.mode is DynamicKvMode.DRY_RUN:
                 # Nothing to capture means nothing to report, which the sizing
@@ -376,7 +393,7 @@ class DynamicKvSizer:
                 logger.warning("[Dynamic KV] dry run: %s", message)
                 return nullcontext(None)
             raise RuntimeError(message)
-        return torch.rbln.capture_programs()
+        return capture()
 
     def collect_runtimes(self) -> list[Any]:
         """Every rbln runtime warm-up built, deduplicated across programs."""
@@ -411,11 +428,19 @@ class DynamicKvSizer:
                 "[Dynamic KV] this torch_rbln has no mem_get_info_per_chiplet(); "
                 "sizing from this process's allocator instead."
             )
+        # This path is reached on a torch_rbln without mem_get_info_per_chiplet,
+        # which may not carry get_device_properties either; say so instead of
+        # failing on the attribute.
+        properties = getattr(torch.rbln, "get_device_properties", None)
+        if properties is None:
+            raise RuntimeError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs torch_rbln's "
+                "get_device_properties() to size from this process's allocator "
+                "when mem_get_info_per_chiplet() is missing."
+            )
         # Cached-but-free blocks would otherwise count as used.
         torch.rbln.empty_cache(device)
-        memory_per_chiplet = int(
-            torch.rbln.get_device_properties(device).memory_per_chiplet
-        )
+        memory_per_chiplet = int(properties(device).memory_per_chiplet)
         snapshot = snapshot_from_allocator(
             torch.rbln.memory_stats_per_chiplet(device),
             memory_per_chiplet=memory_per_chiplet,

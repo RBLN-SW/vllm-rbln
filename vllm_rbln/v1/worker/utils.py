@@ -247,14 +247,16 @@ def rbln_device_dram_total_bytes() -> int | None:
         import torch.rbln
     except ImportError:
         return None
-    if torch.rbln.is_dummy_device():
-        return None
     try:
+        if torch.rbln.is_dummy_device():
+            return None
         total = int(torch.rbln.get_device_properties().total_memory)
-    except RuntimeError as exc:
+    except (RuntimeError, AttributeError) as exc:
+        # AttributeError: a torch_rbln without the symbol at all, which is the
+        # case this fallback exists for.
         logger.warning(
-            "torch.rbln.get_device_properties() failed: %s; falling back to the "
-            "built-in %d byte DRAM capacity.",
+            "torch.rbln.get_device_properties() is unavailable (%s); falling back "
+            "to the built-in %d byte DRAM capacity.",
             exc,
             REBEL_DRAM_NBYTES,
         )

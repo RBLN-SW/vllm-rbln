@@ -287,12 +287,13 @@ environment_variables = {
     ),
     # --- DYNAMIC KV CACHE ---
     # Size the KV cache from the compiled artifact instead of the estimate.
-    # The dry-run variable below implies it.
+    # The dry-run variable below implies it, but only when this one is unset:
+    # an explicit 0 is a decision, not a default to override.
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
         lambda: (
-            os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
-            in ("true", "1")
-            or os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()
+            os.environ["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"].lower() in ("true", "1")
+            if "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" in os.environ
+            else os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()
             in ("true", "1")
         )
     ),
