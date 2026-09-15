@@ -104,12 +104,12 @@ def cfg_square():
 
 class TestFlashAttentionBackendStatic:
     def test_kv_cache_shape(self):
-        # Layout is (2, num_blocks, num_kv_heads, 1, block_size, head_size).
+        # Layout is (num_blocks, 2, num_kv_heads, 1, block_size, head_size).
         # Distinct primes catch any argument re-ordering.
         shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
             num_blocks=7, block_size=11, num_kv_heads=3, head_size=5
         )
-        assert shape == (2, 7, 3, 1, 11, 5)
+        assert shape == (7, 2, 3, 1, 11, 5)
 
     def test_supported_head_sizes(self):
         # Pins the supported set; a change here is a deliberate capability shift.

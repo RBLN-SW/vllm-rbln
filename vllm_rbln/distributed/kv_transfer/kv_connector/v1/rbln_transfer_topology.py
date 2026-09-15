@@ -20,20 +20,24 @@ that substitutes it upstream can import it without pulling the whole connector
 package in at plugin load.
 """
 
-import torch
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     EngineTransferInfo,
     TransferTopology,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
 class RblnTransferTopology(TransferTopology):
-    """Upstream's topology with the KV layout it standardized on in 0.26 undone.
+    """Upstream's topology, refusing the attention cache RBLN now allocates.
+
+    The RBLN attention cache is ``(num_blocks, 2, H, 1, block_size, D)``, so K
+    and V sit inside the same block and cannot become two NIXL regions. The
+    descriptor path has not moved to upstream's interleaved-KV split yet, so
+    this refuses that cache at handshake time rather than transferring halves
+    of itself. MLA and Mamba caches are unaffected and stay on upstream's path.
 
     ``__post_init__`` reimplements upstream's rather than extending it, since
-    upstream's asserts the very layout this class exists to decline. So a
+    upstream's derives the layout from a 5-dim shape RBLN never produces. So a
     field upstream sets there has to be set here too, and leaving one out
     fails nowhere until the first handshake reads it.
     """
@@ -42,6 +46,7 @@ class RblnTransferTopology(TransferTopology):
         self.local_physical_heads = max(1, self.total_num_kv_heads // self.tp_size)
         self._engines: dict[tuple[EngineId, int], EngineTransferInfo] = {}
         self._cross_layers_blocks = False
+        self._is_kv_layout_blocks_first = self.is_mamba
         if self.is_mamba:
             # Upstream skips the shape for the same reason: a Mamba cache is a
             # (conv, ssm) pair, and the connector hands it no tensor shape.
@@ -49,21 +54,18 @@ class RblnTransferTopology(TransferTopology):
         shape = self.attn_backends[0].get_kv_cache_shape(
             num_blocks=1, block_size=16, num_kv_heads=1, head_size=1
         )
-        leading = (1,) if self.is_mla else (2, 1)
-        assert shape[: len(leading)] == leading, (
-            "RBLN NIXL descriptors assume a (2, num_blocks, ...) attention "
-            f"cache or a (num_blocks, ...) MLA cache, got {shape} from "
-            f"{self.attn_backends[0].__name__}."
+        if not self.is_mla:
+            raise NotImplementedError(
+                "RBLN NIXL cuts K and V out of separate regions, which the "
+                f"blocks-first attention cache {shape} from "
+                f"{self.attn_backends[0].__name__} interleaves inside each "
+                "block. Disaggregated serving on RBLN is limited to MLA until "
+                "the descriptor path moves to upstream's interleaved-KV split."
+            )
+        assert shape[:1] == (1,), (
+            "RBLN NIXL descriptors assume a (num_blocks, ...) MLA cache, got "
+            f"{shape} from {self.attn_backends[0].__name__}."
         )
         self._cross_layers_blocks = (
             self.tensor_shape is not None and len(self.tensor_shape) == len(shape) + 1
         )
-
-    def get_transfer_cache_regions(
-        self, cache: torch.Tensor, layer_spec: KVCacheSpec
-    ) -> list[torch.Tensor] | torch.Tensor:
-        if self.is_mla or self.is_mamba or self._cross_layers_blocks:
-            return super().get_transfer_cache_regions(cache, layer_spec)
-        # Iterating the tensor yields K and V; the caller divides the page size
-        # by how many come back.
-        return cache
