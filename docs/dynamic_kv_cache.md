@@ -33,9 +33,9 @@ compile-time cache, and after warm-up sizes the real cache from two measurements
   are rounded to 4 KiB and served best-fit from free blocks, a miss maps a
   2 MiB segment (request up to 1 MiB), a 20 MiB segment (up to 10 MiB) or the
   request rounded up to 2 MiB, and a split block's remainder serves later
-  requests of the same pool. Many mid-size shards therefore share segments
-  (DeepSeek-V3.2's 61 indexer shards of 4.85 MB take 16 segments, not 61), and
-  the rounding costs at most a few blocks below the linear answer.
+  requests of the same pool. A model with many mid-size shards therefore packs
+  several of them into one segment, and the rounding costs at most a few blocks
+  below the linear answer.
 - **Base** -- how many bytes are already spoken for on each chiplet. A per-chiplet
   memory snapshot is taken after the compile-time cache is released, so what
   the runtime does not hand back is measured as base rather than assumed away:
@@ -138,7 +138,7 @@ when it is off. Run with `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` to use them.
 | Configuration | Why |
 | --- | --- |
 | KV transfer connectors | The connector registers the KV cache's physical views during warm-up, and the reallocation invalidates them. A dry run does not reallocate and is allowed. |
-| Cross-layer KV sharing | The compiler admits a dynamic KV input through view ops into several paged naive attention calls (`paged_flash_causal_attention_naive_*`, `paged_sliding_window_attention_naive_*`), which is how a deduped base shared by a full and a sliding-window layer (gpt-oss) compiles; the same view feeding two layers' attention calls is not admitted. |
+| Cross-layer KV sharing | The compiler admits a dynamic KV input through view ops into several paged naive attention calls (`paged_flash_causal_attention_naive_*`, `paged_sliding_window_attention_naive_*`), which is how a deduped base shared by a full-attention and a sliding-window layer compiles; the same view feeding two layers' attention calls is not admitted. |
 
 ## When Start-up Refuses
 
