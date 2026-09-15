@@ -414,6 +414,10 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+        # Compile-affecting only because the compiler bakes the mark_dynamic'd
+        # KV dim's extent: a dry run traces at the count vllm sized, the real
+        # mode at the compile hint. Move to NON_COMPILE once that extent stops
+        # shaping the graph; the two then share a bundle.
         "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
         "VLLM_RBLN_USE_MULTI_BLOCK_ATTN",
     }
