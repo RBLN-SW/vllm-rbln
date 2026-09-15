@@ -387,15 +387,12 @@ def max_num_blocks(
         allocated = growth.allocated_at(n)
         return all(allocated[unit] <= room[unit] for unit in room)
 
-    # fits_all is monotone in n; bisect below the linear bound.
-    low, high = 0, min(linear.values())
-    while low < high:
-        mid = (low + high + 1) // 2
-        if fits_all(mid):
-            low = mid
-        else:
-            high = mid - 1
-    num_blocks = low
+    # Not monotone in n: a shard crossing 10 MiB drops from a 20 MiB segment to
+    # 2 MiB rounding, so a count can fit while smaller ones do not. Scan down
+    # from the linear bound, which is an upper bound on the answer.
+    num_blocks = min(linear.values())
+    while num_blocks > 0 and not fits_all(num_blocks):
+        num_blocks -= 1
 
     fits: dict[Unit, UnitFit] = {}
     for unit, per_block in sorted(growth.per_block.items()):

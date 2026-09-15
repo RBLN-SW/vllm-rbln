@@ -328,6 +328,23 @@ class TestMaxNumBlocks:
         assert n == 15 * 512 + 4
         assert fits[(1, 0)].base == 20 * self.GIB - 8 * 2**20
 
+    def test_a_shard_crossing_a_size_class_does_not_fool_the_search(self):
+        # allocator_reserved dips at 10 MiB (a 20 MiB segment gives way to 2 MiB
+        # rounding), so the fit is not monotone in n and a bisection converges
+        # below the answer: here it returned 1 of the 12 blocks that fit.
+        one_mib = _placement(
+            [2, S, 8, 1, 2048, 128], [_shard(0, 0, [2, S, 1, 1, 2048, 128])]
+        )
+        growth = kv_growth(_specs([one_mib]), hint_blocks=HINT)
+        assert growth.per_block == {(0, 0): 2**20}
+        assert growth.allocated_at(10) == {(0, 0): 20 * 2**20}
+        assert growth.allocated_at(11) == {(0, 0): 12 * 2**20}
+        snapshot = self._snapshot({(0, 0): 35 * self.GIB - 13_000_000})
+        n, _ = max_num_blocks(
+            snapshot, growth, gpu_memory_utilization=1.0, kv_resident={}
+        )
+        assert n == 12
+
     def test_the_answer_is_the_largest_count_that_fits(self):
         # Odd bases so the linear bound over-shoots the allocator's rounding.
         growth = self._growth()
