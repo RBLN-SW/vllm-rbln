@@ -596,11 +596,42 @@ class DynamicKvSizer:
         """Release the compile-time cache, then size from what the runtime
         actually handed back; no KV cache is bound until `apply_num_blocks`."""
         growth, hint_blocks, device = self._kv_growth_from_programs()
+        before, _ = self.memory_snapshot(device)
         self.release_kv_cache_tensors(self.model_runner.kv_cache_config)
-        num_blocks, fits, _, _ = self._size_kv_from_snapshot(
+        num_blocks, fits, after, _ = self._size_kv_from_snapshot(
             growth, device, kv_resident={}
         )
+        self.log_release_shortfall(
+            before, after, growth.allocated_at(hint_blocks), hint_blocks
+        )
         return KvSizing(num_blocks, fits, hint_blocks, growth)
+
+    @staticmethod
+    def log_release_shortfall(
+        before: Mapping[Unit, ChipletMemory],
+        after: Mapping[Unit, ChipletMemory],
+        expected: Mapping[Unit, int],
+        hint_blocks: int,
+    ) -> None:
+        """What the release actually handed back, against the compile-time
+        cache's own allocation. The count is sized from `after`, so bytes that
+        stay resident are charged to the non-KV base and silently cost blocks."""
+        retained = {}
+        for unit, want in expected.items():
+            if unit not in before or unit not in after:
+                continue
+            freed = before[unit].used - after[unit].used
+            if freed < want:
+                retained[unit] = want - freed
+        if not retained:
+            return
+        logger.warning(
+            "[Dynamic KV] the release handed back less than the %d-block compile "
+            "cache holds; these bytes stay resident per chiplet and are charged to "
+            "the non-KV base, so the count comes out lower: %s",
+            hint_blocks,
+            {f"{n}:{c}": v for (n, c), v in sorted(retained.items())},
+        )
 
     def _propose_kv_size(self) -> KvSizing:
         """Size without touching the cache, reporting the count under both

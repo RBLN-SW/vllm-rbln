@@ -74,6 +74,7 @@ def _kv_cache_tensors_for(programs):
 
 def _bind_sizing(sizer) -> None:
     """Give a SimpleNamespace sizer the real placement-sizing methods."""
+    sizer.log_release_shortfall = DynamicKvSizer.log_release_shortfall
     for name in (
         "_kv_growth_from_programs",
         "_size_kv_from_snapshot",
@@ -157,7 +158,9 @@ class TestComputeDynamicKvNumBlocks:
         n = DynamicKvSizer.compute_num_blocks(sizer)
         # chiplet 1: (35 GiB - 30 GiB) / 2 MiB = 2560 blocks, nothing subtracted
         assert n == 5 * 512
-        assert order == ["release", "snapshot"]
+        # The first snapshot is the before-release reading the shortfall check
+        # compares against; the count is sized from the one after it.
+        assert order == ["snapshot", "release", "snapshot"]
 
     def test_a_dry_run_reports_and_resizes_nothing(self, caplog, monkeypatch):
         current = 200
@@ -240,7 +243,8 @@ class TestComputeDynamicKvNumBlocks:
 
         sizer.memory_snapshot = snapshot
         DynamicKvSizer.compute_num_blocks(sizer)
-        assert seen == [torch.device("cpu", 3)]
+        # Both readings -- before the release and the one sized from.
+        assert seen == [torch.device("cpu", 3)] * 2
 
     def test_a_base_over_budget_is_refused_with_the_breakdown(self):
         programs = [_program([HEAD_SPLIT])]
@@ -649,6 +653,36 @@ class TestDynamicKvLayoutGuards:
         )
         with pytest.raises(RuntimeError, match="cross-layer KV"):
             DynamicKvSizer.assert_cache_layout(sizer)
+
+
+class TestReleaseShortfallIsReported:
+    """The count is sized from the snapshot after the release, so bytes the
+    runtime keeps are charged to the non-KV base and silently cost blocks."""
+
+    @staticmethod
+    def _mem(used):
+        return {u: dks.ChipletMemory(total=100, used=used[u]) for u in used}
+
+    def test_a_full_release_says_nothing(self, caplog):
+        with caplog.at_level("WARNING"):
+            DynamicKvSizer.log_release_shortfall(
+                self._mem({(0, 0): 50, (0, 1): 50}),
+                self._mem({(0, 0): 10, (0, 1): 10}),
+                {(0, 0): 40, (0, 1): 40},
+                4,
+            )
+        assert caplog.text == ""
+
+    def test_retained_bytes_are_named_per_chiplet(self, caplog):
+        with caplog.at_level("WARNING"):
+            DynamicKvSizer.log_release_shortfall(
+                self._mem({(0, 0): 50, (0, 1): 50}),
+                self._mem({(0, 0): 10, (0, 1): 35}),  # chiplet 1 kept 25
+                {(0, 0): 40, (0, 1): 40},
+                4,
+            )
+        assert "the 4-block compile cache holds" in caplog.text
+        assert "{'0:1': 25}" in caplog.text
 
 
 class TestDryRunOnlyObserves:
