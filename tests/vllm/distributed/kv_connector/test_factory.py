@@ -24,7 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
 
 
-def test_native_backend_registers_every_connector():
+def test_vllm_path_registers_every_connector():
     registry = KVConnectorFactory._registry
     assert "RblnNixlPullConnector" in registry
     assert "RblnNixlPushConnector" in registry

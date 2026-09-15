@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Builders for the native v1/attention tests: a kv-cache spec, the builder,
+"""Builders for the v1/attention tests: a kv-cache spec, the builder,
 and the CommonAttentionMetadata input that build() reads (CPU, no mocks)."""
 
 from __future__ import annotations

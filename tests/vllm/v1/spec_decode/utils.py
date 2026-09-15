@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Builders for the native eagle proposer tests: a real RBLNEagleProposer from
+"""Builders for the eagle proposer tests: a real RBLNEagleProposer from
 upstream's eagle model pair (config-only fetch), with the compiled model left
 unset for the caller to mock."""
 

@@ -23,7 +23,7 @@ from tests.vllm.utils import (
     _SPAWN_CHILD_ENV,
     _SPAWN_RESULTS_ENV,
     LAYERS_PINNABLE_ENV,
-    NATIVE_ENV,
+    VLLM_RBLN_ENV,
     ModuleSpawn,
     host_chip,
     read_log_tail,
@@ -380,7 +380,7 @@ def pytest_configure(config):
     global _scrubbed, _config
     _config = config
     _scrubbed = scrub_env()
-    os.environ.update(NATIVE_ENV)
+    os.environ.update(VLLM_RBLN_ENV)
 
     # Must land before the import below: platform.py reads this at module scope.
     device_tensor = config.getoption("--device-tensor")
@@ -431,21 +431,21 @@ def pytest_report_header(config):
 
     origin = "explicit" if config.getoption("--device-tensor") else "source default"
     header = [
-        f"native: env {', '.join(f'{k}={v}' for k, v in NATIVE_ENV.items())}",
-        f"native: device_type={RblnPlatform.device_type} ({origin})",
+        f"vllm-rbln: env {', '.join(f'{k}={v}' for k, v in VLLM_RBLN_ENV.items())}",
+        f"vllm-rbln: device_type={RblnPlatform.device_type} ({origin})",
     ]
     num_hidden_layers = _session_layers(config)
     pinnable = (
         " (a spec may pin its own)" if os.environ.get(LAYERS_PINNABLE_ENV) else ""
     )
     header.append(
-        f"native: num_hidden_layers={num_hidden_layers or 'whole model'}{pinnable}",
+        f"vllm-rbln: num_hidden_layers={num_hidden_layers or 'whole model'}{pinnable}",
     )
     # Which chip a job landed on decides which specs run, and a step may request
     # several -- so the run has to say which one it got.
-    header.append(f"native: chip={host_chip() or 'unknown'}")
+    header.append(f"vllm-rbln: chip={host_chip() or 'unknown'}")
     if _scrubbed:
-        header.append(f"native: scrubbed {', '.join(sorted(_scrubbed))}")
+        header.append(f"vllm-rbln: scrubbed {', '.join(sorted(_scrubbed))}")
     return header
 
 

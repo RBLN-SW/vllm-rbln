@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HF and vLLM runners for the native suite. Imports vllm at module scope, so
+"""HF and vLLM runners for this suite. Imports vllm at module scope, so
 import lazily from a fixture (after pytest_configure sets the env)."""
 
 from __future__ import annotations

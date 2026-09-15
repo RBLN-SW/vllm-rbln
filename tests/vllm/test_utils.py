@@ -23,8 +23,8 @@ import pytest
 
 from .test_envs import ENV_SOURCE_ALIASES, RBLN_KEYS
 from .utils import (
-    NATIVE_ENV,
     SCRUBBED_EXTRA,
+    VLLM_RBLN_ENV,
     devices_needed,
     is_scrubbed,
     rbln_device_count,
@@ -99,7 +99,7 @@ def test_extra_entries_are_real_additions():
     assert not redundant, f"{redundant} are already scrubbed by the prefix rule"
 
 
-def test_native_env_pins_no_host_description():
+def test_vllm_env_pins_no_host_description():
     """The suite may pin behavior, never machine identity: pinning the device
     list or the SOC would hard-code one host's topology."""
     host_description = {
@@ -108,7 +108,7 @@ def test_native_env_pins_no_host_description():
         "RBLN_FORCE_NPU_NAME",
         "RBLN_TARGET_SOC",
     }
-    assert not (set(NATIVE_ENV) & host_description)
+    assert not (set(VLLM_RBLN_ENV) & host_description)
 
 
 class TestDeviceInventory:

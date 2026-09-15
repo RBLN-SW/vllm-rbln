@@ -117,7 +117,7 @@ def fake_engine(monkeypatch):
     return engine
 
 
-def test_native_defaults_apply_and_kwargs_override(fake_engine):
+def test_runner_defaults_apply_and_kwargs_override(fake_engine):
     with AsyncVllmRunner(MODEL, data_parallel_size=4, block_size=512):
         pass
     args = fake_engine.captured["args"]

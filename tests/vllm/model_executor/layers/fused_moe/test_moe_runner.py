@@ -334,7 +334,7 @@ class TestRoutingMaskDtype:
 
 class TestRegistration:
     def test_moe_runner_resolves_to_rbln_oot_implementation(self):
-        # The native conftest loads the general plugins before collection, so
+        # The suite conftest loads the general plugins before collection, so
         # RBLNMoERunner is already registered as the out-of-tree MoERunner.
         assert maybe_get_oot_by_class(MoERunner) is RBLNMoERunner
         # The factory path itself: PluggableLayer.__new__ allocates the RBLN class
