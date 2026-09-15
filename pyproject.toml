@@ -40,6 +40,8 @@ dependencies = [
     "datasets>=4.0.0",
     "qwen_vl_utils",
     "vllm==0.26.0+cpu",
+    # vllm 0.26.0 imports openai.types.responses.NamespaceTool (openai>=2.25.0) but declares openai>=2.0.0
+    "openai>=2.25.0",
     "fastapi[standard]<0.137",
     "torch",
     "torchvision",
