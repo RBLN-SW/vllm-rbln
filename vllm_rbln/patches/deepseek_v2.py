@@ -236,7 +236,7 @@ def rbln_indexer_forward(
     if getattr(self.k_cache, "scale_cache", None) is not None:
         scale_cache = _resolve_kv_cache(
             attn_metadata, self.k_cache.scale_cache.layer_index
-        ).squeeze(-1)  # [num_block, ps, 1] -> [num_block, ps]
+        )
 
     weights = weights.contiguous()  # [B, T, n_head]
     softmax_scale = torch.tensor(

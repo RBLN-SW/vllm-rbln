@@ -125,6 +125,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_base_bindings,
     build_kv_cache_forward_context_kwargs,
+    kv_cache_dynamic_axis,
     validate_shared_attention_kv_cache_contiguity,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
@@ -2946,7 +2947,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         kv_caches: dict[str, torch.Tensor] = {}
         kv_cache_base_tensors: dict[str, torch.Tensor] = {}
         kv_cache_view_infos: dict[str, KVCacheViewInfo] = {}
-        marked_layers: list[str] = []
+        marked_layers: list[tuple[str, int]] = []
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -2992,6 +2993,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
+                    if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+                        base_dynamic_axis = kv_cache_dynamic_axis(
+                            attn_backend,
+                            kernel_num_blocks,
+                            kernel_block_size,
+                            kv_cache_spec,
+                            self.cache_config.cache_dtype,
+                            kv_cache_stride_order,
+                        )
+                        view_dynamic_axis = inv_order.index(base_dynamic_axis)
+                    else:
+                        base_dynamic_axis = None
+                        view_dynamic_axis = None
                     # Keep the deduped base in a backend-native multidimensional
                     # shape so export/Relay never sees a giant flat dimension.
                     typed_base = (
@@ -3000,26 +3014,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         .view(kv_cache_shape)
                     )
                     kv_caches[layer_name] = typed_base.permute(*inv_order)
-                    if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-                        # Keeps num_blocks resizable after compile; the compiler
-                        # allows one dynamic dim with a single attention use.
-                        torch._dynamo.mark_dynamic(kv_caches[layer_name], 1)
-                        marked_layers.append(layer_name)
+                    if view_dynamic_axis is not None:
+                        # The graph input when no base is shared across layers
+                        # (kv_cache_bases stays empty then); otherwise a no-op.
+                        torch._dynamo.mark_dynamic(
+                            kv_caches[layer_name], view_dynamic_axis
+                        )
+                        marked_layers.append((layer_name, view_dynamic_axis))
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
                         view_shape=kv_cache_shape,
                         permute_order=tuple(inv_order),
+                        dynamic_axis=base_dynamic_axis,
                     )
                 else:
                     raise NotImplementedError
 
         if marked_layers:
+            first_layer, first_axis = marked_layers[0]
             logger.info(
-                "[Dynamic KV] mark_dynamic(kv_cache, dim=1) applied to %d layer(s); "
-                "%s shape=%s",
+                "[Dynamic KV] mark_dynamic(kv_cache) applied to %d layer(s); "
+                "%s dim=%d shape=%s",
                 len(marked_layers),
-                marked_layers[0],
-                tuple(kv_caches[marked_layers[0]].shape),
+                first_layer,
+                first_axis,
+                tuple(kv_caches[first_layer].shape),
             )
 
         return kv_caches, kv_cache_base_tensors, kv_cache_view_infos
@@ -3076,6 +3095,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_cache_view_infos,
             num_attn_module,
         )
+        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE and self.kv_cache_bases:
+            # With shared bases these are the graph inputs and the per-layer
+            # views are built inside the graph.
+            base_axes = {
+                info.base_index: info.dynamic_axis
+                for info in self.kv_cache_view_infos
+                if info.dynamic_axis is not None
+            }
+            for index, base in enumerate(self.kv_cache_bases):
+                torch._dynamo.mark_dynamic(base, base_axes[index])
+            logger.info(
+                "[Dynamic KV] mark_dynamic(kv_cache_base, dim=%s) applied to %d "
+                "deduped base(s); shape=%s",
+                sorted(set(base_axes.values())),
+                len(self.kv_cache_bases),
+                tuple(self.kv_cache_bases[0].shape),
+            )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
         forward_context = self.compilation_config.static_forward_context
