@@ -3,4 +3,4 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-run_pytest tests/native -v --durations 25 "$@"
+run_pytest tests/vllm -v --durations 25 "$@"

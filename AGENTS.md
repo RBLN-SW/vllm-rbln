@@ -16,7 +16,7 @@ A pure agent-authored change is not acceptable. Upstream vLLM states the same ru
 Run everything through `uv`. Never use the system `python3` or a bare `pip`.
 
 ```bash
-uv run --no-sync pytest tests/native/v1/worker/test_rbln_worker.py::<one test> -x
+uv run --no-sync pytest tests/vllm/v1/worker/test_rbln_worker.py::<one test> -x
 uvx pre-commit run --files <every file you changed>
 ```
 
@@ -26,7 +26,7 @@ Run `pre-commit` through `uvx`, since it is not a project dependency. Pass `--fi
 
 A new `.py` file needs the Apache header that every other file carries; `check-license-header` rejects it otherwise. Copy the header from a neighbouring file.
 
-`tests/native/` defines three session options (see its `conftest.py`):
+`tests/vllm/` defines three session options (see its `conftest.py`):
 
 - `--model-compile` — opt into whole-model compiles, minutes per test
 - `--device-tensor {0,1}` — session-wide, cannot be parametrized per test
@@ -38,8 +38,8 @@ They do not exist in `tests/optimum/`.
 
 The codebase already has a word for each of these. Use it, and do not reach for a synonym because the sentence reads better.
 
-- **model path** — which model implementation runs. The two are the **optimum-rbln path** and the **vLLM-native path**; `optimum` and `native` are the short forms in prose, while the modules implementing a path carry the `_impl` suffix (`platform/optimum_impl.py`, `platform/vllm_impl.py`). Not "backend", not "mode". `torch.compile` describes how the native path works and is not its name.
-- **suite** — a top-level test tree: `tests/native/`, `tests/optimum/`.
+- **model path** — which model implementation runs. The two are the **optimum-rbln path** and the **vLLM-native path**; `optimum` and `native` are the short forms in prose. Identifiers name a path after the model implementation it selects, `optimum` and `vllm`: `tests/optimum/` and `tests/vllm/`, `platform/optimum_impl.py` and `platform/vllm_impl.py`. Not "backend", not "mode". `torch.compile` describes how the native path works and is not its name.
+- **suite** — a top-level test tree: `tests/vllm/`, `tests/optimum/`.
 - **lane** — a slice of a suite selected by a flag, a mark, or the device mode: the default lane, the `--model-compile` lane, the cpu and device lanes.
 
 ## Two model paths
@@ -57,7 +57,7 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 - Say which path or paths you changed in the PR description.
 - A change to one path must not alter the other. If it appears to need both, stop and ask before writing code.
 - A new env var goes in three places in `envs.py`: the `TYPE_CHECKING` block, the `environment_variables` dict, and either `RBLN_COMPILE_ENV` or `RBLN_NON_COMPILE_ENV`. The two sets partition the mega-cache bundle key, and `test_mega_cache.py` asserts they cover every variable.
-- Suites carry the path: `tests/native/` sets it to `1` in its conftest and scrubs `VLLM_RBLN_*`; `tests/optimum/` has no suite-level conftest and takes the default. An exported `VLLM_RBLN_USE_VLLM_MODEL` therefore changes what `tests/optimum/` exercises without failing.
+- Suites carry the path: `tests/vllm/` sets it to `1` in its conftest and scrubs `VLLM_RBLN_*`; `tests/optimum/` has no suite-level conftest and takes the default. An exported `VLLM_RBLN_USE_VLLM_MODEL` therefore changes what `tests/optimum/` exercises without failing.
 - Do not set `VLLM_RBLN_USE_VLLM_MODEL` inside a test to escape its suite.
 
 ## Patching upstream vLLM
@@ -137,7 +137,7 @@ Code either succeeds or fails with a clear error.
 - Extend an existing file, `conftest.py` fixture, or `utils.py` helper before adding a new file.
 - Do not add a test that is skipped as a placeholder. A test that never runs covers nothing while reading as coverage that exists.
 - `--strict-markers` turns a misspelled mark into a collection error, but a mark you leave off is silent. Forgetting `model_compile` is how a whole-model compile ends up in the lane that runs on every PR.
-- The `model_compile`, `use_device`, and `maybe_use_device` marks exist in `tests/native/` only.
+- The `model_compile`, `use_device`, and `maybe_use_device` marks exist in `tests/vllm/` only.
 - `tests/optimum/optimum_correctness/` holds `fire` CLI scripts, not pytest tests. Do not add `test_*.py` there.
 
 ## Reporting
@@ -163,6 +163,6 @@ The two have different lifetimes. The squash merge keeps the subject line and di
 
 Read and follow the matching skill at the point it applies:
 
-- Adding or changing tests under `tests/native/`: `.claude/skills/writing-tests/SKILL.md`
+- Adding or changing tests under `tests/vllm/`: `.claude/skills/writing-tests/SKILL.md`
 - Investigating a bug, a test failure, or unexpected behavior: `.claude/skills/debugging/SKILL.md`
 - Before claiming a change is done: `.claude/skills/finishing-a-change/SKILL.md`
