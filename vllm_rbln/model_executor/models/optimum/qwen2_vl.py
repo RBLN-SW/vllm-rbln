@@ -18,7 +18,7 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMRoPE
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLImageEmbeddingInputs,
     Qwen2_5_VLImagePixelInputs,
@@ -60,14 +60,13 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
     RBLNOptimumDecoderMixin,
+    SupportsMRoPE,
     ABC,
 ):
     """
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
     Automatically detects model type based on the model configuration.
     """
-
-    supports_mrope = True
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
