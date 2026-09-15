@@ -1521,6 +1521,23 @@ class TestDummyRunDraftParticipation:
         monkeypatch.setattr(mr, "build_kv_cache_forward_context_kwargs", lambda b: {})
         return runner, drafter
 
+    def test_idle_backbone_runs_the_window_the_draft_the_decided_length(
+        self, monkeypatch
+    ):
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        staged: list = []
+
+        def record(**kwargs):
+            staged.append(kwargs["layout"].query_len)
+            return SimpleNamespace(as_kwargs=lambda: {})
+
+        monkeypatch.setattr(runner.input_stager, "stage", record)
+
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert staged == [1 + self.NUM_SPEC]
+        drafter.dummy_run.assert_called_once_with(1, 1, False)
+
     def test_idle_draft_runs_the_decided_length(self, monkeypatch):
         # Beside a prefilling peer the step decides this rank's own single token,
         # and the group's token dimension is sized for that. Running the draft at

@@ -2491,8 +2491,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # here and no collective inside the forward is left half-done.
             return
         query_len = batch_desc.query_len
+        target_query_len = query_len
+        if not is_prefill and self.uses_fixed_decode_window:
+            target_query_len = max(query_len, self.num_spec_tokens + 1)
+            assert batch_desc.num_tokens_padded is None or (
+                batch_desc.num_reqs_padded * target_query_len
+                <= batch_desc.num_tokens_padded
+            ), (
+                f"a decode window of {batch_desc.num_reqs_padded} x "
+                f"{target_query_len} does not fit the "
+                f"{batch_desc.num_tokens_padded} tokens the ranks settled on"
+            )
 
-        num_scheduled_tokens = np.array([query_len] * num_reqs, dtype=np.int32)
+        num_scheduled_tokens = np.array([target_query_len] * num_reqs, dtype=np.int32)
         num_tokens = int(num_scheduled_tokens.sum())
         # The decided length, not the requested one, is what the buffers below are
         # sliced to.
@@ -2514,7 +2525,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         attn_metadata, _ = self._build_attention_metadata(
             num_tokens=num_tokens,
-            max_query_len=query_len,
+            max_query_len=target_query_len,
             num_reqs=num_reqs,
             num_reqs_padded=batch_desc.num_reqs_padded,
         )
@@ -2534,9 +2545,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         token_indices: torch.Tensor | None = None
         if self.use_wrapped_compute_logits and is_prefill:
             token_indices = torch.arange(
-                query_len - 1,
-                num_reqs * query_len,
-                query_len,
+                target_query_len - 1,
+                num_reqs * target_query_len,
+                target_query_len,
                 device=input_ids.device,
                 dtype=torch.int32,
             )
@@ -2549,21 +2560,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             intermediate_tensors = None
         else:
             intermediate_tensors = self._create_or_get_intermediate_tensors(
-                batch_desc.num_reqs_padded, query_len
+                batch_desc.num_reqs_padded, target_query_len
             )
 
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
-            input_ids=input_ids.view(num_reqs, query_len),
-            positions=positions.view(num_reqs, query_len),
+            input_ids=input_ids.view(num_reqs, target_query_len),
+            positions=positions.view(num_reqs, target_query_len),
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=token_indices,
             layout=InputLayout(
                 num_reqs=num_reqs,
                 num_reqs_padded=batch_desc.num_reqs_padded,
-                query_len=query_len,
-                query_len_padded=query_len,
+                query_len=target_query_len,
+                query_len_padded=target_query_len,
             ),
         )
 
