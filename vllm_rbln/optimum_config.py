@@ -1,41 +1,42 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
-
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RBLN options for the vLLM-native model path.
+"""RBLN options for the optimum-rbln model path.
 
 On this path the config *is* `VllmConfig.additional_config`, which
 `check_and_update_config` replaces with the resolved object. Being a
 `VllmConfig` field is what carries it to every worker in the config pickle,
 and what makes `VllmConfig.compute_hash()` call our `compute_hash`.
-`platform.py` gates all of it on `VLLM_RBLN_USE_VLLM_MODEL=1`.
+`platform.py` gates all of it on `VLLM_RBLN_USE_VLLM_MODEL` being unset or 0.
+
+`config.py` is the same thing for the vLLM-native path. Neither file imports
+the other: a path takes the options it reads and nothing else.
 
 Resolution order, highest first:
 
-  1. `additional_config`, an `RBLNConfig` or a dict of field names. The
+  1. `additional_config`, an `OptimumRBLNConfig` or a dict of field names. The
      `--rbln-*` flags write into it.
   2. `VLLM_RBLN_<FIELD>`, read through `envs.py` so the parsing there still
-     applies. `_ENV_PROBE` lists the names that break the pattern.
+     applies, for the fields that have such a variable. `_ENV_PROBE` lists the
+     names that break the pattern.
   3. the field default
-
-Most call sites still read `envs.py` directly. They move over one subsystem
-at a time.
 """
 
 import argparse
 import os
 from dataclasses import field, fields
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from vllm.config.utils import config as vllm_config_dataclass
 
@@ -46,124 +47,83 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The flags are `--rbln-*` on either path, so the group keeps one name.
 _GROUP_TITLE = "RBLNConfig"
 
-DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
+_INTERNAL = {"internal": True}
 
 
 @vllm_config_dataclass
-class RBLNConfig:
-    """RBLN NPU options for the vLLM-native model path."""
+class OptimumRBLNConfig:
+    """RBLN NPU options for the optimum-rbln model path."""
 
+    # ====================================================================
+    # Given by the user
+    # ====================================================================
     num_devices_per_local_rank: int = 1
-    """Number of NPU devices assigned to each local rank."""
+    """Number of NPU devices assigned to each local rank. A pre-compiled model
+    overrides this with the value it was compiled for."""
 
     sampler: bool = True
     """Use the customized RBLN sampler."""
 
-    compile_model: bool = True
-    """Compile models with torch.compile. Otherwise run CPU eager mode, if
-    possible."""
+    optimum_overrides: dict[str, Any] = field(default_factory=dict)
+    """Entries for optimum-rbln's model config (its `rbln_config`), laid over
+    what vllm-rbln derives from the vLLM settings when the model is compiled.
+    With a pre-compiled model only the `device` entries apply."""
 
-    compile_strict_mode: bool = False
-    """Compile with torch.compile's strict mode, which fails on a graph break
-    instead of falling back to eager."""
+    prefix_block_size: int | None = None
+    """Block size of the prefix cache. Defaults to the prefill chunk size."""
 
-    num_hidden_layers: int = 0
-    """Build only the first N decoder layers and leave the rest as
-    `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
-    truncation."""
+    # ====================================================================
+    # Written by the platform hook and the config sync. Not user-facing, and
+    # overwritten if given.
+    # ====================================================================
+    user_max_num_batched_tokens: int | None = field(default=None, metadata=_INTERNAL)
+    """`--max-num-batched-tokens` as the user gave it, copied here by the
+    platform hook before vLLM fills in its default. Under `optimum` it is the
+    prefill chunk size to compile."""
 
-    enforce_model_fp32: bool = False
-    """Force the model dtype to fp32 instead of model_config.dtype."""
+    cached_model_path: str | None = field(default=None, metadata=_INTERNAL)
+    """Where the compile cache holds, or will put, this model's artifact."""
 
-    use_dynamic_kv_cache: bool = False
-    """Size the KV cache from the compiled artifact instead of the estimate."""
+    attn_block_size: int | None = field(default=None, metadata=_INTERNAL)
+    """The KV-cache block size (`kvcache_block_size`), when prefix caching
+    splits it from cache_config.block_size. Copied out of `rbln_config` or the
+    artifact for the processes that have no RBLNParams of their own."""
 
-    flash_causal_attn: bool = True
-    """Use flash attention for causal attention."""
+    num_blocks_override: int | None = field(default=None, metadata=_INTERNAL)
+    """cache_config.num_gpu_blocks_override as given, before the prefix-cache
+    block ratio is applied."""
 
-    batch_attn_opt: bool = False
-    """Use the batch attention optimization for paged attention."""
+    num_blocks_synced: bool = field(default=False, metadata=_INTERNAL)
+    """Set once num_gpu_blocks is derived from the compiled model, so the
+    second run of the sync in EngineCore does not derive it again."""
 
-    use_custom_kernel: bool = False
-    """Use the custom RBLN kernels."""
-
-    sub_block_cache: bool = True
-    """Enable sub-block prefix caching. The sub-block size equals
-    max_num_batched_tokens (the prefill chunk size)."""
-
-    specialize_moe_decode: bool = True
-    """Specialize the case where every instance is at the decode stage."""
-
-    use_moe_tokens_mask: bool = True
-    """Apply the tokens mask to the MoE expert kernel."""
-
-    dispatch_all2all: bool = False
-    """Use all2all dispatch instead of all-gather for MoE DP dispatch."""
-
-    combine_all2all: bool = False
-    """Use all2all combine instead of reduce-scatter for MoE DP combine."""
-
-    decode_batch_bucket_strategy: DecodeBatchBucketStrategy = "exponential"
-    """How the decode batch buckets are laid out."""
-
-    decode_batch_bucket_min: int = 1
-    """Smallest decode batch bucket."""
-
-    decode_batch_bucket_step: int = 2
-    """Step between decode batch buckets."""
-
-    decode_batch_bucket_limit: int = 1
-    """Largest decode batch bucket."""
-
-    decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
-    """Explicit decode batch sizes, used when the strategy is `manual`."""
-
-    nixl_swa_view_opt: bool = False
-    """Publish a second SWA-sized descriptor range alongside the Full-sized
-    range at the same NIXL base addresses, so SWA groups transfer only
-    `sliding_window` bytes per block over RDMA."""
-
-    use_w8a8: bool = False
-    """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
-    whose kernels take an fp8 activation."""
+    image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_INTERNAL)
+    """Image-prefill buckets (gemma3/gemma4), read by the scheduler, which has
+    no RBLNParams of its own."""
 
     def compute_hash(self) -> str:
         """Hash of the fields that change the compiled artifact.
 
-        `VllmConfig.compute_hash()` calls this and `mega_cache` uses that for
-        its bundle key, so changing a field listed below keeps the compiled
-        graphs.
+        `VllmConfig.compute_hash()` calls this, so a field ignored below leaves
+        an already compiled model valid.
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
-        ignored_factors = {
-            # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. The rest change what runs, not what is built.
-            "sampler",
-            "compile_strict_mode",
-            "sub_block_cache",
-            "nixl_swa_view_opt",
-        }
-        return hash_factors(get_hash_factors(self, ignored_factors))
-
-    def __post_init__(self) -> None:
-        buckets = self.decode_batch_bucket_manual_buckets
-        if any(b <= 0 for b in buckets):
-            raise ValueError("decode_batch_bucket_manual_buckets must all be > 0")
-        if len(buckets) != len(set(buckets)):
-            raise ValueError("decode_batch_bucket_manual_buckets must be unique")
-        if self.decode_batch_bucket_strategy == "manual" and not buckets:
-            raise ValueError(
-                "decode_batch_bucket_strategy='manual' needs at least one entry "
-                "in decode_batch_bucket_manual_buckets"
-            )
+        # The sampler changes what runs, not what optimum-rbln builds.
+        return hash_factors(get_hash_factors(self, {"sampler"}))
 
 
 # `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
 # without vllm installed, so it cannot see that this makes a dataclass.
-_FIELDS = fields(RBLNConfig)  # type: ignore[arg-type]
+_FIELDS = fields(OptimumRBLNConfig)  # type: ignore[arg-type]
+
+
+# TODO(vllm-rbln>=0.12.0): delete. Former additional_config keys, still accepted
+# with a warning.
+_RENAMED_KEYS = {"rbln_config": "optimum_overrides"}
 
 
 # Which env name means "the user set this field". It is VLLM_RBLN_<FIELD>
@@ -174,7 +134,6 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_TP_SIZE",
     ),
-    "use_custom_kernel": ("RBLN_USE_CUSTOM_KERNEL",),
 }
 
 
@@ -184,6 +143,8 @@ def _env_overrides() -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     for f in _FIELDS:
         env_name = f"VLLM_RBLN_{f.name.upper()}"
+        if env_name not in envs.environment_variables:
+            continue
         for probe in _ENV_PROBE.get(f.name, (env_name,)):
             if probe in os.environ:
                 overrides[f.name] = getattr(envs, env_name)
@@ -191,21 +152,32 @@ def _env_overrides() -> dict[str, Any]:
     return overrides
 
 
-def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
+def build_optimum_rbln_config(additional_config: Any = None) -> OptimumRBLNConfig:
     """Resolve the RBLN config from `additional_config` and the environment.
 
-    An `RBLNConfig` is returned unchanged, so a process that receives one
-    cannot resolve it into something different.
+    An `OptimumRBLNConfig` is returned unchanged, so a process that receives
+    one cannot resolve it into something different.
     """
-    if isinstance(additional_config, RBLNConfig):
+    if isinstance(additional_config, OptimumRBLNConfig):
         return additional_config
 
     given: dict[str, Any] = additional_config or {}
     if not isinstance(given, dict):
         raise ValueError(
-            "additional_config must be an RBLNConfig or a mapping of its field "
-            f"names on the vLLM-native path, got {type(given).__name__}"
+            "additional_config must be an OptimumRBLNConfig or a mapping of its "
+            f"field names on the optimum-rbln path, got {type(given).__name__}"
         )
+
+    for old, new in _RENAMED_KEYS.items():
+        if old in given:
+            logger.warning_once(
+                "additional_config[%r] is deprecated and will be removed in "
+                "0.12.0; use %r.",
+                old,
+                new,
+            )
+            given = {**given, new: given[old]}
+            del given[old]
 
     known = {f.name for f in _FIELDS}
     if unknown := sorted(set(given) - known):
@@ -213,8 +185,8 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
         # keyword arguments. Upstream's --gdn-prefill-backend arrives this way:
         # arg_utils writes it into additional_config.
         raise ValueError(
-            f"additional_config takes only RBLNConfig fields on the "
-            f"vLLM-native path, and {unknown} are not fields. The fields are "
+            f"additional_config takes only OptimumRBLNConfig fields on the "
+            f"optimum-rbln path, and {unknown} are not fields. The fields are "
             f"{sorted(known)}."
         )
 
@@ -228,46 +200,7 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
             ", ".join(shadowed),
         )
 
-    return RBLNConfig(**overrides)
-
-
-_rbln_config: RBLNConfig | None = None
-
-
-def set_rbln_config(config: RBLNConfig) -> None:
-    """Publish the resolved config for this process.
-
-    Each process does this at its own entry point. A worker and EngineCore
-    receive an already-built `VllmConfig`, so its `__post_init__` -- where the
-    platform hook runs -- does not run again there.
-    """
-    global _rbln_config
-    _rbln_config = config
-
-    defaults = RBLNConfig()
-    changed = {
-        f.name: getattr(config, f.name)
-        for f in _FIELDS
-        if getattr(config, f.name) != getattr(defaults, f.name)
-    }
-    logger.info("RBLN config: %s", changed or "all defaults")
-
-
-def get_rbln_config() -> RBLNConfig:
-    """The resolved RBLN config for this process.
-
-    There is deliberately no fallback to the environment. A child process
-    inherits env vars but not `--rbln-*` values, so a fallback would be right
-    when the option came from the environment and wrong when it came from the
-    command line.
-    """
-    if _rbln_config is None:
-        raise RuntimeError(
-            "RBLNConfig was never resolved in this process. Call "
-            "set_rbln_config(build_rbln_config(vllm_config.additional_config)) "
-            "from this process's entry point."
-        )
-    return _rbln_config
+    return OptimumRBLNConfig(**overrides)
 
 
 # `from_cli_args` only copies dataclass fields, so a `--rbln-*` flag cannot
@@ -322,8 +255,8 @@ class _MergeAdditionalConfig(argparse.Action):
         _additional_config(namespace).update(values)
 
 
-def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
-    """Add the `RBLNConfig` group to `parser`. Safe to call twice.
+def add_optimum_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
+    """Add the `OptimumRBLNConfig` group to `parser`. Safe to call twice.
 
     `RblnPlatform.pre_register_and_update(parser)` calls this from inside
     `AsyncEngineArgs.add_cli_args()`, before `parse_args()`. That is early
@@ -336,10 +269,12 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
 
     group = parser.add_argument_group(
         title=_GROUP_TITLE,
-        description=RBLNConfig.__doc__,
+        description=OptimumRBLNConfig.__doc__,
     )
-    kwargs = get_kwargs(RBLNConfig)
+    kwargs = get_kwargs(OptimumRBLNConfig)
     for f in _FIELDS:
+        if f.metadata.get("internal"):
+            continue
         field_kwargs = kwargs[f.name]
         is_bool = field_kwargs.pop("action", None) is argparse.BooleanOptionalAction
         group.add_argument(

@@ -22,8 +22,8 @@ if TYPE_CHECKING:
 else:
     VllmConfig = None
 
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 
 logger = init_logger(__name__)
 

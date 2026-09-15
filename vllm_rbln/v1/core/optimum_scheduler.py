@@ -44,8 +44,8 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.v1.core.optimum_kv_cache_manager import RBLNKVCacheManager
 
 logger = init_logger(__name__)

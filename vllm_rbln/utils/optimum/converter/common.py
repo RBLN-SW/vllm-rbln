@@ -14,8 +14,8 @@
 
 from typing import TYPE_CHECKING
 
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
     is_pooling_arch,

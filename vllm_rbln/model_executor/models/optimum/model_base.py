@@ -32,8 +32,8 @@ import optimum.rbln
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.paths import is_compiled_dir

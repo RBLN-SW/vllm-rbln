@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_rbln.config import OptimumRBLNConfig
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.converter.common import (
     apply_user_prefill_chunk_size,
     get_user_max_num_batched_tokens,

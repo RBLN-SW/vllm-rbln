@@ -269,19 +269,19 @@ class RblnPlatform(Platform):
             if action.dest == "block_size":
                 action.choices = None  # Override choices
 
-        from vllm_rbln.config import OptimumRBLNConfig, RBLNConfig, add_rbln_cli_args
+        if envs.VLLM_RBLN_USE_VLLM_MODEL:
+            from vllm_rbln.config import add_rbln_cli_args
 
-        add_rbln_cli_args(
-            parser, RBLNConfig if envs.VLLM_RBLN_USE_VLLM_MODEL else OptimumRBLNConfig
-        )
+            add_rbln_cli_args(parser)
+        else:
+            from vllm_rbln.optimum_config import add_optimum_rbln_cli_args
+
+            add_optimum_rbln_cli_args(parser)
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.config import (
-            build_optimum_rbln_config,
-            build_rbln_config,
-            set_rbln_config,
-        )
+        from vllm_rbln.config import build_rbln_config, set_rbln_config
+        from vllm_rbln.optimum_config import build_optimum_rbln_config
         from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
         from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
         from vllm_rbln.utils.optimum.registry import is_pooling_arch

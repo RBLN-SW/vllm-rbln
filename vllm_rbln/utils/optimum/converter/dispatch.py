@@ -18,8 +18,8 @@ import os
 from typing import TYPE_CHECKING
 
 from vllm_rbln import envs
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.paths import is_compiled_dir
 
 from .common import get_user_max_num_batched_tokens

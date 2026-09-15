@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm_rbln.config import OptimumRBLNConfig
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.converter.dispatch import _generate_model_path_name
 
 

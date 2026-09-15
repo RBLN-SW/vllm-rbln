@@ -18,7 +18,7 @@ import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_rbln.config import (
+from vllm_rbln.optimum_config import (
     _GROUP_TITLE,
     OptimumRBLNConfig,
     build_optimum_rbln_config,

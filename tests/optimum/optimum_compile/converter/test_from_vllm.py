@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_rbln.config import OptimumRBLNConfig
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.converter.from_vllm import sync_from_vllm
 
 DECODER_ARCH = "LlamaForCausalLM"

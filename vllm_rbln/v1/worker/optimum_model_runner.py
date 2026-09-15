@@ -72,7 +72,6 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 from vllm_rbln import envs
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
 from vllm_rbln.model_executor.models.optimum import (
@@ -84,6 +83,7 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
 )
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info

@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.block_size import (
     get_block_ratio,
     is_full_block_available,
