@@ -71,6 +71,7 @@ def _wire_runner(proposer, *, num_reqs):
         kv_cache_view_infos=[],
         shape_config=_shape_config(),
         dp_status=None,
+        decode_back_pad=torch.zeros(num_reqs, dtype=torch.int32),
     )
     proposer.draft_attn_groups = [
         SimpleNamespace(
@@ -150,8 +151,9 @@ class TestPreprocess:
         )
 
     def test_first_pass_uses_explicit_token_indices_verbatim(self):
-        # Given token indices are used as-is (not recomputed from
-        # query_start_loc); the next tokens land at exactly those slots.
+        # The target ids shift left by one (drop the first) and each request's
+        # next token lands at the caller's index -- never at a slot recomputed
+        # from query_start_loc, which back padding can leave un-scheduled.
         proposer = make_eagle_proposer()
         _, _, _, tip = self._first_pass(
             proposer, torch.tensor([0, 3, 8], dtype=torch.int64)

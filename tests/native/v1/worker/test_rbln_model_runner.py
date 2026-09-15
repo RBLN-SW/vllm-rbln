@@ -41,7 +41,11 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 import vllm_rbln.v1.worker.utils as worker_utils
-from tests.native.v1.worker.utils import make_runner_config, schedule_new
+from tests.native.v1.worker.utils import (
+    make_runner_config,
+    make_speculative_config,
+    schedule_new,
+)
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -1111,6 +1115,102 @@ class TestMayReorderBatch:
         assert r.input_batch.batch_update_builder.moved != []
 
 
+class TestDummyRunDecodeWindowPadding:
+    pytestmark = pytest.mark.maybe_use_device
+
+    NUM_REQS = 2
+    NUM_SPEC = 3
+
+    @pytest.mark.parametrize(
+        "fixed_window,warmup,expected_tokens",
+        [
+            (True, True, 1 + NUM_SPEC),
+            (False, True, 1),
+            (True, False, 1),
+        ],
+    )
+    def test_only_a_warm_up_with_a_fixed_window_pads(
+        self, make_model_runner, monkeypatch, fixed_window, warmup, expected_tokens
+    ):
+        runner = make_model_runner()
+        monkeypatch.setattr(runner, "num_spec_tokens", self.NUM_SPEC)
+        monkeypatch.setattr(type(runner), "uses_fixed_decode_window", fixed_window)
+        seen: list = []
+
+        def record(num_reqs, num_tokens, is_idle, **kw):
+            seen.append(num_tokens)
+            return None, None, None
+
+        monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", record)
+
+        runner._dummy_run(self.NUM_REQS, 1, False, warmup=warmup)
+
+        assert seen == [self.NUM_REQS * expected_tokens]
+
+
+class TestUsesFixedDecodeWindow:
+    @pytest.mark.parametrize(
+        "method, expected",
+        [
+            ("eagle", True),
+            ("eagle3", True),
+            ("mtp", True),
+            ("ngram", False),
+            ("suffix", False),
+            ("medusa", False),
+            ("dflash", False),
+        ],
+    )
+    def test_only_a_model_based_drafter_fixes_the_window(self, method, expected):
+        runner = _make_runner_stub(speculative_config=make_speculative_config(method))
+        assert runner.uses_fixed_decode_window is expected
+
+    def test_no_speculative_config_has_no_window(self):
+        runner = _make_runner_stub(speculative_config=None)
+        assert runner.uses_fixed_decode_window is False
+
+
+class TestFixedDecodeWindowConfig:
+    @staticmethod
+    def _runner(max_model_len, num_spec_tokens, block_size=1024, method="mtp"):
+        return _make_runner_stub(
+            max_model_len=max_model_len,
+            num_spec_tokens=num_spec_tokens,
+            speculative_config=make_speculative_config(method),
+            cache_config=SimpleNamespace(block_size=block_size),
+            rbln_config=RBLNConfig(),
+        )
+
+    @pytest.mark.parametrize("method", ["mtp", "ngram"])
+    def test_a_block_narrower_than_the_window_is_refused(self, method):
+        runner = self._runner(1024 * 4, 3, block_size=2, method=method)
+        with pytest.raises(ValueError, match="cannot hold the 4-slot"):
+            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
+
+    def test_a_fixed_window_that_misses_the_last_block_is_refused(self):
+        runner = self._runner(1024 * 4 + 2, 3)
+        with pytest.raises(ValueError, match="leaves 2 token"):
+            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
+
+    def test_the_same_last_block_is_allowed_without_a_fixed_window(self, monkeypatch):
+        # Same remainder, a method that falls back to qlen=1 there: not fatal, so
+        # it must not be refused at load. The guard is all that is under test, so
+        # the step after it ends the call.
+        runner = self._runner(1024 * 4 + 2, 3, method="ngram")
+
+        class PastTheGuard(Exception):
+            pass
+
+        def stop(self, kv_cache_config):
+            raise PastTheGuard
+
+        monkeypatch.setattr(
+            type(runner), "maybe_add_kv_sharing_layers_to_kv_cache_groups", stop
+        )
+        with pytest.raises(PastTheGuard):
+            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
+
+
 class TestAllocateKvCacheTensors:
     # Device selection: "cpu" if not compiling, else self.device if device-tensor,
     # else "meta". The mapping/validation logic is exercised on CPU.
@@ -1371,7 +1471,7 @@ class TestDummyRunDraftParticipation:
         attrs = dict(
             max_num_tokens=64,
             max_num_reqs=8,
-            speculative_config=SimpleNamespace(),
+            speculative_config=make_speculative_config("eagle"),
             num_spec_tokens=cls.NUM_SPEC,
             query_start_loc_np=np.zeros(16, dtype=np.int32),
             input_ids=torch.zeros(64, dtype=torch.int32),
@@ -1421,6 +1521,23 @@ class TestDummyRunDraftParticipation:
         monkeypatch.setattr(mr, "build_kv_cache_forward_context_kwargs", lambda b: {})
         return runner, drafter
 
+    def test_idle_backbone_runs_the_window_the_draft_the_decided_length(
+        self, monkeypatch
+    ):
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        staged: list = []
+
+        def record(**kwargs):
+            staged.append(kwargs["layout"].query_len)
+            return SimpleNamespace(as_kwargs=lambda: {})
+
+        monkeypatch.setattr(runner.input_stager, "stage", record)
+
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert staged == [1 + self.NUM_SPEC]
+        drafter.dummy_run.assert_called_once_with(1, 1, False)
+
     def test_idle_draft_runs_the_decided_length(self, monkeypatch):
         # Beside a prefilling peer the step decides this rank's own single token,
         # and the group's token dimension is sized for that. Running the draft at
@@ -1429,18 +1546,18 @@ class TestDummyRunDraftParticipation:
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
         drafter.dummy_run.assert_called_once_with(1, 1, False)
 
-    @pytest.mark.parametrize("query_len", [1, 1 + NUM_SPEC])
-    def test_warmup_compiles_the_draft_at_every_query_length(
-        self, monkeypatch, query_len
+    @pytest.mark.parametrize("requested", [1, 1 + NUM_SPEC])
+    def test_warmup_compiles_the_draft_at_the_window_length(
+        self, monkeypatch, requested
     ):
-        # Both decode lengths reach the draft. Query length 1 is the one a step
-        # forced to no-spec runs, and compiling only the spec length leaves that
-        # step to compile its own graph while it serves.
+        # The window is the only decode length this config compiles, so a warm-up
+        # dummy asking for a shorter decode query reaches the draft padded out to
+        # it rather than at a length nothing compiled.
         runner, drafter = self._runner(monkeypatch, has_drafter=True)
-        runner._dummy_run(2, query_len, is_prefill=False, warmup=True)
+        runner._dummy_run(2, requested, is_prefill=False, warmup=True)
         # warmup path keeps the num_padded_tokens kwarg (draft's own pad target).
         drafter.dummy_run.assert_called_once_with(
-            2, query_len, False, num_padded_tokens=None
+            2, 1 + self.NUM_SPEC, False, num_padded_tokens=None
         )
 
     def test_no_drafter_skips_cleanly(self, monkeypatch):

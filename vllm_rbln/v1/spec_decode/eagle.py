@@ -128,6 +128,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=target_positions,
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
+                back_pad=self.runner.decode_back_pad,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
