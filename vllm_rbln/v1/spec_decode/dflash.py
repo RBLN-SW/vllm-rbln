@@ -678,8 +678,8 @@ class RBLNDFlashProposer(DFlashProposer):
             for token_start, count, block, offset in runs:
                 token_slice = slice(token_start, token_start + count)
                 cache_slice = slice(offset, offset + count)
-                dst_k = cache[0, block, :, 0, cache_slice, :].unbind(0)
-                dst_v = cache[1, block, :, 0, cache_slice, :].unbind(0)
+                dst_k = cache[block, 0, :, 0, cache_slice, :].unbind(0)
+                dst_v = cache[block, 1, :, 0, cache_slice, :].unbind(0)
                 src_k = k_layer[:, token_slice, :].unbind(0)
                 src_v = v_layer[:, token_slice, :].unbind(0)
                 # Interleave key/value per head to keep the original order.
