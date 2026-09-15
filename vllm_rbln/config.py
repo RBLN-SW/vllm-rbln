@@ -37,7 +37,7 @@ at a time.
 import argparse
 import os
 from dataclasses import Field, field, fields
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from vllm.config.utils import config as vllm_config_dataclass
 
@@ -50,10 +50,8 @@ logger = init_logger(__name__)
 
 _GROUP_TITLE = "RBLNConfig"
 
-ModelImpl = Literal["vllm", "optimum"]
 DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
 
-_VLLM = {"model_impl": "vllm"}
 _INTERNAL = {"internal": True}
 
 
@@ -61,90 +59,77 @@ _INTERNAL = {"internal": True}
 class RBLNConfig:
     """RBLN NPU options for the vLLM-native model path."""
 
-    model_impl: ClassVar[ModelImpl] = "vllm"
-
-    # ====================================================================
-    # Shared with OptimumRBLNConfig
-    # ====================================================================
     num_devices_per_local_rank: int = 1
-    """Number of NPU devices assigned to each local rank. Under `optimum` a
-    pre-compiled model overrides this with the value it was compiled for."""
+    """Number of NPU devices assigned to each local rank."""
 
     sampler: bool = True
     """Use the customized RBLN sampler."""
 
-    # ====================================================================
-    # vllm only
-    # ====================================================================
-    compile_model: bool = field(default=True, metadata=_VLLM)
+    compile_model: bool = True
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
     possible."""
 
-    compile_strict_mode: bool = field(default=False, metadata=_VLLM)
+    compile_strict_mode: bool = False
     """Compile with torch.compile's strict mode, which fails on a graph break
     instead of falling back to eager."""
 
-    num_hidden_layers: int = field(default=0, metadata=_VLLM)
+    num_hidden_layers: int = 0
     """Build only the first N decoder layers and leave the rest as
     `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
     truncation."""
 
-    enforce_model_fp32: bool = field(default=False, metadata=_VLLM)
+    enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
 
-    use_dynamic_kv_cache: bool = field(default=False, metadata=_VLLM)
+    use_dynamic_kv_cache: bool = False
     """Size the KV cache from the compiled artifact instead of the estimate."""
 
-    flash_causal_attn: bool = field(default=True, metadata=_VLLM)
+    flash_causal_attn: bool = True
     """Use flash attention for causal attention."""
 
-    batch_attn_opt: bool = field(default=False, metadata=_VLLM)
+    batch_attn_opt: bool = False
     """Use the batch attention optimization for paged attention."""
 
-    use_custom_kernel: bool = field(default=False, metadata=_VLLM)
+    use_custom_kernel: bool = False
     """Use the custom RBLN kernels."""
 
-    sub_block_cache: bool = field(default=True, metadata=_VLLM)
+    sub_block_cache: bool = True
     """Enable sub-block prefix caching. The sub-block size equals
     max_num_batched_tokens (the prefill chunk size)."""
 
-    specialize_moe_decode: bool = field(default=True, metadata=_VLLM)
+    specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
 
-    use_moe_tokens_mask: bool = field(default=True, metadata=_VLLM)
+    use_moe_tokens_mask: bool = True
     """Apply the tokens mask to the MoE expert kernel."""
 
-    dispatch_all2all: bool = field(default=False, metadata=_VLLM)
+    dispatch_all2all: bool = False
     """Use all2all dispatch instead of all-gather for MoE DP dispatch."""
 
-    combine_all2all: bool = field(default=False, metadata=_VLLM)
+    combine_all2all: bool = False
     """Use all2all combine instead of reduce-scatter for MoE DP combine."""
 
-    decode_batch_bucket_strategy: DecodeBatchBucketStrategy = field(
-        default="exponential", metadata=_VLLM
-    )
+    decode_batch_bucket_strategy: DecodeBatchBucketStrategy = "exponential"
     """How the decode batch buckets are laid out."""
 
-    decode_batch_bucket_min: int = field(default=1, metadata=_VLLM)
+    decode_batch_bucket_min: int = 1
     """Smallest decode batch bucket."""
 
-    decode_batch_bucket_step: int = field(default=2, metadata=_VLLM)
+    decode_batch_bucket_step: int = 2
     """Step between decode batch buckets."""
 
-    decode_batch_bucket_limit: int = field(default=1, metadata=_VLLM)
+    decode_batch_bucket_limit: int = 1
     """Largest decode batch bucket."""
 
-    decode_batch_bucket_manual_buckets: list[int] = field(
-        default_factory=list, metadata=_VLLM
-    )
+    decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
-    nixl_swa_view_opt: bool = field(default=False, metadata=_VLLM)
+    nixl_swa_view_opt: bool = False
     """Publish a second SWA-sized descriptor range alongside the Full-sized
     range at the same NIXL base addresses, so SWA groups transfer only
     `sliding_window` bytes per block over RDMA."""
 
-    use_w8a8: bool = field(default=False, metadata=_VLLM)
+    use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
 
@@ -181,17 +166,22 @@ class RBLNConfig:
 
 
 @vllm_config_dataclass
-class OptimumRBLNConfig(RBLNConfig):
+class OptimumRBLNConfig:
     """RBLN NPU options for the optimum-rbln model path.
 
-    The shared fields of `RBLNConfig` plus the ones below. The `_VLLM` fields
-    are inherited but neither settable nor shown on this path."""
-
-    model_impl: ClassVar[ModelImpl] = "optimum"
+    Independent of `RBLNConfig`: each class carries only what its own path
+    reads, and an option both paths have keeps the same name in both."""
 
     # ====================================================================
     # Given by the user
     # ====================================================================
+    num_devices_per_local_rank: int = 1
+    """Number of NPU devices assigned to each local rank. A pre-compiled model
+    overrides this with the value it was compiled for."""
+
+    sampler: bool = True
+    """Use the customized RBLN sampler."""
+
     optimum_overrides: dict[str, Any] = field(default_factory=dict)
     """Entries for optimum-rbln's model config (its `rbln_config`), laid over
     what vllm-rbln derives from the vLLM settings when the model is compiled.
@@ -229,20 +219,26 @@ class OptimumRBLNConfig(RBLNConfig):
     """Image-prefill buckets (gemma3/gemma4), read by the scheduler, which has
     no RBLNParams of its own."""
 
+    def compute_hash(self) -> str:
+        """Hash of the fields that change the compiled artifact.
 
-_Config = TypeVar("_Config", bound=RBLNConfig)
+        `VllmConfig.compute_hash()` calls this, so a field ignored below leaves
+        an already compiled model valid.
+        """
+        from vllm.config.utils import get_hash_factors, hash_factors
+
+        # The sampler changes what runs, not what optimum-rbln builds.
+        return hash_factors(get_hash_factors(self, {"sampler"}))
 
 
-def _fields_of(cls: type[RBLNConfig]) -> list["Field[Any]"]:
-    """The fields `additional_config` may set for `cls`: its own, and the
-    inherited ones not marked `_VLLM`, i.e. for another `model_impl`."""
+_Config = TypeVar("_Config", RBLNConfig, OptimumRBLNConfig)
+
+
+def _fields_of(cls: type[RBLNConfig | OptimumRBLNConfig]) -> list["Field[Any]"]:
+    """The fields `additional_config` may set for `cls`."""
     # `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
     # without vllm installed, so it cannot see that this makes a dataclass.
-    return [
-        f
-        for f in fields(cls)  # type: ignore[arg-type]
-        if f.metadata.get("model_impl", cls.model_impl) == cls.model_impl
-    ]
+    return list(fields(cls))  # type: ignore[arg-type]
 
 
 # TODO(vllm-rbln>=0.12.0): delete. Former additional_config keys, still accepted
@@ -262,7 +258,7 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
 }
 
 
-def _env_overrides(cls: type[RBLNConfig]) -> dict[str, Any]:
+def _env_overrides(cls: type[RBLNConfig | OptimumRBLNConfig]) -> dict[str, Any]:
     from vllm_rbln import envs
 
     overrides: dict[str, Any] = {}
@@ -428,7 +424,9 @@ class _MergeAdditionalConfig(argparse.Action):
         _additional_config(namespace).update(values)
 
 
-def add_rbln_cli_args(parser: "FlexibleArgumentParser", cls: type[RBLNConfig]) -> None:
+def add_rbln_cli_args(
+    parser: "FlexibleArgumentParser", cls: type[RBLNConfig | OptimumRBLNConfig]
+) -> None:
     """Add the `cls` group to `parser`. Safe to call twice.
 
     `RblnPlatform.pre_register_and_update(parser)` calls this from inside

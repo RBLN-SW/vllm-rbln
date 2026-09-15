@@ -103,3 +103,10 @@ def test_flags_cover_the_optimum_path_and_nothing_else():
     flags = {a.dest for a in group._group_actions}
     assert {"rbln_sampler", "rbln_optimum_overrides", "rbln_prefix_block_size"} <= flags
     assert not flags & {"rbln_use_w8a8", "rbln_cached_model_path"}
+
+
+def test_only_compile_fields_change_the_hash():
+    """`VllmConfig.compute_hash()` calls this to key the compile cache."""
+    base = OptimumRBLNConfig().compute_hash()
+    assert OptimumRBLNConfig(sampler=False).compute_hash() == base
+    assert OptimumRBLNConfig(optimum_overrides={"batch_size": 4}).compute_hash() != base
