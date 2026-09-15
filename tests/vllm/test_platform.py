@@ -760,7 +760,7 @@ class TestDynamicKvConfig:
         )
 
     @pytest.fixture(autouse=True)
-    def _native_lane(self, monkeypatch):
+    def _vllm_lane(self, monkeypatch):
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
 

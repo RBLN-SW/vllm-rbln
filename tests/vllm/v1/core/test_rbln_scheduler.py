@@ -1279,7 +1279,7 @@ class TestDeferredBlockFree:
     # processed, because with several batches in flight (PP) a connector load can
     # refill blocks the in-flight step is still writing. On only when >1 batch is
     # in flight AND the instance is a KV consumer. The fence lives in the copied
-    # schedule() and had no native unit coverage.
+    # schedule() and had no unit coverage of its own.
 
     def test_deferred_free_fenced_by_inflight_step(self):
         sched = create_rbln_scheduler(

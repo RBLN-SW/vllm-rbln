@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VllmConfig builders for native tests, via EngineArgs.create_engine_config()
+"""VllmConfig builders for the suite, via EngineArgs.create_engine_config()
 so the result matches the config the engine hands production (after the
 platform's check_and_update_config). Import lazily from a fixture."""
 

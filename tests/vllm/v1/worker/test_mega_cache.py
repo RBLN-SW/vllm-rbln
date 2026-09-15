@@ -367,7 +367,7 @@ def bundle(tmp_path, monkeypatch):
     from rebel.core import mega_cache as rbln_mega_cache
 
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
-    # The native suite disables the compile cache session-wide; this is the one
+    # The suite disables the compile cache session-wide; this is the one
     # module that has to run with it on.
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
     monkeypatch.delenv("LOCAL_RANK", raising=False)

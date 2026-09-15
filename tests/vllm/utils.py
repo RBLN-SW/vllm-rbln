@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared helpers for the native (``VLLM_RBLN_USE_VLLM_MODEL=1``) suite."""
+"""Shared helpers for the suite (``VLLM_RBLN_USE_VLLM_MODEL=1``)."""
 
 from __future__ import annotations
 
@@ -31,10 +31,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import ParamSpec
 
-# What "native" means: the switch that selects vLLM modelling over optimum, plus
+# What the suite pins: the switch that selects vLLM modelling over optimum, plus
 # the knobs whose source default the suite must not take. Nothing that merely
 # repeats a default -- pinning those would hide the day one is flipped.
-NATIVE_ENV = {
+VLLM_RBLN_ENV = {
     "RBLN_ROOT_IP": "127.0.0.1",
     "RBLN_LOCAL_IP": "127.0.0.1",
     "VLLM_DISABLE_COMPILE_CACHE": "1",
@@ -411,7 +411,7 @@ _SPAWN_POLL_INTERVAL_S = 0.2
 class ModuleSpawn:
     """A running ``pytest <module>`` child, consumed one test at a time.
 
-    The child appends a JSON line per event as it goes (see the native conftest's
+    The child appends a JSON line per event as it goes (see the suite conftest's
     logreport hook), so the parent never has to wait for the whole file:
     :meth:`records_for` blocks only until *that* test's phase reports land.
     Waiting for the process instead would make the module's first test absorb the
@@ -545,7 +545,7 @@ def start_module_in_spawned_process(
     Lets a whole device-touching file share ONE spawn instead of spawning per
     test: the child is a real pytest run (so it resolves fixtures,
     parametrization and skips itself) with the spawn-child guard set, and the
-    native conftest's logreport hook serializes each phase report to a file.
+    suite conftest's logreport hook serializes each phase report to a file.
 
     The parent passes the tests it actually selected rather than the file, so
     -m/-k/--deselect mean what they say: handing over the file would run the
@@ -569,7 +569,7 @@ def start_module_in_spawned_process(
     log_path: str | None = None
     if not stream_output:
         with tempfile.NamedTemporaryFile(
-            delete=False, prefix="native-spawn-", suffix=".log", mode="w"
+            delete=False, prefix="vllm-rbln-spawn-", suffix=".log", mode="w"
         ) as tmp:
             log_path = tmp.name
 
@@ -667,5 +667,5 @@ def create_new_process_for_each_test(
 ) -> Callable[[Callable[_P, None]], Callable[_P, None]]:
     """Decorator factory. RBLN only supports spawn -- fork would inherit the
     parent's already-loaded RBLN runtime and defeat the isolation."""
-    assert method == "spawn", "the native suite only supports method='spawn'"
+    assert method == "spawn", "this suite only supports method='spawn'"
     return spawn_new_process_for_each_test

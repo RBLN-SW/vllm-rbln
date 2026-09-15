@@ -275,7 +275,7 @@ class TestIsSupported:
 
 class TestRegistration:
     def test_block_fp8_kernels_registered_for_oot_platform(self):
-        # The native conftest's plugin load inserts both RBLN block-fp8 kernels
+        # The suite conftest's plugin load inserts both RBLN block-fp8 kernels
         # into the OOT slot of vLLM's fp8-block-kernel registry.
         from vllm.model_executor.kernels import linear
         from vllm.platforms import PlatformEnum
