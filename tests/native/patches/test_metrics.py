@@ -262,6 +262,68 @@ class TestWriteMetricsJson:
         pm._write_metrics_json("runner", "TP1 DP0", {})
         assert (tmp_path / "metrics_tp1_dp0.json").exists()
 
+    def test_label_separates_the_reports_of_one_rank(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        pm._write_metrics_json("runner", "DP0", {}, "isl 1024")
+        pm._write_metrics_json("runner", "DP0", {}, "isl 51200")
+        assert sorted(f.name for f in tmp_path.iterdir()) == [
+            "metrics_dp0_isl_1024.json",
+            "metrics_dp0_isl_51200.json",
+        ]
+        assert (
+            json.loads((tmp_path / "metrics_dp0_isl_1024.json").read_text())["label"]
+            == "isl 1024"
+        )
+
+
+class TestFlushPass:
+    """One engine, several workloads: each report must be that workload's alone."""
+
+    @staticmethod
+    def _worker(ctx):
+        runner = types.SimpleNamespace()
+        if ctx is not None:
+            setattr(runner, pm._CTX_ATTR, ctx)
+        return types.SimpleNamespace(model_runner=runner)
+
+    def test_second_pass_is_not_the_first_plus_the_second(
+        self, ctx, clock, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        monkeypatch.setattr(pm, "_metrics_enabled", lambda: True)
+        worker = self._worker(ctx)
+
+        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=8 * MS)
+        assert pm.flush_pass(worker, "first") is True
+
+        # The runner now has no context; the next pass builds its own.
+        fresh = pm._ctx(worker.model_runner)
+        run_pass(fresh, clock, phase=pm._Phase.DECODE, model=2 * MS)
+        assert pm.flush_pass(worker, "second") is True
+
+        first = json.loads((tmp_path / "metrics_first.json").read_text())
+        second = json.loads((tmp_path / "metrics_second.json").read_text())
+        assert first["sections"]["MODEL + SAMPLE (DECODE)"]["call_count"] == 1
+        assert second["sections"]["MODEL + SAMPLE (DECODE)"]["call_count"] == 1
+        assert second["sections"]["MODEL + SAMPLE (DECODE)"][
+            "mean_latency_ms"
+        ] == pytest.approx(2.0)
+
+    def test_nothing_recorded_is_false_not_an_empty_report(
+        self, ctx, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        monkeypatch.setattr(pm, "_metrics_enabled", lambda: True)
+        assert pm.flush_pass(self._worker(ctx), "empty") is False
+
+    def test_no_context_is_false(self, monkeypatch):
+        monkeypatch.setattr(pm, "_metrics_enabled", lambda: True)
+        assert pm.flush_pass(self._worker(None)) is False
+
+    def test_metrics_off_is_false(self, ctx, monkeypatch):
+        monkeypatch.setattr(pm, "_metrics_enabled", lambda: False)
+        assert pm.flush_pass(self._worker(ctx)) is False
+
 
 class TestRankTag:
     @staticmethod

@@ -43,6 +43,7 @@ import contextlib
 import functools
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -144,15 +145,24 @@ class _PerformanceContext:
         if self._start is not None:
             self._graph_latency = (self._graph_latency or 0.0) + latency
 
-    def print_stats(self) -> None:
+    def print_stats(self, label: str | None = None) -> bool:
+        """Report what has been accumulated. True when anything was recorded.
+
+        `label` names one workload of several measured against the same engine;
+        it joins the report name and the JSON filename so the reports do not
+        overwrite each other. See flush_pass.
+        """
         sections: dict[str, _Metrics] = {}
-        for label, table in (("MODEL + SAMPLE", self._graph), ("E2E", self._e2e)):
+        for group, table in (("MODEL + SAMPLE", self._graph), ("E2E", self._e2e)):
             for phase in _Phase:
                 if phase in table:
-                    sections[f"{label} ({phase.value})"] = table[phase]
+                    sections[f"{group} ({phase.value})"] = table[phase]
         name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
+        if label:
+            name = f"{name} | {label}" if name else label
         logger.info("%s", "\n".join(_render_metrics_report(name, sections)))
-        _write_metrics_json(self.name, self.rank_tag, sections)
+        _write_metrics_json(self.name, self.rank_tag, sections, label)
+        return any(m.call_count for m in sections.values())
 
 
 def _rank_tag() -> str:
@@ -219,19 +229,27 @@ def _render_metrics_report(
     return lines
 
 
+def _slug(value: str) -> str:
+    """Filename-safe label: one report per (rank, label), never a path."""
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", value).strip("_").lower()
+
+
 def _write_metrics_json(
-    name: str | None, rank_tag: str, sections: dict[str, _Metrics]
+    name: str | None,
+    rank_tag: str,
+    sections: dict[str, _Metrics],
+    label: str | None = None,
 ) -> None:
     if not envs.VLLM_RBLN_METRICS_DIR:
         return
 
-    suffix = rank_tag.replace(" ", "_").lower()
-    filename = f"metrics_{suffix}.json" if suffix else "metrics.json"
-    path = os.path.join(envs.VLLM_RBLN_METRICS_DIR, filename)
+    parts = [p for p in ("metrics", _slug(rank_tag), _slug(label or "")) if p]
+    path = os.path.join(envs.VLLM_RBLN_METRICS_DIR, "_".join(parts) + ".json")
     payload = {
         "name": name,
         "rank": rank_tag,
-        "sections": {label: m.to_dict() for label, m in sections.items()},
+        "label": label,
+        "sections": {group: m.to_dict() for group, m in sections.items()},
     }
 
     try:
@@ -373,6 +391,29 @@ def send_handoff(self, *args, **kwargs):
     ctx.add_graph_time(time.perf_counter() - start)
     ctx.end_pass()
     return output
+
+
+def flush_pass(worker, label: str | None = None) -> bool:
+    """Report this worker's measurements and start a fresh accumulation.
+
+    For measuring several workloads against ONE engine. The context accumulates for
+    the life of the runner, so without this the second workload's report would be
+    the first plus the second. `label` separates the reports.
+
+    False means nothing was recorded -- metrics off, or no runner, or an engine that
+    ran no pass. That is an UNMEASURED workload, not an empty one, and the caller
+    should say so rather than publish a zero.
+    """
+    if not _metrics_enabled():
+        return False
+    runner = getattr(worker, "model_runner", None)
+    ctx = getattr(runner, _CTX_ATTR, None)
+    if ctx is None:
+        return False
+    recorded = ctx.print_stats(label=label)
+    # The next pass builds its own context (see _ctx), so it starts from zero.
+    setattr(runner, _CTX_ATTR, None)
+    return recorded
 
 
 @functools.wraps(_shutdown)
