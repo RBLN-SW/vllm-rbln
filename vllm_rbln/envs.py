@@ -404,19 +404,6 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-        "VLLM_RBLN_FLASH_CAUSAL_ATTN",
-        "VLLM_RBLN_BATCH_ATTN_OPT",
-        "VLLM_RBLN_USE_CUSTOM_KERNEL",
-        "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
-        "VLLM_RBLN_USE_MOE_TOKENS_MASK",
-        "VLLM_RBLN_DISPATCH_ALL2ALL",
-        "VLLM_RBLN_COMBINE_ALL2ALL",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_MIN",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_STEP",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
-        "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
-        "VLLM_RBLN_USE_W8A8",
         # Compile-affecting only because the compiler bakes the mark_dynamic'd
         # KV dim's extent: a dry run traces at the count vllm sized, the real
         # mode at the compile hint. Move to NON_COMPILE once that extent stops
