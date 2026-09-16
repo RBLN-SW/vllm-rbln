@@ -129,7 +129,14 @@ def connector_option(vllm_config: "VllmConfig", key: str, default: _T) -> _T:
     here rather than coercing into a truthy string.
     """
     value = vllm_config.kv_transfer_config.get_from_extra_config(key, default)
-    if not isinstance(value, type(default)):
+    # `bool` is a subclass of `int`, so an int knob given `true` would pass an
+    # isinstance check and then count as 1.
+    wrong_type = (
+        not isinstance(value, bool)
+        if isinstance(default, bool)
+        else isinstance(value, bool) or not isinstance(value, type(default))
+    )
+    if wrong_type:
         raise RuntimeError(
             f"RBLN NIXL: kv_connector_extra_config[{key!r}] is "
             f"{value!r}, but this knob takes a {type(default).__name__}"
