@@ -28,7 +28,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 )
 from vllm.v1.request import RequestStatus
 
+import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as wm
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
+from tests.native.distributed.kv_connector.utils import fake_sysfs_net
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
     RblnNixlPullConnectorScheduler,
 )
@@ -106,6 +108,9 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._block_ids_need_save = {}
+    sched._exit_on_link_down = False
+    sched._link_checked_at = 0.0
+    sched._link_down = False
     # Upstream state the inherited entry points read.
     sched._heartbeat_by_engine = {}
     sched._heartbeat_req_engine = {}
@@ -460,3 +465,47 @@ class TestRejectedBeforeScheduling:
         sched.request_finished(req, ([],))
 
         assert req.kv_transfer_params["remote_block_ids"] == ([4, 5],)
+
+
+class TestLinkDownKeepsTheEngineStepping:
+    # The worker polls its links and exits from get_finished, which only an
+    # engine step calls. Reporting pending work while every link is down keeps
+    # an idle producer stepping, so it reaches the exit on time.
+
+    def test_all_links_down_is_pending_work(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(wm, "_SYS_CLASS_NET", fake_sysfs_net(tmp_path, ens1="down"))
+        sched = _scheduler()
+        sched._exit_on_link_down = True
+        assert sched.has_pending_push_work()
+
+    def test_a_live_spare_link_is_not_pending_work(self, monkeypatch, tmp_path):
+        sysfs = fake_sysfs_net(tmp_path, ens1="down", ens2="up")
+        monkeypatch.setattr(wm, "_SYS_CLASS_NET", sysfs)
+        sched = _scheduler()
+        sched._exit_on_link_down = True
+        assert not sched.has_pending_push_work()
+
+    def test_a_link_returning_releases_the_engine(self, monkeypatch, tmp_path):
+        sysfs = fake_sysfs_net(tmp_path, ens1="down")
+        monkeypatch.setattr(wm, "_SYS_CLASS_NET", sysfs)
+        sched = _scheduler()
+        sched._exit_on_link_down = True
+        assert sched.has_pending_push_work()
+
+        (sysfs / "ens1" / "operstate").write_text("up\n")
+        sched._link_checked_at = 0.0
+        assert not sched.has_pending_push_work()
+
+    def test_without_the_exit_setting_the_links_are_not_read(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(wm, "_SYS_CLASS_NET", fake_sysfs_net(tmp_path, ens1="down"))
+        sched = _scheduler()
+        assert not sched.has_pending_push_work()
+
+    def test_push_work_still_counts(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(wm, "_SYS_CLASS_NET", fake_sysfs_net(tmp_path, ens1="up"))
+        sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
+        sched._exit_on_link_down = True
+        sched._finished_request_blocks = {"r0": object()}
+        assert sched.has_pending_push_work()

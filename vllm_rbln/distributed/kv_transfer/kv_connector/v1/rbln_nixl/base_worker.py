@@ -76,7 +76,17 @@ _RECONNECT_CAP_S = 30.0
 # Physical NICs in this network namespace, which under an RDMA device plugin
 # are exactly the links NIXL can use. A veth has no `device` entry.
 _SYS_CLASS_NET = Path("/sys/class/net")
-_LINK_POLL_S = 1.0
+LINK_POLL_S = 1.0
+
+
+def every_local_link_down() -> tuple[bool, list[str]]:
+    """Whether every physical link in this namespace is down, and their names."""
+    states = {
+        dev.name: (dev / "operstate").read_text().strip()
+        for dev in _SYS_CLASS_NET.iterdir()
+        if (dev / "device").exists()
+    }
+    return bool(states) and all(s == "down" for s in states.values()), sorted(states)
 
 
 class RblnNixlWorkerBase(NixlBaseConnectorWorker):
@@ -2015,20 +2025,15 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         now = time.perf_counter()
-        if now - self._link_checked_at >= _LINK_POLL_S:
+        if now - self._link_checked_at >= LINK_POLL_S:
             self._link_checked_at = now
-            states = {
-                dev.name: (dev / "operstate").read_text().strip()
-                for dev in _SYS_CLASS_NET.iterdir()
-                if (dev / "device").exists()
-            }
-            all_down = bool(states) and all(s == "down" for s in states.values())
+            all_down, links = every_local_link_down()
             if all_down and self._link_down_since is None:
                 self._link_down_since = now
                 logger.warning(
                     "Every local RDMA link is down (%s); KV transfers fail until "
                     "one returns or this instance is recycled.",
-                    ", ".join(sorted(states)),
+                    ", ".join(links),
                 )
             elif not all_down and self._link_down_since is not None:
                 self._link_down_since = None
