@@ -378,3 +378,29 @@ class TestApplyRegisteredPatches:
         )
         apply_registered_patches()
         assert fake_target.symbol is reg._built_replacements["k"]
+
+
+class TestApplySites:
+    """Which process applies the patches.
+
+    ``register_ops`` covers every process that inherits a resolved model path;
+    the process that resolves it applies them from the platform hook instead.
+    Both apply the whole set, and a narrower one would leave a process
+    half-patched, so that is pinned here rather than left to the call site.
+    """
+
+    def test_patch_upstream_applies_everything(self, monkeypatch):
+        import vllm_rbln.patches as patches
+        from vllm_rbln.platform import vllm_impl
+
+        applied: list = []
+        monkeypatch.setattr(
+            patches, "apply_registered_patches", lambda: applied.append("patches")
+        )
+        monkeypatch.setattr(
+            patches, "apply_registrations", lambda: applied.append("registrations")
+        )
+
+        vllm_impl.patch_upstream()
+
+        assert applied == ["registrations", "patches"]

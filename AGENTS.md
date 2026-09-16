@@ -62,7 +62,9 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 ## Patching upstream vLLM
 
-`vllm_rbln/patches/` adapts upstream vLLM for RBLN. Both mechanisms live in `patches/registry.py`, both take a required `reason`, and `register_ops()` applies registrations before patches — on the vllm model path only.
+`vllm_rbln/patches/` adapts upstream vLLM for RBLN. Both mechanisms live in `patches/registry.py`, both take a required `reason`, and only the vllm model path applies them. Registrations go first, then patches.
+
+Two places apply them, and each applies all of them. `register_ops()` covers every process that inherits a resolved model path. It runs before the arguments are parsed, so it cannot cover the process that resolves the path itself; `platform/vllm_impl.patch_upstream()` does, from the post-parse window of `pre_register_and_update()`.
 
 **Use upstream's own extension points first.** `@add_registration` wraps a callback that registers through a vLLM API: `base_cls.register_oot(...)`, a `PlatformEnum.OOT` entry in a kernel registry, and so on. `patches/oot.py` is the worked example. A registration survives an upstream refactor; a replaced symbol does not.
 

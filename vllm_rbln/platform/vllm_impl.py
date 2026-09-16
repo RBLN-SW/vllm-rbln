@@ -33,7 +33,17 @@ logger = init_logger(__name__)
 
 
 def patch_upstream() -> None:
-    """The vllm model path replaces no upstream symbol from the platform hook."""
+    """Replace the upstream symbols the vllm model path needs.
+
+    This is the process that resolves the model path, so it is the one
+    ``register_ops`` cannot serve: that entry point runs before the arguments
+    are parsed. Every other process inherits the resolved path and applies the
+    same set from there.
+    """
+    from vllm_rbln.patches import apply_registered_patches, apply_registrations
+
+    apply_registrations()
+    apply_registered_patches()
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
