@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+import vllm_rbln.envs as platform_envs
 import vllm_rbln.patches.registry as reg
 from vllm_rbln.patches.registry import (
     MAX_PATCH_PRIORITY,
@@ -388,6 +389,52 @@ class TestApplySites:
     Both apply the whole set, and a narrower one would leave a process
     half-patched, so that is pinned here rather than left to the call site.
     """
+
+    @pytest.mark.parametrize("model_impl", ["vllm", "optimum"])
+    def test_only_the_native_path_touches_upstream(self, model_impl):
+        """The guarantee the whole split rests on.
+
+        A process handed the resolved path applies from its plugin entry point.
+        On the optimum path it applies nothing, and does not even import
+        `patches`, which is what keeps that path's upstream pristine.
+        """
+        import json
+        import os
+        import subprocess
+        import sys
+
+        probe = """
+import json, sys
+from vllm.plugins import load_general_plugins
+load_general_plugins()
+imported = "vllm_rbln.patches" in sys.modules
+applied = applicable = 0
+if imported:
+    from vllm_rbln.patches import registry
+    applied = len(registry._applied_patch_keys)
+    applicable = len([
+        d for d in registry._REGISTERED_PATCH_DESCRIPTORS
+        if d.condition is None or d.condition()
+    ])
+print("RESULT" + json.dumps(
+    {"imported": imported, "applied": applied, "applicable": applicable}
+))
+"""
+        env = {k: v for k, v in os.environ.items() if not k.startswith("VLLM_RBLN")}
+        env[platform_envs.RESOLVED_MODEL_IMPL_ENV] = model_impl
+        out = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, env=env
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        line = next(ln for ln in out.stdout.splitlines() if ln.startswith("RESULT"))
+        result = json.loads(line.removeprefix("RESULT"))
+
+        if model_impl == "optimum":
+            assert result == {"imported": False, "applied": 0, "applicable": 0}
+        else:
+            assert result["imported"]
+            assert result["applicable"] > 0
+            assert result["applied"] == result["applicable"]
 
     def test_patch_upstream_applies_everything(self, monkeypatch):
         import vllm_rbln.patches as patches
