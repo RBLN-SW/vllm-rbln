@@ -79,7 +79,8 @@ The registry rules:
 - Never `setattr` an upstream symbol directly. Every replacement goes through the registry, which verifies that it took.
 - A new module under `patches/` must be added to the import list in `patches/__init__.py`. A decorator in a module nobody imports registers nothing.
 - Duplicate keys and duplicate targets raise. Two patches may share a target only when their `condition` predicates are mutually exclusive.
-- `priority` applies `0` first and `100` last, default `50`. `apply_immediately` patches at import time, for targets that import-time code snapshots before `apply_registered_patches()` runs; it cannot be combined with an explicit `priority`.
+- `priority` applies `0` first and `100` last, default `50`. Importing a `patches/` module only registers; nothing touches upstream until `apply_registered_patches()` runs.
+- `build=True` makes the decorated object a zero-argument factory that the registry calls at apply time. Use it when building the replacement reads a target another patch replaces: give it the later `priority`, and the factory sees the patched value.
 - Pass `verify` when "the attribute is now our object" does not prove the patch took effect.
 
 ## Language

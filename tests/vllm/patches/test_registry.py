@@ -49,6 +49,7 @@ def isolated(monkeypatch):
     monkeypatch.setattr(reg, "_REGISTERED_PATCH_DESCRIPTORS", [])
     monkeypatch.setattr(reg, "_applied_registration_keys", set())
     monkeypatch.setattr(reg, "_applied_patch_keys", set())
+    monkeypatch.setattr(reg, "_built_replacements", {})
 
 
 @pytest.fixture
@@ -67,7 +68,7 @@ def _patch(
     priority=50,
     condition=None,
     verify=None,
-    apply_immediately=False,
+    build=False,
 ):
     return PatchDescriptor(
         key=key,
@@ -78,7 +79,7 @@ def _patch(
         condition=condition,
         verify=verify,
         priority=priority,
-        apply_immediately=apply_immediately,
+        build=build,
     )
 
 
@@ -215,12 +216,6 @@ class TestAddRegistration:
 
 
 class TestRegisterPatch:
-    def test_apply_immediately_with_explicit_priority_raises(self):
-        with pytest.raises(ValueError, match="cannot influence"):
-            register_patch(
-                target="m.x", reason="r", apply_immediately=True, priority=10
-            )
-
     def test_registers_descriptor_with_given_fields(self, isolated):
         @register_patch(target="m.x", reason="r", key="mykey", priority=20)
         def replacement():
@@ -253,27 +248,16 @@ class TestRegisterPatch:
         [descriptor] = reg._REGISTERED_PATCH_DESCRIPTORS
         assert descriptor.key == f"custom.mod.{replacement.__qualname__}"
 
-    def test_apply_immediately_patches_at_registration(self, isolated, fake_target):
-        @register_patch(target=_TARGET, reason="r", key="k", apply_immediately=True)
+    def test_registration_does_not_touch_the_target(self, isolated, fake_target):
+        """Importing a patches module must leave upstream alone; only
+        apply_registered_patches installs anything."""
+        original = fake_target.symbol
+
+        @register_patch(target=_TARGET, reason="r", key="k")
         def replacement():
             pass
 
-        assert fake_target.symbol is replacement
-
-    def test_apply_immediately_respects_false_condition(self, isolated, fake_target):
-        # Registered, but a False condition keeps it from applying at import time.
-        @register_patch(
-            target=_TARGET,
-            reason="r",
-            key="k",
-            apply_immediately=True,
-            condition=lambda: False,
-        )
-        def replacement():
-            pass
-
-        assert len(reg._REGISTERED_PATCH_DESCRIPTORS) == 1
-        assert fake_target.symbol == "ORIGINAL"
+        assert fake_target.symbol is original
 
 
 class TestApplyRegistrations:
@@ -350,3 +334,47 @@ class TestApplyRegisteredPatches:
         )
         apply_registered_patches()
         assert order == ["b", "a"]
+
+    def test_build_calls_the_factory_at_apply_time(self, isolated, fake_target):
+        # The factory must not run while the module is being imported, and its
+        # result is what lands on the target.
+        calls: list = []
+
+        def factory():
+            calls.append(fake_target.symbol)
+            return "BUILT"
+
+        reg._REGISTERED_PATCH_DESCRIPTORS.append(
+            _patch(key="k", replacement=factory, build=True)
+        )
+        assert calls == []
+        apply_registered_patches()
+        assert calls == ["ORIGINAL"]
+        assert fake_target.symbol == "BUILT"
+
+    def test_build_sees_an_earlier_patch(self, isolated, fake_target):
+        # The point of build=: a factory that reads a target another patch
+        # replaces has to observe the replacement, not the original.
+        reg._REGISTERED_PATCH_DESCRIPTORS.extend(
+            [
+                _patch(key="a", replacement="PATCHED", priority=0),
+                _patch(
+                    key="b",
+                    target="_registry_test_target.other",
+                    replacement=lambda: f"wraps {fake_target.symbol}",
+                    priority=50,
+                    build=True,
+                ),
+            ]
+        )
+        apply_registered_patches()
+        assert fake_target.other == "wraps PATCHED"
+
+    def test_build_verifies_against_the_built_object(self, isolated, fake_target):
+        # A factory that returns a fresh object each call would fail the default
+        # verify unless the registry reuses the object it installed.
+        reg._REGISTERED_PATCH_DESCRIPTORS.append(
+            _patch(key="k", replacement=lambda: object(), build=True)
+        )
+        apply_registered_patches()
+        assert fake_target.symbol is reg._built_replacements["k"]
