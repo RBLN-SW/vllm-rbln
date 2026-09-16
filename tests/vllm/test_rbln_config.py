@@ -174,8 +174,9 @@ def test_get_rbln_config_needs_the_current_config_context():
         get_rbln_config()
 
 
-def test_get_rbln_config_rejects_a_config_that_is_not_ours():
-    """The optimum-rbln path leaves a dict there, and nothing resolves it."""
+@pytest.mark.parametrize("other", [{}, OptimumRBLNConfig()], ids=["unbuilt", "optimum"])
+def test_get_rbln_config_rejects_a_config_that_is_not_ours(other):
+    """The two classes share a base, so `isinstance` has to reject the sibling."""
     from types import SimpleNamespace
 
     from vllm.config import set_current_vllm_config
@@ -183,7 +184,7 @@ def test_get_rbln_config_rejects_a_config_that_is_not_ours():
     from vllm_rbln.config import get_rbln_config
 
     with (
-        set_current_vllm_config(SimpleNamespace(additional_config={})),
+        set_current_vllm_config(SimpleNamespace(additional_config=other)),
         pytest.raises(RuntimeError, match="not an RBLNConfig"),
     ):
         get_rbln_config()
@@ -206,30 +207,29 @@ def test_invalid_value_is_rejected():
 
 
 def test_no_field_is_read_from_the_environment():
-    """A field here is the source, so nothing on this path may read its variable.
+    """A field is the source, so nothing may read its variable instead.
 
     `envs.py` resolves the variable into the field; a reader that goes around
     that would ignore `--rbln-*` and `additional_config`. The options that stay
     in `envs.py` are not fields, so they are exempt by construction.
 
-    `build_rbln_config` only runs on the vllm model path, so the optimum-rbln
-    path's own readers are outside the claim.
+    Both paths resolve their own class now, so neither is excluded. The probe
+    comes from `_env_source`, not from the field name, because a renamed field
+    reads a variable that no longer matches it.
     """
     import vllm_rbln
 
     root = pathlib.Path(vllm_rbln.__file__).parent
-    optimum_owned = ("utils/optimum/", "model_executor/models/optimum/")
     sources = "\n".join(
         path.read_text()
         for path in root.rglob("*.py")
-        if (rel := path.relative_to(root).as_posix()) not in ("envs.py", "config.py")
-        and not rel.startswith(optimum_owned)
-        and not path.name.startswith("optimum_")
+        if path.relative_to(root).as_posix() not in ("envs.py", "config.py")
     )
     assert not [
         f.name
-        for f in dataclasses.fields(RBLNConfig)
-        if f"envs.VLLM_RBLN_{f.name.upper()}" in sources
+        for cls in (RBLNConfig, OptimumRBLNConfig)
+        for f in dataclasses.fields(cls)
+        if f"envs.{_env_source(f.name)[0]}" in sources
     ]
 
 

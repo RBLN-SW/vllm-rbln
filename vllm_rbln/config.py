@@ -289,6 +289,10 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
     return _resolve(RBLNConfig, additional_config)
 
 
+def build_optimum_rbln_config(additional_config: Any = None) -> OptimumRBLNConfig:
+    return _resolve(OptimumRBLNConfig, additional_config)
+
+
 def _resolve(cls: type[_C], additional_config: Any) -> _C:
     """Resolve `cls` from `additional_config` and the environment.
 
@@ -368,9 +372,9 @@ def get_rbln_config() -> RBLNConfig:
     rbln_config = get_current_vllm_config().additional_config
     if not isinstance(rbln_config, RBLNConfig):
         raise RuntimeError(
-            "additional_config is not an RBLNConfig; "
-            "check_and_update_config resolves it on the vllm model path, so "
-            f"this is the optimum-rbln path or an unbuilt config: {rbln_config!r}"
+            "additional_config is not an RBLNConfig; each path resolves it into "
+            "its own class, so this is the optimum-rbln path's "
+            f"OptimumRBLNConfig or an unbuilt config: {rbln_config!r}"
         )
     return rbln_config
 
