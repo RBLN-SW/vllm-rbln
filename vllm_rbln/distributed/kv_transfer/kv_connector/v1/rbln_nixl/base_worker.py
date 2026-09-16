@@ -16,6 +16,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import msgspec
@@ -72,6 +73,10 @@ logger = init_logger(__name__)
 # A peer that stays down is re-dialled on this backoff, not once per request.
 _RECONNECT_BASE_S = 5.0
 _RECONNECT_CAP_S = 30.0
+# Physical NICs in this network namespace, which under an RDMA device plugin
+# are exactly the links NIXL can use. A veth has no `device` entry.
+_SYS_CLASS_NET = Path("/sys/class/net")
+_LINK_POLL_S = 1.0
 
 
 class RblnNixlWorkerBase(NixlBaseConnectorWorker):
@@ -178,6 +183,19 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # then probed in the background on (failed probes, next probe).
         self._engines_to_rehandshake: set[str] = set()
         self._reconnect_backoff: dict[str, tuple[int, float]] = {}
+        # When every local RDMA link went down, or None. A peer cannot be dialled
+        # from a dead link and is not the fault, so requests fail without a probe.
+        self._link_down_since: float | None = None
+        self._link_checked_at = 0.0
+        self._link_down_exit_s = envs.VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S
+        if self._link_down_exit_s > 0:
+            kv_config = vllm_config.kv_transfer_config
+            if not kv_config.is_kv_producer or kv_config.is_kv_consumer:
+                raise RuntimeError(
+                    "VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S recycles a KV producer whose "
+                    "links died; a consumer keeps serving its running requests on "
+                    "recompute and is recycled from outside."
+                )
         # Per producer shard, a local xfer dlist scoped to that shard's local
         # region subset, keyed by (engine_id, global_rank, block_size); and the
         # shard's per-region KV-group ids, keyed by (engine_id, global_rank).
@@ -1996,6 +2014,36 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         self._engines_to_rehandshake.add(engine_id)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
+        now = time.perf_counter()
+        if now - self._link_checked_at >= _LINK_POLL_S:
+            self._link_checked_at = now
+            states = {
+                dev.name: (dev / "operstate").read_text().strip()
+                for dev in _SYS_CLASS_NET.iterdir()
+                if (dev / "device").exists()
+            }
+            all_down = bool(states) and all(s == "down" for s in states.values())
+            if all_down and self._link_down_since is None:
+                self._link_down_since = now
+                logger.warning(
+                    "Every local RDMA link is down (%s); KV transfers fail until "
+                    "one returns or this instance is recycled.",
+                    ", ".join(sorted(states)),
+                )
+            elif not all_down and self._link_down_since is not None:
+                self._link_down_since = None
+                # The outage was ours, so the next request dials at once.
+                self._reconnect_backoff.clear()
+                logger.warning("A local RDMA link is back up.")
+            if (
+                self._link_down_since is not None
+                and 0 < self._link_down_exit_s <= now - self._link_down_since
+            ):
+                raise RuntimeError(
+                    f"Every local RDMA link has been down for "
+                    f"{self._link_down_exit_s:.0f}s; exiting so this KV producer "
+                    "is recycled."
+                )
         done = super().get_finished()
         # Upstream re-dials only an engine it does not know, and a dead peer
         # stays known: every read refreshes its TTL on the way to failing. Drop
@@ -2016,6 +2064,11 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
     def _ensure_handshake(
         self, engine_id: str, host: str, port: int, tp_size: int
     ) -> Future[dict[int, str]] | None:
+        deferred: Future[dict[int, str]] = Future()
+        # Nothing can be dialled from a dead local link, and the peer is fine.
+        if self._link_down_since is not None:
+            deferred.set_exception(RuntimeError("every local RDMA link is down"))
+            return deferred
         # A down peer owes no request the dial's timeout: probe in the
         # background and fail this one now, so it recomputes at once and a
         # later one finds the peer handshaked.
@@ -2025,6 +2078,5 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             return super()._ensure_handshake(engine_id, host, port, tp_size)
         if now >= probe_at:
             super()._ensure_handshake(engine_id, host, port, tp_size)
-        deferred: Future[dict[int, str]] = Future()
         deferred.set_exception(RuntimeError(f"engine {engine_id} is down"))
         return deferred

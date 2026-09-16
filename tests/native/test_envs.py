@@ -203,6 +203,7 @@ def test_unrecognized_value_disables_a_default_on_variable(monkeypatch):
 _PROBE_OVERRIDES = {
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY": "linear",
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": "3,5",
+    "VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S": "30",
 }
 
 # Keys that resolve from a differently named variable: custom kernels follow the

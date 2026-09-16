@@ -71,6 +71,10 @@ def _push_worker():
     w._engines_to_rehandshake = set()
     w._reconnect_backoff = {}
     w._recving_transfers = {}
+    # Never read this host's links in a unit test.
+    w._link_down_since = None
+    w._link_checked_at = float("inf")
+    w._link_down_exit_s = 0.0
     # __init__ never ran, so the writer state shutdown() reaches through
     # __del__ is absent; silence it rather than leak an unraisable at GC.
     w.shutdown = lambda: None
