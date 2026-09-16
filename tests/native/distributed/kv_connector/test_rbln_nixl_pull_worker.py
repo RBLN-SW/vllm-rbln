@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
+import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as wm
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
@@ -107,6 +108,10 @@ class TestShardReadPath:
         w._failed_recv_reqs = queue.Queue()
         w._engines_to_rehandshake = set()
         w._reconnect_backoff = {}
+        # Never read this host's links in a unit test.
+        w._link_down_since = None
+        w._link_checked_at = float("inf")
+        w._link_down_exit_s = 0.0
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
         # single group, 2 regions per shard
@@ -530,6 +535,84 @@ class TestUnreachableEngineReconnect:
         w._engines_to_rehandshake.discard("eng")
         w._handle_failed_transfer("r0", None)
         assert w._reconnect_backoff["eng"][1] > time.perf_counter()
+
+
+class TestLocalLinkAttribution:
+    # Every physical link in this namespace down means this side is the fault:
+    # no peer can be dialled from it, so requests fail at once instead of
+    # probing or waiting out the transport timeout, and a producer may exit so
+    # the orchestrator replaces it.
+
+    @staticmethod
+    def _sysfs(tmp_path, **operstate):
+        # The pod network is a veth with no `device`; RDMA NICs are physical.
+        (tmp_path / "eth0").mkdir()
+        (tmp_path / "eth0" / "operstate").write_text("up\n")
+        for name, state in operstate.items():
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "device").touch()
+            (tmp_path / name / "operstate").write_text(f"{state}\n")
+        return tmp_path
+
+    @staticmethod
+    def _worker(monkeypatch, sysfs):
+        w = TestShardReadPath._read_worker(pp_size=2)
+        w.tp_rank = 0
+        w._reqs_to_send = {}
+        w.nixl_wrapper.get_new_notifs.return_value = {}
+        w._link_checked_at = 0.0
+        monkeypatch.setattr(wm, "_SYS_CLASS_NET", sysfs)
+        return w
+
+    def test_all_links_down_fails_requests_without_a_dial(self, monkeypatch, tmp_path):
+        w = self._worker(monkeypatch, self._sysfs(tmp_path, ens1="down", ens2="down"))
+        w.get_finished()
+        assert w._link_down_since is not None
+
+        # An unknown peer is not dialled.
+        w._remote_agents = {}
+        dial = MagicMock(return_value=None)
+        monkeypatch.setattr(NixlBaseConnectorWorker, "_ensure_handshake", dial)
+        with pytest.raises(RuntimeError, match="local RDMA link"):
+            w._ensure_handshake("eng", "host", 1234, 1).result()
+        dial.assert_not_called()
+
+    def test_a_live_spare_link_is_not_our_fault(self, monkeypatch, tmp_path):
+        # The re-handshake moves to the spare, so the peer path must stay open.
+        w = self._worker(monkeypatch, self._sysfs(tmp_path, ens1="down", ens2="up"))
+        w.get_finished()
+        assert w._link_down_since is None
+
+    def test_no_physical_link_says_nothing(self, monkeypatch, tmp_path):
+        w = self._worker(monkeypatch, self._sysfs(tmp_path))
+        w.get_finished()
+        assert w._link_down_since is None
+
+    def test_a_link_returning_clears_the_backoff(self, monkeypatch, tmp_path):
+        sysfs = self._sysfs(tmp_path, ens1="down")
+        w = self._worker(monkeypatch, sysfs)
+        w.get_finished()
+        w._reconnect_backoff["eng"] = (3, time.perf_counter() + 10)
+
+        (sysfs / "ens1" / "operstate").write_text("up\n")
+        w._link_checked_at = 0.0
+        w.get_finished()
+        assert w._link_down_since is None
+        assert w._reconnect_backoff == {}
+
+    def test_a_producer_exits_once_the_links_stay_down(self, monkeypatch, tmp_path):
+        w = self._worker(monkeypatch, self._sysfs(tmp_path, ens1="down"))
+        w._link_down_exit_s = 30.0
+        w.get_finished()
+
+        w._link_down_since -= 29
+        w._link_checked_at = 0.0
+        w.get_finished()
+
+        w._link_down_since -= 2
+        w._link_checked_at = 0.0
+        with pytest.raises(RuntimeError, match="recycled"):
+            w.get_finished()
 
 
 class TestReadMarksTheEngineActive:

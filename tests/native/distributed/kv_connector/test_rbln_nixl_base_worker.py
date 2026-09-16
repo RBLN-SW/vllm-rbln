@@ -63,6 +63,7 @@ def _build_worker(
     nixl_available=True,
     swa_view_opt=False,
     use_mla=False,
+    kv_role=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -99,12 +100,31 @@ def _build_worker(
     # _check_pp_constraints compares pipeline_parallel_size <= 1; give it a real
     # int (a MagicMock would raise TypeError). 1 == the non-PP default here.
     vllm_config.parallel_config.pipeline_parallel_size = 1
+    kv_config = vllm_config.kv_transfer_config
+    kv_config.is_kv_producer = kv_role in ("kv_producer", "kv_both")
+    kv_config.is_kv_consumer = kv_role in ("kv_consumer", "kv_both")
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     kv_cache_config.kv_cache_groups = [
         MagicMock(kv_cache_spec=spec) for spec in (specs or [])
     ]
     return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+
+
+class TestLinkDownExitRole:
+    # A consumer holds every running generation and serves on recompute while
+    # its links are down; only a producer may exit to be recycled.
+
+    @pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_both"])
+    def test_a_consumer_rejects_the_exit(self, monkeypatch, kv_role):
+        monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S", 30.0)
+        with pytest.raises(RuntimeError, match="producer"):
+            _build_worker(monkeypatch, kv_role=kv_role)
+
+    def test_a_producer_takes_it(self, monkeypatch):
+        monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S", 30.0)
+        worker = _build_worker(monkeypatch, kv_role="kv_producer")
+        assert worker._link_down_exit_s == 30.0
 
 
 class TestBackendSelection:

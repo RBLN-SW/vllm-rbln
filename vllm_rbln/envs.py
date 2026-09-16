@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
     # --- KV CONNECTOR ---
     VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
+    VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S: float = 0.0
     # --- QUANTIZATION ---
     VLLM_RBLN_USE_W8A8: bool = False
 
@@ -385,6 +386,12 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # A KV producer whose local RDMA links all stay down for this many seconds
+    # exits so the orchestrator replaces it; 0 keeps it serving. A consumer
+    # keeps its running requests and recomputes, so it rejects this variable.
+    "VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S": lambda: float(
+        os.environ.get("VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S", "0")
+    ),
     # --- QUANTIZATION ---
     # W8A16 runs on every RBLN NPU, W8A8 only on the ones whose kernels take an
     # fp8 activation, so W8A8 is opted into rather than derived from the device.
@@ -428,6 +435,7 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_AUTO_PORT",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
         "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
+        "VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S",
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_COMPILE_MODEL",
