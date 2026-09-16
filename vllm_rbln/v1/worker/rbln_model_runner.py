@@ -3650,8 +3650,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             nt = op.num_tokens
             for kv_cache in self.kv_caches:
                 if self.model_config.use_mla:
-                    dsts.append(kv_cache[dst, :nt, :])
-                    srcs.append(kv_cache[src, :nt, :])
+                    dsts.append(kv_cache[dst, :nt])
+                    srcs.append(kv_cache[src, :nt])
                 else:
                     dsts.append(kv_cache[:, dst, :, :, :nt, :])
                     srcs.append(kv_cache[:, src, :, :, :nt, :])
