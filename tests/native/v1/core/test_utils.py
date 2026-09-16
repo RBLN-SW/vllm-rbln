@@ -27,6 +27,7 @@ from vllm_rbln.v1.core.utils import (
     resolve_propagated_token_write,
     should_defer_spec_step,
     step_is_prefill,
+    sub_block_size_in_use,
 )
 
 
@@ -152,3 +153,51 @@ class TestShouldDeferSpecStep:
         assert should_defer_spec_step(3, [], -3) is True
         assert should_defer_spec_step(3, [], 0) is False
         assert should_defer_spec_step(3, [], 1) is False
+
+
+class TestSubBlockSizeInUse:
+    """One predicate for the scheduler's manager choice and the worker's
+    copy-stream reserve."""
+
+    @pytest.fixture
+    def eligible(self, monkeypatch):
+        from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
+
+        def _set(value):
+            monkeypatch.setattr(
+                RBLNKVCacheManager,
+                "can_use_sub_block_caching",
+                staticmethod(lambda cfg, size: value),
+            )
+
+        return _set
+
+    def _call(self, **kw):
+        args = dict(
+            enable_prefix_caching=True,
+            sub_block_cache=True,
+            max_num_batched_tokens=512,
+            kv_cache_config=object(),
+        )
+        args.update(kw)
+        return sub_block_size_in_use(**args)
+
+    def test_defaults_to_the_prefill_chunk(self, eligible):
+        eligible(True)
+        assert self._call() == 512
+
+    def test_an_explicit_size_wins_and_needs_no_config_flag(self, eligible):
+        eligible(True)
+        assert self._call(sub_block_cache=False, sub_block_size=128) == 128
+
+    def test_none_without_prefix_caching(self, eligible):
+        eligible(True)
+        assert self._call(enable_prefix_caching=False) is None
+
+    def test_none_when_the_flag_is_off_and_no_size_is_given(self, eligible):
+        eligible(True)
+        assert self._call(sub_block_cache=False) is None
+
+    def test_none_when_the_config_is_ineligible(self, eligible):
+        eligible(False)
+        assert self._call() is None

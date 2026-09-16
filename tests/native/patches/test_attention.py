@@ -13,13 +13,14 @@
 # limitations under the License.
 
 """The KV-cache spec a sliding-window layer declares. Which one it is decides
-the cache layout for the whole run, and VLLM_RBLN_USE_MULTI_BLOCK_ATTN decides
-which one."""
+the cache layout for the whole run, and the device decides which one: REBEL
+CR13 carries the appending kernel, every other NPU shifts one block."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
@@ -46,42 +47,37 @@ def _config(use_mla=False):
 
 
 @pytest.fixture
-def multi_block(monkeypatch):
+def cr13(monkeypatch):
     def switch(on):
-        monkeypatch.setenv("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", "1" if on else "0")
+        monkeypatch.setattr(current_platform, "is_cr13", lambda: on)
 
     return switch
 
 
 class TestSlidingWindowSpec:
-    def test_multi_block_declares_upstreams_spec(self, multi_block):
+    def test_cr13_declares_upstreams_spec(self, cr13):
         # Appending into an ordinary paged cache is what upstream's spec and its
         # manager already describe: several blocks, reclaimed behind the window.
-        multi_block(True)
+        cr13(True)
         spec = patched_get_kv_cache_spec(_layer(16), _config())
         assert type(spec) is SlidingWindowSpec
 
-    @pytest.mark.parametrize("explicitly_off", [True, False])
-    def test_otherwise_the_rbln_spec(self, monkeypatch, multi_block, explicitly_off):
+    def test_otherwise_the_rbln_spec(self, cr13):
         # The shift kernel holds the window in one block, which only
-        # RBLNSlidingWindowSpec and its manager allocate that way. It stays the
-        # default, so an unset variable has to land here too.
-        if explicitly_off:
-            multi_block(False)
-        else:
-            monkeypatch.delenv("VLLM_RBLN_USE_MULTI_BLOCK_ATTN", raising=False)
+        # RBLNSlidingWindowSpec and its manager allocate that way.
+        cr13(False)
         spec = patched_get_kv_cache_spec(_layer(16), _config())
         assert type(spec) is RBLNSlidingWindowSpec
 
-    def test_a_layer_without_a_window_ignores_the_flag(self, multi_block):
-        # The flag names a sliding-window cache layout; full attention keeps the
-        # one spec it has on either setting.
-        multi_block(True)
+    def test_a_layer_without_a_window_ignores_the_device(self, cr13):
+        # The device picks a sliding-window cache layout; full attention keeps
+        # the one spec it has on either NPU.
+        cr13(True)
         assert type(patched_get_kv_cache_spec(_layer(None), _config())) is (
             FullAttentionSpec
         )
 
-    def test_mla_with_a_window_is_rejected(self, multi_block):
-        multi_block(True)
+    def test_mla_with_a_window_is_rejected(self, cr13):
+        cr13(True)
         with pytest.raises(NotImplementedError, match="MLA"):
             patched_get_kv_cache_spec(_layer(16), _config(use_mla=True))

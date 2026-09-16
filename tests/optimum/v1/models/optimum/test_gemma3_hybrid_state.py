@@ -38,7 +38,6 @@ def _bare_gemma3(max_batch_size: int) -> Gemma3:
     obj = Gemma3.__new__(Gemma3)
     obj.decoder_batch_size = max_batch_size
     obj.use_multiple_decoder = False
-    obj.available_blocks = torch.arange(50, 60, dtype=torch.int16)
     obj.attention_manager = MultimodalHybridAttentionStateManager()
     obj._image_token_id = lambda: 999
     return obj
@@ -69,8 +68,8 @@ def test_forward_prefill_passes_slot_and_records_graph_state():
         is_prompt=True,
         running_requests_ids=["A"],
         input_tokens=torch.tensor([[11, 12, 13]]),
-        input_positions=torch.tensor([[0, 1, 2]]),
-        block_tables=torch.tensor([[10]], dtype=torch.int16),
+        input_positions=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        block_tables=torch.tensor([10], dtype=torch.int16),
         inputs_embeds=torch.zeros(1, 3, 4),
         cache_slot_ids=torch.tensor([1], dtype=torch.int16),
     )
@@ -111,14 +110,15 @@ def test_forward_decode_wires_state_by_running_order():
     model_input = types.SimpleNamespace(
         is_prompt=False,
         running_requests_ids=["B", "A"],  # reversed vs slot order
+        padded_batch_size=2,
         input_tokens=torch.tensor([[201], [200]]),
-        input_positions=torch.tensor([[3], [2]]),
+        input_positions=torch.tensor([[3], [2]], dtype=torch.int32),
         block_tables=torch.tensor([[10], [11]], dtype=torch.int16),
-        cache_slot_ids=torch.tensor([1, 0], dtype=torch.int16),
+        cache_slot_ids=torch.tensor([[1], [0]], dtype=torch.int16),
     )
     obj.forward(model_input)
 
-    # Slot ids in running order, padded to the decoder batch.
+    # The runner-padded slot ids reach the graph unchanged.
     assert torch.equal(
         recorded["local_block_tables"], torch.tensor([[1], [0]], dtype=torch.int16)
     )

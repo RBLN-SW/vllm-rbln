@@ -336,7 +336,7 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.config import build_rbln_config, set_rbln_config
+        from vllm_rbln.config import build_rbln_config
         from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
         from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
         from vllm_rbln.utils.optimum.registry import is_pooling_arch
@@ -357,17 +357,15 @@ class RblnPlatform(Platform):
             cls._validate_dynamic_kv_config(vllm_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            vllm_config.additional_config = build_rbln_config(
-                vllm_config.additional_config
-            )
-            set_rbln_config(vllm_config.additional_config)
+            rbln_config = build_rbln_config(vllm_config.additional_config)
+            vllm_config.additional_config = rbln_config
 
             if vllm_config.lora_config is not None:
                 raise ValueError("LoRA is not supported on RBLN.")
 
             cls.validate_and_setup_prerequisite(vllm_config)
 
-            if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
+            if rbln_config.enforce_model_fp32:
                 if model_config.dtype != torch.float32:
                     # FIXME(RBLN): force model dtype into fp32 for graph compilation
                     original_dtype = model_config.dtype
@@ -402,7 +400,7 @@ class RblnPlatform(Platform):
             # only reader of the flag, and on the optimum path the refusal
             # below is the whole story.
             if scheduler_config.async_scheduling and not (
-                envs.VLLM_RBLN_USE_DEVICE_TENSOR and envs.VLLM_RBLN_SAMPLER
+                envs.VLLM_RBLN_USE_DEVICE_TENSOR and rbln_config.use_custom_sampler
             ):
                 logger.warning(
                     "Disabling asynchronous scheduling: it requires "
@@ -411,7 +409,7 @@ class RblnPlatform(Platform):
                     "which puts the sampler on the device so those tokens never "
                     "reach the host mid-step. Running synchronously.",
                     int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
-                    int(envs.VLLM_RBLN_SAMPLER),
+                    int(rbln_config.use_custom_sampler),
                 )
                 scheduler_config.async_scheduling = False
 
@@ -609,15 +607,10 @@ class RblnPlatform(Platform):
             cls.disable_unsupported_prefix_caching(vllm_config)
             sync_vllm_and_optimum(vllm_config)
 
-        if (
-            parallel_config.distributed_executor_backend is not None
-            and parallel_config.distributed_executor_backend != "mp"
-        ):
+        if parallel_config.distributed_executor_backend not in (None, "mp", "uni"):
             logger.warning(
-                (
-                    "%s is not supported on RBLN, fallback to mp "
-                    "distributed executor backend."
-                ),
+                "%s is not supported on RBLN. Keeping the selected distributed "
+                "executor backend; use 'mp' for supported multi-worker execution.",
                 parallel_config.distributed_executor_backend,
             )
 
@@ -663,36 +656,33 @@ class RblnPlatform(Platform):
     def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
         """Reject configurations the dynamic-KV path cannot size.
 
-        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
-        Configurations".
+        A dry run reports them instead: it changes nothing, so refusing would
+        stop a run that the flag off would have served. Reasons per shape:
+        docs/dynamic_kv_cache.md, "Unsupported Configurations".
         """
+        dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
+
+        def reject(message: str) -> None:
+            if dry_run:
+                logger.warning("dynamic KV cache dry run: %s", message)
+                return
+            raise ValueError(message)
+
         if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
                 "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
             )
 
-        if vllm_config.model_config.use_mla:
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
-                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
-            )
-
-        if vllm_config.speculative_config is not None:
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
-                "decoding; the merged profiles cannot be attributed per artifact."
-            )
-
         if not USE_DEVICE_TENSOR:
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
                 "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
                 "no dynamic KV dimension."
             )
 
         if vllm_config.kv_transfer_config is not None:
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
                 "transfer connector; the resize invalidates its registrations."
             )
@@ -723,6 +713,8 @@ class RblnPlatform(Platform):
 
     @classmethod
     def validate_and_setup_prerequisite(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.config import RBLNConfig
+
         scheduler_config = vllm_config.scheduler_config
         if not scheduler_config.enable_chunked_prefill:
             raise ValueError(
@@ -775,10 +767,11 @@ class RblnPlatform(Platform):
                     "when DP enabled."
                 )
 
+            rbln_config: RBLNConfig = vllm_config.additional_config
             if (
                 parallel_config.data_parallel_size > 1
                 or parallel_config.enable_expert_parallel
-            ) and not envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
+            ) and not rbln_config.use_moe_tokens_mask:
                 raise ValueError(
                     "VLLM_RBLN_USE_MOE_TOKENS_MASK is required when DP or EP enabled: "
                     "the mask marks padded tokens introduced by DP multicast. "

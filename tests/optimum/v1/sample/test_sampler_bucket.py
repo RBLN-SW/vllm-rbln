@@ -68,13 +68,12 @@ def _assert_padded_bucket(runner, num_live: int):
 def _rig_forward(runner, token_logits: dict[int, float], base: float = 0.0):
     """Make the model emit fixed logits so sampling is predictable.
 
-    Mirrors RBLNOptimumForCausalLM.forward's output contract: prefill
-    returns one row for the scheduled request, decode returns one row
-    per live request (the model-side bucket padding already sliced off).
+    Mirrors RBLNOptimumForCausalLM.forward's output contract: one row per
+    row of the padded batch (1 for prefill); the runner drops the padding.
     """
 
     def rigged_forward(model_input, **kwargs):
-        num_rows = 1 if model_input.is_prompt else runner.input_batch.num_reqs
+        num_rows = model_input.padded_batch_size
         vocab_size = runner.model_config.get_vocab_size()
         logits = torch.full((num_rows, 1, vocab_size), base, dtype=runner.model.dtype)
         for token_id, value in token_logits.items():
