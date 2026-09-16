@@ -1655,6 +1655,14 @@ class TestDummyRunDraftParticipation:
         assert staged == [1 + self.NUM_SPEC]
         drafter.dummy_run.assert_called_once_with(1, 1, False)
 
+    def test_a_single_token_draft_runs_the_window_on_an_idle_step(self, monkeypatch):
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        monkeypatch.setattr(runner, "num_spec_tokens", 1)
+
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        drafter.dummy_run.assert_called_once_with(1, 2, False)
+
     def test_idle_draft_runs_the_decided_length(self, monkeypatch):
         # Beside a prefilling peer the step decides this rank's own single token,
         # and the group's token dimension is sized for that. Running the draft at

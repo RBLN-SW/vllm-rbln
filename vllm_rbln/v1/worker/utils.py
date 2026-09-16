@@ -332,6 +332,8 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
         one_request += cdiv(
             spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
         )
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
         admission = getattr(spec, "max_admission_blocks_per_request", None)
         if admission is None and isinstance(
             spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)
