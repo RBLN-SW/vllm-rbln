@@ -387,8 +387,6 @@ def pytest_configure(config):
     if device_tensor is not None:
         os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
     if device_tensor == "0":
-        # The dynamic KV dim lives in the device-tensor artifact, so the cpu
-        # lane has nowhere to put it and platform.py rejects the pair.
         del os.environ["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"]
 
     # Also before the import below: the get_pp_indices patch conditions on this.
