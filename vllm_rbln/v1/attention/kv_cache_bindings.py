@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -40,6 +42,10 @@ class KVCacheViewInfo:
     view_shape: tuple[int, ...] | None = None
     permute_order: tuple[int, ...] | None = None
     select_index: int | None = None
+    # Axis of `view_shape` taken from the base at view time, scaled by
+    # dynamic_scale = (num, den), so a dynamic num_blocks is not specialized.
+    dynamic_axis: int | None = None
+    dynamic_scale: tuple[int, int] = (1, 1)
 
 
 def build_kv_cache_base_bindings(
@@ -64,14 +70,71 @@ def build_kv_cache_base_bindings(
             base_index_by_storage[storage_key] = base_index
             base_tensors.append(base_tensor)
 
-        view_infos.append(
-            replace(
-                kv_cache_view_infos_by_layer[layer_name],
-                base_index=base_index,
+        view_info = kv_cache_view_infos_by_layer[layer_name]
+        if view_info.dynamic_axis is not None and view_info.view_shape is not None:
+            axis = view_info.dynamic_axis
+            # materialize_kv_cache_view reads the extent after the dtype view.
+            as_viewed = base_tensors[base_index]
+            if view_info.view_dtype is not None:
+                as_viewed = as_viewed.view(view_info.view_dtype)
+            view_info = replace(
+                view_info,
+                dynamic_scale=_reduced_ratio(
+                    view_info.view_shape[axis], int(as_viewed.shape[axis])
+                ),
             )
-        )
+        view_infos.append(replace(view_info, base_index=base_index))
 
     return base_tensors, view_infos
+
+
+def attention_block_axis(use_custom_kernel: bool) -> int:
+    """Which axis of the paged attention KV cache `num_blocks` sits on.
+
+    The layout belongs to whichever kernel reads the cache: rbln_custom_ops
+    reads `[num_blocks, 2, ...]`, rbln_triton_ops still reads
+    `[2, num_blocks, ...]`, and `use_custom_kernel` is what routes attention to
+    the latter. A setting of its own could disagree with the namespace in use,
+    and nothing would catch that. Goes away once the triton kernels move.
+    """
+    return 1 if use_custom_kernel else 0
+
+
+def kv_cache_dynamic_axis(
+    attn_backend: Any,
+    kernel_num_blocks: int,
+    kernel_block_size: int,
+    kv_cache_spec: Any,
+    cache_dtype: str,
+    stride_order: Sequence[int],
+) -> int:
+    """The axis of the backend's KV shape (in stride order) that grows with
+    `num_blocks`: `attention_block_axis` for the paged layout, dim 0 for MLA's
+    `[num_blocks, block_size, latent]`, wherever the stride order puts it."""
+
+    def shape(num_blocks: int) -> tuple[int, ...]:
+        raw = attn_backend.get_kv_cache_shape(
+            num_blocks,
+            kernel_block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=cache_dtype,
+        )
+        return tuple(raw[i] for i in stride_order)
+
+    at_n, at_n1 = shape(kernel_num_blocks), shape(kernel_num_blocks + 1)
+    axes = [i for i, (a, b) in enumerate(zip(at_n, at_n1)) if a != b]
+    if len(axes) != 1:
+        raise ValueError(
+            f"KV cache shape {at_n} does not grow along exactly one dim with "
+            f"num_blocks (changed dims: {axes})"
+        )
+    return axes[0]
+
+
+def _reduced_ratio(numerator: int, denominator: int) -> tuple[int, int]:
+    g = math.gcd(numerator, denominator)
+    return numerator // g, denominator // g
 
 
 def materialize_kv_cache_view(
@@ -82,7 +145,18 @@ def materialize_kv_cache_view(
     if view_info.view_dtype is not None:
         tensor = tensor.view(view_info.view_dtype)
     if view_info.view_shape is not None:
-        tensor = tensor.view(view_info.view_shape)
+        shape = list(view_info.view_shape)
+        if view_info.dynamic_axis is not None:
+            axis = view_info.dynamic_axis
+            num, den = view_info.dynamic_scale
+            extent = tensor.shape[axis]
+            if den > 1:
+                # Lets dynamo simplify extent // den; a -1 here leaves an
+                # unsimplified floordiv in every other dim.
+                torch._check(extent % den == 0)
+                extent = extent // den
+            shape[axis] = extent * num
+        tensor = tensor.view(shape)
     if view_info.permute_order is not None:
         tensor = tensor.permute(*view_info.permute_order)
     if view_info.select_index is not None:

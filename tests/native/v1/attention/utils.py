@@ -30,9 +30,13 @@ def make_attention_spec(
     head_size: int = 64,
     dtype: torch.dtype = torch.float16,
     sliding_window: int | None = None,
+    appends_kv: bool = True,
 ) -> Any:
-    """A FullAttentionSpec, or a SlidingWindowSpec when sliding_window is set."""
+    """A FullAttentionSpec, or a sliding-window spec when sliding_window is set:
+    upstream's, or RBLN's shift-layout one when appends_kv is False."""
     from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
     kwargs = dict(
         block_size=block_size,
@@ -42,7 +46,8 @@ def make_attention_spec(
     )
     if sliding_window is None:
         return FullAttentionSpec(**kwargs)
-    return SlidingWindowSpec(**kwargs, sliding_window=sliding_window)
+    spec_cls = SlidingWindowSpec if appends_kv else RBLNSlidingWindowSpec
+    return spec_cls(**kwargs, sliding_window=sliding_window)
 
 
 def make_common_attn_metadata(
@@ -66,12 +71,13 @@ def make_builder(
     vllm_config: Any,
     *,
     sliding_window: int | None = None,
+    appends_kv: bool = True,
     spec: Any = None,
     layer_names: tuple[str, ...] = ("model.layers.0.self_attn",),
     device: str = "cpu",
 ) -> Any:
-    """Construct the real builder. is_causal is read from
-    VLLM_RBLN_FLASH_CAUSAL_ATTN at __init__, so set it before calling."""
+    """Construct the real builder. is_causal comes from `vllm_config`, so pass a
+    config built with `use_flash_causal_attn` off to get the non-causal builder."""
     from vllm.config import set_current_vllm_config
 
     from vllm_rbln.v1.attention.backends.flash_attention import (
@@ -79,7 +85,7 @@ def make_builder(
     )
 
     if spec is None:
-        spec = make_attention_spec(sliding_window=sliding_window)
+        spec = make_attention_spec(sliding_window=sliding_window, appends_kv=appends_kv)
     with set_current_vllm_config(vllm_config):
         return RBLNFlashAttentionMetadataBuilder(
             spec, list(layer_names), vllm_config, torch.device(device)

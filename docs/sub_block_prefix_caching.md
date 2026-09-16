@@ -193,10 +193,11 @@ The scheduler returns `RBLNSchedulerOutput` containing `kv_cache_copy_ops`.
 Before the forward pass, the model runner copies sub-block KV data:
 
 ```python
-# For each copy op targeting a specific group's layers:
-# kv_cache tensor (shape: 2, num_blocks, H, 1, block_size, D):
-kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
-    kv_cache[:, src_block_id, :, :, :num_tokens, :]
+# For each copy op targeting a specific group's layers. `block_axis` is 0 for
+# the (num_blocks, 2, H, 1, block_size, D) cache the rbln_custom_ops kernels
+# read, 1 for the (2, num_blocks, ...) one rbln_triton_ops still reads:
+kv_cache.select(block_axis, dst_block_id)[..., :num_tokens, :] = \
+    kv_cache.select(block_axis, src_block_id)[..., :num_tokens, :]
 ```
 
 ### Block lifecycle

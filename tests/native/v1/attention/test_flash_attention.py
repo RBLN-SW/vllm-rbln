@@ -13,11 +13,15 @@
 # limitations under the License.
 
 
+from dataclasses import fields
+
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.envs as envs
+import vllm_rbln.v1.attention.backends.flash_attention as flash_attention
 from tests.native.v1.attention.utils import (
     make_builder,
     make_common_attn_metadata,
@@ -58,21 +62,39 @@ def _cam(*, num_reqs, query_start_loc, seq_lens, block_table):
     )
 
 
+def _unexpected(name: str):
+    def called(*args, **kwargs):
+        raise AssertionError(f"{name} must not be reached")
+
+    return called
+
+
 def _lower_triangular(n: int) -> torch.Tensor:
     # causal_mask = 1 - triu(ones, diag=1): 1 where key <= query, else 0.
     return 1 - torch.triu(torch.ones(n, n), diagonal=1)
 
 
-@pytest.fixture
-def custom_kernel_on(monkeypatch):
-    # USE_CUSTOM_KERNEL resolves from RBLN_USE_CUSTOM_KERNEL, not the
-    # VLLM_RBLN_-prefixed name (pinned in test_envs).
-    monkeypatch.setenv("RBLN_USE_CUSTOM_KERNEL", "1")
+@pytest.fixture(scope="module")
+def cfg_custom_kernel():
+    return make_vllm_config(
+        max_model_len=MAX_LEN,
+        max_num_batched_tokens=CHUNK,
+        additional_config={"use_custom_kernel": True},
+    )
 
 
 @pytest.fixture(scope="module")
 def cfg():
     return make_vllm_config(max_model_len=MAX_LEN, max_num_batched_tokens=CHUNK)
+
+
+@pytest.fixture(scope="module")
+def cfg_noncausal():
+    return make_vllm_config(
+        max_model_len=MAX_LEN,
+        max_num_batched_tokens=CHUNK,
+        additional_config={"use_flash_causal_attn": False},
+    )
 
 
 @pytest.fixture(scope="module")
@@ -82,13 +104,24 @@ def cfg_square():
 
 
 class TestFlashAttentionBackendStatic:
-    def test_kv_cache_shape(self):
-        # Layout is (2, num_blocks, num_kv_heads, 1, block_size, head_size).
+    @pytest.mark.parametrize(
+        "use_custom_kernel, expected",
+        [(False, (7, 2, 3, 1, 11, 5)), (True, (2, 7, 3, 1, 11, 5))],
+        ids=["rbln_custom_ops", "rbln_triton_ops"],
+    )
+    def test_kv_cache_shape(self, use_custom_kernel, expected):
+        # num_blocks leads for the kernels that read a whole block at once and
+        # trails the K/V axis for the ones that still read K and V apart, so
+        # the shape has to follow the namespace `use_custom_kernel` selects.
         # Distinct primes catch any argument re-ordering.
-        shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
-            num_blocks=7, block_size=11, num_kv_heads=3, head_size=5
+        config = make_vllm_config(
+            additional_config={"use_custom_kernel": use_custom_kernel}
         )
-        assert shape == (2, 7, 3, 1, 11, 5)
+        with set_current_vllm_config(config):
+            shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
+                num_blocks=7, block_size=11, num_kv_heads=3, head_size=5
+            )
+        assert shape == expected
 
     def test_supported_head_sizes(self):
         # Pins the supported set; a change here is a deliberate capability shift.
@@ -126,14 +159,13 @@ class TestBackendRegistration:
 
 
 class TestFlashAttentionMetadataPostInit:
-    def test_custom_kernel_off_leaves_dtype_untouched(self, monkeypatch):
+    def test_custom_kernel_off_leaves_dtype_untouched(self):
         # Without the custom kernel, __post_init__ returns early: no casting.
-        monkeypatch.delenv("RBLN_USE_CUSTOM_KERNEL", raising=False)
         assert _metadata().seq_lens.dtype == torch.int64
 
-    def test_custom_kernel_on_casts_seq_lens_to_int32(self, custom_kernel_on):
+    def test_custom_kernel_on_casts_seq_lens_to_int32(self):
         # The custom-kernel path casts seq_lens; absent cache tensors stay None.
-        md = _metadata()
+        md = _metadata(use_custom_kernel=True)
         assert md.seq_lens.dtype == torch.int32
         assert md.cache_seq_lens is None
         assert md.cache_offsets is None
@@ -143,23 +175,30 @@ class TestFlashAttentionMetadataPostInit:
     CACHE_FIELDS = ["cache_seq_lens", "cache_offsets"]
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_multielement_cache_field_raises_ambiguous(self, custom_kernel_on, field):
+    def test_multielement_cache_field_raises_ambiguous(self, field):
         # KNOWN BUG pinned: `if self.<field>` on a multi-element tensor raises.
         # The real SWA/decode path emits [batch, 1], so it fires at batch >= 2.
         with pytest.raises(RuntimeError, match="ambiguous"):
-            _metadata(**{field: torch.tensor([[1], [2]], dtype=torch.int64)})
+            _metadata(
+                use_custom_kernel=True,
+                **{field: torch.tensor([[1], [2]], dtype=torch.int64)},
+            )
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_single_zero_cache_field_is_silently_dropped(self, custom_kernel_on, field):
+    def test_single_zero_cache_field_is_silently_dropped(self, field):
         # TODO(RBLN): KNOWN BUG pinned — a 1-element tensor of value 0 is falsy,
         # so a valid all-zero value is discarded to None instead of cast.
-        md = _metadata(**{field: torch.tensor([[0]], dtype=torch.int64)})
+        md = _metadata(
+            use_custom_kernel=True, **{field: torch.tensor([[0]], dtype=torch.int64)}
+        )
         assert getattr(md, field) is None
 
     @pytest.mark.parametrize("field", CACHE_FIELDS)
-    def test_single_nonzero_cache_field_is_cast(self, custom_kernel_on, field):
+    def test_single_nonzero_cache_field_is_cast(self, field):
         # The only shape that survives correctly: 1 element, != 0.
-        md = _metadata(**{field: torch.tensor([[3]], dtype=torch.int64)})
+        md = _metadata(
+            use_custom_kernel=True, **{field: torch.tensor([[3]], dtype=torch.int64)}
+        )
         assert getattr(md, field) is not None
         assert getattr(md, field).dtype == torch.int32
 
@@ -218,8 +257,7 @@ class TestBuildPrefillCausal:
 
 
 class TestBuildPrefillNonCausal:
-    def _mask(self, config, monkeypatch, *, positions):
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
+    def _mask(self, config, *, positions):
         builder = make_builder(config)
         return builder.build(
             _cam(
@@ -233,17 +271,17 @@ class TestBuildPrefillNonCausal:
             is_prefill=True,
         ).attn_masks
 
-    def test_step_below_chunk_places_triangle_only(self, cfg, monkeypatch):
+    def test_step_below_chunk_places_triangle_only(self, cfg_noncausal):
         # step = positions[0] = 0 (< chunk): no cached region, triangle at [0:chunk]
-        mask = self._mask(cfg, monkeypatch, positions=torch.arange(4))
+        mask = self._mask(cfg_noncausal, positions=torch.arange(4))
         assert mask.shape == (1, 1, 1, CHUNK, MAX_LEN)
         expected = torch.zeros(1, 1, 1, CHUNK, MAX_LEN)
         expected[..., 0:CHUNK] = _lower_triangular(CHUNK)
         assert torch.equal(mask.float(), expected)
 
-    def test_step_at_chunk_fills_cached_region(self, cfg, monkeypatch):
+    def test_step_at_chunk_fills_cached_region(self, cfg_noncausal):
         # step = positions[0] = CHUNK (>= chunk): [:step] all attend, triangle after
-        mask = self._mask(cfg, monkeypatch, positions=torch.arange(4) + CHUNK)
+        mask = self._mask(cfg_noncausal, positions=torch.arange(4) + CHUNK)
         expected = torch.zeros(1, 1, 1, CHUNK, MAX_LEN)
         expected[..., :CHUNK] = 1
         expected[..., CHUNK : 2 * CHUNK] = _lower_triangular(CHUNK)
@@ -254,7 +292,7 @@ class TestBuildPrefillNonCausal:
         [(False, torch.float32), (True, torch.float16)],
     )
     def test_mask_dtype_follows_enforce_eager(
-        self, cfg, monkeypatch, eager, expected_dtype
+        self, cfg_noncausal, eager, expected_dtype
     ):
         # float16 under enforce_eager, float32 otherwise. enforce_eager needs
         # device tensors, so that case is skipped on the cpu lane.
@@ -265,11 +303,12 @@ class TestBuildPrefillNonCausal:
                 max_model_len=MAX_LEN,
                 max_num_batched_tokens=CHUNK,
                 enforce_eager=True,
+                additional_config={"use_flash_causal_attn": False},
             )
             if eager
-            else cfg
+            else cfg_noncausal
         )
-        mask = self._mask(config, monkeypatch, positions=torch.arange(4))
+        mask = self._mask(config, positions=torch.arange(4))
         assert mask.dtype == expected_dtype
 
 
@@ -295,11 +334,10 @@ class TestBuildDecodeCausal:
 
 
 class TestBuildDecodeNonCausal:
-    def test_per_request_attend_length(self, cfg, monkeypatch):
+    def test_per_request_attend_length(self, cfg_noncausal):
         # Decode mask: each batch row attends positions 0..seq_len; rows beyond
         # the request count stay zero.
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
-        builder = make_builder(cfg)
+        builder = make_builder(cfg_noncausal)
         md = builder.build(
             _cam(
                 num_reqs=2,
@@ -329,7 +367,7 @@ class TestBuildSlidingWindowPrefill:
         # cache_seq_lens = clamp(num_computed, window); cache_offsets adds
         # query_lens; local_block_tables is the first block; no SWA/attn mask.
         window = 4
-        builder = make_builder(cfg, sliding_window=window)  # causal
+        builder = make_builder(cfg, sliding_window=window, appends_kv=False)
         md = builder.build(
             _cam(
                 num_reqs=1,
@@ -347,10 +385,9 @@ class TestBuildSlidingWindowPrefill:
         assert md.swa_attn_masks is None  # prefill
         assert md.attn_masks is None  # causal
 
-    def test_noncausal_still_sets_swa_fields(self, cfg, monkeypatch):
+    def test_noncausal_still_sets_swa_fields(self, cfg_noncausal):
         # SWA block is independent of is_causal: chunked mask AND SWA fields set.
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
-        builder = make_builder(cfg, sliding_window=4)
+        builder = make_builder(cfg_noncausal, sliding_window=4, appends_kv=False)
         md = builder.build(
             _cam(num_reqs=1, query_start_loc=[0, 4], seq_lens=[10], block_table=[[7]]),
             torch.arange(4),
@@ -363,7 +400,7 @@ class TestBuildSlidingWindowPrefill:
     def test_respects_num_reqs_slice(self, cfg):
         # Only seq_lens[:num_reqs] feeds the SWA fields: req0 clamps to 1 while
         # req1 would clamp to 4, so the value identifies which was used.
-        builder = make_builder(cfg, sliding_window=4)
+        builder = make_builder(cfg, sliding_window=4, appends_kv=False)
         md = builder.build(
             _cam(
                 num_reqs=1,
@@ -383,7 +420,7 @@ class TestBuildSlidingWindowDecode:
         # Decode SWA: cache_* padded to batch_pad, swa mask marks positions
         # <= cache_seq_len, local_block_tables is the first block per row.
         window = 4
-        builder = make_builder(cfg, sliding_window=window)  # causal
+        builder = make_builder(cfg, sliding_window=window, appends_kv=False)
         md = builder.build(
             _cam(
                 num_reqs=1,
@@ -405,6 +442,68 @@ class TestBuildSlidingWindowDecode:
         assert torch.equal(md.swa_attn_masks.float(), expected)
         # decode block_tables padded to [[5], [0]], then [..., :1]
         assert md.local_block_tables.reshape(-1).tolist() == [5, 0]
+
+    @pytest.mark.parametrize(
+        "back_pad, exp_cache, exp_offset",
+        [
+            (None, 3, 6),  # caller stages no window: the raw difference, as before
+            ([2], 4, 5),  # window padded behind: cache starts 2 later, spans 2 less
+        ],
+    )
+    def test_back_pad_moves_the_cache_start_to_the_staged_position(
+        self, cfg, back_pad, exp_cache, exp_offset
+    ):
+        builder = make_builder(cfg, sliding_window=4, appends_kv=False)
+        md = builder.build(
+            _cam(
+                num_reqs=1,
+                query_start_loc=[0, 3],
+                seq_lens=[6],
+                block_table=[[5]],
+            ),
+            torch.arange(10),
+            batch_pad=1,
+            is_prefill=False,
+            back_pad=None if back_pad is None else torch.tensor(back_pad),
+        )
+        assert md.cache_seq_lens.reshape(-1).tolist() == [exp_cache]
+        assert md.cache_offsets.reshape(-1).tolist() == [exp_offset]
+
+
+class TestBuildSlidingWindowAppend:
+    def test_builds_what_a_full_attention_group_builds(self, cfg):
+        # An appended cache is upstream's SlidingWindowSpec, and the window is
+        # resolved inside the op: apart from the flag that names the path, the
+        # builder emits nothing that depends on it.
+        cam = _cam(
+            num_reqs=1, query_start_loc=[0, 1], seq_lens=[7], block_table=[[5, 6]]
+        )
+        args = (cam, torch.arange(10))
+        kwargs = dict(batch_pad=2, is_prefill=False)
+        swa = make_builder(cfg, sliding_window=4).build(*args, **kwargs)
+        full = make_builder(cfg).build(*args, **kwargs)
+
+        assert swa.swa_appends and not full.swa_appends
+        for field in fields(RBLNFlashAttentionMetadata):
+            if field.name == "swa_appends":
+                continue
+            swa_value = getattr(swa, field.name)
+            full_value = getattr(full, field.name)
+            if isinstance(swa_value, torch.Tensor):
+                assert torch.equal(swa_value, full_value)
+            else:
+                assert swa_value == full_value
+
+    def test_the_shift_spec_does_not_append(self, cfg):
+        # The flag follows the spec class, which is what the device picks.
+        builder = make_builder(cfg, sliding_window=4, appends_kv=False)
+        assert not builder.swa_appends
+
+    def test_custom_kernel_is_rejected(self, cfg_custom_kernel):
+        # rbln_triton_ops carries no sliding_window_attention_v1, so the group
+        # cannot be built at all rather than failing at the first forward.
+        with pytest.raises(NotImplementedError, match="sliding_window_attention_v1"):
+            make_builder(cfg_custom_kernel, sliding_window=4)
 
 
 class TestBuildOutputAssembly:
@@ -543,17 +642,16 @@ class TestFlashImplInit:
         with pytest.raises(NotImplementedError, match="flash causal"):
             make_impl(cfg_square, kv_cache_dtype="fp8")
 
-    def test_fp8_non_causal_raises(self, cfg, monkeypatch):
+    def test_fp8_non_causal_raises(self, cfg_noncausal):
         # is_causal off routes to the plain attention ops.
-        monkeypatch.setenv("VLLM_RBLN_FLASH_CAUSAL_ATTN", "0")
         with pytest.raises(NotImplementedError, match="flash causal"):
-            make_impl(cfg, kv_cache_dtype="fp8")
+            make_impl(cfg_noncausal, kv_cache_dtype="fp8")
 
-    def test_fp8_with_custom_kernel_raises(self, cfg, custom_kernel_on):
+    def test_fp8_with_custom_kernel_raises(self, cfg_custom_kernel):
         # The rbln_triton_ops variants drop the scales even on the flash
         # causal path.
         with pytest.raises(NotImplementedError, match="CUSTOM_KERNEL"):
-            make_impl(cfg, kv_cache_dtype="fp8")
+            make_impl(cfg_custom_kernel, kv_cache_dtype="fp8")
 
     def test_logits_soft_cap_disabled_with_warning(self, cfg, monkeypatch):
         # RBLN does not support a logits soft cap: it warns and forces it to 0.
@@ -594,3 +692,91 @@ class TestFlashImplInit:
 
     def test_is_normal_false_when_sinks_present(self, cfg_square):
         assert make_impl(cfg_square, sinks=torch.zeros(8)).is_normal is False
+
+
+@pytest.mark.maybe_use_device
+class TestForwardSlidingWindow:
+    """Which kernel a sliding-window layer reaches is carried on the metadata
+    by the builder, and the two take different inputs."""
+
+    WINDOW = 4
+    HEADS, DIM = 8, 128  # make_impl defaults; num_queries_per_kv is 1
+
+    def _forward(self, cfg, monkeypatch, target, metadata):
+        impl = make_impl(cfg, sliding_window=self.WINDOW)
+        b_size = metadata.seq_lens.shape[0]
+        recorded = []
+
+        def record(*args, **kwargs):
+            recorded.append(args)
+            return torch.zeros(b_size, self.HEADS, 1, 1, self.DIM)
+
+        for name in (
+            "sliding_window_attention_v1",
+            "sliding_window_attention_naive_prefill",
+            "sliding_window_attention_naive_decode",
+        ):
+            monkeypatch.setattr(
+                flash_attention, name, record if name == target else _unexpected(name)
+            )
+        qkv = torch.zeros(b_size, self.HEADS, self.DIM)
+        impl.forward(
+            None,  # layer: only the flash causal branch reads it
+            qkv,
+            qkv,
+            qkv,
+            torch.zeros(1, 1, 1, 1, self.WINDOW, 1),  # kv_cache: last dim but one
+            metadata,
+            torch.zeros(b_size, self.HEADS, self.DIM),
+        )
+        return recorded[0]
+
+    def _decode_metadata(self, swa_appends):
+        return RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[6], [0]]),
+            block_tables=torch.tensor([[7, 8, 9], [0, 0, 0]]),
+            is_prefill=False,
+            swa_appends=swa_appends,
+            cache_seq_lens=torch.tensor([[4], [0]]),
+            cache_offsets=torch.tensor([[5], [0]]),
+            local_block_tables=torch.tensor([[7], [0]]),
+        )
+
+    def test_appends_with_the_position_and_the_whole_table(self, cfg, monkeypatch):
+        # Neither the position nor the table is cut on the way in: the op
+        # resolves the window from them itself.
+        md = self._decode_metadata(swa_appends=True)
+        _q, _k, _v, _cache, seq_idx, _scale, tables, window, sinks = self._forward(
+            cfg, monkeypatch, "sliding_window_attention_v1", md
+        )
+        assert seq_idx is md.seq_lens  # absolute, not clamped to the window
+        assert tables is md.block_tables  # the whole table, not its first column
+        assert window == self.WINDOW
+        assert sinks is None
+
+    def test_otherwise_the_shift_kernel_takes_the_fill_and_one_block(
+        self, cfg, monkeypatch
+    ):
+        # The shift path is untouched: the clamped fill, its end, and the single
+        # block the window lives in.
+        md = self._decode_metadata(swa_appends=False)
+        *_, cache_seq_len, cache_offset, _scale, tables, _mask, _sinks = self._forward(
+            cfg, monkeypatch, "sliding_window_attention_naive_decode", md
+        )
+        assert cache_seq_len is md.cache_seq_lens
+        assert cache_offset is md.cache_offsets
+        assert tables is md.local_block_tables
+
+    def test_prefill_takes_the_same_call(self, cfg, monkeypatch):
+        # One op for both phases; its 1-D block table is reshaped by the op.
+        md = RBLNFlashAttentionMetadata(
+            seq_lens=torch.tensor([[6]]),
+            block_tables=torch.tensor([7, 8, 9]),
+            is_prefill=True,
+            swa_appends=True,
+        )
+        *_, tables, window, _sinks = self._forward(
+            cfg, monkeypatch, "sliding_window_attention_v1", md
+        )
+        assert tables.tolist() == [7, 8, 9]
+        assert window == self.WINDOW

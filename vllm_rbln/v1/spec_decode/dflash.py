@@ -40,10 +40,12 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.compilation import build_process_group_dict, compile
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
+    attention_block_axis,
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -86,9 +88,10 @@ class RBLNDFlashProposer(DFlashProposer):
     def __init__(self, vllm_config, device: torch.device, runner=None):
         # Checked before the base class does any work.
         self._require_single_sequence(vllm_config.scheduler_config)
+        rbln_config: RBLNConfig = vllm_config.additional_config
         if (
             vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
+            or not rbln_config.compile_model
         ):
             # The attention ops are pattern stubs the compiler replaces, so an
             # eager context write would silently write nothing.
@@ -304,11 +307,12 @@ class RBLNDFlashProposer(DFlashProposer):
             # NOTE(RBLN): the greedy pick belongs in the graph.
             return torch.ops.rbln.argmax(logits)
 
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         compile_kwargs = dict(
             dynamic=False,
             fullgraph=True,
             compile_context=self.runner.compile_context,
-            num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+            num_devices=rbln_config.num_devices_per_local_rank,
             model_trace_method="export" if USE_DEVICE_TENSOR else "",
             process_group_dict=build_process_group_dict(),
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
@@ -668,6 +672,8 @@ class RBLNDFlashProposer(DFlashProposer):
         # same views in one call per layer instead of one index at a time.
         destinations: list[torch.Tensor] = []
         sources: list[torch.Tensor] = []
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        block_axis = attention_block_axis(rbln_config.use_custom_kernel)
         for layer_index, layer in enumerate(model.layers):
             cache = layer.self_attn.attn.kv_cache
             k_layer = keys[layer_index]
@@ -675,8 +681,9 @@ class RBLNDFlashProposer(DFlashProposer):
             for token_start, count, block, offset in runs:
                 token_slice = slice(token_start, token_start + count)
                 cache_slice = slice(offset, offset + count)
-                dst_k = cache[0, block, :, 0, cache_slice, :].unbind(0)
-                dst_v = cache[1, block, :, 0, cache_slice, :].unbind(0)
+                one_block = cache.select(block_axis, block)
+                dst_k = one_block[0, :, 0, cache_slice, :].unbind(0)
+                dst_v = one_block[1, :, 0, cache_slice, :].unbind(0)
                 src_k = k_layer[:, token_slice, :].unbind(0)
                 src_v = v_layer[:, token_slice, :].unbind(0)
                 # Interleave key/value per head to keep the original order.
