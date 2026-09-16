@@ -181,7 +181,9 @@ class RblnNixlPullConnector(
         self.connector_worker.start_load_kv(meta)
 
 
-class RblnNixlPushConnector(RblnNixlConnectorBase, NixlPushConnector):
+class RblnNixlPushConnector(
+    RblnNixlConnectorBase, NixlPushConnector, SupportsDeferredLoad
+):
     """Push-based (WRITE) RBLN NIXL KV transfer connector."""
 
     def __init__(
@@ -191,6 +193,7 @@ class RblnNixlPushConnector(RblnNixlConnectorBase, NixlPushConnector):
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
+        self._deferred_load_meta: NixlConnectorMetadata | None = None
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = RblnNixlPushConnectorScheduler(
                 vllm_config, self.engine_id, kv_cache_config
@@ -213,15 +216,32 @@ class RblnNixlPushConnector(RblnNixlConnectorBase, NixlPushConnector):
         self.connector_worker.start_early_push(self._connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        """Let the previous step's offers go, then start this step's work.
+        """Keep this step's work; `flush_deferred_load` runs it.
 
-        Ahead of `super()`, which adopts the handover: a request whose handover
-        lands on this step has to be written by its offer rather than dropped
-        along with it.
+        An offer covers blocks a prefill closed on the step before this one, and
+        that forward has not retired at this point: the model call this step is
+        about to make is what it retires behind. Held so the release sits past
+        that call.
         """
+        self._deferred_load_meta = self._connector_metadata
+
+    def flush_deferred_load(self) -> None:
+        """Release the held offers and drive the worker, or do nothing.
+
+        The release stays ahead of the handover the worker adopts, so a request
+        whose handover lands on this step is written by its offer as well -- the
+        two are successive batches of it, not duplicates.
+
+        A step with no forward reaches no flush site of its own; the next step's
+        entry site runs what it holds, so nothing is stranded.
+        """
+        meta = self._deferred_load_meta
+        if meta is None:
+            return
+        self._deferred_load_meta = None
         assert isinstance(self.connector_worker, RblnNixlPushConnectorWorker)
         self.connector_worker.release_early_offers()
-        super().start_load_kv(forward_context, **kwargs)
+        self.connector_worker.start_load_kv(meta)
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
         """Drain an early write whose source blocks are about to be reused.
