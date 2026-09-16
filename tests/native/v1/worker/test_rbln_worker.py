@@ -26,6 +26,7 @@ import pytest
 import torch
 import vllm.platforms.interface as platform_interface
 from torch._dynamo.exc import BackendCompilerFailed
+from vllm.config import get_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -1122,3 +1123,28 @@ class TestDynamicKvLayoutGuards:
 
         assert calls.index("attention") < calls.index("shrink")
         assert calls.index("bindings") > calls.index("initialize_kv_cache")
+
+
+class TestDynamicKvBlockCountRpcs:
+    def test_both_rpcs_run_with_the_vllm_config_set(self):
+        # `get_kv_cache_shape` resolves the KV layout through
+        # `get_current_vllm_config()`, and these two land after warm-up has
+        # returned -- outside the scope WorkerWrapperBase opens around
+        # `initialize_from_config`. Without one of their own, the reallocation
+        # raises "Current vLLM config is not set" and kills the worker.
+        vllm_config = _make_vllm_config()
+        seen: list = []
+        worker = SimpleNamespace(
+            vllm_config=vllm_config,
+            dynamic_kv=SimpleNamespace(
+                compute_num_blocks=lambda: seen.append(get_current_vllm_config()),
+                apply_num_blocks=lambda n: seen.append(get_current_vllm_config()),
+            ),
+        )
+
+        RBLNWorker.compute_dynamic_kv_num_blocks(worker)
+        RBLNWorker.apply_dynamic_kv_num_blocks(worker, 4)
+
+        # Identity, not just "something was set": an outer scope holding a
+        # different config would satisfy a bare call.
+        assert seen == [vllm_config, vllm_config]

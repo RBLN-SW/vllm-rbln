@@ -18,8 +18,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
-from functools import partial
-from typing import Any, NamedTuple, TypeAlias, cast
+from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -319,6 +318,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Lazy initialization
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        # Layer name -> which axis of its cache a block indexes.
+        self.kv_cache_block_axes: dict[str, int] = {}
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
         # KV cache layer names in layer-index order; the deterministic
@@ -2944,6 +2945,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         dict[str, torch.Tensor],
         dict[str, torch.Tensor],
         dict[str, KVCacheViewInfo],
+        dict[str, int],
     ]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
@@ -2954,14 +2956,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 correct size but uninitialized shape.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         Returns:
-            Tuple of (kv_caches, kv_cache_base_tensors, kv_cache_view_infos):
+            Tuple of (kv_caches, kv_cache_base_tensors, kv_cache_view_infos,
+            kv_cache_block_axes):
             - kv_caches: layer name -> reshaped+permuted KV cache tensor
             - kv_cache_base_tensors: layer name -> typed base tensor (pre-permute)
             - kv_cache_view_infos: layer name -> view transformation metadata
+            - kv_cache_block_axes: layer name -> axis of the view a block indexes
         """
         kv_caches: dict[str, torch.Tensor] = {}
         kv_cache_base_tensors: dict[str, torch.Tensor] = {}
         kv_cache_view_infos: dict[str, KVCacheViewInfo] = {}
+        kv_cache_block_axes: dict[str, int] = {}
         marked_layers: list[tuple[str, int]] = []
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
@@ -3008,16 +3013,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
+                    base_block_axis = kv_cache_dynamic_axis(
+                        attn_backend,
+                        kernel_num_blocks,
+                        kernel_block_size,
+                        kv_cache_spec,
+                        self.cache_config.cache_dtype,
+                        kv_cache_stride_order,
+                    )
+                    view_block_axis = inv_order.index(base_block_axis)
+                    kv_cache_block_axes[layer_name] = view_block_axis
                     if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-                        base_dynamic_axis = kv_cache_dynamic_axis(
-                            attn_backend,
-                            kernel_num_blocks,
-                            kernel_block_size,
-                            kv_cache_spec,
-                            self.cache_config.cache_dtype,
-                            kv_cache_stride_order,
-                        )
-                        view_dynamic_axis = inv_order.index(base_dynamic_axis)
+                        base_dynamic_axis = base_block_axis
+                        view_dynamic_axis = view_block_axis
                     else:
                         base_dynamic_axis = None
                         view_dynamic_axis = None
@@ -3056,7 +3064,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 tuple(kv_caches[first_layer].shape),
             )
 
-        return kv_caches, kv_cache_base_tensors, kv_cache_view_infos
+        return (
+            kv_caches,
+            kv_cache_base_tensors,
+            kv_cache_view_infos,
+            kv_cache_block_axes,
+        )
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
@@ -3078,7 +3091,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
 
         # Change the memory buffer to the desired shape
-        kv_caches, kv_cache_bases_by_layer, kv_cache_view_infos = (
+        kv_caches, kv_cache_bases_by_layer, kv_cache_view_infos, block_axes = (
             self._reshape_kv_cache_tensors(
                 kv_cache_config,
                 kv_cache_raw_tensors,
@@ -3093,6 +3106,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_cache_bases_by_layer[layer_name] = kv_cache_bases_by_layer[
                 target_layer_name
             ]
+            block_axes[layer_name] = block_axes[target_layer_name]
             if target_layer_name in kv_cache_view_infos:
                 kv_cache_view_infos[layer_name] = kv_cache_view_infos[target_layer_name]
 
@@ -3129,6 +3143,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
+        self.kv_cache_block_axes = block_axes
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
@@ -3262,12 +3277,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 }
                 kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
-            kv_transfer_group.set_host_xfer_buffer_ops(
-                partial(
-                    copy_host_device_kv_blocks,
-                    use_mla=self.model_config.use_mla,
-                )
-            )
+            kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3629,6 +3639,26 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         mega_cache.save(self.model_config.model, sig)
 
+    def _copy_host_device_kv_blocks(
+        self,
+        src_kv_caches: dict[str, torch.Tensor],
+        dst_kv_caches: dict[str, torch.Tensor],
+        src_block_ids: list[int],
+        dst_block_ids: list[int],
+        direction: Literal["h2d", "d2h"],
+    ) -> None:
+        """The connector's `CopyBlocksOp`, reading the block axes at call time.
+        A dynamic-KV reallocation replaces the dict, which a bound one would
+        keep a dead reference to."""
+        copy_host_device_kv_blocks(
+            src_kv_caches,
+            dst_kv_caches,
+            src_block_ids,
+            dst_block_ids,
+            direction,
+            block_axes=self.kv_cache_block_axes,
+        )
+
     def _process_kv_cache_copy_ops(
         self,
         copy_ops: list[KVCacheCopyOp],
@@ -3651,13 +3681,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             src = op.src_block_id
             dst = op.dst_block_id
             nt = op.num_tokens
-            for kv_cache in self.kv_caches:
+            for layer_name, kv_cache in zip(
+                self.kv_cache_names, self.kv_caches, strict=True
+            ):
+                # An MLA-family cache is blocks-first whatever the kernel, and
+                # the indexer scale one has no axis after its tokens.
                 if self.model_config.use_mla:
                     dsts.append(kv_cache[dst, :nt])
                     srcs.append(kv_cache[src, :nt])
                 else:
-                    dsts.append(kv_cache[:, dst, :, :, :nt, :])
-                    srcs.append(kv_cache[:, src, :, :, :nt, :])
+                    axis = self.kv_cache_block_axes[layer_name]
+                    dsts.append(kv_cache.select(axis, dst)[..., :nt, :])
+                    srcs.append(kv_cache.select(axis, src)[..., :nt, :])
         torch._foreach_copy_(dsts, srcs)
 
 
