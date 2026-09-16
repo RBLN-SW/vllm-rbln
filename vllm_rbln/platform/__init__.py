@@ -237,7 +237,11 @@ class RblnPlatform(Platform):
             elif action.dest == "gpu_memory_utilization":
                 action.default = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
 
-        _impl().add_cli_args(parser)
+        # Not dispatched: the flags cover both paths, because which one runs is
+        # not known until the arguments are parsed.
+        from vllm_rbln.config import add_rbln_cli_args
+
+        add_rbln_cli_args(parser)
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
