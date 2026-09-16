@@ -3643,8 +3643,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dst = op.dst_block_id
             nt = op.num_tokens
             for kv_cache in self.kv_caches:
-                dsts.append(kv_cache[dst, ..., :nt, :])
-                srcs.append(kv_cache[src, ..., :nt, :])
+                if self.model_config.use_mla:
+                    dsts.append(kv_cache[dst, :nt])
+                    srcs.append(kv_cache[src, :nt])
+                else:
+                    dsts.append(kv_cache[dst, ..., :nt, :])
+                    srcs.append(kv_cache[src, ..., :nt, :])
         torch._foreach_copy_(dsts, srcs)
 
 
