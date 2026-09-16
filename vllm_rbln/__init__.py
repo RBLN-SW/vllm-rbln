@@ -26,35 +26,31 @@ def register():
 
 
 def register_model():
-    from vllm_rbln import envs
+    """Nothing to do, and kept so an installed copy still resolves this name.
 
-    if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-        return
-
-    from vllm.model_executor.models import ModelRegistry
-    from vllm.transformers_utils.config import _CONFIG_REGISTRY
-
-    from vllm_rbln.patches import axk2
-    from vllm_rbln.patches.axk2.config import AXK2Config
-
-    # A.X K2 (axk2) is vendored only until upstream vLLM ships it. Once upstream
-    # registers the architecture our copy would shadow it, so fail loudly to get
-    # this vendored path removed instead of silently overriding upstream.
-    if axk2._upstream_has_axk2():
-        raise RuntimeError(
-            "upstream vLLM now ships the axk2 architecture; delete "
-            "vllm_rbln/patches/axk2/ and this registration."
-        )
-
-    _CONFIG_REGISTRY[axk2.MODEL_TYPE] = AXK2Config
-    ModelRegistry.register_model(axk2.ARCH, axk2.MODEL_CLASS_PATH)
+    The A.X K2 registration this used to hold runs from the patch registry now.
+    It has to: this entry point is called before the arguments are parsed, too
+    early to know the model path, while the architecture is resolved in the
+    process that parses them.
+    """
+    # TODO(vllm-rbln>=0.12.0): delete, with the entry point in pyproject.toml.
 
 
 def register_ops():
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
     from vllm_rbln import envs
+    from vllm_rbln.platform import RblnPlatform
 
-    if envs.VLLM_RBLN_USE_VLLM_MODEL:
+    # Both `vllm serve` and `LLM(...)` load the plugins before they build a
+    # config, and only the first of them parses arguments, so this is the one
+    # point early enough to see every `create_engine_config` call.
+    RblnPlatform._capture_model_impl()
+
+    # The environment is all there is here: this runs before the arguments are
+    # parsed. In the process that parses them that means "not yet", and the
+    # platform hook applies the same set afterwards; every other process was
+    # handed the resolved path by the one that spawned it.
+    if envs.model_impl_from_env() == "vllm":
         from vllm_rbln.patches import apply_registered_patches, apply_registrations
 
         apply_registrations()

@@ -169,6 +169,28 @@ def use_auto_port() -> bool:
     )
 
 
+# Not a knob, so it is a plain constant and has no entry below: the frontend
+# writes the resolved model path here for the processes it spawns, which run
+# their plugin entry points before the config reaches them. The leading
+# underscore keeps it out of the VLLM_RBLN_* namespace that `environment_variables`
+# owns, while leaving it where `env | grep RBLN` finds it. Setting it by hand
+# does nothing the frontend does not overwrite.
+RESOLVED_MODEL_IMPL_ENV = "_VLLM_RBLN_RESOLVED_MODEL_IMPL"
+
+
+def model_impl_from_env() -> str:
+    """The model path the environment names, for a reader with no config yet."""
+    resolved = os.environ.get(RESOLVED_MODEL_IMPL_ENV)
+    if resolved:
+        return resolved
+    # TODO(vllm-rbln>=0.12.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
+    use_vllm_model = os.environ.get("VLLM_RBLN_USE_VLLM_MODEL", "False").lower() in (
+        "true",
+        "1",
+    )
+    return "vllm" if use_vllm_model else "optimum"
+
+
 # extended environments
 environment_variables = {
     # ====================================================================

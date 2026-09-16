@@ -46,14 +46,19 @@ VLLM_RBLN_ENV = {
 SCRUBBED_PREFIXES = ("VLLM_RBLN_",)
 
 # Knobs outside that prefix that still decide what the suite runs: two upstream
-# ones RblnPlatform branches on, and the compiler flag VLLM_RBLN_USE_CUSTOM_KERNEL
-# resolves from instead of a private copy.
+# ones RblnPlatform branches on, the compiler flag VLLM_RBLN_USE_CUSTOM_KERNEL
+# resolves from instead of a private copy, and the model path a parent process
+# publishes, which outranks VLLM_RBLN_USE_VLLM_MODEL above. Spelled out rather
+# than imported from `vllm_rbln.envs`: importing it here would pull the platform
+# in before `pytest_configure` sets the environment it resolves itself from.
+# `test_utils.py` checks the spelling against the source.
 SCRUBBED_EXTRA = frozenset(
     {
         "VLLM_USE_V2_MODEL_RUNNER",
         "VLLM_DISABLE_COMPILE_CACHE",
         "VLLM_WORKER_MULTIPROC_METHOD",
         "RBLN_USE_CUSTOM_KERNEL",
+        "_VLLM_RBLN_RESOLVED_MODEL_IMPL",
     }
 )
 

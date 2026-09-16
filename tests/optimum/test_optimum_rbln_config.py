@@ -26,9 +26,9 @@ from vllm_rbln.config import _GROUP_TITLE, OptimumRBLNConfig, _resolve
 
 @pytest.fixture(autouse=True)
 def on_the_optimum_path():
-    """An exported VLLM_RBLN_USE_VLLM_MODEL would silently move this file to the
-    other path, so say so instead of testing the wrong one."""
-    assert not envs.VLLM_RBLN_USE_VLLM_MODEL
+    """Either name in the environment would silently move this file to the other
+    path, so say so instead of testing the wrong one."""
+    assert envs.model_impl_from_env() == "optimum"
 
 
 @pytest.fixture(scope="module")

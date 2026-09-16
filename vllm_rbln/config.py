@@ -36,7 +36,7 @@ exists, and the rest are bring-up knobs -- are not fields here.
 import argparse
 import os
 from dataclasses import Field, field, fields
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_args
 
 from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
@@ -59,12 +59,19 @@ _NO_FLAG = {"no_flag": True}
 # something derived from the artifact the key is looking for.
 _DERIVED = {"no_flag": True, "derived": True}
 
+ModelImpl = Literal["vllm", "optimum"]
+
 DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
 
 
 @vllm_config_dataclass
 class RBLNConfigBase:
     """RBLN NPU options that are not specific to one model path."""
+
+    model_impl: ModelImpl = "optimum"
+    """Which model implementation runs: optimum-rbln, or the vLLM model under
+    torch.compile. It picks the class this config is resolved into, so it is
+    read through `resolve_model_impl` before the class is known."""
 
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
@@ -283,6 +290,34 @@ def _env_overrides(cls: type[RBLNConfigBase]) -> dict[str, Any]:
                 overrides[f.name] = getattr(envs, attr)
                 break
     return overrides
+
+
+def _as_model_impl(value: Any) -> ModelImpl:
+    if value not in get_args(ModelImpl):
+        raise ValueError(
+            f"model_impl must be one of {list(get_args(ModelImpl))}, got {value!r}"
+        )
+    return value
+
+
+def resolve_model_impl(additional_config: Any = None) -> ModelImpl:
+    """The model path, from an `additional_config` nobody has resolved yet.
+
+    Which path runs decides which class the config becomes, so it cannot be read
+    off a built config. This looks at the one key instead, early enough for
+    `RblnPlatform` to point itself at the right device and for the plugin entry
+    points of the processes it spawns.
+    """
+    if isinstance(additional_config, RBLNConfigBase):
+        return additional_config.model_impl
+
+    given = additional_config if isinstance(additional_config, dict) else {}
+    if "model_impl" in given:
+        return _as_model_impl(given["model_impl"])
+
+    from vllm_rbln import envs
+
+    return _as_model_impl(envs.model_impl_from_env())
 
 
 def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
