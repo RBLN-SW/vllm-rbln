@@ -1620,7 +1620,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.3a6"
+version = "0.11.3a8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1632,10 +1632,11 @@ dependencies = [
     { name = "torchcodec", marker = "platform_python_implementation == 'CPython'" },
     { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/84/35/84cfc698aad10e330a3b87bcfeccfc4a9eddef596b21b31263e1837ae006/optimum_rbln-0.11.3a6.tar.gz", hash = "sha256:30e2a4aa821a073c6e52279746abd5c2edbea667de953ddabee54cc5cbbefe12", size = 658264, upload-time = "2026-09-10T04:11:51.918Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/44/01/4b594368256d1d5de81832be2869aedd9c80fc397886351de57b7152cd4f/optimum_rbln-0.11.3a8.tar.gz", hash = "sha256:840ceb4aaf7c60fc1ca19a0f737ec757f21fe0edd0c7ab29fafc871844ab403b", size = 668110, upload-time = "2026-09-16T11:29:04.56Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/31/10/3c5c8b270f6284742253e5cce59e52a28e46753da61d73da864491392421/optimum_rbln-0.11.3a6-py3-none-any.whl", hash = "sha256:f850841f619dc36b62b324728d775d0f726cff36faad68539e9338e5dd72645d", size = 678795, upload-time = "2026-09-10T04:11:49.669Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/d7/c9cb0743d03bc74458d2269cf8d469f810d156aaca5124270b87e0906a57/optimum_rbln-0.11.3a8-py3-none-any.whl", hash = "sha256:bd2296e5996598ba46574c2c1b5b701bab5d8eee1d1f61cf0fb03545c8881108", size = 696798, upload-time = "2026-09-16T11:29:02.529Z" },
 ]
 
 [[package]]
@@ -3115,7 +3116,7 @@ requires-dist = [
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "openai", specifier = ">=2.25.0" },
-    { name = "optimum-rbln", specifier = ">=0.11.3a6,<0.11.4" },
+    { name = "optimum-rbln", specifier = ">=0.11.3a8,<0.11.4" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
