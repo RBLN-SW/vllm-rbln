@@ -26,7 +26,6 @@ from vllm_rbln.platform import USE_DEVICE_TENSOR
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     from vllm_rbln.config import RBLNConfig
 
@@ -35,12 +34,6 @@ logger = init_logger(__name__)
 
 def patch_upstream() -> None:
     """The vllm model path replaces no upstream symbol from the platform hook."""
-
-
-def add_cli_args(parser: "FlexibleArgumentParser") -> None:
-    from vllm_rbln.config import add_rbln_cli_args
-
-    add_rbln_cli_args(parser)
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:

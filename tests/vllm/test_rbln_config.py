@@ -25,6 +25,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_rbln.config import (
     _GROUP_TITLE,
+    OptimumRBLNConfig,
     RBLNConfig,
     _env_source,
     build_rbln_config,
@@ -58,9 +59,23 @@ def test_group_is_registered(parser):
 
 
 def test_every_field_gets_a_flag(parser):
+    # The group is built before the model path is known, so it carries both
+    # classes' fields. A field on the shared base is registered once, and a
+    # field the code fills in gets no flag at all.
     group = next(g for g in parser._action_groups if g.title == _GROUP_TITLE)
     flags = {a.dest for a in group._group_actions}
-    assert flags == {f"rbln_{f.name}" for f in dataclasses.fields(RBLNConfig)}
+    assert flags == {
+        f"rbln_{f.name}"
+        for cls in (RBLNConfig, OptimumRBLNConfig)
+        for f in dataclasses.fields(cls)
+        if not f.metadata.get("no_flag")
+    }
+
+
+def test_a_field_of_the_other_path_is_rejected():
+    """Both paths' flags are registered, so the class is what narrows them."""
+    with pytest.raises(ValueError, match="are not fields"):
+        build_rbln_config({"prefix_block_size": 256})
 
 
 def test_defaults_when_nothing_is_passed(parser):
