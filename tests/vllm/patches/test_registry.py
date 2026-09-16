@@ -408,14 +408,14 @@ import json, sys
 from vllm.plugins import load_general_plugins
 load_general_plugins()
 imported = "vllm_rbln.patches" in sys.modules
-applied = applicable = 0
+applied = applicable = []
 if imported:
     from vllm_rbln.patches import registry
-    applied = len(registry._applied_patch_keys)
-    applicable = len([
-        d for d in registry._REGISTERED_PATCH_DESCRIPTORS
+    applied = sorted(registry._applied_patch_keys)
+    applicable = sorted(
+        d.key for d in registry._REGISTERED_PATCH_DESCRIPTORS
         if d.condition is None or d.condition()
-    ])
+    )
 print("RESULT" + json.dumps(
     {"imported": imported, "applied": applied, "applicable": applicable}
 ))
@@ -430,10 +430,10 @@ print("RESULT" + json.dumps(
         result = json.loads(line.removeprefix("RESULT"))
 
         if model_impl == "optimum":
-            assert result == {"imported": False, "applied": 0, "applicable": 0}
+            assert result == {"imported": False, "applied": [], "applicable": []}
         else:
             assert result["imported"]
-            assert result["applicable"] > 0
+            assert result["applicable"]
             assert result["applied"] == result["applicable"]
 
     def test_patch_upstream_applies_everything(self, monkeypatch):
