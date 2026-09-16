@@ -332,6 +332,8 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
         one_request += cdiv(
             spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
         )
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
         admission = getattr(spec, "max_admission_blocks_per_request", None)
         if admission is None and isinstance(
             spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)
@@ -1090,13 +1092,14 @@ def copy_host_device_kv_blocks(
     dst_block_ids: list[int],
     direction: Literal["h2d", "d2h"],
     *,
-    use_mla: bool = False,
+    block_axes: dict[str, int],
 ) -> None:
     """Copy KV blocks between the host xfer buffer and the device KV cache.
 
-    Requires VLLM_RBLN_USE_DEVICE_TENSOR=1. Splits K/V (dim 0) first so each
-    per-block view is contiguous. MLA has no K/V level to split, and only
-    `use_mla` says so -- SSM/conv and cross-layer pools are 3D as well.
+    Requires VLLM_RBLN_USE_DEVICE_TENSOR=1. `block_axes` says which axis of a
+    layer's cache a block id indexes: dim 0 for MLA and SSM/conv, and for the
+    attention cache the rbln_custom_ops kernels read, but dim 1 for the
+    K/V-first one rbln_triton_ops reads, where dim 0 would select a K/V half.
     """
     if not src_kv_caches or not dst_kv_caches or not src_block_ids or not dst_block_ids:
         return
@@ -1112,15 +1115,8 @@ def copy_host_device_kv_blocks(
     srcs: list[torch.Tensor] = []
     for layer_name, dst_cache in dst_kv_caches.items():
         src_cache = src_kv_caches[layer_name]
-        if use_mla:
-            for idx in src_block_ids:
-                dsts.append(dst_cache[idx])
-                srcs.append(src_cache[idx])
-            continue
-        for kv in range(dst_cache.shape[0]):
-            dst_kv = dst_cache[kv]
-            src_kv = src_cache[kv]
-            for idx in src_block_ids:
-                dsts.append(dst_kv[idx])
-                srcs.append(src_kv[idx])
+        axis = block_axes[layer_name]
+        for idx in src_block_ids:
+            dsts.append(dst_cache.select(axis, idx))
+            srcs.append(src_cache.select(axis, idx))
     torch._foreach_copy_(dsts, srcs)

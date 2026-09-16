@@ -88,6 +88,18 @@ def build_kv_cache_base_bindings(
     return base_tensors, view_infos
 
 
+def attention_block_axis(use_custom_kernel: bool) -> int:
+    """Which axis of the paged attention KV cache `num_blocks` sits on.
+
+    The layout belongs to whichever kernel reads the cache: rbln_custom_ops
+    reads `[num_blocks, 2, ...]`, rbln_triton_ops still reads
+    `[2, num_blocks, ...]`, and `use_custom_kernel` is what routes attention to
+    the latter. A setting of its own could disagree with the namespace in use,
+    and nothing would catch that. Goes away once the triton kernels move.
+    """
+    return 1 if use_custom_kernel else 0
+
+
 def kv_cache_dynamic_axis(
     attn_backend: Any,
     kernel_num_blocks: int,
@@ -97,8 +109,8 @@ def kv_cache_dynamic_axis(
     stride_order: Sequence[int],
 ) -> int:
     """The axis of the backend's KV shape (in stride order) that grows with
-    `num_blocks`: dim 1 for the `[2, num_blocks, ...]` paged layout, dim 0 for
-    MLA's `[num_blocks, block_size, latent]`."""
+    `num_blocks`: `attention_block_axis` for the paged layout, dim 0 for MLA's
+    `[num_blocks, block_size, latent]`, wherever the stride order puts it."""
 
     def shape(num_blocks: int) -> tuple[int, ...]:
         raw = attn_backend.get_kv_cache_shape(
