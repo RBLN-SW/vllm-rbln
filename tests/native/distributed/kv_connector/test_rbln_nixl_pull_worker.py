@@ -351,6 +351,9 @@ class TestUpstreamReachesTheOverride:
         w = TestShardReadPath._read_worker(pp_size=1)
         w._overlapping_ranks = {}  # nothing narrowed -> delegate to upstream
         w._sw_ratio = 2
+        # The desc-id formula spaces a block's ids by this; separate K/V regions
+        # put one id per block, which is the layout this case is written for.
+        w._kv_per_block = 1
         w._group_specs = [_sliding_window_spec()]
         w.num_regions = 2
         w.engine_id = "local"

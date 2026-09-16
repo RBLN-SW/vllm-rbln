@@ -184,6 +184,10 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         self._kv_slices: int = 1
         # And which axis they came from -- the two counts alone do not say.
         self._kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
+        # The extent of the `kv` axis inside a region's block
+        # (`get_kv_cache_shape`), which is one unless the attention cache packs
+        # both. Host staging registers whole logical buffers and stays here.
+        self._kv_per_block: int = 1
 
         # Model-wide counts, not this rank's share. None where the layer has
         # no head band (`_layer_kv_heads`).
@@ -556,6 +560,11 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             # For when registering multiple tensors eg K/V in separate
             # regions. MLA is key-only, so `cache_list` holds one.
             physical_page_size = physical_page_size // len(cache_list)
+            if not is_mla_region and not isinstance(layer_spec, MambaSpec):
+                # One region back means the block holds both; two means each
+                # has its own. Read off what registered, not the config that
+                # chose it.
+                self._kv_per_block = 2 // len(cache_list)
             if self.transfer_topo.cross_layers_blocks:
                 physical_page_size = physical_page_size * len(
                     self.kv_cache_config.kv_cache_tensors
@@ -747,6 +756,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         split: int = 1,
         region_ids: list[int] | None = None,
         replica_fanout: int = 1,
+        kv_runs: int = 1,
     ) -> tuple[int, np.ndarray]:
         if self._sw_ratio is None:
             if (
@@ -754,12 +764,14 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 and peer_areas is None
                 and split == 1
                 and replica_fanout == 1
+                and kv_runs == 1
             ):
                 # No SWA view opt, whole-engine peer: upstream's Full-only
                 # layout, one handle covering every region.
                 return super().register_local_xfer_handler(block_size)
             # Per-peer shard: only the regions this peer serves, each cut into
-            # `split` pieces (_shard_local_region_ids, _head_split).
+            # `split` pieces (_shard_local_region_ids, _head_split) and into
+            # `kv_runs` halves (_kv_runs).
             return self._register_shard_local_xfer_handler(
                 block_size,
                 registered_layer_names or self.local_seen_layer_names,
@@ -767,6 +779,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 split=split,
                 region_ids=region_ids,
                 replica_fanout=replica_fanout,
+                kv_runs=kv_runs,
             )
         assert (
             registered_layer_names is None
@@ -787,20 +800,27 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # Two passes when SWA is present: Full descs first, then SWA descs
         # at the same base addresses but `sliding_window`-sized.
         # _sw_ratio is not None here (the None case returned early above).
+        # A window is a prefix, so a packed block takes one inside K and one
+        # inside V -- a single prefix runs past K's end and never reaches V.
+        kv_per_block = self._kv_per_block
         length_divisors = [1, self._sw_ratio]
         for divisor in length_divisors:
             for i, base_addr in enumerate(local_base_addresses):
-                kv_block_len = (
+                kv_stride = (
                     self.get_backend_aware_kv_block_len(
                         layer_idx=i, first_split=True, mamba_view=False
                     )
                     // block_size_ratio
-                    // divisor
+                    // kv_per_block
                 )
+                desc_len = kv_stride // divisor
                 stride = self.block_len_per_layer[i] // block_size_ratio
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * stride
-                    blocks_data.append((addr, kv_block_len, self.device_id))
+                    for kv in range(kv_per_block):
+                        blocks_data.append(
+                            (addr + kv * kv_stride, desc_len, self.device_id)
+                        )
 
         logger.debug(
             "Created %s local blocks (%s) for engine %s rank %s",
@@ -896,9 +916,10 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         areas_r = nixl_agent_meta.kv_areas
         slices_r = nixl_agent_meta.kv_slices
 
-        split = self._head_split(
-            self.transfer_topo.tp_size * slices_l, remote_tp_size * slices_r
-        )
+        cuts_l = self.transfer_topo.tp_size * slices_l
+        cuts_r = remote_tp_size * slices_r
+        split = self._head_split(cuts_l, cuts_r)
+        kv_runs = self._kv_runs(self._kv_per_block, cuts_l, cuts_r)
 
         replicas_l = areas_l // slices_l
         replicas_r = areas_r // slices_r
@@ -950,14 +971,16 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                         device_id=nixl_agent_meta.device_id,
                         num_blocks=num_blocks,
                         split=split,
+                        kv_runs=kv_runs,
                     )
                 )
         # Per block, a region becomes one descriptor per head piece per peer
-        # copy -- the same count `_register_shard_local_xfer_handler` builds
-        # locally and `_shard_descs_per_block` records.
+        # copy per K/V range -- the same count
+        # `_register_shard_local_xfer_handler` builds locally and
+        # `_shard_descs_per_block` records.
         fanout = replicas_r if self._writes_into_peer else 1
         assert len(out) == (
-            len(logical_pairs) * len(areas_iter) * num_blocks * split * fanout
+            len(logical_pairs) * len(areas_iter) * num_blocks * split * fanout * kv_runs
         )
         return out
 
@@ -1022,14 +1045,20 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         device_id: int,
         num_blocks: int,
         split: int,
+        kv_runs: int = 1,
     ) -> list[tuple[int, int, int]]:
-        """Descriptors for one local region: ``split`` (`_head_split`) per block.
+        """Descriptors for one local region: ``split * kv_runs`` per block.
 
         The split is the caller's, one value for the whole transfer; the head
         bands in ``geom``/``peer`` are this region's.
 
-        Order is block-major, piece-minor, to match the local list
-        `_register_shard_local_xfer_handler` builds.
+        ``kv_runs`` (`_kv_runs`) is 2 where the peer packs K and V into one
+        block and we read a head band out of it, since the band sits once in
+        each half. The halves are `page // kv_runs` apart, and heads run
+        contiguously inside one of them rather than across the whole block.
+
+        Order is block-major, piece-minor, K/V-innermost, to match the local
+        list `_register_shard_local_xfer_handler` builds.
         """
         base_l, per_slice_l, replicas_l = geom
         base_r, per_slice_r, replicas_r, slices_r = peer
@@ -1039,7 +1068,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             layer_idx=region_id, first_split=True, mamba_view=False
         )
         per_piece = per_slice_l // split
-        sub_len = desc_len // split
+        sub_len = desc_len // kv_runs // split
 
         # Replicas of a slice hold identical bytes, so reading any one of them
         # answers -- but writing only one leaves the peer's other chiplets on
@@ -1061,26 +1090,41 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             for k in range(fanout):
                 remote_region = logical_r * areas_r + slice_r * replicas_r + k
                 page = remote_lens[remote_region]
-                if page % per_slice_r != 0:
+                if page % kv_runs != 0:
+                    raise RuntimeError(
+                        f"RBLN NIXL D2D: peer region {remote_region} block "
+                        f"length {page}B does not divide into {kv_runs} "
+                        "range(s) of K and V."
+                    )
+                kv_stride = page // kv_runs
+                if kv_stride % per_slice_r != 0:
                     raise RuntimeError(
                         f"RBLN NIXL D2D: peer region {remote_region} block "
                         f"length {page}B does not split into {per_slice_r} "
                         "heads."
                     )
-                # Heads are contiguous inside a block, so skipping
-                # `head_within` of them is a plain byte offset.
-                head_offset = head_within * (page // per_slice_r)
-                if sub_len + head_offset > page:
+                # Heads are contiguous inside K, and inside V, so skipping
+                # `head_within` of them is a plain byte offset into one of them.
+                head_offset = head_within * (kv_stride // per_slice_r)
+                if sub_len + head_offset > kv_stride:
                     raise RuntimeError(
                         f"RBLN NIXL D2D: local region {region_id} piece {j} "
                         f"wants {sub_len}B at +{head_offset}B, past the end of "
-                        f"the peer's {page}B region {remote_region}."
+                        f"the peer's {kv_stride}B half of region "
+                        f"{remote_region}."
                     )
                 pieces.append((remote_bases[remote_region] + head_offset, page))
 
         for block_id in range(num_blocks):
             for base, page in pieces:
-                out.append((base + block_id * page, sub_len, device_id))
+                for kv in range(kv_runs):
+                    out.append(
+                        (
+                            base + block_id * page + kv * (page // kv_runs),
+                            sub_len,
+                            device_id,
+                        )
+                    )
         return out
 
     def _peer_head_split(
@@ -1095,6 +1139,24 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             return 1
         assert self.transfer_topo is not None
         return self._head_split(
+            self.transfer_topo.tp_size * self._kv_slices,
+            remote_tp_size * nixl_agent_meta.kv_slices,
+        )
+
+    def _peer_kv_runs(
+        self, nixl_agent_meta: RblnNixlAgentMetadata, remote_tp_size: int
+    ) -> int:
+        """`_kv_runs` for a peer, from its advertised chiplet geometry.
+
+        A peer of our own width is named in whole blocks, which are contiguous
+        under either layout. The window view also reads part of a block, and
+        takes its own count from the layout (`register_local_xfer_handler`).
+        """
+        if not self._is_head_matched_peer(remote_tp_size):
+            return 1
+        assert self.transfer_topo is not None
+        return self._kv_runs(
+            self._kv_per_block,
             self.transfer_topo.tp_size * self._kv_slices,
             remote_tp_size * nixl_agent_meta.kv_slices,
         )
@@ -1165,6 +1227,22 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 "cut heads at commensurate granularities."
             )
         return cuts_r // cuts_l
+
+    @staticmethod
+    def _kv_runs(kv_per_block: int, cuts_l: int, cuts_r: int) -> int:
+        """How many ranges one piece of a block breaks into.
+
+        `kv_per_block` is what the backend's layout puts in a block: 2 when K
+        and V share it, 1 when each is its own region. A whole block is one
+        contiguous range either way, so the break only appears once a side reads
+        part of one -- a head band sits once in K and once in V.
+
+        Unequal cuts are what make a side read part of a block, and the count
+        has to match on both: the two descriptor lists pair element-wise, so the
+        side holding a whole block describes it as its halves rather than as one
+        range.
+        """
+        return kv_per_block if cuts_l != cuts_r else 1
 
     def _register_remote_engine_prelude(
         self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
@@ -1326,6 +1404,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # remote tensor's physical block stride is still Full-sized),
         # shorter desc length.
         # _sw_ratio is not None here (the None case returned early above).
+        kv_per_block = self._kv_per_block
         length_divisors = [1, self._sw_ratio]
         for divisor in length_divisors:
             for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
@@ -1335,16 +1414,26 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 remote_kv_block_len = local_block_len // block_size_ratio
                 if block_size_ratio > 1:
                     local_block_len = remote_kv_block_len
-                desc_len = local_block_len // divisor
+                desc_len = local_block_len // kv_per_block // divisor
                 rank_offset = (
                     self.tp_rank % tp_ratio * remote_kv_block_len
                     if indexes_into_remote
                     else 0
                 )
                 page_size = nixl_agent_meta.block_lens[i]
+                # The step from K to V is the peer's own, as in
+                # `_head_matched_desc`; the two ends hold the same layout here.
+                kv_stride = page_size // kv_per_block
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * page_size + rank_offset
-                    blocks_data.append((addr, desc_len, nixl_agent_meta.device_id))
+                    for kv in range(kv_per_block):
+                        blocks_data.append(
+                            (
+                                addr + kv * kv_stride,
+                                desc_len,
+                                nixl_agent_meta.device_id,
+                            )
+                        )
 
         logger.debug(
             "Created %s remote blocks (%s) for dst engine %s "
@@ -1395,8 +1484,11 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         if block_size_ratio is not None:
             num_blocks = int(num_blocks * block_size_ratio)
 
+        # Both lists run region-major, block, then K/V, so a block's descriptors
+        # are `_kv_per_block` consecutive ids (`register_local_xfer_handler`).
+        kv_per_block = self._kv_per_block
         region_ids = np.arange(self.num_regions)[:, None]
-        num_full_descs = self.num_regions * num_blocks
+        num_full_descs = self.num_regions * num_blocks * kv_per_block
         all_descs: list[np.ndarray] = []
         for g, group in enumerate(block_ids):
             if not group:
@@ -1404,7 +1496,12 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             is_sw = isinstance(self._group_specs[g], SlidingWindowSpec)
             offset = num_full_descs if is_sw else 0
             group_arr = np.asarray(group)[None, :]
-            all_descs.append((region_ids * num_blocks + group_arr + offset).flatten())
+            block_ids_2d = (region_ids * num_blocks + group_arr)[..., None]
+            all_descs.append(
+                (
+                    block_ids_2d * kv_per_block + np.arange(kv_per_block) + offset
+                ).flatten()
+            )
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
 
     # ------------------------------------------------------------------
@@ -1464,6 +1561,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             kv_areas=self._kv_areas,
             kv_slices=self._kv_slices,
             kv_split_axis=self._kv_split_axis,
+            kv_per_block=self._kv_per_block,
         )
         base_hash = self.compat_hash
         assert base_hash is not None
@@ -1683,6 +1781,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                     # carry, since the peer frees a request's blocks by it.
                     partial = len(overlap) < len(names)
                     split = self._peer_head_split(metadata, remote_tp_size)
+                    kv_runs = self._peer_kv_runs(metadata, remote_tp_size)
                     fanout = self._peer_replica_fanout(metadata, remote_tp_size)
                     fan_in = self._is_fan_in_peer(remote_tp_size)
 
@@ -1709,9 +1808,13 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                         )
                         remote_rank_to_agent_name[(pp_rank, remote_tp_rank)] = agent
 
-                    if not (pp_size > 1 or partial or fan_in or split > 1):
+                    if not (
+                        pp_size > 1 or partial or fan_in or split > 1 or kv_runs > 1
+                    ):
                         # Nothing is narrowed: upstream's whole-engine handle
                         # describes this peer, so the transfer path delegates.
+                        # A K/V split narrows it too: upstream names a block
+                        # once where our list names it per range.
                         continue
                     self._register_shard_xfer_state(
                         expected_engine_id,
@@ -1724,6 +1827,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                         split=split,
                         remote_tp_size=remote_tp_size,
                         replica_fanout=fanout,
+                        kv_runs=kv_runs,
                     )
                     overlapping.append(global_rank)
         # Published once, not accumulated: a handshake that raises partway
@@ -1778,6 +1882,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         split: int = 1,
         remote_tp_size: int = 1,
         replica_fanout: int = 1,
+        kv_runs: int = 1,
     ) -> None:
         # Compute the local region ids once and reuse them for the handler
         # (PP context is always the shard path: SWA + PP is rejected earlier).
@@ -1798,6 +1903,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 split=split,
                 region_ids=region_ids,
                 replica_fanout=replica_fanout,
+                kv_runs=kv_runs,
             )
         self.src_xfer_handles_by_remote[key] = handle
         n_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -1806,7 +1912,9 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             f"got {n_groups}"
         )
         self._shard_region_group_ids[(engine_id, global_rank)] = (0,) * len(region_ids)
-        self._shard_descs_per_block[(engine_id, global_rank)] = split * replica_fanout
+        self._shard_descs_per_block[(engine_id, global_rank)] = (
+            split * replica_fanout * kv_runs
+        )
 
     def _cleanup_remote_engine(
         self, engine_id: str, *, log_eviction: bool = True
@@ -2013,6 +2121,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         split: int = 1,
         region_ids: list[int] | None = None,
         replica_fanout: int = 1,
+        kv_runs: int = 1,
     ) -> tuple[int, np.ndarray]:
         assert not self._has_mamba, "RBLN NIXL connector does not support Mamba."
 
@@ -2034,22 +2143,29 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                 // block_size_ratio
             )
             stride = self.block_len_per_layer[region_id] // block_size_ratio
-            # The pieces are consecutive byte ranges on this side -- it is the
-            # REMOTE side that scatters.
-            sub_len = kv_block_len // split
+            # Head pieces are consecutive byte ranges within K, and within V --
+            # it is the REMOTE side that scatters. The two sit `kv_stride`
+            # apart, so a piece that names a head band names it in each (see
+            # _head_matched_desc).
+            kv_stride = kv_block_len // kv_runs
+            sub_len = kv_stride // split
             for block_id in range(num_blocks):
                 for j in range(split):
                     # One entry per peer copy this piece goes to: the same
                     # bytes reach every replica (see _head_matched_desc), so
                     # the source repeats while the destination advances.
                     for _ in range(replica_fanout):
-                        blocks_data.append(
-                            (
-                                base_addr + block_id * stride + j * sub_len,
-                                sub_len,
-                                self.device_id,
+                        for kv in range(kv_runs):
+                            blocks_data.append(
+                                (
+                                    base_addr
+                                    + block_id * stride
+                                    + kv * kv_stride
+                                    + j * sub_len,
+                                    sub_len,
+                                    self.device_id,
+                                )
                             )
-                        )
 
         descs_data = _as_descs(blocks_data)
         descs = self.nixl_wrapper.get_xfer_descs(descs_data, self.nixl_memory_type)
@@ -2112,6 +2228,17 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             raise RuntimeError(
                 "RBLN NIXL D2D: sliding-window attention is not supported with "
                 f"heterogeneous tensor parallelism (tp_ratio={tp_ratio})."
+            )
+        peer_kv_per_block = nixl_agent_meta.kv_per_block
+        if peer_kv_per_block != self._kv_per_block:
+            # Refused here rather than as a region-count mismatch further in:
+            # that one names the count, not the cause an operator can act on.
+            raise RuntimeError(
+                f"RBLN NIXL D2D: a peer block holds {peer_kv_per_block} of K "
+                f"and V and this worker's holds {self._kv_per_block}. The "
+                "attention cache is packed for the rbln_custom_ops kernels and "
+                "split for rbln_triton_ops, so both ends of a transfer must "
+                "run under the same use_custom_kernel setting."
             )
         n_remote = len(nixl_agent_meta.kv_caches_base_addr)
         peer_layers = len(nixl_agent_meta.registered_layer_names)

@@ -43,7 +43,8 @@ if TYPE_CHECKING:
 #   2: + kv_areas / kv_slices (chiplet geometry)
 #   3: + the transfer direction in the hash
 #   4: + kv_split_axis (which axis the geometry above came from)
-RBLN_NIXL_CONNECTOR_VERSION: int = 4
+#   5: + kv_per_block (whether a region's block holds K and V together)
+RBLN_NIXL_CONNECTOR_VERSION: int = 5
 
 
 class KVSplitAxis(Enum):
@@ -78,6 +79,10 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # The default keeps a blob without this field meaning what versions 2 and 3
     # meant by the two counts above.
     kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
+    # What a block holds (`_kv_per_block`). A process picks the layout, not the
+    # build, so two peers off one build can differ and the version cannot tell
+    # them apart. The default is the layout every version through 4 had.
+    kv_per_block: int = 1
 
 
 def rbln_compat_hash(

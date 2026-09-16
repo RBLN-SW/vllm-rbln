@@ -593,6 +593,20 @@ def _impl_xfer_result(
     return xfer
 
 
+def _packed_kv(num_blocks):
+    # The other layout: K and V share a block, so a layer registers one region
+    # whose span is the whole page rather than half of it.
+    def _packed(cache, spec):
+        region = MagicMock()
+        region.shape = (num_blocks, spec.page_size_bytes)
+        region.numel.return_value = num_blocks * spec.page_size_bytes
+        region.element_size.return_value = 1
+        region.data_ptr.return_value = cache.data_ptr()
+        return [region]
+
+    return _packed
+
+
 def _fake_nixl_rbln(xfer_result):
     module: Any = types.ModuleType("nixl_rbln")
     module.register_kv_regions = MagicMock(return_value=xfer_result)
@@ -603,6 +617,46 @@ def _fake_nixl_rbln(xfer_result):
 class TestRegisterKvCachesImpl:
     # The deferred D2D body: hands the logical K/V regions to
     # nixl_rbln.register_kv_regions and absorbs the returned transfer tables.
+    def test_one_region_per_layer_means_the_block_holds_both(self, monkeypatch):
+        # How many of K and V a block holds is read off what the layout handed
+        # back, not from the config that chose it -- the descriptor path is then
+        # right about the bytes that actually registered. Two regions per layer
+        # is the split layout and leaves it at one.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec()
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = _packed_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(
+                sys.modules,
+                {
+                    "nixl_rbln": _fake_nixl_rbln(
+                        _impl_xfer_result(
+                            base_addrs=(0x20000, 0x30000), block_lens=(512, 512)
+                        )
+                    )
+                },
+            ),
+            patch.object(wm, "rebel"),
+            patch.object(
+                worker,
+                "register_local_xfer_handler",
+                return_value=("local-handle", [(0x0, 0, 0)]),
+            ),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert worker._kv_per_block == 2
+
     @pytest.mark.parametrize("stripe_width", [None, 0, 1])
     def test_registers_with_vram_segment_and_captures_xfer_tables(
         self, monkeypatch, stripe_width

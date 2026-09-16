@@ -34,15 +34,15 @@ class RblnTransferTopology(TransferTopology):
 
     The rbln_triton_ops cache keeps K and V as separate spans, so each becomes
     its own NIXL region -- the layout upstream standardized away in 0.26. The
-    rbln_custom_ops cache puts them inside one block, which the descriptor path
-    has no second region to name, so that one is refused at handshake time
-    rather than transferring halves of a block. MLA and Mamba caches are
-    upstream's own shapes and stay on its path.
+    rbln_custom_ops cache puts them inside one block, so that one registers as
+    a single region and the descriptor path names the two halves itself.
+    MLA and Mamba caches are upstream's own shapes and stay on its path.
 
     ``__post_init__`` reimplements upstream's rather than extending it, since
     upstream's asserts a blocks-first 4-dim shape RBLN never produces. So a
     field upstream sets there has to be set here too, and leaving one out
-    fails nowhere until the first handshake reads it.
+    fails nowhere until the first handshake reads it -- and one it does not set
+    fails the test holding the two in step.
     """
 
     def __post_init__(self) -> None:
@@ -67,14 +67,16 @@ class RblnTransferTopology(TransferTopology):
                 "RBLN NIXL descriptors assume a (num_blocks, ...) MLA cache, "
                 f"got {shape} from {backend.__name__}."
             )
-        elif block_dim != 1:
-            raise NotImplementedError(
-                "RBLN NIXL cuts K and V out of separate regions, which the "
-                f"blocks-first attention cache {shape} from {backend.__name__} "
-                "interleaves inside each block. Disaggregated serving needs "
-                "the rbln_triton_ops kernels until the descriptor path moves "
-                "to upstream's interleaved-KV split."
+        else:
+            assert block_dim in (0, 1), (
+                "RBLN NIXL descriptors assume the attention cache carries "
+                f"num_blocks on one of its first two axes, got {shape} from "
+                f"{backend.__name__}."
             )
+        # Read here rather than where the regions are cut: the shape comes from
+        # the RBLN config, which is only guaranteed to be set while the model
+        # is being built, and `get_transfer_cache_regions` runs later.
+        self._kv_shares_a_block = block_dim == 0
         self._cross_layers_blocks = (
             self.tensor_shape is not None and len(self.tensor_shape) == len(shape) + 1
         )
@@ -84,7 +86,10 @@ class RblnTransferTopology(TransferTopology):
     ) -> list[torch.Tensor] | torch.Tensor:
         if self.is_mla or self.is_mamba or self._cross_layers_blocks:
             return super().get_transfer_cache_regions(cache, layer_spec)
-        # Only a K/V-first cache gets this far -- __post_init__ refuses the
-        # blocks-first one. Iterating the tensor yields K and V; the caller
-        # divides the page size by how many come back.
+        if self._kv_shares_a_block:
+            # Nothing to iterate: the block is the unit, and the descriptor
+            # path cuts K and V out of it (`RblnNixlWorkerBase._kv_runs`).
+            return [cache]
+        # Iterating the tensor yields K and V; the caller divides the page size
+        # by how many come back.
         return cache
