@@ -773,21 +773,38 @@ class TestDynamicKvConfig:
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL=1"):
             RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
-    def test_mla_is_rejected(self):
-        with pytest.raises(ValueError, match="MLA"):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
+    def test_mla_passes(self):
+        RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
 
-    def test_speculative_decoding_is_rejected(self):
-        with pytest.raises(ValueError, match="speculative"):
-            RblnPlatform._validate_dynamic_kv_config(
-                self._cfg(speculative_config=SimpleNamespace())
-            )
+    def test_speculative_decoding_passes(self):
+        RblnPlatform._validate_dynamic_kv_config(
+            self._cfg(speculative_config=SimpleNamespace())
+        )
 
     def test_a_kv_transfer_connector_is_rejected(self):
         with pytest.raises(ValueError, match="KV transfer"):
             RblnPlatform._validate_dynamic_kv_config(
                 self._cfg(kv_transfer_config=SimpleNamespace())
             )
+
+    def test_a_dry_run_reports_every_refusal_instead_of_raising(
+        self, monkeypatch, caplog
+    ):
+        """A dry run changes nothing, so refusing would stop a run the flag off
+        would have served. Each shape is reported and the run continues."""
+        monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "1")
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
+        with (
+            patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
+            caplog.at_level("WARNING"),
+        ):
+            RblnPlatform._validate_dynamic_kv_config(
+                self._cfg(kv_transfer_config=SimpleNamespace())
+            )
+        assert "VLLM_RBLN_USE_VLLM_MODEL=1" in caplog.text
+        assert "VLLM_RBLN_USE_DEVICE_TENSOR=1" in caplog.text
+        assert "KV transfer connector" in caplog.text
+        assert caplog.text.count("dynamic KV cache dry run:") == 3
 
     def test_device_tensor_off_is_refused(self):
         with (

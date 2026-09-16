@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 import vllm_rbln.envs as envs
 import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.worker.kv_placement import ChipletMemory
 from vllm_rbln.v1.worker.utils import (
     REBEL_DRAM_NBYTES,
     chiplet_replication_factor,
@@ -52,7 +53,7 @@ from vllm_rbln.v1.worker.utils import (
     get_rbln_planned_affinity_cpu_count,
     get_rbln_visible_card_indices,
     prepare_kernel_block_sizes,
-    read_rbln_card_dram_total_bytes,
+    rbln_device_dram_total_bytes,
     read_rbln_card_dram_used_bytes,
     reorder_input_batch,
     set_cpu_affinity,
@@ -615,6 +616,52 @@ class TestEstimateAvailableMemory:
         )
         assert result > 0
 
+    @staticmethod
+    def _snapshot(used_by_chiplet):
+        return {
+            (0, chiplet): ChipletMemory(total=40 * _GB, used=used)
+            for chiplet, used in enumerate(used_by_chiplet)
+        }
+
+    def _measured(self, snapshot, **kw):
+        kwargs = dict(kernel_size=_GB, buffer=0, gpu_memory_utilization=1.0)
+        kwargs.update(kw)
+        return estimate_available_memory(
+            _make_model_config(),
+            _make_parallel_config(),
+            chiplet_memory=snapshot,
+            **kwargs,
+        )
+
+    def test_chiplet_memory_budgets_the_tightest_chiplet(self, rbln):
+        rbln("RBLN-CR13")
+        one_tight = self._measured(self._snapshot([3 * _GB, _GB, _GB, _GB]))
+        all_tight = self._measured(self._snapshot([3 * _GB] * 4))
+        all_loose = self._measured(self._snapshot([_GB] * 4))
+        assert one_tight == all_tight < all_loose
+
+    def test_chiplet_memory_still_charges_kernel_size(self, rbln):
+        rbln("RBLN-CR13")
+        snapshot = self._snapshot([_GB] * 4)
+        assert self._measured(snapshot) > self._measured(snapshot, kernel_size=5 * _GB)
+
+    def test_chiplet_memory_still_charges_buffer(self, rbln):
+        rbln("RBLN-CR13")
+        snapshot = self._snapshot([_GB] * 4)
+        assert self._measured(snapshot) > self._measured(snapshot, buffer=4 * _GB)
+
+    def test_chiplet_memory_must_cover_one_rank_s_chiplets(self, rbln):
+        # The downstream terms are written for one quad-chiplet card; a snapshot
+        # of another size would scale the budget by the wrong factor.
+        rbln("RBLN-CR13")
+        with pytest.raises(ValueError, match="covers 8 chiplet"):
+            self._measured(self._snapshot([_GB] * 8))
+
+    def test_chiplet_memory_full_chiplet_raises(self, rbln):
+        rbln("RBLN-CR13")
+        with pytest.raises(MemoryError):
+            self._measured(self._snapshot([40 * _GB, _GB, _GB, _GB]))
+
 
 class TestGetAutobindCpuIds:
     @pytest.fixture
@@ -946,34 +993,26 @@ class TestReplicationFactorIsGated:
         mock_platform,
         num_kv_heads,
         dynamic_kv,
-        sysfs_total=REBEL_DRAM_NBYTES,
-        sysfs_error=None,
+        device_total=REBEL_DRAM_NBYTES,
     ):
         """Measure with the card DRAM capacity pinned, not read off the host.
 
         The CI fleet is ATOM (~15.7 GiB), so letting the RBLN-CR branch read the
-        real card makes every figure in this class ~9x too small. `sysfs_error`
-        exists because a caller's own patch of the reader would lose to the one
-        applied here.
+        real card makes every figure in this class ~9x too small.
         """
         mock_platform.get_device_name.return_value = "RBLN-CR03"
         mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
-        mock_envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE = dynamic_kv
-
-        def read_card_dram_total_bytes() -> int | None:
-            if sysfs_error is not None:
-                raise sysfs_error
-            return sysfs_total
 
         with patch(
-            "vllm_rbln.v1.worker.utils.read_rbln_card_dram_total_bytes",
-            read_card_dram_total_bytes,
+            "vllm_rbln.v1.worker.utils.rbln_device_dram_total_bytes",
+            lambda: device_total,
         ):
             return estimate_available_memory(
                 _make_model_config(num_kv_heads=num_kv_heads),
                 _make_parallel_config(tp_size=1),
                 kernel_size=self.KERNEL,
                 gpu_memory_utilization=0.9,
+                exact_dram=dynamic_kv,
             )
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
@@ -1068,32 +1107,6 @@ class TestReplicationFactorIsGated:
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
     @patch("vllm_rbln.v1.worker.utils.envs")
-    def test_heterogeneous_cards_do_not_break_the_static_path(
-        self, mock_envs, mock_platform, caplog
-    ):
-        """The per-chiplet reader refuses to answer; this path must not die.
-
-        `read_rbln_card_dram_total_bytes` raises when the visible cards report
-        different capacities, because a single per-chiplet budget would be
-        meaningless. This estimate only wants one card's capacity, so it falls
-        back instead of turning a mixed host into a start-up failure.
-        """
-        with caplog.at_level("WARNING"):
-            got = self._measure(
-                mock_envs,
-                mock_platform,
-                8,
-                True,
-                sysfs_error=RuntimeError(
-                    "visible RBLN cards report different dram_total"
-                ),
-            )
-        # 144 GiB - 4 GiB, the literal, == what sysfs reports on a uniform host.
-        assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
-        assert any("different dram_total" in m for m in caplog.messages)
-
-    @patch("vllm_rbln.v1.worker.utils.current_platform")
-    @patch("vllm_rbln.v1.worker.utils.envs")
     @pytest.mark.parametrize(
         "sysfs_total",
         [
@@ -1102,11 +1115,11 @@ class TestReplicationFactorIsGated:
             REBEL_DRAM_NBYTES,  # exactly the ceiling
         ],
     )
-    def test_sysfs_capacity_never_raises_the_estimate(
+    def test_device_capacity_never_raises_the_estimate(
         self, mock_envs, mock_platform, sysfs_total
     ):
-        """The reader clamps, so nothing above the ceiling can reach here."""
-        got = self._measure(mock_envs, mock_platform, 8, True, sysfs_total=sysfs_total)
+        """The helper clamps, so nothing above the ceiling can reach here."""
+        got = self._measure(mock_envs, mock_platform, 8, True, device_total=sysfs_total)
         assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
 
     @patch("vllm_rbln.v1.worker.utils.current_platform")
@@ -1123,7 +1136,7 @@ class TestReplicationFactorIsGated:
             mock_platform,
             8,
             True,
-            sysfs_total=REBEL_DRAM_NBYTES - 4 * 2**30,
+            device_total=REBEL_DRAM_NBYTES - 4 * 2**30,
         )
         assert got / 2**30 == pytest.approx(118.0 - 4 * 0.9, abs=1e-3)
 
@@ -1135,13 +1148,15 @@ class TestReplicationFactorIsGated:
     def test_the_default_path_never_reads_the_device(
         self, mock_envs, mock_platform, sysfs_total
     ):
-        """With the flag off the estimate is the constant, whatever sysfs says.
+        """With the flag off the estimate is the constant, whatever the device says.
 
         The two figures agree on every card measured, so reading the driver here
         would change nothing today -- but it would tie the default path's KV size
         to a driver release. That is not this feature's call to make.
         """
-        got = self._measure(mock_envs, mock_platform, 8, False, sysfs_total=sysfs_total)
+        got = self._measure(
+            mock_envs, mock_platform, 8, False, device_total=sysfs_total
+        )
         assert got / 2**30 == pytest.approx(118.0, abs=1e-3)
 
 
@@ -1245,7 +1260,7 @@ class TestRblnSysfsReaders:
         ):
             assert get_rbln_visible_card_indices() == [0, 1, 3]
 
-    def test_dram_total_is_none_without_sysfs(self, tmp_path):
+    def test_dram_used_is_zero_without_sysfs(self, tmp_path):
         with (
             patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": ""}),
             patch(
@@ -1253,10 +1268,9 @@ class TestRblnSysfsReaders:
                 str(tmp_path / "missing"),
             ),
         ):
-            assert read_rbln_card_dram_total_bytes() is None
             assert read_rbln_card_dram_used_bytes() == 0
 
-    def test_dram_total_reads_uniform_capacity(self, tmp_path):
+    def test_dram_used_takes_the_worst_owned_card(self, tmp_path):
         # RBLN_DEV_DIR must be patched too: both readers resolve RBLN_VISIBLE_DEVICES
         # against the device nodes actually present, so leaving /dev alone makes
         # the result depend on the host's card numbering. On a container exposing
@@ -1277,96 +1291,8 @@ class TestRblnSysfsReaders:
             patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
             patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
         ):
-            total = read_rbln_card_dram_total_bytes()
-            assert total == 150_323_855_360
-            # 140.0 GiB exactly, i.e. the value the old literal encoded; / 4
-            # chiplets = the 35.0 GiB per-chiplet capacity.
-            assert total / 2**30 == 140.0
-            assert total // 4 == 35 * 2**30
             # dram_used is reported per card; take the worst case.
             assert read_rbln_card_dram_used_bytes() == 1024
-
-    def test_heterogeneous_capacity_is_rejected(self, tmp_path):
-        sysfs = tmp_path / "sysfs"
-        sysfs.mkdir()
-        dev = tmp_path / "dev"
-        dev.mkdir()
-        for index, size in ((0, 150323855360), (1, 75161927680)):
-            card = sysfs / f"rbln{index}"
-            card.mkdir()
-            (card / "dram_total").write_text(f"{size}\n")
-            (dev / f"rbln{index}").touch()
-        with (
-            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0,1"}),
-            patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
-            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
-            pytest.raises(RuntimeError, match="different dram_total"),
-        ):
-            read_rbln_card_dram_total_bytes()
-
-    def test_dram_total_ignores_cards_we_do_not_own(self, tmp_path):
-        """Capacity must come from our own cards, like `dram_used`.
-
-        A container holding /dev/rbln4..7 with RBLN_VISIBLE_DEVICES=0,1 owns physical
-        cards 4 and 5. Reading the raw entry instead would report card 0's
-        capacity -- somebody else's card, and a different SKU here.
-        """
-        sysfs = tmp_path / "sysfs"
-        sysfs.mkdir()
-        dev = tmp_path / "dev"
-        dev.mkdir()
-        for index in (4, 5, 6, 7):
-            card = sysfs / f"rbln{index}"
-            card.mkdir()
-            (card / "dram_total").write_text("150323855360\n")
-            (dev / f"rbln{index}").touch()
-        # Cards we do NOT own, deliberately a different capacity.
-        for index in (0, 1):
-            card = sysfs / f"rbln{index}"
-            card.mkdir()
-            (card / "dram_total").write_text("75161927680\n")
-
-        with (
-            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0,1"}),
-            patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
-            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
-        ):
-            # Ours (4, 5), not the raw entries (0, 1). Reading the raw entries
-            # would return 75161927680 instead.
-            assert read_rbln_card_dram_total_bytes() == 150_323_855_360
-
-    @pytest.mark.parametrize(
-        ("reported", "expected"),
-        [
-            (150_323_855_360, 150_323_855_360),  # today's driver, unchanged
-            (REBEL_DRAM_NBYTES, REBEL_DRAM_NBYTES),  # exactly the ceiling
-            (144 * 2**30, REBEL_DRAM_NBYTES),  # raw capacity -> clamped
-            (200 * 2**30, REBEL_DRAM_NBYTES),  # anything larger -> clamped
-            (100 * 2**30, 100 * 2**30),  # a smaller card passes through
-        ],
-    )
-    def test_dram_total_is_clamped_in_the_reader(self, tmp_path, reported, expected):
-        """The clamp belongs to the reader, not to one call site.
-
-        Both callers size real allocations from this number: the static estimate
-        every model takes, and the per-chiplet dynamic-KV budget that feeds
-        `max_num_blocks`. A clamp applied at only one of them leaves the other
-        over-committing the device.
-        """
-        sysfs = tmp_path / "sysfs"
-        sysfs.mkdir()
-        dev = tmp_path / "dev"
-        dev.mkdir()
-        card = sysfs / "rbln0"
-        card.mkdir()
-        (card / "dram_total").write_text(f"{reported}\n")
-        (dev / "rbln0").touch()
-        with (
-            patch.dict(os.environ, {"RBLN_VISIBLE_DEVICES": "0"}),
-            patch("vllm_rbln.v1.worker.utils.RBLN_DEV_DIR", str(dev)),
-            patch("vllm_rbln.v1.worker.utils.RBLN_SYSFS_CLASS_DIR", str(sysfs)),
-        ):
-            assert read_rbln_card_dram_total_bytes() == expected
 
 
 class TestCopyHostDeviceKvBlocks:
@@ -1414,3 +1340,78 @@ class TestCopyHostDeviceKvBlocks:
                 [1],
                 "h2d",
             )
+
+
+# ---------------------------------------------------------------------------
+# device DRAM capacity from torch.rbln.get_device_properties
+# ---------------------------------------------------------------------------
+class TestRblnDeviceDramTotal:
+    @staticmethod
+    def _props(total_memory):
+        return SimpleNamespace(total_memory=total_memory)
+
+    @pytest.fixture(autouse=True)
+    def _real_device(self):
+        with patch("torch.rbln.is_dummy_device", create=True, return_value=False):
+            yield
+
+    def test_reads_the_device_total(self):
+        with patch(
+            "torch.rbln.get_device_properties",
+            create=True,
+            return_value=self._props(150_323_855_360 - 2**30),
+        ):
+            assert rbln_device_dram_total_bytes() == 150_323_855_360 - 2**30
+
+    def test_a_dummy_device_is_not_asked(self):
+        """The compile-only executor step runs under RBLN_DUMMY_DEVICE; asking
+        would raise and print a C++ stack for a known answer."""
+        with (
+            patch("torch.rbln.is_dummy_device", create=True, return_value=True),
+            patch(
+                "torch.rbln.get_device_properties",
+                create=True,
+                side_effect=AssertionError("must not be called"),
+            ),
+        ):
+            assert rbln_device_dram_total_bytes() is None
+
+    @pytest.mark.parametrize(
+        ("reported", "expected"),
+        [
+            (REBEL_DRAM_NBYTES, REBEL_DRAM_NBYTES),
+            (REBEL_DRAM_NBYTES + 1, REBEL_DRAM_NBYTES),
+            (144 * 2**30, REBEL_DRAM_NBYTES),
+        ],
+    )
+    def test_is_clamped_to_the_build_ceiling(self, reported, expected, caplog):
+        with (
+            caplog.at_level("WARNING"),
+            patch(
+                "torch.rbln.get_device_properties",
+                create=True,
+                return_value=self._props(reported),
+            ),
+        ):
+            assert rbln_device_dram_total_bytes() == expected
+        assert ("clamping" in caplog.text) == (reported > REBEL_DRAM_NBYTES)
+
+    def test_a_failing_query_is_none_and_warns(self, caplog):
+        """No device, dummy mode, or an old torch_rbln: the estimate keeps the
+        constant instead of dying before the model loads."""
+        with (
+            caplog.at_level("WARNING"),
+            patch(
+                "torch.rbln.get_device_properties",
+                create=True,
+                side_effect=RuntimeError("RBLN_DUMMY_DEVICE"),
+            ),
+        ):
+            assert rbln_device_dram_total_bytes() is None
+        assert "falling back" in caplog.text
+
+    def test_a_non_positive_total_is_none(self):
+        with patch(
+            "torch.rbln.get_device_properties", create=True, return_value=self._props(0)
+        ):
+            assert rbln_device_dram_total_bytes() is None

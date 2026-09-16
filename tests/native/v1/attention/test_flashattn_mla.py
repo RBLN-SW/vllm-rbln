@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from vllm.v1.attention.backend import AttentionType
@@ -26,6 +28,11 @@ from vllm_rbln.v1.attention.backends.mla.flashattn_mla import (
     RBLNFlashAttnMLABackend,
     RBLNFlashAttnMLAImpl,
 )
+from vllm_rbln.v1.attention.backends.mla.indexer import (
+    RBLNDeepseekV32IndexerBackend,
+    RBLNDeepseekV32IndexerScaleBackend,
+)
+from vllm_rbln.v1.attention.kv_cache_bindings import kv_cache_dynamic_axis
 
 
 @pytest.fixture(scope="module")
@@ -168,3 +175,46 @@ class TestMlaImplInit:
         # MLA only supports head_size 576.
         with pytest.raises(ValueError, match="not supported"):
             make_mla_impl(cfg, head_size=128)
+
+
+class TestIndexerCacheBackends:
+    """The DSA indexer's key cache and its fp8 companion scale cache. The scale
+    cache is handed to the kernel flat as [num_blocks, block_size]: a trailing
+    head dim squeezed inside the graph is a host op on a dynamic input, which the
+    compiler refuses."""
+
+    def test_key_cache_shape_keeps_the_head_dim(self):
+        shape = RBLNDeepseekV32IndexerBackend.get_kv_cache_shape(
+            num_blocks=7, block_size=11, num_kv_heads=1, head_size=128
+        )
+        assert shape == (7, 11, 128)
+        assert len(RBLNDeepseekV32IndexerBackend.get_kv_cache_stride_order()) == 3
+
+    def test_scale_cache_shape_is_flat(self):
+        shape = RBLNDeepseekV32IndexerScaleBackend.get_kv_cache_shape(
+            num_blocks=7, block_size=11, num_kv_heads=1, head_size=1
+        )
+        assert shape == (7, 11)
+        assert RBLNDeepseekV32IndexerScaleBackend.get_kv_cache_stride_order() == (
+            0,
+            1,
+        )
+        assert RBLNDeepseekV32IndexerScaleBackend.get_kv_cache_stride_order(
+            include_num_layers_dimension=True
+        ) == (0, 1, 2)
+
+    def test_scale_cache_head_size_and_dtype(self):
+        assert RBLNDeepseekV32IndexerScaleBackend.get_supported_head_sizes() == [1]
+        assert RBLNDeepseekV32IndexerScaleBackend.supported_dtypes == [torch.float16]
+
+    @pytest.mark.parametrize(
+        ("backend", "head_size"),
+        [
+            (RBLNDeepseekV32IndexerBackend, 128),
+            (RBLNDeepseekV32IndexerScaleBackend, 1),
+        ],
+    )
+    def test_num_blocks_is_the_leading_axis(self, backend, head_size):
+        spec = SimpleNamespace(num_kv_heads=1, head_size=head_size)
+        order = backend.get_kv_cache_stride_order()
+        assert kv_cache_dynamic_axis(backend, 4, 2048, spec, "fp8", order) == 0

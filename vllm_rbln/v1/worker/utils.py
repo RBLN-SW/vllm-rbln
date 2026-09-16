@@ -17,21 +17,24 @@ import math
 import os
 import platform
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
-from vllm.config import ModelConfig, ParallelConfig
+from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
     get_allowed_cpu_list,
     get_visible_memory_node,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ChunkedLocalAttentionSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
@@ -41,7 +44,9 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 from vllm_rbln import envs
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -235,37 +240,39 @@ def _read_card_attr_int(card_index: int, attr: str) -> int | None:
         return None
 
 
-def read_rbln_card_dram_total_bytes() -> int | None:
-    """Per-card DRAM capacity in bytes, or None when sysfs is unavailable.
-
-    Reads only the cards this process owns; a heterogeneous set is rejected
-    rather than averaged. Clamped to `REBEL_DRAM_NBYTES` here rather than at the
-    call sites, because both of them size real allocations from this number.
-    """
-    values: dict[int, int] = {}
-    for card_index in get_rbln_owned_card_indices():
-        value = _read_card_attr_int(card_index, "dram_total")
-        if value is not None and value > 0:
-            values[card_index] = value
-    if not values:
+def rbln_device_dram_total_bytes() -> int | None:
+    """Device DRAM capacity from `torch.rbln.get_device_properties()`, clamped
+    to `REBEL_DRAM_NBYTES`; None when it cannot be answered."""
+    try:
+        import torch.rbln
+    except ImportError:
         return None
-    distinct = set(values.values())
-    if len(distinct) != 1:
-        raise RuntimeError(
-            "visible RBLN cards report different dram_total values "
-            f"({values}); a single per-chiplet DRAM budget cannot be derived."
-        )
-    dram_total = next(iter(distinct))
-    if dram_total > REBEL_DRAM_NBYTES:
+    try:
+        if torch.rbln.is_dummy_device():
+            return None
+        total = int(torch.rbln.get_device_properties().total_memory)
+    except (RuntimeError, AttributeError) as exc:
+        # AttributeError: a torch_rbln without the symbol at all, which is the
+        # case this fallback exists for.
         logger.warning(
-            "sysfs reports %d bytes of card DRAM, more than the %d this build "
+            "torch.rbln.get_device_properties() is unavailable (%s); falling back "
+            "to the built-in %d byte DRAM capacity.",
+            exc,
+            REBEL_DRAM_NBYTES,
+        )
+        return None
+    if total <= 0:
+        return None
+    if total > REBEL_DRAM_NBYTES:
+        logger.warning(
+            "the device reports %d bytes of DRAM, more than the %d this build "
             "assumes usable; clamping. Raise REBEL_DRAM_NBYTES if the card is "
             "genuinely larger.",
-            dram_total,
+            total,
             REBEL_DRAM_NBYTES,
         )
         return REBEL_DRAM_NBYTES
-    return dram_total
+    return total
 
 
 def read_rbln_card_dram_used_bytes() -> int:
@@ -282,6 +289,69 @@ def read_rbln_card_dram_used_bytes() -> int:
         if (value := _read_card_attr_int(card_index, "dram_used")) is not None
     ]
     return max(used, default=0)
+
+
+def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
+    """Why the compile and warm-up will be skipped, or None if they will run."""
+    if vllm_config.model_config.enforce_eager:
+        return "enforce_eager is set"
+    rbln_config: RBLNConfig = vllm_config.additional_config
+    if not rbln_config.compile_model:
+        return "VLLM_RBLN_COMPILE_MODEL is off"
+    if not envs.VLLM_RBLN_ENABLE_WARM_UP:
+        return "VLLM_RBLN_ENABLE_WARM_UP is off"
+    return None
+
+
+@dataclass(frozen=True)
+class KvMinimum:
+    """The fewest blocks a KV cache pool can serve with."""
+
+    one_request: int
+    decode_batch: int
+
+    @property
+    def needed(self) -> int:
+        # +1: the block pool keeps block 0 as the null block.
+        return 1 + max(self.one_request, self.decode_batch)
+
+
+def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
+    """Blocks one max-length request and one full decode batch need, summed over
+    the groups sharing the pool."""
+    max_model_len = vllm_config.model_config.max_model_len
+    in_flight_tokens = getattr(
+        vllm_config,
+        "max_in_flight_tokens",
+        vllm_config.scheduler_config.max_num_batched_tokens,
+    )
+    one_request = 0
+    per_seq = 0
+    for group in cfg.kv_cache_groups:
+        spec = group.kv_cache_spec
+        one_request += cdiv(
+            spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+        )
+        admission = getattr(spec, "max_admission_blocks_per_request", None)
+        if admission is None and isinstance(
+            spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)
+        ):
+            raise AttributeError(
+                f"{type(spec).__name__} no longer exposes "
+                "max_admission_blocks_per_request; the per-sequence minimum "
+                "would silently fall back to one block."
+            )
+        # Positional: the first parameter is max_num_batched_tokens before the
+        # vllm bump and max_in_flight_tokens after it; the position is the same.
+        # The value has to be the runtime gate's, or the pool is sized against a
+        # smaller per-request peak than the scheduler later enforces.
+        per_seq += (
+            admission(in_flight_tokens, max_model_len) if admission is not None else 1
+        )
+    return KvMinimum(
+        one_request=one_request,
+        decode_batch=vllm_config.scheduler_config.max_num_seqs * per_seq,
+    )
 
 
 def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
@@ -399,6 +469,8 @@ def estimate_available_memory(
     num_runtimes: int = 2,
     gpu_memory_utilization: float = 0.9,
     num_devices_per_local_rank: int = 1,
+    chiplet_memory: Mapping[Unit, ChipletMemory] | None = None,
+    exact_dram: bool = False,
 ) -> int:
     # We are finding max_num_blocks(x) that satisfies the following equation:
 
@@ -451,29 +523,18 @@ def estimate_available_memory(
         # single device == Quad chiplet
         rsd_size = REBEL_CHIPLET_SIZE
         available_dram_bytes = REBEL_DRAM_NBYTES
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            # Flag-gated: reading the driver would tie the default path's KV
-            # size to a driver release, which is not this feature's to decide.
-            try:
-                sysfs_dram_total = read_rbln_card_dram_total_bytes()
-            except RuntimeError as exc:
-                # The reader refuses on heterogeneous cards; this estimate only
-                # wants one card's capacity, so fall back rather than fail.
-                logger.warning(
-                    "%s; falling back to the built-in %d byte DRAM capacity.",
-                    exc,
-                    REBEL_DRAM_NBYTES,
-                )
-                sysfs_dram_total = None
-            if sysfs_dram_total is None:
+        if exact_dram:
+            # Caller-gated: the default path's estimate must not depend on the
+            # driver, and neither may a dry run, which only observes it.
+            device_dram_total = rbln_device_dram_total_bytes()
+            if device_dram_total is None:
                 logger.debug(
-                    "sysfs %s is unavailable; falling back to the built-in %d "
-                    "byte DRAM capacity.",
-                    RBLN_SYSFS_CLASS_DIR,
+                    "the device DRAM capacity is unavailable; falling back to the "
+                    "built-in %d byte DRAM capacity.",
                     REBEL_DRAM_NBYTES,
                 )
             else:
-                available_dram_bytes = sysfs_dram_total
+                available_dram_bytes = device_dram_total
         # FIXME(RBLN) - basic data type fp8 for REBEL, for now fp16
         default_bits_per_param = 16
     else:
@@ -482,7 +543,36 @@ def estimate_available_memory(
         )
 
     num_runtimes = num_runtimes * rsd_size
-    available_dram_bytes = int(available_dram_bytes * gpu_memory_utilization)
+    if chiplet_memory is None:
+        available_dram_bytes = int(available_dram_bytes * gpu_memory_utilization)
+    else:
+        # Budget the tightest chiplet and let every chiplet carry that much,
+        # since a block costs each the same. The weights are not resident yet.
+        budgets = {
+            unit: int(memory.total * gpu_memory_utilization) - memory.used
+            for unit, memory in chiplet_memory.items()
+        }
+        tightest = min(budgets, key=budgets.__getitem__)
+        if len(budgets) != rsd_size:
+            raise ValueError(
+                f"the memory snapshot covers {len(budgets)} chiplet(s) but the "
+                f"estimate is written for {rsd_size}; the snapshot must cover "
+                "exactly the chiplets one rank's KV cache spans."
+            )
+        available_dram_bytes = budgets[tightest] * rsd_size
+        logger.info(
+            "per-chiplet KV budget: %s; tightest %s leaves %.3f GiB x %d chiplets "
+            "= %.3f GiB",
+            ", ".join(
+                f"{unit[0]}:{unit[1]}(total={m.total} used={m.used} "
+                f"budget={budgets[unit]})"
+                for unit, m in sorted(chiplet_memory.items())
+            ),
+            f"{tightest[0]}:{tightest[1]}",
+            budgets[tightest] / 2**30,
+            len(budgets),
+            available_dram_bytes / 2**30,
+        )
 
     def check_oom(available_dram_bytes: int) -> None:
         if available_dram_bytes <= 0:
@@ -538,7 +628,7 @@ def estimate_available_memory(
         available_dram_bytes, num_key_value_heads, rsd_size
     )
     if released_dram_bytes != exact_dram_bytes:
-        # NOTE(RBLN): only the flag path acts on this, so only it warns. The
+        # NOTE(RBLN): only the exact path acts on this, so only it warns. The
         # default path keeps the released number and says so at debug level:
         # warning about an estimate this function is not changing reads as a
         # fault where there is none.
@@ -557,13 +647,11 @@ def estimate_available_memory(
             exact_dram_bytes / 2**30,
         )
         # One format string, two tails: `logger.*(a + b)` trips ruff G003.
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+        if exact_dram:
             logger.warning(disagreement, *args, " Using the exact figure.")
         else:
             logger.debug(disagreement, *args, " Keeping the released figure.")
-    available_dram_bytes = (
-        exact_dram_bytes if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE else released_dram_bytes
-    )
+    available_dram_bytes = exact_dram_bytes if exact_dram else released_dram_bytes
 
     check_oom(available_dram_bytes)
 

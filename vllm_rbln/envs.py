@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
+    VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN: bool = False
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
@@ -285,10 +286,21 @@ environment_variables = {
         )
     ),
     # --- DYNAMIC KV CACHE ---
-    # Size the KV cache from the compiled artifact instead of the estimate
+    # Size the KV cache from the compiled artifact instead of the estimate.
+    # The dry-run variable below implies it, but only when this one is unset:
+    # an explicit 0 is a decision, not a default to override.
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
         lambda: (
-            os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
+            os.environ["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"].lower() in ("true", "1")
+            if "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" in os.environ
+            else os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Compute and log the block count, resize nothing
+    "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()
             in ("true", "1")
         )
     ),
@@ -402,6 +414,11 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+        # Compile-affecting only because the compiler bakes the mark_dynamic'd
+        # KV dim's extent: a dry run traces at the count vllm sized, the real
+        # mode at the compile hint. Move to NON_COMPILE once that extent stops
+        # shaping the graph; the two then share a bundle.
+        "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
         "VLLM_RBLN_USE_MULTI_BLOCK_ATTN",
     }
 )

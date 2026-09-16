@@ -241,6 +241,7 @@ class RBLNFlashAttentionMetadataBuilder(
         batch_pad: int,
         is_prefill: bool,
         skip_attn_masks: bool = False,
+        back_pad: torch.Tensor | None = None,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
@@ -307,6 +308,10 @@ class RBLNFlashAttentionMetadataBuilder(
         if isinstance(self.kv_cache_spec, RBLNSlidingWindowSpec):
             sliding_window = self.kv_cache_spec.sliding_window
             num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
+            if back_pad is not None:
+                num_computed_tokens = num_computed_tokens + back_pad[:num_reqs].view(
+                    -1, 1
+                )
             seq_lens = seq_lens_cpu[:num_reqs].view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)

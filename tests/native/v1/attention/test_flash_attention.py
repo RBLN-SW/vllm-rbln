@@ -431,6 +431,32 @@ class TestBuildSlidingWindowDecode:
         # decode block_tables padded to [[5], [0]], then [..., :1]
         assert md.local_block_tables.reshape(-1).tolist() == [5, 0]
 
+    @pytest.mark.parametrize(
+        "back_pad, exp_cache, exp_offset",
+        [
+            (None, 3, 6),  # caller stages no window: the raw difference, as before
+            ([2], 4, 5),  # window padded behind: cache starts 2 later, spans 2 less
+        ],
+    )
+    def test_back_pad_moves_the_cache_start_to_the_staged_position(
+        self, cfg, back_pad, exp_cache, exp_offset
+    ):
+        builder = make_builder(cfg, sliding_window=4, appends_kv=False)
+        md = builder.build(
+            _cam(
+                num_reqs=1,
+                query_start_loc=[0, 3],
+                seq_lens=[6],
+                block_table=[[5]],
+            ),
+            torch.arange(10),
+            batch_pad=1,
+            is_prefill=False,
+            back_pad=None if back_pad is None else torch.tensor(back_pad),
+        )
+        assert md.cache_seq_lens.reshape(-1).tolist() == [exp_cache]
+        assert md.cache_offsets.reshape(-1).tolist() == [exp_offset]
+
 
 class TestBuildSlidingWindowAppend:
     def test_builds_what_a_full_attention_group_builds(self, cfg):
