@@ -858,9 +858,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         logical_num_tokens = num_scheduled_tokens
 
         # NOTE(RBLN): A decode query is one contiguous KV window, so a step that
-        # stages the fixed num_spec_tokens + 1 query splits the slack around the
-        # scheduled tokens: in front as far as the block's used tail reaches, the
-        # rest behind.
+        # stages the fixed num_spec_tokens + 1 query puts the slack behind the
+        # scheduled tokens. Only a window that would otherwise run past
+        # max_model_len shifts, by the overshoot, onto computed positions.
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         window_fixed = not self.is_prefill and (
             self.uses_fixed_decode_window or use_spec_decode
@@ -873,9 +873,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 f"query_lengths={query_lengths}, "
                 f"logical_num_tokens={logical_num_tokens}"
             )
-            block_size = self.cache_config.block_size
             num_computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-            front_pad = np.minimum(slack, num_computed % block_size).astype(np.int32)
+            front_pad = np.maximum(
+                0, num_computed + query_lengths - self.max_model_len
+            ).astype(np.int32)
             back_pad = slack - front_pad
         else:
             query_lengths = logical_num_tokens
@@ -3187,24 +3188,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 "multi-group KV caches yet.  "
                 "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
             )
-
-        if self.num_spec_tokens > 0:
-            window = self.num_spec_tokens + 1
-            block_size = self.cache_config.block_size
-            if block_size < window:
-                raise ValueError(
-                    f"block_size={block_size} cannot hold the {window}-slot "
-                    f"speculative decode window."
-                )
-            remainder = self.max_model_len % block_size
-            if self.uses_fixed_decode_window and remainder and remainder < window:
-                raise ValueError(
-                    f"max_model_len={self.max_model_len} leaves {remainder} "
-                    f"token(s) in its last KV block, which cannot hold the "
-                    f"{window}-slot speculative decode window. Round "
-                    f"max_model_len to a multiple of block_size={block_size}, "
-                    f"or leave at least {window} tokens in the last block."
-                )
 
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
