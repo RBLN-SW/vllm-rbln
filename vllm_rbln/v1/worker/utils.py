@@ -332,10 +332,6 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
         one_request += cdiv(
             spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
         )
-        # Unwrap only after the block count above, which the wrapper answers for
-        # the whole group. It is not a SlidingWindowSpec subclass, so both the
-        # lookup and the guard below would miss it; its members are all one
-        # type, so any of them carries the group's admission cap.
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = next(iter(spec.kv_cache_specs.values()))
         admission = getattr(spec, "max_admission_blocks_per_request", None)
