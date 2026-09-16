@@ -44,21 +44,21 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 ## Two model paths
 
-`RBLNConfigBase.model_impl` selects the model path: `optimum` (the default) or `vllm`. `--rbln-model-impl` sets it, and `resolve_model_impl()` reads it before the config exists. `VLLM_RBLN_USE_VLLM_MODEL=1` still means `vllm` and is deprecated.
+`RBLNConfigBase.model_impl` selects the model path: `optimum` (the default) or `vllm`. `--rbln-model-impl` sets it, and `resolve_model_impl()` reads it before the config exists. `VLLM_RBLN_USE_VLLM_MODEL=1` still means `vllm`, warns, and goes away in 0.12.0.
 
 | Path         | Owns                                                                        |
 | ------------ | --------------------------------------------------------------------------- |
 | optimum      | `model_executor/models/optimum/`, `utils/optimum/`, `v1/worker/optimum_*.py`, `platform/optimum_impl.py` |
 | vllm         | `patches/`, `compilation/`, `v1/worker/rbln_*.py`, `platform/vllm_impl.py` |
-| shared       | everything else |
+| shared       | everything else, including `config.py`, which holds both paths' config classes |
 
 **`config.py` defines the selector; only `__init__.py` and `platform/__init__.py` branch on it.** Do not branch on the model path anywhere else. Path-specific code belongs in the module that path owns.
 
 - Say which path or paths you changed in the PR description.
 - A change to one path must not alter the other. If it appears to need both, stop and ask before writing code.
 - A new env var goes in three places in `envs.py`: the `TYPE_CHECKING` block, the `environment_variables` dict, and either `RBLN_COMPILE_ENV` or `RBLN_NON_COMPILE_ENV`. The two sets partition the mega-cache bundle key, and `test_mega_cache.py` asserts they cover every variable.
-- Suites carry the path: `tests/vllm/` sets it to `1` in its conftest and scrubs `VLLM_RBLN_*`; `tests/optimum/` has no suite-level conftest and takes the default. An exported `VLLM_RBLN_USE_VLLM_MODEL` therefore changes what `tests/optimum/` exercises without failing.
-- Do not set `VLLM_RBLN_USE_VLLM_MODEL` inside a test to escape its suite.
+- Suites carry the path: `tests/vllm/` adopts `vllm` in its conftest and scrubs `VLLM_RBLN_*`; `tests/optimum/` has no suite-level conftest and takes the default. An exported `VLLM_RBLN_USE_VLLM_MODEL` therefore changes what `tests/optimum/` exercises without failing.
+- Do not select the model path inside a test to escape its suite.
 
 ## Patching upstream vLLM
 

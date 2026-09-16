@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 _RSD_ENV = "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"
+_RSD_SERVE = "rbln_num_devices_per_local_rank"
 _PARALLEL_KEYS = (
     "tensor_parallel_size",
     "pipeline_parallel_size",
@@ -61,8 +62,12 @@ def device_count() -> int:
 
 def devices_needed(serve: dict[str, Any], env: dict[str, str]) -> int:
     """Mirrors RBLNWorker._init_device_env: DP ranks do not share, and every rank
-    of vLLM's world size takes VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK devices."""
-    needed = int(env.get(_RSD_ENV, 1))
+    of vLLM's world size takes --rbln-num-devices-per-local-rank devices.
+
+    Both spellings are read, because the variable still works until 0.12.0 and
+    the worker reads both.
+    """
+    needed = int(serve.get(_RSD_SERVE, env.get(_RSD_ENV, 1)))
     for key in _PARALLEL_KEYS:
         needed *= int(serve.get(key, 1))
     return needed

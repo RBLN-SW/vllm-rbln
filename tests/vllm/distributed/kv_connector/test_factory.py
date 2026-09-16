@@ -17,7 +17,7 @@
 # imports `lmcache_rbln` at load time.
 
 # Importing the factory module fires the register_connector side effects, exactly
-# as register_ops() does under VLLM_RBLN_USE_VLLM_MODEL in production.
+# as register_ops() does on the native path in production.
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
