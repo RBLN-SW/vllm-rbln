@@ -201,20 +201,12 @@ url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/"
 name = "rbln-release"
 url = "https://pypi.rbln.ai/simple/"
 
-[[tool.uv.index]]
-name = "pypi"
-url = "https://pypi.org/simple"
-
 [tool.uv.sources]
 vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
 torchcodec = { index = "pytorch-cpu" }
-# The nexus group index mirrors PyPI, so under `index-strategy = "unsafe-best-match"`
-# any re-lock that queries nexus (i.e. every rebel-compiler bump) moves optimum-rbln's
-# recorded source off PyPI, making a base `uv sync` need nexus credentials.
-optimum-rbln = { index = "pypi" }
 
 [tool.typos.default]
 binary = false

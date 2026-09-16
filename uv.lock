@@ -3115,7 +3115,7 @@ requires-dist = [
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "openai", specifier = ">=2.25.0" },
-    { name = "optimum-rbln", specifier = ">=0.11.3a6,<0.11.4", index = "https://pypi.org/simple" },
+    { name = "optimum-rbln", specifier = ">=0.11.3a6,<0.11.4" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
