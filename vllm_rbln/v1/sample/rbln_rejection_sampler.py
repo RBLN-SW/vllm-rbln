@@ -69,12 +69,15 @@ class RBLNRejectionSampler(RejectionSampler):
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
 
-        if use_rbln_sampler:
-            assert not self.synthetic_mode, (
-                "RBLNRejectionSampler does not support synthetic rejection "
-                "sampling (rejection_sample_method='synthetic'). Use "
-                "`VLLM_RBLN_SAMPLER=0` for this mode."
-            )
+        # NOTE(RBLN): The synthetic acceptance count is drawn on the host, so the
+        # rates have to live there -- the base class builds them on the sampler's
+        # device, which is the NPU under device tensors. Both impls take this
+        # copy; the Torch impl's kernels move it to their own device anyway.
+        self.synthetic_conditional_rates_cpu = (
+            self.synthetic_conditional_rates.to("cpu", torch.float32)
+            if self.synthetic_conditional_rates is not None
+            else None
+        )
         self.impl = (
             RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
             if use_rbln_sampler
@@ -175,7 +178,7 @@ class RBLNRejectionSampler(RejectionSampler):
             bonus_token_ids,
             sampling_metadata,
             synthetic_mode=self.synthetic_mode,
-            synthetic_conditional_rates=self.synthetic_conditional_rates,
+            synthetic_conditional_rates=self.synthetic_conditional_rates_cpu,
             bonus_logits=bonus_logits,
         )
 
@@ -442,6 +445,9 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
                 "bonus_temperature": torch.ones(batch_size, dtype=dtype, device=device),
                 "top_k": torch.zeros(batch_size, dtype=torch.int32, device=device),
                 "top_p": torch.ones(batch_size, dtype=torch.float32, device=device),
+                "synthetic_num_accepted": torch.zeros(
+                    batch_size, dtype=torch.int32, device=device
+                ),
             }
 
         # Pad the packed inputs to the fixed [B*K] length the op wants. Rows past
@@ -519,7 +525,19 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         cu_num_draft_tokens_t = bufs["cu_num_draft_tokens"]
         cu_num_draft_tokens_t.copy_(cu_num_draft_tokens)
         num_draft_tokens_t = bufs["counts"]
-        num_draft_tokens_t.copy_(torch.tensor(num_draft_tokens, dtype=torch.int32))
+        counts = torch.tensor(num_draft_tokens, dtype=torch.int32)
+        num_draft_tokens_t.copy_(counts)
+
+        synthetic_num_accepted = None
+        if synthetic_mode:
+            assert synthetic_conditional_rates is not None
+            synthetic_num_accepted = bufs["synthetic_num_accepted"]
+            synthetic_num_accepted.copy_(
+                draw_synthetic_acceptance(
+                    batch_size, max_spec_len, counts, synthetic_conditional_rates
+                )
+            )
+
         return self._compiled_rejection_sample(
             reshaped_draft_token_ids,
             reshaped_target_logits,
@@ -532,6 +550,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             num_draft_tokens_t,
             bonus_logits,
             bonus_temperature,
+            synthetic_num_accepted,
         )
 
     def apply_sampling_constraints(
@@ -550,6 +569,37 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         return logits
 
 
+def draw_synthetic_acceptance(
+    batch_size: int,
+    max_spec_len: int,
+    num_draft_tokens: torch.Tensor,
+    conditional_rates: torch.Tensor,
+) -> torch.Tensor:
+    """Draw a per-request accepted count for `rejection_sample_method="synthetic"`.
+
+    A position is accepted when a fresh uniform draw falls under its rate, and the
+    first rejection ends the request's run, so the count is the leading
+    all-accepted prefix -- capped by what was actually drafted.
+
+    Args:
+        batch_size: Number of requests.
+        max_spec_len: The padded draft width, K.
+        num_draft_tokens: Per-request draft count, on the host. Shape is [B].
+        conditional_rates: Per-position acceptance probability, on the host.
+            Shape is [num_spec]; positions past its end are rejected.
+
+    Returns:
+        The accepted counts, on the host. Shape is [B], int32.
+    """
+    rates = torch.zeros(max_spec_len, dtype=torch.float32)
+    n_rates = min(max_spec_len, conditional_rates.shape[0])
+    rates[:n_rates] = conditional_rates[:n_rates]
+
+    accepted = torch.rand(batch_size, max_spec_len) < rates.unsqueeze(0)
+    num_accepted = accepted.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    return torch.minimum(num_accepted, num_draft_tokens)
+
+
 def rbln_rejection_sample(
     draft_token_ids: torch.Tensor,
     target_logits: torch.Tensor,
@@ -562,6 +612,7 @@ def rbln_rejection_sample(
     num_draft_tokens: torch.Tensor,
     bonus_logits: torch.Tensor | None = None,
     bonus_temperature: torch.Tensor | None = None,
+    synthetic_num_accepted: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample, then build the output token ids.
 
@@ -583,6 +634,8 @@ def rbln_rejection_sample(
             `bonus_temperature` is given. Shape is [B, vocab_size].
         bonus_temperature: Per-row divisor for a top-k/top-p draw of the bonus
             token under the same `top_k`/`top_p`. Shape is [B].
+        synthetic_num_accepted: Replaces the op's own accepted count under
+            `rejection_sample_method="synthetic"`. Shape is [B], int32.
 
     Returns:
         The sampled token ids, `PLACEHOLDER_TOKEN_ID` in unfilled slots. Shape
@@ -615,6 +668,39 @@ def rbln_rejection_sample(
     # never a computed index that gets gathered -- that fails to compile at B=1.
     batch_size, max_spec_len = draft_per_batch.shape
     num_accepted = num_accepted.reshape(batch_size)
+
+    if bonus_logits is not None and bonus_temperature is not None:
+        # The bonus sampler's draw;
+        bonus_probs = torch.softmax(
+            bonus_logits / bonus_temperature.unsqueeze(1), dim=-1
+        )
+        bonus = torch.ops.rbln.top_k_top_p(bonus_probs, top_k, top_p).reshape(-1, 1)
+    elif bonus_logits is not None:
+        # `rbln::argmax` returns [B]; `bonus_token_ids` already comes as [B, 1].
+        bonus = torch.ops.rbln.argmax(bonus_logits).unsqueeze(1)
+    else:
+        assert bonus_token_ids is not None
+        bonus = bonus_token_ids
+
+    if synthetic_num_accepted is not None:
+        # Synthetic mode simulates a chosen acceptance rate: the op above still
+        # ran -- that is the cost being measured -- but its verdict is replaced
+        # by the host's draw, already capped by `num_draft_tokens`.
+        # `recovered_token_ids` is filled only at the position the op itself
+        # rejected, so a draw landing anywhere else would read a zero. Carry the
+        # op's own token instead -- its recovered one, or its bonus when it
+        # accepted everything -- and let it broadcast to whatever slot the draw
+        # picks. It is a real sampled token, but not the one that slot would
+        # have drawn: this mode is for measurement, not for output quality.
+        op_recovered = recovered_token_ids.gather(
+            1, num_accepted.clamp(max=max_spec_len - 1).to(torch.int64).unsqueeze(1)
+        )
+        recovered_token_ids = torch.where(
+            (num_accepted == num_draft_tokens).unsqueeze(1),
+            bonus.to(dtype=recovered_token_ids.dtype),
+            op_recovered,
+        )
+        num_accepted = synthetic_num_accepted.reshape(batch_size)
     # `all_accepted` is True for inactive rows too (0 == 0), which is what the
     # bonus placement wants; recovery needs `num_draft_tokens > 0` to exclude them.
     all_accepted = num_accepted == num_draft_tokens
@@ -641,18 +727,6 @@ def rbln_rejection_sample(
     bonus_mask = all_accepted.unsqueeze(1) & (
         positions_k1 == num_draft_tokens.unsqueeze(1)
     )
-    if bonus_logits is not None and bonus_temperature is not None:
-        # The bonus sampler's draw;
-        bonus_probs = torch.softmax(
-            bonus_logits / bonus_temperature.unsqueeze(1), dim=-1
-        )
-        bonus = torch.ops.rbln.top_k_top_p(bonus_probs, top_k, top_p).reshape(-1, 1)
-    elif bonus_logits is not None:
-        # `rbln::argmax` returns [B]; `bonus_token_ids` already comes as [B, 1].
-        bonus = torch.ops.rbln.argmax(bonus_logits).unsqueeze(1)
-    else:
-        assert bonus_token_ids is not None
-        bonus = bonus_token_ids
     return torch.where(bonus_mask, bonus.to(dtype=out.dtype), out)
 
 
