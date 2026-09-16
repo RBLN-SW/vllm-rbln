@@ -61,10 +61,11 @@ def _neutralize(monkeypatch):
     )
 
 
-def _wire_runner(proposer, *, num_reqs):
+def _wire_runner(proposer, *, num_reqs, intermediate_chunk=False):
     proposer.runner = SimpleNamespace(
         # propose runs in the decode phase, which is the step phase it reads.
-        is_prefill=False,
+        is_prefill=intermediate_chunk,
+        is_intermediate_chunked_prefill=intermediate_chunk,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
         kv_caches=[],
         kv_cache_bases=[],
@@ -402,6 +403,29 @@ class TestPropose:
         assert out.shape == (2, 3)
         cols = out.cpu()
         assert torch.equal(cols[:, 1:], cols[:, :-1] + 1)
+
+    def test_an_intermediate_chunk_runs_one_pass_and_drafts_nothing(self, monkeypatch):
+        # An intermediate chunk's sampled token is a placeholder, so only the pass
+        # that walks the drafter's KV cache across the chunk is worth running. The
+        # extension passes would extend the placeholder, and the drafts they
+        # produce are discarded.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2, intermediate_chunk=True)
+        echo = _echo_model_exec(proposer.hidden_size)
+        passes = []
+
+        def counting(**kwargs):
+            passes.append(1)
+            return echo(**kwargs)
+
+        proposer.model_executable = counting
+
+        out = _call_propose(proposer)
+
+        assert len(passes) == 1
+        assert out.shape == (2, 3)
+        assert out.cpu().tolist() == [[0, 0, 0], [0, 0, 0]]
 
     def test_multi_step_handles_rejected_and_capped_positions(self, monkeypatch):
         # Drives the loop's seq_len adjustments (num_rejected_tokens, positions

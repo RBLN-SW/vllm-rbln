@@ -38,7 +38,9 @@ from vllm.sequence import IntermediateTensors
 # rather than letting it fail mid-compile.
 EAGLE3_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM"})
 
-AUX_SLOT = "aux_hidden_states_"
+# One handoff tensor carries every aux hidden state, concatenated on the feature
+# dim in ascending layer order, which is the layout the drafter's `fc` already expects.
+AUX_COMBINED = "aux_hidden_states"
 
 
 def eagle3_aux_hidden_states_enabled(
@@ -135,12 +137,13 @@ def install_aux_handoff_slots(model: nn.Module) -> None:
     def make_empty_intermediate_tensors(
         batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
-        keys = ["hidden_states", "residual"]
-        keys += [f"{AUX_SLOT}{i}" for i in aux_slots_received(inner)]
+        widths = {"hidden_states": hidden_size, "residual": hidden_size}
+        if received := aux_slots_received(inner):
+            widths[AUX_COMBINED] = len(received) * hidden_size
         return IntermediateTensors(
             {
-                key: torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
-                for key in keys
+                key: torch.zeros((batch_size, width), dtype=dtype, device=device)
+                for key, width in widths.items()
             }
         )
 
