@@ -67,7 +67,7 @@ def make_synthetic_rejection_sampler(
     mock_sampler = Mock(spec=Sampler)
     mock_sampler.logprobs_mode = "raw_logprobs"
     sampler = RBLNRejectionSampler(mock_sampler, use_rbln_sampler=False)
-    sampler.synthetic_conditional_rates_cpu = torch.tensor(
+    sampler.synthetic_conditional_rates = torch.tensor(
         conditional_rates, dtype=torch.float32, device=DEVICE
     )
     sampler.synthetic_mode = True
@@ -1008,9 +1008,9 @@ def test_npu_impl_keeps_the_synthetic_rates_on_the_host(monkeypatch):
     """The NPU impl decides synthetic acceptance from host randomness.
 
     The NPU `rbln::rejection_sample` primitive ignores synthetic rates, so the
-    sampler overrides the acceptance count after the op instead. That override
-    runs on the host, which needs the rates there -- the base class builds them
-    on the sampler's device.
+    sampler overrides the acceptance count after the op instead. That draw runs
+    on the host every step, so the rates are settled once at construction: moved
+    off the sampler's device and padded to the op's draft width.
     """
     # The impl compiles a graph on construction, which this test does not need.
     monkeypatch.setattr(rejection_sampler_module, "RBLNRejectionSamplerImpl", Mock())
@@ -1019,6 +1019,8 @@ def test_npu_impl_keeps_the_synthetic_rates_on_the_host(monkeypatch):
     spec_config = Mock()
     spec_config.rejection_sample_method = "synthetic"
     spec_config.synthetic_acceptance_rates = [0.5, 0.25]
+    # Wider than the rates, so the padding the draw relies on is exercised.
+    spec_config.num_speculative_tokens = 3
     sampler = RBLNRejectionSampler(
         mock_sampler,
         spec_config=spec_config,
@@ -1027,7 +1029,7 @@ def test_npu_impl_keeps_the_synthetic_rates_on_the_host(monkeypatch):
     )
 
     assert sampler.synthetic_mode
-    rates = sampler.synthetic_conditional_rates_cpu
+    rates = sampler.synthetic_conditional_rates
     assert rates is not None and rates.device.type == "cpu"
-    # Conditional rates: c_i = p_i / p_{i-1}.
-    assert torch.allclose(rates, torch.tensor([0.5, 0.5]))
+    # Conditional rates c_i = p_i / p_{i-1}, then a never-accepting third slot.
+    assert torch.allclose(rates, torch.tensor([0.5, 0.5, 0.0]))

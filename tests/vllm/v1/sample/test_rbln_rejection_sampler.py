@@ -614,7 +614,6 @@ def test_synthetic_acceptance_is_capped_by_the_drafted_count():
     # the two padded slots: the second must not be invented.
     drawn = draw_synthetic_acceptance(
         batch_size=2,
-        max_spec_len=NUM_SPEC_TOKENS,
         num_draft_tokens=torch.tensor([1, 2], dtype=torch.int32),
         conditional_rates=torch.ones(NUM_SPEC_TOKENS),
     )
