@@ -18,8 +18,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
-from functools import partial
-from typing import Any, NamedTuple, TypeAlias, cast
+from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
@@ -3275,12 +3274,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 }
                 kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
-            kv_transfer_group.set_host_xfer_buffer_ops(
-                partial(
-                    copy_host_device_kv_blocks,
-                    block_axes=self.kv_cache_block_axes,
-                )
-            )
+            kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3641,6 +3635,26 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter.dummy_run()
 
         mega_cache.save(self.model_config.model, sig)
+
+    def _copy_host_device_kv_blocks(
+        self,
+        src_kv_caches: dict[str, torch.Tensor],
+        dst_kv_caches: dict[str, torch.Tensor],
+        src_block_ids: list[int],
+        dst_block_ids: list[int],
+        direction: Literal["h2d", "d2h"],
+    ) -> None:
+        """The connector's `CopyBlocksOp`, reading the block axes at call time.
+        A dynamic-KV reallocation replaces the dict, which a bound one would
+        keep a dead reference to."""
+        copy_host_device_kv_blocks(
+            src_kv_caches,
+            dst_kv_caches,
+            src_block_ids,
+            dst_block_ids,
+            direction,
+            block_axes=self.kv_cache_block_axes,
+        )
 
     def _process_kv_cache_copy_ops(
         self,

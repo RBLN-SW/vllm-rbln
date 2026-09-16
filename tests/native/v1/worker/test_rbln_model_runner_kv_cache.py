@@ -128,6 +128,37 @@ class TestKVCacheBaseBindings:
         assert runner.kv_cache_view_infos == []
 
 
+class TestHostBufferCopyOp:
+    def test_the_registered_op_reads_the_axes_at_call_time(
+        self, make_model_runner, monkeypatch
+    ):
+        # A host-staging connector moves blocks through the op registered here.
+        # A dynamic-KV reallocation replaces `kv_cache_block_axes`, so an op
+        # holding the dict it was registered with would keep copying by the
+        # axes of a cache that no longer exists.
+        captured: list = []
+        seen: dict = {}
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(
+            mr,
+            "get_kv_transfer_group",
+            lambda: SimpleNamespace(
+                register_kv_caches=lambda _caches: None,
+                set_host_xfer_buffer_ops=captured.append,
+            ),
+        )
+        monkeypatch.setattr(
+            mr, "copy_host_device_kv_blocks", lambda *a, **kw: seen.update(kw)
+        )
+
+        runner = make_model_runner(init_kv_cache=False)
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
+        runner.kv_cache_block_axes = {"layer.0": 1}
+        captured[0]({}, {}, [], [], "h2d")
+
+        assert seen == {"block_axes": {"layer.0": 1}}
+
+
 class TestBuildAttentionMetadata:
     def test_one_build_per_group_shared_across_its_layers(
         self, make_model_runner, monkeypatch
