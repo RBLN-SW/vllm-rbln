@@ -22,7 +22,6 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
@@ -32,10 +31,6 @@ def patch_upstream() -> None:
     # path it would be an unknown field of RBLNConfig.
     _capture_user_max_num_batched_tokens()
     _allow_gemma4_global_per_layer_attribute_access()
-
-
-def add_cli_args(parser: "FlexibleArgumentParser") -> None:
-    """The optimum path takes no RBLN command-line arguments."""
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:

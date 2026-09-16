@@ -49,6 +49,15 @@ logger = init_logger(__name__)
 
 _GROUP_TITLE = "RBLNConfig"
 
+# No `--rbln-*` flag; the field's own docstring says why. Still accepted through
+# `additional_config`, which is how one of them arrives before the config exists.
+_NO_FLAG = {"no_flag": True}
+
+# Written by the config sync, from the compiled artifact or from other fields. A
+# value given here is overwritten, and hashing it would key the compile cache on
+# something derived from the artifact the key is looking for.
+_DERIVED = {"no_flag": True, "derived": True}
+
 DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
 
 
@@ -148,6 +157,74 @@ class RBLNConfig(RBLNConfigBase):
             )
 
 
+@vllm_config_dataclass
+class OptimumRBLNConfig(RBLNConfigBase):
+    """RBLN NPU options for the optimum-rbln model path."""
+
+    optimum_overrides: dict[str, Any] = field(default_factory=dict)
+    """Entries for optimum-rbln's own model config, laid over what vllm-rbln
+    derives from the vLLM settings when the model is compiled. With a
+    pre-compiled model only the `device` entries apply."""
+
+    prefix_block_size: int | None = None
+    """Block size of the prefix cache. Defaults to the prefill chunk size."""
+
+    # Snapshots of a vLLM field taken before it is overwritten. vLLM already has
+    # the flag, so there is no `--rbln-*` one, but they stay settable: the
+    # platform hook writes the first into the dict before this class exists.
+    user_max_num_batched_tokens: int | None = field(default=None, metadata=_NO_FLAG)
+    """`--max-num-batched-tokens` as the user gave it, before vLLM fills in its
+    default. On this path it is the prefill chunk size to compile."""
+
+    num_blocks_override: int | None = field(default=None, metadata=_NO_FLAG)
+    """`--num-gpu-blocks-override` as given, before the prefix-cache block ratio
+    is applied to it."""
+
+    # Written by the sync, and carried to the processes that cannot build
+    # `RBLNParams` of their own.
+    attn_block_size: int | None = field(default=None, metadata=_DERIVED)
+    """`RBLNParams.kvcache_block_size`, when prefix caching splits the KV-cache
+    block size from `cache_config.block_size`."""
+
+    image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
+    """`RBLNParams.image_prefill_chunk_size`, the image-prefill buckets
+    (gemma3/gemma4) the scheduler pads against."""
+
+    cached_model_path: str | None = field(default=None, metadata=_DERIVED)
+    """Where the compile cache holds, or will put, this model's artifact. Built
+    from the fields above, so it cannot key the cache it names."""
+
+    num_blocks_synced: bool = field(default=False, metadata=_DERIVED)
+    """Set once num_gpu_blocks is derived from the compiled model, so the second
+    run of the sync in EngineCore does not derive it again."""
+
+    def compute_hash(self) -> str:
+        """Hash of the fields that change the compiled artifact.
+
+        `VllmConfig.compute_hash()` requires this of an `additional_config` that
+        is not a dict, and `mega_cache` keys its bundle on the result.
+        """
+        from vllm.config.utils import get_hash_factors, hash_factors
+
+        ignored_factors = {
+            f.name for f in _fields_of(type(self)) if f.metadata.get("derived")
+        } | {
+            # Sampler graphs compile with use_cache=False, so they never enter
+            # the bundle.
+            "use_custom_sampler",
+        }
+        return hash_factors(get_hash_factors(self, ignored_factors))
+
+
+# Every class a `--rbln-*` flag can belong to.
+_CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (RBLNConfig, OptimumRBLNConfig)
+
+# TODO(vllm-rbln>=0.12.0): delete. Former additional_config keys, still accepted
+# with a warning.
+_RENAMED_KEYS: dict[type[RBLNConfigBase], dict[str, str]] = {
+    OptimumRBLNConfig: {"rbln_config": "optimum_overrides"},
+}
+
 _C = TypeVar("_C", bound=RBLNConfigBase)
 
 
@@ -192,6 +269,9 @@ def _env_overrides(cls: type[RBLNConfigBase]) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     for f in _fields_of(cls):
         attr, probes = _env_source(f.name)
+        if attr not in envs.environment_variables:
+            # No variable of its own; the CLI or the default is the only source.
+            continue
         for probe in probes:
             if probe in os.environ:
                 overrides[f.name] = getattr(envs, attr)
@@ -218,6 +298,16 @@ def _resolve(cls: type[_C], additional_config: Any) -> _C:
             f"additional_config must be a {cls.__name__} or a mapping of its "
             f"field names, got {type(given).__name__}"
         )
+
+    for old, new in _RENAMED_KEYS.get(cls, {}).items():
+        if old in given:
+            logger.warning_once(
+                "additional_config[%r] is deprecated and will be removed in "
+                "0.12.0; use %r.",
+                old,
+                new,
+            )
+            given = {k: v for k, v in given.items() if k != old} | {new: given[old]}
 
     known = {f.name for f in _fields_of(cls)}
     if unknown := sorted(set(given) - known):
@@ -331,14 +421,14 @@ class _MergeAdditionalConfig(argparse.Action):
         _additional_config(namespace).update(values)
 
 
-def add_rbln_cli_args(
-    parser: "FlexibleArgumentParser", cls: type[RBLNConfigBase] = RBLNConfig
-) -> None:
-    """Add `cls`'s `--rbln-*` group to `parser`. Safe to call twice.
+def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
+    """Add every `--rbln-*` flag to `parser`. Safe to call twice.
 
     `RblnPlatform.pre_register_and_update(parser)` calls this from inside
     `AsyncEngineArgs.add_cli_args()`, before `parse_args()`. That is early
-    enough for `--help`, `--help=all` and `--help=rblnconfig`.
+    enough for `--help`, `--help=all` and `--help=rblnconfig`, and too early to
+    know the model path, so both paths' fields are registered. `_resolve`
+    rejects a field the selected class does not have.
     """
     if any(group.title == _GROUP_TITLE for group in parser._action_groups):
         return
@@ -347,18 +437,25 @@ def add_rbln_cli_args(
 
     group = parser.add_argument_group(
         title=_GROUP_TITLE,
-        description=cls.__doc__,
+        description="RBLN NPU options for both model paths.",
     )
-    kwargs = get_kwargs(cls)
-    for f in _fields_of(cls):
-        field_kwargs = kwargs[f.name]
-        is_bool = field_kwargs.pop("action", None) is argparse.BooleanOptionalAction
-        group.add_argument(
-            f"--rbln-{f.name.replace('_', '-')}",
-            dest=f"rbln_{f.name}",
-            action=_StoreRblnBool if is_bool else _StoreRbln,
-            **field_kwargs,
-        )
+    seen: set[str] = set()
+    for cls in _CONFIG_CLASSES:
+        kwargs = get_kwargs(cls)
+        for f in _fields_of(cls):
+            if f.name in seen:
+                continue
+            seen.add(f.name)
+            if f.metadata.get("no_flag"):
+                continue
+            field_kwargs = kwargs[f.name]
+            is_bool = field_kwargs.pop("action", None) is argparse.BooleanOptionalAction
+            group.add_argument(
+                f"--rbln-{f.name.replace('_', '-')}",
+                dest=f"rbln_{f.name}",
+                action=_StoreRblnBool if is_bool else _StoreRbln,
+                **field_kwargs,
+            )
 
     for action in parser._actions:
         if action.dest == "additional_config":

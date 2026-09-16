@@ -235,7 +235,11 @@ class RblnPlatform(Platform):
             if action.dest == "block_size":
                 action.choices = None  # Override choices
 
-        _impl().add_cli_args(parser)
+        # Not dispatched: the flags cover both paths, because which one runs is
+        # not known until the arguments are parsed.
+        from vllm_rbln.config import add_rbln_cli_args
+
+        add_rbln_cli_args(parser)
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
