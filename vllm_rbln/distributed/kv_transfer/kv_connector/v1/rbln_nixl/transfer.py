@@ -252,7 +252,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 f"{chunks} chunk(s) a block holds"
             )
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
-        per_block = self._shard_descs_per_block.get((engine_id, global_rank), 1)
+        per_block = self._shard_descs_per_block[(engine_id, global_rank)]
         positions = np.arange(len(region_group_ids), dtype=np.int64)
         if span_ix is not None:
             positions = positions[positions % self._kv_areas == span_ix]
