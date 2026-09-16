@@ -49,6 +49,10 @@ PLACEHOLDER_TOKEN_ID = -1
 
 
 class RBLNRejectionSampler(RejectionSampler):
+    # Declared so the host-side move below is not a `has-type` cycle for mypy,
+    # which cannot see the base class under `--follow-imports skip`.
+    synthetic_conditional_rates: torch.Tensor | None
+
     def __init__(
         self,
         sampler: Sampler,
@@ -69,15 +73,16 @@ class RBLNRejectionSampler(RejectionSampler):
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
 
-        # NOTE(RBLN): The synthetic acceptance count is drawn on the host, so the
-        # rates have to live there -- the base class builds them on the sampler's
-        # device, which is the NPU under device tensors. Both impls take this
-        # copy; the Torch impl's kernels move it to their own device anyway.
-        self.synthetic_conditional_rates_cpu = (
-            self.synthetic_conditional_rates.to("cpu", torch.float32)
-            if self.synthetic_conditional_rates is not None
-            else None
-        )
+        # NOTE(RBLN): The synthetic count is drawn on the host every step, so
+        # settle the rates here instead: onto the host, because the base class
+        # builds them on the sampler's device (the NPU under device tensors), and
+        # padded to the op's fixed draft width, because they are only as long as
+        # the configured spec length. Positions past their end never accept.
+        if self.synthetic_conditional_rates is not None:
+            rates = torch.zeros(num_spec_tokens, dtype=torch.float32)
+            width = min(num_spec_tokens, self.synthetic_conditional_rates.shape[0])
+            rates[:width] = self.synthetic_conditional_rates[:width].cpu()
+            self.synthetic_conditional_rates = rates
         self.impl = (
             RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
             if use_rbln_sampler
@@ -178,7 +183,7 @@ class RBLNRejectionSampler(RejectionSampler):
             bonus_token_ids,
             sampling_metadata,
             synthetic_mode=self.synthetic_mode,
-            synthetic_conditional_rates=self.synthetic_conditional_rates_cpu,
+            synthetic_conditional_rates=self.synthetic_conditional_rates,
             bonus_logits=bonus_logits,
         )
 
@@ -534,7 +539,7 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             synthetic_num_accepted = bufs["synthetic_num_accepted"]
             synthetic_num_accepted.copy_(
                 draw_synthetic_acceptance(
-                    batch_size, max_spec_len, counts, synthetic_conditional_rates
+                    batch_size, counts, synthetic_conditional_rates
                 )
             )
 
@@ -571,7 +576,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
 
 def draw_synthetic_acceptance(
     batch_size: int,
-    max_spec_len: int,
     num_draft_tokens: torch.Tensor,
     conditional_rates: torch.Tensor,
 ) -> torch.Tensor:
@@ -583,19 +587,14 @@ def draw_synthetic_acceptance(
 
     Args:
         batch_size: Number of requests.
-        max_spec_len: The padded draft width, K.
         num_draft_tokens: Per-request draft count, on the host. Shape is [B].
-        conditional_rates: Per-position acceptance probability, on the host.
-            Shape is [num_spec]; positions past its end are rejected.
+        conditional_rates: Per-position acceptance probability, on the host,
+            already padded to the op's draft width. Shape is [K].
 
     Returns:
         The accepted counts, on the host. Shape is [B], int32.
     """
-    rates = torch.zeros(max_spec_len, dtype=torch.float32)
-    n_rates = min(max_spec_len, conditional_rates.shape[0])
-    rates[:n_rates] = conditional_rates[:n_rates]
-
-    accepted = torch.rand(batch_size, max_spec_len) < rates.unsqueeze(0)
+    accepted = torch.rand(batch_size, conditional_rates.shape[0]) < conditional_rates
     num_accepted = accepted.to(torch.int32).cumprod(dim=1).sum(dim=1)
     return torch.minimum(num_accepted, num_draft_tokens)
 
