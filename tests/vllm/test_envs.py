@@ -306,8 +306,9 @@ def test_declared_default_matches_resolved(monkeypatch, name):
     "name", ["VLLM_USE_V2_MODEL_RUNNER", "VLLM_DISABLE_COMPILE_CACHE"]
 )
 def test_upstream_variables_reachable(name):
-    """``platform.py`` reads these upstream names off ``vllm_rbln.envs`` via
-    the ``__getattr__`` fallthrough to ``vllm.envs`` (surfaced in ``__dir__``)."""
+    """``platform/__init__.py`` and ``platform/vllm_impl.py`` read these
+    upstream names off ``vllm_rbln.envs`` via the ``__getattr__`` fallthrough
+    to ``vllm.envs`` (surfaced in ``__dir__``)."""
     assert name in dir(envs)
     getattr(envs, name)
 

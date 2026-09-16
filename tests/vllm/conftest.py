@@ -120,12 +120,13 @@ def pytest_addoption(parser):
         choices=["0", "1"],
         default=None,
         help=(
-            "VLLM_RBLN_USE_DEVICE_TENSOR for the whole session. platform.py "
-            "resolves it at module scope into RblnPlatform.device_type and "
-            "friends, and seven modules copy USE_DEVICE_TENSOR into their own "
-            "namespace, so it cannot be parametrized per test -- run the suite "
-            "once per value instead. Left unset by default so the source's own "
-            "default is what gets exercised."
+            "VLLM_RBLN_USE_DEVICE_TENSOR for the whole session. "
+            "platform/__init__.py resolves it at module scope into "
+            "RblnPlatform.device_type and friends, and eight modules copy "
+            "USE_DEVICE_TENSOR into their own namespace, so it cannot be "
+            "parametrized per test -- run the suite once per value instead. "
+            "Left unset by default so the source's own default is what gets "
+            "exercised."
         ),
     )
     parser.addoption(
@@ -382,7 +383,8 @@ def pytest_configure(config):
     _scrubbed = scrub_env()
     os.environ.update(VLLM_RBLN_ENV)
 
-    # Must land before the import below: platform.py reads this at module scope.
+    # Must land before the import below: platform/__init__.py reads this at
+    # module scope.
     device_tensor = config.getoption("--device-tensor")
     if device_tensor is not None:
         os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
