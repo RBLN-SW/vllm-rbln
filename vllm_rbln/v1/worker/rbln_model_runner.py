@@ -2614,7 +2614,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # all-gather stays in step with the busy ranks, on the length this
                 # step decided -- what it stages then fits the dimension the group
                 # settled on, whichever route decided it.
-                self.drafter.dummy_run(num_reqs, query_len, False)
+                draft_query_len = query_len
+                if self.uses_fixed_decode_window and self.num_spec_tokens == 1:
+                    draft_query_len = target_query_len
+                self.drafter.dummy_run(num_reqs, draft_query_len, False)
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
