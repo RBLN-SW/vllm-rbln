@@ -367,7 +367,7 @@ def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
         rejection_sampler=SimpleNamespace(
             impl=SimpleNamespace(rejection_sample=rejection_sample),
             synthetic_mode=True,
-            synthetic_conditional_rates_cpu=rates,
+            synthetic_conditional_rates=rates,
         ),
     )
 
@@ -399,7 +399,7 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
         rejection_sampler=SimpleNamespace(
             impl=SimpleNamespace(rejection_sample=rejection_sample),
             synthetic_mode=False,
-            synthetic_conditional_rates_cpu=None,
+            synthetic_conditional_rates=None,
         ),
     )
 

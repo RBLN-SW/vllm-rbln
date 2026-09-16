@@ -3582,7 +3582,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 sampling_metadata,
                 synthetic_mode=self.rejection_sampler.synthetic_mode,
                 synthetic_conditional_rates=(
-                    self.rejection_sampler.synthetic_conditional_rates_cpu
+                    self.rejection_sampler.synthetic_conditional_rates
                 ),
                 bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
