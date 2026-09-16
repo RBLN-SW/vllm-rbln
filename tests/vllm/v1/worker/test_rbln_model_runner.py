@@ -340,6 +340,45 @@ class TestSamplePadding:
         assert rejection_sampler.call_args.args[3] is sampling_metadata
 
 
+def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
+    """Synthetic mode hands the graph one more input, which dynamo specializes on.
+
+    A warm-up that passed `synthetic_mode=False` would compile the variant the
+    real steps never ask for, and the first real step would recompile. So the
+    warm-up forwards the sampler's own setting.
+    """
+    rejection_sample = MagicMock()
+    rates = torch.tensor([0.9, 0.8])
+    runner = _make_runner_stub(
+        rbln_config=RBLNConfig(use_custom_sampler=True),
+        speculative_config=object(),
+        num_spec_tokens=2,
+        is_pooling_model=False,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 10),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        bucketing_manager=SimpleNamespace(
+            decode_batch_buckets=[2, 4], max_batch_size=4
+        ),
+        max_num_reqs=8,
+        input_batch=SimpleNamespace(
+            top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
+        ),
+        rejection_sampler=SimpleNamespace(
+            impl=SimpleNamespace(rejection_sample=rejection_sample),
+            synthetic_mode=True,
+            synthetic_conditional_rates_cpu=rates,
+        ),
+    )
+
+    runner._warmup_sampler_decode_batches()
+
+    assert rejection_sample.call_args_list
+    for call in rejection_sample.call_args_list:
+        assert call.kwargs["synthetic_mode"] is True
+        assert call.kwargs["synthetic_conditional_rates"] is rates
+
+
 def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
     rejection_sample = MagicMock()
     runner = _make_runner_stub(
@@ -358,7 +397,9 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
             top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
         ),
         rejection_sampler=SimpleNamespace(
-            impl=SimpleNamespace(rejection_sample=rejection_sample)
+            impl=SimpleNamespace(rejection_sample=rejection_sample),
+            synthetic_mode=False,
+            synthetic_conditional_rates_cpu=None,
         ),
     )
 
