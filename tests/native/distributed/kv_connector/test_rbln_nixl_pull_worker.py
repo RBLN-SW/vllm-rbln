@@ -487,6 +487,21 @@ class TestShardReadPath:
 
         assert w._recv_valid_tokens == {"earlier": 5, "r0": 33}
 
+    def test_a_count_whose_request_never_reads_is_dropped(self):
+        # The other end of the case above: a request deferred behind a
+        # handshake can end before its read, and nothing else would touch its
+        # entry -- upstream reports a completion and a failure through the same
+        # set, so both ways out land here.
+        w = self._read_worker(pp_size=1)
+        w._recv_valid_tokens = {"r0": 33, "still_going": 5}
+
+        with patch.object(
+            NixlPullConnectorWorker, "get_finished", return_value=(set(), {"r0"})
+        ):
+            w.get_finished()
+
+        assert w._recv_valid_tokens == {"still_going": 5}
+
     def test_single_stage_read_delegates_to_upstream(self):
         # A producer that advertised pp_size 1 reads through the upstream path:
         # the per-stage loop would key handles the non-PP registration never

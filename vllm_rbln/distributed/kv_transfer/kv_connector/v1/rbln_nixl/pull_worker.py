@@ -56,6 +56,21 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         # The producer's token count per request, until the read consumes it.
         self._recv_valid_tokens: dict[str, int] = {}
 
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        """Drop the token count of a request that will not read it.
+
+        `start_load_kv` takes one for every request listed for receive, and
+        only the read consumes it -- a request that is deferred behind a
+        handshake and then ends before its read leaves an entry that nothing
+        else touches, for the life of the process. Upstream reports both the
+        completion and the failure here, so one site covers the two ways a
+        request can end without reading.
+        """
+        done_sending, done_recving = super().get_finished()
+        for req_id in done_recving:
+            self._recv_valid_tokens.pop(req_id, None)
+        return done_sending, done_recving
+
     def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
         assert isinstance(metadata, RblnNixlConnectorMetadata)
         # Accumulated rather than replaced: a request waiting on a handshake is
