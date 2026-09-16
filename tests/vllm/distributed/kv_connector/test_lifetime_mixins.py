@@ -12,28 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""No two lifetime mixins may bind the same name.
+"""What one lifetime mixin binds, no sibling may bind or reach.
 
-The worker is assembled from mixins over one shared base, so a name two of them
-define resolves to whichever the MRO reaches first, and a `super()` in the
-earlier one -- written to reach upstream -- lands on the sibling instead, while
-the earlier one did not change.
+The worker is assembled from mixins over one shared base. Two of them binding
+one name resolves to whichever the MRO reaches first, so a `super()` written to
+reach upstream lands on the sibling instead. And a mixin's only base is
+`state.py`, so a member parked in one is untyped where a sibling or the base
+reads it -- `state.py` is where such a member belongs.
 
-Nothing else catches that. `F811` is a redefinition within one namespace, so two
-files binding one name reads as the override the direction subclasses and the
-schedulers do on purpose, and each file is correct read on its own.
+Nothing else catches either. `F811` reads a second binding as the override the
+direction subclasses do on purpose, and the untyped read would be a mypy
+`attr-defined` if the pre-commit hook's environment had vllm; without it the
+upstream base degrades to `Any` and every read of `self` is legal.
 
-A name the shared base already binds is flagged too, since `state.py` is where a
-name two lifetimes need belongs. The mixins are discovered by their base rather
-than listed, so a fourth lifetime is covered the day it is added.
-`test_patch_targets.py` guards the other half of what the split created.
+The mixins are discovered by their base, not listed, so a fourth is covered the
+day it is added. `test_patch_targets.py` guards the other half of the split.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import pkgutil
+import textwrap
 
 
 def _lifetimes() -> tuple[type, list[type]]:
@@ -89,6 +91,37 @@ def _collisions(base: type, mixins: list[type]) -> list[str]:
     return sorted(found)
 
 
+def _self_reads(cls: type) -> set[str]:
+    """Names this class's own body reaches through `self`.
+
+    Off the source, because the defect is about which class the read sits in and
+    an inherited attribute is indistinguishable from an own one at runtime.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cls)))
+    return {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    }
+
+
+def _cross_reads(base: type, mixins: list[type]) -> list[str]:
+    """A lifetime's own callable that a sibling, or the shared base, reaches.
+
+    The assembled subclasses are not readers here: they inherit every lifetime,
+    so the same read is typed there and carries none of this risk.
+    """
+    owners = {name: cls for cls in mixins for name in _own_callables(cls)}
+    return sorted(
+        f"{name}: {owners[name].__name__} defines it, {reader.__name__} reads it"
+        for reader in [base, *mixins]
+        for name in _self_reads(reader)
+        if name in owners and owners[name] is not reader
+    )
+
+
 def test_no_lifetime_shadows_a_sibling():
     base, mixins = _lifetimes()
     # A discovery that found one class would pass the assertion below on
@@ -104,6 +137,17 @@ def test_no_lifetime_shadows_a_sibling():
         "override, and each file is correct read on its own. Move the shared "
         "one to state.py, or give them names that say which lifetime owns "
         "them:\n  " + "\n  ".join(_collisions(base, mixins))
+    )
+
+
+def test_no_lifetime_member_is_read_from_a_sibling_or_the_base():
+    base, mixins = _lifetimes()
+    assert not _cross_reads(base, mixins), (
+        "a lifetime's own member is reached from outside that lifetime, where "
+        "it is untyped: a mixin's only base is state.py, so the reader's class "
+        "does not declare it and the read is not an error. Move it to "
+        "state.py, together with any private helper of its own that it "
+        "calls:\n  " + "\n  ".join(_cross_reads(base, mixins))
     )
 
 
@@ -149,3 +193,32 @@ def test_the_check_sees_what_a_def_line_does_not():
         as_staticmethod = staticmethod(lambda: None)
 
     assert _collisions(Base, [L, R]) == ["as_staticmethod: L and R"]
+
+
+def test_the_check_sees_a_read_across_two_lifetimes():
+    # Without this the test above passes on a rule that matches nothing. The
+    # class names are unique in the file because `inspect.getsource` finds one
+    # by searching the source for its name. The reads below are the defect, so
+    # mypy reports them here -- which it cannot do in the connector, where the
+    # upstream base it needs is absent from this environment and becomes `Any`.
+    class CrossBase:
+        def reaches_up(self):
+            return self.owned_by_one  # type: ignore[attr-defined]
+
+    class CrossOwner(CrossBase):
+        def owned_by_one(self): ...
+
+    class CrossSibling(CrossBase):
+        def reaches_sideways(self):
+            return self.owned_by_one()  # type: ignore[attr-defined]
+
+        def reaches_its_own(self):
+            return self.reaches_sideways()
+
+    assert _cross_reads(CrossBase, [CrossOwner, CrossSibling]) == [
+        "owned_by_one: CrossOwner defines it, CrossBase reads it",
+        "owned_by_one: CrossOwner defines it, CrossSibling reads it",
+    ]
+    # Nobody owns `owned_by_one` now, and a lifetime reading its own member
+    # is what the rule permits -- both must come back clean.
+    assert _cross_reads(CrossBase, [CrossSibling]) == []
