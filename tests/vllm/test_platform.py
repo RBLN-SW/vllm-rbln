@@ -984,6 +984,33 @@ class TestModelImpl:
         assert platform.USE_DEVICE_TENSOR is True
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
 
+    def test_a_built_config_passed_in_keeps_its_path(self, on_the_other_path):
+        """`LLM(additional_config=RBLNConfig(...))` hands in a resolved object.
+
+        The wrapper must read the path off it rather than overwrite it with a
+        dict, which would drop every other field the caller set.
+        """
+        given = RBLNConfig(model_impl="vllm", use_w8a8=True)
+
+        config = _build(additional_config=given)
+
+        assert config.additional_config is given
+        assert config.additional_config.use_w8a8 is True
+        assert RblnPlatform.device_type == "rbln"
+
+    def test_the_write_back_keeps_the_rest_of_additional_config(
+        self, on_the_other_path
+    ):
+        """The wrapper writes the resolved path in beside what the caller gave.
+
+        Replacing the dict instead of merging into it would drop every other
+        `--rbln-*` flag on the way to the engine, silently.
+        """
+        config = _build(additional_config={"model_impl": "vllm", "use_w8a8": True})
+
+        assert config.additional_config.model_impl == "vllm"
+        assert config.additional_config.use_w8a8 is True
+
     def test_creating_the_engine_config_publishes_the_path(self, monkeypatch):
         """The wrapper is the only place the flag and the spawned processes meet.
 
@@ -1028,7 +1055,9 @@ class TestModelImpl:
             "import vllm_rbln;"
             "vllm_rbln.register_model();"
             "vllm_rbln.register_ops();"
-            "print([m for m in sys.modules if m in COPIERS])".replace(
+            "applied = sys.modules.get('vllm_rbln.patches.registry');"
+            "print(applied and applied._applied_patch_keys,"
+            " [m for m in sys.modules if m in COPIERS])".replace(
                 "COPIERS", repr(_DEVICE_FLAG_COPIERS)
             )
         )
@@ -1044,4 +1073,6 @@ class TestModelImpl:
             },
         )
         assert out.returncode == 0, out.stderr[-2000:]
-        assert out.stdout.strip().endswith("[]"), out.stdout
+        # "None []": the registry was never imported, so nothing was applied and
+        # no module bound a stale USE_DEVICE_TENSOR.
+        assert out.stdout.strip().endswith("None []"), out.stdout

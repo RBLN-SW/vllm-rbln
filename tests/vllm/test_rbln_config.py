@@ -235,6 +235,21 @@ def test_no_field_is_read_from_the_environment():
     ]
 
 
+def test_the_model_path_keys_the_compile_cache():
+    """A different model implementation is a different artifact.
+
+    Adding the field already cost everyone one cache invalidation; dropping it
+    from the key later would instead hand a run the other path's artifact. Once
+    VLLM_RBLN_USE_VLLM_MODEL leaves RBLN_COMPILE_ENV this is the only thing
+    putting the path in the mega-cache bundle key.
+    """
+    assert RBLNConfig(model_impl="vllm").compute_hash() != RBLNConfig().compute_hash()
+    assert (
+        OptimumRBLNConfig(model_impl="vllm").compute_hash()
+        != OptimumRBLNConfig().compute_hash()
+    )
+
+
 def test_only_compile_fields_change_the_hash():
     """`mega_cache` uses this for its bundle key, via VllmConfig.
 
@@ -286,6 +301,15 @@ class TestResolveModelImpl:
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         monkeypatch.setenv(RESOLVED_MODEL_IMPL_ENV, "optimum")
         assert resolve_model_impl() == "optimum"
+
+    def test_the_key_wins_over_the_published_path(self, monkeypatch):
+        """A worker is handed the path, but an explicit key still decides.
+
+        Nothing relies on this today; it keeps the ladder total, so a reader
+        does not have to guess which of the two wins.
+        """
+        monkeypatch.setenv(RESOLVED_MODEL_IMPL_ENV, "optimum")
+        assert resolve_model_impl({"model_impl": "vllm"}) == "vllm"
 
     @pytest.mark.parametrize("value", ["transformers", "auto", True, None])
     def test_an_unknown_path_is_rejected(self, value):
