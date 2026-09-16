@@ -1859,11 +1859,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             ):
                 num_rows = logits_indices.shape[0]
                 if int(logits_indices[-1]) == num_rows - 1:
-                    # Indices climbing from 0 end at num_rows - 1 only when the
-                    # sampled rows lead the batch; a view replaces the gather.
+                    # Ascending indices ending at num_rows - 1 are exactly 0..num_rows-1
                     logits = logits[:num_rows]
                 else:
-                    # `index_select` is the cheaper gather on the device.
                     logits = torch.index_select(logits, 0, logits_indices)
 
         self.execute_model_state = ExecuteModelState(
