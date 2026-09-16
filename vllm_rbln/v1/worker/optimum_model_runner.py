@@ -76,6 +76,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_rbln import envs
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
@@ -180,7 +181,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         )
 
         # Sampler
-        self.use_rbln_sampler = envs.VLLM_RBLN_SAMPLER
+        rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+        self.use_rbln_sampler = rbln_config.use_custom_sampler
         if self.use_rbln_sampler:
             assert not vllm_config.model_config.use_fp64_gumbel, (
                 "RBLNSampler does not support use_fp64_gumbel=True. "
@@ -221,7 +223,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             tuple(logits_processors) if logits_processors is not None else ()
         )
         logitsprocs_builder = (
-            build_rbln_logitsprocs if envs.VLLM_RBLN_SAMPLER else build_logitsprocs
+            build_rbln_logitsprocs if self.use_rbln_sampler else build_logitsprocs
         )
         logitsprocs = logitsprocs_builder(
             self.vllm_config,

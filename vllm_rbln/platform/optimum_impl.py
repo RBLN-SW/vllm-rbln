@@ -34,9 +34,16 @@ def patch_upstream() -> None:
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
+    from vllm_rbln.config import build_optimum_rbln_config
     from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
     from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
     from vllm_rbln.utils.optimum.registry import is_pooling_arch
+
+    # Everything below, and the sync at the end, reads additional_config as an
+    # OptimumRBLNConfig. The sync also writes its derived fields back.
+    vllm_config.additional_config = build_optimum_rbln_config(
+        vllm_config.additional_config
+    )
 
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
@@ -113,20 +120,18 @@ def _capture_user_max_num_batched_tokens() -> None:
     """
     from vllm.engine.arg_utils import EngineArgs
 
-    from vllm_rbln.utils.optimum.converter.common import (
-        USER_MAX_NUM_BATCHED_TOKENS_KEY,
-    )
-
     if getattr(EngineArgs, "_rbln_user_mnbt_patched", False):
         return
 
     orig_set_defaults = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
 
     def _set_default_max_num_seqs_and_batched_tokens_args(self, *args, **kwargs):
-        # Runs before the value is resolved from None to its default.
+        # Runs before the value is resolved from None to its default, and
+        # before check_and_update_config, so additional_config is still a dict.
+        # build_optimum_rbln_config turns the key into the field of that name.
         if self.additional_config is None:
             self.additional_config = {}
-        self.additional_config[USER_MAX_NUM_BATCHED_TOKENS_KEY] = (
+        self.additional_config["user_max_num_batched_tokens"] = (
             self.max_num_batched_tokens
         )
         return orig_set_defaults(self, *args, **kwargs)
