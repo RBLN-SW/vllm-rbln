@@ -107,22 +107,17 @@ def kv_blocks_per_request(
 
 
 def rbln_engine_args(model: str, **kwargs) -> dict:
-    from vllm_rbln import envs
-
     merged = {**_RBLN_RUNNER_DEFAULTS, **kwargs}
-    # An override puts the dynamic KV sizer in PINNED mode, so only the lane
-    # that has no sizer sizes the pool here.
-    if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-        merged.setdefault(
-            "num_gpu_blocks_override",
-            kv_blocks_per_request(
-                model,
-                merged["max_model_len"],
-                merged["block_size"],
-                merged["max_num_batched_tokens"],
-            )
-            + 1,
+    merged.setdefault(
+        "num_gpu_blocks_override",
+        kv_blocks_per_request(
+            model,
+            merged["max_model_len"],
+            merged["block_size"],
+            merged["max_num_batched_tokens"],
         )
+        + 1,
+    )
     return merged
 
 

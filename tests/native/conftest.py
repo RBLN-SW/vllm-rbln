@@ -386,8 +386,6 @@ def pytest_configure(config):
     device_tensor = config.getoption("--device-tensor")
     if device_tensor is not None:
         os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
-    if device_tensor == "0":
-        del os.environ["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"]
 
     # Also before the import below: the get_pp_indices patch conditions on this.
     os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(_session_layers(config))
@@ -433,8 +431,7 @@ def pytest_report_header(config):
 
     origin = "explicit" if config.getoption("--device-tensor") else "source default"
     header = [
-        # Resolved, not requested: the cpu lane drops one of these.
-        f"native: env {', '.join(f'{k}={os.environ.get(k)}' for k in NATIVE_ENV)}",
+        f"native: env {', '.join(f'{k}={v}' for k, v in NATIVE_ENV.items())}",
         f"native: device_type={RblnPlatform.device_type} ({origin})",
     ]
     num_hidden_layers = _session_layers(config)
