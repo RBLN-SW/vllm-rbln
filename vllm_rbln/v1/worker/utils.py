@@ -332,20 +332,18 @@ def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
         one_request += cdiv(
             spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
         )
-        # UniformTypeKVCacheSpecs is not a SlidingWindowSpec subclass, so both
-        # the lookup and the guard below miss it; its members are all one type,
-        # so any of them carries the group's admission cap.
-        capped = (
-            next(iter(spec.kv_cache_specs.values()))
-            if isinstance(spec, UniformTypeKVCacheSpecs)
-            else spec
-        )
-        admission = getattr(capped, "max_admission_blocks_per_request", None)
+        # Unwrap only after the block count above, which the wrapper answers for
+        # the whole group. It is not a SlidingWindowSpec subclass, so both the
+        # lookup and the guard below would miss it; its members are all one
+        # type, so any of them carries the group's admission cap.
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        admission = getattr(spec, "max_admission_blocks_per_request", None)
         if admission is None and isinstance(
-            capped, (SlidingWindowSpec, ChunkedLocalAttentionSpec)
+            spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)
         ):
             raise AttributeError(
-                f"{type(capped).__name__} no longer exposes "
+                f"{type(spec).__name__} no longer exposes "
                 "max_admission_blocks_per_request; the per-sequence minimum "
                 "would silently fall back to one block."
             )
