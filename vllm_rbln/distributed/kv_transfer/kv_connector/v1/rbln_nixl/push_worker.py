@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import torch
+import torch.rbln  # noqa: F401
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -127,6 +129,9 @@ class _StreamedSend:
     # Tokens that offer holds. Travels with it to the writer -- see
     # `OfferedBlocks`.
     pending_offer_tokens: int = 0
+    # Completes when the device work that wrote those blocks does. Set and
+    # cleared with the offer.
+    pending_offer_done: "torch.rbln.Event | None" = None
     # Whether the writer has been told about this request at all. Not derivable
     # from `pending_offer`: an aborted offer clears that without ever releasing.
     released: bool = False
@@ -316,9 +321,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         the same request because `push_stream_enabled` refuses host staging.
 
         Held rather than handed over, because the forward that produced the KV
-        completes asynchronously and the runtime's wait covers transfers rather
-        than compute: a write issued from here reads KV still being written and
-        reports no error. `release_early_offers` holds it a step.
+        completes asynchronously: a write issued from here would read KV still
+        being written, silently -- the transfer reports no error. The event
+        recorded here is what `release_early_offers` waits on before releasing.
 
         Called from `wait_for_save` rather than `get_finished` so the host copy
         for the step is already done: speculative decoding on the last stage
@@ -326,10 +331,15 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         """
         if not self._early_push_enabled:
             return
+        if not metadata.reqs_to_save:
+            return
+        done = torch.rbln.Event()
+        done.record(torch.rbln.current_stream())
         for req_id, meta in metadata.reqs_to_save.items():
             send = self._streamed.setdefault(req_id, _StreamedSend())
             send.pending_offer = meta.local_block_ids
             send.pending_offer_tokens = metadata.push_stream_tokens.get(req_id, 0)
+            send.pending_offer_done = done
             total = metadata.push_stream_total.get(req_id)
             if total is not None:
                 send.total = total
@@ -337,18 +347,17 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     def release_early_offers(self) -> None:
         """Hand the previous step's held offers to the writer.
 
-        Called from the connector's flush site, once a submission is in flight
-        and before the handover is adopted, so a request whose handover lands on
-        this same step is written by the offer as well. Reached on every step --
-        one that closes no chunk and one with no forward included -- so nothing
-        is left held.
+        Waits for the device work behind an offer before letting it go. Called
+        from the connector's flush site, past the submission that work retires
+        behind, so the wait is a check rather than a stall, and ahead of the
+        handover, so a request whose handover lands on this step is written by
+        its offer too. Every offer goes on the step that reaches here --
+        `_seal_at_handover` counts only what has been released.
 
-        What guarantees a next step at all: while the request runs, it is
-        unfinished; once it ends, the scheduler keeps stepping on the
-        connector's pending-push-work hook until the send is reported. The
-        second half rests on a hook upstream documents as a placeholder, so a
-        held offer outliving the engine is what to suspect if a request ever
-        stalls with its KV never arriving.
+        What guarantees a next step: an unfinished request keeps the engine
+        stepping, and a finished one keeps it stepping on the connector's
+        pending-push-work hook, which upstream documents as a placeholder.
+        Suspect a held offer if a request ever stalls with its KV never arriving.
         """
         offers = [
             (req_id, send, OfferedBlocks(send.pending_offer, send.pending_offer_tokens))
@@ -361,8 +370,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             for _, send, _ in offers:
                 send.released = True
         for req_id, send, block_ids in offers:
+            done = send.pending_offer_done
+            assert done is not None
+            done.synchronize()
             send.pending_offer = None
             send.pending_offer_tokens = 0
+            send.pending_offer_done = None
             send.queued += 1
             self._finished_blocks_inbox.put((req_id, block_ids))
         self._push_writer_wake.set()

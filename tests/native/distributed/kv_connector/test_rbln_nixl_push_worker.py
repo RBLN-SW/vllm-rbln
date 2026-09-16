@@ -1200,6 +1200,19 @@ class TestEarlySend:
     it cannot go out in the step that produced the KV -- that forward completes
     asynchronously, so the offer waits for this rank's next step."""
 
+    @pytest.fixture(autouse=True)
+    def _off_the_device(self, monkeypatch):
+        # Recording a `torch.rbln.Event` opens the NPU, and `conftest.py` keeps
+        # the parent process off it. The tests that assert on the event patch it
+        # with a recorder of their own; this is for the rest, which reach
+        # `start_early_push` for other reasons and would otherwise pin a device
+        # they never use.
+        monkeypatch.setattr(
+            pw.torch.rbln,
+            "Event",
+            lambda: SimpleNamespace(record=lambda _s: None, synchronize=lambda: None),
+        )
+
     @staticmethod
     def _worker(*, enabled=True, use_host_buffer=False):
         w = TestPerShardWrite._writing_worker(ranks=2)
@@ -1308,6 +1321,61 @@ class TestEarlySend:
         worker.release_early_offers()
 
         assert first.offered_tokens == 1500
+
+    def test_the_offer_carries_the_device_work_that_wrote_it(self, monkeypatch):
+        # Nothing else names when those blocks stop being written: the runtime's
+        # transfer wait covers pending transfers, not compute.
+        recorded: list = []
+        monkeypatch.setattr(
+            pw.torch.rbln,
+            "Event",
+            lambda: SimpleNamespace(record=recorded.append, synchronize=lambda: None),
+        )
+        worker = self._worker()
+
+        worker.start_early_push(self._meta(saves=["r0"]))
+
+        assert worker._streamed["r0"].pending_offer_done is not None
+        assert recorded == [pw.torch.rbln.current_stream()]
+
+    def test_a_step_with_nothing_to_offer_records_no_event(self, monkeypatch):
+        # Recording one costs a device call, and `wait_for_save` runs every
+        # step -- including the decode steps, which offer nothing.
+        recorded: list = []
+        monkeypatch.setattr(
+            pw.torch.rbln,
+            "Event",
+            lambda: SimpleNamespace(record=recorded.append, synchronize=lambda: None),
+        )
+        worker = self._worker()
+
+        worker.start_early_push(self._meta())
+
+        assert recorded == []
+
+    def test_the_offer_waits_for_that_work_before_the_writer_sees_it(self, monkeypatch):
+        # The writer reads the blocks straight out of device memory and reports
+        # no error when they are still being written, so the wait is the only
+        # thing standing between a half-written block and a silent bad transfer.
+        order = []
+        monkeypatch.setattr(
+            pw.torch.rbln,
+            "Event",
+            lambda: SimpleNamespace(
+                record=lambda _stream: None,
+                synchronize=lambda: order.append("wait"),
+            ),
+        )
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"]))
+        monkeypatch.setattr(
+            worker._finished_blocks_inbox, "put", lambda item: order.append("hand")
+        )
+
+        worker.release_early_offers()
+
+        assert order == ["wait", "hand"]
+        assert worker._streamed["r0"].pending_offer_done is None
 
     def test_a_step_that_closes_nothing_still_releases_what_is_held(self):
         # The release cannot wait for another closing chunk: steps that close
