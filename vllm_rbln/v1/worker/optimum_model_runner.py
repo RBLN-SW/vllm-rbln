@@ -860,6 +860,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         for _, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
         ):
+            # TODO: record this run into VLLM_RBLN_METRICS as an ENCODER tracker.
             outputs = self.model.embed_multimodal(**mm_kwargs_batch)
             sanity_check_mm_encoder_outputs(outputs, expected_num_items=num_items)
             encoder_outputs.extend(outputs)
