@@ -52,6 +52,22 @@ _ENGINE_ARGS = dict(
     enable_chunked_prefill=True,
 )
 
+# Modules that bind platform.USE_DEVICE_TENSOR into their own namespace at
+# import. _apply_model_impl cannot reach them, so none may be imported before
+# the model path is resolved.
+_DEVICE_FLAG_COPIERS = frozenset(
+    {
+        "vllm_rbln.patches.deepseek_mtp",
+        "vllm_rbln.platform.vllm_impl",
+        "vllm_rbln.v1.sample.rbln_rejection_sampler",
+        "vllm_rbln.v1.sample.rbln_sampler",
+        "vllm_rbln.v1.spec_decode.dflash",
+        "vllm_rbln.v1.spec_decode.eagle",
+        "vllm_rbln.v1.spec_decode.medusa",
+        "vllm_rbln.v1.worker.rbln_model_runner",
+    }
+)
+
 _STANDALONE = "RBLN_CTX_STANDALONE"
 # Means "the platform did not touch it". Set rather than deleted so monkeypatch
 # has recorded the key and can roll back the platform's direct os.environ write.
@@ -117,7 +133,7 @@ class TestPlatformIdentity:
 
     def test_device_tensor_needs_both_switches(self):
         assert platform.USE_DEVICE_TENSOR is (
-            platform.envs.VLLM_RBLN_USE_VLLM_MODEL
+            platform.envs.model_impl_from_env() == "vllm"
             and platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR
         )
 
@@ -775,11 +791,17 @@ class TestDynamicKvConfig:
     model loads; the worker keeps only the checks that read runtime state."""
 
     @staticmethod
-    def _cfg(use_mla=False, speculative_config=None, kv_transfer_config=None):
+    def _cfg(
+        use_mla=False,
+        speculative_config=None,
+        kv_transfer_config=None,
+        model_impl="vllm",
+    ):
         return SimpleNamespace(
             model_config=SimpleNamespace(use_mla=use_mla),
             speculative_config=speculative_config,
             kv_transfer_config=kv_transfer_config,
+            additional_config={"model_impl": model_impl},
         )
 
     @pytest.fixture(autouse=True)
@@ -790,10 +812,9 @@ class TestDynamicKvConfig:
     def test_a_clean_config_passes(self):
         RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
-    def test_needs_the_vllm_model_path(self, monkeypatch):
-        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
+    def test_needs_the_vllm_model_path(self):
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL=1"):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg())
+            RblnPlatform._validate_dynamic_kv_config(self._cfg(model_impl="optimum"))
 
     def test_mla_passes(self):
         RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
@@ -829,16 +850,16 @@ class TestDynamicKvConfig:
         """A dry run changes nothing, so refusing would stop a run the flag off
         would have served. Each shape is reported and the run continues."""
         monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "1")
-        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
         with (
             patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
             caplog.at_level("WARNING"),
         ):
             RblnPlatform._validate_dynamic_kv_config(
                 self._cfg(
+                    model_impl="optimum",
                     kv_transfer_config=SimpleNamespace(
                         kv_connector="RBLNLMCacheConnectorV1"
-                    )
+                    ),
                 )
             )
         assert "VLLM_RBLN_USE_VLLM_MODEL=1" in caplog.text
@@ -897,3 +918,130 @@ class TestDflashTokenBudget:
             config.scheduler_config.max_num_scheduled_tokens = 8
 
         assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8
+
+
+class TestModelImpl:
+    """`--rbln-model-impl` decides the path, and the path decides the device.
+
+    The frontend only learns it after the arguments are parsed, later than the
+    module scope where RblnPlatform's device identity is first computed, so the
+    values are assigned again from the parsed config.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore(self):
+        before = platform.envs.model_impl_from_env()
+        yield
+        platform._apply_model_impl(before)
+
+    @pytest.mark.parametrize(
+        ("model_impl", "expected"),
+        [("vllm", ("rbln", "rbln", "rbln-ccl")), ("optimum", ("cpu", "cpu", ""))],
+    )
+    def test_the_path_moves_the_device_identity(self, model_impl, expected):
+        platform._apply_model_impl(model_impl)
+        assert (
+            RblnPlatform.device_name,
+            RblnPlatform.device_type,
+            RblnPlatform.dist_backend,
+        ) == expected
+
+    def test_the_path_picks_the_impl_module(self):
+        platform._apply_model_impl("vllm")
+        assert platform._impl().__name__.endswith("vllm_impl")
+        platform._apply_model_impl("optimum")
+        assert platform._impl().__name__.endswith("optimum_impl")
+
+    @pytest.fixture
+    def on_the_other_path(self, monkeypatch):
+        """Start where the flag has to move the platform from.
+
+        The suite exports the deprecated variable and this module resolved it at
+        import, so without this the assertions below would pass on import-time
+        state and prove nothing.
+        """
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        # Set, not deleted, so monkeypatch has the key recorded and can roll
+        # back what _apply_model_impl writes.
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        platform._apply_model_impl("optimum")
+
+    def test_building_a_config_from_the_flag_alone_reaches_the_device(
+        self, on_the_other_path
+    ):
+        """`LLM(...)` builds its config without ever parsing a command line.
+
+        It is the entry point that skips `add_cli_args`, so a wrapper installed
+        from there would never see this call, and a run with the flag set would
+        stay on the optimum path.
+        """
+        assert RblnPlatform.device_type == "cpu"
+
+        config = _build(additional_config={"model_impl": "vllm"})
+
+        assert config.additional_config.model_impl == "vllm"
+        assert RblnPlatform.device_type == "rbln"
+        assert platform.USE_DEVICE_TENSOR is True
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
+
+    def test_creating_the_engine_config_publishes_the_path(self, monkeypatch):
+        """The wrapper is the only place the flag and the spawned processes meet.
+
+        It writes the path back into additional_config, so the config that
+        reaches a worker states its own path, and publishes it for the entry
+        points that run before that config arrives.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        seen = []
+        monkeypatch.setattr(
+            EngineArgs,
+            "create_engine_config",
+            lambda self, *a, **k: seen.append(self.additional_config),
+            raising=False,
+        )
+        monkeypatch.delattr(EngineArgs, "_rbln_model_impl_patched", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        RblnPlatform._capture_model_impl()
+
+        EngineArgs.create_engine_config(
+            SimpleNamespace(additional_config={"model_impl": "vllm"})
+        )
+
+        assert seen == [{"model_impl": "vllm"}]
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
+        assert RblnPlatform.device_type == "rbln"
+
+    def test_the_modules_that_copy_the_device_flag_import_late(self):
+        """They bind USE_DEVICE_TENSOR at their own import.
+
+        That is only correct while none of them is imported before the path is
+        resolved, so the platform module is the only one _apply_model_impl has
+        to reach. A new early import here would silently pin a stale value.
+        """
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys;"
+            "from vllm.platforms import current_platform;"
+            "import vllm_rbln;"
+            "vllm_rbln.register_model();"
+            "vllm_rbln.register_ops();"
+            "print([m for m in sys.modules if m in COPIERS])".replace(
+                "COPIERS", repr(_DEVICE_FLAG_COPIERS)
+            )
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("VLLM_RBLN")
+                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
+            },
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().endswith("[]"), out.stdout

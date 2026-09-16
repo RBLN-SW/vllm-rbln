@@ -29,7 +29,9 @@ from vllm_rbln.config import (
     RBLNConfig,
     _env_source,
     build_rbln_config,
+    resolve_model_impl,
 )
+from vllm_rbln.envs import RESOLVED_MODEL_IMPL_ENV
 
 
 @pytest.fixture(autouse=True)
@@ -247,3 +249,62 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
     assert buckets.compute_hash() != base
+
+
+class TestResolveModelImpl:
+    """The model path has to be readable before the config class is known.
+
+    Which path runs picks the class, so `resolve_model_impl` reads the one key
+    and the environment instead of building anything.
+    """
+
+    def test_a_built_config_states_its_own_path(self):
+        assert resolve_model_impl(RBLNConfig(model_impl="vllm")) == "vllm"
+        assert resolve_model_impl(OptimumRBLNConfig()) == "optimum"
+
+    def test_the_key_wins_over_the_environment(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
+        assert resolve_model_impl({"model_impl": "optimum"}) == "optimum"
+
+    def test_nothing_given_is_the_default_path(self, monkeypatch):
+        # The suite conftest exports the deprecated variable, which is exactly
+        # what this asserts the absence of.
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        monkeypatch.delenv(RESOLVED_MODEL_IMPL_ENV, raising=False)
+        assert resolve_model_impl() == "optimum"
+        assert resolve_model_impl({}) == "optimum"
+        assert resolve_model_impl(None) == "optimum"
+
+    def test_the_deprecated_variable_still_selects_the_path(self, monkeypatch):
+        # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
+        assert resolve_model_impl() == "vllm"
+
+    def test_the_published_path_wins_over_the_deprecated_variable(self, monkeypatch):
+        # A spawned process is handed the resolved path; what the shell exported
+        # has already been folded into it.
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
+        monkeypatch.setenv(RESOLVED_MODEL_IMPL_ENV, "optimum")
+        assert resolve_model_impl() == "optimum"
+
+    @pytest.mark.parametrize("value", ["transformers", "auto", True, None])
+    def test_an_unknown_path_is_rejected(self, value):
+        # `--model-impl` upstream takes "transformers" and "auto"; this is a
+        # different option with its own values.
+        with pytest.raises(ValueError, match="model_impl must be one of"):
+            resolve_model_impl({"model_impl": value})
+
+
+def test_the_flag_reaches_the_config(parser):
+    assert resolve(parser, ["--rbln-model-impl", "vllm"]).model_impl == "vllm"
+
+
+def test_model_impl_has_no_variable_of_its_own():
+    """The path is a flag now, so it gains no `VLLM_RBLN_MODEL_IMPL`.
+
+    Only the deprecated name keeps working, and only through
+    `resolve_model_impl`.
+    """
+    from vllm_rbln import envs
+
+    assert _env_source("model_impl")[0] not in envs.environment_variables

@@ -44,7 +44,7 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 ## Two model paths
 
-`VLLM_RBLN_USE_VLLM_MODEL` selects the model path at startup: unset or `0` is the optimum model path, `1` is the vllm model path.
+`RBLNConfigBase.model_impl` selects the model path: `optimum` (the default) or `vllm`. `--rbln-model-impl` sets it, and `resolve_model_impl()` reads it before the config exists. `VLLM_RBLN_USE_VLLM_MODEL=1` still means `vllm` and is deprecated.
 
 | Path         | Owns                                                                        |
 | ------------ | --------------------------------------------------------------------------- |
@@ -52,7 +52,7 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 | vllm         | `patches/`, `compilation/`, `v1/worker/rbln_*.py`, `platform/vllm_impl.py` |
 | shared       | everything else |
 
-**`envs.py` defines the flag; only `__init__.py` and `platform/__init__.py` branch on it.** Do not branch on `VLLM_RBLN_USE_VLLM_MODEL` anywhere else. Path-specific code belongs in the module that path owns.
+**`config.py` defines the selector; only `__init__.py` and `platform/__init__.py` branch on it.** Do not branch on the model path anywhere else. Path-specific code belongs in the module that path owns.
 
 - Say which path or paths you changed in the PR description.
 - A change to one path must not alter the other. If it appears to need both, stop and ask before writing code.

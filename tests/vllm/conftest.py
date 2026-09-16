@@ -374,9 +374,8 @@ def pytest_runtest_protocol(item, nextitem):
 
 
 def pytest_configure(config):
-    # Must run before collection: register_ops() gates on
-    # VLLM_RBLN_USE_VLLM_MODEL, and test modules capture upstream symbols at
-    # import time -- so the patches have to be in place before any of them
+    # Must run before collection: test modules capture upstream symbols at
+    # import time, so the patches have to be in place before any of them
     # execute `from vllm.xxx import yyy`.
     global _scrubbed, _config
     _config = config
@@ -402,12 +401,19 @@ def pytest_configure(config):
             os.environ.pop(LAYERS_PINNABLE_ENV, None)
 
     # Platform plugins activate on their own when current_platform is first
-    # touched, but the patches live in the general_plugins group and nothing
-    # loads those implicitly. Without this the suite runs half-applied:
-    # RblnPlatform is current, yet every patched symbol is still upstream's.
+    # touched, but the registrations live in the general_plugins group and
+    # nothing loads those implicitly.
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
+
+    # In production the patches land when create_engine_config resolves the
+    # model path. No engine is built here, so apply them directly; without this
+    # the suite runs half-applied, RblnPlatform current yet every patched symbol
+    # still upstream's.
+    from vllm_rbln.platform import vllm_impl
+
+    vllm_impl.patch_upstream()
 
 
 def pytest_sessionfinish(session):

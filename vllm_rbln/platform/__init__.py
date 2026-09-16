@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
+
+    from vllm_rbln.config import ModelImpl
 else:
     VllmConfig = None
 
@@ -38,9 +40,11 @@ logger = init_logger(__name__)
 # any engine code reads a variable.
 envs.publish_to_vllm_envs()
 
-USE_DEVICE_TENSOR: bool = (
-    envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-)
+# Assigned by `_apply_model_impl`, which this module calls once at the bottom
+# and `register_ops` calls again once the arguments name the model path. Eight
+# modules copy this name into their own namespace, and every one of them imports
+# after both.
+USE_DEVICE_TENSOR: bool = False
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 # RBLN default for gpu_memory_utilization (upstream vLLM defaults to 0.92).
@@ -70,7 +74,7 @@ def _impl():
     their own import time, and one branch at a time so that neither path
     imports the other's module.
     """
-    if envs.VLLM_RBLN_USE_VLLM_MODEL:
+    if envs.model_impl_from_env() == "vllm":
         from vllm_rbln.platform import vllm_impl
 
         return vllm_impl
@@ -83,14 +87,14 @@ def _impl():
 class RblnPlatform(Platform):
     _enum = PlatformEnum.OOT
 
-    # Compute device_name/device_type/dist_backend once at class definition
-    # from env vars so that subprocesses spawned under
-    # VLLM_WORKER_MULTIPROC_METHOD=spawn (which re-import this module fresh)
-    # observe identical values to the parent without any extra plumbing.
     plugin_name: str = "rbln"
-    device_name: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    device_type: str = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    dist_backend: str = "rbln-ccl" if USE_DEVICE_TENSOR else ""
+    # Placeholders. `_apply_model_impl` assigns the three from the model path.
+    # Class attributes rather than properties, so that a process re-importing
+    # this module under VLLM_WORKER_MULTIPROC_METHOD=spawn lands on the parent's
+    # values without any extra plumbing.
+    device_name: str = "cpu"
+    device_type: str = "cpu"
+    dist_backend: str = ""
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
     device_control_env_var: str = "RBLN_VISIBLE_DEVICES"
@@ -196,6 +200,41 @@ class RblnPlatform(Platform):
         EngineArgs._rbln_max_num_seqs_patched = True
 
     @classmethod
+    def _capture_model_impl(cls) -> None:
+        """Adopt the model path as soon as the arguments name it.
+
+        `create_engine_config` is where `additional_config` first exists parsed,
+        and `pre_register_and_update()` is its first statement but takes no
+        arguments, so it is wrapped instead. `register_ops` installs the wrapper,
+        being the one hook both `vllm serve` and `LLM(...)` reach before the
+        config is built. Not a registry patch: the registry applies from inside
+        `create_engine_config`, too late to wrap it, and `patches/` is the
+        native path's alone while this has to run on both.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        from vllm_rbln.config import RBLNConfigBase, resolve_model_impl
+
+        if getattr(EngineArgs, "_rbln_model_impl_patched", False):
+            return
+
+        orig_create_engine_config = EngineArgs.create_engine_config
+
+        def create_engine_config(self, *args, **kwargs):
+            model_impl = resolve_model_impl(self.additional_config)
+            if not isinstance(self.additional_config, RBLNConfigBase):
+                # Write it back so the config states its own path. That config
+                # is what reaches every worker in the pickle.
+                self.additional_config = (self.additional_config or {}) | {
+                    "model_impl": model_impl
+                }
+            _apply_model_impl(model_impl)
+            return orig_create_engine_config(self, *args, **kwargs)
+
+        EngineArgs.create_engine_config = create_engine_config
+        EngineArgs._rbln_model_impl_patched = True
+
+    @classmethod
     def _adopt_deprecated_device_control_env_var(cls) -> None:
         """Fold ``RBLN_DEVICES`` into ``device_control_env_var`` and unset it.
 
@@ -290,6 +329,8 @@ class RblnPlatform(Platform):
         stop a run that the flag off would have served. Reasons per shape:
         docs/dynamic_kv_cache.md, "Unsupported Configurations".
         """
+        from vllm_rbln.config import resolve_model_impl
+
         dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
 
         def reject(message: str) -> None:
@@ -298,7 +339,7 @@ class RblnPlatform(Platform):
                 return
             raise ValueError(message)
 
-        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
+        if resolve_model_impl(vllm_config.additional_config) != "vllm":
             reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
                 "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
@@ -393,3 +434,22 @@ class RblnPlatform(Platform):
             additional_kwargs["kv_cache_bases"] = kwargs["kv_cache_bases"]
 
         return additional_kwargs
+
+
+def _apply_model_impl(model_impl: "ModelImpl") -> None:
+    """Adopt `model_impl`, and publish it for the processes this one spawns.
+
+    Called at import, where only the environment names the path, and again once
+    the arguments do -- ahead of the `DeviceConfig` that reads `device_type`.
+    Everything the path decides is mapped here and nowhere else.
+    """
+    global USE_DEVICE_TENSOR
+
+    os.environ[envs.RESOLVED_MODEL_IMPL_ENV] = model_impl
+    USE_DEVICE_TENSOR = model_impl == "vllm" and envs.VLLM_RBLN_USE_DEVICE_TENSOR
+    RblnPlatform.device_name = "rbln" if USE_DEVICE_TENSOR else "cpu"
+    RblnPlatform.device_type = "rbln" if USE_DEVICE_TENSOR else "cpu"
+    RblnPlatform.dist_backend = "rbln-ccl" if USE_DEVICE_TENSOR else ""
+
+
+_apply_model_impl(envs.model_impl_from_env())  # type: ignore[arg-type]
