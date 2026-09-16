@@ -24,9 +24,9 @@ Nothing in the language catches that, and neither does reading the diff: the
 patch line does not change. So it is asserted here instead, over the source of
 every test in this directory.
 
-`utils.py` carries the substitutions to use instead, `patch_in_package` and
-`setattr_in_package`, which apply a name to every module of the package that
-binds it and refuse a name none of them binds.
+`utils.py` carries the substitutions to use instead, which the failure names,
+and `test_lifetime_mixins.py` guards the other half of what the split created:
+no two of the worker's lifetime mixins may bind the same name.
 """
 
 from __future__ import annotations
