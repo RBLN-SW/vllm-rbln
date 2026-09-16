@@ -194,9 +194,9 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         for region_id, group_id in enumerate(region_group_ids):
             group_arr = group_arrays[group_id]
             # Regions run area-minor within a layer, and a shard that leaves
-            # part of a block out keeps every area (asserted where it
-            # registers), so this position names the span whose token range the
-            # request's last block does not reach.
+            # part of a block out keeps every area: the peer that would not is
+            # refused in `_check_split_axis_constraints`. So this position names
+            # the span whose token range the request's last block does not reach.
             if keep_spans is not None and region_id % self._kv_areas >= keep_spans:
                 group_arr = group_arr[:-1]
             if group_arr.size == 0:
