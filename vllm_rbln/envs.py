@@ -409,7 +409,6 @@ RBLN_COMPILE_ENV = frozenset(
         # mode at the compile hint. Move to NON_COMPILE once that extent stops
         # shaping the graph; the two then share a bundle.
         "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
-        "VLLM_RBLN_USE_MULTI_BLOCK_ATTN",
     }
 )
 
