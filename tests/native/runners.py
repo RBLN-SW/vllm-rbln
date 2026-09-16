@@ -47,18 +47,22 @@ _RBLN_RUNNER_DEFAULTS = dict(
 
 
 @functools.cache
-def kv_blocks_per_request(model: str, max_model_len: int, block_size: int) -> int:
+def kv_blocks_per_request(
+    model: str, max_model_len: int, block_size: int, max_num_batched_tokens: int
+) -> int:
     """Blocks one request needs across every KV cache group.
 
     vLLM sizes the shared pool in units of ``group_size * page_size``, so the
     requirement is the sum over groups: a full-attention group holds the whole
-    context, an RBLN sliding-window group exactly one page. Plain
+    context, a sliding-window group only what its layout keeps. Plain
     ``cdiv(max_model_len, block_size) + 1`` is the special case of at most one
     sliding group -- true for a 1:1 pattern (gpt-oss), false for gemma3's 5:1.
 
     Does not model PP stages, Mamba/linear attention, KV sharing, or mixed
     window sizes; pin num_gpu_blocks_override on the spec for those.
     """
+    from vllm.platforms import current_platform
+
     from vllm_rbln import envs
 
     full_blocks = math.ceil(max_model_len / block_size)
@@ -77,6 +81,17 @@ def kv_blocks_per_request(model: str, max_model_len: int, block_size: int) -> in
     )
     counts = Counter(layer_types[:num_layers])
 
+    # CR13 takes upstream's SlidingWindowSpec, which appends across a block
+    # table rather than sliding one block in place; mirror its
+    # max_admission_blocks_per_request, whose in-flight term is
+    # max_concurrent_batches (2 under async scheduling at pp=1) times the budget.
+    window = getattr(config, "sliding_window", None)
+    if window and current_platform.is_cr13():
+        held = min(window - 1 + 2 * max_num_batched_tokens, max_model_len)
+        sliding_blocks = math.ceil(held / block_size) + 1
+    else:
+        sliding_blocks = 1
+
     if len(counts) == 1:
         group_size = num_layers
     else:
@@ -85,17 +100,29 @@ def kv_blocks_per_request(model: str, max_model_len: int, block_size: int) -> in
         # larger count wastes less.
         group_size = most if most < fewest * 1.5 else fewest
     return sum(
-        math.ceil(count / group_size) * (full_blocks if kind == "full_attention" else 1)
+        math.ceil(count / group_size)
+        * (full_blocks if kind == "full_attention" else sliding_blocks)
         for kind, count in counts.items()
     )
 
 
 def rbln_engine_args(model: str, **kwargs) -> dict:
+    from vllm_rbln import envs
+
     merged = {**_RBLN_RUNNER_DEFAULTS, **kwargs}
-    merged.setdefault(
-        "num_gpu_blocks_override",
-        kv_blocks_per_request(model, merged["max_model_len"], merged["block_size"]) + 1,
-    )
+    # An override puts the dynamic KV sizer in PINNED mode, so only the lane
+    # that has no sizer sizes the pool here.
+    if not envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+        merged.setdefault(
+            "num_gpu_blocks_override",
+            kv_blocks_per_request(
+                model,
+                merged["max_model_len"],
+                merged["block_size"],
+                merged["max_num_batched_tokens"],
+            )
+            + 1,
+        )
     return merged
 
 
