@@ -930,22 +930,29 @@ class TestDummyRunFlushesTheDeferredLoad:
 class TestProcessKvCacheCopyOps:
     # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
     # and compile_model. Forced deterministically.
-    def test_eager_copy_non_mla(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "block_axis, shape",
+        [(0, (4, 2, 1, 1, 8, 2)), (1, (2, 4, 1, 1, 8, 2))],
+        ids=["blocks_first", "kv_first"],
+    )
+    def test_eager_copy_non_mla(self, monkeypatch, block_axis, shape):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)  # -> eager path
-        # non-MLA layout: (num_blocks, 2, heads, 1, block_tokens, dim).
-        kv = torch.zeros(4, 2, 1, 1, 8, 2)
-        kv[1] = 5.0  # source = block 1
+        # The rbln_custom_ops and rbln_triton_ops layouts, in that order.
+        kv = torch.zeros(shape)
+        kv.select(block_axis, 1).fill_(5.0)  # source = block 1
         r = _make_runner_stub(
             kv_caches=[kv],
+            kv_cache_block_axes=[block_axis],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         # First 3 token slots of dst block 2 now match src; the rest stay 0.
-        # Both K and V move: a copy that kept the old axis would miss V.
-        assert torch.equal(kv[2, ..., :3, :].cpu(), kv[1, ..., :3, :].cpu())
-        assert (kv[2, ..., :3, :] == 5.0).all()
-        assert (kv[2, ..., 3:, :] == 0.0).all()
+        # Both K and V move: taking the other axis would copy a K/V half.
+        dst, src = kv.select(block_axis, 2), kv.select(block_axis, 1)
+        assert torch.equal(dst[..., :3, :].cpu(), src[..., :3, :].cpu())
+        assert (dst[..., :3, :] == 5.0).all()
+        assert (dst[..., 3:, :] == 0.0).all()
 
     def test_eager_copy_mla(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
@@ -953,6 +960,7 @@ class TestProcessKvCacheCopyOps:
         kv[1] = 7.0
         r = _make_runner_stub(
             kv_caches=[kv],
+            kv_cache_block_axes=[0],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -970,6 +978,7 @@ class TestProcessKvCacheCopyOps:
         scale[1] = 9.0
         r = _make_runner_stub(
             kv_caches=[latent, scale],
+            kv_cache_block_axes=[0, 0],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -987,6 +996,7 @@ class TestProcessKvCacheCopyOps:
         )
         r = _make_runner_stub(
             kv_caches=[],
+            kv_cache_block_axes=[],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
             rbln_config=RBLNConfig(),

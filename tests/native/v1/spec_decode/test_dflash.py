@@ -156,29 +156,28 @@ class TestContextWriteContiguity:
     NUM_KV_HEADS = 8
     HEAD_DIM = 128
 
-    def _cache(self):
-        return torch.zeros(
-            4,
-            2,
-            self.NUM_KV_HEADS,
-            1,
-            BLOCK_SIZE,
-            self.HEAD_DIM,
-            dtype=torch.bfloat16,
-        )
+    # block_axis 0 is the rbln_custom_ops layout, 1 the rbln_triton_ops one.
+    # Neither side of the copy changes rank, so both reach the same conclusion.
+    def _cache(self, block_axis):
+        shape = [2, self.NUM_KV_HEADS, 1, BLOCK_SIZE, self.HEAD_DIM]
+        shape.insert(block_axis, 4)
+        return torch.zeros(shape, dtype=torch.bfloat16)
 
-    def test_all_heads_at_once_is_strided_on_both_sides(self):
-        cache = self._cache()
+    @pytest.mark.parametrize("block_axis", [0, 1], ids=["blocks_first", "kv_first"])
+    def test_all_heads_at_once_is_strided_on_both_sides(self, block_axis):
+        cache = self._cache(block_axis)
         source = torch.zeros(6, self.NUM_KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
-        assert not cache[1, 0, :, 0, 3:9, :].is_contiguous()
+        assert not cache.select(block_axis, 1)[0, :, 0, 3:9, :].is_contiguous()
         assert not source[0:6].transpose(0, 1).is_contiguous()
 
-    def test_per_head_is_contiguous_on_both_sides(self):
-        cache = self._cache()
+    @pytest.mark.parametrize("block_axis", [0, 1], ids=["blocks_first", "kv_first"])
+    def test_per_head_is_contiguous_on_both_sides(self, block_axis):
+        cache = self._cache(block_axis)
         # Head-major, which is the layout the compiled projection now emits.
         source = torch.zeros(self.NUM_KV_HEADS, 6, self.HEAD_DIM, dtype=torch.bfloat16)
+        one_block = cache.select(block_axis, 1)
         for head in range(self.NUM_KV_HEADS):
-            assert cache[1, 0, head, 0, 3:9, :].is_contiguous()
+            assert one_block[0, head, 0, 3:9, :].is_contiguous()
             assert source[head, 0:6, :].is_contiguous()
 
     def test_a_write_run_never_leaves_its_block(self):

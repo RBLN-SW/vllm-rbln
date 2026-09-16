@@ -155,16 +155,16 @@ def flash_causal_attention_naive_prefill(
                 # 1. cache update (aligned store -> unaligned store)
                 k_cache_base_ptr = tl.make_block_ptr(
                     base=kv_cache_base,
-                    shape=(NUM_BLOCK, 2, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
+                    shape=(2, NUM_BLOCK, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
                     strides=(
-                        2 * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                        NUM_BLOCK * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                         NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                         1 * PARTITION_SIZE * HEAD_DIM,
                         PARTITION_SIZE * HEAD_DIM,
                         HEAD_DIM,
                         1,
                     ),
-                    offsets=(block_number, 0, 0, 0, 0, 0),
+                    offsets=(0, block_number, 0, 0, 0, 0),
                     block_shape=(1, 1, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
                     order=(5, 4, 3, 2, 1, 0),
                 )
@@ -212,16 +212,16 @@ def flash_causal_attention_naive_prefill(
 
                 v_cache_base_ptr = tl.make_block_ptr(
                     base=kv_cache_base,
-                    shape=(NUM_BLOCK, 2, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
+                    shape=(2, NUM_BLOCK, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
                     strides=(
-                        2 * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                        NUM_BLOCK * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                         NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                         1 * PARTITION_SIZE * HEAD_DIM,
                         PARTITION_SIZE * HEAD_DIM,
                         HEAD_DIM,
                         1,
                     ),
-                    offsets=(block_number, 1, 0, 0, 0, 0),
+                    offsets=(1, block_number, 0, 0, 0, 0),
                     block_shape=(1, 1, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
                     order=(5, 4, 3, 2, 1, 0),
                 )
@@ -396,16 +396,16 @@ def flash_causal_attention_naive_decode(
                 # 1. cache update (aligned store -> unaligned store)
                 k_cache_base_ptr = tl.make_block_ptr(
                     base=kv_cache_base,
-                    shape=(NUM_BLOCK, 2, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
+                    shape=(2, NUM_BLOCK, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
                     strides=(
-                        2 * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                        NUM_BLOCK * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                         NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                         1 * PARTITION_SIZE * HEAD_DIM,
                         PARTITION_SIZE * HEAD_DIM,
                         HEAD_DIM,
                         1,
                     ),
-                    offsets=(block_number, 0, 0, 0, 0, 0),
+                    offsets=(0, block_number, 0, 0, 0, 0),
                     block_shape=(1, 1, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
                     order=(5, 4, 3, 2, 1, 0),
                 )
@@ -453,16 +453,16 @@ def flash_causal_attention_naive_decode(
 
                 v_cache_base_ptr = tl.make_block_ptr(
                     base=kv_cache_base,
-                    shape=(NUM_BLOCK, 2, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
+                    shape=(2, NUM_BLOCK, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
                     strides=(
-                        2 * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                        NUM_BLOCK * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                         NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                         1 * PARTITION_SIZE * HEAD_DIM,
                         PARTITION_SIZE * HEAD_DIM,
                         HEAD_DIM,
                         1,
                     ),
-                    offsets=(block_number, 1, 0, 0, 0, 0),
+                    offsets=(1, block_number, 0, 0, 0, 0),
                     block_shape=(1, 1, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
                     order=(5, 4, 3, 2, 1, 0),
                 )
@@ -544,7 +544,7 @@ def flash_causal_attention_naive_prefill_wrapper(
     QUERY_LEN = query.shape[-2]
     PARTITION_SIZE = kv_cache.shape[-2]
     MAX_SEQ_LEN = PARTITION_SIZE * seq_idx.shape[1]
-    NUM_BLOCK = kv_cache.shape[0]
+    NUM_BLOCK = kv_cache.shape[1]
     NUM_BATCH = query.shape[0]
     DIM_BLOCK_TABLE = block_table.dim()
 
@@ -619,7 +619,7 @@ def flash_causal_attention_naive_decode_wrapper(
     QUERY_LEN = query.shape[-2]
     PARTITION_SIZE = kv_cache.shape[-2]
     MAX_SEQ_LEN = PARTITION_SIZE * seq_idx.shape[1]
-    NUM_BLOCK = kv_cache.shape[0]
+    NUM_BLOCK = kv_cache.shape[1]
     NUM_BATCH = query.shape[0]
     DIM_BLOCK_TABLE = block_table.dim()
 

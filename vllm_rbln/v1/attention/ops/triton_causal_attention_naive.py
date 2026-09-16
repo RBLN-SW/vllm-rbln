@@ -98,31 +98,31 @@ def causal_attention_naive_prefill(
         )
         k_cache_base_ptr = tl.make_block_ptr(
             base=kv_cache_base,
-            shape=(NUM_BATCH, 2, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
+            shape=(2, NUM_BATCH, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             strides=(
-                2 * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 1 * PARTITION_SIZE * HEAD_DIM,
                 PARTITION_SIZE * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ),
-            offsets=(block_number, 0, 0, 0, 0, 0),
+            offsets=(0, block_number, 0, 0, 0, 0),
             block_shape=(1, 1, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             order=(5, 4, 3, 2, 1, 0),
         )
         v_cache_base_ptr = tl.make_block_ptr(
             base=kv_cache_base,
-            shape=(NUM_BATCH, 2, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
+            shape=(2, NUM_BATCH, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             strides=(
-                2 * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 1 * PARTITION_SIZE * HEAD_DIM,
                 PARTITION_SIZE * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ),
-            offsets=(block_number, 1, 0, 0, 0, 0),
+            offsets=(1, block_number, 0, 0, 0, 0),
             block_shape=(1, 1, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             order=(5, 4, 3, 2, 1, 0),
         )
@@ -272,31 +272,31 @@ def causal_attention_naive_decode(
         )
         k_cache_base_ptr = tl.make_block_ptr(
             base=kv_cache_base,
-            shape=(NUM_BATCH, 2, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
+            shape=(2, NUM_BATCH, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             strides=(
-                2 * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 1 * PARTITION_SIZE * HEAD_DIM,
                 PARTITION_SIZE * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ),
-            offsets=(block_number, 0, 0, 0, 0, 0),
+            offsets=(0, block_number, 0, 0, 0, 0),
             block_shape=(1, 1, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             order=(5, 4, 3, 2, 1, 0),
         )
         v_cache_base_ptr = tl.make_block_ptr(
             base=kv_cache_base,
-            shape=(NUM_BATCH, 2, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
+            shape=(2, NUM_BATCH, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             strides=(
-                2 * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
+                NUM_BATCH * NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 NUM_HEAD * 1 * PARTITION_SIZE * HEAD_DIM,
                 1 * PARTITION_SIZE * HEAD_DIM,
                 PARTITION_SIZE * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ),
-            offsets=(block_number, 1, 0, 0, 0, 0),
+            offsets=(1, block_number, 0, 0, 0, 0),
             block_shape=(1, 1, NUM_HEAD, 1, PARTITION_SIZE, HEAD_DIM),
             order=(5, 4, 3, 2, 1, 0),
         )

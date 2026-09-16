@@ -45,6 +45,7 @@ from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
+    attention_block_axis,
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -671,6 +672,8 @@ class RBLNDFlashProposer(DFlashProposer):
         # same views in one call per layer instead of one index at a time.
         destinations: list[torch.Tensor] = []
         sources: list[torch.Tensor] = []
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        block_axis = attention_block_axis(rbln_config.use_custom_kernel)
         for layer_index, layer in enumerate(model.layers):
             cache = layer.self_attn.attn.kv_cache
             k_layer = keys[layer_index]
@@ -678,8 +681,9 @@ class RBLNDFlashProposer(DFlashProposer):
             for token_start, count, block, offset in runs:
                 token_slice = slice(token_start, token_start + count)
                 cache_slice = slice(offset, offset + count)
-                dst_k = cache[block, 0, :, 0, cache_slice, :].unbind(0)
-                dst_v = cache[block, 1, :, 0, cache_slice, :].unbind(0)
+                one_block = cache.select(block_axis, block)
+                dst_k = one_block[0, :, 0, cache_slice, :].unbind(0)
+                dst_v = one_block[1, :, 0, cache_slice, :].unbind(0)
                 src_k = k_layer[:, token_slice, :].unbind(0)
                 src_v = v_layer[:, token_slice, :].unbind(0)
                 # Interleave key/value per head to keep the original order.

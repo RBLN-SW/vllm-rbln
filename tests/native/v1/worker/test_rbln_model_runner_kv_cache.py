@@ -84,7 +84,7 @@ class TestReshapeKVCacheTensors:
         raw = runner._allocate_kv_cache_tensors(config)
         kernel_block_sizes = runner._kernel_block_sizes
 
-        caches, _, infos = runner._reshape_kv_cache_tensors(
+        caches, _, infos, _ = runner._reshape_kv_cache_tensors(
             config, raw, kernel_block_sizes
         )
         semantic_shape = tuple(caches["layer.0"].shape)
@@ -99,7 +99,7 @@ class TestReshapeKVCacheTensors:
             "get_kv_cache_stride_order",
             staticmethod(lambda *args, **kwargs: order),
         )
-        caches, bases, infos = runner._reshape_kv_cache_tensors(
+        caches, bases, infos, _ = runner._reshape_kv_cache_tensors(
             config, raw, kernel_block_sizes
         )
 
