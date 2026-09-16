@@ -337,10 +337,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     def release_early_offers(self) -> None:
         """Hand the previous step's held offers to the writer.
 
-        Called at the start of a step, before the handover is adopted, so a
-        request whose handover lands on this same step is written by the offer
-        rather than dropped with it. Runs on every step -- one that closes no
-        chunk and one with no forward included -- so nothing is left held.
+        Called from the connector's flush site, once a submission is in flight
+        and before the handover is adopted, so a request whose handover lands on
+        this same step is written by the offer as well. Reached on every step --
+        one that closes no chunk and one with no forward included -- so nothing
+        is left held.
 
         What guarantees a next step at all: while the request runs, it is
         unfinished; once it ends, the scheduler keeps stepping on the

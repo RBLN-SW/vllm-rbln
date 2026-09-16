@@ -313,6 +313,7 @@ class TestEarlyWriteWiring:
             worker.start_early_push = MagicMock()
             worker.flush_early_sends = MagicMock()
             worker.release_early_offers = MagicMock()
+            worker.start_load_kv = MagicMock()
             # __init__ was skipped, so the state __del__ reaches is absent.
             worker.shutdown = lambda: None
             return connector
@@ -347,23 +348,81 @@ class TestEarlyWriteWiring:
 
         connector.connector_worker.flush_early_sends.assert_called_once_with({"r0"})
 
-    def test_the_release_precedes_this_step_s_work(
-        self, monkeypatch, push_worker_connector
-    ):
-        # The handover is adopted inside super().start_load_kv; releasing after
-        # it would drop the offer of a request whose handover lands on this
-        # same step instead of writing it.
-        order = []
-        monkeypatch.setattr(
-            cm.NixlPushConnector,
-            "start_load_kv",
-            lambda self, ctx, **kw: order.append("adopt"),
-        )
+    def test_the_step_s_work_is_held(self, push_worker_connector):
+        # Both halves wait for the flush: the release wants a submission ahead of
+        # it, and the handover must stay behind the release.
         connector = push_worker_connector()
-        connector.connector_worker.release_early_offers.side_effect = (
-            lambda: order.append("release")
-        )
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
 
         connector.start_load_kv(object())
 
+        connector.connector_worker.release_early_offers.assert_not_called()
+        connector.connector_worker.start_load_kv.assert_not_called()
+
+    def test_upstream_is_never_reached_at_this_point(
+        self, monkeypatch, push_worker_connector
+    ):
+        # Upstream drives the worker here; this override replaces that rather
+        # than adding to it. `monkeypatch(raising=True)` would not notice
+        # upstream dropping the method -- it checks `hasattr`, which the
+        # inherited definition on `KVConnectorBase_V1` satisfies -- so the
+        # class's own namespace is what says the override is still there.
+        assert "start_load_kv" in vars(cm.NixlPushConnector)
+        delegated = []
+        monkeypatch.setattr(
+            cm.NixlPushConnector,
+            "start_load_kv",
+            lambda self, ctx, **kw: delegated.append(ctx),
+        )
+        connector = push_worker_connector()
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
+
+        connector.start_load_kv(object())
+
+        assert delegated == []
+
+    def test_the_release_precedes_this_step_s_work(self, push_worker_connector):
+        # The handover is adopted by the worker's start_load_kv; releasing after
+        # it would drop the offer of a request whose handover lands on this
+        # same step instead of writing it.
+        order = []
+        connector = push_worker_connector()
+        meta = cm.RblnNixlConnectorMetadata()
+        connector._connector_metadata = meta
+        connector.connector_worker.release_early_offers.side_effect = (
+            lambda: order.append("release")
+        )
+        connector.connector_worker.start_load_kv.side_effect = (
+            lambda held: order.append("adopt")
+        )
+        connector.start_load_kv(object())
+
+        connector.flush_deferred_load()
+
         assert order == ["release", "adopt"]
+        connector.connector_worker.start_load_kv.assert_called_once_with(meta)
+
+    def test_flush_again_releases_nothing(self, push_worker_connector):
+        # The entry site and the dummy step both flush; a second release would
+        # hand the writer offers it has already taken.
+        connector = push_worker_connector()
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
+        connector.start_load_kv(object())
+        connector.flush_deferred_load()
+
+        connector.flush_deferred_load()
+
+        connector.connector_worker.release_early_offers.assert_called_once()
+        connector.connector_worker.start_load_kv.assert_called_once()
+
+    def test_the_helper_reaches_this_connector(self, push_worker_connector):
+        # The runner flushes through the helper, which skips anything without the
+        # protocol -- so going through it is what proves this connector is reached.
+        connector = push_worker_connector()
+        connector._connector_metadata = cm.RblnNixlConnectorMetadata()
+        connector.start_load_kv(object())
+        assert not connector.connector_worker.release_early_offers.called
+
+        flush_deferred_loads(connector)
+
+        connector.connector_worker.release_early_offers.assert_called_once()
