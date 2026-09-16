@@ -18,7 +18,7 @@ On this path the config *is* `VllmConfig.additional_config`, which
 `check_and_update_config` replaces with the resolved object. Being a
 `VllmConfig` field is what carries it to every worker in the config pickle,
 and what makes `VllmConfig.compute_hash()` call our `compute_hash`.
-`platform/__init__.py` gates all of it on `VLLM_RBLN_USE_VLLM_MODEL=1`.
+`platform/__init__.py` gates all of it on `model_impl`.
 
 Resolution order, highest first:
 

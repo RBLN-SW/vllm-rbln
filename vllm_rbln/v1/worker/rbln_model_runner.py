@@ -3652,7 +3652,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and self.rbln_config.compile_model
         ):
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
-            # in this path (VLLM_RBLN_USE_VLLM_MODEL).
+            # in this path (--rbln-model-impl vllm).
             for op in copy_ops:
                 runtime = self.runtime_holder[0]
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)

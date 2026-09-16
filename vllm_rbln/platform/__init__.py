@@ -392,8 +392,8 @@ class RblnPlatform(Platform):
         # kv_buffer_device "cpu" is the host-bounce path; "rbln" is the D2D
         # path (upstream NixlConnectorWorker.__init__ rejects kv_buffer_device
         # values not listed here). Listed under both device_types because
-        # device_type is "rbln" only when VLLM_RBLN_USE_DEVICE_TENSOR and
-        # VLLM_RBLN_USE_VLLM_MODEL are both set.
+        # device_type is "rbln" only on the vLLM-native path, and only
+        # with VLLM_RBLN_USE_DEVICE_TENSOR set.
         return {
             "cpu": ("cpu", "rbln"),
             "rbln": ("rbln", "cpu"),
