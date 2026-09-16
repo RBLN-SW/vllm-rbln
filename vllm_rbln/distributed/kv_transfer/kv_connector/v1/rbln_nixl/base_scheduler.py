@@ -86,6 +86,32 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
             return 0, False
         return count - overshoot, load_async
 
+    def _accumulate_blocks_to_save(
+        self,
+        req_id: ReqId,
+        new_block_id_groups: tuple[list[int], ...] | None,
+        resumed: bool,
+    ) -> bool:
+        """Fold a step's new blocks into what the request still has to save.
+
+        Returns whether the stored list was reseeded rather than extended. A
+        resumed request re-sends its whole list instead of a delta, so
+        appending would double-count it -- and anything a caller counted off
+        the old list is stale.
+        """
+        if new_block_id_groups is None:
+            return False
+        if resumed or req_id not in self._block_ids_need_save:
+            self._block_ids_need_save[req_id] = tuple(
+                list(group) for group in new_block_id_groups
+            )
+            return True
+        for stored_group, new_group in zip(
+            self._block_ids_need_save[req_id], new_block_id_groups
+        ):
+            stored_group.extend(new_group)
+        return False
+
     def _build_save_meta(
         self,
         meta: NixlConnectorMetadata,
@@ -96,6 +122,11 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
         NOTE(RBLN): upstream saves each step's new blocks as they arrive. The
         RBLN host copy moves whole blocks and transfers once, so blocks are
         accumulated here and handed over when the prefill completes.
+
+        What it produces reads as "this request's KV for this rank's layers is
+        complete and ready to leave", which is why the write path calls this
+        too: host staging moves it to the host buffer, and the direct path,
+        having nowhere local to move it to, writes it out.
         """
         for req_id, new_block_id_groups, resumed in yield_req_data(scheduler_output):
             req = self._reqs_need_save.get(req_id)
@@ -118,18 +149,7 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
                 f"num_scheduled={num_scheduled_tokens}"
             )
 
-            if has_new_block_ids:
-                if resumed or not has_block_ids_to_save:
-                    # A resumed request re-sends its full block list, not a
-                    # delta, so appending would double-count.
-                    self._block_ids_need_save[req_id] = tuple(
-                        list(group) for group in new_block_id_groups
-                    )
-                else:
-                    for stored_group, new_group in zip(
-                        self._block_ids_need_save[req_id], new_block_id_groups
-                    ):
-                        stored_group.extend(new_group)
+            self._accumulate_blocks_to_save(req_id, new_block_id_groups, resumed)
 
             is_partial = (
                 req.num_computed_tokens + num_scheduled_tokens

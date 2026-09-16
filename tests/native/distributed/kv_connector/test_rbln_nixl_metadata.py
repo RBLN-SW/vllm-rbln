@@ -296,14 +296,24 @@ class TestRblnNixlConnectorMetadata:
         assert promoted.reqs_to_save == {"r1": "save"}
         assert promoted.reqs_in_batch == {"r2"}
         assert promoted.push_finished_blocks == {"r3": ([1],)}
+        assert promoted.push_early_flush == set()
+        assert promoted.push_stream_total == {}
         assert promoted.valid_tokens == {}
         # Upstream asserts on its own type in several places.
         assert isinstance(promoted, NixlConnectorMetadata)
 
-    def test_promotion_carries_the_token_counts(self):
-        # Promotion runs on an instance this side already filled, not only on a
-        # bare upstream one, so the added field has to survive it.
+    def test_the_added_fields_do_not_bleed_into_each_other(self):
+        # They are filled by different paths on different steps -- the flush on
+        # a preemption, the total on every streamed offer, the token count only
+        # on a handover -- so a promotion that aliased them would show up as
+        # one path clearing another.
         meta = RblnNixlConnectorMetadata()
+        meta.push_early_flush = {"r0"}
+        meta.push_stream_total = {"r1": 4}
         meta.valid_tokens = {"r2": 33}
 
-        assert RblnNixlConnectorMetadata.promote(meta).valid_tokens == {"r2": 33}
+        promoted = RblnNixlConnectorMetadata.promote(meta)
+
+        assert promoted.push_early_flush == {"r0"}
+        assert promoted.push_stream_total == {"r1": 4}
+        assert promoted.valid_tokens == {"r2": 33}

@@ -28,6 +28,11 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
+#: What a transfer parks for `_compute_desc_ids`, whose signature is
+#: upstream's: the request's final token count and block count, and the chunk
+#: ranges a streamed batch named on the side that call is for.
+RequestTail = tuple[int | None, int, tuple[tuple[int, tuple[int, int]], ...]]
+
 
 # What the byte target is when nobody names one: large enough that the fixed
 # cost of a descriptor is small beside what it carries.
@@ -114,6 +119,17 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: moving bytes the other way must not pass the handshake (`rbln_compat_hash`).
     _writes_into_peer: ClassVar[bool] = False
 
+    def _writes_less_than_a_request(self) -> bool:
+        """Whether this side ever moves part of a request at a time.
+
+        A peer that narrows nothing is described by upstream's whole-engine
+        handle, and that handle's notification has no room to say which blocks
+        a transfer filled. Anything sending a request in pieces needs its own
+        descriptors for that reason alone, so it has to be asked for even when
+        the two sides are shaped identically.
+        """
+        return False
+
     # While registering one peer, the local region ids that peer's regions
     # correspond to, in ITS order -- see `_regions_viewed_as`.
     _viewed_region_ids: list[int] | None = None
@@ -140,7 +156,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _shard_descs_per_block: dict[tuple[str, int], int]
     _shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None]
     _chunk_grid: tuple[int, int] | None
-    _request_tail: tuple[int | None, int] | None
+    _request_tail: "RequestTail | None"
 
     @property
     def _spans_per_block(self) -> int:
@@ -289,7 +305,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
 
         None where a chunk comes out the whole span, so neither list grows and
         a transfer keeps naming whole spans -- which is what a block too small
-        for the byte target, or a prefill chunk as wide as a span, asks for.
+        for the byte target, or a prefill chunk as wide as a span, asks for. A
+        side that writes a request in pieces asks for one as the knob does.
 
         The axis says where a chunk sits. A context cut gives an area the
         in-block token range [a * span, (a + 1) * span), so a chunk of it is
@@ -300,7 +317,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         rather than one region's band standing for the rest. A piece narrower
         than a head gets none for the same reason.
         """
-        if not self._chunk_mode:
+        if not (self._chunk_mode or self._writes_less_than_a_request()):
             return None
         if self._kv_split_axis is KVSplitAxis.NON_HEAD:
             spans, heads_per_span = self._kv_areas, 1

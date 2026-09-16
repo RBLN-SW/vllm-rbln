@@ -47,6 +47,9 @@ from tests.native.distributed.kv_connector.utils import (
     mock_vllm_config,
     patched_in_package,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
+    RblnNixlWorkerBase,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
     RblnNixlAgentMetadata,
@@ -637,6 +640,23 @@ class TestPpHandshakeFanout:
         _handshake(w, _FakeSock(pp_size=1))
         assert w._overlapping_ranks["eng"] == []
         assert w._register_shard_xfer_state.call_count == 0
+
+    def test_a_side_that_moves_part_of_a_request_asks_even_a_matching_peer(
+        self, monkeypatch
+    ):
+        # The same peer as above. Nothing is narrowed, so the only reason to
+        # build per-shard state is that a transfer covering part of a request
+        # needs a notification saying which part -- which upstream's
+        # whole-engine handle has no room for.
+        monkeypatch.setattr(
+            RblnNixlWorkerBase, "_writes_less_than_a_request", lambda self: True
+        )
+        w = _make_worker()
+
+        _handshake(w, _FakeSock(pp_size=1))
+
+        assert w._overlapping_ranks["eng"] == [0]
+        assert w._register_shard_xfer_state.call_count == 1
 
     def test_a_side_that_trims_a_last_block_asks_even_a_matching_peer(self):
         # Same peer again, and the same reason in a different shape: the trim
@@ -1488,6 +1508,25 @@ class TestShardLocalRegions:
             is needs_own
         )
 
+    @pytest.mark.parametrize("sw_ratio, needs_own", [(8, False), (None, True)])
+    def test_a_streamed_engine_asks_for_its_own_descriptors_unless_windowed(
+        self, sw_ratio, needs_own
+    ):
+        # Streaming asks for per-shard ids so a batch can be named on the
+        # wire, and gives way to a window for the same reason chunk mode
+        # does: a hybrid's two groups fit on no other list.
+        w = self._wired_worker()
+        w._chunk_mode = False
+        w._sw_ratio = sw_ratio
+        w._writes_less_than_a_request = lambda: True
+
+        assert (
+            w._needs_own_descriptors(
+                pp_size=1, partial=False, fan_in=False, split=1, fanout=1
+            )
+            is needs_own
+        )
+
     def test_register_shard_xfer_state_hands_the_derived_grid_on(self):
         # Derived once here and used for the local list; left out, the local
         # list holds whole blocks while every peer's carries the range.
@@ -1681,14 +1720,18 @@ class TestChunkSizing:
             self._sized(monkeypatch, span_tokens=2048, bytes_per_token=256, TOKENS=256)
 
     @staticmethod
-    def _grid_worker(*, block_len, areas=4, prefill=512):
-        w = object.__new__(RblnNixlPullConnectorWorker)
+    def _grid_worker(*, block_len, areas=4, prefill=512, cls=None):
+        w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._chunk_mode = True
         w._kv_areas = areas
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         w.block_len_per_layer = [block_len] * 8
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
+        # __init__ never ran, so the state a push worker's shutdown()
+        # reaches through __del__ is absent; silence it rather than leak
+        # an unraisable at GC.
+        w.shutdown = lambda: None
         return w
 
     def test_a_context_cut_spreads_a_chunk_over_one_run(self, monkeypatch):
@@ -1721,6 +1764,15 @@ class TestChunkSizing:
         w._chunk_mode = False
 
         assert w._shard_chunk_grid(block_size=8192, split=1) is None
+
+    def test_a_side_that_writes_in_pieces_gets_a_grid_without_the_knob(self):
+        # Streaming names a range of a block whether or not the knob is on, so
+        # it asks for the same grid the knob would have built.
+        w = self._grid_worker(block_len=2048 * 256, cls=RblnNixlPushConnectorWorker)
+        w._chunk_mode = False
+        w._early_push_enabled = True
+
+        assert w._shard_chunk_grid(block_size=8192, split=1) == (1, 2)
 
 
 class TestBaseFanInHandle:
@@ -2609,6 +2661,9 @@ class TestDescriptorOrderContract:
             # __init__ never ran, so the writer state shutdown() reaches through
             # __del__ is absent; silence it rather than leak an unraisable at GC.
             w.shutdown = lambda: None
+            # The write path reads this to decide whether a peer needs a chunk
+            # range; off, as the streaming tests are the ones that turn it on.
+            w._early_push_enabled = False
         w.transfer_topo.is_kv_layout_blocks_first = False
         w.nixl_wrapper = MagicMock()
         w._shard_descs_per_block = {}

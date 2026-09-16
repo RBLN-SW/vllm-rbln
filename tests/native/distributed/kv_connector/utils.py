@@ -644,6 +644,7 @@ def build_worker(
     use_mla=False,
     chunk_mode=False,
     chunk_bytes=0,
+    push_stream=False,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -689,7 +690,10 @@ def build_worker(
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
     vllm_config = mock_vllm_config(
-        chunk_mode=chunk_mode, swa_view_opt=swa_view_opt, chunk_bytes=chunk_bytes
+        chunk_mode=chunk_mode,
+        swa_view_opt=swa_view_opt,
+        chunk_bytes=chunk_bytes,
+        push_stream=push_stream,
     )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # No speculative decoding: the compat hash then folds what it always did.

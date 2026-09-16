@@ -47,7 +47,16 @@ if TYPE_CHECKING:
 #   2: + kv_areas / kv_slices (chiplet geometry)
 #   3: + the transfer direction in the hash
 #   4: + kv_split_axis (which axis the geometry above came from)
-RBLN_NIXL_CONNECTOR_VERSION: int = 4
+#   5: + which consumer blocks a completion notification covered
+#   6: + the unit that range is counted in
+RBLN_NIXL_CONNECTOR_VERSION: int = 6
+
+# Prefix a push completion notification carries when it names the half-open
+# range this write filled: ``RBLNS:<writer>:<lo>:<hi>:<per_block>:`` ahead of
+# the message upstream builds, counting units of one consumer block divided
+# by ``per_block`` (1 where a write never splits one). Left off where no
+# single range describes the write, so a consumer must accept a bare message.
+RBLN_COVERAGE_NOTIF_PREFIX: bytes = b"RBLNS:"
 
 
 class KVSplitAxis(Enum):
@@ -85,10 +94,10 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
 
 
 class RblnNixlConnectorMetadata(NixlConnectorMetadata):
-    """``NixlConnectorMetadata`` + what the trim needs to size a last block.
+    """``NixlConnectorMetadata`` + the requests whose early write must be drained.
 
-    Promoted from the instance upstream builds rather than constructed in its
-    place: ``NixlBaseConnectorScheduler.build_connector_meta`` names the
+    Promoted from the instance upstream builds rather than constructed
+    in its place: ``NixlBaseConnectorScheduler.build_connector_meta`` names the
     upstream type directly and offers no hook for a subclass. This struct stays
     inside one engine -- it never reaches a peer -- so it is not part of the
     handshake schema and does not move ``RBLN_NIXL_CONNECTOR_VERSION``.
@@ -96,6 +105,21 @@ class RblnNixlConnectorMetadata(NixlConnectorMetadata):
 
     def __init__(self) -> None:
         super().__init__()
+        # Requests whose source blocks go back to the allocator without a lease
+        # -- preempted, or finished on a non-terminal status. A write already
+        # issued for them reads memory the next forward may overwrite.
+        self.push_early_flush: set[ReqId] = set()
+        # Blocks a streamed request will hold once its whole prompt is
+        # computed. The consumer registered the tail of that, so where its
+        # window begins can only be found from the total -- and the prefix
+        # offered mid-stream is shorter than it.
+        self.push_stream_total: dict[ReqId, int] = {}
+        # Tokens of KV the offered prefix holds. Distinct from `valid_tokens`,
+        # which is the request's final count and only exists once it is over:
+        # an offer is a prefix of a request still being computed, and how much
+        # of its last block is filled is what a write smaller than a block
+        # needs to know.
+        self.push_stream_tokens: dict[ReqId, int] = {}
         # Tokens of KV the offered block list holds, so a last block that is not
         # full can leave the areas above its final token behind. Absent where
         # the count is unknown, which keeps the whole block.

@@ -33,6 +33,10 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.registration import (
     RblnNixlRegistrationMixin,
+    sliding_window_view_ratio,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    RequestTail,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
     RblnNixlTransferMixin,
@@ -152,7 +156,7 @@ class RblnNixlWorkerBase(
         self._chunk_grid: tuple[int, int] | None = None
         # How far the request being transferred fills its last block, parked
         # for the length of one upstream call (`_tail_viewed_as`).
-        self._request_tail: tuple[int | None, int] | None = None
+        self._request_tail: RequestTail | None = None
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.
         self.local_seen_layer_names: list[str] = []
@@ -180,28 +184,18 @@ class RblnNixlWorkerBase(
             isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
         self._sw_ratio: int | None = None
-        # Chunk mode turns the view opt on rather than asking for it. Its
-        # descriptor ranges are ours to extend only where `_sw_ratio` is set --
-        # `_compute_desc_ids` hands the whole list to upstream otherwise, and
-        # upstream's has no room for a second range, let alone a third.
+        # Chunk mode and streaming turn the view opt on rather than asking
+        # for it. Their descriptor ranges are ours to extend only where
+        # `_sw_ratio` is set -- `_compute_desc_ids` hands the whole list to
+        # upstream otherwise, and upstream's has no room for a second range,
+        # let alone a third.
         swa_view_opt = connector_option(self.vllm_config, "swa_view_opt", False)
         if self._has_swa and (
-            swa_view_opt or connector_option(self.vllm_config, "chunk_mode", False)
+            swa_view_opt
+            or connector_option(self.vllm_config, "chunk_mode", False)
+            or connector_option(self.vllm_config, "push_stream", False)
         ):
-            for spec in self._group_specs:
-                if not isinstance(spec, SlidingWindowSpec):
-                    continue
-                assert spec.block_size % spec.sliding_window == 0
-                ratio = spec.block_size // spec.sliding_window
-                if ratio == 1:
-                    continue
-                if self._sw_ratio is None:
-                    self._sw_ratio = ratio
-                else:
-                    assert self._sw_ratio == ratio, (
-                        "RBLN NIXL connector assumes a single SWA ratio "
-                        f"across groups, got {self._sw_ratio} vs {ratio}"
-                    )
+            self._sw_ratio = sliding_window_view_ratio(self._group_specs)
             if self._sw_ratio is not None:
                 # Fail at startup rather than at the first handshake: the
                 # two desc ranges `register_local_xfer_handler` builds and a
@@ -213,10 +207,12 @@ class RblnNixlWorkerBase(
                     )
                 if not swa_view_opt:
                     logger.warning(
-                        "RBLN NIXL: chunk_mode turned the SWA view on "
-                        "over swa_view_opt=0 -- a "
-                        "chunk range extends that layout and has nowhere "
-                        "else to sit."
+                        "RBLN NIXL: %s turned the SWA view on over "
+                        "swa_view_opt=0 -- the range it needs extends that "
+                        "layout and has nowhere else to sit.",
+                        "chunk_mode"
+                        if connector_option(self.vllm_config, "chunk_mode", False)
+                        else "push_stream",
                     )
                 logger.info(
                     "SWA view on: trimming SWA-group RDMA payload by 1/%d "
