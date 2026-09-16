@@ -109,9 +109,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
             or parallel_config.enable_expert_parallel
         ) and not rbln_config.use_moe_tokens_mask:
             raise ValueError(
-                "VLLM_RBLN_USE_MOE_TOKENS_MASK is required when DP or EP enabled: "
+                "--rbln-use-moe-tokens-mask is required when DP or EP enabled: "
                 "the mask marks padded tokens introduced by DP multicast. "
-                "Set VLLM_RBLN_USE_MOE_TOKENS_MASK=1 (default)."
+                "It is on by default; drop --no-rbln-use-moe-tokens-mask."
             )
 
     if (
@@ -308,7 +308,7 @@ def _wire(vllm_config: "VllmConfig") -> None:
         logger.warning(
             "Disabling asynchronous scheduling: it requires "
             "VLLM_RBLN_USE_DEVICE_TENSOR=1 (got %s), which carries the "
-            "in-flight sampled tokens, and VLLM_RBLN_SAMPLER=1 (got %s), "
+            "in-flight sampled tokens, and --rbln-use-custom-sampler (got %s), "
             "which puts the sampler on the device so those tokens never "
             "reach the host mid-step. Running synchronously.",
             int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),

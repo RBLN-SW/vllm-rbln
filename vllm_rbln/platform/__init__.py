@@ -335,7 +335,7 @@ class RblnPlatform(Platform):
         if resolve_model_impl(vllm_config.additional_config) != "vllm":
             reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
-                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
+                "--rbln-model-impl vllm; see docs/dynamic_kv_cache.md."
             )
 
         if not USE_DEVICE_TENSOR:

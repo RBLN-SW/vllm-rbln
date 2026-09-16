@@ -280,6 +280,7 @@ def _env_overrides(cls: type[RBLNConfigBase]) -> dict[str, Any]:
     from vllm_rbln import envs
 
     overrides: dict[str, Any] = {}
+    deprecated: list[str] = []
     for f in _fields_of(cls):
         attr, probes = _env_source(f.name)
         if attr not in envs.environment_variables:
@@ -288,7 +289,19 @@ def _env_overrides(cls: type[RBLNConfigBase]) -> dict[str, Any]:
         for probe in probes:
             if probe in os.environ:
                 overrides[f.name] = getattr(envs, attr)
+                deprecated.append(f"{probe} -> --rbln-{f.name.replace('_', '-')}")
                 break
+
+    if deprecated:
+        # TODO(vllm-rbln>=0.12.0): delete, with the variables themselves. Every
+        # field here has a flag now, and the flag is what the config records; a
+        # variable reaches it only through this function.
+        logger.warning_once(
+            "These environment variables are deprecated and will be removed in "
+            "0.12.0. Use the flag instead, or the additional_config key it "
+            "writes, which is the flag without the --rbln- prefix: %s.",
+            ", ".join(sorted(deprecated)),
+        )
     return overrides
 
 
@@ -317,6 +330,13 @@ def resolve_model_impl(additional_config: Any = None) -> ModelImpl:
 
     from vllm_rbln import envs
 
+    # TODO(vllm-rbln>=0.12.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
+    if "VLLM_RBLN_USE_VLLM_MODEL" in os.environ:
+        logger.warning_once(
+            "VLLM_RBLN_USE_VLLM_MODEL is deprecated and will be removed in "
+            "0.12.0. Use --rbln-model-impl, or the additional_config key it "
+            'writes, additional_config={"model_impl": "vllm"}, instead.'
+        )
     return _as_model_impl(envs.model_impl_from_env())
 
 
@@ -482,7 +502,11 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
 
     group = parser.add_argument_group(
         title=_GROUP_TITLE,
-        description="RBLN NPU options for both model paths.",
+        description=(
+            "RBLN NPU options for both model paths. Each flag is also an "
+            "additional_config key, spelled without the --rbln- prefix: "
+            '--rbln-use-w8a8 is additional_config={"use_w8a8": true}.'
+        ),
     )
     seen: set[str] = set()
     for cls in _CONFIG_CLASSES:

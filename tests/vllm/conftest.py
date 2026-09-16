@@ -402,15 +402,23 @@ def pytest_configure(config):
 
     # Platform plugins activate on their own when current_platform is first
     # touched, but the registrations live in the general_plugins group and
-    # nothing loads those implicitly.
+    # nothing loads those implicitly. This also imports the platform, which no
+    # module may do directly: vllm.platforms has to be the one resolving it.
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
 
-    # In production the patches land when create_engine_config resolves the
-    # model path. No engine is built here, so apply them directly; without this
-    # the suite runs half-applied, RblnPlatform current yet every patched symbol
+    # This suite is the native path's, and nothing has said so yet: production
+    # adopts the path in create_engine_config, and no engine is built here. The
+    # second call is what the platform hook makes right after; without it the
+    # suite runs half-applied, RblnPlatform current yet every patched symbol
     # still upstream's.
+    from vllm_rbln.platform import _apply_model_impl
+
+    _apply_model_impl("vllm")
+
+    # Imported only now: it copies USE_DEVICE_TENSOR into its own namespace, as
+    # seven other modules do, and the call above is what settles that value.
     from vllm_rbln.platform import vllm_impl
 
     vllm_impl.patch_upstream()

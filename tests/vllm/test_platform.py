@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnPlatform on the vllm model path only (VLLM_RBLN_USE_VLLM_MODEL=1). Written
+# RblnPlatform on the vllm model path only (--rbln-model-impl vllm). Written
 # against outcomes rather than call paths -- a real config is built so the engine's
 # own entry point (VllmConfig.__post_init__ -> check_and_update_config) does the
 # work, and the assertions read the resulting config, the raised error, or the
@@ -222,7 +222,7 @@ class TestRejectedConfigs:
 
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
-        with pytest.raises(ValueError, match="VLLM_RBLN_USE_MOE_TOKENS_MASK"):
+        with pytest.raises(ValueError, match="--rbln-use-moe-tokens-mask"):
             reconfigure(_ranks(moe_tokens_mask=False, **ranks))
 
     def test_tp_inherits_neither_dp_rule(self, reconfigure):
@@ -813,7 +813,7 @@ class TestDynamicKvConfig:
         RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
     def test_needs_the_vllm_model_path(self):
-        with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL=1"):
+        with pytest.raises(ValueError, match="--rbln-model-impl vllm"):
             RblnPlatform._validate_dynamic_kv_config(self._cfg(model_impl="optimum"))
 
     def test_mla_passes(self):
@@ -843,7 +843,7 @@ class TestDynamicKvConfig:
             RblnPlatform._validate_dynamic_kv_config(
                 self._cfg(model_impl="optimum", kv_transfer_config=SimpleNamespace())
             )
-        assert "VLLM_RBLN_USE_VLLM_MODEL=1" in caplog.text
+        assert "--rbln-model-impl vllm" in caplog.text
         assert "VLLM_RBLN_USE_DEVICE_TENSOR=1" in caplog.text
         assert "KV transfer connector" in caplog.text
         assert caplog.text.count("dynamic KV cache dry run:") == 3

@@ -64,15 +64,14 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         logger.warning(
             "Disabling asynchronous scheduling: the optimum model runner "
             "does not support it. Running synchronously. Set "
-            "VLLM_RBLN_USE_VLLM_MODEL=1 to use the runner that does."
+            "--rbln-model-impl vllm to use the runner that does."
         )
     scheduler_config.async_scheduling = False
 
     assert parallel_config.tensor_parallel_size == 1, (
         "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
         "If you want to compile with tensor parallelism in vllm-rbln, "
-        "please use the `VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK` "
-        "environment variable instead."
+        "please use --rbln-num-devices-per-local-rank instead."
     )
     assert parallel_config.pipeline_parallel_size == 1, (
         "Pipeline parallelism is not supported in optimum-rbln."

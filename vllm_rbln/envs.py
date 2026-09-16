@@ -89,24 +89,18 @@ if TYPE_CHECKING:
 def get_num_devices_per_local_rank() -> int:
     """Number of NPU devices assigned to each local rank.
 
-    Resolves ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``. For backward
-    compatibility the deprecated ``VLLM_RBLN_TP_SIZE`` is still honored as a
-    fallback when the new variable is unset, and emits a deprecation warning.
+    Resolves ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``, and the older
+    ``VLLM_RBLN_TP_SIZE`` as a fallback when it is unset. Both are deprecated;
+    `_env_overrides` warns, naming the flag that replaces them. Nothing here
+    may log: this module has to stay importable while `vllm` is, and
+    `vllm_rbln.logger` imports `vllm`.
     """
     new_value = os.environ.get("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK")
+    if new_value is not None:
+        return int(new_value)
+
     legacy_value = os.environ.get("VLLM_RBLN_TP_SIZE")
-
-    if legacy_value is not None:
-        from vllm_rbln.logger import init_logger
-
-        init_logger(__name__).warning_once(
-            "VLLM_RBLN_TP_SIZE is deprecated and will be removed in a future "
-            "release. Please use VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK instead."
-        )
-        if new_value is None:
-            return int(legacy_value)
-
-    return int(new_value) if new_value is not None else 1
+    return int(legacy_value) if legacy_value is not None else 1
 
 
 def get_decode_batch_bucket_strategy() -> str:
@@ -184,11 +178,11 @@ def model_impl_from_env() -> str:
     if resolved:
         return resolved
     # TODO(vllm-rbln>=0.12.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
-    use_vllm_model = os.environ.get("VLLM_RBLN_USE_VLLM_MODEL", "False").lower() in (
-        "true",
-        "1",
-    )
-    return "vllm" if use_vllm_model else "optimum"
+    # Silent here on purpose: `vllm_rbln.platform` calls this while `vllm` is
+    # still importing itself, and a logger would pull `vllm` back in.
+    # `resolve_model_impl` warns instead.
+    legacy = os.environ.get("VLLM_RBLN_USE_VLLM_MODEL", "False")
+    return "vllm" if legacy.lower() in ("true", "1") else "optimum"
 
 
 # extended environments

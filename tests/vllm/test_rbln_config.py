@@ -332,3 +332,55 @@ def test_model_impl_has_no_variable_of_its_own():
     from vllm_rbln import envs
 
     assert _env_source("model_impl")[0] not in envs.environment_variables
+
+
+def test_only_two_modules_decide_the_model_path():
+    """AGENTS.md: the selector lives in config.py, two modules branch on it.
+
+    The whole split rests on this. A path branch anywhere else sends the two
+    paths down one another's code, and reading the resolved path is what a
+    branch starts from, so that is what this looks for.
+    """
+    import vllm_rbln
+
+    root = pathlib.Path(vllm_rbln.__file__).parent
+    allowed = {"__init__.py", "platform/__init__.py", "config.py", "envs.py"}
+    readers = sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if path.relative_to(root).as_posix() not in allowed
+        and (
+            "model_impl_from_env" in (text := path.read_text())
+            or "resolve_model_impl" in text
+        )
+    )
+    assert not readers, f"{readers} resolve the model path; see AGENTS.md"
+
+
+def test_the_deprecated_variable_survives_being_set_before_vllm_is_imported():
+    """How every caller that has not migrated still starts: export, then import.
+
+    `vllm_rbln.platform` reads the path while `vllm` is part-way through
+    importing itself, so anything on that road that touches `vllm` again -- a
+    logger, most easily -- raises out of the half-built module. A subprocess,
+    because the failure is in import order and this one is long past it.
+    """
+    import os
+    import subprocess
+    import sys
+
+    probe = (
+        "import os;"
+        "os.environ['VLLM_RBLN_USE_VLLM_MODEL'] = '1';"
+        "from vllm import LLM;"
+        "from vllm_rbln.config import resolve_model_impl;"
+        "print('PATH' + resolve_model_impl())"
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("VLLM_RBLN")}
+    env.pop(RESOLVED_MODEL_IMPL_ENV, None)
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, env=env
+    )
+
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert "PATHvllm" in out.stdout, out.stdout

@@ -297,7 +297,7 @@ def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
         return "enforce_eager is set"
     rbln_config: RBLNConfig = vllm_config.additional_config
     if not rbln_config.compile_model:
-        return "VLLM_RBLN_COMPILE_MODEL is off"
+        return "--no-rbln-compile-model is set"
     if not envs.VLLM_RBLN_ENABLE_WARM_UP:
         return "VLLM_RBLN_ENABLE_WARM_UP is off"
     return None

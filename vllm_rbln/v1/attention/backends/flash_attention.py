@@ -153,10 +153,10 @@ class RBLNFlashAttentionMetadata:
 
     def __post_init__(self):
         # FIXME(RBLN): to_dynamic_index does not accept int64 inputs.Thus in the
-        # VLLM_RBLN_USE_CUSTOM_KERNEL=0 path, rebel-compiler automatically converts
+        # --no-rbln-use-custom-kernel path, rebel-compiler automatically converts
         # integer tensor inputs to a supported dtype.
         # However, this preprocessing is somewhat missing in the triton-rbln kernel
-        # path(VLLM_RBLN_USE_CUSTOM_KERNEL=1), so we explicitly cast the input to a
+        # path(--rbln-use-custom-kernel), so we explicitly cast the input to a
         # supported dtype here. This can be removed when the triton-rbln kernel path
         # performs the same dtype conversion.
 
@@ -208,7 +208,7 @@ class RBLNFlashAttentionMetadataBuilder(
         if self.swa_appends and self.use_custom_kernel:
             raise NotImplementedError(
                 "Sliding window attention on REBEL CR13 is not supported with "
-                "VLLM_RBLN_USE_CUSTOM_KERNEL=1: rbln_triton_ops has no "
+                "--rbln-use-custom-kernel: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
 
@@ -457,13 +457,13 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if self.use_custom_kernel:
                 raise NotImplementedError(
                     "fp8 KV cache is not supported with "
-                    "VLLM_RBLN_USE_CUSTOM_KERNEL=1: the rbln_triton_ops "
+                    "--rbln-use-custom-kernel: the rbln_triton_ops "
                     "attention kernels take no dequant scales."
                 )
             if self.sliding_window is not None or not self.is_causal or self.is_normal:
                 raise NotImplementedError(
                     "fp8 KV cache is only supported by the flash causal "
-                    "attention path (VLLM_RBLN_FLASH_CAUSAL_ATTN=1, "
+                    "attention path (--rbln-use-flash-causal-attn, "
                     "block_size != max_model_len, no sliding window); got "
                     f"sliding_window={self.sliding_window}, "
                     f"is_causal={self.is_causal}, is_normal={self.is_normal}."
