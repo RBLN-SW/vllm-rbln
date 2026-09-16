@@ -1518,6 +1518,10 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         )
         payload_bytes, perf_bytes = sock.recv_multipart()
         recv_time = time.perf_counter()
+        if not payload_bytes:
+            raise RuntimeError(
+                f"engine {expected_engine_id} reports every RDMA link down"
+            )
         try:
             handshake_payload = msgspec.msgpack.Decoder(NixlHandshakePayload).decode(
                 payload_bytes

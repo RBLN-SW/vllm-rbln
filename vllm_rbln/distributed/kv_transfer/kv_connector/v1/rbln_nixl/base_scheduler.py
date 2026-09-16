@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+import msgspec
+import zmq
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -25,8 +28,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    GET_META_MSG,
     ReqId,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
 
 import vllm_rbln.envs as envs
@@ -79,6 +85,39 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
             if self._link_down:
                 return True
         return super().has_pending_push_work()
+
+    def _nixl_handshake_listener(
+        self,
+        encoded_data: dict[tuple[int, int], Any],
+        ready_event: threading.Event,
+        stop_event: threading.Event,
+        host: str,
+        port: int,
+    ) -> None:
+        # Upstream's listener, answering with an empty payload frame while every
+        # local link is down: the side channel rides the pod network, so a peer
+        # would otherwise handshake fine and then wait out the CM timeout on a
+        # dial that cannot succeed. The clock frame is still sent.
+        path = make_zmq_path("tcp", host, port)
+        with zmq_ctx(zmq.ROUTER, path) as sock:
+            sock.setsockopt(zmq.RCVTIMEO, 1000)
+            ready_event.set()
+            while True:
+                try:
+                    identity, _, msg = sock.recv_multipart()
+                except zmq.Again:
+                    if stop_event.is_set():
+                        break
+                    continue
+                msg, target_pp_rank, target_tp_rank = msgspec.msgpack.decode(msg)
+                if msg != GET_META_MSG:
+                    logger.warning("Connection listener got unexpected message %s", msg)
+                all_down, _ = every_local_link_down()
+                payload = (
+                    b"" if all_down else encoded_data[(target_pp_rank, target_tp_rank)]
+                )
+                ts = msgspec.msgpack.encode(time.perf_counter())
+                sock.send_multipart((identity, b"", payload, ts))
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int

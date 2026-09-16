@@ -17,15 +17,20 @@
 # through the inherited entry points of whichever direction sits underneath.
 # Built bare with only the state those paths read.
 
+import socket
+import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
+import zmq
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPullConnectorScheduler,
     NixlPushConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import GET_META_MSG
 from vllm.v1.request import RequestStatus
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as wm
@@ -497,3 +502,47 @@ class TestLinkDownKeepsTheEngineStepping:
         sched._exit_on_link_down = True
         sched._finished_request_blocks = {"r0": object()}
         assert sched.has_pending_push_work()
+
+
+class TestLinkDownRefusesTheHandshake:
+    # The side channel rides the pod network and stays up when the RDMA links
+    # die, so a peer would handshake fine and then wait out the CM timeout.
+    # Answering with an empty frame fails its handshake at once instead.
+
+    @staticmethod
+    def _ask(sched, encoded, port):
+        ready, stop = threading.Event(), threading.Event()
+        t = threading.Thread(
+            target=sched._nixl_handshake_listener,
+            args=(encoded, ready, stop, "127.0.0.1", port),
+            daemon=True,
+        )
+        t.start()
+        assert ready.wait(5)
+        ctx = zmq.Context()
+        try:
+            req = ctx.socket(zmq.REQ)
+            req.setsockopt(zmq.RCVTIMEO, 5000)
+            req.connect(f"tcp://127.0.0.1:{port}")
+            req.send(msgspec.msgpack.encode((GET_META_MSG, 0, 0)))
+            payload, _clock = req.recv_multipart()
+            return payload
+        finally:
+            stop.set()
+            t.join(5)
+            ctx.destroy(linger=0)
+
+    @staticmethod
+    def _free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def test_all_links_down_answers_an_empty_frame(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(wm, "_SYS_CLASS_NET", fake_sysfs_net(tmp_path, ens1="down"))
+        assert self._ask(_scheduler(), {(0, 0): b"meta"}, self._free_port()) == b""
+
+    def test_a_live_link_answers_the_metadata(self, monkeypatch, tmp_path):
+        sysfs = fake_sysfs_net(tmp_path, ens1="down", ens2="up")
+        monkeypatch.setattr(wm, "_SYS_CLASS_NET", sysfs)
+        assert self._ask(_scheduler(), {(0, 0): b"meta"}, self._free_port()) == b"meta"
