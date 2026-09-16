@@ -18,6 +18,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from copy import copy, deepcopy
+from functools import partial
 from typing import Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -318,8 +319,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Lazy initialization
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
-        # Parallel to `kv_caches`: which axis of each one a block indexes.
-        self.kv_cache_block_axes: list[int] = []
+        # Layer name -> which axis of its cache a block indexes.
+        self.kv_cache_block_axes: dict[str, int] = {}
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
         # KV cache layer names in layer-index order; the deterministic
@@ -3140,7 +3141,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         self.kv_cache_names = get_kv_cache_names(kv_caches, num_attn_module)
         self.kv_caches = [kv_caches[name] for name in self.kv_cache_names]
-        self.kv_cache_block_axes = [block_axes[name] for name in self.kv_cache_names]
+        self.kv_cache_block_axes = block_axes
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
@@ -3274,7 +3275,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 }
                 kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
-            kv_transfer_group.set_host_xfer_buffer_ops(copy_host_device_kv_blocks)
+            kv_transfer_group.set_host_xfer_buffer_ops(
+                partial(
+                    copy_host_device_kv_blocks,
+                    block_axes=self.kv_cache_block_axes,
+                )
+            )
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3658,8 +3664,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             src = op.src_block_id
             dst = op.dst_block_id
             nt = op.num_tokens
-            for kv_cache, block_axis in zip(
-                self.kv_caches, self.kv_cache_block_axes, strict=True
+            for layer_name, kv_cache in zip(
+                self.kv_cache_names, self.kv_caches, strict=True
             ):
                 # An MLA-family cache is blocks-first whatever the kernel, and
                 # the indexer scale one has no axis after its tokens.
@@ -3667,8 +3673,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     dsts.append(kv_cache[dst, :nt])
                     srcs.append(kv_cache[src, :nt])
                 else:
-                    dsts.append(kv_cache.select(block_axis, dst)[..., :nt, :])
-                    srcs.append(kv_cache.select(block_axis, src)[..., :nt, :])
+                    axis = self.kv_cache_block_axes[layer_name]
+                    dsts.append(kv_cache.select(axis, dst)[..., :nt, :])
+                    srcs.append(kv_cache.select(axis, src)[..., :nt, :])
         torch._foreach_copy_(dsts, srcs)
 
 

@@ -942,7 +942,8 @@ class TestProcessKvCacheCopyOps:
         kv.select(block_axis, 1).fill_(5.0)  # source = block 1
         r = _make_runner_stub(
             kv_caches=[kv],
-            kv_cache_block_axes=[block_axis],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": block_axis},
             model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -960,7 +961,8 @@ class TestProcessKvCacheCopyOps:
         kv[1] = 7.0
         r = _make_runner_stub(
             kv_caches=[kv],
-            kv_cache_block_axes=[0],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": 0},
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -978,7 +980,8 @@ class TestProcessKvCacheCopyOps:
         scale[1] = 9.0
         r = _make_runner_stub(
             kv_caches=[latent, scale],
-            kv_cache_block_axes=[0, 0],
+            kv_cache_names=["latent", "scale"],
+            kv_cache_block_axes={"latent": 0, "scale": 0},
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -996,7 +999,8 @@ class TestProcessKvCacheCopyOps:
         )
         r = _make_runner_stub(
             kv_caches=[],
-            kv_cache_block_axes=[],
+            kv_cache_names=[],
+            kv_cache_block_axes={},
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
             rbln_config=RBLNConfig(),

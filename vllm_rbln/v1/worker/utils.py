@@ -1089,12 +1089,15 @@ def copy_host_device_kv_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     direction: Literal["h2d", "d2h"],
+    *,
+    block_axes: dict[str, int],
 ) -> None:
     """Copy KV blocks between the host xfer buffer and the device KV cache.
 
-    Requires VLLM_RBLN_USE_DEVICE_TENSOR=1. Every cache this sees -- attention,
-    MLA latent, SSM/conv -- carries blocks on dim 0, so one block is one
-    contiguous view.
+    Requires VLLM_RBLN_USE_DEVICE_TENSOR=1. `block_axes` says which axis of a
+    layer's cache a block id indexes: dim 0 for MLA and SSM/conv, and for the
+    attention cache the rbln_custom_ops kernels read, but dim 1 for the
+    K/V-first one rbln_triton_ops reads, where dim 0 would select a K/V half.
     """
     if not src_kv_caches or not dst_kv_caches or not src_block_ids or not dst_block_ids:
         return
@@ -1110,7 +1113,8 @@ def copy_host_device_kv_blocks(
     srcs: list[torch.Tensor] = []
     for layer_name, dst_cache in dst_kv_caches.items():
         src_cache = src_kv_caches[layer_name]
+        axis = block_axes[layer_name]
         for idx in src_block_ids:
-            dsts.append(dst_cache[idx])
-            srcs.append(src_cache[idx])
+            dsts.append(dst_cache.select(axis, idx))
+            srcs.append(src_cache.select(axis, idx))
     torch._foreach_copy_(dsts, srcs)

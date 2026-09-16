@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RBLN's attention cache is blocks-first with K and V inside one block, which
-# the descriptor path cannot cut into two regions; the MLA and Mamba caches are
-# upstream's own shapes and still register. Upstream's own registration path
-# builds the topology, so every test here constructs one directly.
+# RBLN's attention cache is K/V-first on the rbln_triton_ops kernels, where K
+# and V become two regions, and blocks-first on rbln_custom_ops, where they
+# share a block the descriptor path cannot cut in two; the MLA and Mamba caches
+# are upstream's own shapes and register either way. Upstream's own
+# registration path builds the topology, so every test here constructs one
+# directly.
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 
+from tests.native.vllm_config import make_vllm_config
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
     RblnTransferTopology,
 )
@@ -43,11 +47,30 @@ class TestRblnTransferTopology:
             tensor_shape=tensor_shape,
         )
 
-    def test_the_attention_cache_is_refused(self):
-        # K and V share a block, so the descriptors have no second region to
-        # name; refusing here beats transferring halves of a block.
-        with pytest.raises(NotImplementedError, match="interleaves inside each"):
+    @staticmethod
+    def _kernel_config(use_custom_kernel):
+        # What the attention cache's layout follows.
+        return set_current_vllm_config(
+            make_vllm_config(additional_config={"use_custom_kernel": use_custom_kernel})
+        )
+
+    def test_the_blocks_first_attention_cache_is_refused(self):
+        # K and V share a block there, so the descriptors have no second region
+        # to name; refusing here beats transferring halves of a block.
+        with (
+            self._kernel_config(False),
+            pytest.raises(NotImplementedError, match="interleaves inside each"),
+        ):
             self._topology(RBLNFlashAttentionBackend)
+
+    def test_the_kv_first_attention_cache_splits_k_from_v(self):
+        # Upstream packs K and V into one region; this layout keeps them apart,
+        # and the caller divides the page size by how many regions come back.
+        with self._kernel_config(True):
+            topo = self._topology(RBLNFlashAttentionBackend)
+        cache = torch.zeros(2, 4, 1, 1, 64, 8)
+
+        assert len(topo.get_transfer_cache_regions(cache, object())) == 2
 
     def test_the_mla_layout_builds(self):
         topo = self._topology(RBLNFlashAttnMLABackend, is_mla=True)

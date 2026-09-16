@@ -21,11 +21,13 @@ from vllm_rbln.patches import register_patch
 register_patch(
     target="vllm.distributed.kv_transfer.kv_connector.utils.TransferTopology",
     reason=(
-        "0.26 reads the KV layout off a 5-dim shape in "
-        "TransferTopology.__post_init__; RBLN's attention cache is 6-dim, so "
-        "upstream takes it for K/V-first and cuts each block in half. "
-        "Upstream has no per-platform way to say the layout differs, and it "
-        "builds the class inside its own register_kv_caches, which the "
-        "host-bounce path delegates to."
+        "0.26 asserts a blocks-first, K/V-packed 4-dim cache in "
+        "TransferTopology.__post_init__. RBLN's attention cache is 6-dim and "
+        "is K/V-first on the rbln_triton_ops kernels, so those models cannot "
+        "register at all; the blocks-first one has to be refused here instead, "
+        "since upstream would cut each block in half. Upstream has no "
+        "per-platform way to say the layout differs, and it builds the class "
+        "inside its own register_kv_caches, which the host-bounce path "
+        "delegates to."
     ),
 )(RblnTransferTopology)

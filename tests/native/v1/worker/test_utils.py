@@ -1297,28 +1297,32 @@ class TestRblnSysfsReaders:
 
 
 class TestCopyHostDeviceKvBlocks:
-    # The host-bounce staging copy. Only the listed block ids move, and a block
-    # id indexes dim 0 whatever the cache's rank -- the attention cache carries
-    # K/V on dim 1, so splitting it off first would copy the wrong slices.
+    # The host-bounce staging copy. Only the listed block ids move, and which
+    # axis a block id indexes is the layer's own: dim 1 for the K/V-first
+    # attention cache, where dim 0 would copy a K/V half instead.
     @pytest.mark.parametrize(
-        "shape", [(4, 2, 1, 1, 8, 2), (4, 8, 2)], ids=["attention", "mla"]
+        "shape, axis",
+        [((4, 2, 1, 1, 8, 2), 0), ((2, 4, 1, 1, 8, 2), 1), ((4, 8, 2), 0)],
+        ids=["attention_blocks_first", "attention_kv_first", "mla"],
     )
-    def test_copies_only_the_listed_blocks(self, shape):
+    def test_copies_only_the_listed_blocks(self, shape, axis):
         src = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape)
         # Compared against a snapshot, and dst filled with a sentinel: a copy
         # running the other way would make src equal dst and read as a hit.
         expected = src.clone()
         dst = torch.full_like(src, -1.0)
-        copy_host_device_kv_blocks({"l0": src}, {"l0": dst}, [1, 3], [1, 3], "h2d")
+        copy_host_device_kv_blocks(
+            {"l0": src}, {"l0": dst}, [1, 3], [1, 3], "h2d", block_axes={"l0": axis}
+        )
         for block in (1, 3):
-            assert torch.equal(dst[block], expected[block])
+            assert torch.equal(dst.select(axis, block), expected.select(axis, block))
         for block in (0, 2):
-            assert (dst[block] == -1.0).all()
+            assert (dst.select(axis, block) == -1.0).all()
 
     def test_empty_ids_is_a_noop(self):
         dst = torch.zeros(2, 4, 3)
         copy_host_device_kv_blocks(
-            {"l0": torch.ones(2, 4, 3)}, {"l0": dst}, [], [], "h2d"
+            {"l0": torch.ones(2, 4, 3)}, {"l0": dst}, [], [], "h2d", block_axes={}
         )
         assert (dst == 0.0).all()
 
@@ -1330,6 +1334,7 @@ class TestCopyHostDeviceKvBlocks:
                 [0],
                 [1],
                 "h2d",
+                block_axes={"l0": 0},
             )
 
 
