@@ -1862,6 +1862,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
             model_executable=executable,
             num_prompt_logprobs=None,
             kv_cache_bases=None,
+            decode_back_pad=torch.zeros(1, dtype=torch.int32),
         )
         return runner, order
 
