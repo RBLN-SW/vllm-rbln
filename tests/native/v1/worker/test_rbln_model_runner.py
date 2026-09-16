@@ -959,6 +959,25 @@ class TestProcessKvCacheCopyOps:
         assert (kv[2, :3, :] == 7.0).all()
         assert (kv[2, 3:, :] == 0.0).all()
 
+    def test_eager_copy_mla_indexer_scale(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
+        # DeepSeek-V3.2 carries three MLA-family caches and the indexer scale
+        # one is (num_blocks, block_tokens) -- no trailing head axis.
+        latent = torch.zeros(4, 8, 2)
+        scale = torch.zeros(4, 8)
+        latent[1] = 7.0
+        scale[1] = 9.0
+        r = _make_runner_stub(
+            kv_caches=[latent, scale],
+            model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
+            runtime_holder=[None],
+        )
+        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
+        assert (latent[2, :3, :] == 7.0).all()
+        assert (latent[2, 3:, :] == 0.0).all()
+        assert (scale[2, :3] == 9.0).all()
+        assert (scale[2, 3:] == 0.0).all()
+
     def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
         calls = []
