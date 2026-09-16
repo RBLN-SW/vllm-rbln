@@ -14,6 +14,7 @@
 
 import re
 import types
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_base_bindings,
     build_kv_cache_forward_context_kwargs,
+    kv_cache_dynamic_axis,
     materialize_kv_cache_view,
     validate_shared_attention_kv_cache_contiguity,
 )
@@ -37,6 +39,63 @@ def _layer(i: int) -> str:
     # A layer name extract_layer_index() parses to `i` (single integer, has
     # "attn"). Used as the dict keys the helpers order and group by.
     return f"model.layers.{i}.self_attn"
+
+
+class TestKvCacheDynamicAxis:
+    """The dynamic axis is read off the backend's shape, not assumed."""
+
+    @staticmethod
+    def _spec():
+        return SimpleNamespace(num_kv_heads=8, head_size=128)
+
+    def test_paged_layout_grows_along_dim_1(self):
+        backend = SimpleNamespace(
+            get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (
+                2,
+                n,
+                h,
+                1,
+                bs,
+                hd,
+            )
+        )
+        assert (
+            kv_cache_dynamic_axis(backend, 4, 1024, self._spec(), "auto", range(6)) == 1
+        )
+
+    def test_mla_layout_grows_along_dim_0(self):
+        backend = SimpleNamespace(
+            get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (n, bs, hd)
+        )
+        assert (
+            kv_cache_dynamic_axis(backend, 4, 1024, self._spec(), "auto", range(3)) == 0
+        )
+
+    def test_the_stride_order_moves_the_axis(self):
+        backend = SimpleNamespace(
+            get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (
+                2,
+                n,
+                h,
+                1,
+                bs,
+                hd,
+            )
+        )
+        # Stored as [h, 2, n, ...]: num_blocks lands on dim 2.
+        assert (
+            kv_cache_dynamic_axis(
+                backend, 4, 1024, self._spec(), "auto", (2, 0, 1, 3, 4, 5)
+            )
+            == 2
+        )
+
+    def test_a_shape_without_a_num_blocks_dim_is_refused(self):
+        backend = SimpleNamespace(
+            get_kv_cache_shape=lambda n, bs, h, hd, cache_dtype_str: (2, h, bs, hd)
+        )
+        with pytest.raises(ValueError, match="exactly one dim"):
+            kv_cache_dynamic_axis(backend, 4, 1024, self._spec(), "auto", range(4))
 
 
 class TestStorageKey:
@@ -91,6 +150,20 @@ class TestBuildKvCacheBaseBindings:
         assert got.permute_order == (1, 0)
         assert got.select_index == 2
 
+    def test_dynamic_scale_is_taken_after_the_dtype_view(self):
+        # materialize reads the extent after .view(view_dtype); a uint8 base
+        # viewed as bf16 halves its trailing dim, so the scale must be taken
+        # from the viewed shape or the view comes out twice too small.
+        base = torch.zeros(4, 16, dtype=torch.uint8)
+        info = KVCacheViewInfo(
+            view_shape=(4, 8), view_dtype=torch.bfloat16, dynamic_axis=1
+        )
+        _, view_infos = build_kv_cache_base_bindings(
+            {_layer(0): base}, {_layer(0): info}
+        )
+        assert view_infos[0].dynamic_scale == (1, 1)
+        assert materialize_kv_cache_view([base], view_infos[0]).shape == (4, 8)
+
     def test_mixed_shared_and_distinct_storage(self):
         # Two layers aliasing one base plus an independent third: guards the
         # dedup <-> index interaction the pure cases cannot.
@@ -137,6 +210,48 @@ class TestMaterializeKvCacheView:
         expected = flat.view(2, 3, 4).permute(1, 0, 2).select(0, 1)
         assert torch.equal(out, expected)
         assert _storage_key(out) == _storage_key(flat)  # aliases the base
+
+    def test_dynamic_axis_is_scaled_from_the_base(self):
+        # The extent is derived from the base at view time so a dynamic base dim
+        # stays symbolic under dynamo; the shape comes out the same.
+        base = torch.zeros(2, 4, 8, 1, 16, 4)
+        finer = KVCacheViewInfo(
+            base_index=0,
+            view_shape=(2, 32, 8, 1, 2, 4),
+            dynamic_axis=1,
+            dynamic_scale=(8, 1),
+        )
+        out = materialize_kv_cache_view([base], finer)
+        assert out.shape == (2, 32, 8, 1, 2, 4)
+        assert _storage_key(out) == _storage_key(base)
+        coarser = KVCacheViewInfo(
+            base_index=0,
+            view_shape=(2, 1, 8, 1, 64, 4),
+            dynamic_axis=1,
+            dynamic_scale=(1, 4),
+        )
+        assert materialize_kv_cache_view([base], coarser).shape == (2, 1, 8, 1, 64, 4)
+
+    def test_bindings_record_the_view_to_base_scale(self):
+        # gpt-oss: layer 0 (windowed, 64 kernel blocks per block) types the base;
+        # the full layer's view is 1/64 of it, the windowed layer's is 1:1.
+        raw = torch.zeros(2 * 4 * 8 * 1 * 8192 * 4, dtype=torch.float16)
+        windowed = raw.view(2, 256, 8, 1, 128, 4)
+        full = raw.view(2, 4, 8, 1, 8192, 4)
+        bases = {_layer(0): windowed, _layer(1): full}
+        infos = {
+            _layer(0): KVCacheViewInfo(
+                view_shape=(2, 256, 8, 1, 128, 4), dynamic_axis=1
+            ),
+            _layer(1): KVCacheViewInfo(
+                view_shape=(2, 4, 8, 1, 8192, 4), dynamic_axis=1
+            ),
+        }
+        base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
+        assert base_tensors[0].shape[1] == 256
+        assert [vi.dynamic_scale for vi in view_infos] == [(1, 1), (1, 64)]
+        for vi in view_infos:
+            assert materialize_kv_cache_view(base_tensors, vi).shape == vi.view_shape
 
     def test_dtype_view_reinterprets_bytes(self):
         # view_dtype reinterprets the base storage as another same-width dtype

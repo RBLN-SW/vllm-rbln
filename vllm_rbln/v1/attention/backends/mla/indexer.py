@@ -72,3 +72,22 @@ class RBLNDeepseekV32IndexerScaleBackend(RBLNDeepseekV32IndexerBackend):
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         return [1]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        assert num_kv_heads == 1 and head_size == 1
+        return (num_blocks, block_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (0, 1, 2)
+        return (0, 1)

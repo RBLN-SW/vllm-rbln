@@ -25,6 +25,7 @@ from vllm_rbln.compilation import (
     compile,
     create_compile_context,
 )
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 
 if TYPE_CHECKING:
@@ -62,9 +63,10 @@ class RBLNMedusaProposer(MedusaProposer):
             logits = self.model.compute_logits(hidden_states)
             return logits
 
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         if (
             self.vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
+            or not rbln_config.compile_model
         ):
             self.model_executable = model_wrapper
         else:
@@ -73,7 +75,7 @@ class RBLNMedusaProposer(MedusaProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                num_devices=rbln_config.num_devices_per_local_rank,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
