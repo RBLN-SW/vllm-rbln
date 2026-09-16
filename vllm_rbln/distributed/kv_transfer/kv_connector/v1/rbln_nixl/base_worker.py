@@ -158,6 +158,10 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
 
+        self._stripe_width = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get("stripe_width")
+        )
+
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
         # --- Chiplet geometry of one KV entry (D2D only) ---
@@ -274,7 +278,9 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         if self._use_rbln_nixl_backend:
             import nixl_rbln
 
-            nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
+            nixl_rbln.ensure_rbln_backend(
+                self.nixl_wrapper, device_id=0, stripe_width=self._stripe_width
+            )
         super().register_kv_caches(kv_caches)
         # Re-wrap upstream's published handshake metadata with this stage's PP
         # identity + owned layer names (no-op degrade for pp_size == 1).
@@ -482,6 +488,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             device_id,
             mem=self.nixl_memory_type,
             rbln_ctx_ptr=rbln_ctx_ptr,
+            stripe_width=self._stripe_width,
         )
         self.device_id = device_id
         self.block_len_per_layer = list(xfer.block_lens)
