@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
@@ -28,6 +29,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
+import vllm_rbln.envs as envs
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
+    LINK_POLL_S,
+    every_local_link_down,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -56,6 +62,23 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
 
         # Blocks collected so far for a prefill that is still being chunked.
         self._block_ids_need_save: dict[ReqId, BlockIds] = {}
+
+        # The worker polls its links and exits from get_finished, which only an
+        # engine step calls, and an idle engine does not step. While every link
+        # is down this side reports pending work so the producer keeps stepping.
+        self._exit_on_link_down = envs.VLLM_RBLN_NIXL_LINK_DOWN_EXIT_S > 0
+        self._link_checked_at = 0.0
+        self._link_down = False
+
+    def has_pending_push_work(self) -> bool:
+        if self._exit_on_link_down:
+            now = time.perf_counter()
+            if now - self._link_checked_at >= LINK_POLL_S:
+                self._link_checked_at = now
+                self._link_down, _ = every_local_link_down()
+            if self._link_down:
+                return True
+        return super().has_pending_push_work()
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int

@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMappi
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as wm
+from tests.native.distributed.kv_connector.utils import fake_sysfs_net
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
@@ -544,17 +545,6 @@ class TestLocalLinkAttribution:
     # the orchestrator replaces it.
 
     @staticmethod
-    def _sysfs(tmp_path, **operstate):
-        # The pod network is a veth with no `device`; RDMA NICs are physical.
-        (tmp_path / "eth0").mkdir()
-        (tmp_path / "eth0" / "operstate").write_text("up\n")
-        for name, state in operstate.items():
-            (tmp_path / name).mkdir()
-            (tmp_path / name / "device").touch()
-            (tmp_path / name / "operstate").write_text(f"{state}\n")
-        return tmp_path
-
-    @staticmethod
     def _worker(monkeypatch, sysfs):
         w = TestShardReadPath._read_worker(pp_size=2)
         w.tp_rank = 0
@@ -565,7 +555,9 @@ class TestLocalLinkAttribution:
         return w
 
     def test_all_links_down_fails_requests_without_a_dial(self, monkeypatch, tmp_path):
-        w = self._worker(monkeypatch, self._sysfs(tmp_path, ens1="down", ens2="down"))
+        w = self._worker(
+            monkeypatch, fake_sysfs_net(tmp_path, ens1="down", ens2="down")
+        )
         w.get_finished()
         assert w._link_down_since is not None
 
@@ -579,17 +571,17 @@ class TestLocalLinkAttribution:
 
     def test_a_live_spare_link_is_not_our_fault(self, monkeypatch, tmp_path):
         # The re-handshake moves to the spare, so the peer path must stay open.
-        w = self._worker(monkeypatch, self._sysfs(tmp_path, ens1="down", ens2="up"))
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="down", ens2="up"))
         w.get_finished()
         assert w._link_down_since is None
 
     def test_no_physical_link_says_nothing(self, monkeypatch, tmp_path):
-        w = self._worker(monkeypatch, self._sysfs(tmp_path))
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path))
         w.get_finished()
         assert w._link_down_since is None
 
     def test_a_link_returning_clears_the_backoff(self, monkeypatch, tmp_path):
-        sysfs = self._sysfs(tmp_path, ens1="down")
+        sysfs = fake_sysfs_net(tmp_path, ens1="down")
         w = self._worker(monkeypatch, sysfs)
         w.get_finished()
         w._reconnect_backoff["eng"] = (3, time.perf_counter() + 10)
@@ -601,7 +593,7 @@ class TestLocalLinkAttribution:
         assert w._reconnect_backoff == {}
 
     def test_a_producer_exits_once_the_links_stay_down(self, monkeypatch, tmp_path):
-        w = self._worker(monkeypatch, self._sysfs(tmp_path, ens1="down"))
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="down"))
         w._link_down_exit_s = 30.0
         w.get_finished()
 
