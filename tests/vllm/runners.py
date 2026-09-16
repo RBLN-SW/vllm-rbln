@@ -66,8 +66,8 @@ def kv_blocks_needed(
     Does not model Mamba/linear attention, KV sharing, or mixed window sizes;
     pin num_gpu_blocks_override on the spec for those.
     """
-    from tests.native.model_specs import CR13
-    from tests.native.utils import host_chip
+    from tests.vllm.model_specs import CR13
+    from tests.vllm.utils import host_chip
     from vllm_rbln import envs
 
     full_blocks = math.ceil(max_model_len / block_size)

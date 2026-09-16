@@ -24,7 +24,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 
-from tests.native.vllm_config import make_vllm_config
+from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
     RblnTransferTopology,
 )

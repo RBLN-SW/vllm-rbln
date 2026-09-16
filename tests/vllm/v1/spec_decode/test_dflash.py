@@ -34,7 +34,7 @@ import pytest
 import torch
 
 import vllm_rbln.v1.spec_decode.dflash as dflash_module
-from tests.native.v1.spec_decode.utils import make_cad
+from tests.vllm.v1.spec_decode.utils import make_cad
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 
