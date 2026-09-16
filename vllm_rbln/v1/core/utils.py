@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 
@@ -236,3 +237,29 @@ class DecodeBatchBudget:
     @property
     def count(self) -> int:
         return self._count
+
+
+def sub_block_size_in_use(
+    *,
+    enable_prefix_caching: bool,
+    sub_block_cache: bool,
+    max_num_batched_tokens: int,
+    kv_cache_config: KVCacheConfig,
+    sub_block_size: int | None = None,
+) -> int | None:
+    """The sub-block size prefix caching runs at (default: the prefill chunk),
+    or None when the scheduler stays on vLLM's manager."""
+    # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
+    from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
+
+    if sub_block_size is None and sub_block_cache:
+        sub_block_size = max_num_batched_tokens
+    if not (
+        enable_prefix_caching
+        and sub_block_size
+        and RBLNKVCacheManager.can_use_sub_block_caching(
+            kv_cache_config, sub_block_size
+        )
+    ):
+        return None
+    return sub_block_size
