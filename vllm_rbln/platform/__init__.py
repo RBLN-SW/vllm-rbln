@@ -217,9 +217,11 @@ class RblnPlatform(Platform):
         # max_num_seqs, which is still None here.
         cls._adopt_deprecated_device_control_env_var()
         cls._override_default_max_num_seqs()
-        _impl().patch_upstream()
 
         if parser is None:
+            # Post-parse window: create_engine_config calls this as its first
+            # statement, so the replacements land before anything reads them.
+            _impl().patch_upstream()
             return
 
         for action in parser._actions:
