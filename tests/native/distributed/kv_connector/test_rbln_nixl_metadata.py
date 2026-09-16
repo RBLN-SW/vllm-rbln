@@ -87,13 +87,22 @@ class TestConnectorOptions:
         assert connector_option(config, "chunk_mode", False) is True
         assert connector_option(config, "chunk_bytes", 0) == 128
 
-    def test_a_value_of_the_wrong_type_is_refused(self):
-        # The knob would otherwise be read for its truthiness, which "0" and
-        # "false" both pass -- and this config is written by hand.
-        config = self._config({"chunk_mode": "false"})
+    @pytest.mark.parametrize(
+        "extra, key, default, takes",
+        [
+            # Read for its truthiness otherwise, which "0" and "false" both
+            # pass -- and this config is written by hand.
+            ({"chunk_mode": "false"}, "chunk_mode", False, "bool"),
+            # The axis the bool case cannot reach: `bool` is a subclass of
+            # `int`, so an int knob given `true` would count as 1.
+            ({"chunk_bytes": True}, "chunk_bytes", 0, "int"),
+        ],
+    )
+    def test_a_value_of_the_wrong_type_is_refused(self, extra, key, default, takes):
+        config = self._config(extra)
 
-        with pytest.raises(RuntimeError, match="takes a bool"):
-            connector_option(config, "chunk_mode", False)
+        with pytest.raises(RuntimeError, match=f"takes a {takes}"):
+            connector_option(config, key, default)
 
 
 class TestRblnNixlAgentMetadata:
