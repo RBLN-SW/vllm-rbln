@@ -259,8 +259,8 @@ class TestRegisterKvCaches:
         monkeypatch.setattr(
             sys.modules["nixl_rbln"],
             "ensure_rbln_backend",
-            lambda wrapper, device_id=0, *, stripe_width=None: ensured.append(
-                (wrapper, device_id, stripe_width)
+            lambda wrapper, device_id=0, **kwargs: ensured.append(
+                (wrapper, device_id, kwargs)
             ),
             raising=False,
         )
@@ -271,7 +271,7 @@ class TestRegisterKvCaches:
             lambda self, kv: delegated.append(kv),
         )
         worker.register_kv_caches({"layer0": "tensor"})
-        assert ensured == [("wrapper", 0, stripe_width)]
+        assert ensured == [("wrapper", 0, {"stripe_width": stripe_width})]
         assert delegated == [{"layer0": "tensor"}]
         assert worker._pending_kv_caches is None
         # Host staging needs the per-region counts too: a pipelined peer reaches
