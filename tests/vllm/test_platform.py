@@ -28,6 +28,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from pydantic import ValidationError
 from vllm.config import CompilationMode, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -993,6 +994,13 @@ class TestModelImpl:
 
         assert config.additional_config.model_impl == "vllm"
         assert config.additional_config.use_w8a8 is True
+
+    def test_a_bare_string_additional_config_is_left_to_upstream(self):
+        """`_MergeAdditionalConfig` keeps the bare string the CLI action takes,
+        and `VllmConfig`, which types the field, is what refuses it. Merging the
+        path into it first raises a TypeError from an operator instead."""
+        with pytest.raises(ValidationError, match="additional_config"):
+            _build(additional_config="something")
 
     def test_creating_the_engine_config_publishes_the_path(self, monkeypatch):
         """The wrapper is the only place the flag and the spawned processes meet.

@@ -27,9 +27,6 @@ logger = init_logger(__name__)
 
 
 def patch_upstream() -> None:
-    # Only sync_from_vllm reads the key the first one writes, and on the vllm
-    # path it would be an unknown field of RBLNConfig.
-    _capture_user_max_num_batched_tokens()
     _allow_gemma4_global_per_layer_attribute_access()
 
 
@@ -93,52 +90,6 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
 
     disable_unsupported_prefix_caching(vllm_config)
     sync_vllm_and_optimum(vllm_config)
-
-
-def _capture_user_max_num_batched_tokens() -> None:
-    """Stash the user's raw max_num_batched_tokens so the converter can read it.
-
-    In the RBLN optimum path an explicit max_num_batched_tokens IS the
-    prefill chunk size, so ``sync_from_vllm`` needs to know whether the user
-    set it. By the time that runs it can no longer tell, because vLLM has
-    already overwritten the value:
-
-      1. The user passes ``max_num_batched_tokens`` (an int) or leaves it
-         ``None``.
-      2. ``_set_default_max_num_seqs_and_batched_tokens_args`` replaces a
-         ``None`` with a throughput default and, since chunked prefill is
-         off on RBLN, floors it up to ``max_model_len``.
-      3. ``VllmConfig.__post_init__`` calls ``check_and_update_config`` ->
-         ``sync_from_vllm``, which now sees a concrete number with no trace
-         of whether it came from the user or from step 2.
-
-    This wrapper runs at the start of step 2, before the overwrite, and
-    records the raw value (``None`` if unset) into ``additional_config``,
-    which flows unchanged into ``VllmConfig``. ``sync_from_vllm`` then reads
-    it via ``get_user_max_num_batched_tokens``.
-    """
-    from vllm.engine.arg_utils import EngineArgs
-
-    if getattr(EngineArgs, "_rbln_user_mnbt_patched", False):
-        return
-
-    orig_set_defaults = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
-
-    def _set_default_max_num_seqs_and_batched_tokens_args(self, *args, **kwargs):
-        # Runs before the value is resolved from None to its default, and
-        # before check_and_update_config, so additional_config is still a dict.
-        # build_optimum_rbln_config turns the key into the field of that name.
-        if self.additional_config is None:
-            self.additional_config = {}
-        self.additional_config["user_max_num_batched_tokens"] = (
-            self.max_num_batched_tokens
-        )
-        return orig_set_defaults(self, *args, **kwargs)
-
-    EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = (
-        _set_default_max_num_seqs_and_batched_tokens_args
-    )
-    EngineArgs._rbln_user_mnbt_patched = True
 
 
 def _allow_gemma4_global_per_layer_attribute_access() -> None:
