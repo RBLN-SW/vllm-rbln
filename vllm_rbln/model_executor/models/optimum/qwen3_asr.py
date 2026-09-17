@@ -172,7 +172,7 @@ class RBLNOptimumQwen3ASRForConditionalGeneration(
 
         self.model.decoder = self.model.decoders[model_input.padded_batch_size]
         return self.model.decoder(
-            inputs_embeds=model_input.inputs_embeds,
+            input_ids=model_input.input_tokens,
             cache_position=model_input.input_positions,
             block_tables=model_input.block_tables,
         ).logits

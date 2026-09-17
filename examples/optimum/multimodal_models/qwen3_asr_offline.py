@@ -108,10 +108,9 @@ def main(
     results = llm.generate(inputs, sampling_params)
 
     for i, result in enumerate(results):
-        raw = result.outputs[0].text
+        output = result.outputs[0].text
         print(f"===================== Output {i} ==============================")
-        print(f"[raw]  {raw}")
-        print(f"[text] {post_process(raw)}")
+        print(output)
         print("===============================================================\n")
 
 
