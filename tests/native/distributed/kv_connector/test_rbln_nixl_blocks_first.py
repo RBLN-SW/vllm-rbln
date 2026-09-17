@@ -22,10 +22,14 @@ from collections import defaultdict
 from unittest.mock import MagicMock, patch
 
 import pytest
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    RblnNixlAgentMetadata,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
@@ -443,3 +447,63 @@ class TestDescIdsSpaceABlockByItsKvCount:
         # num_regions(2) * num_blocks(4) * kv(2) full descs come first.
         assert packed == 16 + 2
         assert min(self._ids(SPLIT, sw)) == 8 + 1
+
+
+class TestAPackedBlockNeedsAnEqualPeerBlockSize:
+    """The equal-TP peer hands its descriptors to upstream unchanged, and
+    upstream cuts a block into `block_size_ratio` equal pieces to pair each with
+    one peer block. Under a packed block that cut falls on the K/V boundary, so
+    the combination is refused rather than transferred wrong.
+    """
+
+    @staticmethod
+    def _worker(kv_per_block, block_size_ratio):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._kv_per_block = kv_per_block
+        w.transfer_topo = MagicMock()
+        w.transfer_topo.block_size_ratio.return_value = block_size_ratio
+        for check in (
+            "_check_split_axis_constraints",
+            "_check_mla_constraints",
+            "_check_d2d_region_pairing",
+        ):
+            setattr(w, check, lambda *a, **k: None)
+        # Unequal TP pairs by head band and refuses this on its own; the path
+        # this guards is the one that reaches upstream.
+        w._is_head_matched_peer = lambda _: False
+        return w
+
+    @staticmethod
+    def _meta():
+        meta = MagicMock(spec=RblnNixlAgentMetadata)
+        meta.pp_size = 1
+        meta.block_size = 64
+        return meta
+
+    def test_a_peer_with_a_different_block_size_is_refused(self):
+        worker = self._worker(PACKED, block_size_ratio=2)
+
+        with pytest.raises(RuntimeError, match="equal P/D block sizes"):
+            worker._validate_remote_agent_handshake(self._meta(), remote_tp_size=1)
+
+    @pytest.mark.parametrize(
+        "kv_per_block, block_size_ratio",
+        [
+            pytest.param(PACKED, 1, id="packed_equal_block_size"),
+            pytest.param(SPLIT, 2, id="separate_regions_unequal_block_size"),
+        ],
+    )
+    def test_upstream_still_gets_the_cases_it_handles(
+        self, kv_per_block, block_size_ratio
+    ):
+        # Separate regions are a whole block of K or of V, so upstream's cut
+        # stays between token ranges however the two sides size their blocks.
+        worker = self._worker(kv_per_block, block_size_ratio)
+        meta = self._meta()
+
+        with patch.object(
+            NixlBaseConnectorWorker, "_validate_remote_agent_handshake"
+        ) as upstream:
+            worker._validate_remote_agent_handshake(meta, remote_tp_size=1)
+
+        upstream.assert_called_once_with(meta, 1)

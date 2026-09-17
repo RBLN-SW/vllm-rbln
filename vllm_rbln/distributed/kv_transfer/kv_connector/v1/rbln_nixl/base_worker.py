@@ -567,6 +567,7 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # None here means something else than for `logical_kv_heads` above:
         # not "no head axis" but "no head band names it" (`_layer_kv_heads`).
         logical_total_kv_heads: list[int | None] = []
+        kv_per_block_seen: int | None = None
         for layer_name, cache_or_caches in xfer_buffers.items():
             layer_spec = self._unwrapped_layer_spec(layer_name)
             cache_list = self.transfer_topo.get_transfer_cache_regions(
@@ -587,8 +588,19 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
             if not is_mla_region and not isinstance(layer_spec, MambaSpec):
                 # One region back means the block holds both; two means each
                 # has its own. Read off what registered, not the config that
-                # chose it.
-                self._kv_per_block = 2 // len(cache_list)
+                # chose it. Anything else makes `2 //` yield 0, which surfaces
+                # as a division far from the layout that caused it.
+                assert len(cache_list) in (1, 2), (
+                    f"{layer_name}: an attention layer registers K and V as "
+                    f"one region or as two, got {len(cache_list)}"
+                )
+                kv_per_block = 2 // len(cache_list)
+                assert kv_per_block_seen in (None, kv_per_block), (
+                    "attention layers disagree on whether K and V share a "
+                    "block; the descriptor arithmetic is model-wide"
+                )
+                kv_per_block_seen = kv_per_block
+                self._kv_per_block = kv_per_block
             if self.transfer_topo.cross_layers_blocks:
                 physical_page_size = physical_page_size * len(
                     self.kv_cache_config.kv_cache_tensors
@@ -2465,6 +2477,18 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
                     nixl_agent_meta.registered_layer_names or None,
                 )
                 return
+            assert self.transfer_topo is not None
+            # Upstream cuts a block into `block_size_ratio` equal pieces and
+            # pairs each with one peer block. A block holding both K and V is
+            # cut on their boundary instead of between token ranges, and its
+            # descriptors carry no K/V axis to say which half is which.
+            if self._kv_per_block > 1 and (
+                self.transfer_topo.block_size_ratio(nixl_agent_meta.block_size) != 1
+            ):
+                raise RuntimeError(
+                    "RBLN NIXL: a KV cache that packs K and V into one block "
+                    "requires equal P/D block sizes."
+                )
             super()._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
             return
 

@@ -722,6 +722,14 @@ def _packed_kv(num_blocks):
     return _packed
 
 
+def _three_regions(num_blocks):
+    # Neither layout: `2 // 3` is 0, which the descriptor arithmetic divides by.
+    def _three(cache, spec):
+        return [MagicMock() for _ in range(3)]
+
+    return _three
+
+
 def _fake_nixl_rbln(xfer_result):
     module: Any = types.ModuleType("nixl_rbln")
     module.register_kv_regions = MagicMock(return_value=xfer_result)
@@ -771,6 +779,50 @@ class TestRegisterKvCachesImpl:
             worker._register_kv_caches_impl(kv_caches)
 
         assert worker._kv_per_block == 2
+
+    @pytest.mark.parametrize(
+        "regions_per_layer, message",
+        [
+            pytest.param(
+                [_packed_kv, _packed_kv, _split_kv],
+                "disagree on whether K and V share a block",
+                id="layers_disagree",
+            ),
+            pytest.param(
+                [_three_regions],
+                "registers K and V as one region or as two",
+                id="neither_one_nor_two",
+            ),
+        ],
+    )
+    def test_a_layer_count_the_descriptor_path_cannot_encode_is_refused(
+        self, monkeypatch, regions_per_layer, message
+    ):
+        # `2 // len(cache_list)` is the whole derivation, and it is model-wide:
+        # three regions make it 0 and surface as a division much later, and a
+        # layer that disagrees with its neighbours is silently the last one.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec()
+        worker._layer_specs = {f"l{i}": spec for i in range(len(regions_per_layer))}
+        kv_caches = _impl_kv_caches(
+            num_blocks=worker.num_blocks, names=list(worker._layer_specs)
+        )
+
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = [
+            build(worker.num_blocks)(kv_caches[name], spec)
+            for build, name in zip(regions_per_layer, kv_caches, strict=True)
+        ]
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            pytest.raises(AssertionError, match=message),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
 
     @pytest.mark.parametrize("stripe_width", [None, 0, 1])
     def test_registers_with_vram_segment_and_captures_xfer_tables(
