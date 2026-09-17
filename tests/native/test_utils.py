@@ -35,7 +35,7 @@ from .utils import (
 @pytest.mark.parametrize(
     ("key", "expected"),
     [
-        ("VLLM_RBLN_SORT_BATCH", True),
+        ("VLLM_RBLN_BATCH_ATTN_OPT", True),
         # Bare RBLN_ names belong to the host and the compiler, not to the
         # package under test, so the shell keeps them.
         ("RBLN_DEVICES", False),
@@ -60,7 +60,7 @@ def test_is_scrubbed_classification(key, expected):
 def test_scrub_env_removes_reports_and_preserves():
     """The three observable halves of the contract, in one pass."""
     environ = {
-        "VLLM_RBLN_SORT_BATCH": "1",
+        "VLLM_RBLN_BATCH_ATTN_OPT": "1",
         "RBLN_USE_CUSTOM_KERNEL": "1",
         "RBLN_DEVICES": "0,1",
         "PATH": "/usr/bin",
@@ -68,7 +68,7 @@ def test_scrub_env_removes_reports_and_preserves():
     removed = scrub_env(environ)
 
     # Reported with values, so pytest_report_header can show what it took.
-    assert removed == {"VLLM_RBLN_SORT_BATCH": "1", "RBLN_USE_CUSTOM_KERNEL": "1"}
+    assert removed == {"VLLM_RBLN_BATCH_ATTN_OPT": "1", "RBLN_USE_CUSTOM_KERNEL": "1"}
     # Mutated in place, and nothing else was touched.
     assert environ == {"RBLN_DEVICES": "0,1", "PATH": "/usr/bin"}
 
@@ -102,23 +102,32 @@ def test_extra_entries_are_real_additions():
 def test_native_env_pins_no_host_description():
     """The suite may pin behavior, never machine identity: pinning the device
     list or the SOC would hard-code one host's topology."""
-    host_description = {"RBLN_DEVICES", "RBLN_FORCE_NPU_NAME", "RBLN_TARGET_SOC"}
+    host_description = {
+        "RBLN_VISIBLE_DEVICES",
+        "RBLN_DEVICES",
+        "RBLN_FORCE_NPU_NAME",
+        "RBLN_TARGET_SOC",
+    }
     assert not (set(NATIVE_ENV) & host_description)
 
 
 class TestDeviceInventory:
     """The guard that keeps a multi-device test off a host with too few NPUs."""
 
-    def test_visible_list_wins_over_the_nodes(self, monkeypatch):
-        monkeypatch.setenv("RBLN_DEVICES", "3,4")
+    @pytest.mark.parametrize("name", ["RBLN_VISIBLE_DEVICES", "RBLN_DEVICES"])
+    def test_visible_list_wins_over_the_nodes(self, monkeypatch, name):
+        # The deprecated name counts too: this helper runs in the parent pytest
+        # process, before the platform plugin folds one name into the other.
+        monkeypatch.setenv(name, "3,4")
         assert rbln_device_count() == 2
 
     @pytest.mark.parametrize("blank", ["", " "])
     def test_blank_visible_list_falls_back_to_the_nodes(self, monkeypatch, blank):
         # Read as zero it would skip every device test on a host that has them.
+        monkeypatch.delenv("RBLN_VISIBLE_DEVICES", raising=False)
         monkeypatch.delenv("RBLN_DEVICES", raising=False)
         mounted = rbln_device_count()
-        monkeypatch.setenv("RBLN_DEVICES", blank)
+        monkeypatch.setenv("RBLN_VISIBLE_DEVICES", blank)
         assert rbln_device_count() == mounted
 
     @pytest.mark.parametrize(

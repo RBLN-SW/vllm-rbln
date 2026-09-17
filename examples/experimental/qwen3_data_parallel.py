@@ -66,7 +66,7 @@ def main(
 
     # CUDA_VISIBLE_DEVICES for each DP rank is set automatically inside the
     # engine processes.
-    os.environ["RBLN_DEVICES"] = str(local_dp_rank + 2)
+    os.environ["RBLN_VISIBLE_DEVICES"] = str(local_dp_rank + 2)
 
     # Sample prompts.
     prompts = [

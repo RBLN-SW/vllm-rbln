@@ -48,12 +48,9 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
-    def test_sub_block_size_defaults_to_max_num_batched_tokens(self, monkeypatch):
-        # With VLLM_RBLN_SUB_BLOCK_CACHE and no explicit sub_block_size, the
-        # scheduler uses max_num_batched_tokens as the sub_block_size.
-        import vllm_rbln.envs as envs
-
-        monkeypatch.setattr(envs, "VLLM_RBLN_SUB_BLOCK_CACHE", True)
+    def test_sub_block_size_defaults_to_max_num_batched_tokens(self):
+        # enable_sub_block_cache is on by default, so with no explicit
+        # sub_block_size the scheduler uses max_num_batched_tokens.
         sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,
@@ -62,6 +59,17 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
+
+    def test_additional_config_turns_sub_block_caching_off(self):
+        # Eligible otherwise, so the plain manager is the option's doing.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.
@@ -185,7 +193,7 @@ class TestTrySubBlockMatch:
         # match.num_tokens >= external -> match wins (ties favor local copy).
         sched = self._seeded_scheduler()
         query = make_request("q", list(range(8)) + [100] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         match, n = sched._try_sub_block_match(query, local, 8)
         assert match is not None
         assert n == 8
@@ -195,14 +203,14 @@ class TestTrySubBlockMatch:
         # external > match -> the match is released and (None, 0) returned.
         sched = self._seeded_scheduler()
         query = make_request("q", list(range(8)) + [100] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         assert sched._try_sub_block_match(query, local, 12) == (None, 0)
 
     def test_no_match_returns_none(self):
         # No sub-block match at all -> (None, 0).
         sched = self._seeded_scheduler()
         query = make_request("q", [500] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         assert sched._try_sub_block_match(query, local, 0) == (None, 0)
 
 
@@ -1368,3 +1376,62 @@ class TestDeferredBlockFree:
         assert request.request_id not in manager._req_sub_hashes
         assert request.request_id not in manager._pending_indexing
         assert partial_block.block_hash is not None
+
+
+class TestDraftingLookahead:
+    """A first chunk was allocated with no drafting lookahead at all, so a
+    request whose prefill ends in a block's last slots got no page for the draft
+    block that follows it. Upstream zeroes the lookahead only to keep the local
+    and remote block counts matching under an async P/D load; that is the
+    condition here, rather than every request on its first chunk."""
+
+    LOOKAHEAD = 4
+
+    PROMPT = 32
+
+    def _lookahead_seen(self, use_kv_connector=None, remote_prefill=False):
+        sched = create_rbln_scheduler(
+            num_speculative_tokens=3,
+            use_kv_connector=use_kv_connector,
+            enable_prefix_caching=True,
+        )
+        # ngram is what the helper builds without a draft model, so the two
+        # attributes a drafting method would set are set here instead -- they
+        # are what the branch reads.
+        sched.use_eagle = True
+        sched.num_lookahead_tokens = self.LOOKAHEAD
+
+        seen: list[int] = []
+        allocate_slots = sched.kv_cache_manager.allocate_slots
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs["num_lookahead_tokens"])
+            return allocate_slots(*args, **kwargs)
+
+        sched.kv_cache_manager.allocate_slots = spy
+
+        request = create_requests(1, num_tokens=self.PROMPT)[0]
+        if remote_prefill:
+            request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        sched.schedule()
+        return seen
+
+    def test_a_first_chunk_gets_the_drafting_lookahead(self):
+        assert self._lookahead_seen() == [self.LOOKAHEAD]
+
+    def test_a_synchronous_remote_load_keeps_it(self):
+        seen = self._lookahead_seen(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=False),
+            remote_prefill=True,
+        )
+        assert seen == [self.LOOKAHEAD]
+
+    def test_an_async_remote_load_still_gets_none(self):
+        """The case upstream zeroes it for: an extra block here would leave the
+        local and remote block counts mismatched."""
+        seen = self._lookahead_seen(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=True),
+            remote_prefill=True,
+        )
+        assert seen == [0]

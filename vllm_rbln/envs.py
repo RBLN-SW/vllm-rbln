@@ -54,19 +54,19 @@ if TYPE_CHECKING:
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = False
+    VLLM_RBLN_DISABLE_WORKER_FAIL_FAST: bool = False
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # True unless device-tensor mode is explicitly disabled.
     VLLM_RBLN_AUTO_PORT: bool = True
     VLLM_RBLN_ENFORCE_MODEL_FP32: bool = False
-    VLLM_RBLN_NUM_RAY_NODES: int = 1
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = False
+    VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN: bool = False
     # --- ATTENTION ---
     VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     # --- MODEL INPUT / SCHEDULING ---
-    VLLM_RBLN_SORT_BATCH: bool = False
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_SUB_BLOCK_SIZE: int = 0
     # --- MOE ---
@@ -271,6 +271,11 @@ environment_variables = {
             in ("true", "1")
         )
     ),
+    # Disable only for debugging worker failures without terminating the worker.
+    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: os.environ.get(
+        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False"
+    ).lower()
+    in ("true", "1"),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
@@ -280,15 +285,22 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # Number of Ray nodes
-    "VLLM_RBLN_NUM_RAY_NODES": lambda: int(
-        os.environ.get("VLLM_RBLN_NUM_RAY_NODES", 1)
-    ),
     # --- DYNAMIC KV CACHE ---
-    # Size the KV cache from the compiled artifact instead of the estimate
+    # Size the KV cache from the compiled artifact instead of the estimate.
+    # The dry-run variable below implies it, but only when this one is unset:
+    # an explicit 0 is a decision, not a default to override.
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
         lambda: (
-            os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "False").lower()
+            os.environ["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"].lower() in ("true", "1")
+            if "VLLM_RBLN_USE_DYNAMIC_KV_CACHE" in os.environ
+            else os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()
+            in ("true", "1")
+        )
+    ),
+    # Compute and log the block count, resize nothing
+    "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "False").lower()
             in ("true", "1")
         )
     ),
@@ -312,9 +324,6 @@ environment_variables = {
         )
     ),
     # --- MODEL INPUT / SCHEDULING ---
-    "VLLM_RBLN_SORT_BATCH": (
-        lambda: os.environ.get("VLLM_RBLN_SORT_BATCH", "False").lower() in ("true", "1")
-    ),
     # Enable sub-block prefix caching.
     # Sub-block size equals max_num_batched_tokens (prefill chunk size).
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
@@ -394,15 +403,43 @@ environment_variables = {
 # Partition for the mega-cache config signature: COMPILE vars are hashed into
 # the bundle key, NON_COMPILE vars are ignored. test_mega_cache.py asserts the
 # two sets exactly cover environment_variables — classify every new var here.
+# An `RBLNConfig` field goes in NON_COMPILE: `RBLNConfig.compute_hash()` already
+# keys the bundle on the resolved value, whichever route supplied it.
 RBLN_COMPILE_ENV = frozenset(
     {
         "VLLM_RBLN_USE_VLLM_MODEL",
-        "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
-        "VLLM_RBLN_COMPILE_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
-        "VLLM_RBLN_ENFORCE_MODEL_FP32",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
+        # Compile-affecting only because the compiler bakes the mark_dynamic'd
+        # KV dim's extent: a dry run traces at the count vllm sized, the real
+        # mode at the compile hint. Move to NON_COMPILE once that extent stops
+        # shaping the graph; the two then share a bundle.
+        "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
+    }
+)
+
+RBLN_NON_COMPILE_ENV = frozenset(
+    {
+        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST",
+        # sampler graphs compile with use_cache=False, never enter the bundle
+        "VLLM_RBLN_SAMPLER",
+        "VLLM_RBLN_COMPILE_STRICT_MODE",
+        "VLLM_RBLN_ENABLE_WARM_UP",
+        "VLLM_RBLN_METRICS",
+        "VLLM_RBLN_METRICS_FILE",
+        "VLLM_RBLN_METRICS_DIR",
+        "VLLM_RBLN_NUMA",
+        "VLLM_RBLN_COMPILE_ONLY",
+        "VLLM_RBLN_DISABLE_OFFLOAD",
+        "VLLM_RBLN_AUTO_PORT",
+        "VLLM_RBLN_SUB_BLOCK_CACHE",
+        "VLLM_RBLN_SUB_BLOCK_SIZE",
+        "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
+        # RBLNConfig fields: the config hash keys the bundle on these
+        "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
+        "VLLM_RBLN_COMPILE_MODEL",
+        "VLLM_RBLN_ENFORCE_MODEL_FP32",
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",
@@ -416,27 +453,6 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT",
         "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS",
         "VLLM_RBLN_USE_W8A8",
-    }
-)
-
-RBLN_NON_COMPILE_ENV = frozenset(
-    {
-        # sampler graphs compile with use_cache=False, never enter the bundle
-        "VLLM_RBLN_SAMPLER",
-        "VLLM_RBLN_COMPILE_STRICT_MODE",
-        "VLLM_RBLN_NUM_RAY_NODES",
-        "VLLM_RBLN_ENABLE_WARM_UP",
-        "VLLM_RBLN_METRICS",
-        "VLLM_RBLN_METRICS_FILE",
-        "VLLM_RBLN_METRICS_DIR",
-        "VLLM_RBLN_NUMA",
-        "VLLM_RBLN_COMPILE_ONLY",
-        "VLLM_RBLN_DISABLE_OFFLOAD",
-        "VLLM_RBLN_AUTO_PORT",
-        "VLLM_RBLN_SORT_BATCH",
-        "VLLM_RBLN_SUB_BLOCK_CACHE",
-        "VLLM_RBLN_SUB_BLOCK_SIZE",
-        "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
     }
 )
 

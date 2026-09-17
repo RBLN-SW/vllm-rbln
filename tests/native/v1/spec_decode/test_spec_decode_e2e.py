@@ -16,7 +16,10 @@
 # target, so greedy output with a method ON must equal spec OFF. Covers ngram,
 # suffix, eagle, eagle3 and medusa.
 
+import warnings
+
 import pytest
+from vllm.config import SpeculativeConfig
 
 from tests.native.utils import check_outputs_almost_equal
 from tests.native.v1.spec_decode.utils import (
@@ -77,19 +80,6 @@ SPEC_METHODS = {
 # medusa is excluded: its only small ungated checkpoint is random-init, so
 # acceptance there would measure model quality, not the code path.
 _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3"}
-_XFAIL_REASON = {
-    "eagle3": "RBLNCompileError: RblnTensorAllocateDevTensorKey pass fails on the "
-    "eagle3 aux-hidden-state graph",
-}
-
-
-def _method_param(method: str):
-    if method in _XFAIL_REASON:
-        return pytest.param(
-            method,
-            marks=pytest.mark.xfail(reason=_XFAIL_REASON[method], run=False),
-        )
-    return method
 
 
 @pytest.fixture(autouse=True)
@@ -97,8 +87,33 @@ def _use_reference_sampler(monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
 
 
+@pytest.fixture(autouse=True)
+def _pin_aux_layers(request, monkeypatch):
+    from vllm_rbln import envs
+
+    num_layers = envs.VLLM_RBLN_NUM_HIDDEN_LAYERS
+    if request.node.callspec.params["method"] != "eagle3" or num_layers == 0:
+        return
+
+    if num_layers < 3:
+        warnings.warn(
+            f"eagle3 needs at least three aux hidden states: raising "
+            f"VLLM_RBLN_NUM_HIDDEN_LAYERS from {num_layers} to 3",
+            stacklevel=2,
+        )
+        monkeypatch.setenv("VLLM_RBLN_NUM_HIDDEN_LAYERS", "3")
+
+    original = SpeculativeConfig.__post_init__
+
+    def post_init(self) -> None:
+        original(self)
+        self.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids = [0, 1, 2]
+
+    monkeypatch.setattr(SpeculativeConfig, "__post_init__", post_init)
+
+
 @pytest.mark.model_compile
-@pytest.mark.parametrize("method", [_method_param(m) for m in SPEC_METHODS])
+@pytest.mark.parametrize("method", SPEC_METHODS)
 def test_speculative_decoding_matches_reference(
     vllm_runner, method: str, whole_model: bool
 ) -> None:

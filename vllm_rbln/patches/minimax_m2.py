@@ -90,7 +90,7 @@ def _forward_qk(
         "([B*L, H]) around forward_qkv and reshaping back, although a numerical no-op "
         "in eager, corrupts attention on RBLN: the flatten/unflatten roundtrip "
         "perturbs the [B, L, H] layout that the compiled rotary + flash-attention path "
-        "(and VLLM_RBLN_BATCH_ATTN_OPT / VLLM_RBLN_SORT_BATCH) is built around. "
+        "(and VLLM_RBLN_BATCH_ATTN_OPT) is built around. "
         "Instead we split qkv on the last dim (no reshape) and apply a locally "
         "reimplemented forward_qk -- plain RMSNorm over dim=-1, which is "
         "layout-invariant -- so q/k/v reach rotary/attn in the exact layout 0.22 used. "

@@ -29,16 +29,20 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
-import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
+from vllm_rbln.config import RBLNConfig, get_rbln_config
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
+from vllm_rbln.v1.attention.kv_cache_bindings import (
+    KVCacheViewInfo,
+    attention_block_axis,
+)
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 from ..ops.attention_naive import (
     attention_naive_decode,
@@ -56,9 +60,10 @@ from ..ops.flash_causal_attention_naive import (
     flash_causal_attention_naive_decode,
     flash_causal_attention_naive_prefill,
 )
-from ..ops.sliding_window_attention_naive import (
+from ..ops.sliding_window_attention import (
     sliding_window_attention_naive_decode,
     sliding_window_attention_naive_prefill,
+    sliding_window_attention_v1,
 )
 
 logger = init_logger(__name__)
@@ -112,11 +117,15 @@ class RBLNFlashAttentionBackend(AttentionBackend):
         # G - num_heads / num_kv_heads = 32/8 = 4
         # D - head_size
         # L - q_len
-        list of kv cache = [num_layer][kv=2]
-        kv_cache_shape= [B, H, 1, S, D]
+        list of kv cache = [num_layer]
+        kv_cache_shape= [B, kv=2, H, 1, S, D], or [kv=2, B, H, 1, S, D] where
+            the kernels reading it are rbln_triton_ops
         query_shape   = [1, H, G, L, D]
         """
-        return (2, num_blocks, num_kv_heads, 1, block_size, head_size)
+        shape = [2, num_kv_heads, 1, block_size, head_size]
+        axis = attention_block_axis(get_rbln_config().use_custom_kernel)
+        shape.insert(axis, num_blocks)
+        return tuple(shape)
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -134,11 +143,13 @@ class RBLNFlashAttentionMetadata:
     kv_caches: list[torch.Tensor] | None = None
     kv_cache_view_infos: list[KVCacheViewInfo] | None = None
 
-    # For sliding window attention
+    swa_appends: bool = False
     cache_seq_lens: torch.Tensor | None = None
     cache_offsets: torch.Tensor | None = None
     local_block_tables: torch.Tensor | None = None
     swa_attn_masks: torch.Tensor | None = None
+
+    use_custom_kernel: bool = False
 
     def __post_init__(self):
         # FIXME(RBLN): to_dynamic_index does not accept int64 inputs.Thus in the
@@ -149,7 +160,7 @@ class RBLNFlashAttentionMetadata:
         # supported dtype here. This can be removed when the triton-rbln kernel path
         # performs the same dtype conversion.
 
-        if not envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+        if not self.use_custom_kernel:
             return
 
         self.seq_lens = self.seq_lens.to(torch.int32)
@@ -176,11 +187,30 @@ class RBLNFlashAttentionMetadataBuilder(
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.scheduler_config = vllm_config.scheduler_config
+        rbln_config: RBLNConfig = vllm_config.additional_config
+        self.use_custom_kernel = rbln_config.use_custom_kernel
 
         self.block_size = kv_cache_spec.block_size
         self.chunked_prefill_size = self.scheduler_config.max_num_batched_tokens
         self.enforce_eager = get_current_vllm_config().model_config.enforce_eager
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
+        # Causality is per model, not per process: each model builds its
+        # attention under its own config, and upstream sets `use_non_causal` on
+        # the draft config only, so a non-causal drafter and a causal target
+        # coexist in one process.
+        self.is_causal = (
+            rbln_config.use_flash_causal_attn
+            and not vllm_config.attention_config.use_non_causal
+        )
+
+        self.swa_appends = isinstance(
+            kv_cache_spec, SlidingWindowSpec
+        ) and not isinstance(kv_cache_spec, RBLNSlidingWindowSpec)
+        if self.swa_appends and self.use_custom_kernel:
+            raise NotImplementedError(
+                "Sliding window attention on REBEL CR13 is not supported with "
+                "VLLM_RBLN_USE_CUSTOM_KERNEL=1: rbln_triton_ops has no "
+                "sliding_window_attention_v1 kernel."
+            )
 
         self._staged: dict[tuple, torch.Tensor] = {}
 
@@ -216,6 +246,8 @@ class RBLNFlashAttentionMetadataBuilder(
         positions: torch.Tensor,
         batch_pad: int,
         is_prefill: bool,
+        skip_attn_masks: bool = False,
+        back_pad: torch.Tensor | None = None,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
@@ -230,6 +262,8 @@ class RBLNFlashAttentionMetadataBuilder(
         seq_idx = positions[query_start_loc_cpu[:num_reqs]].view(-1, 1)
         max_seq_len = self.model_config.max_model_len
 
+        # Masks are host-built at `max_model_len` width and staged every step,
+        # so a caller that replaces them opts out with `skip_attn_masks`.
         attn_masks = None
         if is_prefill:
             # NOTE(RBLN): block_tables_tensor for prefill must be a 1D tensor.
@@ -237,7 +271,7 @@ class RBLNFlashAttentionMetadataBuilder(
             # NOTE(RBLN): entries beyond num_blocks_per_row must stay 0 -- the
             # padded prefill's multi-block store can address block start_blk+1.
             # See docs/sub_block_prefix_caching.md.
-            if not self.is_causal:
+            if not self.is_causal and not skip_attn_masks:
                 prefill_chunk_size = self.chunked_prefill_size
                 chunked_attention_mask = torch.zeros(
                     1,
@@ -261,7 +295,7 @@ class RBLNFlashAttentionMetadataBuilder(
         else:
             seq_idx = rbln_utils.pad(seq_idx, 0, batch_pad)
             block_tables_tensor = rbln_utils.pad(block_tables_tensor, 0, batch_pad)
-            if not self.is_causal:
+            if not self.is_causal and not skip_attn_masks:
                 decode_attention_mask = torch.zeros(
                     batch_pad,
                     1,
@@ -278,8 +312,15 @@ class RBLNFlashAttentionMetadataBuilder(
         cache_offsets = None
         local_block_tables = None
         swa_attn_masks = None
-        if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
+        # RBLNSlidingWindowSpec is the shift kernel's cache layout, so its
+        # absence is the append path, which needs none of these.
+        if isinstance(self.kv_cache_spec, RBLNSlidingWindowSpec):
+            sliding_window = self.kv_cache_spec.sliding_window
             num_computed_tokens = num_computed_tokens[:num_reqs].view(-1, 1)
+            if back_pad is not None:
+                num_computed_tokens = num_computed_tokens + back_pad[:num_reqs].view(
+                    -1, 1
+                )
             seq_lens = seq_lens_cpu[:num_reqs].view(-1, 1)
             query_lens = seq_lens - num_computed_tokens
             cache_seq_lens = torch.clamp(num_computed_tokens, max=sliding_window)
@@ -301,10 +342,12 @@ class RBLNFlashAttentionMetadataBuilder(
             block_tables=self._stage(block_tables_tensor, "block_tables"),
             is_prefill=is_prefill,
             attn_masks=self._stage(attn_masks, "attn_masks"),
+            swa_appends=self.swa_appends,
             cache_seq_lens=self._stage(cache_seq_lens, "cache_seq_lens"),
             cache_offsets=self._stage(cache_offsets, "cache_offsets"),
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
             swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
+            use_custom_kernel=self.use_custom_kernel,
         )
 
         return attn_metadata
@@ -329,6 +372,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         sinks: torch.Tensor | None = None,
     ) -> None:
         vllm_config = get_current_vllm_config()
+        rbln_config: RBLNConfig = vllm_config.additional_config
+        self.compile_model = rbln_config.compile_model
+        self.use_custom_kernel = rbln_config.use_custom_kernel
         self.enforce_eager = vllm_config.model_config.enforce_eager
         self.device = vllm_config.device_config.device
         self.block_size = vllm_config.cache_config.block_size
@@ -391,8 +437,11 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if len(self.sinks.size()) == 1:
                 self.sinks = self.sinks[:, None]
 
-        self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
-        self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
+        self.is_causal = (
+            rbln_config.use_flash_causal_attn
+            and not vllm_config.attention_config.use_non_causal
+        )
+        self.is_batch_attention_opt = rbln_config.use_batch_attn_opt
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
         )
@@ -405,7 +454,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # with no scales, so reject those combinations here rather than
         # producing garbage. All the dispatch inputs are fixed by __init__.
         if self.kv_cache_dtype.startswith("fp8"):
-            if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+            if self.use_custom_kernel:
                 raise NotImplementedError(
                     "fp8 KV cache is not supported with "
                     "VLLM_RBLN_USE_CUSTOM_KERNEL=1: the rbln_triton_ops "
@@ -438,11 +487,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             query:  shape = [num_tokens, num_heads, head_size]
             key:    shape = [num_tokens, num_kv_heads, head_size]
             value:  shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache shape= [2, num_blocks, num_kv_heads, 1,
-                                block_size, head_size]
+            kv_cache shape= `get_kv_cache_shape`, whose num_blocks and K/V
+                              axes swap with the kernel namespace in use
 
         Shape that we expect:
-            kv_cache  = [2, num_blocks, num_kv_heads, 1, block_size, head_size]
             key       = [1, num_kv_heads, 1, block_size, head_size]
             query     = [1, num_kv_heads, 4, query_len, head_size]
             key_t     = [1, num_kv_heads, 1, head_size, block_size]
@@ -493,7 +541,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # seq_lens, block_table, slot_mapping}
         # output = {attn_output}
         # q, k, v = [batch,H,G,L,D]
-        # key/value cache = [B,H,1,S,D]
+        # key/value cache = [B,kv=2,H,1,S,D] or [kv=2,B,H,1,S,D]
         # mask  = [1,1,1,L,C]
         # o = [batch,H,G,L,D]
 
@@ -509,39 +557,60 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
         if self.sliding_window is not None:
-            assert self.sliding_window == kv_cache.size(-2), (
-                "SWA kernel_block_size must match window_size"
-            )
-            assert attn_metadata.cache_seq_lens is not None
-            assert attn_metadata.cache_offsets is not None
-
-            if attn_metadata.is_prefill:
-                attn_output = sliding_window_attention_naive_prefill(
+            if attn_metadata.swa_appends:
+                # `seq_lens` is the absolute position the chunk starts at, not
+                # a length: the op resolves the window's blocks from it and the
+                # whole table.
+                attn_output = sliding_window_attention_v1(
                     query,
                     key,
                     value,
                     kv_cache,
-                    attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
+                    attn_metadata.seq_lens,
                     self.scale,
-                    attn_metadata.local_block_tables,
+                    attn_metadata.block_tables,
+                    self.sliding_window,
                     self.sinks,
+                    compile_model=self.compile_model,
                 )
             else:
-                attn_output = sliding_window_attention_naive_decode(
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata.cache_seq_lens,
-                    attn_metadata.cache_offsets,
-                    self.scale,
-                    attn_metadata.local_block_tables,
-                    attn_metadata.swa_attn_masks
-                    if self.is_batch_attention_opt and b_size > 1
-                    else None,
-                    self.sinks,
+                assert self.sliding_window == kv_cache.size(-2), (
+                    "SWA kernel_block_size must match window_size"
                 )
+                assert attn_metadata.cache_seq_lens is not None
+                assert attn_metadata.cache_offsets is not None
+
+                if attn_metadata.is_prefill:
+                    attn_output = sliding_window_attention_naive_prefill(
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        self.sinks,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
+                    )
+                else:
+                    attn_output = sliding_window_attention_naive_decode(
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata.cache_seq_lens,
+                        attn_metadata.cache_offsets,
+                        self.scale,
+                        attn_metadata.local_block_tables,
+                        attn_metadata.swa_attn_masks
+                        if self.is_batch_attention_opt and b_size > 1
+                        else None,
+                        self.sinks,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
+                    )
 
         elif self.is_causal:
             if self.is_normal:
@@ -555,6 +624,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
                     attn_output = causal_attention_naive_decode(
@@ -566,6 +637,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
                     )
             else:
                 # * batched attention - seq_lens[B, 1] == seq_idx,
@@ -588,6 +661,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         k_quantize_scale,
                         v_quantize_scale,
                         cache_dtype,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
                     attn_output = flash_causal_attention_naive_decode(
@@ -602,6 +677,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         k_quantize_scale,
                         v_quantize_scale,
                         cache_dtype,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
                     )
         else:
             if self.is_normal:
@@ -616,6 +693,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
                     attn_output = attention_naive_decode(
@@ -628,6 +707,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
                     )
             else:
                 if attn_metadata.is_prefill:
@@ -641,6 +722,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
                     attn_output = flash_attention_naive_decode(
@@ -653,11 +736,13 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
+                        compile_model=self.compile_model,
+                        use_custom_kernel=self.use_custom_kernel,
                     )
 
         # 2. attention output reshape for attention backend return
         # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch*L,H*4,D]
-        if self.enforce_eager or not envs.VLLM_RBLN_COMPILE_MODEL:
+        if self.enforce_eager or not self.compile_model:
             attn_output = attn_output.reshape(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)

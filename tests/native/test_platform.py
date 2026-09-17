@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,7 +34,11 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
 from tests.native.vllm_config import local_model_path
-from vllm_rbln.platform import RBLN_DEFAULT_MAX_NUM_SEQS, RblnPlatform
+from vllm_rbln.config import RBLNConfig
+from vllm_rbln.platform import (
+    RBLN_DEFAULT_MAX_NUM_SEQS,
+    RblnPlatform,
+)
 
 # Small, non-gated and already needed by the spec-decode tests; a config build
 # never touches the device.
@@ -120,7 +125,7 @@ class TestPlatformIdentity:
             # Ops dispatch on CPU even when tensors live on the device.
             ("dispatch_key", "CPU"),
             # RBLNWorker._init_device_env narrows this var per rank.
-            ("device_control_env_var", "RBLN_DEVICES"),
+            ("device_control_env_var", "RBLN_VISIBLE_DEVICES"),
             ("simple_compile_backend", "bypass"),
         ],
     )
@@ -198,20 +203,20 @@ class TestRejectedConfigs:
             reconfigure(_ranks(data_parallel_size=2, max_num_seqs=5))
 
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
-    def test_dp_and_ep_need_the_moe_tokens_mask(self, monkeypatch, reconfigure, ranks):
-        monkeypatch.setattr(platform.envs, "VLLM_RBLN_USE_MOE_TOKENS_MASK", False)
+    def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_MOE_TOKENS_MASK"):
-            reconfigure(_ranks(**ranks))
+            reconfigure(_ranks(moe_tokens_mask=False, **ranks))
 
-    def test_tp_inherits_neither_dp_rule(self, monkeypatch, reconfigure):
+    def test_tp_inherits_neither_dp_rule(self, reconfigure):
         # Both rules guard padding introduced by DP multicast, so TP alone must
         # pass even with the mask off and an indivisible budget.
-        monkeypatch.setattr(platform.envs, "VLLM_RBLN_USE_MOE_TOKENS_MASK", False)
-        reconfigure(_ranks(tensor_parallel_size=2, max_num_seqs=5))
+        reconfigure(
+            _ranks(tensor_parallel_size=2, max_num_seqs=5, moe_tokens_mask=False)
+        )
 
     def test_moe_tokens_mask_defaults_on(self):
-        # The error above calls 1 the default; a flipped default breaks DP.
-        assert platform.envs.VLLM_RBLN_USE_MOE_TOKENS_MASK is True
+        # The error above calls it the default; a flipped default breaks DP.
+        assert RBLNConfig().use_moe_tokens_mask is True
 
 
 def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int = 2):
@@ -238,7 +243,13 @@ def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int
     return mutate
 
 
-def _ranks(*, ep: bool = False, max_num_seqs: int | None = None, **parallel):
+def _ranks(
+    *,
+    ep: bool = False,
+    max_num_seqs: int | None = None,
+    moe_tokens_mask: bool | None = None,
+    **parallel,
+):
     """A mutator that widens a config to more ranks."""
 
     def mutate(config: VllmConfig) -> None:
@@ -248,6 +259,10 @@ def _ranks(*, ep: bool = False, max_num_seqs: int | None = None, **parallel):
             config.parallel_config.enable_expert_parallel = True
         if max_num_seqs is not None:
             config.scheduler_config.max_num_seqs = max_num_seqs
+        if moe_tokens_mask is not None:
+            config.additional_config = replace(
+                config.additional_config, use_moe_tokens_mask=moe_tokens_mask
+            )
 
     return mutate
 
@@ -284,11 +299,8 @@ class TestDtype:
         )
         assert config.model_config.dtype == torch.float32
 
-    def test_enforce_fp32_overrides_a_supported_dtype(self, monkeypatch, reconfigure):
-        monkeypatch.setattr(platform.envs, "VLLM_RBLN_ENFORCE_MODEL_FP32", True)
-        config = reconfigure(
-            lambda config: setattr(config.model_config, "dtype", torch.float16)
-        )
+    def test_enforce_fp32_overrides_a_supported_dtype(self):
+        config = _build(dtype="float16", additional_config={"enforce_model_fp32": True})
         assert config.model_config.dtype == torch.float32
 
 
@@ -305,17 +317,19 @@ class TestWorkerAndScheduler:
             == "pkg.mod.MyWorker"
         )
 
-    def test_scheduler_is_replaced_unconditionally(self, monkeypatch, reconfigure):
+    def test_scheduler_is_replaced_unconditionally(self, reconfigure):
         # Unlike worker_cls there is no "auto" guard: whatever was asked for is
         # overwritten. Reading the expectation back off the config under test
         # would agree with whatever the platform decided, so the carriers are
         # pinned off and the sync scheduler named outright.
-        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
-        config = reconfigure(
-            lambda config: setattr(
-                config.scheduler_config, "scheduler_cls", "pkg.mod.MyScheduler"
+
+        def mutate(config: VllmConfig) -> None:
+            config.scheduler_config.scheduler_cls = "pkg.mod.MyScheduler"
+            config.additional_config = replace(
+                config.additional_config, use_custom_sampler=False
             )
-        )
+
+        config = reconfigure(mutate)
         assert (
             config.scheduler_config.scheduler_cls
             == "vllm_rbln.v1.core.rbln_scheduler.RBLNScheduler"
@@ -403,7 +417,8 @@ class TestSchedulerOverrides:
 
         def mutate(config: VllmConfig) -> None:
             config.scheduler_config.async_scheduling = True
-            config.speculative_config = object()
+            # eagle is a method vLLM does allow async scheduling with.
+            config.speculative_config = SimpleNamespace(method="eagle")
 
         config = reconfigure(mutate)
         assert config.scheduler_config.async_scheduling is False
@@ -446,6 +461,18 @@ class TestEnforceEager:
         else:
             with pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
                 reconfigure(mutate)
+
+    def test_v32_mtp_eager_force_is_undone(self, reconfigure):
+        # Upstream forces the drafter eager for deepseek_v32 MTP; RBLN compiles it
+        # instead, so the reset has to win back over that force.
+        def mutate(config):
+            config.model_config.hf_text_config.model_type = "deepseek_v32"
+            config.model_config.enforce_eager = False
+            config.speculative_config = SimpleNamespace(
+                method="mtp", enforce_eager=True
+            )
+
+        assert reconfigure(mutate).speculative_config.enforce_eager is False
 
 
 def _selector(*, use_mla: bool = False, use_sparse: bool = False) -> SimpleNamespace:
@@ -522,6 +549,19 @@ class TestDeviceName:
         with pytest.raises(RuntimeError, match="RBLN_FORCE_NPU_NAME"):
             RblnPlatform.get_device_name()
 
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("RBLN-CR13", True),
+            (" rbln-cr13 ", True),
+            ("RBLN-CR03", False),
+            ("RBLN-CA25", False),
+        ],
+    )
+    def test_is_cr13_matches_the_exact_soc_name(self, monkeypatch, name, expected):
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
+        assert RblnPlatform.is_cr13() is expected
+
 
 class TestAdditionalForwardContext:
     def test_kv_cache_bases_passes_through(self):
@@ -556,6 +596,46 @@ class TestPreRegisterAndUpdate:
         before = EngineArgs.get_batch_defaults.__func__
         RblnPlatform.pre_register_and_update()
         assert EngineArgs.get_batch_defaults.__func__ is before
+
+
+class TestDeprecatedDeviceControlEnvVar:
+    """``RBLN_DEVICES`` is folded into ``device_control_env_var`` and unset.
+
+    Unsetting is the point: the runtime takes both names but prefers the
+    deprecated one, so one left behind would override the pool a worker
+    narrows itself to.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_env(self):
+        # patch.dict, not monkeypatch.delenv: the code under test creates the
+        # current name, and a key a test never held is not restored.
+        with patch.dict(os.environ):
+            os.environ.pop("RBLN_DEVICES", None)
+            os.environ.pop(RblnPlatform.device_control_env_var, None)
+            yield
+
+    def test_legacy_value_carries_over_and_the_name_goes(self):
+        os.environ["RBLN_DEVICES"] = "4,5"
+
+        RblnPlatform.pre_register_and_update()
+
+        assert os.environ[RblnPlatform.device_control_env_var] == "4,5"
+        assert "RBLN_DEVICES" not in os.environ
+
+    def test_the_current_name_wins_when_both_are_set(self):
+        os.environ["RBLN_DEVICES"] = "4,5"
+        os.environ[RblnPlatform.device_control_env_var] = "6,7"
+
+        RblnPlatform.pre_register_and_update()
+
+        assert os.environ[RblnPlatform.device_control_env_var] == "6,7"
+        assert "RBLN_DEVICES" not in os.environ
+
+    def test_nothing_is_invented_when_neither_is_set(self):
+        RblnPlatform.pre_register_and_update()
+
+        assert RblnPlatform.device_control_env_var not in os.environ
 
 
 class TestCustomKvCacheSpecs:
@@ -619,6 +699,38 @@ def test_running_the_hook_twice_changes_nothing(configured, reconfigure):
     )
 
 
+def test_default_single_worker_uses_uni_without_warning(caplog):
+    config = _build()
+    assert config.parallel_config.distributed_executor_backend == "uni"
+    assert not any(
+        record.name == platform.logger.name
+        and "distributed executor backend" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("backend", [None, "mp", "uni", "ray", "external_launcher"])
+def test_executor_backend_warning_preserves_selection(reconfigure, caplog, backend):
+    caplog.clear()
+    config = reconfigure(
+        lambda config: setattr(
+            config.parallel_config, "distributed_executor_backend", backend
+        )
+    )
+    assert config.parallel_config.distributed_executor_backend == backend
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == platform.logger.name
+        and "distributed executor backend" in record.getMessage()
+    ]
+    if backend in ("ray", "external_launcher"):
+        assert len(messages) == 1
+        assert "Keeping the selected" in messages[0]
+    else:
+        assert messages == []
+
+
 class TestKnownGaps:
     """Behaviour pinned as-is because it looks unintended; see
     docs/test_note.log."""
@@ -634,12 +746,6 @@ class TestKnownGaps:
         )
         assert RblnPlatform._uses_sliding_window(config.model_config.hf_config)
         assert config.cache_config.enable_prefix_caching is True
-
-    def test_a_non_mp_executor_backend_is_only_warned_about(self, configured):
-        # The warning says "fallback to mp" but nothing assigns, and vLLM's own
-        # default for world_size 1 is "uni" -- so it fires on every single-process
-        # run and Executor.get_class still builds a UniProcExecutor.
-        assert configured.parallel_config.distributed_executor_backend == "uni"
 
 
 class TestDynamicKvConfig:
@@ -667,21 +773,38 @@ class TestDynamicKvConfig:
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL=1"):
             RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
-    def test_mla_is_rejected(self):
-        with pytest.raises(ValueError, match="MLA"):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
+    def test_mla_passes(self):
+        RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
 
-    def test_speculative_decoding_is_rejected(self):
-        with pytest.raises(ValueError, match="speculative"):
-            RblnPlatform._validate_dynamic_kv_config(
-                self._cfg(speculative_config=SimpleNamespace())
-            )
+    def test_speculative_decoding_passes(self):
+        RblnPlatform._validate_dynamic_kv_config(
+            self._cfg(speculative_config=SimpleNamespace())
+        )
 
     def test_a_kv_transfer_connector_is_rejected(self):
         with pytest.raises(ValueError, match="KV transfer"):
             RblnPlatform._validate_dynamic_kv_config(
                 self._cfg(kv_transfer_config=SimpleNamespace())
             )
+
+    def test_a_dry_run_reports_every_refusal_instead_of_raising(
+        self, monkeypatch, caplog
+    ):
+        """A dry run changes nothing, so refusing would stop a run the flag off
+        would have served. Each shape is reported and the run continues."""
+        monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "1")
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
+        with (
+            patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
+            caplog.at_level("WARNING"),
+        ):
+            RblnPlatform._validate_dynamic_kv_config(
+                self._cfg(kv_transfer_config=SimpleNamespace())
+            )
+        assert "VLLM_RBLN_USE_VLLM_MODEL=1" in caplog.text
+        assert "VLLM_RBLN_USE_DEVICE_TENSOR=1" in caplog.text
+        assert "KV transfer connector" in caplog.text
+        assert caplog.text.count("dynamic KV cache dry run:") == 3
 
     def test_device_tensor_off_is_refused(self):
         with (
@@ -703,3 +826,34 @@ class TestDynamicKvConfig:
             monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
             reconfigure(lambda config: None)
             assert len(seen) == 1
+
+
+class TestDflashTokenBudget:
+    """DFlash reserves no drafting slots, so the auto-computed budget is the
+    whole of `max_num_batched_tokens`; anything else was set explicitly, and no
+    other prefill chunk lands on a KV block boundary."""
+
+    def _mutate(self, scheduled):
+        def mutate(config: VllmConfig) -> None:
+            config.speculative_config = SimpleNamespace(method="dflash")
+            config.scheduler_config.max_num_scheduled_tokens = scheduled
+
+        return mutate
+
+    def test_the_auto_computed_budget_is_accepted(self, reconfigure, configured):
+        budget = configured.scheduler_config.max_num_batched_tokens
+        config = reconfigure(self._mutate(budget))
+        assert config.scheduler_config.max_num_scheduled_tokens == budget
+
+    @pytest.mark.parametrize("delta", [-1, -8, 1])
+    def test_any_other_budget_is_refused(self, reconfigure, configured, delta):
+        budget = configured.scheduler_config.max_num_batched_tokens
+        with pytest.raises(ValueError, match="auto-computed"):
+            reconfigure(self._mutate(budget + delta))
+
+    def test_only_dflash_is_gated(self, reconfigure, configured):
+        def mutate(config: VllmConfig) -> None:
+            config.speculative_config = SimpleNamespace(method="eagle3")
+            config.scheduler_config.max_num_scheduled_tokens = 8
+
+        assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8

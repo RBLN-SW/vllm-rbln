@@ -1,4 +1,4 @@
-# Copyright 2026 Rebellions Inc. All rights reserved.
+# Copyright 2025 Rebellions Inc. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,15 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import torch
 
-from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumDecoderMixin
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlPushConnectorScheduler,
+)
+
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
+    RblnNixlSchedulerBase,
+)
 
 
-def test_padding_row_does_not_alias_a_real_slot():
-    padded = RBLNOptimumDecoderMixin.pad_cache_slot_ids(
-        torch.tensor([0], dtype=torch.int16), 4
-    )
-
-    assert padded[0, 0] == 0  # the scheduled request keeps its slot
-    assert 0 not in {int(padded[row, 0]) for row in range(1, 4)}
+class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorScheduler):
+    """Scheduler side of the write path."""

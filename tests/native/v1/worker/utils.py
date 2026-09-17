@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import Any
 
+from vllm.config import SpeculativeConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
 from vllm.v1.kv_cache_interface import (
@@ -45,6 +47,17 @@ NUM_BLOCKS = 10
 MAX_NUM_SEQS = 4
 MAX_NUM_BATCHED_TOKENS = 128
 MAX_MODEL_LEN = 4096
+
+
+def make_speculative_config(method: str) -> SimpleNamespace:
+    """A speculative_config stub that classifies itself the way upstream does.
+
+    `use_eagle` is bound to upstream's own implementation rather than a copy of
+    its method list, so a stub cannot drift from what the runner reads.
+    """
+    config = SimpleNamespace(method=method)
+    config.use_eagle = lambda: SpeculativeConfig.use_eagle(config)
+    return config
 
 
 def make_runner_config(**overrides: Any):

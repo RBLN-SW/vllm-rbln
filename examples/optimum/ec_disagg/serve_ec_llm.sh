@@ -25,7 +25,7 @@ PULL_PORT="${PULL_PORT:-16100}"
 # LLM devices
 LLM_DEVICES="${LLM_DEVICES:-22,23,24,25,26,27,28,29}"
 
-export RBLN_DEVICES=$LLM_DEVICES
+export RBLN_VISIBLE_DEVICES=$LLM_DEVICES
 exec vllm serve "$MODEL_ID" \
     --port "$PORT" \
     --mm-processor-kwargs '{"max_pixels": 802816}' \

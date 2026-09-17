@@ -317,10 +317,11 @@ def determine_draft_batch_execution_and_padding(
             f"reported {status.num_tokens[dp_rank]} tokens, running {num_tokens}"
         )
     else:
-        assert query_len == 1, f"the drafting loop runs one token, got {query_len}"
-        tokens_per_rank = status.num_reqs
+        # Every request contributes `query_len` tokens: one for the chained
+        # drafting loop, `1 + num_speculative_tokens` for parallel drafting.
+        tokens_per_rank = tuple(reqs * query_len for reqs in status.num_reqs)
         any_prefill = False
-        tokens_across_dp = torch.tensor(status.num_reqs, dtype=torch.int32)
+        tokens_across_dp = torch.tensor(tokens_per_rank, dtype=torch.int32)
 
     if not draft_has_moe:
         # Nothing in this draft reads the token dimension, so it states what this

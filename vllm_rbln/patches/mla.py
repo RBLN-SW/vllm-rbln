@@ -19,8 +19,13 @@
 
 import torch
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention import mla_attention as _mla_attention_mod
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.utils import replace_parameter
 
+from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
+    RBLNModelOptFp8LinearMethod,
+)
 from vllm_rbln.patches import register_patch
 from vllm_rbln.patches.attention import (
     _record_pipeline_layer_index,
@@ -30,6 +35,34 @@ from vllm_rbln.patches.attention import (
 mla_attention_original_init = MLAAttention.__init__
 mla_attention_original_process_weights = MLAAttention.process_weights_after_loading
 mla_attention_original_get_kv_cache_spec = MLAAttention.get_kv_cache_spec
+mla_attention_original_get_and_maybe_dequant_weights = (
+    _mla_attention_mod.get_and_maybe_dequant_weights
+)
+
+
+@register_patch(
+    target=(
+        "vllm.model_executor.layers.attention.mla_attention."
+        "get_and_maybe_dequant_weights"
+    ),
+    reason=(
+        "The MLA kv_b_proj weight-absorb dequantises eagerly at load time. "
+        "Upstream's fast path covers only Fp8LinearMethod, so per-tensor ModelOpt "
+        "fp8 falls to the generic base case, which reads the weight back by "
+        "running the layer's apply() against an identity matrix -- an eager "
+        "matmul the dummy compile device has no NPU to execute. Dequantise "
+        "directly instead."
+    ),
+)
+def patched_get_and_maybe_dequant_weights(
+    layer: torch.nn.Module, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    quant_method = getattr(layer, "quant_method", None)
+    if isinstance(quant_method, RBLNModelOptFp8LinearMethod):
+        weight = layer.weight.detach().to("cpu", torch.float32)
+        scale = layer.weight_scale.detach().to("cpu", torch.float32)
+        return (weight * scale).to(out_dtype).to(layer.weight.device)
+    return mla_attention_original_get_and_maybe_dequant_weights(layer, out_dtype)
 
 
 class _RBLNNoOpMLAPrefillBackend:
@@ -195,6 +228,6 @@ def patched_mla_process_weights(self: MLAAttention, act_dtype: torch.dtype) -> N
     mla_attention_original_process_weights(self, act_dtype)
     # RBLN uses 4D weights for batched matmul: [1, N, P, L] / [1, N, L, V]
     if hasattr(self, "W_UK_T"):
-        self.W_UK_T = self.W_UK_T.unsqueeze(0)
+        replace_parameter(self, "W_UK_T", self.W_UK_T.unsqueeze(0))
     if hasattr(self, "W_UV"):
-        self.W_UV = self.W_UV.unsqueeze(0)
+        replace_parameter(self, "W_UV", self.W_UV.unsqueeze(0))

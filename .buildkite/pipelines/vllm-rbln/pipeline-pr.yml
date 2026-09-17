@@ -38,21 +38,6 @@ _sync: &sync |
   bash .buildkite/scripts/rebel-compiler-override.sh
 
 steps:
-  - label: ":pytest: [CA25] pytest"
-    key: "vllm-rbln-pytest-ca25"
-    if_changed: *if_changed
-    agents:
-      queue: r18s
-      resource_class: "RBLN-CA25-32"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    secrets: *secrets
-    timeout_in_minutes: 60
-    command:
-      - *sync
-      - "echo '--- :pytest: pytest (sampler)' && uv run --no-sync pytest tests/torch_compile/unit/v1/sample -v"
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t1-compile.sh"
-
   - label: ":pytest: [CR13] pytest"
     key: "vllm-rbln-pytest-cr13"
     if_changed: *if_changed

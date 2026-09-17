@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln import envs
@@ -282,9 +283,9 @@ def execute_model(self, *args, **kwargs):
     _ACTIVE_CTX = ctx
     ctx.start_pass()
     output = _execute_model(self, *args, **kwargs)
-    # The engine calls sample_tokens() only if execute_model() returned None, so a
-    # non-None return means nobody else will end this pass.
-    if output is not None:
+    # A None pass is closed by sample_tokens, an IntermediateTensors pass by
+    # send_handoff below; anything else nobody would end.
+    if output is not None and not isinstance(output, IntermediateTensors):
         ctx.end_pass()
     return output
 
@@ -357,6 +358,21 @@ def determine_batch_execution_and_padding(self, *args, **kwargs):
     # A no-op on the dummy run, which reaches this with no pass open.
     _ctx(self).mark_phase(phase)
     return result
+
+
+_send_handoff = RBLNWorker._send_handoff
+
+
+@functools.wraps(_send_handoff)
+def send_handoff(self, *args, **kwargs):
+    # The send waits on this stage's compute, so its wall carries the stage's time.
+    # No try/finally: a raising hand-off leaves the pass open, like any raising pass.
+    ctx = _ctx(self.model_runner)
+    start = time.perf_counter()
+    output = _send_handoff(self, *args, **kwargs)
+    ctx.add_graph_time(time.perf_counter() - start)
+    ctx.end_pass()
+    return output
 
 
 @functools.wraps(_shutdown)
@@ -433,6 +449,12 @@ def _register_patches() -> None:
             determine_batch_execution_and_padding,
             "Reads the pass phase where it is decided. The padded token dimension is a "
             "local of execute_model and is not observable from any wrapped callable.",
+        ),
+        (
+            f"{_WORKER}._send_handoff",
+            send_handoff,
+            "Times the hand-off and closes its pass; left outside the pass, "
+            "the send hides a non-last rank's stage time.",
         ),
         (
             f"{_WORKER}.shutdown",

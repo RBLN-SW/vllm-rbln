@@ -92,6 +92,14 @@ All of the following must be satisfied for a PR to be merged:
 
 ------
 
+## Inactivity
+
+A bot marks an issue or pull request `stale` after 30 days without activity, and closes it 7 days later. Any comment or push removes the label and restarts the clock, and a closed issue or pull request can be reopened at any time. Draft pull requests are never marked stale.
+
+If something needs to stay open while it waits, say so in a comment and a maintainer will add the `keep-open` label, which exempts it permanently.
+
+------
+
 ## 🙌 Thank You
 
 Thank you for taking the time to contribute to **vllm-rbln**!

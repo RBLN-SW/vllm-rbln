@@ -28,7 +28,6 @@ import re
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from tests.native.vllm_config import make_vllm_config
 from vllm_rbln.v1.worker import mega_cache, rbln_model_runner
@@ -89,18 +88,18 @@ class TestSignatureComposition:
         assert mega_cache.config_signature(_stub_config()) != before
 
 
-# Variables the built graph depends on; one per resolved type, since what has to
-# survive is the round trip through normalize_value()/hash_factors().
+# Variables the built graph depends on and RBLNConfig does not carry, so this
+# is the only route into the key. One per type still on this route, since what
+# has to survive is the round trip through normalize_value()/hash_factors().
 GRAPH_ENV = [
     ("VLLM_RBLN_NUM_HIDDEN_LAYERS", "0", "4"),  # int
-    ("VLLM_RBLN_USE_W8A8", "0", "1"),  # bool
-    ("VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY", "exponential", "linear"),  # str
-    ("VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS", "1,2,4", "1,2,4,8"),  # list
+    ("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0", "1"),  # bool
 ]
 
 # Variables that must not move it. Each value differs from that variable's
 # default, so the row cannot pass by probing with the default itself.
 RUNTIME_ENV = [
+    ("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "1"),
     # Sampler graphs compile with use_cache=False, so they never enter a bundle.
     ("VLLM_RBLN_SAMPLER", "0"),
     # Must stay out, or a bundle compiled on a CPU host misses on the NPU host.
@@ -135,6 +134,25 @@ class TestSignatureEnv:
         first = self._sig()
         monkeypatch.setenv(name, after)
         assert self._sig() != first
+
+    def test_flag_and_variable_share_one_bundle(self, monkeypatch):
+        """A flag and its variable resolve to one config, so to one bundle.
+
+        `_stub_config` stands in for `VllmConfig.compute_hash()`, which folds
+        the `RBLNConfig` hash into its own.
+        """
+        from vllm_rbln.config import build_rbln_config
+
+        monkeypatch.setenv("VLLM_RBLN_USE_W8A8", "1")
+        via_env = build_rbln_config(None)
+        env_sig = mega_cache.config_signature(_stub_config(via_env.compute_hash()))
+
+        monkeypatch.delenv("VLLM_RBLN_USE_W8A8")
+        via_flag = build_rbln_config({"use_w8a8": True})
+        flag_sig = mega_cache.config_signature(_stub_config(via_flag.compute_hash()))
+
+        assert via_env == via_flag
+        assert env_sig == flag_sig
 
     @pytest.mark.parametrize(("name", "value"), RUNTIME_ENV)
     def test_runtime_env_invariant(self, monkeypatch, name, value):
@@ -356,32 +374,28 @@ def bundle(tmp_path, monkeypatch):
 
     state = SimpleNamespace(
         artifact=b"bundle-bytes",
-        save_result=None,
+        nothing_to_save=False,  # every graph came out of the loaded bundle
         save_raises=None,
         loaded=[],
         set_dirs=[],
-        steps=[],  # boundary calls in the order they happened
     )
-    state.save_result = (state.artifact, object())
     state.path = mega_cache.bundle_path(MODEL, SIG)
 
-    def fake_save():
-        state.steps.append("serialize")
+    def fake_write(dst):
         if state.save_raises is not None:
             raise state.save_raises
-        return state.save_result
+        if state.nothing_to_save:
+            return False
+        dst.write(state.artifact)
+        return True
 
-    def fake_load(data):
-        state.loaded.append(data)
+    def fake_read(src):
+        state.loaded.append(src.read())
         return object()  # stands in for torch's CacheInfo
 
-    def fake_flush():
-        state.steps.append("flush")
-
     monkeypatch.setattr(rbln_mega_cache, "set_dir", state.set_dirs.append)
-    monkeypatch.setattr(rbln_mega_cache, "flush_to_bundle", fake_flush)
-    monkeypatch.setattr(torch.compiler, "save_cache_artifacts", fake_save)
-    monkeypatch.setattr(torch.compiler, "load_cache_artifacts", fake_load)
+    monkeypatch.setattr(rbln_mega_cache, "write_bundle", fake_write)
+    monkeypatch.setattr(rbln_mega_cache, "read_bundle", fake_read)
     return state
 
 
@@ -404,12 +418,6 @@ class TestSaveLoad:
 
         mega_cache.load(MODEL, SIG)
         assert bundle.loaded == [bundle.artifact]
-
-    def test_save_flushes_staged_blobs_first(self, bundle):
-        # Disk-staged .rbln blobs enter the bundle only via flush_to_bundle(),
-        # so flushing after serializing would drop every one of them.
-        mega_cache.save(MODEL, SIG)
-        assert bundle.steps == ["flush", "serialize"]
 
     def test_both_point_rebel_at_the_cache_root(self, bundle):
         mega_cache.save(MODEL, SIG)
@@ -446,22 +454,24 @@ class TestSaveLoad:
 
     def test_resave_replaces_in_place(self, bundle):
         mega_cache.save(MODEL, SIG)
-        bundle.save_result = (b"second-bundle", object())
+        bundle.artifact = b"second-bundle"
         mega_cache.save(MODEL, SIG)
         assert _bundle_bytes(bundle.path) == b"second-bundle"
 
     def test_nothing_new_compiled_keeps_the_bundle(self, bundle):
-        # torch returns None when the run recorded no new artifact -- i.e. every
-        # graph came out of the loaded bundle. Re-saving must not empty it.
+        # rebel reports nothing to write when the run recorded no new artifact
+        # -- i.e. every graph came out of the loaded bundle. Re-saving must not
+        # empty it.
         mega_cache.save(MODEL, SIG)
-        bundle.save_result = None
+        bundle.nothing_to_save = True
         mega_cache.save(MODEL, SIG)
         assert _bundle_bytes(bundle.path) == bundle.artifact
 
     def test_nothing_to_save_writes_no_bundle(self, bundle):
-        bundle.save_result = None
+        bundle.nothing_to_save = True
         mega_cache.save(MODEL, SIG)
         assert not os.path.exists(bundle.path)
+        assert not _tmp_leftovers(bundle.path)
 
     def test_save_failure_leaves_no_bundle(self, bundle):
         bundle.save_raises = RuntimeError("boom")
@@ -493,11 +503,12 @@ class TestSaveLoad:
 
     def test_out_of_space_keeps_the_previous_bundle(self, bundle, monkeypatch):
         mega_cache.save(MODEL, SIG)
-        bundle.save_result = (b"second-bundle", object())
+        first = bundle.artifact
+        bundle.artifact = b"second-bundle"
         with monkeypatch.context() as m:
             m.setattr(mega_cache.os, "replace", _raiser(OSError(errno.ENOSPC, "boom")))
             mega_cache.save(MODEL, SIG)
-        assert _bundle_bytes(bundle.path) == bundle.artifact
+        assert _bundle_bytes(bundle.path) == first
         assert not _tmp_leftovers(bundle.path)
 
     def test_out_of_space_is_logged_at_error(self, bundle, monkeypatch, caplog):
@@ -517,19 +528,23 @@ class TestSaveLoad:
         assert not _tmp_leftovers(bundle.path)
 
     def test_corrupt_bundle_warns_and_recompiles(self, bundle, monkeypatch, caplog):
+        from rebel.core import mega_cache as rbln_mega_cache
+
         os.makedirs(os.path.dirname(bundle.path), exist_ok=True)
         with open(bundle.path, "wb") as f:
             f.write(b"garbage")
         monkeypatch.setattr(
-            torch.compiler, "load_cache_artifacts", _raiser(RuntimeError("bad bundle"))
+            rbln_mega_cache, "read_bundle", _raiser(RuntimeError("bad bundle"))
         )
         with caplog.at_level(logging.WARNING, logger=mega_cache.logger.name):
             mega_cache.load(MODEL, SIG)  # must not propagate
         assert "bad bundle" in caplog.text
 
     def test_unreadable_bundle_warns_and_skips(self, bundle, monkeypatch, caplog):
+        from rebel.core import mega_cache as rbln_mega_cache
+
         mega_cache.save(MODEL, SIG)
-        monkeypatch.setattr(torch.compiler, "load_cache_artifacts", lambda _: None)
+        monkeypatch.setattr(rbln_mega_cache, "read_bundle", lambda _: None)
         with caplog.at_level(logging.WARNING, logger=mega_cache.logger.name):
             mega_cache.load(MODEL, SIG)
         assert "unreadable" in caplog.text
@@ -599,15 +614,14 @@ class TestConformance:
     """Drift alarms: the save/load path is stubbed everywhere above, so nothing
     else in this file would notice either dependency changing shape."""
 
-    def test_torch_mega_cache_api(self):
-        assert callable(torch.compiler.save_cache_artifacts)
-        assert callable(torch.compiler.load_cache_artifacts)
-
     def test_rebel_mega_cache_api(self):
+        # save()/load() are thin wrappers over these; an older rebel without
+        # them degrades to "no cache" through the broad excepts, silently.
         from rebel.core import mega_cache as rbln_mega_cache
 
         assert len(inspect.signature(rbln_mega_cache.set_dir).parameters) == 1
-        assert not inspect.signature(rbln_mega_cache.flush_to_bundle).parameters
+        assert len(inspect.signature(rbln_mega_cache.write_bundle).parameters) == 1
+        assert len(inspect.signature(rbln_mega_cache.read_bundle).parameters) == 1
 
     def test_rbln_artifact_type_is_registered_with_torch(self):
         # rebel registers it at import; without it a bundle's rbln entries

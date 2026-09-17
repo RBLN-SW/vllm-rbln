@@ -12,51 +12,109 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RBLN-specific NIXL metadata: pipeline-parallel (PP) extensions.
+"""What an RBLN producer advertises beyond upstream's ``NixlAgentMetadata``.
 
-Isolated from upstream ``NixlAgentMetadata`` so the base struct and its
-compatibility hash stay untouched. Both P and D are RBLN, so a private version
-tag folded into the compat hash (``rbln_pp_compat_hash``) is enough to gate
-PP-aware peers against mismatched ones. Under PP the producer advertises, per
-(pp_rank, tp_rank) shard, the KV-cache layer names it owns; the consumer matches
-each shard to its local regions by name (owned range derived locally, not sent).
+Peers pair by what each holds rather than by position, on two axes, and each
+axis needs one thing upstream's struct does not carry: the layer names a shard
+registered, and the chiplet geometry its regions expanded into. Both describe
+the sender; the receiver derives its own side and matches.
+
+Kept in a subclass so upstream's struct and its compatibility hash stay
+untouched. Both ends are RBLN, so folding a private version tag into that hash
+(``rbln_compat_hash``) is enough to keep peers speaking different schemas from
+completing a handshake.
 """
 
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING
 
 from vllm.config.utils import hash_factors
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 
-# Bump on any incompatible change to the RBLN PP metadata schema/semantics.
-# Folded into the NIXL compatibility hash so a PP-aware producer and a
-# mismatched consumer fail the handshake cleanly (both ends are RBLN).
-RBLN_NIXL_PP_VERSION: int = 1
+if TYPE_CHECKING:
+    from vllm.config import SpeculativeConfig
+
+# Bump on any incompatible change to the RBLN metadata schema or semantics.
+# Folded into the NIXL compatibility hash so an RBLN peer speaking a different
+# schema fails the handshake cleanly (both ends are RBLN). Upstream keeps its
+# own counterpart the same way (``NIXL_CONNECTOR_VERSION``).
+#   1: pp_rank / pp_size / registered_layer_names (the layer axis)
+#   2: + kv_areas / kv_slices (chiplet geometry)
+#   3: + the transfer direction in the hash
+#   4: + kv_split_axis (which axis the geometry above came from)
+RBLN_NIXL_CONNECTOR_VERSION: int = 4
+
+
+class KVSplitAxis(Enum):
+    """Which axis the compiler cut a KV entry on across the chiplets.
+
+    ``HEAD`` means an area holds some of the shard's KV heads over every token
+    of a block; ``NON_HEAD`` means every head over some of the tokens.
+    """
+
+    HEAD = 0
+    NON_HEAD = 1
 
 
 @dataclass
 class RblnNixlAgentMetadata(NixlAgentMetadata):
-    """``NixlAgentMetadata`` + this producer stage's PP identity and the layer
-    names it owns.
+    """``NixlAgentMetadata`` + which layers and which slice of the KV cache
+    this shard holds.
 
-    New fields default to the ``pp_size == 1`` (no-PP) values so a blob decoded
-    by the base/older consumer (which uses ``NixlAgentMetadata`` and ignores the
-    extra fields) degrades to single-stage behavior. A PP-aware consumer decodes
-    with this type to read them and matches ``registered_layer_names`` against
-    its own local layers to place each shard's regions.
+    New fields default to the single-shard, single-area values, so a blob decoded
+    by upstream (which uses ``NixlAgentMetadata`` and ignores the extra fields)
+    degrades to the shape upstream assumes.
     """
 
     pp_rank: int = 0
     pp_size: int = 1
     # Registered KV-cache layer names, ordered as kv_caches_base_addr / block_lens.
     registered_layer_names: list[str] = field(default_factory=list)
+    # Physical areas one logical region expanded into, and how many of them are
+    # DISTINCT rather than replicas (see `_slice_head_bounds`).
+    kv_areas: int = 1
+    kv_slices: int = 1
+    # The default keeps a blob without this field meaning what versions 2 and 3
+    # meant by the two counts above.
+    kv_split_axis: KVSplitAxis = KVSplitAxis.HEAD
 
 
-def rbln_pp_compat_hash(base_hash: str) -> str:
-    """Fold the RBLN PP schema version into the upstream NIXL compat hash.
+def rbln_compat_hash(
+    base_hash: str,
+    *,
+    writes_into_peer: bool,
+    speculative_config: "SpeculativeConfig | None" = None,
+) -> str:
+    """Fold the RBLN schema version, the transfer direction and the draft model
+    into the upstream NIXL compat hash.
 
-    Keeps PP-aware RBLN peers from handshaking with PP-unaware / mismatched
-    ones without touching upstream ``compute_nixl_compatibility_hash``.
+    An extension rather than a change to ``compute_nixl_compatibility_hash``,
+    which stays upstream's. The direction belongs in it because the read and the
+    write path move bytes by protocols that do not meet: a producer that writes
+    into a consumer expecting to read finds a peer whose every length check
+    passes. This vLLM hashes nothing that separates them -- the connector name
+    is not a factor -- so this is the only place it can be settled.
+
+    The draft model belongs in it because its attention layers are members of
+    the KV cache this connector registers, while upstream's factors describe
+    the target alone. Model-level values only -- the hash is compared across
+    every shard, so a per-rank quantity would differ between PP stages.
     """
-    return hash_factors(
-        {"base": base_hash, "rbln_nixl_pp_version": RBLN_NIXL_PP_VERSION}
-    )
+    factors: dict[str, object] = {
+        "base": base_hash,
+        "rbln_nixl_connector_version": RBLN_NIXL_CONNECTOR_VERSION,
+        "rbln_writes_into_peer": writes_into_peer,
+    }
+    if speculative_config is not None and (
+        speculative_config.use_eagle() or speculative_config.uses_draft_model()
+    ):
+        draft_model_config = speculative_config.draft_model_config
+        assert draft_model_config is not None
+        factors |= {
+            "rbln_spec_method": speculative_config.method,
+            "rbln_draft_model": draft_model_config.model,
+            "rbln_draft_revision": draft_model_config.revision,
+            "rbln_draft_code_revision": draft_model_config.code_revision,
+        }
+    return hash_factors(factors)

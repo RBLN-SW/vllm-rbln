@@ -14,6 +14,14 @@ _secrets: &secrets
   HF_TOKEN: FSW_HF_TOKEN
   HF_HOME: FSW_HF_HOME
 
+_secrets_k8s: &secrets_k8s
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
+  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
+  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+  HF_TOKEN: HF_TOKEN
+  HF_HOME: HF_HOME
+
 
 _sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
 
@@ -28,24 +36,30 @@ _lm_eval: &lm_eval
 steps:
   - label: ":pytest: [CA25] pytest (T0)"
     key: "nightly-t0-ca25"
-    agents:
-      queue: r18s
-      resource_class: "RBLN-CA25-4"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
-    secrets: *secrets
+    resources:
+      npu:
+        count: 4
+        product: "RBLN-CA25"
+    secrets: *secrets_k8s
+    env:
+      UV_CACHE_DIR: "/mnt/uv_cache"
     timeout_in_minutes: 60
     command:
       - *sync
+      - "echo '--- :pytest: pytest (sampler)' && uv run --no-sync pytest tests/torch_compile/unit/v1/sample -v"
       - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
 
   - label: ":pytest: [CA25] pytest (T2)"
     key: "nightly-t2-ca25"
-    agents:
-      queue: r18s
-      resource_class: "RBLN-CA25-32"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
-    secrets: *secrets
+    resources:
+      npu:
+        count: 32
+        product: "RBLN-CA25"
+    secrets: *secrets_k8s
     env:
+      UV_CACHE_DIR: "/mnt/uv_cache"
       VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
       VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
     timeout_in_minutes: 120

@@ -149,6 +149,7 @@ def create_rbln_scheduler(
     policy: str = "fcfs",
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
+    additional_config: dict | None = None,
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
@@ -195,6 +196,7 @@ def create_rbln_scheduler(
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
+        additional_config=additional_config or {},
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -411,14 +413,20 @@ def prefill_request(
     """Drive the full get_computed_blocks -> allocate_slots flow, then simulate
     execute_model completion. Returns ``(computed_blocks, total_computed_tokens,
     allocated_blocks)``."""
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
+    (
+        computed_blocks,
+        num_computed_tokens,
+        request.shared_prefix_boundary,
+    ) = manager.get_computed_blocks(request)
     match = manager.get_computed_blocks_sub_block(request, num_computed_tokens)
     sub_extra = match.num_tokens if match else 0
     total_computed = num_computed_tokens + sub_extra
+    # The sub-block tokens go on the tokens-to-compute side, as they do in
+    # RBLNScheduler.schedule.
     blocks = manager.allocate_slots(
         request,
-        request.num_tokens - total_computed,
-        total_computed,
+        request.num_tokens - num_computed_tokens,
+        num_computed_tokens,
         computed_blocks,
     )
     if blocks is not None and match is not None:
