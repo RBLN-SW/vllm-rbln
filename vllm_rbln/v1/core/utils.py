@@ -253,8 +253,10 @@ def sub_block_size_in_use(
     """The sub-block size prefix caching runs at (0 takes the prefill chunk),
     or None when the scheduler stays on vLLM's manager.
 
-    Every rule on the sub-block configuration is here, so a caller gets a size
-    or a ValueError and never a setting that was dropped on the way.
+    Every rule on the sub-block configuration is here. A size the caller asked
+    for is honored or refused with a ValueError, never dropped on the way. The
+    derived default returns None wherever it does not fit instead, since a run
+    that never asked for sub-blocks should not fail over them.
     """
     # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
     from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
@@ -276,15 +278,24 @@ def sub_block_size_in_use(
         return None
 
     sub_block_size = wanted or max_num_batched_tokens
-    if not RBLNKVCacheManager.can_use_sub_block_caching(
+    eligible = RBLNKVCacheManager.can_use_sub_block_caching(
         kv_cache_config, sub_block_size
-    ):
-        return None
-    if not block_size >= max_num_batched_tokens >= sub_block_size:
+    )
+    fits = block_size >= max_num_batched_tokens >= sub_block_size
+    if not wanted:
+        if not (eligible and fits):
+            return None
+    elif not fits:
         raise ValueError(
             "sub-block prefix caching needs block_size >= max_num_batched_tokens "
             f">= sub_block_size, got {block_size} >= {max_num_batched_tokens} >= "
             f"{sub_block_size}."
+        )
+    elif not eligible:
+        raise ValueError(
+            f"sub_block_size={sub_block_size} is not one this KV cache can hold: "
+            "every group needs a spec that stores per-token KV, and a block_size "
+            f"larger than {sub_block_size} and a multiple of it."
         )
     # Left until last: the equal case never asks, so a compile-only worker with
     # no NPU to name still starts on the default setting.

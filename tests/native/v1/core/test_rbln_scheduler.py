@@ -105,12 +105,17 @@ class TestSchedulerInit:
                 sub_block_size=8,
             )
 
-    def test_equal_block_and_sub_block_size_disables(self):
-        # sub_block_size == block_size is ineligible -> plain manager.
-        sched = create_rbln_scheduler(
-            enable_prefix_caching=True, block_size=16, sub_block_size=16
-        )
-        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+    def test_equal_block_and_sub_block_size_is_rejected(self):
+        # sub_block_size == block_size leaves no sub-block to match, and the
+        # size was asked for, so it is refused rather than dropped.
+        with pytest.raises(ValueError, match="not one this KV cache can hold"):
+            create_rbln_scheduler(
+                enable_prefix_caching=True,
+                block_size=128,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                sub_block_size=128,
+            )
 
 
 class TestPendingRunnerBlockDeltas:
