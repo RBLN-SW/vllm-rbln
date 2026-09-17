@@ -48,12 +48,9 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
-    def test_sub_block_size_defaults_to_max_num_batched_tokens(self, monkeypatch):
-        # With VLLM_RBLN_SUB_BLOCK_CACHE and no explicit sub_block_size, the
-        # scheduler uses max_num_batched_tokens as the sub_block_size.
-        import vllm_rbln.envs as envs
-
-        monkeypatch.setattr(envs, "VLLM_RBLN_SUB_BLOCK_CACHE", True)
+    def test_sub_block_size_defaults_to_max_num_batched_tokens(self):
+        # enable_sub_block_cache is on by default, so with no explicit
+        # sub_block_size the scheduler uses max_num_batched_tokens.
         sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,
@@ -63,19 +60,16 @@ class TestSchedulerInit:
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
 
-    def test_additional_config_reaches_the_scheduler(self):
-        # EngineCore receives an already-built VllmConfig, so __init__ is the
-        # only place the section can be resolved. No env var is involved.
-        from vllm_rbln.config import get_rbln_config
-
-        create_rbln_scheduler(
+    def test_additional_config_turns_sub_block_caching_off(self):
+        # Eligible otherwise, so the plain manager is the option's doing.
+        sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,
             max_num_batched_tokens=128,
             max_model_len=2048,
-            additional_config={"sub_block_cache": False},
+            additional_config={"enable_sub_block_cache": False},
         )
-        assert get_rbln_config().sub_block_cache is False
+        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.
@@ -199,7 +193,7 @@ class TestTrySubBlockMatch:
         # match.num_tokens >= external -> match wins (ties favor local copy).
         sched = self._seeded_scheduler()
         query = make_request("q", list(range(8)) + [100] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         match, n = sched._try_sub_block_match(query, local, 8)
         assert match is not None
         assert n == 8
@@ -209,14 +203,14 @@ class TestTrySubBlockMatch:
         # external > match -> the match is released and (None, 0) returned.
         sched = self._seeded_scheduler()
         query = make_request("q", list(range(8)) + [100] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         assert sched._try_sub_block_match(query, local, 12) == (None, 0)
 
     def test_no_match_returns_none(self):
         # No sub-block match at all -> (None, 0).
         sched = self._seeded_scheduler()
         query = make_request("q", [500] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         assert sched._try_sub_block_match(query, local, 0) == (None, 0)
 
 

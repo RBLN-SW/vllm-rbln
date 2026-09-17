@@ -94,7 +94,7 @@ def rbln_engine_args(model: str, **kwargs) -> dict:
     merged = {**_RBLN_RUNNER_DEFAULTS, **kwargs}
     merged.setdefault(
         "num_gpu_blocks_override",
-        kv_blocks_per_request(model, merged["max_model_len"], merged["block_size"]) + 1,
+        kv_blocks_per_request(model, merged["max_model_len"], merged["block_size"]) + 2,
     )
     return merged
 

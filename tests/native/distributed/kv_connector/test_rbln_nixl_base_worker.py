@@ -22,6 +22,7 @@ import types
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.config import CacheConfig
@@ -37,6 +38,9 @@ from vllm.v1.kv_cache_interface import (
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as wm
 import vllm_rbln.envs as envs
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    KVSplitAxis,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
@@ -73,6 +77,11 @@ def _build_worker(
         self.kv_buffer_device = kv_buffer_device
         self.use_mla = use_mla
         self._block_size = {}
+        # Read by `_layer_kv_heads` to recover a model-wide count from a spec's
+        # per-rank share.
+        self.world_size = 1
+        self.model_config = MagicMock()
+        self.model_config.get_total_num_kv_heads.return_value = 8
         # Upstream's own __init__ sets this to None;
         # register_kv_caches reads it after super().register_kv_caches().
         self.xfer_handshake_metadata = None
@@ -85,6 +94,8 @@ def _build_worker(
 
     vllm_config = MagicMock()
     vllm_config.cache_config = CacheConfig(block_size=block_size)
+    # No speculative decoding: the compat hash then folds what it always did.
+    vllm_config.speculative_config = None
     # _check_pp_constraints compares pipeline_parallel_size <= 1; give it a real
     # int (a MagicMock would raise TypeError). 1 == the non-PP default here.
     vllm_config.parallel_config.pipeline_parallel_size = 1
@@ -235,6 +246,8 @@ class TestRegisterKvCaches:
         # then delegates registration to upstream.
         worker = _build_worker(monkeypatch, kv_buffer_device="cpu", nixl_available=True)
         worker.nixl_wrapper = "wrapper"
+        worker._layer_specs = {"layer0": _impl_layer_spec()}
+        worker.block_len_per_layer = [2048, 2048]
         ensured = []
         monkeypatch.setattr(
             sys.modules["nixl_rbln"],
@@ -252,6 +265,33 @@ class TestRegisterKvCaches:
         assert ensured == [("wrapper", 0)]
         assert delegated == [{"layer0": "tensor"}]
         assert worker._pending_kv_caches is None
+        # Host staging needs the per-region counts too: a pipelined peer reaches
+        # the per-head handshake check through it.
+        assert worker._logical_region_kv_heads == [8, 8]
+
+    def test_host_bounce_rejects_differing_per_layer_sizes(self, monkeypatch):
+        # Pins the refusal at this path's own point rather than upstream's assert.
+        worker = _build_worker(monkeypatch, kv_buffer_device="cpu", nixl_available=True)
+        worker.nixl_wrapper = "wrapper"
+        worker._layer_specs = {
+            "l0": _impl_layer_spec(page_size_bytes=4096),
+            "l1": _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32),
+        }
+        monkeypatch.setattr(
+            sys.modules["nixl_rbln"],
+            "ensure_rbln_backend",
+            lambda wrapper, device_id=0: None,
+            raising=False,
+        )
+        delegated = []
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker,
+            "register_kv_caches",
+            lambda self, kv: delegated.append(kv),
+        )
+        with pytest.raises(RuntimeError, match="host staging cannot register"):
+            worker.register_kv_caches({"l0": "tensor", "l1": "tensor"})
+        assert delegated == []
 
 
 class TestFinalize:
@@ -369,22 +409,27 @@ class TestSwaViewDelegation:
         assert worker.add_remote_agent(MagicMock(engine_id="peer"), 2, 4) == "agent"
         assert calls == [(2, 4)]
 
-    def test_add_remote_agent_is_idempotent_on_rehandshake(self, monkeypatch):
-        # With SWA active, a remote already handshaked returns its cached name
-        # without re-registering (no super() / topology work).
+    def test_add_remote_agent_returns_the_cached_name_for_a_known_pair(
+        self, monkeypatch
+    ):
+        # The SWA branch's half of the cache check upstream keeps behind a TODO.
+        # Nothing reaches it today -- the agent map is empty until a handshake
+        # returns -- so this pins the lookup, not a retry path.
         worker = _build_worker(
             monkeypatch,
             swa_view_opt=True,
             specs=[_sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        worker._remote_agents = {"peer": {0: "cached-name"}}
+        # Flat rank 1 of a TP2 peer is its (pp 0, tp 1): no pipelining, which
+        # this branch refuses, and not a palindrome, which would pass reversed.
+        worker._remote_agents = {"peer": {(0, 1): "cached-name"}}
         super_calls = []
         monkeypatch.setattr(
             NixlBaseConnectorWorker,
             "add_remote_agent",
             lambda self, *a, **k: super_calls.append(1),
         )
-        result = worker.add_remote_agent(MagicMock(engine_id="peer"), 0, 1)
+        result = worker.add_remote_agent(MagicMock(engine_id="peer"), 1, 2)
         assert result == "cached-name"
         assert super_calls == []
 
@@ -435,18 +480,21 @@ def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
     return worker
 
 
-def _impl_layer_spec(page_size_bytes=4096):
-    # Full-attention spec stand-in: only .page_size_bytes is read, and it must
-    # fail the isinstance(MambaSpec/UniformTypeKVCacheSpecs) checks.
+def _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8):
+    # Full-attention spec stand-in: .page_size_bytes and .num_kv_heads are read,
+    # and it must fail the isinstance(MambaSpec/UniformTypeKVCacheSpecs) checks.
+    # num_kv_heads defaults to the 8 the tensors _impl_kv_caches builds.
     spec = MagicMock(spec=FullAttentionSpec)
     spec.page_size_bytes = page_size_bytes
+    spec.num_kv_heads = num_kv_heads
     return spec
 
 
-def _impl_kv_caches(num_blocks=128, base_ptr=0x10000):
-    # Two Full-layer tensors: shape (K/V, num_blocks, heads, ..., dim).
+def _impl_kv_caches(num_blocks=128, base_ptr=0x10000, names=("l0", "l1")):
+    # Full-layer tensors: shape (K/V, num_blocks, heads, ..., dim). Only the
+    # entry's address is read here; the per-region bytes come from _split_kv.
     kv = {}
-    for i, name in enumerate(("l0", "l1")):
+    for i, name in enumerate(names):
         t = MagicMock()
         t.shape = (2, num_blocks, 8, 1, 64, 64)
         t.data_ptr.return_value = base_ptr + i * 0x10000
@@ -456,12 +504,15 @@ def _impl_kv_caches(num_blocks=128, base_ptr=0x10000):
     return kv
 
 
-def _mla_kv_caches(num_blocks=128, base_ptr=0x10000):
-    # Two MLA layers: a 3D latent cache, block axis first, no K/V split.
+def _mla_kv_caches(num_blocks=128, base_ptr=0x10000, page_size_bytes=4096):
+    # Two MLA layers: a 3D latent cache, block axis first, no K/V split. The
+    # whole entry is the region, so its bytes must be num_blocks x the page.
     kv = {}
     for i, name in enumerate(("l0", "l1")):
         t = MagicMock()
-        t.shape = (num_blocks, 64, 576)
+        t.shape = (num_blocks, page_size_bytes)
+        t.numel.return_value = num_blocks * page_size_bytes
+        t.element_size.return_value = 1
         t.data_ptr.return_value = base_ptr + i * 0x10000
         t.get_device.return_value = 0
         t.zero_ = MagicMock()
@@ -471,12 +522,17 @@ def _mla_kv_caches(num_blocks=128, base_ptr=0x10000):
 
 def _split_kv(num_blocks):
     # Fake TransferTopology.get_transfer_cache_regions: K and V as two region
-    # tensors, each with shape[0] == num_blocks.
-    def _split(cache, _spec):
+    # tensors, each with shape[0] == num_blocks. Each half is sized from THIS
+    # layer's spec, so its byte footprint agrees with the spec -- what the
+    # per-region span check asserts.
+    def _split(cache, spec):
+        half = spec.page_size_bytes // 2
         regions = []
         for off in (0, 0x100):
             region = MagicMock()
-            region.shape = (num_blocks, 8, 1, 64, 64)
+            region.shape = (num_blocks, half)
+            region.numel.return_value = num_blocks * half
+            region.element_size.return_value = 1
             region.data_ptr.return_value = cache.data_ptr() + off
             regions.append(region)
         return regions
@@ -493,7 +549,7 @@ def _patch_worker_nixl_symbols(topo, *, mamba_spec=None, uniform_spec=None):
     msgspec_mock.msgpack.Encoder.return_value.encode.return_value = b"meta"
     return patch.multiple(
         wm,
-        TransferTopology=MagicMock(return_value=topo),
+        RblnTransferTopology=MagicMock(return_value=topo),
         compute_nixl_compatibility_hash=MagicMock(return_value="hash"),
         MambaSpec=mamba_spec or type("MambaSpec", (), {}),
         UniformTypeKVCacheSpecs=uniform_spec or type("UniformTypeKVCacheSpecs", (), {}),
@@ -504,13 +560,21 @@ def _patch_worker_nixl_symbols(topo, *, mamba_spec=None, uniform_spec=None):
 
 
 def _impl_xfer_result(
-    base_addrs=(0x20000, 0x20100, 0x30000, 0x30100), block_lens=(256, 256, 256, 256)
+    base_addrs=(0x20000, 0x20100, 0x30000, 0x30100),
+    block_lens=(256, 256, 256, 256),
+    slice_ids=None,
+    n_shards=1,
+    slices=1,
 ):
     xfer = MagicMock()
     xfer.base_addrs = list(base_addrs)
     xfer.block_lens = list(block_lens)
     xfer.reg_handle = "reg-handle"
-    xfer.n_shards = 1
+    xfer.n_shards = n_shards
+    xfer.slices = slices
+    # Parallel to base_addrs: which logical slice each expanded region carries.
+    # One area per region by default, so every region is its entry whole.
+    xfer.slice_ids = list(slice_ids) if slice_ids is not None else [0] * len(base_addrs)
     return xfer
 
 
@@ -537,10 +601,12 @@ class TestRegisterKvCachesImpl:
         xfer_result.block_lens = [256, 256, 256, 256]
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = 1
+        xfer_result.slices = 1
+        xfer_result.slice_ids = [0] * len(xfer_result.base_addrs)
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=False,
+            virtually_split_kv_in_blocks=False,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -592,9 +658,9 @@ class TestRegisterKvCachesImpl:
             worker.src_xfer_handles_by_block_size[worker.block_size] == "local-handle"
         )
 
-    def test_layout_blocks_first_doubles_region_count(self, monkeypatch):
-        # is_kv_layout_blocks_first flips the region count to 2x (K and V share a
-        # region tensor), which cascades into num_descs.
+    def test_a_split_kv_state_doubles_the_region_count(self, monkeypatch):
+        # A Mamba state indexes two regions per block, which doubles the count
+        # and cascades into num_descs.
         worker = _prep_impl_worker(monkeypatch)
         spec = _impl_layer_spec()
         worker._layer_specs = {"l0": spec, "l1": spec}
@@ -605,10 +671,12 @@ class TestRegisterKvCachesImpl:
         xfer_result.block_lens = [256, 256, 256, 256]
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = 1
+        xfer_result.slices = 1
+        xfer_result.slice_ids = [0] * len(xfer_result.base_addrs)
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=True,
+            virtually_split_kv_in_blocks=True,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -631,8 +699,10 @@ class TestRegisterKvCachesImpl:
         # two, and every chiplet area of it carries the same latent -> REPLICATE.
         worker = _prep_impl_worker(monkeypatch)
         worker.use_mla = True
+        worker._kv_split_axis = KVSplitAxis.NON_HEAD  # see the head-axis case
         spec = MagicMock(spec=MLAAttentionSpec)
         spec.page_size_bytes = 4096
+        spec.num_kv_heads = 1
         worker._layer_specs = {"l0": spec, "l1": spec}
         kv_caches = _mla_kv_caches(num_blocks=worker.num_blocks)
 
@@ -644,11 +714,11 @@ class TestRegisterKvCachesImpl:
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = areas
         xfer_result.slices = 1
-        xfer_result.slice_ids = [0] * areas
+        xfer_result.slice_ids = [0] * (2 * areas)
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=False,
+            virtually_split_kv_in_blocks=False,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -669,6 +739,8 @@ class TestRegisterKvCachesImpl:
         assert worker.num_regions == 2 * areas
         assert worker.num_descs == 2 * areas * worker.num_blocks
         assert (worker._kv_areas, worker._kv_slices) == (areas, 1)
+        # One head over one slice: nothing was cut, so the axis stays HEAD.
+        assert worker._kv_split_axis is KVSplitAxis.HEAD
 
     def test_region_flags_must_cover_every_transfer_region(self, monkeypatch):
         # A logical region count that does not account for the returned table
@@ -677,6 +749,7 @@ class TestRegisterKvCachesImpl:
         worker.use_mla = True
         spec = MagicMock(spec=MLAAttentionSpec)
         spec.page_size_bytes = 4096
+        spec.num_kv_heads = 1
         worker._layer_specs = {"l0": spec, "l1": spec}
         kv_caches = _mla_kv_caches(num_blocks=worker.num_blocks)
 
@@ -686,11 +759,11 @@ class TestRegisterKvCachesImpl:
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = 4
         xfer_result.slices = 1
-        xfer_result.slice_ids = [0] * 4
+        xfer_result.slice_ids = [0] * 3
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=False,
+            virtually_split_kv_in_blocks=False,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -719,10 +792,12 @@ class TestRegisterKvCachesImpl:
         xfer_result.block_lens = [256, 256, 256, 256]
         xfer_result.reg_handle = "reg-handle"
         xfer_result.n_shards = 1
+        xfer_result.slices = 1
+        xfer_result.slice_ids = [0] * len(xfer_result.base_addrs)
         fake = _fake_nixl_rbln(xfer_result)
 
         topo = MagicMock(
-            is_kv_layout_blocks_first=False,
+            virtually_split_kv_in_blocks=False,
             _cross_layers_blocks=False,
             cross_layers_blocks=False,
         )
@@ -736,7 +811,7 @@ class TestRegisterKvCachesImpl:
         ):
             mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
             worker._register_kv_caches_impl(kv_caches)
-            cast(MagicMock, wm.TransferTopology).assert_called_once_with(
+            cast(MagicMock, wm.RblnTransferTopology).assert_called_once_with(
                 tp_rank=0,
                 tp_size=1,
                 block_size=64,
@@ -764,7 +839,7 @@ class TestRegisterKvCachesImpl:
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
-        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=False)
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=False)
         topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
 
         with (
@@ -778,6 +853,240 @@ class TestRegisterKvCachesImpl:
         regions = fake.register_kv_regions.call_args.args[1]
         assert [block_len for _, _, block_len in regions] == [2048] * 4
 
+    def test_a_draft_layer_with_its_own_page_size_is_registered(self, monkeypatch):
+        # Requiring one size for every non-MLA tensor would reject this outright;
+        # registration has to describe each region by its own geometry.
+        worker = _prep_impl_worker(monkeypatch)
+        target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
+        draft = _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32)
+        worker._layer_specs = {"l0": target, "l1": target, "l2": draft}
+        # A head count is accepted only if some model here has it, so the draft
+        # has to be declared.
+        spec_cfg = MagicMock(method="eagle3")
+        spec_cfg.draft_model_config.model = "draft"
+        spec_cfg.draft_model_config.revision = None
+        spec_cfg.draft_model_config.code_revision = None
+        spec_cfg.draft_model_config.get_total_num_kv_heads.return_value = 32
+        worker.vllm_config.speculative_config = spec_cfg
+        # The draft layer is named past the target's depth, so it comes last.
+        kv_caches = _impl_kv_caches(
+            num_blocks=worker.num_blocks, names=("l0", "l1", "l2")
+        )
+
+        fake = _fake_nixl_rbln(
+            _impl_xfer_result(
+                base_addrs=(0x20000, 0x20100, 0x30000, 0x30100, 0x40000, 0x40100),
+                block_lens=(2048, 2048, 2048, 2048, 8192, 8192),
+            )
+        )
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=False)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        regions = fake.register_kv_regions.call_args.args[1]
+        # Each half is that layer's own page, not the first layer's.
+        assert [block_len for _, _, block_len in regions] == [
+            2048,
+            2048,
+            2048,
+            2048,
+            8192,
+            8192,
+        ]
+        # Without a per-region count the draft's regions would be banded at the
+        # target's width.
+        assert worker._logical_region_kv_heads == [8, 8, 8, 8, 32, 32]
+        assert worker.num_regions == 6
+
+    def test_replicated_heads_get_no_head_band(self, monkeypatch):
+        # 4 heads at TP 8: upstream floors the share at 1, so the product reads
+        # 8 and passes the divisibility guard (`_layer_kv_heads`). No count is
+        # recorded, so the head-band paths refuse the region.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.world_size = 8
+        worker.model_config.get_total_num_kv_heads.return_value = 4
+        spec = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=1)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        fake = _fake_nixl_rbln(_impl_xfer_result())
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=False)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        # Registration itself still serves.
+        assert worker._logical_region_kv_heads == [None] * 4
+        with pytest.raises(AssertionError, match="no head band"):
+            worker._region_kv_heads(0)
+
+    def test_two_models_sharing_a_per_rank_share_of_one_is_refused(self, monkeypatch):
+        # Target 4 heads and draft 8 at TP 8: both report 1 per rank, so the
+        # target's replicated layer is indistinguishable from the draft's real 8.
+        # Banded at 8, rank 3 would claim head 3 while it holds head 1.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.world_size = 8
+        worker.model_config.get_total_num_kv_heads.return_value = 4
+        spec_cfg = MagicMock(method="eagle3")
+        spec_cfg.draft_model_config.model = "draft"
+        spec_cfg.draft_model_config.revision = None
+        spec_cfg.draft_model_config.code_revision = None
+        spec_cfg.draft_model_config.get_total_num_kv_heads.return_value = 8
+        worker.vllm_config.speculative_config = spec_cfg
+        spec = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=1)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+
+        assert worker._layer_kv_heads("l0") is None
+
+    def test_a_head_count_a_model_in_the_engine_has_is_kept(self, monkeypatch):
+        # The counterpart: 8 heads over TP 8 replicates nothing, so the band is
+        # real and recorded.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.world_size = 8
+        worker.model_config.get_total_num_kv_heads.return_value = 8
+        spec = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=1)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        fake = _fake_nixl_rbln(_impl_xfer_result())
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=False)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert worker._logical_region_kv_heads == [8] * 4
+
+    def test_each_region_records_its_own_slice_count(self, monkeypatch):
+        # Each region's own count comes from `slice_ids`, not from the `slices`
+        # scalar, which describes the LAST region only -- a draft's.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec()
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        fake = _fake_nixl_rbln(
+            _impl_xfer_result(
+                base_addrs=tuple(0x20000 + 0x100 * i for i in range(16)),
+                block_lens=(256,) * 16,
+                # Two entries of four areas each: the first tiled over all four,
+                # the second cut in two and replicated across pairs.
+                slice_ids=(0, 1, 2, 3, 0, 1, 2, 3, 0, 0, 1, 1, 0, 0, 1, 1),
+                n_shards=4,
+                slices=2,
+            )
+        )
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=False)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert worker._logical_region_slices == [4, 4, 2, 2]
+        # The scalar the library reported is only the last region's, which is
+        # exactly why the list above cannot be derived from it.
+        assert worker._kv_slices == 2
+
+    def test_a_region_whose_span_disagrees_with_its_spec_is_rejected(self, monkeypatch):
+        # Without the span check a spec/allocation disagreement shifts every
+        # descriptor past block 0.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec(page_size_bytes=4096)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        def _short_regions(cache, layer_spec):
+            regions = _split_kv(worker.num_blocks)(cache, layer_spec)
+            # One block's worth missing, with shape[0] still right so the block
+            # count assert cannot catch it.
+            regions[0].numel.return_value -= 2048
+            return regions
+
+        fake = _fake_nixl_rbln(_impl_xfer_result())
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=False)
+        topo.get_transfer_cache_regions.side_effect = _short_regions
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            pytest.raises(AssertionError, match="is not 128 blocks of 2048B"),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+    def test_mixed_mla_and_non_mla_layers_are_rejected(self, monkeypatch):
+        # An MLA draft under a non-MLA target: the latent would be iterated as a
+        # K/V pair and the region list would count blocks as regions.
+        worker = _prep_impl_worker(monkeypatch)
+        target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.page_size_bytes = 4096
+        latent.num_kv_heads = 1
+        worker._layer_specs = {"l0": target, "l1": latent}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        fake = _fake_nixl_rbln(_impl_xfer_result())
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=False)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            pytest.raises(RuntimeError, match="mix MLA and non-MLA"),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        # Refused before anything was handed to nixl-rbln.
+        fake.register_kv_regions.assert_not_called()
+
+    def test_cross_layer_blocks_with_differing_page_sizes_are_rejected(
+        self, monkeypatch
+    ):
+        # Without this the page keeps the KV-cache tensor count as a factor, so
+        # the stride describes no layer.
+        worker = _prep_impl_worker(monkeypatch)
+        target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
+        draft = _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32)
+        worker._layer_specs = {"l0": target, "l1": draft}
+        worker.kv_cache_config = MagicMock(kv_cache_tensors=[object(), object()])
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        fake = _fake_nixl_rbln(_impl_xfer_result())
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=True)
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel"),
+            pytest.raises(RuntimeError, match="cross-layer blocks require one page"),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
     def test_cross_layer_blocks_scale_the_page_by_the_tensor_count(self, monkeypatch):
         # One tensor holds every layer's blocks, so a layer's page covers the
         # whole set and the stride from one block to the next is that much wider.
@@ -788,7 +1097,7 @@ class TestRegisterKvCachesImpl:
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
-        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=True)
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=True)
         topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
 
         with (
@@ -824,7 +1133,7 @@ class TestRegisterKvCachesImpl:
         fake = _fake_nixl_rbln(
             _impl_xfer_result(base_addrs=[0x20000, 0x30000], block_lens=[4096, 4096])
         )
-        topo = MagicMock(is_kv_layout_blocks_first=False, _cross_layers_blocks=False)
+        topo = MagicMock(virtually_split_kv_in_blocks=False, cross_layers_blocks=False)
         topo.get_transfer_cache_regions.side_effect = _one_region
 
         with (
@@ -838,6 +1147,127 @@ class TestRegisterKvCachesImpl:
         regions = fake.register_kv_regions.call_args.args[1]
         assert [block_len for _, _, block_len in regions] == [2048, 2048]
 
+    def test_one_head_over_several_slices_is_a_non_head_cut(self, monkeypatch):
+        # A single KV head cannot be cut along the head axis -- the compiler
+        # replicates it instead -- so distinct slices can only have come from
+        # another axis. This is the geometry a sparse-MLA model registers.
+        worker = _prep_impl_worker(monkeypatch)
+        worker.use_mla = True
+        spec = MagicMock(spec=MLAAttentionSpec)
+        spec.page_size_bytes = 4096
+        spec.num_kv_heads = 1
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _mla_kv_caches(num_blocks=worker.num_blocks)
+
+        areas = 4
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000 + 0x1000 * i for i in range(2 * areas)]
+        xfer_result.block_lens = [1024] * (2 * areas)
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = areas
+        xfer_result.slices = areas
+        xfer_result.slice_ids = [0, 1, 2, 3] * 2
+        fake = _fake_nixl_rbln(xfer_result)
+
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = lambda cache, _spec: [cache]
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel") as mock_rebel,
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
+
+    def test_the_same_slice_count_over_several_heads_stays_head(self, monkeypatch):
+        # Identical areas and slices to the case above, and the opposite answer:
+        # 8 heads divide into 4 slices, so head tiling explains it and the
+        # derivation must not claim more than it can prove.
+        worker = _prep_impl_worker(monkeypatch)
+        # HEAD is also the field's initial value, so start from the other one:
+        # otherwise the assertion below passes just as well when the derivation
+        # never runs at all.
+        worker._kv_split_axis = KVSplitAxis.NON_HEAD
+        spec = _impl_layer_spec()
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        areas = 4
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000 + 0x1000 * i for i in range(4 * areas)]
+        xfer_result.block_lens = [64] * (4 * areas)
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = areas
+        xfer_result.slices = areas
+        xfer_result.slice_ids = [0, 1, 2, 3] * 4
+        fake = _fake_nixl_rbln(xfer_result)
+
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel") as mock_rebel,
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert worker._kv_split_axis is KVSplitAxis.HEAD
+
+    def test_regions_cut_on_different_axes_are_rejected(self, monkeypatch):
+        # One axis is advertised per engine, so regions that disagree cannot be
+        # described -- and either choice mislabels the other's areas while every
+        # byte count still adds up. Both layers are latents so the two axes
+        # differ by geometry alone (a mixed MLA engine is refused earlier).
+        worker = _prep_impl_worker(monkeypatch)
+        worker.use_mla = True
+        latent = MagicMock(spec=MLAAttentionSpec)
+        latent.page_size_bytes = 4096
+        latent.num_kv_heads = 1
+        worker._layer_specs = {"l0": latent, "l1": latent}
+        kv_caches = _mla_kv_caches(num_blocks=worker.num_blocks)
+
+        areas = 4
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000 + 0x1000 * i for i in range(2 * areas)]
+        xfer_result.block_lens = [1024] * (2 * areas)
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = areas
+        xfer_result.slices = areas
+        xfer_result.slice_ids = [0, 1, 2, 3] + [0] * areas
+        fake = _fake_nixl_rbln(xfer_result)
+
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = lambda cache, _spec: [cache]
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patch.object(wm, "rebel") as mock_rebel,
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+            pytest.raises(RuntimeError, match="not all cut on the same axis"),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+
 
 class TestRegisterLocalXferHandlerSwa:
     # With _sw_ratio set, register_local_xfer_handler emits a dual desc range
@@ -848,14 +1278,18 @@ class TestRegisterLocalXferHandlerSwa:
         worker._has_mamba = False
         worker.tp_rank = 0
         worker.device_id = 0
-        worker.transfer_topo = MagicMock(is_kv_layout_blocks_first=False)
+        worker.transfer_topo = MagicMock(virtually_split_kv_in_blocks=False)
         worker.kv_caches_base_addr = {worker.engine_id: {0: [0x1000, 0x2000]}}
         worker.block_len_per_layer = [256, 256]
         worker.nixl_memory_type = "DRAM"
         worker.nixl_wrapper = MagicMock()
 
         with patch.object(worker, "get_backend_aware_kv_block_len", return_value=256):
-            worker.register_local_xfer_handler(64)  # block_size_ratio == 1
+            _, blocks = worker.register_local_xfer_handler(64)  # block_size_ratio 1
+
+        # This return becomes src_blocks_data, which upstream's hetero-TP split
+        # reads with .tolist(); a list of triples would not survive that.
+        assert (blocks.shape, blocks.dtype) == ((16, 3), np.uint64)
 
         worker.nixl_wrapper.get_xfer_descs.assert_called_once()
         blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
@@ -887,6 +1321,22 @@ def _remote_agent_meta():
 class TestAddRemoteAgentSwa:
     # The remote engine must be registered and its TPMapping built before any
     # topology lookup, or get_engine_info() KeyErrors.
+    def test_a_mamba_worker_is_refused(self, monkeypatch):
+        # The SWA tail builds Full-only descriptors, so a conv/ssm pair has no
+        # shape here. Nothing else in add_remote_agent says so.
+        worker = _build_worker(monkeypatch, num_blocks=4, block_size=64)
+        worker._sw_ratio = 2
+        worker._has_mamba = True
+        worker.transfer_topo = MagicMock()
+        worker._remote_agents = {}
+        worker.nixl_wrapper = MagicMock()
+
+        with (
+            patch.object(worker, "_register_remote_engine_prelude"),
+            pytest.raises(AssertionError, match="Mamba"),
+        ):
+            worker.add_remote_agent(_remote_agent_meta(), 0, 1)
+
     def test_registers_remote_engine_before_topology_lookups(self, monkeypatch):
         worker = _build_worker(monkeypatch, num_blocks=4, block_size=64)
         worker._sw_ratio = 2
@@ -896,7 +1346,7 @@ class TestAddRemoteAgentSwa:
         worker._group_spec_types = ()
         worker.nixl_memory_type = "DRAM"
 
-        topo = MagicMock(is_kv_layout_blocks_first=False)
+        topo = MagicMock(virtually_split_kv_in_blocks=False)
         topo.block_size_ratio.return_value = 1
         topo.tp_ratio.return_value = 1
         topo.is_kv_replicated.return_value = True
@@ -965,7 +1415,7 @@ class TestAddRemoteAgentSwa:
         worker._group_spec_types = ()
         worker.nixl_memory_type = "DRAM"
 
-        topo = MagicMock(is_kv_layout_blocks_first=False)
+        topo = MagicMock(virtually_split_kv_in_blocks=False)
         topo.block_size_ratio.return_value = 2
         topo.tp_ratio.return_value = 1
         topo.is_kv_replicated.return_value = True

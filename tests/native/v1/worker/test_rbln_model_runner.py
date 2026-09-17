@@ -22,7 +22,7 @@ import contextlib
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
@@ -40,6 +40,13 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 
 import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
+import vllm_rbln.v1.worker.utils as worker_utils
+from tests.native.v1.worker.utils import (
+    make_runner_config,
+    make_speculative_config,
+    schedule_new,
+)
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
@@ -288,9 +295,10 @@ class TestPadDepad:
 
 class TestSamplePadding:
     @staticmethod
-    def _runner(rejection_output: SamplerOutput):
+    def _runner(rejection_output: SamplerOutput, *, sampler: bool):
         rejection_sampler = MagicMock(return_value=rejection_output)
         runner = _make_runner_stub(
+            rbln_config=RBLNConfig(use_custom_sampler=sampler),
             _is_prefill_step=False,
             use_async_scheduling=False,
             input_batch=SimpleNamespace(
@@ -305,26 +313,24 @@ class TestSamplePadding:
         )
         return runner, rejection_sampler
 
-    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", True)
+    def test_compiled_rejection_sampler_uses_per_stage_batch_bound(self):
         output = SamplerOutput(
             sampled_token_ids=torch.zeros((4, 3), dtype=torch.int32),
             logprobs_tensors=None,
         )
-        runner, rejection_sampler = self._runner(output)
+        runner, rejection_sampler = self._runner(output, sampler=True)
 
         runner._sample(torch.zeros((4, 10)), _spec_decode_metadata([1, 1]))
 
         padded_metadata = rejection_sampler.call_args.args[0]
         assert len(padded_metadata.num_draft_tokens) == 4
 
-    def test_torch_rejection_sampler_keeps_live_batch_metadata(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", False)
+    def test_torch_rejection_sampler_keeps_live_batch_metadata(self):
         output = SamplerOutput(
             sampled_token_ids=torch.zeros((2, 3), dtype=torch.int32),
             logprobs_tensors=None,
         )
-        runner, rejection_sampler = self._runner(output)
+        runner, rejection_sampler = self._runner(output, sampler=False)
         spec_decode_metadata = _spec_decode_metadata([1, 1])
         sampling_metadata = runner.input_batch.sampling_metadata
 
@@ -334,10 +340,10 @@ class TestSamplePadding:
         assert rejection_sampler.call_args.args[3] is sampling_metadata
 
 
-def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
-    monkeypatch.setattr(mr.envs, "VLLM_RBLN_SAMPLER", True)
+def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
     rejection_sample = MagicMock()
     runner = _make_runner_stub(
+        rbln_config=RBLNConfig(use_custom_sampler=True),
         speculative_config=object(),
         num_spec_tokens=2,
         is_pooling_model=False,
@@ -355,8 +361,17 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound(monkeypatch):
 
     runner._warmup_sampler_decode_batches()
 
-    assert rejection_sample.call_count == 1
-    assert len(rejection_sample.call_args.args[1]) == 4
+    # One call per bonus-token graph: the argmax-in-graph one an all-greedy
+    # step without logprobs takes, and the pre-sampled-ids one every other
+    # step takes. Both are warmed at the same batch bound.
+    assert rejection_sample.call_count == 2
+    for call in rejection_sample.call_args_list:
+        assert len(call.args[1]) == 4
+    variants = [
+        (call.args[6] is None, call.kwargs["bonus_logits"] is None)
+        for call in rejection_sample.call_args_list
+    ]
+    assert sorted(variants) == [(False, True), (True, False)]
 
 
 class TestPredicates:
@@ -538,6 +553,57 @@ class TestResolveBatchDescriptor:
         )._determine_batch_execution_and_padding(3, 30)
         assert batch_desc.num_tokens_padded is None
         assert across is None
+
+
+@pytest.mark.maybe_use_device
+@pytest.mark.parametrize(("backend", "should_exit"), [("mp", True), ("uni", False)])
+def test_async_output_inherits_runner_fail_fast_policy(
+    make_model_runner, monkeypatch, backend, should_exit
+):
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    config = make_runner_config(distributed_executor_backend=backend)
+    # The CPU lane disables async scheduling at platform setup. Exercise the
+    # deferred output path with CPU tensors after that setup has completed.
+    config.scheduler_config.async_scheduling = True
+    runner = make_model_runner(vllm_config=config)
+    scheduler_output = schedule_new("a")
+    runner._update_states(scheduler_output)
+    hidden_states = torch.zeros(1, 1)
+    runner.execute_model_state = ExecuteModelState(
+        scheduler_output, hidden_states, None, None, hidden_states, hidden_states, None
+    )
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        Mock(
+            return_value=SamplerOutput(
+                sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
+                logprobs_tensors=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_bookkeeping_sync",
+        Mock(return_value=(0, None, [], {}, ["a"], {"a": 0}, [])),
+    )
+    output = runner.sample_tokens(None)
+    error = RuntimeError("runner output copy failed")
+    monkeypatch.setattr(output._sampled_token_ids_cpu, "copy_", Mock(side_effect=error))
+    monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "0")
+    exit_process = Mock(side_effect=SystemExit(70))
+    monkeypatch.setattr(worker_utils.os, "_exit", exit_process)
+
+    with pytest.raises(SystemExit if should_exit else RuntimeError) as excinfo:
+        output.get_output()
+
+    if should_exit:
+        exit_process.assert_called_once_with(70)
+        assert isinstance(excinfo.value, SystemExit)
+        assert excinfo.value.code == 70
+    else:
+        exit_process.assert_not_called()
+        assert excinfo.value is error
 
 
 class TestShapeConfigWiring:
@@ -778,24 +844,116 @@ class TestDummyRunPadding:
         assert captured["layout"].num_reqs_padded == 1
 
 
+def _drafter_stub(order):
+    """An RBLNEagleProposer the dummy step will call, recording only that it ran.
+
+    A real instance would need a model and a bucketing manager; what the
+    ordering here turns on is just that the call happens, and isinstance()
+    against the production class is what selects the branch.
+    """
+    drafter = object.__new__(RBLNEagleProposer)
+    drafter.dummy_run = lambda *a, **kw: order.append("draft")
+    return drafter
+
+
+class TestDummyRunFlushesTheDeferredLoad:
+    """The dummy step issues a KV read a step with no forward handed over.
+
+    The forward submission returns without waiting for the device, so a read
+    issued after it runs while this rank's graph runs and the busy ranks sit in
+    their samplers. Reusing TestDummyRunPadding's stub: what changes here is only
+    which calls are recorded.
+    """
+
+    @staticmethod
+    def _runner_with_connector(monkeypatch, **kwargs):
+        runner, captured = TestDummyRunPadding._runner(monkeypatch, **kwargs)
+        order: list[str] = []
+        runner.model_executable = lambda **kw: order.append("submit")
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: "CONNECTOR")
+        monkeypatch.setattr(
+            mr,
+            "flush_deferred_loads",
+            lambda connector: order.append(f"flush:{connector}"),
+        )
+        return runner, captured, order
+
+    def test_flush_comes_after_the_submission(self, monkeypatch):
+        # The whole point is that the read runs behind a submission already in
+        # flight. Flushing first would delay the submission the MoE collective
+        # waits on, so the order is the behaviour, not just the call.
+        runner, _, order = self._runner_with_connector(
+            monkeypatch, reqs_across_dp=[2, 1, 1, 1]
+        )
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert order == ["submit", "flush:CONNECTOR"]
+
+    def test_warmup_does_not_flush(self, monkeypatch):
+        # Warm-up compiles shapes before serving; there is no connector metadata
+        # to issue, and asking for the transfer group there is out of place.
+        runner, _, order = self._runner_with_connector(
+            monkeypatch, reqs_across_dp=[2, 1, 1, 1]
+        )
+        runner._dummy_run(1, 1, is_prefill=False)
+
+        assert order == ["submit"]
+
+    def test_the_flush_precedes_the_draft(self, monkeypatch):
+        # The draft submits several times with each call depending on the last,
+        # so it occupies the host rather than leaving it idle. Issuing the read
+        # after it would land on a host already spent; the window is the one the
+        # main submission opened.
+        runner, _, order = self._runner_with_connector(
+            monkeypatch, reqs_across_dp=[2, 1, 1, 1]
+        )
+        runner.drafter = _drafter_stub(order)
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert order == ["submit", "flush:CONNECTOR", "draft"]
+
+    def test_a_drained_group_flushes_nothing(self, monkeypatch):
+        # Every rank stops before the forward here, so this dummy has no
+        # submission for the read to run behind either -- issuing it would be the
+        # synchronous submission the deferral exists to avoid. The recovery flush
+        # on the next execute_model picks it up instead.
+        runner, captured, order = self._runner_with_connector(
+            monkeypatch, reqs_across_dp=[1, 1, 1, 1], peers_idle=True
+        )
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert captured == {}
+        assert order == []
+
+
 class TestProcessKvCacheCopyOps:
     # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
-    # and VLLM_RBLN_COMPILE_MODEL. Forced deterministically via monkeypatch.
-    def test_eager_copy_non_mla(self, monkeypatch):
+    # and compile_model. Forced deterministically.
+    @pytest.mark.parametrize(
+        "block_axis, shape",
+        [(0, (4, 2, 1, 1, 8, 2)), (1, (2, 4, 1, 1, 8, 2))],
+        ids=["blocks_first", "kv_first"],
+    )
+    def test_eager_copy_non_mla(self, monkeypatch, block_axis, shape):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)  # -> eager path
-        # non-MLA layout: (2, num_blocks, heads, 1, block_tokens, dim).
-        kv = torch.zeros(2, 4, 1, 1, 8, 2)
-        kv[:, 1, :, :, :, :] = 5.0  # source = block 1
+        # The rbln_custom_ops and rbln_triton_ops layouts, in that order.
+        kv = torch.zeros(shape)
+        kv.select(block_axis, 1).fill_(5.0)  # source = block 1
         r = _make_runner_stub(
             kv_caches=[kv],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": block_axis},
             model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         # First 3 token slots of dst block 2 now match src; the rest stay 0.
-        assert torch.equal(kv[:, 2, :, :, :3, :].cpu(), kv[:, 1, :, :, :3, :].cpu())
-        assert (kv[:, 2, :, :, :3, :] == 5.0).all()
-        assert (kv[:, 2, :, :, 3:, :] == 0.0).all()
+        # Both K and V move: taking the other axis would copy a K/V half.
+        dst, src = kv.select(block_axis, 2), kv.select(block_axis, 1)
+        assert torch.equal(dst[..., :3, :].cpu(), src[..., :3, :].cpu())
+        assert (dst[..., :3, :] == 5.0).all()
+        assert (dst[..., 3:, :] == 0.0).all()
 
     def test_eager_copy_mla(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
@@ -803,6 +961,8 @@ class TestProcessKvCacheCopyOps:
         kv[1] = 7.0
         r = _make_runner_stub(
             kv_caches=[kv],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": 0},
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -810,17 +970,40 @@ class TestProcessKvCacheCopyOps:
         assert (kv[2, :3, :] == 7.0).all()
         assert (kv[2, 3:, :] == 0.0).all()
 
+    def test_eager_copy_mla_indexer_scale(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
+        # DeepSeek-V3.2 carries three MLA-family caches and the indexer scale
+        # one is (num_blocks, block_tokens) -- no trailing head axis.
+        latent = torch.zeros(4, 8, 2)
+        scale = torch.zeros(4, 8)
+        latent[1] = 7.0
+        scale[1] = 9.0
+        r = _make_runner_stub(
+            kv_caches=[latent, scale],
+            kv_cache_names=["latent", "scale"],
+            kv_cache_block_axes={"latent": 0, "scale": 0},
+            model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
+            runtime_holder=[None],
+        )
+        r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
+        assert (latent[2, :3, :] == 7.0).all()
+        assert (latent[2, 3:, :] == 0.0).all()
+        assert (scale[2, :3] == 9.0).all()
+        assert (scale[2, 3:] == 0.0).all()
+
     def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         calls = []
         runtime = SimpleNamespace(
             _copy_kv_cache=lambda src, dst, nt: calls.append((src, dst, nt))
         )
         r = _make_runner_stub(
             kv_caches=[],
+            kv_cache_names=[],
+            kv_cache_block_axes={},
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
+            rbln_config=RBLNConfig(),
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 5, 6, 4)])
         assert calls == [(5, 6, 4)]
@@ -866,10 +1049,6 @@ def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None):
 class TestUpdateStates:
     # Request-state bookkeeping on a real InputBatch; scheduler_output is
     # duck-typed since every access is an attribute or index read.
-    @pytest.fixture(autouse=True)
-    def _config(self, rbln_config):
-        rbln_config()
-
     @staticmethod
     def _runner(monkeypatch, *, input_batch, requests=None):
         monkeypatch.setattr(
@@ -989,7 +1168,7 @@ class TestSortBatchByLength:
     # __init__ enables the sort on REBEL CR13 and wherever
     # VLLM_RBLN_BATCH_ATTN_OPT is set; other parts keep the scheduler's order.
     @pytest.mark.parametrize(
-        ("is_cr13", "batch_attn_opt", "expected"),
+        ("is_cr13", "use_batch_attn_opt", "expected"),
         [
             (True, "0", True),
             (False, "0", False),
@@ -997,10 +1176,10 @@ class TestSortBatchByLength:
         ],
     )
     def test_resolved_from_device_and_flag(
-        self, monkeypatch, make_model_runner, is_cr13, batch_attn_opt, expected
+        self, monkeypatch, make_model_runner, is_cr13, use_batch_attn_opt, expected
     ):
         monkeypatch.setattr(current_platform, "is_cr13", lambda: is_cr13)
-        monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", batch_attn_opt)
+        monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", use_batch_attn_opt)
         runner = make_model_runner(init_kv_cache=False)
         assert runner.sort_batch_by_length is expected
 
@@ -1053,6 +1232,102 @@ class TestMayReorderBatch:
         assert r.input_batch.batch_update_builder.moved != []
 
 
+class TestDummyRunDecodeWindowPadding:
+    pytestmark = pytest.mark.maybe_use_device
+
+    NUM_REQS = 2
+    NUM_SPEC = 3
+
+    @pytest.mark.parametrize(
+        "fixed_window,warmup,expected_tokens",
+        [
+            (True, True, 1 + NUM_SPEC),
+            (False, True, 1),
+            (True, False, 1),
+        ],
+    )
+    def test_only_a_warm_up_with_a_fixed_window_pads(
+        self, make_model_runner, monkeypatch, fixed_window, warmup, expected_tokens
+    ):
+        runner = make_model_runner()
+        monkeypatch.setattr(runner, "num_spec_tokens", self.NUM_SPEC)
+        monkeypatch.setattr(type(runner), "uses_fixed_decode_window", fixed_window)
+        seen: list = []
+
+        def record(num_reqs, num_tokens, is_idle, **kw):
+            seen.append(num_tokens)
+            return None, None, None
+
+        monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", record)
+
+        runner._dummy_run(self.NUM_REQS, 1, False, warmup=warmup)
+
+        assert seen == [self.NUM_REQS * expected_tokens]
+
+
+class TestUsesFixedDecodeWindow:
+    @pytest.mark.parametrize(
+        "method, expected",
+        [
+            ("eagle", True),
+            ("eagle3", True),
+            ("mtp", True),
+            ("ngram", False),
+            ("suffix", False),
+            ("medusa", False),
+            ("dflash", False),
+        ],
+    )
+    def test_only_a_model_based_drafter_fixes_the_window(self, method, expected):
+        runner = _make_runner_stub(speculative_config=make_speculative_config(method))
+        assert runner.uses_fixed_decode_window is expected
+
+    def test_no_speculative_config_has_no_window(self):
+        runner = _make_runner_stub(speculative_config=None)
+        assert runner.uses_fixed_decode_window is False
+
+
+class TestFixedDecodeWindowConfig:
+    @staticmethod
+    def _runner(max_model_len, num_spec_tokens, block_size=1024, method="mtp"):
+        return _make_runner_stub(
+            max_model_len=max_model_len,
+            num_spec_tokens=num_spec_tokens,
+            speculative_config=make_speculative_config(method),
+            cache_config=SimpleNamespace(block_size=block_size),
+            rbln_config=RBLNConfig(),
+        )
+
+    @pytest.mark.parametrize("method", ["mtp", "ngram"])
+    def test_a_block_narrower_than_the_window_is_refused(self, method):
+        runner = self._runner(1024 * 4, 3, block_size=2, method=method)
+        with pytest.raises(ValueError, match="cannot hold the 4-slot"):
+            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
+
+    def test_a_fixed_window_that_misses_the_last_block_is_refused(self):
+        runner = self._runner(1024 * 4 + 2, 3)
+        with pytest.raises(ValueError, match="leaves 2 token"):
+            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
+
+    def test_the_same_last_block_is_allowed_without_a_fixed_window(self, monkeypatch):
+        # Same remainder, a method that falls back to qlen=1 there: not fatal, so
+        # it must not be refused at load. The guard is all that is under test, so
+        # the step after it ends the call.
+        runner = self._runner(1024 * 4 + 2, 3, method="ngram")
+
+        class PastTheGuard(Exception):
+            pass
+
+        def stop(self, kv_cache_config):
+            raise PastTheGuard
+
+        monkeypatch.setattr(
+            type(runner), "maybe_add_kv_sharing_layers_to_kv_cache_groups", stop
+        )
+        with pytest.raises(PastTheGuard):
+            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
+
+
 class TestAllocateKvCacheTensors:
     # Device selection: "cpu" if not compiling, else self.device if device-tensor,
     # else "meta". The mapping/validation logic is exercised on CPU.
@@ -1069,14 +1344,15 @@ class TestAllocateKvCacheTensors:
             ],
         )
 
-    def _runner(self):
+    def _runner(self, *, compile_model=True):
         return _make_runner_stub(
-            device=torch.device("cpu"), runner_only_attn_layers=set()
+            device=torch.device("cpu"),
+            runner_only_attn_layers=set(),
+            rbln_config=RBLNConfig(compile_model=compile_model),
         )
 
-    def test_cpu_when_not_compiling(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+    def test_cpu_when_not_compiling(self):
+        raw = self._runner(compile_model=False)._allocate_kv_cache_tensors(self._cfg())
         assert set(raw) == {"l0", "l1", "l2"}
         assert raw["l0"].device.type == "cpu"
         # Layers sharing a pool share the same buffer object.
@@ -1084,13 +1360,11 @@ class TestAllocateKvCacheTensors:
         assert raw["l0"] is not raw["l2"]
 
     def test_meta_when_compiling_without_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "meta"
 
     def test_self_device_when_compiling_with_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_COMPILE_MODEL", True)
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here
@@ -1314,7 +1588,7 @@ class TestDummyRunDraftParticipation:
         attrs = dict(
             max_num_tokens=64,
             max_num_reqs=8,
-            speculative_config=SimpleNamespace(),
+            speculative_config=make_speculative_config("eagle"),
             num_spec_tokens=cls.NUM_SPEC,
             query_start_loc_np=np.zeros(16, dtype=np.int32),
             input_ids=torch.zeros(64, dtype=torch.int32),
@@ -1364,6 +1638,31 @@ class TestDummyRunDraftParticipation:
         monkeypatch.setattr(mr, "build_kv_cache_forward_context_kwargs", lambda b: {})
         return runner, drafter
 
+    def test_idle_backbone_runs_the_window_the_draft_the_decided_length(
+        self, monkeypatch
+    ):
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        staged: list = []
+
+        def record(**kwargs):
+            staged.append(kwargs["layout"].query_len)
+            return SimpleNamespace(as_kwargs=lambda: {})
+
+        monkeypatch.setattr(runner.input_stager, "stage", record)
+
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        assert staged == [1 + self.NUM_SPEC]
+        drafter.dummy_run.assert_called_once_with(1, 1, False)
+
+    def test_a_single_token_draft_runs_the_window_on_an_idle_step(self, monkeypatch):
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        monkeypatch.setattr(runner, "num_spec_tokens", 1)
+
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        drafter.dummy_run.assert_called_once_with(1, 2, False)
+
     def test_idle_draft_runs_the_decided_length(self, monkeypatch):
         # Beside a prefilling peer the step decides this rank's own single token,
         # and the group's token dimension is sized for that. Running the draft at
@@ -1372,18 +1671,18 @@ class TestDummyRunDraftParticipation:
         runner._dummy_run(1, 1, is_prefill=False, warmup=False)
         drafter.dummy_run.assert_called_once_with(1, 1, False)
 
-    @pytest.mark.parametrize("query_len", [1, 1 + NUM_SPEC])
-    def test_warmup_compiles_the_draft_at_every_query_length(
-        self, monkeypatch, query_len
+    @pytest.mark.parametrize("requested", [1, 1 + NUM_SPEC])
+    def test_warmup_compiles_the_draft_at_the_window_length(
+        self, monkeypatch, requested
     ):
-        # Both decode lengths reach the draft. Query length 1 is the one a step
-        # forced to no-spec runs, and compiling only the spec length leaves that
-        # step to compile its own graph while it serves.
+        # The window is the only decode length this config compiles, so a warm-up
+        # dummy asking for a shorter decode query reaches the draft padded out to
+        # it rather than at a length nothing compiled.
         runner, drafter = self._runner(monkeypatch, has_drafter=True)
-        runner._dummy_run(2, query_len, is_prefill=False, warmup=True)
+        runner._dummy_run(2, requested, is_prefill=False, warmup=True)
         # warmup path keeps the num_padded_tokens kwarg (draft's own pad target).
         drafter.dummy_run.assert_called_once_with(
-            2, query_len, False, num_padded_tokens=None
+            2, 1 + self.NUM_SPEC, False, num_padded_tokens=None
         )
 
     def test_no_drafter_skips_cleanly(self, monkeypatch):
@@ -1467,3 +1766,159 @@ class TestDummyRunPPIntermediateTensors:
         assert captured["intermediate_tensors"]["h"].shape == (8, 1, self.HIDDEN)
         assert captured["layout"].num_reqs == 1
         assert captured["layout"].num_reqs_padded == 8
+
+
+class TestExecuteModelRecoversADeferredLoad:
+    """A read the dummy step never issued goes out on the next execute_model.
+
+    The scheduler lists a request in `reqs_to_recv` once and clears the list
+    while building the metadata, so a read nobody issues strands its request:
+    the consumer waits on KV that no producer was ever asked for. The rounds
+    where no dummy step runs -- a drained group, a sleeping executor, a round
+    the engine loop skipped -- are covered here rather than by matching the
+    conditions that decide whether a dummy step runs at all.
+    """
+
+    @staticmethod
+    def _runner(monkeypatch):
+        order: list[str] = []
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        connector = SimpleNamespace(
+            handle_preemptions=lambda meta: order.append(f"preemptions:{meta}")
+        )
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+        monkeypatch.setattr(
+            mr,
+            "flush_deferred_loads",
+            lambda c: order.append("flush" if c is connector else "flush:WRONG"),
+        )
+
+        def no_forward(scheduler_output, vllm_config):
+            order.append("no_forward")
+            return "OUTPUT"
+
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            use_async_scheduling=False,
+            _update_states=lambda so: order.append("update_states"),
+            kv_connector_no_forward=no_forward,
+            vllm_config="VLLM_CONFIG",
+        )
+        return runner, order
+
+    @staticmethod
+    def _scheduler_output():
+        return SimpleNamespace(
+            total_num_scheduled_tokens=0,
+            kv_connector_metadata="META",
+            kv_cache_copy_ops=None,
+        )
+
+    def test_the_held_read_is_issued_before_the_connector_step(self, monkeypatch):
+        # Issued on entry, so the request is no longer waiting on a read nobody
+        # asked for by the time this step's connector work runs.
+        runner, order = self._runner(monkeypatch)
+
+        out = runner.execute_model(self._scheduler_output())
+
+        assert out == "OUTPUT"
+        assert order == [
+            "preemptions:META",
+            "flush",
+            "update_states",
+            "no_forward",
+        ]
+
+    def test_no_transfer_group_asks_no_connector(self, monkeypatch):
+        # Without a connector there is nothing to recover, and reaching for the
+        # transfer group would raise.
+        runner, order = self._runner(monkeypatch)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
+
+        assert (
+            runner.execute_model(self._scheduler_output())
+            is mr.EMPTY_MODEL_RUNNER_OUTPUT
+        )
+        assert order == ["update_states"]
+
+
+class TestExecuteModelFlushesAfterTheSubmission:
+    """A real step issues its read after the forward submission, not before.
+
+    Upstream calls `start_load_kv` before the submission; the connector holds the
+    read instead, and `execute_model` issues it once the submission is in flight.
+    Under expert parallelism every peer's collective waits on that submission, so
+    the order is the behaviour here, not just the call.
+    """
+
+    @staticmethod
+    def _runner(monkeypatch):
+        order: list[str] = []
+        connector = SimpleNamespace(handle_preemptions=lambda meta: None)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+        monkeypatch.setattr(mr, "flush_deferred_loads", lambda c: order.append("flush"))
+        monkeypatch.setattr(mr, "set_forward_context", lambda *a, **kw: nullcontext())
+        monkeypatch.setattr(
+            mr, "build_kv_cache_forward_context_kwargs", lambda *a, **kw: {}
+        )
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        monkeypatch.setattr(
+            RBLNModelRunner,
+            "maybe_get_kv_connector_output",
+            staticmethod(lambda *a, **kw: nullcontext("KV_OUT")),
+        )
+
+        def executable(**kwargs):
+            order.append("submit")
+            return ("HIDDEN", "LOGITS", None)
+
+        runner = _make_runner_stub(
+            execute_model_state=None,
+            use_async_scheduling=False,
+            _update_states=lambda so: None,
+            _prepare_inputs=lambda so, counts: (
+                "LOGITS_IDX",
+                None,
+                torch.ones(1, dtype=torch.int32),
+                1,
+            ),
+            _determine_batch_execution_and_padding=lambda *a, **kw: _resolved_batch(
+                num_reqs_padded=1, query_len=1, num_tokens_padded=1
+            ),
+            _build_attention_metadata=lambda **kw: ("ATTN", None),
+            _preprocess=lambda *a, **kw: (
+                SimpleNamespace(as_kwargs=lambda: {}),
+                {},
+            ),
+            _bookkeeping_and_output=lambda *a, **kw: "OUTPUT",
+            input_batch=SimpleNamespace(num_reqs=1, req_ids=["r0"]),
+            cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+            speculative_config=None,
+            is_pooling_model=False,
+            vllm_config="VLLM_CONFIG",
+            model_executable=executable,
+            num_prompt_logprobs=None,
+            kv_cache_bases=None,
+            decode_back_pad=torch.zeros(1, dtype=torch.int32),
+        )
+        return runner, order
+
+    def test_the_flush_follows_the_submission(self, monkeypatch):
+        runner, order = self._runner(monkeypatch)
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"r0": 1},
+            kv_connector_metadata="META",
+            kv_cache_copy_ops=None,
+        )
+
+        runner.execute_model(scheduler_output)
+
+        # The entry flush recovers a stale hold, then this step's read goes out
+        # only after its own submission.
+        assert order == ["flush", "submit", "flush"]

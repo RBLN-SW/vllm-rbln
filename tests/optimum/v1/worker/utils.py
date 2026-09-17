@@ -22,6 +22,9 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
+from vllm_rbln.model_executor.models.optimum.model_base import (
+    RBLNOptimumDecoderMixin,
+)
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
@@ -32,7 +35,11 @@ IB_SIZE = 4
 NUM_BLOCKS = MAX_MODEL_LEN // OB_SIZE * MAX_NUM_SEQ + 1
 
 
-class MockModelWrapper(nn.Module):
+class MockModelWrapper(nn.Module, RBLNOptimumDecoderMixin):
+    """Stands in for an optimum decoder model: the runner reads the decode
+    batch layout (decoder_batch_size, the bucket ladder, decode_layout)
+    from the real mixin methods; forward is faked per test."""
+
     class MockModel:
         def __init__(
             self, dtype: torch.dtype, decoder_batch_sizes: tuple[int, ...] | None
@@ -46,12 +53,15 @@ class MockModelWrapper(nn.Module):
 
     def __init__(
         self,
+        max_num_seqs: int,
         dtype: torch.dtype = torch.float32,
         decoder_batch_sizes: tuple[int, ...] | None = None,
     ):
         super().__init__()
         self.model = self.MockModel(dtype, decoder_batch_sizes)
         self.dtype = self.model.rbln_config.dtype
+        self.decoder_batch_size = max_num_seqs
+        self.use_multiple_decoder = decoder_batch_sizes is not None
         if decoder_batch_sizes is not None:
             # Ascending, like RBLNOptimumDecoderMixin.setup_decoder_mixin
             # stores the compiled decoder batch sizes.
@@ -70,18 +80,19 @@ def fake_load_model(
     model_dtype = runner.model_config.dtype
 
     def fake_forward(model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        current_num_reqs = runner.input_batch.num_reqs
-        current_vocab_size = runner.model_config.get_vocab_size()
-
+        # Like the compiled graph, return every row of the padded batch.
         return torch.randn(
-            (current_num_reqs, 1, current_vocab_size),
+            (model_input.padded_batch_size, 1, runner.model_config.get_vocab_size()),
             dtype=model_dtype,
             device=runner.device,
         )
 
     runner.model = MockModelWrapper(
-        dtype=model_dtype, decoder_batch_sizes=decoder_batch_sizes
+        max_num_seqs=runner.scheduler_config.max_num_seqs,
+        dtype=model_dtype,
+        decoder_batch_sizes=decoder_batch_sizes,
     )
+    runner.available_blocks = torch.arange(NUM_BLOCKS, dtype=torch.int16)
     runner.use_optimum_lora = False
     # Assign the fake forward function to the model
     runner.model.forward = fake_forward
@@ -113,7 +124,7 @@ def _schedule_new_request(
     total_num_scheduled_tokens = 0
     if token_ids is None:
         token_ids = [1, 2, 3]
-    outer_block_ids = torch.tensor([outer_block_ids])
+    outer_block_ids = torch.tensor(outer_block_ids)
     for req_id in req_ids:
         request_token_ids = (
             token_ids_by_req.get(req_id, token_ids) if token_ids_by_req else token_ids

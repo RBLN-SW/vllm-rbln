@@ -14,8 +14,6 @@
 
 import torch
 
-from vllm_rbln import envs
-
 from ..ops import triton_sliding_window_attention_naive  # noqa: F401
 
 
@@ -29,9 +27,12 @@ def sliding_window_attention_naive_prefill(
     scale: torch.Tensor,
     block_tables: torch.Tensor,
     sinks: torch.Tensor | None = None,
+    *,
+    compile_model: bool,
+    use_custom_kernel: bool,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+    if compile_model:
+        if use_custom_kernel:
             return torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill(
                 q,
                 k,
@@ -71,9 +72,12 @@ def sliding_window_attention_naive_decode(
     block_tables: torch.Tensor,
     attn_mask: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
+    *,
+    compile_model: bool,
+    use_custom_kernel: bool,
 ) -> torch.Tensor:
-    if envs.VLLM_RBLN_COMPILE_MODEL:
-        if envs.VLLM_RBLN_USE_CUSTOM_KERNEL:
+    if compile_model:
+        if use_custom_kernel:
             return torch.ops.rbln_triton_ops.sliding_window_attention_naive_decode(
                 q,
                 k,
@@ -99,5 +103,36 @@ def sliding_window_attention_naive_decode(
                 attn_mask,
                 sinks,
             )
+
+    raise NotImplementedError
+
+
+def sliding_window_attention_v1(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache: torch.Tensor,
+    seq_idx: torch.Tensor,
+    scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    window_size: int,
+    sinks: torch.Tensor | None = None,
+    *,
+    compile_model: bool,
+) -> torch.Tensor:
+    if compile_model:
+        return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
+            q,
+            k,
+            v,
+            kv_cache,
+            seq_idx,
+            scale,
+            block_tables,
+            window_size,
+            True,  # is_causal
+            None,  # attn_mask: derived from the window by the converter
+            sinks,
+        )
 
     raise NotImplementedError

@@ -34,6 +34,7 @@ import pytest
 import torch
 
 import vllm_rbln.v1.spec_decode.dflash as dflash_module
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 
 BLOCK_SIZE = 1024
@@ -155,29 +156,28 @@ class TestContextWriteContiguity:
     NUM_KV_HEADS = 8
     HEAD_DIM = 128
 
-    def _cache(self):
-        return torch.zeros(
-            2,
-            4,
-            self.NUM_KV_HEADS,
-            1,
-            BLOCK_SIZE,
-            self.HEAD_DIM,
-            dtype=torch.bfloat16,
-        )
+    # block_axis 0 is the rbln_custom_ops layout, 1 the rbln_triton_ops one.
+    # Neither side of the copy changes rank, so both reach the same conclusion.
+    def _cache(self, block_axis):
+        shape = [2, self.NUM_KV_HEADS, 1, BLOCK_SIZE, self.HEAD_DIM]
+        shape.insert(block_axis, 4)
+        return torch.zeros(shape, dtype=torch.bfloat16)
 
-    def test_all_heads_at_once_is_strided_on_both_sides(self):
-        cache = self._cache()
+    @pytest.mark.parametrize("block_axis", [0, 1], ids=["blocks_first", "kv_first"])
+    def test_all_heads_at_once_is_strided_on_both_sides(self, block_axis):
+        cache = self._cache(block_axis)
         source = torch.zeros(6, self.NUM_KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
-        assert not cache[0, 1, :, 0, 3:9, :].is_contiguous()
+        assert not cache.select(block_axis, 1)[0, :, 0, 3:9, :].is_contiguous()
         assert not source[0:6].transpose(0, 1).is_contiguous()
 
-    def test_per_head_is_contiguous_on_both_sides(self):
-        cache = self._cache()
+    @pytest.mark.parametrize("block_axis", [0, 1], ids=["blocks_first", "kv_first"])
+    def test_per_head_is_contiguous_on_both_sides(self, block_axis):
+        cache = self._cache(block_axis)
         # Head-major, which is the layout the compiled projection now emits.
         source = torch.zeros(self.NUM_KV_HEADS, 6, self.HEAD_DIM, dtype=torch.bfloat16)
+        one_block = cache.select(block_axis, 1)
         for head in range(self.NUM_KV_HEADS):
-            assert cache[0, 1, head, 0, 3:9, :].is_contiguous()
+            assert one_block[0, head, 0, 3:9, :].is_contiguous()
             assert source[head, 0:6, :].is_contiguous()
 
     def test_a_write_run_never_leaves_its_block(self):
@@ -276,10 +276,11 @@ class TestPlatformRefusals:
     discards it."""
 
     @staticmethod
-    def _config(max_num_seqs=1, enforce_eager=False):
+    def _config(max_num_seqs=1, enforce_eager=False, compile_model=True):
         return SimpleNamespace(
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
             speculative_config=SimpleNamespace(enforce_eager=enforce_eager),
+            additional_config=RBLNConfig(compile_model=compile_model),
         )
 
     def _construct(self):
@@ -293,10 +294,9 @@ class TestPlatformRefusals:
         with pytest.raises(NotImplementedError, match="cannot run eager"):
             RBLNDFlashProposer(self._config(enforce_eager=True), torch.device("cpu"))
 
-    def test_compile_disabled_is_refused(self, monkeypatch):
-        monkeypatch.setattr(dflash_module.envs, "VLLM_RBLN_COMPILE_MODEL", False)
+    def test_compile_disabled_is_refused(self):
         with pytest.raises(NotImplementedError, match="cannot run eager"):
-            self._construct()
+            RBLNDFlashProposer(self._config(compile_model=False), torch.device("cpu"))
 
     def test_host_visible_cache_is_required(self, monkeypatch):
         """Without device tensors the cache is on `meta` and the context write

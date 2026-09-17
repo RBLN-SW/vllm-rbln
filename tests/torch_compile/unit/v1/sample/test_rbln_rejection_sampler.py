@@ -377,10 +377,13 @@ def run_rejection_sample(
     bonus_token_ids: list[int],
     metadata: SamplingMetadata,
     num_draft_tokens: list[int] | None = None,
+    bonus_from_logits: bool = False,
 ) -> torch.Tensor:
     """Run the impl on a batch of drafts packed in `draft_token_ids` order.
 
     `num_draft_tokens` defaults to every request holding NUM_SPEC_TOKENS drafts.
+    `bonus_from_logits` hands the graph bonus logits peaked at `bonus_token_ids`
+    instead of the ids, the way a greedy step does.
     """
     if num_draft_tokens is None:
         num_draft_tokens = [NUM_SPEC_TOKENS] * (len(draft_token_ids) // NUM_SPEC_TOKENS)
@@ -393,8 +396,11 @@ def run_rejection_sample(
         ),
         draft_probs=None,
         target_logits=make_target_probs(target_argmax_token_ids),
-        bonus_token_ids=torch.tensor(bonus_token_ids, dtype=torch.int64).unsqueeze(-1),
+        bonus_token_ids=None
+        if bonus_from_logits
+        else torch.tensor(bonus_token_ids, dtype=torch.int64).unsqueeze(-1),
         sampling_metadata=metadata,
+        bonus_logits=make_target_probs(bonus_token_ids) if bonus_from_logits else None,
     )
 
 
@@ -432,6 +438,35 @@ def test_greedy_rows_accept_exactly_the_target_argmax(impl, trial):
             [3, 5, 10],  # all accepted -> bonus token
             [2, 7, PLACEHOLDER_TOKEN_ID],  # accept one, then recover the argmax
             [6, 1, 12],  # top_k=1 row behaves like the greedy rows
+        ],
+        dtype=torch.int32,
+    )
+    assert torch.equal(output, expected)
+
+
+def test_greedy_bonus_token_is_the_argmax_of_its_logits(impl):
+    """A greedy step hands the graph the bonus rows' logits; their argmax lands
+    where the bonus token id would."""
+    metadata = make_sampling_metadata(
+        temperature=None,
+        all_greedy=True,
+        all_random=False,
+    )
+
+    output = run_rejection_sample(
+        impl,
+        # Row 0 matches both argmaxes; row 1 mismatches at position 1.
+        draft_token_ids=[3, 5, 2, 4],
+        target_argmax_token_ids=[3, 5, 2, 7],
+        bonus_token_ids=[6, 1],
+        metadata=metadata,
+        bonus_from_logits=True,
+    )
+
+    expected = torch.tensor(
+        [
+            [3, 5, 6],  # all accepted -> the bonus row's argmax
+            [2, 7, PLACEHOLDER_TOKEN_ID],
         ],
         dtype=torch.int32,
     )
