@@ -517,7 +517,12 @@ class RBLNWorker(WorkerBase):
                 # still runs when combined with other connectors. Only on a
                 # successful warm-up — not on the skipped or failed path.
                 if has_kv_transfer_group():
-                    finalize_kv_cache_registrations(get_kv_transfer_group())
+                    # Registration probes the backend for the block axis,
+                    # which reads the config the way
+                    # `apply_dynamic_kv_num_blocks` describes; warm-up is
+                    # already past the scope the executor opened.
+                    with set_current_vllm_config(self.vllm_config, check_compile=False):
+                        finalize_kv_cache_registrations(get_kv_transfer_group())
 
                 # NOTE(RBLN): the sampler warm-up and the deferred KV-cache
                 # registration above are per-rank, so ranks reach this point
