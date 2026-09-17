@@ -71,6 +71,10 @@ class RBLNScheduler(Scheduler):
     ) -> None:
         super().__init__(*args, **kwargs)
 
+        self.num_lookahead_tokens: int = max(
+            self.num_lookahead_tokens, self.num_spec_tokens
+        )
+
         rbln_config: RBLNConfig = self.vllm_config.additional_config
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
