@@ -58,6 +58,3 @@ def register_ops():
 
         apply_registrations()
         apply_registered_patches()
-
-        # TODO(RBLN): remove the following imports after we have a better way
-        import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
