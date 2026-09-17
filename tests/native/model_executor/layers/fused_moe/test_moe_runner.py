@@ -24,7 +24,6 @@ from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 import vllm_rbln.model_executor.layers.fused_moe.utils as fused_moe_utils
-from vllm_rbln.model_executor.layers.fused_moe.runner import moe_runner
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import RBLNMoERunner
 from vllm_rbln.model_executor.layers.fused_moe.runner.moe_runner import (
     _apply_grouped_topk_torch as grouped_topk,
@@ -236,6 +235,7 @@ def _routed_logits_dtype(
     bias_dtype,
     scoring_func="sigmoid",
     num_expert_group=2,
+    use_moe_tokens_mask=True,
 ):
     """Dtype of the weights ``forward`` hands the quant method, mask included.
 
@@ -243,7 +243,6 @@ def _routed_logits_dtype(
     initialized DP group, so the instance is assembled by hand -- but ``forward``
     itself is the real one, which is what the mask dtype has to come out of.
     """
-    monkeypatch.setattr(moe_runner.envs, "VLLM_RBLN_USE_MOE_TOKENS_MASK", True)
     monkeypatch.setattr(
         fused_moe_utils,
         "get_forward_context",
@@ -264,6 +263,7 @@ def _routed_logits_dtype(
 
     runner = object.__new__(RBLNMoERunner)
     torch.nn.Module.__init__(runner)
+    runner.use_moe_tokens_mask = use_moe_tokens_mask
     runner.routed_experts = SimpleNamespace(quant_method=_CaptureQuantMethod())
     runner.top_k = 2
     runner.moe_parallel_config = SimpleNamespace(dp_size=1, dp_rank=0)
@@ -315,6 +315,18 @@ class TestRoutingMaskDtype:
                 bias_dtype=torch.float32,
                 scoring_func="softmax",
                 num_expert_group=None,
+            )
+            is torch.bfloat16
+        )
+
+    def test_the_mask_off_leaves_the_weights_narrow(self, monkeypatch):
+        # No mask, no multiply to match: the fp32 bias never reaches the weights.
+        assert (
+            _routed_logits_dtype(
+                monkeypatch,
+                logits_dtype=torch.bfloat16,
+                bias_dtype=torch.float32,
+                use_moe_tokens_mask=False,
             )
             is torch.bfloat16
         )

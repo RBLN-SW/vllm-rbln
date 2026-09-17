@@ -50,7 +50,6 @@ class TestSubBlockCacheGuard:
     ):
         # Sub-block prefix caching cannot span KV cache groups, and the refusal
         # must come before attention backends are set up.
-        monkeypatch.setattr(mr.envs, "VLLM_RBLN_SUB_BLOCK_CACHE", True)
         runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
         monkeypatch.setattr(
             runner, "initialize_attn_backend", _unexpected("initialize_attn_backend")
@@ -59,6 +58,19 @@ class TestSubBlockCacheGuard:
         config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
         with pytest.raises(NotImplementedError, match="multi-group"):
             runner.initialize_kv_cache(config)
+
+    def test_additional_config_lifts_the_guard(self, make_model_runner):
+        # The scheduler reads the same option, so a runner that kept reading the
+        # environment would refuse a model the scheduler had already agreed to.
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        )
+        assert len(runner.kv_cache_config.kv_cache_groups) == 2
 
 
 class TestReshapeKVCacheTensors:
@@ -72,7 +84,7 @@ class TestReshapeKVCacheTensors:
         raw = runner._allocate_kv_cache_tensors(config)
         kernel_block_sizes = runner._kernel_block_sizes
 
-        caches, _, infos = runner._reshape_kv_cache_tensors(
+        caches, _, infos, _ = runner._reshape_kv_cache_tensors(
             config, raw, kernel_block_sizes
         )
         semantic_shape = tuple(caches["layer.0"].shape)
@@ -80,14 +92,14 @@ class TestReshapeKVCacheTensors:
         assert caches["layer.0"].is_contiguous()
         assert infos["layer.0"].permute_order == identity
 
-        # Blocks outermost instead of the K/V split.
+        # The K/V split outermost instead of blocks.
         order = (1, 0) + identity[2:]
         monkeypatch.setattr(
             runner.attn_groups[0][0].backend,
             "get_kv_cache_stride_order",
             staticmethod(lambda *args, **kwargs: order),
         )
-        caches, bases, infos = runner._reshape_kv_cache_tensors(
+        caches, bases, infos, _ = runner._reshape_kv_cache_tensors(
             config, raw, kernel_block_sizes
         )
 
@@ -117,13 +129,13 @@ class TestKVCacheBaseBindings:
 
 
 class TestHostBufferCopyOp:
-    def test_the_copy_op_carries_the_model_s_mla_flag(
+    def test_the_registered_op_reads_the_axes_at_call_time(
         self, make_model_runner, monkeypatch
     ):
         # A host-staging connector moves blocks through the op registered here.
-        # MLA has no K/V split -- its cache is a 3D latent whose dim 0 is already
-        # blocks -- so a copy that loses the flag slices the wrong axis. The flag
-        # has a silent default, and dropping it leaves this suite green.
+        # A dynamic-KV reallocation replaces `kv_cache_block_axes`, so an op
+        # holding the dict it was registered with would keep copying by the
+        # axes of a cache that no longer exists.
         captured: list = []
         seen: dict = {}
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
@@ -140,10 +152,11 @@ class TestHostBufferCopyOp:
         )
 
         runner = make_model_runner(init_kv_cache=False)
-        monkeypatch.setattr(type(runner.model_config), "use_mla", True)
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
+        runner.kv_cache_block_axes = {"layer.0": 1}
         captured[0]({}, {}, [], [], "h2d")
-        assert seen == {"use_mla": True}
+
+        assert seen == {"block_axes": {"layer.0": 1}}
 
 
 class TestBuildAttentionMetadata:
