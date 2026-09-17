@@ -1546,6 +1546,30 @@ class TestHeadBandMatching:
         ]
         assert len(out) == 16
 
+    def test_a_packed_block_is_named_once_in_k_and_once_in_v(self):
+        # The count is the wiring: `_head_matched_desc` takes how many ranges a
+        # block breaks into, and only this builder derives it. Testing that
+        # method directly leaves the derivation and the hand-off unpinned, and
+        # a peer then reads a whole packed block where it wanted K.
+        split = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
+        packed = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        packed._kv_per_block = 2
+
+        one = split._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
+        two = packed._build_head_matched_remote(
+            meta, remote_tp_rank=0, remote_tp_size=1
+        )
+
+        # Unequal cuts, so a packed block is read once inside K and once inside
+        # V where a split one is read whole.
+        assert len(two) == len(one) * 2
+        assert {ln for _, ln, _ in two} == {128}
+
     def test_area_index_permutation_zero_offset(self):
         """P TP2 -> D TP4: head widths match so the offset is 0, but local area
         2 carries head 1, which is the peer's area 1 — not its area 2."""
