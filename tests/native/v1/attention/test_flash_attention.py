@@ -17,6 +17,7 @@ from dataclasses import fields
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.envs as envs
@@ -103,13 +104,24 @@ def cfg_square():
 
 
 class TestFlashAttentionBackendStatic:
-    def test_kv_cache_shape(self):
-        # Layout is (2, num_blocks, num_kv_heads, 1, block_size, head_size).
+    @pytest.mark.parametrize(
+        "use_custom_kernel, expected",
+        [(False, (7, 2, 3, 1, 11, 5)), (True, (2, 7, 3, 1, 11, 5))],
+        ids=["rbln_custom_ops", "rbln_triton_ops"],
+    )
+    def test_kv_cache_shape(self, use_custom_kernel, expected):
+        # num_blocks leads for the kernels that read a whole block at once and
+        # trails the K/V axis for the ones that still read K and V apart, so
+        # the shape has to follow the namespace `use_custom_kernel` selects.
         # Distinct primes catch any argument re-ordering.
-        shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
-            num_blocks=7, block_size=11, num_kv_heads=3, head_size=5
+        config = make_vllm_config(
+            additional_config={"use_custom_kernel": use_custom_kernel}
         )
-        assert shape == (2, 7, 3, 1, 11, 5)
+        with set_current_vllm_config(config):
+            shape = RBLNFlashAttentionBackend.get_kv_cache_shape(
+                num_blocks=7, block_size=11, num_kv_heads=3, head_size=5
+            )
+        assert shape == expected
 
     def test_supported_head_sizes(self):
         # Pins the supported set; a change here is a deliberate capability shift.
@@ -483,14 +495,14 @@ class TestBuildSlidingWindowAppend:
                 assert swa_value == full_value
 
     def test_the_shift_spec_does_not_append(self, cfg):
-        # The flag follows the spec class, which is what the env var picks.
+        # The flag follows the spec class, which is what the device picks.
         builder = make_builder(cfg, sliding_window=4, appends_kv=False)
         assert not builder.swa_appends
 
     def test_custom_kernel_is_rejected(self, cfg_custom_kernel):
         # rbln_triton_ops carries no sliding_window_attention_v1, so the group
         # cannot be built at all rather than failing at the first forward.
-        with pytest.raises(NotImplementedError, match="MULTI_BLOCK_ATTN"):
+        with pytest.raises(NotImplementedError, match="sliding_window_attention_v1"):
             make_builder(cfg_custom_kernel, sliding_window=4)
 
 

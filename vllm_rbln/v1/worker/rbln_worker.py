@@ -469,12 +469,16 @@ class RBLNWorker(WorkerBase):
     def compute_dynamic_kv_num_blocks(self) -> int | None:
         """RPC target of the engine's dynamic-KV patch; see
         `DynamicKvSizer.compute_num_blocks`."""
-        return self.dynamic_kv.compute_num_blocks()
+        with set_current_vllm_config(self.vllm_config, check_compile=False):
+            return self.dynamic_kv.compute_num_blocks()
 
     def apply_dynamic_kv_num_blocks(self, n: int | None) -> int | None:
         """RPC target of the engine's dynamic-KV patch; see
         `DynamicKvSizer.apply_num_blocks`."""
-        return self.dynamic_kv.apply_num_blocks(n)
+        # The KV cache shape reads the RBLN config off the global vllm config,
+        # which these RPCs arrive outside of -- warm-up has already returned.
+        with set_current_vllm_config(self.vllm_config, check_compile=False):
+            return self.dynamic_kv.apply_num_blocks(n)
 
     @instrument(span_name="Warmup (NPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:

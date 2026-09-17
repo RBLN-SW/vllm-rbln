@@ -1021,3 +1021,34 @@ class TestApplyResizesThenMaterializes:
         )
         DynamicKvSizer.materialize(sizer)
         assert ran == [(4, 1, False)]
+
+
+class TestReleaseKvCacheTensors:
+    def test_it_clears_every_piece_of_the_rebound_state(self, monkeypatch):
+        # The rebind reassigns these together from one ordered name list, so a
+        # piece left behind describes a cache that no longer exists.
+        layer = SimpleNamespace(kv_cache=torch.zeros(1))
+        model_runner = SimpleNamespace(
+            kv_caches=[torch.zeros(1)],
+            kv_cache_bases=[torch.zeros(1)],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": 1},
+            compilation_config=SimpleNamespace(static_forward_context={"l0": layer}),
+        )
+        sizer = SimpleNamespace(
+            model_runner=model_runner,
+            allocator_state_per_chiplet=lambda: "stub",
+        )
+        old_cfg = SimpleNamespace(
+            num_blocks=4,
+            kv_cache_tensors=[SimpleNamespace(shared_by=["l0"], size=8)],
+        )
+        monkeypatch.setattr(dks, "empty_rbln_device_caches", lambda: False)
+
+        DynamicKvSizer.release_kv_cache_tensors(sizer, old_cfg)
+
+        assert model_runner.kv_caches == []
+        assert model_runner.kv_cache_bases == []
+        assert model_runner.kv_cache_names == []
+        assert model_runner.kv_cache_block_axes == {}
+        assert layer.kv_cache is None

@@ -201,3 +201,18 @@ def test_a_window_spec_without_the_admission_method_is_loud():
 
     with pytest.raises(AttributeError, match="max_admission_blocks_per_request"):
         minimum_kv_blocks(_config(8192, 32768), _kv(0, _Renamed()))
+
+
+def test_a_uniform_type_group_keeps_the_window_admission_cap():
+    # An all-sliding-window model whose layers differ in hidden size reaches the
+    # sizer wrapped. The wrapper is not a SlidingWindowSpec, so the guard above
+    # cannot see it and the per-sequence term would drop to one block.
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    cfg = _config(128, 2048, max_num_seqs=2, max_num_batched_tokens=128)
+    wrapped = UniformTypeKVCacheSpecs(
+        block_size=128, kv_cache_specs={"layers.0.attn": _swa_spec(128, 128)}
+    )
+    minimum = minimum_kv_blocks(cfg, _kv(0, wrapped))
+    # sliding: cdiv(127 + 128, 128) + 1 = 3 per sequence, over 2 sequences.
+    assert (minimum.one_request, minimum.decode_batch) == (3, 6)
