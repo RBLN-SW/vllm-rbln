@@ -239,6 +239,43 @@ class TestRegisterKvCaches:
         # the per-head handshake check through it.
         assert worker._logical_region_kv_heads == [8, 8]
 
+    @pytest.mark.parametrize(
+        "stripe_width, passed", [(0, {}), (4096, {"stripe_width": 4096})]
+    )
+    def test_a_stripe_width_reaches_the_adapter_only_when_named(
+        self, monkeypatch, stripe_width, passed
+    ):
+        # A stripe is a byte width, so 0 is the knob nobody set: the adapter
+        # keeps its own default instead of being handed a width of none.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            nixl_available=True,
+            stripe_width=stripe_width,
+        )
+        worker.nixl_wrapper = "wrapper"
+        worker._layer_specs = {"layer0": _impl_layer_spec()}
+        worker.block_len_per_layer = [2048, 2048]
+        seen = []
+        monkeypatch.setattr(
+            sys.modules["nixl_rbln"],
+            "ensure_rbln_backend",
+            lambda wrapper, device_id=0, **kw: seen.append(kw),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker, "register_kv_caches", lambda self, kv: None
+        )
+        worker.register_kv_caches({"layer0": "tensor"})
+
+        assert seen == [passed]
+
+    def test_a_stripe_width_given_a_bool_is_refused(self, monkeypatch):
+        # It goes through the same typed knob path as the rest: read straight
+        # off the extra config, `true` would arrive as a one-byte stripe.
+        with pytest.raises(RuntimeError, match="stripe_width"):
+            build_worker(monkeypatch, stripe_width=True)
+
     def test_host_bounce_rejects_differing_per_layer_sizes(self, monkeypatch):
         # Pins the refusal at this path's own point rather than upstream's assert.
         worker = build_worker(monkeypatch, kv_buffer_device="cpu", nixl_available=True)

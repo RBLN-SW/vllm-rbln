@@ -612,11 +612,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         if self._use_rbln_nixl_backend:
             import nixl_rbln
 
-            extra = (
-                {}
-                if self._stripe_width is None
-                else {"stripe_width": self._stripe_width}
-            )
+            extra = {"stripe_width": self._stripe_width} if self._stripe_width else {}
             nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0, **extra)
         page_sizes = self._layer_page_sizes(kv_caches)
         if len(page_sizes) > 1:
