@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from vllm_rbln.model_executor.models.optimum import qwen3_asr
+from vllm_rbln.model_executor.models.optimum.base import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 from vllm_rbln.model_executor.models.optimum.qwen3_asr import (
     RBLNOptimumQwen3ASRForConditionalGeneration as Qwen3ASR,
@@ -122,16 +123,8 @@ def test_transformers_native_checkpoint_layout_passes_guard(monkeypatch):
         )
 
 
-def _bare_decoder(max_batch_size: int) -> Qwen3ASR:
-    obj = Qwen3ASR.__new__(Qwen3ASR)
-    obj.decoder_batch_size = max_batch_size
-    obj.use_multiple_decoder = False
-    obj.available_blocks = torch.arange(50, 60, dtype=torch.int16)
-    return obj
-
-
 def test_forward_prefill_passes_inputs_embeds_without_position_embed():
-    obj = _bare_decoder(max_batch_size=2)
+    obj = Qwen3ASR.__new__(Qwen3ASR)
     passed = {}
 
     def fake_prefill(**kw):
@@ -139,55 +132,49 @@ def test_forward_prefill_passes_inputs_embeds_without_position_embed():
         return types.SimpleNamespace(logits=torch.zeros(1, 1))
 
     obj.model = types.SimpleNamespace(prefill_decoder=fake_prefill)
-    inputs_embeds = torch.zeros(1, 3, HIDDEN)
-    model_input = types.SimpleNamespace(
-        is_prompt=True,
-        running_requests_ids=["A"],
+    model_input = ModelInputForRBLN(
         input_tokens=torch.tensor([[11, 12, 13]]),
-        input_positions=torch.tensor([[0, 1, 2]]),
-        block_tables=torch.tensor([[10]], dtype=torch.int16),
-        inputs_embeds=inputs_embeds,
+        input_positions=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        block_tables=torch.tensor([10], dtype=torch.int16),
+        running_requests_ids=["A"],
+        padded_batch_size=1,
+        batch_rows=slice(0, 1),
+        is_prompt=True,
+        inputs_embeds=torch.zeros(1, 3, HIDDEN),
     )
 
     obj.forward(model_input)
 
     assert set(passed) == {"inputs_embeds", "block_tables", "cache_position"}
-    assert passed["inputs_embeds"] is inputs_embeds
-    assert torch.equal(passed["block_tables"], torch.tensor([10], dtype=torch.int16))
-    assert torch.equal(
-        passed["cache_position"], torch.tensor([[0, 1, 2]], dtype=torch.int32)
-    )
+    assert passed["inputs_embeds"] is model_input.inputs_embeds
+    assert passed["block_tables"] is model_input.block_tables
+    assert passed["cache_position"] is model_input.input_positions
 
 
-def test_forward_decode_pads_batch_and_trims_logits():
-    obj = _bare_decoder(max_batch_size=2)
+def test_forward_decode_picks_the_decoder_of_the_padded_batch():
+    obj = Qwen3ASR.__new__(Qwen3ASR)
     recorded = {}
 
     def fake_decoder(**kw):
         recorded.update(kw)
         return types.SimpleNamespace(logits=torch.arange(2.0).view(2, 1))
 
-    obj.model = types.SimpleNamespace(
-        decoders={2: fake_decoder},
-        embed_tokens=lambda ids: ids.to(torch.float32).unsqueeze(-1),
-    )
-    model_input = types.SimpleNamespace(
-        is_prompt=False,
+    obj.model = types.SimpleNamespace(decoders={1: None, 2: fake_decoder})
+    model_input = ModelInputForRBLN(
+        input_tokens=torch.tensor([[201], [0]]),
+        input_positions=torch.tensor([[3], [0]], dtype=torch.int32),
+        block_tables=torch.tensor([[10], [50]], dtype=torch.int16),
         running_requests_ids=["A"],
-        input_tokens=torch.tensor([[201]]),
-        input_positions=torch.tensor([[3]]),
-        block_tables=torch.tensor([[10]], dtype=torch.int16),
+        padded_batch_size=2,
+        batch_rows=slice(0, 1),
     )
 
     logits = obj.forward(model_input)
 
-    assert set(recorded) == {"inputs_embeds", "cache_position", "block_tables"}
-    # One request padded to the decoder batch of two; the pad row gets a free block.
-    assert recorded["inputs_embeds"].shape == (2, 1, 1)
-    assert recorded["inputs_embeds"][0].item() == 201
-    assert torch.equal(
-        recorded["cache_position"], torch.tensor([[3], [0]], dtype=torch.int32)
-    )
-    assert recorded["block_tables"][0].tolist() == [10]
-    assert recorded["block_tables"][1].item() in range(50, 60)
-    assert logits.shape == (1, 1)
+    assert obj.model.decoder is fake_decoder
+    assert set(recorded) == {"input_ids", "cache_position", "block_tables"}
+    assert recorded["input_ids"] is model_input.input_tokens
+    assert recorded["cache_position"] is model_input.input_positions
+    assert recorded["block_tables"] is model_input.block_tables
+    # The runner owns the padding rows, so forward returns every row it got.
+    assert logits.shape == (2, 1)
