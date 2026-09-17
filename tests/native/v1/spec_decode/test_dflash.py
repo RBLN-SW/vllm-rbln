@@ -34,6 +34,7 @@ import pytest
 import torch
 
 import vllm_rbln.v1.spec_decode.dflash as dflash_module
+from tests.native.v1.spec_decode.utils import make_cad
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 
@@ -123,31 +124,6 @@ class TestDraftBlockMask:
         assert mask[2:].sum() == 0
 
 
-class TestPageCrossing:
-    """The kernel scatters the whole query block at one offset per partition,
-    so the last QUERY_LEN - 1 offsets of a page are unrepresentable."""
-
-    @staticmethod
-    def _crossing(seq_lens):
-        lens = torch.tensor(seq_lens, dtype=torch.int64)
-        return (lens % BLOCK_SIZE) + QUERY_LEN > BLOCK_SIZE
-
-    def test_only_the_last_offsets_of_a_page_cross(self):
-        crossing = self._crossing(list(range(BLOCK_SIZE)))
-        assert int(crossing.sum()) == QUERY_LEN - 1
-        assert crossing[BLOCK_SIZE - QUERY_LEN + 1 :].all()
-        assert not crossing[: BLOCK_SIZE - QUERY_LEN + 1].any()
-
-    def test_a_block_start_never_crosses(self):
-        assert not self._crossing([0, BLOCK_SIZE, 4 * BLOCK_SIZE]).any()
-
-    def test_redirect_lands_on_the_next_page_start(self):
-        lens = torch.tensor([BLOCK_SIZE - 3], dtype=torch.int64)
-        redirected = (lens // BLOCK_SIZE + 1) * BLOCK_SIZE
-        assert int(redirected[0]) == BLOCK_SIZE
-        assert not self._crossing([int(redirected[0])]).any()
-
-
 class TestContextWriteContiguity:
     """A strided copy pair is staged through host memory, and that staging
     buffer's recycled address is what faulted mid-run. Both sides have to be
@@ -207,62 +183,78 @@ class TestSingleSequenceGuard:
             )
 
 
-class TestRedirectTarget:
-    """A crossing row is redirected to its next page, which the scheduler is
-    supposed to have allocated. It does not always: the lookahead is zeroed
-    while `num_computed_tokens` is 0, and that field is assigned only after
-    allocation, so a prefix-cache hit that leaves one waiting-path chunk can end
-    in a page's last slots with nothing reserved beyond it. An unfilled slot
-    reads 0, which is the pool's shared null block, and the query graph would
-    scatter the draft block's K/V there -- dropping the row afterwards does not
-    unwind the write, so the step has to give up before the forward."""
+class _ReachedDraftPass(Exception):
+    """Raised in place of the draft pass, so a step that does not give up is
+    told apart from one that does. A named exception, not a bare RuntimeError:
+    the caller catches it, and catching RuntimeError would swallow a real one."""
 
-    @staticmethod
-    def _call(table, next_page, crossing):
-        """The give-up decision `_run_query_pass` makes, in the same order.
 
-        Returns True when the step gives up, and raises when a crossing row's
-        target is inside the table but unallocated -- the assertion the inlined
-        check keeps as a regression guard.
-        """
-        block_table = torch.tensor(table, dtype=torch.int32)
-        pages = (torch.tensor(next_page, dtype=torch.int64) // BLOCK_SIZE).to(
-            torch.int64
+class TestSpanningBlockAllocation:
+    SPANS = BLOCK_SIZE - 1  # a block starting here leaves its page; 0 does not
+
+    def _run(self, table, ctx_lens):
+        """Drive the real `_run_query_pass` and report whether it got past the
+        allocation check, alongside the drafts it kept."""
+        n = len(ctx_lens)
+
+        def reached(*args, **kwargs):
+            raise _ReachedDraftPass
+
+        proposer = SimpleNamespace(
+            arange_cpu=torch.arange(n + 1, dtype=torch.int32),
+            dflash_causal=False,
+            block_size=BLOCK_SIZE,
+            positions=torch.zeros(n * QUERY_LEN, dtype=torch.int64),
+            _dropped_rows=None,
+            _build_draft_attn_metadata=reached,
         )
-        if int(pages.max()) >= block_table.shape[-1]:
-            return True
-        rows = torch.arange(pages.shape[0])
-        crossing = torch.tensor(crossing, dtype=torch.bool)
-        assert not bool((block_table.cpu()[rows, pages][crossing] == 0).any())
-        return False
+        cad = make_cad(
+            [i * QUERY_LEN for i in range(n + 1)], [c + QUERY_LEN for c in ctx_lens]
+        )
+        cad.block_table_tensor = torch.tensor(table, dtype=torch.int32)
+        try:
+            RBLNDFlashProposer._run_query_pass(
+                proposer,
+                cad,
+                n,
+                QUERY_LEN,
+                n * QUERY_LEN,
+                torch.tensor(ctx_lens, dtype=torch.int32),
+                torch.zeros(n, dtype=torch.int32),
+            )
+            proposer.reached = False
+        except _ReachedDraftPass:
+            proposer.reached = True
+        return proposer
 
-    def test_allocated_next_page_is_accepted(self):
-        # page 1 holds block 6, so the redirect has somewhere to land.
-        assert not self._call([[71, 6, 0, 0]], [BLOCK_SIZE], [True])
+    @pytest.mark.parametrize(
+        "table, ctx_lens",
+        [
+            ([[71, 0, 0, 0]], [0]),
+            ([[71, 6, 0, 0]], [SPANS]),
+        ],
+        ids=["stays_on_its_page", "next_page_allocated"],
+    )
+    def test_a_step_keeps_its_drafts_when_the_page_it_ends_on_is_allocated(
+        self, table, ctx_lens
+    ):
+        proposer = self._run(table, ctx_lens)
+        assert proposer.reached
+        assert not bool(proposer._dropped_rows.any())
 
-    def test_unfilled_next_page_trips_the_assertion(self):
-        """The reviewed regression: inside the table, but never allocated.
-
-        The scheduler's lookahead reservation now rules this out, so it is an
-        assertion rather than a give-up branch.
-        """
-        with pytest.raises(AssertionError):
-            self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [True])
-
-    def test_past_the_table_is_refused(self):
-        """The context ceiling -- no next page exists at all."""
-        assert self._call([[71, 6]], [2 * BLOCK_SIZE], [True])
-
-    def test_a_non_crossing_row_does_not_veto_the_step(self):
-        """Only the rows that actually redirect are checked."""
-        assert not self._call([[71, 0, 0, 0]], [BLOCK_SIZE], [False])
-
-    def test_only_crossing_rows_are_checked(self):
-        table = [[71, 6, 0, 0], [12, 0, 0, 0]]
-        with pytest.raises(AssertionError):
-            self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, True])
-        # the second row is the unfilled one, so it only matters when it crosses
-        assert not self._call(table, [BLOCK_SIZE, BLOCK_SIZE], [True, False])
+    @pytest.mark.parametrize(
+        "table, ctx_lens",
+        [
+            ([[71, 0, 0, 0]], [SPANS]),
+            ([[71, 6]], [2 * BLOCK_SIZE - 1]),
+            ([[71, 6, 0, 0], [80, 0, 0, 0]], [SPANS, SPANS]),
+        ],
+        ids=["unfilled", "past_the_table", "one_bad_row_of_two"],
+    )
+    def test_a_step_gives_up_when_it_is_not(self, table, ctx_lens):
+        proposer = self._run(table, ctx_lens)
+        assert not proposer.reached
+        assert bool(proposer._dropped_rows.all())
 
 
 class TestPlatformRefusals:
