@@ -16,6 +16,7 @@
 # (device DRAM, NUMA, CPU affinity) only the inputs are mocked and the real
 # computed values asserted.
 
+import json
 import math
 import os
 from types import SimpleNamespace
@@ -158,6 +159,63 @@ class TestWorkerFailFast:
             raise OSError("log unavailable")
 
         monkeypatch.setattr(worker_utils.logger, "error", broken_log)
+        with pytest.raises(SystemExit) as excinfo:
+            worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
+
+    @staticmethod
+    def _event_lines(capfd):
+        return [
+            json.loads(line)
+            for line in capfd.readouterr().err.splitlines()
+            if line.startswith('{"event":')
+        ]
+
+    def test_fatal_is_one_json_line_naming_the_failure_site(self, exit_codes, capfd):
+        error = RuntimeError("model step failed\nsecond line")
+
+        @worker_fail_fast
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(
+            fail_fast=True,
+            rank=3,
+            parallel_config=SimpleNamespace(data_parallel_rank=1),
+        )
+        with pytest.raises(SystemExit):
+            step(worker)
+        (event,) = self._event_lines(capfd)
+        assert event["event"] == "rbln.worker.fatal"
+        assert event["schema_version"] == 1
+        assert event["source"] == "vllm-rbln"
+        assert event["pid"] == os.getpid()
+        assert event["where"].endswith("step")
+        assert event["exception_type"] == "RuntimeError"
+        assert event["exception_message"] == str(error)
+        assert event["exit_code"] == 70
+        assert (event["rank"], event["dp_rank"]) == (3, 1)
+        # The worker cannot tell a device or storage fault from any other error.
+        assert event["cause"] == "unknown"
+        assert len(event["event_id"]) == 32
+        assert event["ts"].endswith("Z")
+
+    def test_fatal_event_leaves_unknown_ranks_null(self, exit_codes, capfd):
+        @worker_fail_fast
+        def step(worker):
+            raise ValueError("no rank on this receiver")
+
+        with pytest.raises(SystemExit):
+            step(SimpleNamespace(fail_fast=True))
+        (event,) = self._event_lines(capfd)
+        assert event["rank"] is None and event["dp_rank"] is None
+
+    def test_event_write_failure_does_not_prevent_exit(self, monkeypatch, exit_codes):
+        def broken_write(line):
+            raise OSError("stderr closed")
+
+        monkeypatch.setattr(worker_utils, "_write_event_line", broken_write)
         with pytest.raises(SystemExit) as excinfo:
             worker_utils.abort_worker(RuntimeError("device failed"), where="step")
         assert excinfo.value.code == 70

@@ -13,12 +13,16 @@
 # limitations under the License.
 """Utilities for RBLN worker. (CPU affinity, batch reorder, ...)"""
 
+import contextlib
+import json
 import math
 import os
 import platform
+import uuid
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
@@ -56,14 +60,76 @@ logger = init_logger(__name__)
 _F = TypeVar("_F", bound=Callable[..., Any])
 # EX_SOFTWARE: an unhandled worker error, not the device's error number.
 _FAIL_FAST_EXIT_CODE = 70
+# One JSON line per fatal, for pipelines that index container logs. The schema
+# version moves only when a field is renamed or changes meaning.
+_FATAL_EVENT = "rbln.worker.fatal"
+_EVENT_SCHEMA_VERSION = 1
+_EVENT_MESSAGE_LIMIT = 500
 
 
-def abort_worker(exc: Exception, *, where: str) -> NoReturn:
+def _write_event_line(line: str) -> None:
+    """Write straight to fd 2: no handler lock or buffer before the log."""
+    data = line.encode("utf-8", "replace")
+    while data:
+        written = os.write(2, data)
+        data = data[written:]
+
+
+def _fatal_event(
+    exc: Exception, *, where: str, rank: int | None, dp_rank: int | None
+) -> str:
+    now = datetime.now(timezone.utc)
+    record = {
+        "event": _FATAL_EVENT,
+        "schema_version": _EVENT_SCHEMA_VERSION,
+        "ts": now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
+        "source": "vllm-rbln",
+        "pid": os.getpid(),
+        "event_id": uuid.uuid4().hex,
+        "where": where,
+        "exception_type": type(exc).__name__,
+        "exception_message": str(exc)[:_EVENT_MESSAGE_LIMIT],
+        "exit_code": _FAIL_FAST_EXIT_CODE,
+        "rank": rank,
+        "dp_rank": dp_rank,
+        # The worker sees only the exception. Whether a device or storage is at
+        # fault is for the layers below the worker to report; readers must not
+        # turn "unknown" into a cause.
+        "cause": "unknown",
+    }
+    return json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def _worker_rank(worker: Any) -> int | None:
+    rank = getattr(worker, "rank", None)
+    return rank if isinstance(rank, int) else None
+
+
+def _worker_dp_rank(worker: Any) -> int | None:
+    config = getattr(worker, "parallel_config", None)
+    rank = getattr(config, "data_parallel_rank", None)
+    return rank if isinstance(rank, int) else None
+
+
+def abort_worker(
+    exc: Exception,
+    *,
+    where: str,
+    rank: int | None = None,
+    dp_rank: int | None = None,
+) -> NoReturn:
     """Exit without device cleanup when logging returns or raises.
 
-    No exit deadline is guaranteed if logging blocks on a handler lock or I/O.
+    The structured event goes out first and never blocks the exit; the readable
+    record follows. No exit deadline is guaranteed if logging blocks on a
+    handler lock or I/O.
     """
     try:
+        # The exit must not depend on the event reaching the log.
+        with contextlib.suppress(Exception):
+            _write_event_line(
+                _fatal_event(exc, where=where, rank=rank, dp_rank=dp_rank)
+            )
         logger.error(
             "RBLN worker %d: %s raised %s: %s. Ending this worker process "
             "with exit code %d so the executor detects the failure.",
@@ -93,7 +159,12 @@ def worker_fail_fast(function: _F) -> _F:
             return function(self, *args, **kwargs)
         except Exception as exc:
             if fail_fast:
-                abort_worker(exc, where=function.__qualname__)
+                abort_worker(
+                    exc,
+                    where=function.__qualname__,
+                    rank=_worker_rank(self),
+                    dp_rank=_worker_dp_rank(self),
+                )
             raise
 
     return guarded  # type: ignore[return-value]

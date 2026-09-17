@@ -22,7 +22,11 @@ from typing import Any
 from vllm import envs
 from vllm.logger import _DATE_FORMAT, _use_color, init_logger
 
-_FORMAT = "[vllm-rbln] %(levelname)s %(asctime)s [%(fileinfo)s:%(lineno)d] %(message)s"
+# Same prefix hook as vllm.logger, so one env var tags every line of a process.
+_FORMAT = (
+    f"{envs.VLLM_LOGGING_PREFIX}[vllm-rbln] %(levelname)s %(asctime)s "
+    "[%(fileinfo)s:%(lineno)d] %(message)s"
+)
 DEFAULT_LOGGIN_CONFIG: dict[str, dict[str, Any] | Any] = {
     "formatters": {
         "vllm_rbln": {
