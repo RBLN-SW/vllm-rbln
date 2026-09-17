@@ -1620,8 +1620,8 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.3a7"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+version = "0.11.3a8"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
     { name = "diffusers" },
@@ -1632,10 +1632,11 @@ dependencies = [
     { name = "torchcodec", marker = "platform_python_implementation == 'CPython'" },
     { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a7/optimum_rbln-0.11.3a7.tar.gz", hash = "sha256:a0053b970a1bf4e680ebfd2d2981851635fed407e927146b45a7bdab749d0c8a" }
+sdist = { url = "https://files.pythonhosted.org/packages/44/01/4b594368256d1d5de81832be2869aedd9c80fc397886351de57b7152cd4f/optimum_rbln-0.11.3a8.tar.gz", hash = "sha256:840ceb4aaf7c60fc1ca19a0f737ec757f21fe0edd0c7ab29fafc871844ab403b", size = 668110, upload-time = "2026-09-16T11:29:04.56Z" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a7/optimum_rbln-0.11.3a7-py3-none-any.whl", hash = "sha256:ae1010c576980b3bb5e67b610550a4833c23db2628517d681edea6be99c9ab45" },
+    { url = "https://files.pythonhosted.org/packages/4f/d7/c9cb0743d03bc74458d2269cf8d469f810d156aaca5124270b87e0906a57/optimum_rbln-0.11.3a8-py3-none-any.whl", hash = "sha256:bd2296e5996598ba46574c2c1b5b701bab5d8eee1d1f61cf0fb03545c8881108", size = 696798, upload-time = "2026-09-16T11:29:02.529Z" },
 ]
 
 [[package]]
@@ -3115,7 +3116,7 @@ requires-dist = [
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "openai", specifier = ">=2.25.0" },
-    { name = "optimum-rbln", specifier = ">=0.11.3a7,<0.11.4" },
+    { name = "optimum-rbln", specifier = ">=0.11.3a8,<0.11.4" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
