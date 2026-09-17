@@ -245,8 +245,13 @@ class TestRegisterKvCaches:
         worker.register_kv_caches({"layer0": "tensor"})
         assert worker._pending_kv_caches == {"layer0": "tensor"}
 
-    @pytest.mark.parametrize("stripe_width", [None, 0, 1])
-    def test_host_bounce_creates_backend_and_delegates(self, monkeypatch, stripe_width):
+    @pytest.mark.parametrize(
+        ("stripe_width", "expected_kwargs"),
+        [(None, {}), (0, {"stripe_width": 0}), (1, {"stripe_width": 1})],
+    )
+    def test_host_bounce_creates_backend_and_delegates(
+        self, monkeypatch, stripe_width, expected_kwargs
+    ):
         # Host-bounce with the adapter creates the RBLN backend on the agent,
         # then delegates registration to upstream.
         worker = _build_worker(
@@ -271,7 +276,7 @@ class TestRegisterKvCaches:
             lambda self, kv: delegated.append(kv),
         )
         worker.register_kv_caches({"layer0": "tensor"})
-        assert ensured == [("wrapper", 0, {"stripe_width": stripe_width})]
+        assert ensured == [("wrapper", 0, expected_kwargs)]
         assert delegated == [{"layer0": "tensor"}]
         assert worker._pending_kv_caches is None
         # Host staging needs the per-region counts too: a pipelined peer reaches
@@ -646,7 +651,8 @@ class TestRegisterKvCachesImpl:
         called = fake.register_kv_regions.call_args.kwargs
         assert called["mem"] == "VRAM"
         assert called["rbln_ctx_ptr"] == 0x1000
-        assert called["stripe_width"] == stripe_width
+        assert called.get("stripe_width") == stripe_width
+        assert ("stripe_width" in called) == (stripe_width is not None)
 
         # Returned transfer tables absorbed into worker state.
         assert worker.device_id == 0
