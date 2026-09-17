@@ -22,8 +22,9 @@ and what makes `VllmConfig.compute_hash()` call our `compute_hash`.
 
 Resolution order, highest first:
 
-  1. `additional_config`, an `RBLNConfig` or a dict of field names. The
-     `--rbln-*` flags write into it.
+  1. `additional_config`, one of the two config classes or a dict of field
+     names. The `--rbln-*` flags write into it. A built config names its own
+     model path, so `model_impl` is for the dict and the flag.
   2. `VLLM_RBLN_<FIELD>`, read through `envs.py` so the parsing there still
      applies. `_ENV_PROBE` lists the names that break the pattern.
   3. the field default
@@ -71,7 +72,8 @@ class RBLNConfigBase:
     model_impl: ModelImpl = "optimum"
     """Which model implementation runs: optimum-rbln, or the vLLM model under
     torch.compile. It picks the class this config is resolved into, so it is
-    read through `resolve_model_impl` before the class is known."""
+    read through `resolve_model_impl` before the class is known. Each subclass
+    defaults it to the path that class belongs to."""
 
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
@@ -83,6 +85,8 @@ class RBLNConfigBase:
 @vllm_config_dataclass
 class RBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the vLLM-native model path."""
+
+    model_impl: ModelImpl = "vllm"
 
     compile_model: bool = True
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
@@ -174,6 +178,8 @@ class RBLNConfig(RBLNConfigBase):
 class OptimumRBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the optimum-rbln model path."""
 
+    model_impl: ModelImpl = "optimum"
+
     optimum_overrides: dict[str, Any] = field(default_factory=dict)
     """Entries for optimum-rbln's own model config, laid over what vllm-rbln
     derives from the vLLM settings when the model is compiled. With a
@@ -229,8 +235,10 @@ class OptimumRBLNConfig(RBLNConfigBase):
         return hash_factors(get_hash_factors(self, ignored_factors))
 
 
-# Every class a `--rbln-*` flag can belong to.
-_CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (RBLNConfig, OptimumRBLNConfig)
+# Every class a `--rbln-*` flag can belong to. The optimum path comes first: a
+# field both classes declare takes its flag default from the first of them, and
+# an unset --rbln-model-impl leaves the run on that path.
+_CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (OptimumRBLNConfig, RBLNConfig)
 
 # TODO(vllm-rbln>=0.12.0): delete. Former additional_config keys, still accepted
 # with a warning.
@@ -370,6 +378,15 @@ def _resolve(cls: type[_C], additional_config: Any) -> _C:
     """
     if isinstance(additional_config, cls):
         return additional_config
+
+    if isinstance(additional_config, RBLNConfigBase):
+        # The only way here: a config object whose model_impl contradicts the
+        # class it is. Everything else that names a path agrees with itself.
+        raise ValueError(
+            f"additional_config is an {type(additional_config).__name__}, and "
+            f"its model_impl={additional_config.model_impl!r} selects the "
+            f"{cls.__name__} path. The class picks the path, so drop model_impl."
+        )
 
     given: dict[str, Any] = additional_config or {}
     if not isinstance(given, dict):

@@ -28,6 +28,7 @@ from vllm_rbln.config import (
     OptimumRBLNConfig,
     RBLNConfig,
     _env_source,
+    build_optimum_rbln_config,
     build_rbln_config,
     resolve_model_impl,
 )
@@ -148,6 +149,19 @@ def test_unknown_key_is_rejected():
         build_rbln_config({"compile_modell": False})
 
 
+def test_a_config_that_contradicts_its_class_is_rejected():
+    """`RBLNConfig(model_impl="optimum")` says two different things.
+
+    The key is what the path is read off, so the run lands on the optimum path
+    holding the other path's config. Name the contradiction rather than report
+    the class the path ended up wanting.
+    """
+    with pytest.raises(ValueError, match="drop model_impl"):
+        build_optimum_rbln_config(RBLNConfig(model_impl="optimum"))
+    with pytest.raises(ValueError, match="drop model_impl"):
+        build_rbln_config(OptimumRBLNConfig(model_impl="vllm"))
+
+
 def test_upstream_key_is_rejected():
     """`--gdn-prefill-backend` is written into additional_config by arg_utils."""
     with pytest.raises(ValueError, match="gdn_prefill_backend"):
@@ -243,7 +257,9 @@ def test_the_model_path_keys_the_compile_cache():
     VLLM_RBLN_USE_VLLM_MODEL leaves RBLN_COMPILE_ENV this is the only thing
     putting the path in the mega-cache bundle key.
     """
-    assert RBLNConfig(model_impl="vllm").compute_hash() != RBLNConfig().compute_hash()
+    assert (
+        RBLNConfig(model_impl="optimum").compute_hash() != RBLNConfig().compute_hash()
+    )
     assert (
         OptimumRBLNConfig(model_impl="vllm").compute_hash()
         != OptimumRBLNConfig().compute_hash()
@@ -274,7 +290,13 @@ class TestResolveModelImpl:
     """
 
     def test_a_built_config_states_its_own_path(self):
-        assert resolve_model_impl(RBLNConfig(model_impl="vllm")) == "vllm"
+        """Each class defaults to the path it belongs to.
+
+        `LLM(additional_config=RBLNConfig(...))` is a documented way in, and a
+        native config that answered "optimum" here would be resolved as one and
+        rejected for not being an OptimumRBLNConfig.
+        """
+        assert resolve_model_impl(RBLNConfig()) == "vllm"
         assert resolve_model_impl(OptimumRBLNConfig()) == "optimum"
 
     def test_a_disagreeing_deprecated_variable_is_rejected(self, monkeypatch):
