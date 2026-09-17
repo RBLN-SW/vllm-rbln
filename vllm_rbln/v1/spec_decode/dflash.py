@@ -205,8 +205,8 @@ class RBLNDFlashProposer(DFlashProposer):
             draft_ids = draft_ids + d2t[draft_ids]
         if bool(self._dropped_rows.any()):
             # An empty list, never zeros: the scheduler reads zeros as real
-            # token ids. The target-only step still advances the request to the
-            # aligned page, where speculation resumes.
+            # token ids. The target-only step still advances the request, and
+            # speculation resumes once its span has an allocated page.
             rows = draft_ids.tolist()
             return [
                 [] if bool(self._dropped_rows[i]) else rows[i] for i in range(num_reqs)
@@ -388,8 +388,8 @@ class RBLNDFlashProposer(DFlashProposer):
         if num_query_total > self.max_num_tokens:
             return
         cad = self._build_dummy_attn_metadata(num_reqs, num_query_per_req)
-        # Start every request at block 0 so no row crosses a page and the
-        # redirect path stays out of the warmup.
+        # Start every request at block 0 so no block spans a page and the
+        # give-up path stays out of the warmup.
         ctx_starts = torch.zeros(num_reqs, dtype=torch.int32)
         valid_ctx_lens = torch.zeros(num_reqs, dtype=torch.int32)
         self._run_query_pass(
@@ -691,6 +691,13 @@ class RBLNDFlashProposer(DFlashProposer):
                 sources.extend(chain.from_iterable(zip(src_k, src_v)))
         torch._foreach_copy_(destinations, sources)
 
+    @staticmethod
+    def _span_unallocated(block_table: torch.Tensor, last_page: torch.Tensor) -> bool:
+        if int(last_page.max()) >= block_table.shape[-1]:
+            return True
+        rows = torch.arange(last_page.shape[0])
+        return bool((block_table.cpu()[rows, last_page] == 0).any())
+
     def _run_query_pass(
         self,
         cad: CommonAttentionMetadata,
@@ -721,32 +728,25 @@ class RBLNDFlashProposer(DFlashProposer):
             slot_mapping=torch.tensor(0),  # dummy
             causal=self.dflash_causal,
         )
-        # One dynamic offset per partition scatters the whole block, so a block
-        # cannot straddle two pages -- the last `num_query_per_req - 1` offsets
-        # would write into another request's. Redirect those rows to their next
-        # page start and drop their drafts; model-input positions stay true.
-        crossing = (seq_lens % self.block_size) + num_query_per_req > self.block_size
-        if bool(crossing.any()):
-            next_page = (seq_lens // self.block_size + 1) * self.block_size
-            pages = (next_page // self.block_size).to(torch.int64)
-            if int(pages.max()) >= cad.block_table_tensor.shape[-1]:
-                # Past the context ceiling, so the whole step gives up its
-                # drafts: returning here is what keeps the query graph -- and
-                # its scatter -- from running at all.
-                self._dropped_rows = torch.ones_like(crossing)
+        # The kernel scatters the query block across the pages its table names,
+        # so a spanning block needs no redirect -- only an allocated page to land
+        # on. The waiting path can leave one unreserved, and an unallocated slot
+        # reads 0, the pool's shared null block; a scatter there is not unwound
+        # by dropping the row, so the step gives up before the forward.
+        self._dropped_rows = torch.zeros(num_reqs, dtype=torch.bool)
+        spanning = (seq_lens % self.block_size) + num_query_per_req > self.block_size
+        if bool(spanning.any()):
+            last_page = ((seq_lens + num_query_per_req - 1) // self.block_size).to(
+                torch.int64
+            )
+            if self._span_unallocated(cad.block_table_tensor, last_page):
+                self._dropped_rows = torch.ones(num_reqs, dtype=torch.bool)
                 return self.positions.new_zeros(num_query_total)
-            rows = torch.arange(pages.shape[0])
-            assert not bool(
-                (cad.block_table_tensor.cpu()[rows, pages][crossing] == 0).any()
-            ), "the scheduler's lookahead reservation left a crossing row on block 0"
-            seq_lens = torch.where(crossing, next_page, seq_lens)
-        self._dropped_rows = crossing
 
         # The builder reads one thing out of the positions it is given --
         # `positions[query_start_loc_cpu[:num_reqs]]` -- and that becomes the
-        # kernel's block write offset. Real query positions would leave no way
-        # to redirect a crossing row, so the block start travels in its own
-        # host-side probe and the model keeps the true positions for RoPE.
+        # kernel's block write offset. It travels in its own host-side probe,
+        # leaving the model the true positions for RoPE.
         query_cad.seq_lens = seq_lens
         block_starts = torch.zeros(num_query_total, dtype=torch.int64)
         block_starts[self.arange_cpu[:num_reqs] * num_query_per_req] = seq_lens.to(
