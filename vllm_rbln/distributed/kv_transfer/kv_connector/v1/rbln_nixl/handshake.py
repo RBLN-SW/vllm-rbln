@@ -230,7 +230,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         split = self._head_split(cuts_l, cuts_r)
         kv_runs = self._kv_runs(self._kv_per_block, cuts_l, cuts_r)
         chunk_grid = self._shard_chunk_grid(
-            block_size=nixl_agent_meta.block_size, split=split
+            block_size=nixl_agent_meta.block_size, split=split, kv_runs=kv_runs
         )
 
         replicas_l = areas_l // slices_l
@@ -1152,7 +1152,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         region_ids = self._shard_local_region_ids(
             registered_layer_names, peer_areas=peer_areas
         )
-        chunk_grid = self._shard_chunk_grid(block_size=block_size, split=split)
+        chunk_grid = self._shard_chunk_grid(
+            block_size=block_size, split=split, kv_runs=kv_runs
+        )
         key = (engine_id, global_rank, block_size)
         handle = self._base_fan_in_handle(
             engine_id, global_rank, block_size, region_ids, remote_tp_size
@@ -1445,7 +1447,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 remote_kv_block_len = local_block_len // block_size_ratio
                 if block_size_ratio > 1:
                     local_block_len = remote_kv_block_len
-                desc_len = local_block_len // kv_per_block // divisor
+                kv_runs = 1 if divisor == 1 else kv_per_block
+                desc_len = local_block_len // kv_runs // divisor
                 rank_offset = (
                     self.tp_rank % tp_ratio * remote_kv_block_len
                     if indexes_into_remote
@@ -1466,7 +1469,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     )
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * page_size + rank_offset
-                    for kv in range(kv_per_block):
+                    for kv in range(kv_runs):
                         blocks_data.append(
                             (
                                 addr + kv * kv_stride,

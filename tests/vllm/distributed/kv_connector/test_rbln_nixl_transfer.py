@@ -129,6 +129,19 @@ class TestComputeDescIds:
         # region 0 -> 16+4, 16+6; region 1 -> 16+20, 16+22.
         assert list(out) == [0, 4, 20, 22, 36, 38, 10, 14]
 
+    def test_a_packed_block_moves_only_the_ranges_that_hold_its_halves(
+        self, monkeypatch
+    ):
+        # A whole block is one descriptor however it is packed; the window
+        # range holds two, and the chunk range starts past both.
+        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
+        worker._kv_per_block = 2
+
+        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
+
+        # Whole 0, 4 as before; chunks from 8 * (1 + 2); window at 8 + id * 2.
+        assert list(out) == [0, 4, 28, 30, 44, 46, 12, 13, 20, 21]
+
     def test_the_windowed_group_is_never_cut(self, monkeypatch):
         # Its descriptor IS the window, so there is no unwritten tail in it --
         # and its blocks are the ones a chunk range does not describe.
@@ -172,7 +185,7 @@ PACKED = 2  # rbln_custom_ops: (num_blocks, 2, H, 1, S, D)
 SPLIT = 1  # rbln_triton_ops: (2, num_blocks, H, 1, S, D)
 
 
-class TestDescIdsSpaceABlockByItsKvCount:
+class TestDescIdsForAPackedBlock:
     """`_compute_desc_ids` indexes the lists the class above builds."""
 
     @staticmethod
@@ -194,18 +207,19 @@ class TestDescIdsSpaceABlockByItsKvCount:
             physical_blocks_per_logical=1,
         )
 
-    def test_a_packed_block_names_both_of_its_halves(self):
+    def test_a_whole_block_is_named_once_however_it_is_packed(self):
         full = MagicMock()
-        ids = self._ids(PACKED, full)
-        # Region 0 block 1 -> ids 2,3; region 1 block 1 -> ids 10,11.
-        assert sorted(ids) == [2, 3, 10, 11]
+        # Region 0 block 1 -> id 1, region 1 block 1 -> id 5: the descriptor
+        # is the block, so the packing does not enter the arithmetic.
+        assert sorted(self._ids(PACKED, full)) == [1, 5]
+        assert sorted(self._ids(SPLIT, full)) == [1, 5]
 
-    def test_the_sliding_window_range_starts_past_every_full_desc(self):
+    def test_the_sliding_window_range_starts_past_every_whole_desc(self):
         sw = MagicMock(spec=SlidingWindowSpec)
-        packed = min(self._ids(PACKED, sw))
-        # num_regions(2) * num_blocks(4) * kv(2) full descs come first.
-        assert packed == 16 + 2
-        assert min(self._ids(SPLIT, sw)) == 8 + 1
+        # num_regions(2) * num_blocks(4) whole descs come first; the window
+        # range then names a packed block's halves in order.
+        assert sorted(self._ids(PACKED, sw)) == [10, 11, 18, 19]
+        assert sorted(self._ids(SPLIT, sw)) == [9, 13]
 
 
 class TestTailChunks:

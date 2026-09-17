@@ -127,7 +127,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _kv_split_axis: KVSplitAxis
     #: How many of K and V one region's block holds. Every lifetime reads it:
     #: registration derives it, the handshake pairs and advertises on it, the
-    #: descriptor lists space their ids by it.
+    #: window and chunk ranges of a descriptor list are cut by it.
     _kv_per_block: int
     _chunk_mode: bool
     _logical_region_kv_heads: list[int | None]
@@ -241,18 +241,6 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             mamba_view=mamba_view,
         )
 
-    # ------------------------------------------------------------------
-    # Hybrid Full + SWA desc layout (RDMA payload only)
-    # ------------------------------------------------------------------
-    #
-    # Regions are Full-sized. With swa_view_opt and an SWA group,
-    # two desc ranges share the base addrs: [0, N) Full-length, [N, 2N)
-    # sliding_window-length. SWA groups read only the prefix, so RDMA moves less
-    # while the host copy still moves whole blocks. _compute_desc_ids routes each
-    # group to its range; _sw_ratio None collapses to Full-only. Safe because the
-    # tail SWA writes back is never read and the Full/SWA block-id pools are
-    # disjoint.
-
     @staticmethod
     def _chunk_range_descs(
         pieces: list[tuple[int, int, int, int]],
@@ -287,7 +275,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         return out
 
     def _shard_chunk_grid(
-        self, *, block_size: int, split: int
+        self, *, block_size: int, split: int, kv_runs: int = 1
     ) -> tuple[int, int] | None:
         """`(byte runs a chunk is spread over, chunks each run is cut into)`.
 
@@ -303,6 +291,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         regions that disagree, a draft's named past the target's, get no grid
         rather than one region's band standing for the rest. A piece narrower
         than a head gets none for the same reason.
+
+        A packed block holds a token's K beside its V, so a token range is one
+        run in each -- unless the peer pairing already read the two apart,
+        which is what `kv_runs` reports.
         """
         if not self._chunk_mode:
             return None
@@ -326,16 +318,20 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             spans, heads_per_span = 1, bands.pop()
         if heads_per_span % split:
             return None
+        parts = self._kv_per_block // kv_runs
         span_tokens = block_size // spans
-        bytes_per_token = self.block_len_per_layer[0] // (span_tokens * heads_per_span)
+        bytes_per_token = self.block_len_per_layer[0] // (
+            span_tokens * heads_per_span * parts
+        )
         assert bytes_per_token > 0, (
             f"RBLN NIXL: a region holds {self.block_len_per_layer[0]}B per block, "
             f"which is under one byte per token for {span_tokens} token(s) of "
-            f"{heads_per_span} head(s)"
+            f"{heads_per_span} head(s) in {parts} K/V part(s)"
         )
         chunk_tokens = kv_chunk_tokens(
             span_tokens=span_tokens,
-            # A region holds one band of one span, so this divides out both.
+            # A region holds one band of one span in one part, so this divides
+            # out all three.
             bytes_per_token=bytes_per_token,
             prefill_step_tokens=(
                 self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -349,7 +345,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         assert chunk_tokens * chunks * spans == block_size
         if chunks == 1:
             return None
-        return heads_per_span // split, chunks
+        return parts * heads_per_span // split, chunks
 
     @staticmethod
     def _slice_head_bounds(
@@ -407,6 +403,16 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         kv_runs: int = 1,
         chunk_grid: tuple[int, int] | None = None,
     ) -> tuple[int, np.ndarray]:
+        """This engine's local descriptors, and the views of a block they name.
+
+        A sliding window shortens the RDMA descriptor, not the tensor and not
+        the host copy: regions stay Full-sized whatever the groups are. The
+        list therefore carries whole blocks and then a `sliding_window`-length
+        view over the same addresses, and a transfer picks the range its group
+        needs (`_compute_desc_ids`). The prefix is enough because the tail a
+        window writes back is never read, and the two groups draw block ids
+        from disjoint pools.
+        """
         if self._sw_ratio is None:
             if (
                 registered_layer_names is None
@@ -448,30 +454,29 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         t0 = time.perf_counter()
         blocks_data: list[tuple[int, int, int]] = []
 
-        # Two passes when SWA is present: Full descs first, then SWA descs
-        # at the same base addresses but `sliding_window`-sized.
-        # _sw_ratio is not None here (the None case returned early above).
-        # A window is a prefix, so a packed block takes one inside K and one
-        # inside V -- a single prefix runs past K's end and never reaches V.
+        # A whole block is one range whatever it packs, since K and V are
+        # adjacent in it. A window is a prefix and takes one inside each --
+        # a single prefix runs past K's end and never reaches V.
         kv_per_block = self._kv_per_block
         length_divisors = [1, self._sw_ratio]
         pieces: list[tuple[int, int, int, int]] = []
         for divisor in length_divisors:
             for i, base_addr in enumerate(local_base_addresses):
-                kv_stride = (
+                kv_block_len = (
                     self.get_backend_aware_kv_block_len(
                         layer_idx=i, first_split=True, mamba_view=False
                     )
                     // block_size_ratio
-                    // kv_per_block
                 )
-                desc_len = kv_stride // divisor
+                kv_runs = 1 if divisor == 1 else kv_per_block
+                kv_stride = kv_block_len // kv_per_block
+                desc_len = kv_block_len // kv_runs // divisor
                 stride = self.block_len_per_layer[i] // block_size_ratio
                 if divisor == 1:
-                    pieces.append((base_addr, kv_stride, stride, self.device_id))
+                    pieces.append((base_addr, kv_block_len, stride, self.device_id))
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * stride
-                    for kv in range(kv_per_block):
+                    for kv in range(kv_runs):
                         blocks_data.append(
                             (addr + kv * kv_stride, desc_len, self.device_id)
                         )

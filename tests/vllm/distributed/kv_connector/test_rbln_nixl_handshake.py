@@ -1540,9 +1540,20 @@ class TestShardLocalRegions:
 
         assert register.call_args.kwargs["chunk_grid"] == (1, 2)
 
-    @pytest.mark.parametrize(("split", "expected"), [(1, (2, 2)), (2, (1, 2))])
+    @pytest.mark.parametrize(
+        ("split", "kv_per_block", "kv_runs", "expected"),
+        [
+            (1, 1, 1, (2, 2)),
+            (2, 1, 1, (1, 2)),
+            # A peer that reads K and V apart leaves the piece one of them, so
+            # the grid is the split layout's. Sized against the whole block
+            # instead, a chunk comes out the span and there is no grid at all
+            # -- while the peer's list still carries one.
+            (1, 2, 2, (2, 2)),
+        ],
+    )
     def test_the_local_grid_is_derived_for_the_piece_this_shard_sends(
-        self, split, expected
+        self, split, kv_per_block, kv_runs, expected
     ):
         # A split halves the piece, so it holds half the heads and a chunk is
         # one run fewer. The peer's list is derived with the same split
@@ -1565,13 +1576,16 @@ class TestShardLocalRegions:
         w.transfer_topo.tp_size = 1
         w.vllm_config = mock_vllm_config(chunk_bytes=128)
         w.vllm_config.scheduler_config.max_num_batched_tokens = 8
+        w._kv_per_block = kv_per_block
 
         with patch.object(
             RblnNixlPullConnectorWorker,
             "register_local_xfer_handler",
             return_value=(42, []),
         ) as register:
-            w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"), split=split)
+            w._register_shard_xfer_state(
+                "eng", 2, 16, ("l2", "l3"), split=split, kv_runs=kv_runs
+            )
 
         assert register.call_args.kwargs["chunk_grid"] == expected
         assert w._shard_chunk_grids[("eng", 2)] == expected
@@ -1709,6 +1723,7 @@ class TestChunkSizing:
         w._chunk_mode = True
         w._kv_areas = areas
         w._kv_split_axis = KVSplitAxis.NON_HEAD
+        w._kv_per_block = 1
         w.block_len_per_layer = [block_len] * 8
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
@@ -2243,6 +2258,27 @@ class TestHeadBandMatching:
         assert len(two) == len(one) * 2
         assert {ln for _, ln, _ in two} == {128}
 
+    def test_the_peer_list_derives_its_grid_for_the_halves_it_reads(self):
+        # The grid is derived twice, once per list, and a transfer pairs the
+        # two by position: a tail selecting chunks of one names a different
+        # range of the other. Unequal cuts leave the piece one half here, so
+        # sizing a chunk against the whole block drops the range entirely.
+        w = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        w._kv_per_block = 2
+        w._chunk_mode = True
+        w._kv_split_axis = KVSplitAxis.HEAD
+        w.vllm_config = mock_vllm_config(chunk_bytes=128)
+        w.vllm_config.scheduler_config.max_num_batched_tokens = 8
+        meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
+
+        out = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
+
+        # 4 areas x 2 blocks x 2 halves, each a whole piece and a 1-run,
+        # 2-chunk grid over it.
+        assert len(out) == 4 * 2 * 2 * (1 + 1 * 2)
+
     def _grid_worker(self, *, monkeypatch, kv_heads=8, chunk_bytes=128, prefill=8):
         w = self._worker(
             tp_rank=0,
@@ -2289,6 +2325,26 @@ class TestHeadBandMatching:
         w = self._grid_worker(monkeypatch=monkeypatch)
 
         assert w._shard_chunk_grid(block_size=16, split=split) == expected
+
+    @pytest.mark.parametrize(
+        "kv_per_block, kv_runs, expected",
+        [
+            # A piece that is K or V alone: one run per head, as before.
+            (1, 1, (2, 4)),
+            (2, 2, (2, 4)),
+            # A piece holding both: the same token range sits once in each, so
+            # it takes twice the runs over half the tokens -- and the
+            # descriptor stays the size the byte target asked for.
+            (2, 1, (4, 2)),
+        ],
+    )
+    def test_a_piece_holding_both_halves_takes_a_run_in_each(
+        self, monkeypatch, kv_per_block, kv_runs, expected
+    ):
+        w = self._grid_worker(monkeypatch=monkeypatch, chunk_bytes=64, prefill=2)
+        w._kv_per_block = kv_per_block
+
+        assert w._shard_chunk_grid(block_size=16, split=1, kv_runs=kv_runs) == expected
 
     def test_regions_that_disagree_on_their_band_get_no_grid(self, monkeypatch):
         # Both lists carry one grid, so one region's head band cannot describe
