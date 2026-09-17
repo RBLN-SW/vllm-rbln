@@ -989,9 +989,10 @@ class TestModelImpl:
         """`LLM(additional_config=RBLNConfig(...))` hands in a resolved object.
 
         The wrapper must read the path off it rather than overwrite it with a
-        dict, which would drop every other field the caller set.
+        dict, which would drop every other field the caller set. The class is
+        what states the path; nothing here says it a second time.
         """
-        given = RBLNConfig(model_impl="vllm", use_w8a8=True)
+        given = RBLNConfig(use_w8a8=True)
 
         config = _build(additional_config=given)
 
