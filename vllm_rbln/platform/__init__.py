@@ -213,7 +213,7 @@ class RblnPlatform(Platform):
         """
         from vllm.engine.arg_utils import EngineArgs
 
-        from vllm_rbln.config import RBLNConfigBase, resolve_model_impl
+        from vllm_rbln.config import OptimumRBLNConfig, resolve_model_impl
 
         if getattr(EngineArgs, "_rbln_model_impl_patched", False):
             return
@@ -222,12 +222,24 @@ class RblnPlatform(Platform):
 
         def create_engine_config(self, *args, **kwargs):
             model_impl = resolve_model_impl(self.additional_config)
-            if not isinstance(self.additional_config, RBLNConfigBase):
-                # Write it back so the config states its own path. That config
-                # is what reaches every worker in the pickle.
-                self.additional_config = (self.additional_config or {}) | {
+            config = self.additional_config
+            if config is None or isinstance(config, dict):
+                # Write the path back so the config states it. That config is
+                # what reaches every worker in the pickle. A built one states it
+                # already, and upstream's bare string is left as it is, for
+                # `VllmConfig` to reject in its own words.
+                config = self.additional_config = (config or {}) | {
                     "model_impl": model_impl
                 }
+            if model_impl == "optimum":
+                # The prefill chunk size that path compiles is
+                # `--max-num-batched-tokens` as the user gave it, and the call
+                # below replaces an unset one with a default, leaving
+                # `sync_from_vllm` no way to tell the two apart.
+                if isinstance(config, dict):
+                    config["user_max_num_batched_tokens"] = self.max_num_batched_tokens
+                elif isinstance(config, OptimumRBLNConfig):
+                    config.user_max_num_batched_tokens = self.max_num_batched_tokens
             _apply_model_impl(model_impl)
             return orig_create_engine_config(self, *args, **kwargs)
 

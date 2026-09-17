@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -87,6 +89,37 @@ def test_a_no_flag_field_is_still_accepted():
     the class exists, so resolution has to take it."""
     config = _resolve(OptimumRBLNConfig, {"user_max_num_batched_tokens": 512})
     assert config.user_max_num_batched_tokens == 512
+
+
+def test_the_capture_writes_only_where_this_path_reads(monkeypatch):
+    """`--max-num-batched-tokens` is captured where the path is already known.
+
+    It lands in whichever shape `additional_config` arrived as, since neither a
+    built config nor upstream's bare string takes item assignment. What the
+    other path gets is not this suite's to say; building a native config is
+    what shows that, and the whole of tests/vllm does it.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    from vllm_rbln.platform import RblnPlatform
+
+    # Wrapped around a stub: building a real engine config needs a compiled
+    # model, and what is under test is what the wrapper writes before that.
+    monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: None)
+    monkeypatch.setattr(EngineArgs, "_rbln_model_impl_patched", False, raising=False)
+    RblnPlatform._capture_model_impl()
+
+    def captured(additional_config):
+        args = SimpleNamespace(
+            max_num_batched_tokens=512, additional_config=additional_config
+        )
+        EngineArgs.create_engine_config(args)
+        return args.additional_config
+
+    assert captured(None)["user_max_num_batched_tokens"] == 512
+    assert captured({"prefix_block_size": 64})["user_max_num_batched_tokens"] == 512
+    assert captured(OptimumRBLNConfig()).user_max_num_batched_tokens == 512
+    assert captured("something") == "something"
 
 
 def test_the_former_overrides_key_is_accepted():
