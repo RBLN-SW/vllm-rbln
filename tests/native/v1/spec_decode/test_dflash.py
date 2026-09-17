@@ -183,15 +183,22 @@ class TestSingleSequenceGuard:
             )
 
 
+class _ReachedDraftPass(Exception):
+    """Raised in place of the draft pass, so a step that does not give up is
+    told apart from one that does. A named exception, not a bare RuntimeError:
+    the caller catches it, and catching RuntimeError would swallow a real one."""
+
+
 class TestSpanningBlockAllocation:
     SPANS = BLOCK_SIZE - 1  # a block starting here leaves its page; 0 does not
 
     def _run(self, table, ctx_lens):
-        """Drive the real `_run_query_pass`; it raises once past the check."""
+        """Drive the real `_run_query_pass` and report whether it got past the
+        allocation check, alongside the drafts it kept."""
         n = len(ctx_lens)
 
         def reached(*args, **kwargs):
-            raise RuntimeError("reached the draft pass")
+            raise _ReachedDraftPass
 
         proposer = SimpleNamespace(
             arange_cpu=torch.arange(n + 1, dtype=torch.int32),
@@ -205,15 +212,19 @@ class TestSpanningBlockAllocation:
             [i * QUERY_LEN for i in range(n + 1)], [c + QUERY_LEN for c in ctx_lens]
         )
         cad.block_table_tensor = torch.tensor(table, dtype=torch.int32)
-        RBLNDFlashProposer._run_query_pass(
-            proposer,
-            cad,
-            n,
-            QUERY_LEN,
-            n * QUERY_LEN,
-            torch.tensor(ctx_lens, dtype=torch.int32),
-            torch.zeros(n, dtype=torch.int32),
-        )
+        try:
+            RBLNDFlashProposer._run_query_pass(
+                proposer,
+                cad,
+                n,
+                QUERY_LEN,
+                n * QUERY_LEN,
+                torch.tensor(ctx_lens, dtype=torch.int32),
+                torch.zeros(n, dtype=torch.int32),
+            )
+            proposer.reached = False
+        except _ReachedDraftPass:
+            proposer.reached = True
         return proposer
 
     @pytest.mark.parametrize(
@@ -224,11 +235,12 @@ class TestSpanningBlockAllocation:
         ],
         ids=["stays_on_its_page", "next_page_allocated"],
     )
-    def test_a_step_proceeds_when_the_page_it_ends_on_is_allocated(
+    def test_a_step_keeps_its_drafts_when_the_page_it_ends_on_is_allocated(
         self, table, ctx_lens
     ):
-        with pytest.raises(RuntimeError, match="reached the draft pass"):
-            self._run(table, ctx_lens)
+        proposer = self._run(table, ctx_lens)
+        assert proposer.reached
+        assert not bool(proposer._dropped_rows.any())
 
     @pytest.mark.parametrize(
         "table, ctx_lens",
@@ -240,7 +252,9 @@ class TestSpanningBlockAllocation:
         ids=["unfilled", "past_the_table", "one_bad_row_of_two"],
     )
     def test_a_step_gives_up_when_it_is_not(self, table, ctx_lens):
-        assert bool(self._run(table, ctx_lens)._dropped_rows.all())
+        proposer = self._run(table, ctx_lens)
+        assert not proposer.reached
+        assert bool(proposer._dropped_rows.all())
 
 
 class TestPlatformRefusals:
