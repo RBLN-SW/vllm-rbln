@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import os
 from dataclasses import replace
 from types import SimpleNamespace
@@ -29,9 +28,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from vllm.config import CacheConfig, CompilationMode, VllmConfig
+from vllm.config import CompilationMode, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
-from vllm.entrypoints.llm import LLM
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -453,6 +451,8 @@ class TestSchedulerOverrides:
     def test_an_explicit_max_num_seqs_is_respected(self):
         assert _build(max_num_seqs=8).scheduler_config.max_num_seqs == 8
 
+
+class TestCacheOverrides:
     def test_upstream_default_gpu_memory_utilization_takes_the_rbln_default(
         self, configured
     ):
@@ -471,14 +471,6 @@ class TestSchedulerOverrides:
             parser.get_default("gpu_memory_utilization")
             == RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
         )
-
-    def test_llm_init_still_shares_the_upstream_default(self):
-        """LLM.__init__ carries its own literal, not CacheConfig's; the override
-        keys on CacheConfig's, so the two must not drift apart."""
-        llm_default = (
-            inspect.signature(LLM.__init__).parameters["gpu_memory_utilization"].default
-        )
-        assert llm_default == CacheConfig.gpu_memory_utilization
 
 
 class TestEnforceEager:

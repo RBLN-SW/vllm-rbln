@@ -292,13 +292,9 @@ class RblnPlatform(Platform):
         for action in parser._actions:
             if action.dest == "device":
                 action.choices.append("rbln")
-
-        for action in parser._actions:
-            if action.dest == "block_size":
+            elif action.dest == "block_size":
                 action.choices = None  # Override choices
-
-        for action in parser._actions:
-            if action.dest == "gpu_memory_utilization":
+            elif action.dest == "gpu_memory_utilization":
                 action.default = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
