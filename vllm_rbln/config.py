@@ -380,12 +380,15 @@ def _resolve(cls: type[_C], additional_config: Any) -> _C:
         return additional_config
 
     if isinstance(additional_config, RBLNConfigBase):
-        # The only way here: a config object whose model_impl contradicts the
-        # class it is. Everything else that names a path agrees with itself.
+        # Two ways here: an object whose model_impl disagrees with the class it
+        # is, which is the value the path was read off, or a caller asking for
+        # the other class outright. Neither is inferred, since the message that
+        # named the wrong one read backwards.
         raise ValueError(
-            f"additional_config is an {type(additional_config).__name__}, and "
-            f"its model_impl={additional_config.model_impl!r} selects the "
-            f"{cls.__name__} path. The class picks the path, so drop model_impl."
+            f"additional_config is an {type(additional_config).__name__} "
+            f"(model_impl={additional_config.model_impl!r}), and the "
+            f"{cls.__name__} path is the one being resolved. A config class "
+            "belongs to one model path."
         )
 
     given: dict[str, Any] = additional_config or {}

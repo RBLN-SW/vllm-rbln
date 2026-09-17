@@ -150,17 +150,24 @@ def test_unknown_key_is_rejected():
         build_rbln_config({"compile_modell": False})
 
 
-def test_a_config_that_contradicts_its_class_is_rejected():
-    """`RBLNConfig(model_impl="optimum")` says two different things.
+def test_a_config_of_the_other_path_is_rejected():
+    """Two ways to hand a resolution the wrong class, and one message for both.
 
-    The key is what the path is read off, so the run lands on the optimum path
-    holding the other path's config. Name the contradiction rather than report
-    the class the path ended up wanting.
+    `RBLNConfig(model_impl="optimum")` says two different things and the key is
+    what the path is read off; `build_rbln_config(OptimumRBLNConfig())` says one
+    thing to a caller that asked for the other class. A message that explains
+    either one as the cause reads backwards for the other, so it states what it
+    was handed and what is being resolved, in that order.
     """
-    with pytest.raises(ValueError, match="drop model_impl"):
+    with pytest.raises(ValueError, match="belongs to one model path") as said:
         build_optimum_rbln_config(RBLNConfig(model_impl="optimum"))
-    with pytest.raises(ValueError, match="drop model_impl"):
-        build_rbln_config(OptimumRBLNConfig(model_impl="vllm"))
+    assert "is an RBLNConfig (model_impl='optimum')" in str(said.value)
+    assert "OptimumRBLNConfig path is the one being resolved" in str(said.value)
+
+    with pytest.raises(ValueError, match="belongs to one model path") as said:
+        build_rbln_config(OptimumRBLNConfig())
+    assert "is an OptimumRBLNConfig (model_impl='optimum')" in str(said.value)
+    assert "RBLNConfig path is the one being resolved" in str(said.value)
 
 
 def test_upstream_key_is_rejected():
