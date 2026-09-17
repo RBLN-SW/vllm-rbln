@@ -36,6 +36,7 @@ import vllm_rbln.platform as platform
 from tests.native.vllm_config import local_model_path
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import (
+    RBLN_DEFAULT_GPU_MEMORY_UTILIZATION,
     RBLN_DEFAULT_MAX_NUM_SEQS,
     RblnPlatform,
 )
@@ -448,6 +449,18 @@ class TestSchedulerOverrides:
 
     def test_an_explicit_max_num_seqs_is_respected(self):
         assert _build(max_num_seqs=8).scheduler_config.max_num_seqs == 8
+
+    def test_upstream_default_gpu_memory_utilization_takes_the_rbln_default(
+        self, configured
+    ):
+        assert (
+            configured.cache_config.gpu_memory_utilization
+            == RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
+        )
+
+    def test_an_explicit_gpu_memory_utilization_is_respected(self):
+        config = _build(gpu_memory_utilization=0.5)
+        assert config.cache_config.gpu_memory_utilization == 0.5
 
 
 class TestEnforceEager:
