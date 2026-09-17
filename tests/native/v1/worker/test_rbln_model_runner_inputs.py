@@ -25,6 +25,7 @@ from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.native.v1.worker.utils import (
+    MAX_MODEL_LEN,
     make_scheduler_output,
     make_speculative_config,
     schedule_new,
@@ -115,15 +116,19 @@ class TestPrepareInputsFixedWindow:
     NUM_SPEC = 2
 
     @pytest.mark.parametrize(
-        "num_computed",
+        "num_computed, front_pad",
         [
-            3,
-            BLOCK - 1,
-            BLOCK,
+            # The formula switches on `max_model_len`, not on the block: the
+            # window only shifts once it would run past the last KV slot the
+            # request will ever own.
+            (3, 0),
+            (MAX_MODEL_LEN - NUM_SPEC - 1, 0),
+            (MAX_MODEL_LEN - NUM_SPEC, 1),
         ],
+        ids=["mid_sequence", "last_placement_that_fits", "overshoots_by_one"],
     )
-    def test_the_window_is_fixed_and_starts_at_the_scheduled_token(
-        self, make_model_runner, monkeypatch, num_computed
+    def test_the_window_is_fixed_and_shifts_only_at_max_model_len(
+        self, make_model_runner, monkeypatch, num_computed, front_pad
     ):
         runner = make_model_runner()
         _decode_ready(
@@ -133,31 +138,6 @@ class TestPrepareInputsFixedWindow:
             num_computed=num_computed,
         )
         window = self.NUM_SPEC + 1
-
-        logits_indices, spec_md, query_lengths, total = runner._prepare_inputs(
-            make_scheduler_output(num_scheduled_tokens={"a": 1}),
-            np.array([1], dtype=np.int32),
-        )
-
-        assert query_lengths.tolist() == [window]
-        positions = runner.positions[:window].tolist()
-        assert positions == list(range(num_computed, num_computed + window))
-        # The scheduled token is the first slot, whatever the window crosses.
-        assert logits_indices.tolist() == [0]
-        assert runner.seq_lens[:1].tolist() == [num_computed + 1]
-
-    def test_a_window_past_max_model_len_moves_the_overshoot_in_front(
-        self, make_model_runner, monkeypatch
-    ):
-        runner = make_model_runner()
-        window = self.NUM_SPEC + 1
-        num_computed = runner.max_model_len - window + 1
-        _decode_ready(
-            runner,
-            monkeypatch,
-            num_spec_tokens=self.NUM_SPEC,
-            num_computed=num_computed,
-        )
 
         logits_indices, _, query_lengths, _ = runner._prepare_inputs(
             make_scheduler_output(num_scheduled_tokens={"a": 1}),
@@ -165,13 +145,44 @@ class TestPrepareInputsFixedWindow:
         )
 
         assert query_lengths.tolist() == [window]
-        positions = runner.positions[:window].tolist()
-        assert positions[-1] == runner.max_model_len - 1
-        assert positions == [num_computed - 1, num_computed, num_computed + 1]
-        assert logits_indices.tolist() == [1]
-        assert runner.decode_back_pad_np[0] == 1
+        start = num_computed - front_pad
+        assert runner.positions[:window].tolist() == list(range(start, start + window))
+        assert runner.positions[window - 1] < runner.max_model_len
+        assert logits_indices.tolist() == [front_pad]
+        assert runner.decode_back_pad_np[0] == self.NUM_SPEC - front_pad
+        assert runner.seq_lens[:1].tolist() == [num_computed + 1]
 
-    def test_kept_drafts_at_a_block_start_sample_before_the_back_padding(
+    def test_only_the_request_near_the_end_shifts(self, make_model_runner, monkeypatch):
+        """front_pad is per request, so a request at the end of its context must
+        not move the rest of the batch."""
+        runner = make_model_runner()
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner._update_states(schedule_new("a", "b"))
+        near_end = MAX_MODEL_LEN - self.NUM_SPEC
+        for i, num_computed in enumerate((10, near_end)):
+            runner.input_batch.num_computed_tokens_cpu[i] = num_computed
+            runner.input_batch.num_tokens_no_spec[i] = num_computed
+        monkeypatch.setattr(runner, "num_spec_tokens", self.NUM_SPEC)
+        monkeypatch.setattr(
+            runner, "speculative_config", make_speculative_config("mtp")
+        )
+        runner._is_prefill_step = False
+        window = self.NUM_SPEC + 1
+
+        _, _, query_lengths, total = runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 1, "b": 1}),
+            np.array([1, 1], dtype=np.int32),
+        )
+
+        assert query_lengths.tolist() == [window, window]
+        assert runner.positions[:total].tolist() == [10, 11, 12] + list(
+            range(near_end - 1, near_end + 2)
+        )
+        assert runner.decode_back_pad_np[:2].tolist() == [self.NUM_SPEC, 1]
+
+    def test_kept_drafts_sample_before_the_back_padding(
         self, make_model_runner, monkeypatch
     ):
         runner = make_model_runner()

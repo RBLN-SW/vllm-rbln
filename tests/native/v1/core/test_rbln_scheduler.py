@@ -455,6 +455,31 @@ class TestScheduleSpecDecodeCap:
         assert out.scheduled_spec_decode_tokens == {}
 
 
+class TestFixedWindowReservation:
+    _BS = 16
+    _NUM_SPEC = 4
+
+    def test_the_window_fits_the_blocks_the_scheduler_reserved(self):
+        sched = create_rbln_scheduler(
+            num_speculative_tokens=self._NUM_SPEC,
+            block_size=self._BS,
+            num_blocks=256,
+            max_num_seqs=8,
+        )
+        assert sched.vllm_config.speculative_config.method == "ngram"
+        req = create_requests(
+            1, num_tokens=13, block_size=self._BS, max_tokens=64, req_ids=["R"]
+        )[0]
+        advance_to_decode(sched, req)
+        # Fewer drafts than the window, so the runner pads the rest behind them.
+        req.spec_token_ids = [1, 2]
+        sched.schedule()
+
+        blocks = sched.kv_cache_manager.coordinator.get_blocks(req.request_id)[0]
+        last_position = req.num_computed_tokens + self._NUM_SPEC
+        assert last_position // self._BS < len(blocks)
+
+
 class TestBlockBoundaryJoin:
     _BS = 16
     _NUM_SPEC = 4
@@ -1068,6 +1093,8 @@ class TestSpecDecodeReadyJoin:
         req0.spec_token_ids = [1] * 4
         return sched, req0
 
+    # 16 lands the join on a block start and 8 mid-block; the removed check
+    # treated those as the unsafe and safe sides, and neither costs drafts now.
     @pytest.mark.parametrize("prefix_len", [16, 8])
     def test_a_decode_ready_join_keeps_the_batch_on_spec(self, prefix_len):
         sched, req0 = self._running_decoder_with_spec()
