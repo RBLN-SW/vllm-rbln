@@ -253,7 +253,7 @@ def main():
         ]
     )
     report_geometry("cache-hit geometry (with `enable_prefix_caching`)", outputs)
-    # print(f"\nGenerated answers are the same: {generated_same}")
+    print(f"\nGenerated answers are the same: {generated_same}")
     print(f"Time without prefix caching: {wo_prefix_time:.3f} sec")
     print(f"Time with prefix caching: {w_prefix_time:.3f} sec")
 
