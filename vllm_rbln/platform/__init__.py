@@ -423,20 +423,25 @@ class RblnPlatform(Platform):
         return additional_kwargs
 
 
-def _apply_model_impl(model_impl: "ModelImpl") -> None:
+def _apply_model_impl(model_impl: "ModelImpl", *, publish: bool = True) -> None:
     """Adopt `model_impl`, and publish it for the processes this one spawns.
 
     Called at import, where only the environment names the path, and again once
     the arguments do -- ahead of the `DeviceConfig` that reads `device_type`.
     Everything the path decides is mapped here and nowhere else.
+
+    Only a caller that resolved the path publishes it. The import-time answer is
+    a guess while the deprecated variable still selects the path, and
+    `register_ops` reads the variable as proof that someone resolved it.
     """
     global USE_DEVICE_TENSOR
 
-    os.environ[envs.RESOLVED_MODEL_IMPL_ENV] = model_impl
+    if publish:
+        os.environ[envs.RESOLVED_MODEL_IMPL_ENV] = model_impl
     USE_DEVICE_TENSOR = model_impl == "vllm" and envs.VLLM_RBLN_USE_DEVICE_TENSOR
     RblnPlatform.device_name = "rbln" if USE_DEVICE_TENSOR else "cpu"
     RblnPlatform.device_type = "rbln" if USE_DEVICE_TENSOR else "cpu"
     RblnPlatform.dist_backend = "rbln-ccl" if USE_DEVICE_TENSOR else ""
 
 
-_apply_model_impl(envs.model_impl_from_env())  # type: ignore[arg-type]
+_apply_model_impl(envs.model_impl_from_env(), publish=False)  # type: ignore[arg-type]

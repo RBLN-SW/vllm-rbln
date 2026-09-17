@@ -277,8 +277,29 @@ class TestResolveModelImpl:
         assert resolve_model_impl(RBLNConfig(model_impl="vllm")) == "vllm"
         assert resolve_model_impl(OptimumRBLNConfig()) == "optimum"
 
-    def test_the_key_wins_over_the_environment(self, monkeypatch):
+    def test_a_disagreeing_deprecated_variable_is_rejected(self, monkeypatch):
+        """Two inputs naming the path differently is a mistake, not a ladder.
+
+        Every other field takes the additional_config value over the
+        environment. This one cannot: the plugin entry points have acted on the
+        variable before anything reads the key.
+        """
+        # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
+        with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL"):
+            resolve_model_impl({"model_impl": "optimum"})
+        with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL"):
+            resolve_model_impl(OptimumRBLNConfig())
+
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
+        with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL"):
+            resolve_model_impl({"model_impl": "vllm"})
+
+    def test_an_agreeing_deprecated_variable_is_not_a_conflict(self, monkeypatch):
+        # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
+        assert resolve_model_impl({"model_impl": "vllm"}) == "vllm"
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
         assert resolve_model_impl({"model_impl": "optimum"}) == "optimum"
 
     def test_nothing_given_is_the_default_path(self, monkeypatch):

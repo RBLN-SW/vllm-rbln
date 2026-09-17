@@ -16,6 +16,9 @@
 # applies and verifies them. Its state lives in module globals the conftest has
 # already populated, so tests that mutate them swap in isolated ones.
 
+import json
+import os
+import subprocess
 import sys
 import types
 from typing import Any
@@ -381,6 +384,49 @@ class TestApplyRegisteredPatches:
         assert fake_target.symbol is reg._built_replacements["k"]
 
 
+_PLUGIN_LOAD_PROBE = """
+import json, sys
+from vllm.plugins import load_general_plugins
+load_general_plugins()
+imported = "vllm_rbln.patches" in sys.modules
+applied = applicable = []
+if imported:
+    from vllm_rbln.patches import registry
+    applied = sorted(registry._applied_patch_keys)
+    applicable = sorted(
+        d.key for d in registry._REGISTERED_PATCH_DESCRIPTORS
+        if d.condition is None or d.condition()
+    )
+print("RESULT" + json.dumps(
+    {"imported": imported, "applied": applied, "applicable": applicable}
+))
+"""
+
+_NOTHING_APPLIED = {"imported": False, "applied": [], "applicable": []}
+
+
+def _load_plugins_in(**environ: str) -> dict[str, Any]:
+    """What the plugin entry point applied in a process started with ``environ``.
+
+    Every RBLN knob is dropped first, the resolved path included: this suite
+    exports it, and inheriting it would answer the question the probe asks.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("VLLM_RBLN") and k != platform_envs.RESOLVED_MODEL_IMPL_ENV
+    }
+    out = subprocess.run(
+        [sys.executable, "-c", _PLUGIN_LOAD_PROBE],
+        capture_output=True,
+        text=True,
+        env=env | environ,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    line = next(ln for ln in out.stdout.splitlines() if ln.startswith("RESULT"))
+    return json.loads(line.removeprefix("RESULT"))
+
+
 class TestApplySites:
     """Which process applies the patches.
 
@@ -398,43 +444,24 @@ class TestApplySites:
         On the optimum path it applies nothing, and does not even import
         `patches`, which is what keeps that path's upstream pristine.
         """
-        import json
-        import os
-        import subprocess
-        import sys
-
-        probe = """
-import json, sys
-from vllm.plugins import load_general_plugins
-load_general_plugins()
-imported = "vllm_rbln.patches" in sys.modules
-applied = applicable = []
-if imported:
-    from vllm_rbln.patches import registry
-    applied = sorted(registry._applied_patch_keys)
-    applicable = sorted(
-        d.key for d in registry._REGISTERED_PATCH_DESCRIPTORS
-        if d.condition is None or d.condition()
-    )
-print("RESULT" + json.dumps(
-    {"imported": imported, "applied": applied, "applicable": applicable}
-))
-"""
-        env = {k: v for k, v in os.environ.items() if not k.startswith("VLLM_RBLN")}
-        env[platform_envs.RESOLVED_MODEL_IMPL_ENV] = model_impl
-        out = subprocess.run(
-            [sys.executable, "-c", probe], capture_output=True, text=True, env=env
-        )
-        assert out.returncode == 0, out.stderr[-2000:]
-        line = next(ln for ln in out.stdout.splitlines() if ln.startswith("RESULT"))
-        result = json.loads(line.removeprefix("RESULT"))
+        result = _load_plugins_in(**{platform_envs.RESOLVED_MODEL_IMPL_ENV: model_impl})
 
         if model_impl == "optimum":
-            assert result == {"imported": False, "applied": [], "applicable": []}
+            assert result == _NOTHING_APPLIED
         else:
             assert result["imported"]
             assert result["applicable"]
             assert result["applied"] == result["applicable"]
+
+    def test_the_resolving_process_applies_nothing_yet(self):
+        """The deprecated variable is not a resolved path.
+
+        It answers in the process that parses the arguments too, where
+        `--rbln-model-impl optimum` can still overrule it. Applying here on its
+        answer would put that run on patched upstream with nothing left to undo
+        it, so this process waits for the platform hook.
+        """
+        assert _load_plugins_in(VLLM_RBLN_USE_VLLM_MODEL="1") == _NOTHING_APPLIED
 
     def test_patch_upstream_applies_everything(self, monkeypatch):
         import vllm_rbln.patches as patches
