@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
 import vllm_rbln.v1.worker.utils as worker_utils
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory
 from vllm_rbln.v1.worker.utils import (
@@ -46,6 +47,7 @@ from vllm_rbln.v1.worker.utils import (
     compute_rbln_local_omp_cpuid,
     copy_host_device_kv_blocks,
     divide_by_chiplet_replication,
+    dynamic_kv_unsupported_reason,
     estimate_available_memory,
     estimate_model_kernel_size,
     get_autobind_cpu_ids,
@@ -1411,3 +1413,61 @@ class TestRblnDeviceDramTotal:
             "torch.rbln.get_device_properties", create=True, return_value=self._props(0)
         ):
             assert rbln_device_dram_total_bytes() is None
+
+
+class TestDynamicKvUnsupportedReason:
+    """Each reason is a property of the path, the deployment or the kernel, so
+    the feature turns itself off rather than refusing a run the flag off would
+    have served."""
+
+    @staticmethod
+    def _cfg(use_custom_kernel=False, kv_transfer_config=None):
+        return SimpleNamespace(
+            additional_config=RBLNConfig(use_custom_kernel=use_custom_kernel),
+            kv_transfer_config=kv_transfer_config,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _device_tensor_on(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
+    def test_a_clean_config_is_supported(self):
+        assert dynamic_kv_unsupported_reason(self._cfg()) is None
+
+    def test_device_tensor_off_is_unsupported(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "0")
+        assert "VLLM_RBLN_USE_DEVICE_TENSOR" in dynamic_kv_unsupported_reason(
+            self._cfg()
+        )
+
+    def test_the_triton_kernels_are_unsupported(self):
+        # rbln_triton_ops goes through the compiler's triton converter, so the
+        # KV input never reaches a whitelisted paged_* custom op.
+        reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))
+        assert "RBLN_USE_CUSTOM_KERNEL" in reason
+
+    def test_an_unlisted_kv_transfer_connector_is_unsupported(self):
+        # The worker drives the registration behind the resize, so the set is
+        # a policy; the reason names the connector that was asked for.
+        reason = dynamic_kv_unsupported_reason(
+            self._cfg(
+                kv_transfer_config=SimpleNamespace(
+                    kv_connector="RBLNLMCacheConnectorV1"
+                )
+            )
+        )
+        assert "RBLNLMCacheConnectorV1" in reason
+
+    @pytest.mark.parametrize(
+        "connector",
+        ["RblnNixlConnector", "RblnNixlPullConnector", "RblnNixlPushConnector"],
+    )
+    def test_the_rbln_nixl_connectors_are_supported(self, connector):
+        # One worker base and one registration mixin between them, so the
+        # count fix that opened the path covers all three.
+        assert (
+            dynamic_kv_unsupported_reason(
+                self._cfg(kv_transfer_config=SimpleNamespace(kv_connector=connector))
+            )
+            is None
+        )

@@ -303,6 +303,53 @@ def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
     return None
 
 
+DYNAMIC_KV_SUPPORTED_CONNECTORS = (
+    "RblnNixlConnector",
+    "RblnNixlPullConnector",
+    "RblnNixlPushConnector",
+)
+
+
+def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
+    """Why this configuration cannot size its KV cache from the compiled
+    placement, or None when it can.
+
+    Every reason here is a property of the deployment or of the kernel the model
+    dispatches to, not a request from the caller, so the feature turns itself off
+    and the run serves the pre-compile estimate. A caller who asked for something
+    the mechanism then fails at still gets a hard failure: those live in
+    `DynamicKvSizer`. The optimum path is not among them -- it installs neither
+    the engine patch nor a worker that carries a sizer.
+    """
+    if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+        return (
+            "VLLM_RBLN_USE_DEVICE_TENSOR is off, so the artifact carries no "
+            "dynamic KV dimension"
+        )
+    rbln_config: RBLNConfig = vllm_config.additional_config
+    if rbln_config.use_custom_kernel:
+        # rbln_triton_ops goes through the compiler's triton converter, so the
+        # KV input never reaches a whitelisted paged_* custom op.
+        return (
+            "RBLN_USE_CUSTOM_KERNEL is on, and the rbln_triton_ops kernels take "
+            "no dynamic KV input"
+        )
+    kv_transfer = vllm_config.kv_transfer_config
+    if (
+        kv_transfer is not None
+        and kv_transfer.kv_connector not in DYNAMIC_KV_SUPPORTED_CONNECTORS
+    ):
+        # The worker registers with the connector only once the resize has
+        # allocated. That is connector-agnostic, so one outside this set is
+        # untried rather than known broken.
+        return (
+            f"kv_connector={kv_transfer.kv_connector!r} is not among the "
+            "connectors the dynamic-KV resize is open for "
+            f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class KvMinimum:
     """The fewest blocks a KV cache pool can serve with."""
@@ -526,8 +573,8 @@ def estimate_available_memory(
         rsd_size = REBEL_CHIPLET_SIZE
         available_dram_bytes = REBEL_DRAM_NBYTES
         if exact_dram:
-            # Caller-gated: the default path's estimate must not depend on the
-            # driver, and neither may a dry run, which only observes it.
+            # Caller-gated: only the mode that replaces the estimate may let
+            # the driver's capacity move it.
             device_dram_total = rbln_device_dram_total_bytes()
             if device_dram_total is None:
                 logger.debug(

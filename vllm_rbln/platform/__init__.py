@@ -47,13 +47,6 @@ RBLN_DEFAULT_MAX_NUM_SEQS = 1
 RBLN_DEFAULT_GPU_MEMORY_UTILIZATION = 0.93
 # Superseded by RblnPlatform.device_control_env_var.
 DEPRECATED_DEVICE_CONTROL_ENV_VAR = "RBLN_DEVICES"
-# The connectors the dynamic-KV resize is open for. The order it needs
-# (warm-up, reallocate, register) is driven from the worker and is
-# connector-agnostic, so one outside this set is untried, not known broken.
-DYNAMIC_KV_SUPPORTED_CONNECTORS = (
-    "RblnNixlConnector",
-    "RblnNixlPullConnector",
-)
 
 
 def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
@@ -261,11 +254,6 @@ class RblnPlatform(Platform):
                 "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
             )
 
-        # NOTE(RBLN): checked here, not inside the selected path module -- the
-        # optimum path is exactly where an unsupported flag would go unnoticed.
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
-            cls._validate_dynamic_kv_config(vllm_config)
-
         _impl().check_and_update(vllm_config)
 
         parallel_config = vllm_config.parallel_config
@@ -274,47 +262,6 @@ class RblnPlatform(Platform):
                 "%s is not supported on RBLN. Keeping the selected distributed "
                 "executor backend; use 'mp' for supported multi-worker execution.",
                 parallel_config.distributed_executor_backend,
-            )
-
-    @staticmethod
-    def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
-        """Reject configurations the dynamic-KV path cannot size.
-
-        A dry run reports them instead: it changes nothing, so refusing would
-        stop a run that the flag off would have served. Reasons per shape:
-        docs/dynamic_kv_cache.md, "Unsupported Configurations".
-        """
-        dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
-
-        def reject(message: str) -> None:
-            if dry_run:
-                logger.warning("dynamic KV cache dry run: %s", message)
-                return
-            raise ValueError(message)
-
-        if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-            reject(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
-                "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
-            )
-
-        if not USE_DEVICE_TENSOR:
-            reject(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
-                "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
-                "no dynamic KV dimension."
-            )
-
-        kv_transfer_config = vllm_config.kv_transfer_config
-        if (
-            kv_transfer_config is not None
-            and kv_transfer_config.kv_connector not in DYNAMIC_KV_SUPPORTED_CONNECTORS
-        ):
-            reject(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE reallocates the KV cache after "
-                "warm-up, and the connector registers what the resize allocated. "
-                f"That path is open for {', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)}"
-                f"; got kv_connector={kv_transfer_config.kv_connector!r}."
             )
 
     @classmethod
