@@ -751,12 +751,10 @@ def build_worker(
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
     vllm_config = mock_vllm_config(
-        chunk_mode=chunk_mode, swa_view_opt=swa_view_opt, chunk_bytes=chunk_bytes
-    )
-    # A real dict beside the knob lookups: the stripe width is read straight
-    # off the extra config, and a mock answers "absent" with a mock of its own.
-    vllm_config.kv_transfer_config.kv_connector_extra_config = (
-        {} if stripe_width is None else {"stripe_width": stripe_width}
+        chunk_mode=chunk_mode,
+        swa_view_opt=swa_view_opt,
+        chunk_bytes=chunk_bytes,
+        stripe_width=stripe_width,
     )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # What the worker sets before it builds the connector; `register_kv_caches`

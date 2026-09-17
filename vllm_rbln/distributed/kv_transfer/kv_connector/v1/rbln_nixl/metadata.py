@@ -116,7 +116,9 @@ class RblnNixlConnectorMetadata(NixlConnectorMetadata):
 _T = TypeVar("_T")
 
 
-def connector_option(vllm_config: "VllmConfig", key: str, default: _T) -> _T:
+def connector_option(
+    vllm_config: "VllmConfig", key: str, default: _T, *, takes: type | None = None
+) -> _T:
     """One of this connector's knobs, from ``--kv-transfer-config``.
 
     They live in ``kv_connector_extra_config`` rather than the environment
@@ -127,19 +129,26 @@ def connector_option(vllm_config: "VllmConfig", key: str, default: _T) -> _T:
     The type follows the default. That config arrives as JSON, so a bool and an
     int come through as themselves; anything else is a mistake worth naming
     here rather than coercing into a truthy string.
+
+    A knob whose absence means something none of its values can mean passes
+    ``None`` as the default and names its type in ``takes``, since the default
+    no longer carries one.
     """
     value = vllm_config.kv_transfer_config.get_from_extra_config(key, default)
+    if value is None and default is None:
+        return value
+    expected = takes or type(default)
     # `bool` is a subclass of `int`, so an int knob given `true` would pass an
     # isinstance check and then count as 1.
     wrong_type = (
         not isinstance(value, bool)
-        if isinstance(default, bool)
-        else isinstance(value, bool) or not isinstance(value, type(default))
+        if expected is bool
+        else isinstance(value, bool) or not isinstance(value, expected)
     )
     if wrong_type:
         raise RuntimeError(
             f"RBLN NIXL: kv_connector_extra_config[{key!r}] is "
-            f"{value!r}, but this knob takes a {type(default).__name__}"
+            f"{value!r}, but this knob takes a {expected.__name__}"
         )
     return value
 

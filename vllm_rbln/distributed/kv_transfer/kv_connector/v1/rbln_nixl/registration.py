@@ -68,6 +68,8 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
     #: Whether nixl-rbln is installed, so the RBLN backend can be asked for.
     _use_rbln_nixl_backend: bool
     _pending_kv_caches: dict[str, torch.Tensor] | None
+    #: None where nobody named one, which is not the same as a width of 0.
+    _stripe_width: int | None
 
     @property
     def _backend_extra(self) -> dict[str, int]:

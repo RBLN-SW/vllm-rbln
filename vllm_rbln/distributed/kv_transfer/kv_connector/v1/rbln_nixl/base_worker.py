@@ -124,8 +124,12 @@ class RblnNixlWorkerBase(
                 "handle upstream built, and a chunk range extends neither."
             )
 
-        self._stripe_width = (
-            vllm_config.kv_transfer_config.kv_connector_extra_config.get("stripe_width")
+        # 0 is "nobody named one": a stripe is a byte width, so no width is a
+        # width the adapter is never handed.
+        # 0 is a width the adapter takes, so it cannot stand for "nobody named
+        # one" -- this knob carries its absence instead.
+        self._stripe_width = connector_option(
+            vllm_config, "stripe_width", None, takes=int
         )
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
