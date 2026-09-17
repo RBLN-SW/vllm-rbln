@@ -3567,8 +3567,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         ),
                     )
                 )
-        # Synthetic mode feeds the graph one more input, which is a distinct
-        # compiled variant: warm up the one the real steps will actually ask for.
+        # Synthetic mode feeds one more input, i.e. a distinct compiled variant.
         for bonus_kwargs, sampling_metadata in variants:
             self.rejection_sampler.impl.rejection_sample(
                 draft_token_ids,
