@@ -93,48 +93,16 @@ class TestSchedulerInit:
         sched = create_rbln_scheduler(enable_prefix_caching=False)
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
-    def test_a_sub_block_below_the_chunk_needs_cr13(self, monkeypatch):
-        # Equal to the chunk runs anywhere; below it needs the multi-block
-        # store. Pinning the name keeps the answer off the runner's device.
-        from vllm_rbln import platform
-
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
-        )
-        sched = create_rbln_scheduler(
-            enable_prefix_caching=True,
-            block_size=1024,
-            max_num_batched_tokens=128,
-            max_model_len=2048,
-        )
-        assert sched.kv_cache_manager.sub_block_size == 128
-        with pytest.raises(ValueError, match="REBEL CR13"):
-            create_rbln_scheduler(
-                enable_prefix_caching=True,
-                block_size=1024,
-                max_num_batched_tokens=128,
-                max_model_len=2048,
-                sub_block_size=64,
-            )
-
-    def test_a_chunk_outside_the_block_bounds_is_rejected(self):
-        # The prefill's multi-block store addresses at most block start_blk+1,
-        # so a chunk may not exceed the block; nor a sub-block the chunk.
-        with pytest.raises(ValueError, match="requires block_size >="):
+    def test_the_scheduler_hands_its_own_geometry_to_the_rules(self):
+        # The rules themselves are covered on sub_block_size_in_use; this is
+        # the wiring, which a wrong block_size or chunk would silently pass.
+        with pytest.raises(ValueError, match="block_size >="):
             create_rbln_scheduler(
                 enable_prefix_caching=True,
                 block_size=16,
                 max_num_batched_tokens=128,
                 max_model_len=128,
                 sub_block_size=8,
-            )
-        with pytest.raises(ValueError, match="requires block_size >="):
-            create_rbln_scheduler(
-                enable_prefix_caching=True,
-                block_size=64,
-                max_num_batched_tokens=16,
-                max_model_len=128,
-                sub_block_size=32,
             )
 
     def test_equal_block_and_sub_block_size_disables(self):

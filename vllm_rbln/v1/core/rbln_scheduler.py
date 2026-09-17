@@ -19,7 +19,6 @@ from typing import Any
 
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
-from vllm.platforms import current_platform
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import init_none_hash
@@ -74,34 +73,12 @@ class RBLNScheduler(Scheduler):
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
+            block_size=self.block_size,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             kv_cache_config=self.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,
         )
         if sub_block_size is not None:
-            max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
-            if not (self.block_size >= max_num_batched_tokens >= sub_block_size):
-                raise ValueError(
-                    "RBLN sub-block prefix caching requires block_size >= "
-                    "max_num_batched_tokens >= sub_block_size, but got "
-                    f"block_size={self.block_size}, "
-                    f"max_num_batched_tokens={max_num_batched_tokens}, "
-                    f"sub_block_size={sub_block_size}. Set --max-num-batched-tokens "
-                    "to a value between sub_block_size and block_size (inclusive), "
-                    "or raise --block-size."
-                )
-            # Short-circuited on the equal case: a compile-only worker has no
-            # NPU to name, and only the decoupled one needs to know the device.
-            if sub_block_size != max_num_batched_tokens and not (
-                current_platform.is_cr13()
-            ):
-                raise ValueError(
-                    "A sub_block_size below max_num_batched_tokens makes a "
-                    "prefill chunk span two blocks, which needs the multi-block "
-                    "attention store that only REBEL CR13 carries; this is "
-                    f"{current_platform.get_device_name()}. Set sub_block_size "
-                    f"to {max_num_batched_tokens} or leave it at 0."
-                )
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
             init_none_hash(hash_fn)
 

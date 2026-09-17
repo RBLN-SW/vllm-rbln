@@ -878,7 +878,9 @@ class TestKvCopyStreamReserve:
     @staticmethod
     def _sizer(*, prefix_caching=True, sub_block_cache=True, sub_block_size=0):
         return SimpleNamespace(
-            cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+            cache_config=SimpleNamespace(
+                enable_prefix_caching=prefix_caching, block_size=1024
+            ),
             vllm_config=SimpleNamespace(
                 additional_config=SimpleNamespace(
                     enable_sub_block_cache=sub_block_cache,
@@ -907,7 +909,7 @@ class TestKvCopyStreamReserve:
             == dks.DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES
         )
 
-    def test_the_configured_size_reaches_the_eligibility_check(self, monkeypatch):
+    def test_the_configured_size_reaches_the_eligibility_check(self, monkeypatch, cr13):
         # Not the prefill chunk: RBLNConfig.sub_block_size decouples the two.
         seen: list[int] = []
 

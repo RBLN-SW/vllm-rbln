@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from vllm.platforms import current_platform
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -243,6 +245,7 @@ def sub_block_size_in_use(
     *,
     enable_prefix_caching: bool,
     sub_block_cache: bool,
+    block_size: int,
     max_num_batched_tokens: int,
     kv_cache_config: KVCacheConfig,
     sub_block_size: int = 0,
@@ -250,20 +253,46 @@ def sub_block_size_in_use(
     """The sub-block size prefix caching runs at (0 takes the prefill chunk),
     or None when the scheduler stays on vLLM's manager.
 
-    `sub_block_cache` off keeps the upstream manager; `RBLNConfig` rejects an
-    off flag that comes with a size, so off here means no size either.
+    Every rule on the sub-block configuration is here, so a caller gets a size
+    or a ValueError and never a setting that was dropped on the way.
     """
     # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
     from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 
-    if not sub_block_cache:
+    wanted = sub_block_size
+    if wanted < 0:
+        raise ValueError(f"sub_block_size={wanted} must be >= 0")
+    if not (sub_block_cache and enable_prefix_caching):
+        if wanted:
+            off = (
+                "enable_sub_block_cache"
+                if not sub_block_cache
+                else "enable_prefix_caching"
+            )
+            raise ValueError(
+                f"sub_block_size={wanted} asks for sub-block prefix caching and "
+                f"{off}=False turns it off."
+            )
         return None
-    sub_block_size = sub_block_size or max_num_batched_tokens
-    if not (
-        enable_prefix_caching
-        and RBLNKVCacheManager.can_use_sub_block_caching(
-            kv_cache_config, sub_block_size
-        )
+
+    sub_block_size = wanted or max_num_batched_tokens
+    if not RBLNKVCacheManager.can_use_sub_block_caching(
+        kv_cache_config, sub_block_size
     ):
         return None
+    if not block_size >= max_num_batched_tokens >= sub_block_size:
+        raise ValueError(
+            "sub-block prefix caching needs block_size >= max_num_batched_tokens "
+            f">= sub_block_size, got {block_size} >= {max_num_batched_tokens} >= "
+            f"{sub_block_size}."
+        )
+    # Left until last: the equal case never asks, so a compile-only worker with
+    # no NPU to name still starts on the default setting.
+    if sub_block_size != max_num_batched_tokens and not current_platform.is_cr13():
+        raise ValueError(
+            f"sub_block_size={sub_block_size} below max_num_batched_tokens="
+            f"{max_num_batched_tokens} makes a prefill chunk span two blocks, "
+            "which needs the multi-block store that only REBEL CR13 carries; "
+            f"this is {current_platform.get_device_name()}."
+        )
     return sub_block_size

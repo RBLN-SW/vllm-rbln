@@ -452,6 +452,7 @@ class DynamicKvSizer:
         in_use = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
+            block_size=self.cache_config.block_size,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             kv_cache_config=self.model_runner.kv_cache_config,
             sub_block_size=rbln_config.sub_block_size,

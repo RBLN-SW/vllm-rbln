@@ -83,10 +83,8 @@ class RBLNConfig:
 
     sub_block_size: int = 0
     """Sub-block size in tokens; 0 takes the prefill chunk
-    (`max_num_batched_tokens`). Giving one with `enable_sub_block_cache` off is
-    rejected. The scheduler requires
-    `block_size >= max_num_batched_tokens >= sub_block_size`, and anything below
-    the chunk runs on REBEL CR13 only."""
+    (`max_num_batched_tokens`). `sub_block_size_in_use()` holds the rules a
+    non-zero value has to meet."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
@@ -138,14 +136,6 @@ class RBLNConfig:
         return hash_factors(get_hash_factors(self, ignored_factors))
 
     def __post_init__(self) -> None:
-        if self.sub_block_size < 0:
-            raise ValueError("sub_block_size must be >= 0")
-        if self.sub_block_size and not self.enable_sub_block_cache:
-            raise ValueError(
-                f"sub_block_size={self.sub_block_size} asks for sub-block prefix "
-                "caching and enable_sub_block_cache=False turns it off. Drop "
-                "whichever one you did not mean."
-            )
         buckets = self.decode_batch_bucket_manual_buckets
         if any(b <= 0 for b in buckets):
             raise ValueError("decode_batch_bucket_manual_buckets must all be > 0")
