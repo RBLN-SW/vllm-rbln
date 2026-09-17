@@ -15,9 +15,6 @@
 import os
 import time
 
-os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "0"
-os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
-
 from vllm import LLM, SamplingParams
 
 # NOTE: This is just a running example. For benchmarking purpose,
@@ -69,7 +66,7 @@ def main():
         max_num_batched_tokens=1024,
         max_model_len=8192,
         max_num_seqs=3,
-        tensor_parallel_size=1,
+        tensor_parallel_size=4,
         enable_prefix_caching=False,
     )
 
@@ -95,7 +92,7 @@ def main():
 
     # Destroy the LLM object and free up the GPU memory.
     del regular_llm
-    # cleanup_dist_env_and_memory()
+    cleanup_dist_env_and_memory()
 
     # Create an LLM with prefix caching enabled.
     prefix_cached_llm = LLM(
@@ -104,12 +101,12 @@ def main():
         max_num_batched_tokens=1024,
         max_model_len=8192,
         max_num_seqs=3,
-        tensor_parallel_size=1,
+        tensor_parallel_size=4,
         enable_prefix_caching=True,
     )
 
     # Warmup so that the shared prompt's KV cache is computed.
-    # prefix_cached_llm.generate(generating_prompts[0], sampling_params)
+    prefix_cached_llm.generate(generating_prompts[0], sampling_params)
 
     # Generate with prefix caching.
     start_time = time.time()

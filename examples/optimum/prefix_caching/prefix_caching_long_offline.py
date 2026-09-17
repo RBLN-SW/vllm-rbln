@@ -246,12 +246,12 @@ def main():
         print("-" * 50)
 
     # Compare the results and display the speedup
-    # generated_same = all(
-    #     [
-    #         regular_generated_texts[i] == cached_generated_texts[i]
-    #         for i in range(len(prompts))
-    #     ]
-    # )
+    generated_same = all(
+        [
+            regular_generated_texts[i] == cached_generated_texts[i]
+            for i in range(len(prompts))
+        ]
+    )
     report_geometry("cache-hit geometry (with `enable_prefix_caching`)", outputs)
     # print(f"\nGenerated answers are the same: {generated_same}")
     print(f"Time without prefix caching: {wo_prefix_time:.3f} sec")
