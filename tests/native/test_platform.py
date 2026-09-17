@@ -29,13 +29,15 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm.config import CompilationMode, VllmConfig
-from vllm.engine.arg_utils import EngineArgs
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
 from tests.native.vllm_config import local_model_path
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.platform import (
+    RBLN_DEFAULT_GPU_MEMORY_UTILIZATION,
     RBLN_DEFAULT_MAX_NUM_SEQS,
     RblnPlatform,
 )
@@ -448,6 +450,27 @@ class TestSchedulerOverrides:
 
     def test_an_explicit_max_num_seqs_is_respected(self):
         assert _build(max_num_seqs=8).scheduler_config.max_num_seqs == 8
+
+
+class TestCacheOverrides:
+    def test_upstream_default_gpu_memory_utilization_takes_the_rbln_default(
+        self, configured
+    ):
+        assert (
+            configured.cache_config.gpu_memory_utilization
+            == RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
+        )
+
+    def test_an_explicit_gpu_memory_utilization_is_respected(self):
+        config = _build(gpu_memory_utilization=0.5)
+        assert config.cache_config.gpu_memory_utilization == 0.5
+
+    def test_serve_advertises_the_rbln_gpu_memory_utilization(self):
+        parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+        assert (
+            parser.get_default("gpu_memory_utilization")
+            == RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
+        )
 
 
 class TestEnforceEager:

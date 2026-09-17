@@ -52,6 +52,8 @@ USE_DEVICE_TENSOR: bool = (
 )
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
+# RBLN default for gpu_memory_utilization (upstream vLLM defaults to 0.92).
+RBLN_DEFAULT_GPU_MEMORY_UTILIZATION = 0.93
 # Superseded by RblnPlatform.device_control_env_var.
 DEPRECATED_DEVICE_CONTROL_ENV_VAR = "RBLN_DEVICES"
 
@@ -290,15 +292,30 @@ class RblnPlatform(Platform):
         for action in parser._actions:
             if action.dest == "device":
                 action.choices.append("rbln")
-
-        for action in parser._actions:
-            if action.dest == "block_size":
+            elif action.dest == "block_size":
                 action.choices = None  # Override choices
+            elif action.dest == "gpu_memory_utilization":
+                action.default = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             from vllm_rbln.config import add_rbln_cli_args
 
             add_rbln_cli_args(parser)
+
+    @classmethod
+    def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
+        """Default gpu_memory_utilization to RBLN_DEFAULT_GPU_MEMORY_UTILIZATION.
+
+        The field has no unset sentinel: EngineArgs and LLM.__init__ both bake
+        upstream's default in before any platform hook runs, so a value equal to
+        upstream's own default is the only sign that the user left it alone. An
+        explicit value equal to that default is therefore raised as well.
+        """
+        from vllm.config import CacheConfig
+
+        cache_config = vllm_config.cache_config
+        if cache_config.gpu_memory_utilization == CacheConfig.gpu_memory_utilization:
+            cache_config.gpu_memory_utilization = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
