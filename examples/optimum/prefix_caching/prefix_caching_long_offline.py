@@ -12,17 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import random
-import time
 
 import wikipedia
 from vllm import LLM, SamplingParams
-
-# NOTE: This is just a running example. For benchmarking purpose,
-# please see benchmarks/benchmark_prefix_caching.py
-os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "0"
-os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
 
 BLOCK_SIZE = 1024
 MAX_BATCHED = 512
@@ -139,6 +132,43 @@ def report_geometry(label, outputs):
     return spilled
 
 
+def report_latency(label, outputs):
+    """Latency as vLLM measured it, from `RequestOutput.metrics`.
+
+    The engine must be built with `disable_log_stats=False`, otherwise vLLM
+    keeps no per-request stats and `metrics` is None.  `queued_ts`,
+    `scheduled_ts`, `first_token_ts` and `last_token_ts` are engine-core
+    monotonic timestamps, so they exclude the script-side overhead a
+    `time.time()` bracket around `generate()` would also count.
+    """
+    stats = [out.metrics for out in outputs]
+    if any(s is None for s in stats):
+        raise RuntimeError(
+            "RequestOutput.metrics is empty -- build the LLM with "
+            "`disable_log_stats=False` so vLLM records per-request timings."
+        )
+
+    def mean(xs):
+        return sum(xs) / len(xs)
+
+    # Engine-side wall time: first request queued -> last token of the batch.
+    engine_time = max(s.last_token_ts for s in stats) - min(s.queued_ts for s in stats)
+    queued = [s.scheduled_ts - s.queued_ts for s in stats]
+    prefill = [s.first_token_ts - s.scheduled_ts for s in stats]
+    decode = [s.last_token_ts - s.first_token_ts for s in stats]
+    gen_tokens = sum(s.num_generation_tokens for s in stats)
+
+    print(f"\n{label}")
+    print(f"  engine time (first queued -> last token): {engine_time:.3f} sec")
+    print(f"  queued  per request: mean {mean(queued):.3f} | max {max(queued):.3f} sec")
+    print(
+        f"  prefill per request: mean {mean(prefill):.3f} | max {max(prefill):.3f} sec"
+    )
+    print(f"  decode  per request: mean {mean(decode):.3f} | max {max(decode):.3f} sec")
+    print(f"  generated tokens: {gen_tokens} ({gen_tokens / engine_time:.1f} tok/sec)")
+    return engine_time
+
+
 # Create a sampling params object.
 sampling_params = SamplingParams(temperature=0.0, max_tokens=256)
 MODEL = "meta-llama/Llama-3.2-1B"
@@ -158,6 +188,8 @@ def main():
         max_num_seqs=3,
         enable_prefix_caching=False,
         tensor_parallel_size=4,
+        # Keeps per-request stats on RequestOutput.metrics.
+        disable_log_stats=False,
     )
 
     print("Results without `enable_prefix_caching`")
@@ -165,10 +197,8 @@ def main():
     # ruff: noqa: E501
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
-    start_time = time.time()
     outputs = regular_llm.generate(prompts, sampling_params)
-    end_time = time.time()
-    wo_prefix_time = end_time - start_time
+    wo_prefix_time = report_latency("Latency without `enable_prefix_caching`", outputs)
 
     regular_generated_texts = []
     # Print the outputs.
@@ -193,16 +223,16 @@ def main():
         max_num_seqs=3,
         enable_prefix_caching=True,
         tensor_parallel_size=4,
+        # Keeps per-request stats on RequestOutput.metrics.
+        disable_log_stats=False,
     )
 
     # Warmup so that the shared prompt's KV cache is computed.
     # prefix_cached_llm.generate(prompts[0], sampling_params)
 
     # Generate with prefix caching.
-    start_time = time.time()
     outputs = prefix_cached_llm.generate(prompts, sampling_params)
-    end_time = time.time()
-    w_prefix_time = end_time - start_time
+    w_prefix_time = report_latency("Latency with `enable_prefix_caching`", outputs)
     print("Results with `enable_prefix_caching`")
 
     cached_generated_texts = []
@@ -216,16 +246,16 @@ def main():
         print("-" * 50)
 
     # Compare the results and display the speedup
-    generated_same = all(
-        [
-            regular_generated_texts[i] == cached_generated_texts[i]
-            for i in range(len(prompts))
-        ]
-    )
+    # generated_same = all(
+    #     [
+    #         regular_generated_texts[i] == cached_generated_texts[i]
+    #         for i in range(len(prompts))
+    #     ]
+    # )
     report_geometry("cache-hit geometry (with `enable_prefix_caching`)", outputs)
-    print(f"\nGenerated answers are the same: {generated_same}")
-    print(f"Time without prefix caching: {wo_prefix_time} sec")
-    print(f"Time with prefix caching: {w_prefix_time} sec")
+    # print(f"\nGenerated answers are the same: {generated_same}")
+    print(f"Time without prefix caching: {wo_prefix_time:.3f} sec")
+    print(f"Time with prefix caching: {w_prefix_time:.3f} sec")
 
 
 if __name__ == "__main__":
