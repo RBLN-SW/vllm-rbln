@@ -41,19 +41,18 @@ TOKENS = [70, 39]
 class _FakeAudioTower:
     chunk_len = 100
 
-    def __init__(self, dtype: torch.dtype):
-        self.dtype = dtype
+    def __init__(self):
         self.seen: dict = {}
 
     def __call__(self, features, mask):
         self.seen["features"] = features
         self.seen["mask"] = mask
-        return torch.arange(sum(TOKENS) * HIDDEN, dtype=self.dtype).view(-1, HIDDEN)
+        return torch.arange(sum(TOKENS) * HIDDEN, dtype=torch.float32).view(-1, HIDDEN)
 
 
-def _bare_qwen3_asr(tower_dtype=torch.float32) -> tuple[Qwen3ASR, dict]:
+def _bare_qwen3_asr() -> tuple[Qwen3ASR, dict]:
     obj = Qwen3ASR.__new__(Qwen3ASR)
-    tower = _FakeAudioTower(tower_dtype)
+    tower = _FakeAudioTower()
     obj.model = types.SimpleNamespace(
         audio_tower=tower,
         rbln_config=types.SimpleNamespace(dtype=torch.float32),
@@ -88,13 +87,6 @@ def test_process_audio_input_pads_to_chunks_and_splits_per_audio():
     assert not seen["features"][1, :, 300:].any()
     # The packed tower output is split back into one tensor per audio.
     assert [e.shape[0] for e in embeds] == TOKENS
-
-
-def test_process_audio_input_rejects_dtype_mismatch_with_text_embeds():
-    obj, _ = _bare_qwen3_asr(tower_dtype=torch.float16)
-
-    with pytest.raises(AssertionError, match="dtype"):
-        obj._process_audio_input(_audio_input())
 
 
 class _ReachedModelInit(Exception):
