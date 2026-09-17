@@ -79,8 +79,12 @@ class RBLNConfig:
     """Use the custom RBLN kernels."""
 
     enable_sub_block_cache: bool = True
-    """Enable sub-block prefix caching. The sub-block size equals
-    max_num_batched_tokens (the prefill chunk size)."""
+    """Enable sub-block prefix caching, at `sub_block_size` granularity."""
+
+    sub_block_size: int = 0
+    """Sub-block size in tokens; 0 takes the prefill chunk
+    (`max_num_batched_tokens`). The scheduler requires
+    `block_size >= max_num_batched_tokens >= sub_block_size`."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
@@ -127,10 +131,13 @@ class RBLNConfig:
             # the bundle. Sub-block caching changes what runs, not what is built.
             "use_custom_sampler",
             "enable_sub_block_cache",
+            "sub_block_size",
         }
         return hash_factors(get_hash_factors(self, ignored_factors))
 
     def __post_init__(self) -> None:
+        if self.sub_block_size < 0:
+            raise ValueError("sub_block_size must be >= 0")
         buckets = self.decode_batch_bucket_manual_buckets
         if any(b <= 0 for b in buckets):
             raise ValueError("decode_batch_bucket_manual_buckets must all be > 0")

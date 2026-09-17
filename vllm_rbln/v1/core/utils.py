@@ -27,8 +27,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from vllm_rbln import envs
-
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -247,15 +245,15 @@ def sub_block_size_in_use(
     sub_block_cache: bool,
     max_num_batched_tokens: int,
     kv_cache_config: KVCacheConfig,
-    sub_block_size: int | None = None,
+    sub_block_size: int = 0,
 ) -> int | None:
-    """The sub-block size prefix caching runs at (default: the prefill chunk),
+    """The sub-block size prefix caching runs at (0 takes the prefill chunk),
     or None when the scheduler stays on vLLM's manager."""
     # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
     from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 
-    if sub_block_size is None and sub_block_cache:
-        sub_block_size = envs.VLLM_RBLN_SUB_BLOCK_SIZE or max_num_batched_tokens
+    if not sub_block_size and sub_block_cache:
+        sub_block_size = max_num_batched_tokens
     if not (
         enable_prefix_caching
         and sub_block_size

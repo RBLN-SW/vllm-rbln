@@ -44,7 +44,11 @@ class TestSchedulerInit:
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
         # prefix caching + eligible config + sub_block_size -> RBLNKVCacheManager.
         sched = create_rbln_scheduler(
-            enable_prefix_caching=True, block_size=16, sub_block_size=8
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
+            sub_block_size=8,
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
@@ -59,6 +63,17 @@ class TestSchedulerInit:
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
+
+    def test_additional_config_sets_the_sub_block_size(self):
+        # RBLNConfig.sub_block_size decouples the sub-block from the chunk.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"sub_block_size": 64},
+        )
+        assert sched.kv_cache_manager.sub_block_size == 64
 
     def test_additional_config_turns_sub_block_caching_off(self):
         # Eligible otherwise, so the plain manager is the option's doing.
@@ -75,6 +90,26 @@ class TestSchedulerInit:
         # prefix caching off -> plain KVCacheManager.
         sched = create_rbln_scheduler(enable_prefix_caching=False)
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+    def test_a_chunk_outside_the_block_bounds_is_rejected(self):
+        # The prefill's multi-block store addresses at most block start_blk+1,
+        # so a chunk may not exceed the block; nor a sub-block the chunk.
+        with pytest.raises(ValueError, match="requires block_size >="):
+            create_rbln_scheduler(
+                enable_prefix_caching=True,
+                block_size=16,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                sub_block_size=8,
+            )
+        with pytest.raises(ValueError, match="requires block_size >="):
+            create_rbln_scheduler(
+                enable_prefix_caching=True,
+                block_size=64,
+                max_num_batched_tokens=16,
+                max_model_len=128,
+                sub_block_size=32,
+            )
 
     def test_equal_block_and_sub_block_size_disables(self):
         # sub_block_size == block_size is ineligible -> plain manager.
@@ -147,7 +182,11 @@ class TestUpdateFromOutput:
         # With the RBLN manager, update_from_output runs sub-block indexing so
         # the full block's sub-blocks land in the index.
         sched = create_rbln_scheduler(
-            enable_prefix_caching=True, block_size=16, sub_block_size=8
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
+            sub_block_size=8,
         )
         req = create_requests(1, num_tokens=16, block_size=16)[0]
         sched.add_request(req)
@@ -176,7 +215,8 @@ class TestTrySubBlockMatch:
             enable_prefix_caching=True,
             block_size=16,
             sub_block_size=8,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
+            max_model_len=128,
         )
         m = sched.kv_cache_manager
         seed = make_request("seed", list(range(16)), 16)
@@ -1071,7 +1111,8 @@ class TestSpecDecodeRetroactiveTrim:
             block_size=16,
             sub_block_size=8,
             num_speculative_tokens=4,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
+            max_model_len=128,
             num_blocks=10000,
         )
         req0 = make_request("0", list(range(16)), 16, max_tokens=50)
@@ -1356,17 +1397,20 @@ class TestDeferredBlockFree:
             enable_prefix_caching=True,
             block_size=16,
             sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
             pipeline_parallel_size=2,
             use_kv_connector=MockKVConfig(),
         )
         manager = sched.kv_cache_manager
-        # 24 tokens over a 16-token block with 8-token sub-blocks: one full block
-        # plus an 8-token partial. Ordinary caching hashes the full block only, so
-        # the partial one's hash can come from nothing but this path -- a multiple
-        # of the block size would leave no partial block at all and the assert
-        # below would hold either way.
+        # 24 tokens over a 16-token block with 8-token sub-blocks, prefilled in
+        # two chunks: one full block plus an 8-token partial. Ordinary caching
+        # hashes the full block only, so the partial one's hash can come from
+        # nothing but this path -- a multiple of the block size would leave no
+        # partial block at all and the assert below would hold either way.
         request = create_requests(1, num_tokens=24)[0]
         sched.add_request(request)
+        sched.schedule()
         sched.schedule()
         partial_block = manager.coordinator.get_blocks(request.request_id)[0][-1]
 

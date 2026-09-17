@@ -329,9 +329,6 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
-    # Explicit sub-block size in tokens (0 = auto = max_num_batched_tokens).
-    # A positive value smaller than max_num_batched_tokens needs the multi-block
-    # attention store; see the field comment above.
     "VLLM_RBLN_SUB_BLOCK_SIZE": lambda: int(
         os.environ.get("VLLM_RBLN_SUB_BLOCK_SIZE", 0)
     ),

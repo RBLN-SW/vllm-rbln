@@ -145,7 +145,7 @@ def create_rbln_scheduler(
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
     pipeline_parallel_size: int = 1,
-    sub_block_size: int | None = None,
+    sub_block_size: int = 0,
     policy: str = "fcfs",
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
@@ -196,7 +196,10 @@ def create_rbln_scheduler(
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
-        additional_config=additional_config or {},
+        additional_config={
+            "sub_block_size": sub_block_size,
+            **(additional_config or {}),
+        },
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -211,7 +214,6 @@ def create_rbln_scheduler(
         block_size=block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
-        sub_block_size=sub_block_size,
     )
 
 

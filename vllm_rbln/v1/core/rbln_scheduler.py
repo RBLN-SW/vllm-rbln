@@ -63,12 +63,7 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 
 class RBLNScheduler(Scheduler):
-    def __init__(
-        self,
-        *args,
-        sub_block_size: int | None = None,
-        **kwargs,
-    ) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
@@ -80,7 +75,7 @@ class RBLNScheduler(Scheduler):
             sub_block_cache=rbln_config.enable_sub_block_cache,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             kv_cache_config=self.kv_cache_config,
-            sub_block_size=sub_block_size,
+            sub_block_size=rbln_config.sub_block_size,
         )
         if sub_block_size is not None:
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens

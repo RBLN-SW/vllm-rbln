@@ -29,12 +29,18 @@ if the KV cache tensor has a token dimension that can be sliced for partial copy
 
 ## Configuration
 
-| Environment variable | Default | Description |
-|---|---|---|
-| `VLLM_RBLN_SUB_BLOCK_CACHE` | `true` | Enable sub-block prefix caching. |
+Both options are `RBLNConfig` fields,
+so each takes a `--rbln-*` flag, an `additional_config` key, or the environment variable.
 
-The `sub_block_size` is automatically set to prefill chunk size (`max_num_batched_tokens`)
-so that each prefill does not span multiple blocks.
+| Field | Flag | Environment variable | Default | Description |
+|---|---|---|---|---|
+| `enable_sub_block_cache` | `--rbln-enable-sub-block-cache` | `VLLM_RBLN_SUB_BLOCK_CACHE` | `true` | Enable sub-block prefix caching. |
+| `sub_block_size` | `--rbln-sub-block-size` | `VLLM_RBLN_SUB_BLOCK_SIZE` | `0` | Sub-block size in tokens; `0` takes the prefill chunk. |
+
+Left at `0`, the sub-block size is the prefill chunk size (`max_num_batched_tokens`),
+so each prefill does not span multiple blocks.
+A smaller value decouples the two, and the scheduler then requires
+`block_size >= max_num_batched_tokens >= sub_block_size`.
 
 For cross-engine prefix-aware routing (e.g., llm-d):
 enable KV events via `--kv-events-config` in vLLM and

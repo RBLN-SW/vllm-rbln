@@ -40,7 +40,8 @@ class TestScheduleSubBlockCopyOps:
             enable_prefix_caching=True,
             block_size=16,
             sub_block_size=8,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
+            max_model_len=128,
             num_blocks=10000,
         )
         # req0 prefills a full block; update runs do_pending_indexing so its
@@ -79,7 +80,8 @@ class TestScheduleSubBlockCopyOps:
             enable_prefix_caching=True,
             block_size=16,
             sub_block_size=8,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
+            max_model_len=128,
             num_blocks=10000,
         )
         req = make_request("0", list(range(16)), 16)
@@ -97,7 +99,7 @@ class TestSubBlockVersusKVConnector:
         return create_rbln_scheduler(
             block_size=BLOCK_SIZE,
             num_blocks=100,
-            max_num_batched_tokens=self.MAX_LEN,
+            max_num_batched_tokens=BLOCK_SIZE,
             max_model_len=self.MAX_LEN,
             enable_prefix_caching=True,
             sub_block_size=SUB_BLOCK_SIZE,
@@ -155,7 +157,7 @@ class TestSubBlockVersusKVConnector:
         sched = self._scheduler(matched_tokens=BLOCK_SIZE)
         self._cache_one_block(sched, [0] * BLOCK_SIZE)
 
-        tokens = [0] * SUB_BLOCK_SIZE + [900 + i for i in range(2 * BLOCK_SIZE)]
+        tokens = [0] * SUB_BLOCK_SIZE + [900 + i for i in range(BLOCK_SIZE)]
         out = self._schedule_query(sched, tokens, remote_prefill=True)
 
         assert out.kv_cache_copy_ops == []
@@ -214,7 +216,8 @@ class TestSubBlockPrefixHitRun:
             enable_prefix_caching=True,
             block_size=16,
             sub_block_size=8,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
+            max_model_len=128,
             num_blocks=10000,
         )
         req0 = make_request("0", list(range(16)), 16, max_tokens=3)
@@ -248,7 +251,8 @@ class TestSubBlockIndexingUnderAsyncScheduling:
             enable_prefix_caching=True,
             block_size=16,
             sub_block_size=8,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
+            max_model_len=128,
             num_blocks=10000,
             async_scheduling=async_scheduling,
         )

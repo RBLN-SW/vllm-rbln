@@ -876,12 +876,13 @@ class TestKvCopyStreamReserve:
     """The reserve follows the scheduler's own sub-block prefix caching predicate."""
 
     @staticmethod
-    def _sizer(*, prefix_caching=True, sub_block_cache=True):
+    def _sizer(*, prefix_caching=True, sub_block_cache=True, sub_block_size=0):
         return SimpleNamespace(
             cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
             vllm_config=SimpleNamespace(
                 additional_config=SimpleNamespace(
-                    enable_sub_block_cache=sub_block_cache
+                    enable_sub_block_cache=sub_block_cache,
+                    sub_block_size=sub_block_size,
                 )
             ),
             scheduler_config=SimpleNamespace(max_num_batched_tokens=512),
@@ -905,6 +906,24 @@ class TestKvCopyStreamReserve:
             DynamicKvSizer.copy_stream_reserve_bytes(self._sizer())
             == dks.DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES
         )
+
+    def test_the_configured_size_reaches_the_eligibility_check(self, monkeypatch):
+        # Not the prefill chunk: RBLNConfig.sub_block_size decouples the two.
+        seen: list[int] = []
+
+        def can_use(cfg, sub_block_size):
+            seen.append(sub_block_size)
+            return True
+
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm_rbln.v1.core.rbln_kv_cache_manager",
+            SimpleNamespace(
+                RBLNKVCacheManager=SimpleNamespace(can_use_sub_block_caching=can_use)
+            ),
+        )
+        DynamicKvSizer.copy_stream_reserve_bytes(self._sizer(sub_block_size=64))
+        assert seen == [64]
 
     def test_nothing_without_prefix_caching(self, monkeypatch):
         self._manager(monkeypatch, eligible=True)

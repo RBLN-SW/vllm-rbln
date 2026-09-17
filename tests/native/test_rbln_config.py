@@ -179,6 +179,8 @@ def test_invalid_value_is_rejected():
         build_rbln_config({"decode_batch_bucket_strategy": "garbage"})
     with pytest.raises(ValueError):
         build_rbln_config({"use_w8a8": "junk"})
+    with pytest.raises(ValueError, match="sub_block_size"):
+        build_rbln_config({"sub_block_size": -1})
 
 
 def test_no_field_is_read_from_the_environment():
@@ -218,6 +220,7 @@ def test_only_compile_fields_change_the_hash():
     base = RBLNConfig().compute_hash()
     assert RBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert RBLNConfig(enable_sub_block_cache=False).compute_hash() == base
+    assert RBLNConfig(sub_block_size=64).compute_hash() == base
     assert RBLNConfig(use_w8a8=True).compute_hash() != base
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
