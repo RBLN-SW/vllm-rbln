@@ -67,6 +67,12 @@ def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
 register_backend(name="bypass", compiler_fn=bypass_backend)
 
 
+# The path this process runs, assigned by `_apply_model_impl`: from the
+# environment at import, and from the arguments once they name it. Not read back
+# off the environment, which carries what this process hands its children.
+_MODEL_IMPL: "ModelImpl" = "optimum"
+
+
 def _impl():
     """The module owning the selected model path.
 
@@ -74,7 +80,7 @@ def _impl():
     their own import time, and one branch at a time so that neither path
     imports the other's module.
     """
-    if envs.model_impl_from_env() == "vllm":
+    if _MODEL_IMPL == "vllm":
         from vllm_rbln.platform import vllm_impl
 
         return vllm_impl
@@ -459,8 +465,9 @@ def _apply_model_impl(model_impl: "ModelImpl", *, publish: bool = True) -> None:
     a guess while the deprecated variable still selects the path, and
     `register_ops` reads the variable as proof that someone resolved it.
     """
-    global USE_DEVICE_TENSOR
+    global USE_DEVICE_TENSOR, _MODEL_IMPL
 
+    _MODEL_IMPL = model_impl
     if publish:
         os.environ[envs.RESOLVED_MODEL_IMPL_ENV] = model_impl
     USE_DEVICE_TENSOR = model_impl == "vllm" and envs.VLLM_RBLN_USE_DEVICE_TENSOR

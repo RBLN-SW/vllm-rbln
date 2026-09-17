@@ -1014,6 +1014,34 @@ class TestModelImpl:
         assert config.additional_config.model_impl == "vllm"
         assert config.additional_config.use_w8a8 is True
 
+    def test_a_second_engine_does_not_take_the_first_one_s_path(self, monkeypatch):
+        """The published path is for the processes this one spawns.
+
+        Read back here it would let the first engine decide for every one after
+        it, and `LLM(...)` built with no path of its own would run on that one
+        instead of the default. Both engines are resolved in this process, which
+        is where two `LLM(...)` calls in one script build their configs.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: None)
+        monkeypatch.setattr(
+            EngineArgs, "_rbln_model_impl_patched", False, raising=False
+        )
+        monkeypatch.setattr(platform.envs, "INHERITED_MODEL_IMPL", None)
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        RblnPlatform._capture_model_impl()
+
+        first = SimpleNamespace(
+            max_num_batched_tokens=None, additional_config={"model_impl": "vllm"}
+        )
+        EngineArgs.create_engine_config(first)
+        second = SimpleNamespace(max_num_batched_tokens=None, additional_config=None)
+        EngineArgs.create_engine_config(second)
+
+        assert first.additional_config["model_impl"] == "vllm"
+        assert second.additional_config["model_impl"] == "optimum"
+
     def test_a_bare_string_additional_config_is_left_to_upstream(self):
         """`_MergeAdditionalConfig` keeps the bare string the CLI action takes,
         and `VllmConfig`, which types the field, is what refuses it. Merging the

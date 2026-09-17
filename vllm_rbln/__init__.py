@@ -37,8 +37,6 @@ def register_model():
 
 
 def register_ops():
-    import os
-
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
     from vllm_rbln import envs
     from vllm_rbln.platform import RblnPlatform
@@ -49,11 +47,11 @@ def register_ops():
     RblnPlatform._capture_model_impl()
 
     # Only the path a parent already resolved can be acted on here: this runs
-    # before the arguments are parsed, so in the process that parses them the
-    # variable is unset and the platform hook applies the same set afterwards.
-    # Not `model_impl_from_env()`, which answers there too, from the deprecated
-    # variable: a patch applied on that guess outlives a flag that disagrees.
-    if os.environ.get(envs.RESOLVED_MODEL_IMPL_ENV) == "vllm":
+    # before the arguments are parsed, so in the process that parses them there
+    # is none, and the platform hook applies the same set afterwards. A patch
+    # applied on what the deprecated variable guesses would outlive a flag that
+    # disagrees with it.
+    if envs.INHERITED_MODEL_IMPL == "vllm":
         from vllm_rbln.patches import apply_registered_patches, apply_registrations
 
         apply_registrations()
