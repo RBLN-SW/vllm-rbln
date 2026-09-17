@@ -181,6 +181,10 @@ def test_invalid_value_is_rejected():
         build_rbln_config({"use_w8a8": "junk"})
     with pytest.raises(ValueError, match="sub_block_size"):
         build_rbln_config({"sub_block_size": -1})
+    # A size asks for the path and the off flag denies it; neither may win
+    # silently.
+    with pytest.raises(ValueError, match="enable_sub_block_cache"):
+        build_rbln_config({"enable_sub_block_cache": False, "sub_block_size": 64})
 
 
 def test_no_field_is_read_from_the_environment():

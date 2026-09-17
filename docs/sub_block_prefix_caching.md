@@ -37,8 +37,9 @@ so each takes a `--rbln-*` flag, an `additional_config` key, or the environment 
 | `enable_sub_block_cache` | `--rbln-enable-sub-block-cache` | `VLLM_RBLN_SUB_BLOCK_CACHE` | `true` | Enable sub-block prefix caching. |
 | `sub_block_size` | `--rbln-sub-block-size` | `VLLM_RBLN_SUB_BLOCK_SIZE` | `0` | Sub-block size in tokens; `0` takes the prefill chunk. |
 
-`enable_sub_block_cache` decides whether the path runs at all:
-left off, the scheduler keeps the upstream manager whatever `sub_block_size` says.
+`enable_sub_block_cache` decides whether the path runs at all.
+Turning it off while giving a `sub_block_size` is rejected,
+since the two ask for opposite things.
 
 Left at `0`, the sub-block size is the prefill chunk size (`max_num_batched_tokens`),
 so each prefill does not span multiple blocks.

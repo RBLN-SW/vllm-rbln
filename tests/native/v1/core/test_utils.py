@@ -194,11 +194,10 @@ class TestSubBlockSizeInUse:
         eligible(True)
         assert self._call(enable_prefix_caching=False) is None
 
-    def test_the_flag_is_a_kill_switch(self, eligible):
-        # Off is off, whether or not a size came with it.
+    def test_none_when_the_flag_is_off(self, eligible):
+        # RBLNConfig rejects an off flag carrying a size, so off means no size.
         eligible(True)
         assert self._call(sub_block_cache=False) is None
-        assert self._call(sub_block_cache=False, sub_block_size=128) is None
 
     def test_none_when_the_config_is_ineligible(self, eligible):
         eligible(False)
