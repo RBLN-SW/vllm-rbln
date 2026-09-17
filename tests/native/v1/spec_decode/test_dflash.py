@@ -34,6 +34,7 @@ import pytest
 import torch
 
 import vllm_rbln.v1.spec_decode.dflash as dflash_module
+from tests.native.v1.spec_decode.utils import make_cad
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 
@@ -123,20 +124,6 @@ class TestDraftBlockMask:
         assert mask[2:].sum() == 0
 
 
-class TestQueryBlockSpan:
-    @staticmethod
-    def _last_page(seq_lens):
-        lens = torch.tensor(seq_lens, dtype=torch.int64)
-        return ((lens + QUERY_LEN - 1) // BLOCK_SIZE).to(torch.int64)
-
-    def test_a_block_inside_a_page_ends_on_that_page(self):
-        assert self._last_page([0, 5, BLOCK_SIZE - QUERY_LEN]).tolist() == [0, 0, 0]
-
-    def test_a_block_past_the_page_end_reaches_the_next_page(self):
-        assert self._last_page([BLOCK_SIZE - 1]).tolist() == [1]
-        assert self._last_page([BLOCK_SIZE - QUERY_LEN + 1]).tolist() == [1]
-
-
 class TestContextWriteContiguity:
     """A strided copy pair is staged through host memory, and that staging
     buffer's recycled address is what faulted mid-run. Both sides have to be
@@ -196,32 +183,64 @@ class TestSingleSequenceGuard:
             )
 
 
-class TestSpanUnallocated:
-    @staticmethod
-    def _call(table, last_page):
-        return RBLNDFlashProposer._span_unallocated(
-            torch.tensor(table, dtype=torch.int32),
-            torch.tensor(last_page, dtype=torch.int64),
+class TestSpanningBlockAllocation:
+    SPANS = BLOCK_SIZE - 1  # a block starting here leaves its page; 0 does not
+
+    def _run(self, table, ctx_lens):
+        """Drive the real `_run_query_pass`; it raises once past the check."""
+        n = len(ctx_lens)
+
+        def reached(*args, **kwargs):
+            raise RuntimeError("reached the draft pass")
+
+        proposer = SimpleNamespace(
+            arange_cpu=torch.arange(n + 1, dtype=torch.int32),
+            dflash_causal=False,
+            block_size=BLOCK_SIZE,
+            positions=torch.zeros(n * QUERY_LEN, dtype=torch.int64),
+            _dropped_rows=None,
+            _build_draft_attn_metadata=reached,
         )
+        cad = make_cad(
+            [i * QUERY_LEN for i in range(n + 1)], [c + QUERY_LEN for c in ctx_lens]
+        )
+        cad.block_table_tensor = torch.tensor(table, dtype=torch.int32)
+        RBLNDFlashProposer._run_query_pass(
+            proposer,
+            cad,
+            n,
+            QUERY_LEN,
+            n * QUERY_LEN,
+            torch.tensor(ctx_lens, dtype=torch.int32),
+            torch.zeros(n, dtype=torch.int32),
+        )
+        return proposer
 
-    def test_an_allocated_last_page_is_accepted(self):
-        # page 1 holds block 6, so the spanning write has somewhere to land.
-        assert not self._call([[71, 6, 0, 0]], [1])
+    @pytest.mark.parametrize(
+        "table, ctx_lens",
+        [
+            ([[71, 0, 0, 0]], [0]),
+            ([[71, 6, 0, 0]], [SPANS]),
+        ],
+        ids=["stays_on_its_page", "next_page_allocated"],
+    )
+    def test_a_step_proceeds_when_the_page_it_ends_on_is_allocated(
+        self, table, ctx_lens
+    ):
+        with pytest.raises(RuntimeError, match="reached the draft pass"):
+            self._run(table, ctx_lens)
 
-    def test_an_unfilled_last_page_is_refused(self):
-        """Inside the table, but the allocator never filled it."""
-        assert self._call([[71, 0, 0, 0]], [1])
-
-    def test_past_the_table_is_refused(self):
-        """The context ceiling -- no page exists at all."""
-        assert self._call([[71, 6]], [2])
-
-    def test_a_block_that_stays_on_its_page_is_accepted(self):
-        assert not self._call([[71, 0, 0, 0]], [0])
-
-    def test_any_unallocated_row_refuses_the_whole_step(self):
-        # One row is enough: the step is given up for the batch.
-        assert self._call([[71, 6, 0, 0], [80, 0, 0, 0]], [1, 1])
+    @pytest.mark.parametrize(
+        "table, ctx_lens",
+        [
+            ([[71, 0, 0, 0]], [SPANS]),
+            ([[71, 6]], [2 * BLOCK_SIZE - 1]),
+            ([[71, 6, 0, 0], [80, 0, 0, 0]], [SPANS, SPANS]),
+        ],
+        ids=["unfilled", "past_the_table", "one_bad_row_of_two"],
+    )
+    def test_a_step_gives_up_when_it_is_not(self, table, ctx_lens):
+        assert bool(self._run(table, ctx_lens)._dropped_rows.all())
 
 
 class TestPlatformRefusals:
