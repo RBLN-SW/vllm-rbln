@@ -46,12 +46,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     TPMapping,
     compute_tp_mapping,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    get_representative_spec_type,
+    zmq_ctx,
+)
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    FullAttentionSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -137,7 +141,27 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
-        super().__init__(vllm_config, engine_id, kv_cache_config)
+        # Upstream's PP>1 refusal reads "not FullAttentionSpec" as "the region
+        # count varies per layer", misjudging one merged group of full
+        # attention specs: uniform per layer, yet not a FullAttentionSpec.
+        # Mamba and sliding window merge the same way and do vary, so suppress
+        # for that shape alone. TODO: drop once upstream tests uniformity.
+        groups = kv_cache_config.kv_cache_groups
+        group_spec = groups[0].kv_cache_spec if len(groups) == 1 else None
+        suppress = isinstance(group_spec, UniformTypeKVCacheSpecs) and issubclass(
+            get_representative_spec_type(group_spec), FullAttentionSpec
+        )
+        scheduler_config = vllm_config.scheduler_config
+        hma_disabled = scheduler_config.disable_hybrid_kv_cache_manager
+        scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled or suppress
+        try:
+            super().__init__(vllm_config, engine_id, kv_cache_config)
+        finally:
+            scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
+        if suppress:
+            # What upstream would have computed: `any()` over the one group is
+            # True, since UniformTypeKVCacheSpecs is not a FullAttentionSpec.
+            self._is_hma_required = not hma_disabled
 
         # nixl-rbln present -> RBLN backend (host-bounce DRAM_SEG / D2D VRAM_SEG);
         # absent -> upstream UCX/DRAM defaults, and D2D (kv_buffer_device="rbln")

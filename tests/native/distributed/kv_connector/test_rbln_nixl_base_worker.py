@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, SchedulerConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
 from vllm.v1.kv_cache_interface import (
@@ -46,6 +46,20 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker imp
 )
 
 
+def _merged_uniform_spec(inner):
+    """One group of same-type-but-not-identical layers, which is what
+    `get_kv_cache_groups` merges an MLA model with a sparse indexer into."""
+    return UniformTypeKVCacheSpecs(
+        block_size=inner.block_size, kv_cache_specs={"layer.0": inner}
+    )
+
+
+def _full_attention_spec(block_size=64):
+    return FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
+
+
 def _sliding_window_spec(*, block_size, sliding_window):
     spec = MagicMock(spec=SlidingWindowSpec)
     spec.block_size = block_size
@@ -64,6 +78,8 @@ def _build_worker(
     swa_view_opt=False,
     use_mla=False,
     stripe_width=None,
+    pp_size=1,
+    hma_disabled=False,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -72,6 +88,13 @@ def _build_worker(
     monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_SWA_VIEW_OPT", swa_view_opt)
 
     def fake_super_init(self, vllm_config, engine_id, kv_cache_config):
+        # Upstream reads `disable_hybrid_kv_cache_manager` once in its own
+        # __init__, for its PP refusal and for `_is_hma_required`. Record what
+        # it was shown rather than restating its condition here, and leave
+        # `_is_hma_required` unset so only the override can produce it.
+        self.hma_flag_seen_by_upstream_init = (
+            vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        )
         self.vllm_config = vllm_config
         self.engine_id = engine_id
         self.kv_cache_config = kv_cache_config
@@ -100,15 +123,107 @@ def _build_worker(
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # No speculative decoding: the compat hash then folds what it always did.
     vllm_config.speculative_config = None
-    # _check_pp_constraints compares pipeline_parallel_size <= 1; give it a real
-    # int (a MagicMock would raise TypeError). 1 == the non-PP default here.
-    vllm_config.parallel_config.pipeline_parallel_size = 1
+    # _check_pp_constraints compares pipeline_parallel_size <= 1; a MagicMock
+    # would raise TypeError there, so give it a real int.
+    vllm_config.parallel_config.pipeline_parallel_size = pp_size
+    # Real, so that renaming the flag the override suppresses fails here rather
+    # than being absorbed. `VllmConfig.__post_init__` resolves it before a
+    # worker is built, so a bool is what production sees.
+    vllm_config.scheduler_config = SchedulerConfig(
+        is_encoder_decoder=False, max_model_len=128
+    )
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     kv_cache_config.kv_cache_groups = [
         MagicMock(kv_cache_spec=spec) for spec in (specs or [])
     ]
     return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+
+
+class TestHmaRefusalSuppression:
+    """The override suppresses the hybrid-KV-manager flag across
+    `super().__init__()` for one merged group of full attention specs, and
+    puts it back. These build that layout and the ones it must leave alone.
+    """
+
+    @staticmethod
+    def _pp_worker(monkeypatch, specs, **kwargs):
+        return _build_worker(monkeypatch, specs=specs, pp_size=4, **kwargs)
+
+    def test_the_flag_is_off_while_upstream_looks_at_it(self, monkeypatch):
+        # The refusal reads the flag inside `super().__init__()`, so that call
+        # is the only point where the suppression is observable at all.
+        specs = [_merged_uniform_spec(_full_attention_spec())]
+        worker = self._pp_worker(monkeypatch, specs)
+
+        assert worker.hma_flag_seen_by_upstream_init is True
+
+    def test_the_suppression_is_undone(self, monkeypatch):
+        # Both halves matter. `_is_hma_required` still gates the block-size
+        # and permute guards downstream, and the config object is shared, so a
+        # flag left flipped would outlive this constructor.
+        specs = [_merged_uniform_spec(_full_attention_spec())]
+        worker = self._pp_worker(monkeypatch, specs)
+
+        assert worker._is_hma_required is True
+        scheduler_config = worker.vllm_config.scheduler_config
+        assert scheduler_config.disable_hybrid_kv_cache_manager is False
+
+    def test_hma_switched_off_by_the_operator_stays_off(self, monkeypatch):
+        # The suppression is the manager's own flag, so for someone who turned
+        # the manager off there is nothing to suppress and nothing to require.
+        specs = [_merged_uniform_spec(_full_attention_spec())]
+        worker = self._pp_worker(monkeypatch, specs, hma_disabled=True)
+
+        assert worker.hma_flag_seen_by_upstream_init is True
+        assert worker._is_hma_required is False
+
+    @pytest.mark.parametrize("hma_disabled", [False, True])
+    @pytest.mark.parametrize(
+        "specs",
+        [
+            pytest.param(
+                [
+                    _merged_uniform_spec(
+                        MambaSpec(
+                            block_size=64, shapes=((1, 1),), dtypes=(torch.float16,)
+                        )
+                    )
+                ],
+                id="merged-mamba",
+            ),
+            pytest.param(
+                [
+                    _merged_uniform_spec(
+                        SlidingWindowSpec(
+                            block_size=64,
+                            num_kv_heads=1,
+                            head_size=64,
+                            dtype=torch.float16,
+                            sliding_window=128,
+                        )
+                    )
+                ],
+                id="merged-swa",
+            ),
+            pytest.param([_full_attention_spec()], id="unmerged"),
+            pytest.param(
+                [_merged_uniform_spec(_full_attention_spec())] * 2, id="two-groups"
+            ),
+        ],
+    )
+    def test_a_layout_upstream_judges_right_is_left_alone(
+        self, monkeypatch, specs, hma_disabled
+    ):
+        # Every later net -- upstream's `_has_mamba`, our `_has_swa` and
+        # `_check_pp_constraints` -- reads the group spec, not what a merged
+        # group wraps, so a merged Mamba or SWA group suppressed here would
+        # reach the PP region slicing with nothing left to refuse it.
+        worker = self._pp_worker(monkeypatch, specs, hma_disabled=hma_disabled)
+
+        assert worker.hma_flag_seen_by_upstream_init is hma_disabled
+        assert not hasattr(worker, "_is_hma_required")
 
 
 class TestBackendSelection:
