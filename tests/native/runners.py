@@ -89,12 +89,14 @@ def kv_blocks_needed(
     # CR13 takes upstream's SlidingWindowSpec, which appends across a block
     # table rather than sliding one block in place; mirror its
     # max_admission_blocks_per_request. Its in-flight term is the token budget
-    # times max_concurrent_batches, which is pp_size, or 2 once async
-    # scheduling is on at pp=1 -- take whichever is larger.
+    # times max_concurrent_batches: 2 under the async scheduler this path takes
+    # by default, pp_size once pp > 1 -- take whichever is larger.
     window = getattr(config, "sliding_window", None)
     if window and host_chip() == CR13:
-        batches = max(pipeline_parallel_size, 2)
-        held = min(window - 1 + batches * max_num_batched_tokens, max_model_len)
+        max_concurrent_batches = max(pipeline_parallel_size, 2)
+        held = min(
+            window - 1 + max_concurrent_batches * max_num_batched_tokens, max_model_len
+        )
         sliding_blocks = math.ceil(held / block_size) + 1
     else:
         sliding_blocks = 1
