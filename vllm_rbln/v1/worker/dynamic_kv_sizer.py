@@ -26,8 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
-from vllm.config import VllmConfig, get_layers_from_vllm_config
-from vllm.model_executor.layers.attention import Attention
+from vllm.config import VllmConfig
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -50,8 +49,8 @@ from vllm_rbln.v1.worker.kv_placement import (
 )
 from vllm_rbln.v1.worker.utils import (
     compile_and_warmup_skip_reason,
+    dynamic_kv_unsupported_reason,
     estimate_available_memory,
-    minimum_kv_blocks,
     rescale_kv_cache_config,
 )
 
@@ -65,40 +64,30 @@ class DynamicKvMode(Enum):
     DISABLED = "disabled"
     INERT = "inert"
     PINNED = "pinned"
-    DRY_RUN = "dry_run"
     ACTIVE = "active"
 
 
 def resolve_mode(
     *,
     use_dynamic_kv: bool,
-    dry_run: bool,
+    unsupported_reason: str | None,
     num_gpu_blocks_override: int | None,
     compile_skip_reason: str | None,
 ) -> tuple[DynamicKvMode, str | None]:
     """The mode and its reason. Every input is static config or env, so the
     decision is final at init time."""
     if not use_dynamic_kv:
-        return DynamicKvMode.DISABLED, None
+        return DynamicKvMode.DISABLED, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE is off"
+    if unsupported_reason is not None:
+        return DynamicKvMode.DISABLED, unsupported_reason
     if compile_skip_reason is not None:
         return DynamicKvMode.INERT, compile_skip_reason
-    if dry_run:
-        return DynamicKvMode.DRY_RUN, None
     if num_gpu_blocks_override is not None:
         return (
             DynamicKvMode.PINNED,
             f"--num-gpu-blocks-override={num_gpu_blocks_override}",
         )
     return DynamicKvMode.ACTIVE, None
-
-
-def refuse(mode: DynamicKvMode, message: str) -> None:
-    """Raise, or report and continue in a dry run: the dry run observes, it does
-    not decide whether a configuration boots."""
-    if mode is DynamicKvMode.DRY_RUN:
-        logger.warning("[Dynamic KV] dry run: %s", message)
-        return
-    raise RuntimeError(message)
 
 
 @dataclass(frozen=True)
@@ -178,7 +167,7 @@ class DynamicKvSizer:
         self.rank: int = vllm_config.parallel_config.rank
         self.mode, self.mode_reason = resolve_mode(
             use_dynamic_kv=envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE,
-            dry_run=envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN,
+            unsupported_reason=dynamic_kv_unsupported_reason(vllm_config),
             num_gpu_blocks_override=self.cache_config.num_gpu_blocks_override,
             compile_skip_reason=compile_and_warmup_skip_reason(vllm_config),
         )
@@ -186,14 +175,11 @@ class DynamicKvSizer:
         self.kv_blocks_before_shrink: int | None = None
         self.programs: list[Any] = []
         self.expected_used: dict[Unit, int] = {}
-        if (
-            self.mode is DynamicKvMode.DISABLED
-            and envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
-        ):
+        if self.mode is DynamicKvMode.DISABLED:
             logger.warning(
-                "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN is set, but an explicit "
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0 keeps the feature off, so the "
-                "dry run reports nothing. Unset it to measure."
+                "[Dynamic KV] off for this run (%s); the KV cache is sized from "
+                "the pre-compile estimate, which has no notion of chiplets.",
+                self.mode_reason,
             )
         # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
         self.foreign_dram_used_bytes = foreign_dram_used_bytes
@@ -240,26 +226,12 @@ class DynamicKvSizer:
         }
         if not torch.rbln.is_dummy_device():
             snapshot, source = self.memory_snapshot(self.device)
-            if self.mode is DynamicKvMode.DRY_RUN:
-                measured = estimate_available_memory(
-                    **{**estimate_kwargs, "exact_dram": True},
-                    chiplet_memory=snapshot,
-                )
-                logger.info(
-                    "[Dynamic KV] dry run: the %s memory snapshot of %s would put the "
-                    "pre-compile estimate at %.2f GiB; keeping the whole-card formula.",
-                    source,
-                    self.device,
-                    measured / 1024**3,
-                )
-            else:
-                estimate_kwargs = {**estimate_kwargs, "chiplet_memory": snapshot}
-                logger.info(
-                    "[Dynamic KV] pre-compile estimate from the %s memory snapshot of "
-                    "%s.",
-                    source,
-                    self.device,
-                )
+            estimate_kwargs = {**estimate_kwargs, "chiplet_memory": snapshot}
+            logger.info(
+                "[Dynamic KV] pre-compile estimate from the %s memory snapshot of %s.",
+                source,
+                self.device,
+            )
 
         estimate = estimate_available_memory(**estimate_kwargs)
         one_request = sum(
@@ -297,13 +269,6 @@ class DynamicKvSizer:
                 kv_cache_config.num_blocks,
             )
             return kv_cache_config
-        if self.mode is DynamicKvMode.DRY_RUN:
-            logger.warning(
-                "[Dynamic KV] dry run: compiling at the %d blocks vllm sized; the "
-                "count this feature would pick is only logged after warm-up.",
-                kv_cache_config.num_blocks,
-            )
-            return kv_cache_config
         if self.mode is DynamicKvMode.PINNED:
             logger.warning(
                 "[Dynamic KV] %s pins the count; no shrink and no resize. "
@@ -333,64 +298,16 @@ class DynamicKvSizer:
         )
         return shrunk
 
-    def assert_attention_layout(self) -> None:
-        """Every attention layer must dispatch to a paged causal or sliding-window
-        naive kernel (`is_causal`, not `is_normal`). Runs here, not in platform
-        validation: the layers exist only after the model build."""
-        if self.mode in (DynamicKvMode.DISABLED, DynamicKvMode.INERT):
-            return
-        attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-        offenders: list[str] = []
-        for layer_name, layer in attn_layers.items():
-            impl = layer.impl
-            is_causal = getattr(impl, "is_causal", None)
-            is_normal = getattr(impl, "is_normal", None)
-            if is_causal is not True or is_normal is not False:
-                offenders.append(
-                    f"{layer_name}(is_causal={is_causal}, is_normal={is_normal})"
-                )
-        if offenders:
-            refuse(
-                self.mode,
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires every layer to dispatch "
-                "to a paged causal or sliding-window naive kernel. Offending: "
-                + ", ".join(offenders[:8])
-                + (f" (+{len(offenders) - 8} more)" if len(offenders) > 8 else ""),
-            )
-
-    def assert_cache_layout(self) -> None:
-        """The KV bindings must satisfy the compiler's dynamic-input rules; reads
-        state `initialize_kv_cache` fills."""
-        if self.mode in (DynamicKvMode.DISABLED, DynamicKvMode.INERT):
-            return
-        mr = self.model_runner
-
-        # The compiler admits a dynamic input through view ops into several
-        # attention calls, but not the same view into two calls.
-        if mr.shared_kv_cache_layers:
-            refuse(
-                self.mode,
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support cross-layer KV "
-                f"sharing, but {len(mr.shared_kv_cache_layers)} layer(s) reuse "
-                "another layer's KV cache.",
-            )
-
     def capture_programs(self):
         """Scope that records the programs warm-up builds, when the flag is on."""
         if self.mode is DynamicKvMode.DISABLED:
             return nullcontext(None)
         capture = getattr(torch.rbln, "capture_programs", None)
         if capture is None:
-            message = (
+            raise RuntimeError(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs torch_rbln's "
                 "capture_programs(); this torch_rbln does not carry it."
             )
-            if self.mode is DynamicKvMode.DRY_RUN:
-                # Nothing to capture means nothing to report, which the sizing
-                # step says; it must not stop a run the dry run cannot change.
-                logger.warning("[Dynamic KV] dry run: %s", message)
-                return nullcontext(None)
-            raise RuntimeError(message)
         return capture()
 
     def collect_runtimes(self) -> list[Any]:
@@ -478,19 +395,12 @@ class DynamicKvSizer:
                 self.mode_reason,
             )
             return None
-        dry_run = self.mode is DynamicKvMode.DRY_RUN
-        if not dry_run and self.kv_blocks_before_shrink is None:
+        if self.kv_blocks_before_shrink is None:
             # The branch that cancelled the shrink already logged why.
             logger.warning(
                 "[Dynamic KV] the cache was not shrunk, so no placement is queried "
                 "and the count stays at the %d blocks vllm estimated.",
                 self.model_runner.kv_cache_config.num_blocks,
-            )
-            return None
-        if dry_run and not self.programs:
-            logger.warning(
-                "[Dynamic KV] dry run: no compiled program was captured, so there is "
-                "nothing to report."
             )
             return None
 
@@ -505,18 +415,6 @@ class DynamicKvSizer:
             )
             return None
 
-        if dry_run:
-            try:
-                sizing = self._propose_kv_size()
-            except RuntimeError as exc:
-                logger.warning(
-                    "[Dynamic KV] dry run: the count could not be computed (%s); "
-                    "nothing is resized.",
-                    exc,
-                )
-                return None
-            self.log_dry_run(sizing)
-            return None
         return self._size_kv_and_release().num_blocks
 
     def _kv_growth_from_programs(self) -> tuple[KvGrowth, int, torch.device]:
@@ -718,56 +616,6 @@ class DynamicKvSizer:
             num_blocks,
             source,
             " ".join(parts),
-        )
-
-    def log_dry_run(self, sizing: KvSizing) -> None:
-        """The dry-run report: today's count against each chiplet's budget and
-        the count this feature would pick."""
-        num_blocks, fits, current, growth, if_resident = (
-            sizing.num_blocks,
-            sizing.fits,
-            sizing.hint_blocks,
-            sizing.growth,
-            sizing.if_resident,
-        )
-        now = growth.allocated_at(current)
-        proposed = growth.allocated_at(num_blocks)
-
-        def pct(used: int, of: int) -> float:
-            # A dry run never fails the run, not even on a malformed snapshot.
-            return 100.0 * used / of if of else float("nan")
-
-        per_unit = []
-        for (node, chiplet), fit in sorted(fits.items()):
-            unit = (node, chiplet)
-            headroom = fit.budget - fit.base - now[unit]
-            at_proposed = fit.base + proposed[unit]
-            per_unit.append(
-                f"{node}:{chiplet}(kv_now={now[unit]} base={fit.base} "
-                f"budget={fit.budget} headroom={headroom} = "
-                f"{headroom // fit.per_block:+d} blocks, now "
-                f"{pct(fit.base + now[unit], fit.budget):.1f}% of budget; "
-                f"at {num_blocks} blocks: used={at_proposed} "
-                f"budget_left={fit.budget - at_proposed} "
-                f"total_left={fit.total - at_proposed} = "
-                f"{pct(at_proposed, fit.budget):.1f}% of budget, "
-                f"{pct(at_proposed, fit.total):.1f}% of DRAM)"
-            )
-        minimum = minimum_kv_blocks(self.vllm_config, self.model_runner.kv_cache_config)
-        logger.warning(
-            "[Dynamic KV] dry run: vllm sized %d blocks, this feature would set %d "
-            "(%+d) if the runtime hands the current cache back, %s if it stays "
-            "resident; the pool needs %d (one request %d, decode batch %d, +1 null "
-            "block), so the count %s. Per (node, chiplet): %s. Nothing is resized.",
-            current,
-            num_blocks,
-            num_blocks - current,
-            if_resident,
-            minimum.needed,
-            minimum.one_request,
-            minimum.decode_batch,
-            "would be accepted" if num_blocks >= minimum.needed else "would be REFUSED",
-            " ".join(per_unit),
         )
 
     def apply_num_blocks(self, n: int | None) -> int | None:

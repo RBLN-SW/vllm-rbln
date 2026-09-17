@@ -172,54 +172,6 @@ class TestComputeDynamicKvNumBlocks:
         # compares against; the count is sized from the one after it.
         assert order == ["snapshot", "release", "snapshot"]
 
-    def test_a_dry_run_reports_and_resizes_nothing(self, caplog, monkeypatch):
-        current = 200
-        programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0", extent=current)]
-        resident = current * 2 * 2**20
-        sizer = self._sizer(
-            programs=programs,
-            snapshot=self._snapshot([30 * self.GIB + resident] * 4),
-        )
-        sizer.mode = dks.DynamicKvMode.DRY_RUN
-        sizer.cache_config.num_gpu_blocks_override = current
-        sizer.kv_blocks_before_shrink = None
-        sizer.model_runner.kv_cache_config.num_blocks = current
-        sizer.vllm_config = SimpleNamespace()
-        monkeypatch.setattr(
-            dks,
-            "minimum_kv_blocks",
-            lambda cfg, kv: SimpleNamespace(one_request=8, decode_batch=1, needed=9),
-        )
-        sizer.log_dry_run = lambda *args: (DynamicKvSizer.log_dry_run(sizer, *args))
-        _bind_sizing(sizer)
-        with caplog.at_level("WARNING"):
-            assert DynamicKvSizer.compute_num_blocks(sizer) is None
-        # (35 GiB - 30 GiB) / 2 MiB = 2560 blocks if the 200 in use come back,
-        # 2360 if their 400 MiB stay resident.
-        assert (
-            "vllm sized 200 blocks, this feature would set 2560 (+2360) if the "
-            "runtime hands the current cache back, 2360 if it stays resident"
-            in caplog.text
-        )
-        assert "needs 9 (one request 8, decode batch 1, +1 null block)" in caplog.text
-        assert "would be accepted" in caplog.text
-        assert "headroom=" in caplog.text
-        # 2560 blocks of 2 MiB on top of the 30 GiB base fill the 35 GiB budget.
-        assert (
-            "at 2560 blocks: used=37580963840 budget_left=0 total_left=0" in caplog.text
-        )
-        # The fill is what the rollout reads: how full each chiplet ends up.
-        assert "= 100.0% of budget, 100.0% of DRAM)" in caplog.text
-        assert "now 86.8% of budget" in caplog.text
-
-    def test_a_dry_run_that_cannot_size_warns_instead_of_raising(self, caplog):
-        sizer = self._sizer(programs=[_program([])], snapshot=self._snapshot([0] * 4))
-        sizer.mode = dks.DynamicKvMode.DRY_RUN
-        sizer.kv_blocks_before_shrink = None
-        with caplog.at_level("WARNING"):
-            assert DynamicKvSizer.compute_num_blocks(sizer) is None
-        assert "could not be computed" in caplog.text
-
     def test_the_copy_stream_reserve_comes_off_every_chiplet(self):
         programs = [_program([HEAD_SPLIT, HEAD_SPLIT], name="0/0")]
         sizer = self._sizer(
@@ -430,27 +382,38 @@ class TestModeResolution:
     def _mode(**kwargs):
         args = dict(
             use_dynamic_kv=True,
-            dry_run=False,
+            unsupported_reason=None,
             num_gpu_blocks_override=None,
             compile_skip_reason=None,
         )
         return dks.resolve_mode(**{**args, **kwargs})
 
     def test_the_flag_off_disables_everything(self):
-        assert self._mode(use_dynamic_kv=False) == (dks.DynamicKvMode.DISABLED, None)
+        assert self._mode(use_dynamic_kv=False) == (
+            dks.DynamicKvMode.DISABLED,
+            "VLLM_RBLN_USE_DYNAMIC_KV_CACHE is off",
+        )
 
-    def test_a_skipped_compile_wins_over_the_dry_run_and_the_override(self):
+    def test_an_unsupported_config_disables_the_feature(self):
+        # The flag is on by default, so a shape the path cannot size turns it
+        # off rather than refusing a run the flag off would have served.
+        assert self._mode(unsupported_reason="the optimum path") == (
+            dks.DynamicKvMode.DISABLED,
+            "the optimum path",
+        )
+
+    def test_unsupported_wins_over_a_skipped_compile_and_the_override(self):
+        assert self._mode(
+            unsupported_reason="the optimum path",
+            compile_skip_reason="enforce_eager is set",
+            num_gpu_blocks_override=64,
+        ) == (dks.DynamicKvMode.DISABLED, "the optimum path")
+
+    def test_a_skipped_compile_wins_over_the_override(self):
         assert self._mode(
             compile_skip_reason="enforce_eager is set",
-            dry_run=True,
             num_gpu_blocks_override=64,
         ) == (dks.DynamicKvMode.INERT, "enforce_eager is set")
-
-    def test_a_dry_run_still_reports_under_an_override(self):
-        assert self._mode(dry_run=True, num_gpu_blocks_override=64) == (
-            dks.DynamicKvMode.DRY_RUN,
-            None,
-        )
 
     def test_an_override_pins_the_count(self):
         assert self._mode(num_gpu_blocks_override=64) == (
@@ -491,19 +454,6 @@ class TestWarmupCapturesPrograms:
         ):
             pass
         assert programs is recorded
-
-    def test_a_dry_run_without_capture_programs_reports_instead_of_refusing(
-        self, caplog
-    ):
-        sizer = SimpleNamespace(mode=dks.DynamicKvMode.DRY_RUN)
-        with (
-            patch.object(dks.torch, "rbln", SimpleNamespace(), create=True),
-            caplog.at_level("WARNING"),
-            DynamicKvSizer.capture_programs(sizer) as programs,
-        ):
-            pass
-        assert programs is None
-        assert "dry run" in caplog.text
 
     def test_on_without_capture_programs_refuses(self):
         with (
@@ -547,12 +497,10 @@ class TestMaybeShrinkKvCacheForCompile:
         )
 
     @staticmethod
-    def _shrink(
-        config, *, dynamic=True, override=None, warmup_skipped=False, dry_run=False
-    ):
+    def _shrink(config, *, dynamic=True, override=None, warmup_skipped=False):
         mode, reason = dks.resolve_mode(
             use_dynamic_kv=dynamic,
-            dry_run=dry_run,
+            unsupported_reason=None,
             num_gpu_blocks_override=override,
             compile_skip_reason="enforce_eager is set" if warmup_skipped else None,
         )
@@ -584,21 +532,11 @@ class TestMaybeShrinkKvCacheForCompile:
             for t in config.kv_cache_tensors
         )
 
-    def test_the_flag_off_returns_the_config_untouched_and_silently(self, caplog):
+    def test_the_flag_off_returns_the_config_untouched(self):
         config = self._config()
-        with caplog.at_level("WARNING"):
-            sizer, out = self._shrink(config, dynamic=False)
+        sizer, out = self._shrink(config, dynamic=False)
         assert out is config
         assert sizer.kv_blocks_before_shrink is None
-        assert "[Dynamic KV]" not in caplog.text
-
-    def test_a_dry_run_compiles_at_the_sized_count(self, caplog):
-        config = self._config()
-        with caplog.at_level("WARNING"):
-            sizer, out = self._shrink(config, dry_run=True)
-        assert out is config
-        assert sizer.kv_blocks_before_shrink is None
-        assert "dry run" in caplog.text
 
     def test_a_pinned_block_count_cancels_the_shrink(self, caplog):
         config = self._config()
@@ -635,11 +573,10 @@ class TestMaybeShrinkKvCacheForCompile:
         [
             {},
             {"dynamic": False},
-            {"dry_run": True},
             {"override": 64},
             {"warmup_skipped": True},
         ],
-        ids=["active", "disabled", "dry_run", "pinned", "inert"],
+        ids=["active", "disabled", "pinned", "inert"],
     )
     def test_a_connector_waits_exactly_where_the_shrink_latched(self, kwargs):
         # A KV connector registers the addresses it is handed. It may only be
@@ -653,79 +590,6 @@ class TestMaybeShrinkKvCacheForCompile:
         probe = object.__new__(DynamicKvSizer)
         probe.mode = sizer.mode
         assert probe.defers_kv_registration == (out is not config)
-
-
-class TestDynamicKvLayoutGuards:
-    """The layout guard is split across `initialize_kv_cache`: the attention half
-    runs before it, the binding half after, and neither may drift."""
-
-    @staticmethod
-    def _layer(sliding_window=None, is_causal=True, is_normal=False):
-        return SimpleNamespace(
-            impl=SimpleNamespace(
-                sliding_window=sliding_window,
-                is_causal=is_causal,
-                is_normal=is_normal,
-            )
-        )
-
-    def test_a_non_paged_causal_layer_is_refused_by_name(self):
-        """`block_size == max_model_len` makes is_normal True -- and is also where
-        the estimate can fall below the hint, so the wrong refusal could fire."""
-        sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.ACTIVE)
-        with (
-            patch(
-                "vllm_rbln.v1.worker.dynamic_kv_sizer.get_layers_from_vllm_config",
-                return_value={"layer.0": self._layer(is_normal=True)},
-            ),
-            pytest.raises(RuntimeError) as exc,
-        ):
-            DynamicKvSizer.assert_attention_layout(sizer)
-        assert "paged causal or sliding-window naive kernel" in str(exc.value)
-        assert "layer.0" in str(exc.value)
-        assert "nothing to shrink" not in str(exc.value)
-
-    def test_a_paged_causal_layer_passes(self):
-        sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.ACTIVE)
-        with patch(
-            "vllm_rbln.v1.worker.dynamic_kv_sizer.get_layers_from_vllm_config",
-            return_value={"layer.0": self._layer()},
-        ):
-            DynamicKvSizer.assert_attention_layout(sizer)
-
-    def test_a_sliding_window_layer_passes(self):
-        """gpt-oss alternates full and windowed layers; the compiler admits a
-        dynamic KV input on `paged_sliding_window_attention_naive_*` too."""
-        sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.ACTIVE)
-        with patch(
-            "vllm_rbln.v1.worker.dynamic_kv_sizer.get_layers_from_vllm_config",
-            return_value={
-                "layer.0": self._layer(),
-                "layer.1": self._layer(sliding_window=128),
-            },
-        ):
-            DynamicKvSizer.assert_attention_layout(sizer)
-
-    def test_deduped_bases_pass(self):
-        """gpt-oss shares one tensor between a full and a windowed layer; the
-        compiler takes the deduped base through both views."""
-        sizer = SimpleNamespace(
-            mode=dks.DynamicKvMode.ACTIVE,
-            model_runner=SimpleNamespace(
-                kv_cache_bases=[object()], shared_kv_cache_layers={}
-            ),
-        )
-        DynamicKvSizer.assert_cache_layout(sizer)
-
-    def test_cross_layer_sharing_is_still_refused_after_the_split(self):
-        sizer = SimpleNamespace(
-            mode=dks.DynamicKvMode.ACTIVE,
-            model_runner=SimpleNamespace(
-                kv_cache_bases=[], shared_kv_cache_layers={"layer.1": "layer.0"}
-            ),
-        )
-        with pytest.raises(RuntimeError, match="cross-layer KV"):
-            DynamicKvSizer.assert_cache_layout(sizer)
 
 
 class TestReleaseShortfallIsReported:
@@ -758,9 +622,9 @@ class TestReleaseShortfallIsReported:
         assert "{'0:1': 25}" in caplog.text
 
 
-class TestDryRunOnlyObserves:
-    """A dry run reports the count it would pick. It must not change whether the
-    run boots or what it compiles, or it measures a different run."""
+class TestOnlyTheShrunkModeReplacesTheEstimate:
+    """Every mode but ACTIVE serves the estimate vllm sized, so nothing that
+    only the resize justifies may move it."""
 
     def test_the_one_request_floor_is_only_for_the_shrunk_estimate(self, monkeypatch):
         """The floor exists because the shrink makes the estimate a placeholder.
@@ -787,11 +651,7 @@ class TestDryRunOnlyObserves:
                 sizer(dks.DynamicKvMode.ACTIVE), {}
             )
             assert active == 8000
-            for mode in (
-                dks.DynamicKvMode.DRY_RUN,
-                dks.DynamicKvMode.PINNED,
-                dks.DynamicKvMode.INERT,
-            ):
+            for mode in (dks.DynamicKvMode.PINNED, dks.DynamicKvMode.INERT):
                 assert DynamicKvSizer.pre_compile_estimate(sizer(mode), {}) == 999
 
     def test_the_flag_off_never_snapshots(self, monkeypatch):
@@ -806,32 +666,6 @@ class TestDryRunOnlyObserves:
         assert DynamicKvSizer.pre_compile_estimate(sizer, {}) == 777
         assert seen == []
 
-    def test_a_dry_run_reports_a_refused_attention_layout(self, caplog):
-        sizer = SimpleNamespace(vllm_config=object(), mode=dks.DynamicKvMode.DRY_RUN)
-        layer = SimpleNamespace(impl=SimpleNamespace(is_causal=None, is_normal=True))
-        with (
-            patch(
-                "vllm_rbln.v1.worker.dynamic_kv_sizer.get_layers_from_vllm_config",
-                return_value={"layer.0": layer},
-            ),
-            caplog.at_level("WARNING"),
-        ):
-            DynamicKvSizer.assert_attention_layout(sizer)
-        assert "dry run" in caplog.text
-        assert "layer.0" in caplog.text
-
-    def test_a_dry_run_reports_cross_layer_sharing(self, caplog):
-        sizer = SimpleNamespace(
-            mode=dks.DynamicKvMode.DRY_RUN,
-            model_runner=SimpleNamespace(
-                kv_cache_bases=[], shared_kv_cache_layers={"layer.1": "layer.0"}
-            ),
-        )
-        with caplog.at_level("WARNING"):
-            DynamicKvSizer.assert_cache_layout(sizer)
-        assert "dry run" in caplog.text
-        assert "cross-layer KV" in caplog.text
-
 
 class TestDynamicKvFailuresRaise:
     """After the shrink, failing to size from the device must not boot: the run
@@ -841,7 +675,7 @@ class TestDynamicKvFailuresRaise:
     def _sizer(*, shrunk=True, override=None, programs=()):
         mode, reason = dks.resolve_mode(
             use_dynamic_kv=True,
-            dry_run=False,
+            unsupported_reason=None,
             num_gpu_blocks_override=override,
             compile_skip_reason=None if shrunk or override else "enforce_eager is set",
         )

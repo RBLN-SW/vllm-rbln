@@ -20,7 +20,7 @@ import inspect
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -81,6 +81,7 @@ def _make_vllm_config(
         ),
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
+        kv_transfer_config=None,
         additional_config=(
             additional_config if additional_config is not None else RBLNConfig()
         ),
@@ -511,7 +512,9 @@ class TestDetermineAvailableMemory:
         decode_buckets=3,
         drafter=None,
         speculative_config=None,
+        dynamic=False,
     ):
+        monkeypatch.setattr(dks.envs, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE", dynamic)
         vcfg = _make_vllm_config(quantization=quantization)
         vcfg.model_config.hf_config = hf_config
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
@@ -519,7 +522,6 @@ class TestDetermineAvailableMemory:
         captured: dict = {}
 
         def record(**kw):
-            # The dry run calls twice; the last call is the one whose result counts.
             captured.clear()
             captured.update(kw)
             return 999
@@ -549,9 +551,6 @@ class TestDetermineAvailableMemory:
     def test_dynamic_kv_feeds_the_chiplet_snapshot(self, make_worker, monkeypatch):
         snapshot = {(0, 0): dks.ChipletMemory(total=100, used=40)}
         monkeypatch.setattr(
-            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True
-        )
-        monkeypatch.setattr(
             wm.torch,
             "rbln",
             SimpleNamespace(is_dummy_device=lambda: False),
@@ -562,7 +561,9 @@ class TestDetermineAvailableMemory:
             "memory_snapshot",
             lambda self, device: (snapshot, "driver"),
         )
-        cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
+        cap = self._capture(
+            make_worker, monkeypatch, device_name="RBLN-CR13", dynamic=True
+        )
         assert cap["chiplet_memory"] is snapshot
 
     def test_dynamic_kv_raises_a_short_estimate_to_one_request(
@@ -570,9 +571,6 @@ class TestDetermineAvailableMemory:
     ):
         # vllm refuses a pool below one max-length request against the
         # estimate; under the flag the estimate is only the compile placeholder.
-        monkeypatch.setattr(
-            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True
-        )
         monkeypatch.setattr(
             wm.torch,
             "rbln",
@@ -598,48 +596,21 @@ class TestDetermineAvailableMemory:
             assert worker.determine_available_memory() == 8000
         assert "short of one max-length request" in caplog.text
 
-    def test_dynamic_kv_dry_run_keeps_the_formula(self, make_worker, monkeypatch):
-        snapshot = {(0, 0): dks.ChipletMemory(total=100, used=40)}
-        monkeypatch.setattr(
-            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True
-        )
-        monkeypatch.setattr(
-            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN",
-            True,
-        )
-        monkeypatch.setattr(
-            wm.torch,
-            "rbln",
-            SimpleNamespace(is_dummy_device=lambda: False),
-            raising=False,
-        )
-        monkeypatch.setattr(
-            dks.DynamicKvSizer,
-            "memory_snapshot",
-            lambda self, device: (snapshot, "driver"),
-        )
-        cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
-        assert "chiplet_memory" not in cap
-
     def test_dynamic_kv_skips_the_snapshot_on_a_dummy_device(
         self, make_worker, monkeypatch
     ):
-        monkeypatch.setattr(
-            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True
-        )
         monkeypatch.setattr(
             wm.torch,
             "rbln",
             SimpleNamespace(is_dummy_device=lambda: True),
             raising=False,
         )
-        cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
+        cap = self._capture(
+            make_worker, monkeypatch, device_name="RBLN-CR13", dynamic=True
+        )
         assert "chiplet_memory" not in cap
 
-    def test_default_path_never_snapshots(self, make_worker, monkeypatch):
-        monkeypatch.setattr(
-            "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE", False
-        )
+    def test_the_flag_off_never_snapshots(self, make_worker, monkeypatch):
         cap = self._capture(make_worker, monkeypatch, device_name="RBLN-CR13")
         assert "chiplet_memory" not in cap
 
@@ -779,7 +750,8 @@ class TestDetermineAvailableMemory:
 
 
 class TestInitializeFromConfig:
-    def test_sets_num_gpu_blocks(self, make_worker, monkeypatch):
+    @staticmethod
+    def _init(make_worker, monkeypatch, kv_cfg):
         worker = make_worker()
         monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", lambda *a: None)
         init_calls = []
@@ -788,11 +760,32 @@ class TestInitializeFromConfig:
             register_kv_caches_with_connector=lambda: None,
         )
         _attach_sizer(worker)
-        kv_cfg = SimpleNamespace(num_blocks=123)
         worker.initialize_from_config(kv_cfg)
+        return worker, init_calls
+
+    def test_sets_num_gpu_blocks(self, make_worker, monkeypatch):
+        monkeypatch.setattr(dks.envs, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE", False)
+        kv_cfg = SimpleNamespace(num_blocks=123)
+        worker, init_calls = self._init(make_worker, monkeypatch, kv_cfg)
         assert worker.cache_config.num_gpu_blocks == 123
         assert worker.cache_config.num_cpu_blocks == 123
         assert init_calls == [kv_cfg]
+
+    def test_the_scheduler_keeps_the_estimate_while_the_cache_is_shrunk(
+        self, make_worker, monkeypatch
+    ):
+        """The count the scheduler is sized from is the estimate; only the
+        tensors the compile runs against shrink, and the resize restores them."""
+        kv_cfg = SimpleNamespace(
+            num_blocks=123,
+            kv_cache_tensors=[SimpleNamespace(size=123 * 4096, shared_by=["layer.0"])],
+        )
+        worker, init_calls = self._init(make_worker, monkeypatch, kv_cfg)
+        assert worker.cache_config.num_gpu_blocks == 123
+        assert init_calls[0] is not kv_cfg
+        assert init_calls[0].num_blocks == dks.COMPILE_KV_CACHE_NUM_BLOCKS
+        assert worker.dynamic_kv.kv_blocks_before_shrink == 123
+        assert kv_cfg.num_blocks == 123
 
 
 class TestCompileOrWarmUpModel:
@@ -851,6 +844,9 @@ class TestCompileOrWarmUpModel:
         worker, _ = self._worker(make_worker, monkeypatch)
         monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
         monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "group")
+        # The default flag puts this worker in the mode that defers; pin the
+        # start-up order so this case reads the warm-up site.
+        monkeypatch.setattr(dks.DynamicKvSizer, "defers_kv_registration", False)
         seen: list = []
         monkeypatch.setattr(
             wm,
@@ -1113,45 +1109,6 @@ class TestHandshakeMetadata:
 
 # 1 MiB per block per chiplet, one node, four chiplets (a head split of 8 KV heads).
 PER_BLOCK_PER_CHIPLET = 2**20
-
-
-class TestDynamicKvLayoutGuards:
-    """The attention half of the layout guard runs before the shrink, the
-    binding half after `initialize_kv_cache`; neither may drift."""
-
-    def test_the_attention_guard_runs_before_the_shrink(self):
-        calls: list[str] = []
-
-        def record(name: str, ret: object = None) -> object:
-            calls.append(name)
-            return ret
-
-        config = SimpleNamespace(num_blocks=4, kv_cache_tensors=[])
-        worker = SimpleNamespace(
-            cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
-            vllm_config=object(),
-            model_runner=SimpleNamespace(
-                initialize_kv_cache=lambda cfg: record("initialize_kv_cache"),
-                register_kv_caches_with_connector=lambda: record("register"),
-            ),
-            dynamic_kv=SimpleNamespace(
-                assert_attention_layout=lambda: record("attention"),
-                assert_cache_layout=lambda: record("bindings"),
-                shrink_for_compile=lambda cfg: record("shrink", cfg),
-                defers_kv_registration=False,
-            ),
-        )
-        with (
-            patch(
-                "vllm_rbln.v1.worker.rbln_worker.envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
-                True,
-            ),
-            patch("vllm_rbln.v1.worker.rbln_worker.ensure_kv_transfer_initialized"),
-        ):
-            RBLNWorker.initialize_from_config(worker, config)
-
-        assert calls.index("attention") < calls.index("shrink")
-        assert calls.index("bindings") > calls.index("initialize_kv_cache")
 
 
 class TestDynamicKvBlockCountRpcs:
