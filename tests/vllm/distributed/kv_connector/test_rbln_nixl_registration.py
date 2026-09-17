@@ -1387,6 +1387,14 @@ class TestWhatRegistrationSettles:
         assert plain.compat_hash and drafted.compat_hash
         assert plain.compat_hash != drafted.compat_hash
 
+    def test_a_context_cut_over_a_packed_block_is_refused(self, make_worker):
+        # MLA is the cut's only model shape today and registers K alone, so
+        # nothing has run this pairing; a one-head attention model reaches the
+        # same axis with both halves in the block.
+        geo = KvGeometry(layers=("l0",), heads=1, areas=4, slices=4)
+        with pytest.raises(RuntimeError, match="packs K and V"):
+            make_worker(kv_cache=geo)
+
     def test_an_undeclared_head_count_has_no_band(self, make_worker):
         # Neither the target's count nor any declared draft's: replicated heads
         # report a product no model in this engine has, and _layer_kv_heads

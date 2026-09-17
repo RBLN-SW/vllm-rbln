@@ -427,6 +427,15 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self._kv_split_axis = (
             KVSplitAxis.NON_HEAD if region_non_head == {True} else KVSplitAxis.HEAD
         )
+        # The cut is derived from a region holding one head, which is what
+        # makes a token range one run of its bytes. It says nothing about K and
+        # V sharing the block, and MLA -- the cut's only model shape today --
+        # registers K alone, so this pairing has never run.
+        if self._kv_split_axis is KVSplitAxis.NON_HEAD and self._kv_per_block > 1:
+            raise RuntimeError(
+                "RBLN NIXL (D2D): a context-cut KV cache whose block packs K "
+                "and V is not supported."
+            )
         # A chunk is a token range of a block, and a second attention shape
         # needs a descriptor of its own to be left out of one. A sliding
         # window has that already -- the view opt's second range -- so it may
