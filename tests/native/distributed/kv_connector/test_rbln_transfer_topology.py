@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 0.26 standardized on a blocks-first cache whose K and V share one region and
-# asserts that layout in TransferTopology.__post_init__. RBLN's attention cache
-# is K/V-first and fails it; its MLA cache passes. Upstream's own registration
-# path builds the topology, so every test here constructs one directly.
+# RBLN's attention cache is K/V-first on the rbln_triton_ops kernels, where K
+# and V become two regions, and blocks-first on rbln_custom_ops, where they
+# share a block the descriptor path cannot cut in two; the MLA and Mamba caches
+# are upstream's own shapes and register either way. Upstream's own
+# registration path builds the topology, so every test here constructs one
+# directly.
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 
+from tests.native.vllm_config import make_vllm_config
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
     RblnTransferTopology,
 )
@@ -43,22 +47,36 @@ class TestRblnTransferTopology:
             tensor_shape=tensor_shape,
         )
 
-    def test_the_rbln_attention_layout_builds(self):
-        topo = self._topology(RBLNFlashAttentionBackend)
+    @staticmethod
+    def _kernel_config(use_custom_kernel):
+        # What the attention cache's layout follows.
+        return set_current_vllm_config(
+            make_vllm_config(additional_config={"use_custom_kernel": use_custom_kernel})
+        )
+
+    def test_the_blocks_first_attention_cache_is_refused(self):
+        # K and V share a block there, so the descriptors have no second region
+        # to name; refusing here beats transferring halves of a block.
+        with (
+            self._kernel_config(False),
+            pytest.raises(NotImplementedError, match="interleaves inside each"),
+        ):
+            self._topology(RBLNFlashAttentionBackend)
+
+    def test_the_kv_first_attention_cache_splits_k_from_v(self):
+        # Upstream packs K and V into one region; this layout keeps them apart,
+        # and the caller divides the page size by how many regions come back.
+        with self._kernel_config(True):
+            topo = self._topology(RBLNFlashAttentionBackend)
+        cache = torch.zeros(2, 4, 1, 1, 64, 8)
+
+        assert len(topo.get_transfer_cache_regions(cache, object())) == 2
+
+    def test_the_mla_layout_builds(self):
+        topo = self._topology(RBLNFlashAttnMLABackend, is_mla=True)
 
         assert topo.cross_layers_blocks is False
         assert topo.local_physical_heads == 4
-
-    def test_k_and_v_come_back_as_separate_regions(self):
-        # The caller divides the page size by how many regions come back, so
-        # one region here would double the per-block stride.
-        topo = self._topology(RBLNFlashAttentionBackend)
-        cache = torch.zeros(2, 4, 8, 1, 64, 64)
-
-        regions = topo.get_transfer_cache_regions(cache, object())
-
-        assert len(regions) == 2
-        assert all(region.shape[0] == 4 for region in regions)
 
     def test_an_mla_layer_stays_one_region(self):
         topo = self._topology(RBLNFlashAttnMLABackend, is_mla=True)
@@ -66,32 +84,21 @@ class TestRblnTransferTopology:
 
         assert len(topo.get_transfer_cache_regions(cache, object())) == 1
 
-    @pytest.mark.parametrize(
-        "shape",
-        [
-            # FlashInfer-style: blocks first, K and V packed behind them.
-            lambda n, b, h, d: (n, 2, h, b, d),
-            # K/V first, but tokens where the blocks axis belongs.
-            lambda n, b, h, d: (2, b, h, n, d),
-        ],
-        ids=["blocks_first", "tokens_before_blocks"],
-    )
-    def test_a_cache_the_descriptors_cannot_read_is_rejected(self, shape):
-        # The arithmetic reads K and V off the leading dim and the blocks off
-        # the next, so a cache shaped otherwise has to stop here rather than
-        # transfer halves of itself.
+    def test_an_mla_cache_the_descriptors_cannot_read_is_rejected(self):
+        # The arithmetic reads the blocks off the leading dim, so a latent
+        # cache shaped otherwise has to stop here.
         class Backend:
             @staticmethod
             def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
-                return shape(num_blocks, block_size, num_kv_heads, head_size)
+                return (block_size, num_blocks, head_size)
 
-        with pytest.raises(AssertionError, match="attention"):
-            self._topology(Backend)
+        with pytest.raises(AssertionError, match="MLA cache"):
+            self._topology(Backend, is_mla=True)
 
     def test_the_engine_map_is_there_for_upstream_to_fill(self):
         # Upstream's own register/lookup read this map; no other test here
         # would notice it missing.
-        topo = self._topology(RBLNFlashAttentionBackend)
+        topo = self._topology(RBLNFlashAttnMLABackend, is_mla=True)
         info = EngineTransferInfo(
             remote_tp_size=1,
             remote_block_len=8,
@@ -102,23 +109,6 @@ class TestRblnTransferTopology:
         topo.register_remote_engine("peer", info)
 
         assert topo.get_engine_info("peer") is info
-
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            {"is_mamba": True},
-            {"tensor_shape": torch.Size((28, 2, 4, 8, 1, 64, 64))},
-        ],
-    )
-    def test_the_other_two_layouts_stay_on_upstream_s_path(self, kwargs):
-        # A Mamba state and cross-layer blocks are upstream's own shapes; the
-        # split this class restores is for the K/V-first attention cache alone.
-        # Registration walks a Mamba layer before the descriptor path refuses
-        # it, so that arm is reached in production.
-        topo = self._topology(RBLNFlashAttentionBackend, **kwargs)
-        cache = torch.zeros(2, 4, 8, 1, 64, 64)
-
-        assert len(topo.get_transfer_cache_regions(cache, object())) == 1
 
     def test_a_mamba_topology_never_asks_the_backend_for_a_shape(self):
         # A Mamba cache is a (conv, ssm) pair and the connector hands it no
@@ -153,23 +143,24 @@ class TestRblnTransferTopology:
             attn_backends=[BlocksFirst],
         )
 
-        ours = self._topology(RBLNFlashAttentionBackend)
+        ours = self._topology(RBLNFlashAttnMLABackend, is_mla=True)
 
         assert vars(ours).keys() == vars(theirs).keys()
 
     def test_only_a_mamba_state_asks_for_the_block_split(self):
         # The connector doubles its region count off this upstream property,
-        # which reads the _cross_layers_blocks that this __post_init__ sets --
-        # including on the arm that returns before the shape query.
-        attention = self._topology(RBLNFlashAttentionBackend)
+        # which reads the two layout fields this __post_init__ sets.
+        mla = self._topology(RBLNFlashAttnMLABackend, is_mla=True)
         mamba = self._topology(RBLNFlashAttentionBackend, is_mamba=True)
 
-        assert attention.virtually_split_kv_in_blocks is False
+        assert mla.virtually_split_kv_in_blocks is False
         assert mamba.virtually_split_kv_in_blocks is True
 
     def test_cross_layer_blocks_are_read_off_the_tensor_shape(self):
         topo = self._topology(
-            RBLNFlashAttentionBackend, tensor_shape=torch.Size((28, 2, 4, 8, 1, 64, 64))
+            RBLNFlashAttnMLABackend,
+            is_mla=True,
+            tensor_shape=torch.Size((28, 4, 64, 576)),
         )
 
         assert topo.cross_layers_blocks is True

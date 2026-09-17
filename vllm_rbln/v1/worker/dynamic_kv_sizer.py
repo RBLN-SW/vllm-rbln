@@ -811,10 +811,11 @@ class DynamicKvSizer:
         kv_device_types = {kv_cache.device.type for kv_cache in mr.kv_caches}
         was_device_resident = bool(kv_device_types - {"meta", "cpu"})
 
-        # The rebind reassigns all three from one ordered name list.
+        # The rebind reassigns every one of these from one ordered name list.
         mr.kv_caches = []
         mr.kv_cache_bases = []
         mr.kv_cache_names = []
+        mr.kv_cache_block_axes = {}
 
         # Each layer's view is parked on its Attention module; the next bind
         # overwrites it only after the new tensors exist.

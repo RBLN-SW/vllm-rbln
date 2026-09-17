@@ -930,21 +930,30 @@ class TestDummyRunFlushesTheDeferredLoad:
 class TestProcessKvCacheCopyOps:
     # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
     # and compile_model. Forced deterministically.
-    def test_eager_copy_non_mla(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "block_axis, shape",
+        [(0, (4, 2, 1, 1, 8, 2)), (1, (2, 4, 1, 1, 8, 2))],
+        ids=["blocks_first", "kv_first"],
+    )
+    def test_eager_copy_non_mla(self, monkeypatch, block_axis, shape):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)  # -> eager path
-        # non-MLA layout: (2, num_blocks, heads, 1, block_tokens, dim).
-        kv = torch.zeros(2, 4, 1, 1, 8, 2)
-        kv[:, 1, :, :, :, :] = 5.0  # source = block 1
+        # The rbln_custom_ops and rbln_triton_ops layouts, in that order.
+        kv = torch.zeros(shape)
+        kv.select(block_axis, 1).fill_(5.0)  # source = block 1
         r = _make_runner_stub(
             kv_caches=[kv],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": block_axis},
             model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
             runtime_holder=[None],
         )
         r._process_kv_cache_copy_ops([KVCacheCopyOp(0, 1, 2, 3)])
         # First 3 token slots of dst block 2 now match src; the rest stay 0.
-        assert torch.equal(kv[:, 2, :, :, :3, :].cpu(), kv[:, 1, :, :, :3, :].cpu())
-        assert (kv[:, 2, :, :, :3, :] == 5.0).all()
-        assert (kv[:, 2, :, :, 3:, :] == 0.0).all()
+        # Both K and V move: taking the other axis would copy a K/V half.
+        dst, src = kv.select(block_axis, 2), kv.select(block_axis, 1)
+        assert torch.equal(dst[..., :3, :].cpu(), src[..., :3, :].cpu())
+        assert (dst[..., :3, :] == 5.0).all()
+        assert (dst[..., 3:, :] == 0.0).all()
 
     def test_eager_copy_mla(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
@@ -952,6 +961,8 @@ class TestProcessKvCacheCopyOps:
         kv[1] = 7.0
         r = _make_runner_stub(
             kv_caches=[kv],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": 0},
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -969,6 +980,8 @@ class TestProcessKvCacheCopyOps:
         scale[1] = 9.0
         r = _make_runner_stub(
             kv_caches=[latent, scale],
+            kv_cache_names=["latent", "scale"],
+            kv_cache_block_axes={"latent": 0, "scale": 0},
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -986,6 +999,8 @@ class TestProcessKvCacheCopyOps:
         )
         r = _make_runner_stub(
             kv_caches=[],
+            kv_cache_names=[],
+            kv_cache_block_axes={},
             model_config=SimpleNamespace(use_mla=False, enforce_eager=False),
             runtime_holder=[runtime],
             rbln_config=RBLNConfig(),
@@ -1598,6 +1613,14 @@ class TestDummyRunDraftParticipation:
 
         assert staged == [1 + self.NUM_SPEC]
         drafter.dummy_run.assert_called_once_with(1, 1, False)
+
+    def test_a_single_token_draft_runs_the_window_on_an_idle_step(self, monkeypatch):
+        runner, drafter = self._runner(monkeypatch, has_drafter=True)
+        monkeypatch.setattr(runner, "num_spec_tokens", 1)
+
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+
+        drafter.dummy_run.assert_called_once_with(1, 2, False)
 
     def test_idle_draft_runs_the_decided_length(self, monkeypatch):
         # Beside a prefilling peer the step decides this rank's own single token,
