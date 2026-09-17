@@ -38,7 +38,7 @@ def patch_upstream() -> None:
     This is the process that resolves the model path, so it is the one
     ``register_ops`` cannot serve: that entry point runs before the arguments
     are parsed. Every other process inherits the resolved path and applies the
-    same set from there.
+    same registry from there.
     """
     from vllm_rbln.patches import apply_registered_patches, apply_registrations
 
