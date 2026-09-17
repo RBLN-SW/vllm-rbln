@@ -15,14 +15,15 @@
 
 vLLM's ``hf_config`` may be a vLLM-private config class (e.g. qwen3_asr) that
 transformers' model classes cannot read, so ``init_model`` does not forward it.
-It passes only the layer count (and the per-layer attention types that HF
-validates against it) as HF config kwargs, nested under ``text_config`` for
-composite models. Everything that needs an NPU is faked.
+It passes only the layer count, and the per-layer attention types and
+overrides that HF validates against it, as HF config kwargs -- nested under
+``text_config`` for composite models. Everything that needs an NPU is faked.
 """
 
 import types
 
 import torch
+from transformers import Gemma4Config
 
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
@@ -104,3 +105,60 @@ def test_composite_config_nests_layer_count_under_text_config(monkeypatch, tmp_p
     assert "config" not in passed
     assert passed["text_config"] == {"num_hidden_layers": 2}
     assert "num_hidden_layers" not in passed
+
+
+def test_heterogeneous_config_carries_its_own_per_layer_overrides(
+    monkeypatch, tmp_path
+):
+    """A reduced depth has to forward its own pruned per-layer overrides.
+
+    optimum-rbln merges these kwargs into the checkpoint's own config.json, so
+    the checkpoint's full-depth keys would otherwise be validated against the
+    smaller layer count and raise.
+    """
+    checkpoint = tmp_path / "checkpoint"
+    Gemma4Config().save_pretrained(checkpoint)  # full depth, as published
+
+    # What vLLM holds after hf_overrides capped the decoder at 12 layers.
+    hf_config = Gemma4Config()
+    hf_config.architectures = ["Gemma4ForConditionalGeneration"]
+    text_config = hf_config.text_config
+    text_config.num_hidden_layers = 12
+    text_config.layer_types = list(text_config.layer_types[:12])
+    text_config.per_layer_config = {
+        layer_idx: {
+            attr: getattr(text_config.per_layer_config[layer_idx], attr)
+            for attr in text_config.per_layer_attributes
+        }
+        for layer_idx in range(12)
+    }
+
+    passed = _init_model_with(monkeypatch, tmp_path / "cache", hf_config)
+
+    # The merge optimum-rbln performs must produce a loadable config.
+    merged = Gemma4Config.from_pretrained(
+        checkpoint, text_config=passed["text_config"]
+    ).text_config
+    assert merged.num_hidden_layers == 12
+    assert len(merged.layer_types) == 12
+    # Only the surviving full-attention layers keep the wider head_dim.
+    assert sorted(map(int, merged.to_dict()["per_layer_config"])) == [5, 11]
+    wide = merged.per_layer_config[5].head_dim
+    assert [i for i in range(12) if merged.per_layer_config[i].head_dim == wide] == [
+        5,
+        11,
+    ]
+
+
+def test_homogeneous_config_forwards_no_per_layer_overrides(monkeypatch, tmp_path):
+    # Models without heterogeneity must not grow an empty per_layer_config key.
+    hf_config = types.SimpleNamespace(
+        architectures=["Qwen3ForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["full_attention", "full_attention"],
+    )
+    hf_config.get_text_config = lambda: hf_config
+
+    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+
+    assert "per_layer_config" not in passed

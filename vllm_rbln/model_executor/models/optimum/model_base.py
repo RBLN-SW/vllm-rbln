@@ -254,6 +254,19 @@ class RBLNOptimumModelBase(nn.Module):
             layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
             if hasattr(text_config, "layer_types"):
                 layer_override["layer_types"] = text_config.layer_types
+            # gemma4 keys per-layer overrides by layer index and validates them
+            # against num_hidden_layers. optimum-rbln rebuilds the text config
+            # from the checkpoint's own config.json merged with these kwargs, so
+            # a reduced depth must bring its own pruned mapping or the
+            # checkpoint's full-depth keys outlive the smaller layer count.
+            if getattr(text_config, "is_heterogeneous", False):
+                layer_override["per_layer_config"] = {
+                    layer_idx: {
+                        attr: getattr(text_config.per_layer_config[layer_idx], attr)
+                        for attr in text_config.per_layer_attributes
+                    }
+                    for layer_idx in range(text_config.num_hidden_layers)
+                }
             if text_config is not hf_config:
                 layer_override = {"text_config": layer_override}
             model = spec.model_cls.from_pretrained(
