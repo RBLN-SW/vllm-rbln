@@ -52,8 +52,7 @@ USE_DEVICE_TENSOR: bool = (
 )
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
-# RBLN default for a gpu_memory_utilization left at upstream's default. It has
-# no unset sentinel, so arriving at upstream's own default is the only signal.
+# RBLN default for gpu_memory_utilization (upstream vLLM defaults to 0.92).
 RBLN_DEFAULT_GPU_MEMORY_UTILIZATION = 0.93
 # Superseded by RblnPlatform.device_control_env_var.
 DEPRECATED_DEVICE_CONTROL_ENV_VAR = "RBLN_DEVICES"
@@ -298,15 +297,32 @@ class RblnPlatform(Platform):
             if action.dest == "block_size":
                 action.choices = None  # Override choices
 
+        for action in parser._actions:
+            if action.dest == "gpu_memory_utilization":
+                action.default = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
+
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             from vllm_rbln.config import add_rbln_cli_args
 
             add_rbln_cli_args(parser)
 
     @classmethod
-    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+    def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
+        """Default gpu_memory_utilization to RBLN_DEFAULT_GPU_MEMORY_UTILIZATION.
+
+        The field has no unset sentinel: EngineArgs and LLM.__init__ both bake
+        upstream's default in before any platform hook runs, so a value equal to
+        upstream's own default is the only sign that the user left it alone. An
+        explicit value equal to that default is therefore raised as well.
+        """
         from vllm.config import CacheConfig
 
+        cache_config = vllm_config.cache_config
+        if cache_config.gpu_memory_utilization == CacheConfig.gpu_memory_utilization:
+            cache_config.gpu_memory_utilization = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_rbln.config import build_rbln_config
         from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
         from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
@@ -320,10 +336,6 @@ class RblnPlatform(Platform):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-
-        cache_config = vllm_config.cache_config
-        if cache_config.gpu_memory_utilization == CacheConfig.gpu_memory_utilization:
-            cache_config.gpu_memory_utilization = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
 
         # NOTE(RBLN): checked here, not in `validate_and_setup_prerequisite` --
         # that runs only inside the vLLM-native branch below, and the optimum
