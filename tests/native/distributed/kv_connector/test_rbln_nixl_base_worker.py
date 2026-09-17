@@ -63,6 +63,7 @@ def _build_worker(
     nixl_available=True,
     swa_view_opt=False,
     use_mla=False,
+    stripe_width=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -93,6 +94,9 @@ def _build_worker(
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
     vllm_config = MagicMock()
+    vllm_config.kv_transfer_config.kv_connector_extra_config = (
+        {} if stripe_width is None else {"stripe_width": stripe_width}
+    )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # No speculative decoding: the compat hash then folds what it always did.
     vllm_config.speculative_config = None
@@ -241,10 +245,18 @@ class TestRegisterKvCaches:
         worker.register_kv_caches({"layer0": "tensor"})
         assert worker._pending_kv_caches == {"layer0": "tensor"}
 
-    def test_host_bounce_creates_backend_and_delegates(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("stripe_width", "expected_kwargs"),
+        [(None, {}), (0, {"stripe_width": 0}), (1, {"stripe_width": 1})],
+    )
+    def test_host_bounce_creates_backend_and_delegates(
+        self, monkeypatch, stripe_width, expected_kwargs
+    ):
         # Host-bounce with the adapter creates the RBLN backend on the agent,
         # then delegates registration to upstream.
-        worker = _build_worker(monkeypatch, kv_buffer_device="cpu", nixl_available=True)
+        worker = _build_worker(
+            monkeypatch, kv_buffer_device="cpu", stripe_width=stripe_width
+        )
         worker.nixl_wrapper = "wrapper"
         worker._layer_specs = {"layer0": _impl_layer_spec()}
         worker.block_len_per_layer = [2048, 2048]
@@ -252,7 +264,9 @@ class TestRegisterKvCaches:
         monkeypatch.setattr(
             sys.modules["nixl_rbln"],
             "ensure_rbln_backend",
-            lambda wrapper, device_id=0: ensured.append((wrapper, device_id)),
+            lambda wrapper, device_id=0, **kwargs: ensured.append(
+                (wrapper, device_id, kwargs)
+            ),
             raising=False,
         )
         delegated = []
@@ -262,7 +276,7 @@ class TestRegisterKvCaches:
             lambda self, kv: delegated.append(kv),
         )
         worker.register_kv_caches({"layer0": "tensor"})
-        assert ensured == [("wrapper", 0)]
+        assert ensured == [("wrapper", 0, expected_kwargs)]
         assert delegated == [{"layer0": "tensor"}]
         assert worker._pending_kv_caches is None
         # Host staging needs the per-region counts too: a pipelined peer reaches
@@ -280,7 +294,7 @@ class TestRegisterKvCaches:
         monkeypatch.setattr(
             sys.modules["nixl_rbln"],
             "ensure_rbln_backend",
-            lambda wrapper, device_id=0: None,
+            lambda wrapper, device_id=0, *, stripe_width=None: None,
             raising=False,
         )
         delegated = []
@@ -451,7 +465,7 @@ class TestSetHostXferBufferOps:
 # The real method bodies run; only the external NIXL pieces are faked.
 
 
-def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
+def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64, stripe_width=None):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = _build_worker(
         monkeypatch,
@@ -459,6 +473,7 @@ def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
         num_blocks=num_blocks,
         block_size=block_size,
         nixl_available=True,
+        stripe_width=stripe_width,
     )
     worker.tp_rank = 0
     worker.world_size = 1
@@ -588,8 +603,11 @@ def _fake_nixl_rbln(xfer_result):
 class TestRegisterKvCachesImpl:
     # The deferred D2D body: hands the logical K/V regions to
     # nixl_rbln.register_kv_regions and absorbs the returned transfer tables.
-    def test_registers_with_vram_segment_and_captures_xfer_tables(self, monkeypatch):
-        worker = _prep_impl_worker(monkeypatch)
+    @pytest.mark.parametrize("stripe_width", [None, 0, 1])
+    def test_registers_with_vram_segment_and_captures_xfer_tables(
+        self, monkeypatch, stripe_width
+    ):
+        worker = _prep_impl_worker(monkeypatch, stripe_width=stripe_width)
         spec = _impl_layer_spec()
         worker._layer_specs = {"l0": spec, "l1": spec}
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
@@ -633,6 +651,8 @@ class TestRegisterKvCachesImpl:
         called = fake.register_kv_regions.call_args.kwargs
         assert called["mem"] == "VRAM"
         assert called["rbln_ctx_ptr"] == 0x1000
+        assert called.get("stripe_width") == stripe_width
+        assert ("stripe_width" in called) == (stripe_width is not None)
 
         # Returned transfer tables absorbed into worker state.
         assert worker.device_id == 0

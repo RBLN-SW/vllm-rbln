@@ -170,6 +170,10 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
 
+        self._stripe_width = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get("stripe_width")
+        )
+
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 
         # --- Chiplet geometry of one KV entry (D2D only) ---
@@ -294,7 +298,12 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         if self._use_rbln_nixl_backend:
             import nixl_rbln
 
-            nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0)
+            extra = (
+                {}
+                if self._stripe_width is None
+                else {"stripe_width": self._stripe_width}
+            )
+            nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0, **extra)
         page_sizes = self._layer_page_sizes(kv_caches)
         if len(page_sizes) > 1:
             # TODO(RBLN): delete once the pinned vLLM drops that assert --
@@ -603,12 +612,16 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         # (base addrs + block lens), already shard-expanded so upstream's
         # connector's descriptor math is correct without this connector
         # knowing the shard count.
+        extra = (
+            {} if self._stripe_width is None else {"stripe_width": self._stripe_width}
+        )
         xfer = nixl_rbln.register_kv_regions(
             self.nixl_wrapper,
             regions,
             device_id,
             mem=self.nixl_memory_type,
             rbln_ctx_ptr=rbln_ctx_ptr,
+            **extra,
         )
         self.device_id = device_id
         self.block_len_per_layer = list(xfer.block_lens)

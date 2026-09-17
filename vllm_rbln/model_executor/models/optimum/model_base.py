@@ -250,11 +250,17 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
+            text_config = hf_config.get_text_config()
+            layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
+            if hasattr(text_config, "layer_types"):
+                layer_override["layer_types"] = text_config.layer_types
+            if text_config is not hf_config:
+                layer_override = {"text_config": layer_override}
             model = spec.model_cls.from_pretrained(
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
-                config=hf_config,
                 dtype=self.model_config.dtype,
+                **layer_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path

@@ -1287,47 +1287,6 @@ class TestUsesFixedDecodeWindow:
         assert runner.uses_fixed_decode_window is False
 
 
-class TestFixedDecodeWindowConfig:
-    @staticmethod
-    def _runner(max_model_len, num_spec_tokens, block_size=1024, method="mtp"):
-        return _make_runner_stub(
-            max_model_len=max_model_len,
-            num_spec_tokens=num_spec_tokens,
-            speculative_config=make_speculative_config(method),
-            cache_config=SimpleNamespace(block_size=block_size),
-            rbln_config=RBLNConfig(),
-        )
-
-    @pytest.mark.parametrize("method", ["mtp", "ngram"])
-    def test_a_block_narrower_than_the_window_is_refused(self, method):
-        runner = self._runner(1024 * 4, 3, block_size=2, method=method)
-        with pytest.raises(ValueError, match="cannot hold the 4-slot"):
-            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
-
-    def test_a_fixed_window_that_misses_the_last_block_is_refused(self):
-        runner = self._runner(1024 * 4 + 2, 3)
-        with pytest.raises(ValueError, match="leaves 2 token"):
-            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
-
-    def test_the_same_last_block_is_allowed_without_a_fixed_window(self, monkeypatch):
-        # Same remainder, a method that falls back to qlen=1 there: not fatal, so
-        # it must not be refused at load. The guard is all that is under test, so
-        # the step after it ends the call.
-        runner = self._runner(1024 * 4 + 2, 3, method="ngram")
-
-        class PastTheGuard(Exception):
-            pass
-
-        def stop(self, kv_cache_config):
-            raise PastTheGuard
-
-        monkeypatch.setattr(
-            type(runner), "maybe_add_kv_sharing_layers_to_kv_cache_groups", stop
-        )
-        with pytest.raises(PastTheGuard):
-            runner.initialize_kv_cache(SimpleNamespace(kv_cache_groups=[]))
-
-
 class TestAllocateKvCacheTensors:
     # Device selection: "cpu" if not compiling, else self.device if device-tensor,
     # else "meta". The mapping/validation logic is exercised on CPU.

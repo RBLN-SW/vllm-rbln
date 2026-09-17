@@ -25,6 +25,7 @@ from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.native.v1.worker.utils import (
+    MAX_MODEL_LEN,
     make_scheduler_output,
     make_speculative_config,
     schedule_new,
@@ -62,12 +63,12 @@ def _decode_ready(
 
 
 class TestPrepareInputsSpecDecode:
-    def test_pads_query_to_full_spec_and_backfills_positions(
+    def test_pads_query_to_full_spec_behind_the_scheduled_tokens(
         self, make_model_runner, monkeypatch
     ):
         # 1 real + 1 draft = 2 logical tokens, but the decode query is fixed at
-        # num_spec_tokens + 1 = 3, so one slot is padded. Mid-block the used tail
-        # absorbs it, so the window re-runs the token before the scheduled ones.
+        # num_spec_tokens + 1 = 3, so one slot is padded. Away from the sequence's
+        # end the padding goes behind, leaving the scheduled tokens at the front.
         runner = make_model_runner()
         _decode_ready(runner, monkeypatch, num_spec_tokens=2)
 
@@ -80,8 +81,8 @@ class TestPrepareInputsSpecDecode:
 
         assert query_lengths.tolist() == [3]
         assert total == 3
-        # Slot 0 re-runs position 2; the scheduled tokens land in slots 1 and 2.
-        assert runner.positions[:3].tolist() == [2, 3, 4]
+        # The scheduled tokens land in slots 0 and 1; slot 2 is the back padding.
+        assert runner.positions[:3].tolist() == [3, 4, 5]
         # seq_lens follows the logical count (3 + 2), not the padded query
         # length, or attention would read a KV slot this step never wrote.
         assert runner.seq_lens[:1].tolist() == [5]
@@ -109,25 +110,25 @@ class TestPrepareInputsSpecDecode:
 
 class TestPrepareInputsFixedWindow:
     # A decode with a model-based drafter always stages num_spec_tokens + 1
-    # slots, spending the slack on tokens already computed in this block and
-    # putting whatever the block's used tail cannot absorb behind the scheduled
-    # token. Everything downstream has to follow the token, not the window.
+    # slots and puts the slack behind the scheduled token, so everything
+    # downstream has to follow the token, not the window.
     BLOCK = 1024
     NUM_SPEC = 2
 
     @pytest.mark.parametrize(
-        "num_computed,window_start,sample_slot",
+        "num_computed, front_pad",
         [
-            # Mid-block: the used tail holds the whole slack, so the window
-            # re-runs the two tokens before the scheduled one.
-            (3, 1, 2),
-            # At a block start there is no tail to re-run, so the slack has
-            # nowhere to go but behind the scheduled token.
-            (BLOCK, BLOCK, 0),
+            # The formula switches on `max_model_len`, not on the block: the
+            # window only shifts once it would run past the last KV slot the
+            # request will ever own.
+            (3, 0),
+            (MAX_MODEL_LEN - NUM_SPEC - 1, 0),
+            (MAX_MODEL_LEN - NUM_SPEC, 1),
         ],
+        ids=["mid_sequence", "last_placement_that_fits", "overshoots_by_one"],
     )
-    def test_window_is_fixed_and_stays_in_one_block(
-        self, make_model_runner, monkeypatch, num_computed, window_start, sample_slot
+    def test_the_window_is_fixed_and_shifts_only_at_max_model_len(
+        self, make_model_runner, monkeypatch, num_computed, front_pad
     ):
         runner = make_model_runner()
         _decode_ready(
@@ -138,19 +139,50 @@ class TestPrepareInputsFixedWindow:
         )
         window = self.NUM_SPEC + 1
 
-        logits_indices, spec_md, query_lengths, total = runner._prepare_inputs(
+        logits_indices, _, query_lengths, _ = runner._prepare_inputs(
             make_scheduler_output(num_scheduled_tokens={"a": 1}),
             np.array([1], dtype=np.int32),
         )
 
         assert query_lengths.tolist() == [window]
-        positions = runner.positions[:window].tolist()
-        assert positions == list(range(window_start, window_start + window))
-        assert window_start // self.BLOCK == positions[-1] // self.BLOCK
-        assert logits_indices.tolist() == [sample_slot]
+        start = num_computed - front_pad
+        assert runner.positions[:window].tolist() == list(range(start, start + window))
+        assert runner.positions[window - 1] < runner.max_model_len
+        assert logits_indices.tolist() == [front_pad]
+        assert runner.decode_back_pad_np[0] == self.NUM_SPEC - front_pad
         assert runner.seq_lens[:1].tolist() == [num_computed + 1]
 
-    def test_kept_drafts_at_a_block_start_sample_before_the_back_padding(
+    def test_only_the_request_near_the_end_shifts(self, make_model_runner, monkeypatch):
+        """front_pad is per request, so a request at the end of its context must
+        not move the rest of the batch."""
+        runner = make_model_runner()
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner._update_states(schedule_new("a", "b"))
+        near_end = MAX_MODEL_LEN - self.NUM_SPEC
+        for i, num_computed in enumerate((10, near_end)):
+            runner.input_batch.num_computed_tokens_cpu[i] = num_computed
+            runner.input_batch.num_tokens_no_spec[i] = num_computed
+        monkeypatch.setattr(runner, "num_spec_tokens", self.NUM_SPEC)
+        monkeypatch.setattr(
+            runner, "speculative_config", make_speculative_config("mtp")
+        )
+        runner._is_prefill_step = False
+        window = self.NUM_SPEC + 1
+
+        _, _, query_lengths, total = runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 1, "b": 1}),
+            np.array([1, 1], dtype=np.int32),
+        )
+
+        assert query_lengths.tolist() == [window, window]
+        assert runner.positions[:total].tolist() == [10, 11, 12] + list(
+            range(near_end - 1, near_end + 2)
+        )
+        assert runner.decode_back_pad_np[:2].tolist() == [self.NUM_SPEC, 1]
+
+    def test_kept_drafts_sample_before_the_back_padding(
         self, make_model_runner, monkeypatch
     ):
         runner = make_model_runner()
