@@ -84,7 +84,6 @@ class RBLNOptimumQwen3ASRForConditionalGeneration(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
 
     # optimum-rbln's Qwen3-ASR subclasses RBLNQwen3ForCausalLM, so the decoder
@@ -158,56 +157,22 @@ class RBLNOptimumQwen3ASRForConditionalGeneration(
             batched_features.to(self.dtype), features_mask
         )
 
-        # FIXME: embed_input_ids masked_scatters these into the text embeddings
-        # without a cast, so both towers must agree on dtype. Both come from
-        # rbln_config.dtype today; if that ever diverges, cast here (or override
-        # embed_input_ids) instead of loosening this assert.
-        text_dtype = self.model.get_input_embeddings().weight.dtype
-        assert audio_embeds.dtype == text_dtype, (
-            f"audio_tower emitted {audio_embeds.dtype} but embed_tokens is "
-            f"{text_dtype}; embed_input_ids requires the same dtype."
-        )
-
         output_lengths = _get_feat_extract_output_lengths(
             audio_input["audio_feature_lengths"]
         ).tolist()
         return list(audio_embeds.split(output_lengths))
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
-
-        request_nums = input_ids.shape[0]
-        is_prompt = model_input.is_prompt
-
-        assert len(model_input.running_requests_ids) == request_nums, (
-            f"The number of running requests is "
-            f"{len(model_input.running_requests_ids)}, "
-            f"but the shape of input_ids is {input_ids.shape}"
-        )
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-        cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
-            logits = self.model.prefill_decoder(
+        if model_input.is_prompt:
+            return self.model.prefill_decoder(
                 inputs_embeds=model_input.inputs_embeds,
-                block_tables=block_tables,
-                cache_position=cache_position,
+                block_tables=model_input.block_tables,
+                cache_position=model_input.input_positions,
             ).logits
-        else:
-            padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-            self.model.decoder = self.model.decoders[padded_batch_size]
-            input_ids = kwargs.pop("input_ids")
-            inputs_embeds = self.model.embed_tokens(input_ids)
-            logits = self.model.decoder(
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                block_tables=block_tables,
-            ).logits
-            logits = logits[:request_nums]
-        return logits
+
+        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
+        return self.model.decoder(
+            inputs_embeds=model_input.inputs_embeds,
+            cache_position=model_input.input_positions,
+            block_tables=model_input.block_tables,
+        ).logits
