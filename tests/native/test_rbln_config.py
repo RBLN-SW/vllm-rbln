@@ -142,6 +142,15 @@ def test_manual_strategy_needs_buckets():
         RBLNConfig(decode_batch_bucket_strategy="manual")
 
 
+@pytest.mark.parametrize("size", [0, -1])
+def test_a_sub_block_size_of_zero_or_less_is_rejected(size):
+    """`sub_block_size_in_use()` takes a size or None, so the field refuses
+    the values that would mean neither. Unset is None, not 0."""
+    with pytest.raises(ValueError, match="greater_than"):
+        build_rbln_config({"sub_block_size": size})
+    assert RBLNConfig().sub_block_size is None
+
+
 def test_get_rbln_config_needs_the_current_config_context():
     """It reads the config the model is being built under, so there has to be one."""
     from vllm_rbln.config import get_rbln_config

@@ -35,13 +35,13 @@ so each takes a `--rbln-*` flag, an `additional_config` key, or the environment 
 | Field | Flag | Environment variable | Default | Description |
 |---|---|---|---|---|
 | `enable_sub_block_cache` | `--rbln-enable-sub-block-cache` | `VLLM_RBLN_SUB_BLOCK_CACHE` | `true` | Enable sub-block prefix caching. |
-| `sub_block_size` | `--rbln-sub-block-size` | `VLLM_RBLN_SUB_BLOCK_SIZE` | `0` | Sub-block size in tokens; `0` takes the prefill chunk. |
+| `sub_block_size` | `--rbln-sub-block-size` | `VLLM_RBLN_SUB_BLOCK_SIZE` | unset | Sub-block size in tokens; unset takes the prefill chunk. A value has to be above zero. |
 
 `enable_sub_block_cache` decides whether the path runs at all.
 Turning it off while giving a `sub_block_size` is rejected,
 since the two ask for opposite things.
 
-Left at `0`, the sub-block size is the prefill chunk size (`max_num_batched_tokens`),
+Left unset, the sub-block size is the prefill chunk size (`max_num_batched_tokens`),
 so each prefill does not span multiple blocks.
 A smaller value decouples the two, so a prefill chunk can span two blocks.
 Storing across that boundary needs the multi-block attention store,

@@ -38,6 +38,7 @@ import os
 from dataclasses import field, fields
 from typing import TYPE_CHECKING, Any, Literal
 
+from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
@@ -81,10 +82,10 @@ class RBLNConfig:
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
-    sub_block_size: int = 0
-    """Sub-block size in tokens; 0 takes the prefill chunk
+    sub_block_size: int | None = Field(default=None, gt=0)
+    """Sub-block size in tokens; unset takes the prefill chunk
     (`max_num_batched_tokens`). `sub_block_size_in_use()` holds the rules a
-    non-zero value has to meet."""
+    given size has to meet."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""

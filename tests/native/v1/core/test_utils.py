@@ -208,11 +208,6 @@ class TestSubBlockSizeInUse:
         eligible(False)
         assert self._call() is None
 
-    def test_a_negative_size_is_rejected(self, eligible):
-        eligible(True)
-        with pytest.raises(ValueError, match="must be >= 0"):
-            self._call(sub_block_size=-1)
-
     @pytest.mark.parametrize(
         ("off", "named"),
         [

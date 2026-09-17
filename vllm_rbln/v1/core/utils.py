@@ -248,10 +248,10 @@ def sub_block_size_in_use(
     block_size: int,
     max_num_batched_tokens: int,
     kv_cache_config: KVCacheConfig,
-    sub_block_size: int = 0,
+    sub_block_size: int | None = None,
 ) -> int | None:
-    """The sub-block size prefix caching runs at (0 takes the prefill chunk),
-    or None when the scheduler stays on vLLM's manager.
+    """The sub-block size prefix caching runs at (None takes the prefill
+    chunk), or None when the scheduler stays on vLLM's manager.
 
     Every rule on the sub-block configuration is here. A size the caller asked
     for is honored or refused with a ValueError, never dropped on the way. The
@@ -261,9 +261,8 @@ def sub_block_size_in_use(
     # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
     from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 
+    # RBLNConfig's `gt=0` already refused anything but a size or None.
     wanted = sub_block_size
-    if wanted < 0:
-        raise ValueError(f"sub_block_size={wanted} must be >= 0")
     if not (sub_block_cache and enable_prefix_caching):
         if wanted:
             off = (

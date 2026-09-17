@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
-    VLLM_RBLN_SUB_BLOCK_SIZE: int = 0
+    VLLM_RBLN_SUB_BLOCK_SIZE: int | None = None
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -329,8 +329,9 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_CACHE": lambda: (
         os.environ.get("VLLM_RBLN_SUB_BLOCK_CACHE", "True").lower() in ("true", "1")
     ),
-    "VLLM_RBLN_SUB_BLOCK_SIZE": lambda: int(
-        os.environ.get("VLLM_RBLN_SUB_BLOCK_SIZE", 0)
+    # Unset is None, not 0: RBLNConfig takes a size above zero or nothing.
+    "VLLM_RBLN_SUB_BLOCK_SIZE": lambda: (
+        int(size) if (size := os.environ.get("VLLM_RBLN_SUB_BLOCK_SIZE")) else None
     ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage

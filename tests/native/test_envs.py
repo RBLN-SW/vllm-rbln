@@ -203,6 +203,8 @@ def test_unrecognized_value_disables_a_default_on_variable(monkeypatch):
 _PROBE_OVERRIDES = {
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY": "linear",
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": "3,5",
+    # Defaults to None, which _probe_value has no number to step off.
+    "VLLM_RBLN_SUB_BLOCK_SIZE": "128",
 }
 
 # Keys that resolve from a differently named variable: custom kernels follow the
@@ -243,6 +245,15 @@ def test_custom_kernel_follows_the_compiler_flag(monkeypatch):
 
     monkeypatch.setenv("RBLN_USE_CUSTOM_KERNEL", "1")
     assert envs.VLLM_RBLN_USE_CUSTOM_KERNEL is True
+
+
+def _annotation_names(annotation: str) -> set[str]:
+    """The type names an annotation allows, as ``type(...).__name__`` spells
+    them. A union lists each member, and ``None`` there means ``NoneType``."""
+    return {
+        "NoneType" if part == "None" else part.split("[")[0]
+        for part in (p.strip() for p in annotation.split("|"))
+    }
 
 
 def _declared_in_type_checking() -> dict[str, tuple[str, Any]]:
@@ -288,7 +299,7 @@ def test_declared_default_matches_resolved(monkeypatch, name):
 
     resolved = read(name)
     assert resolved == declared_default
-    assert type(resolved).__name__ == annotation.split("[")[0]
+    assert type(resolved).__name__ in _annotation_names(annotation)
 
 
 @pytest.mark.parametrize(
