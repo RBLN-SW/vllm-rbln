@@ -805,8 +805,9 @@ class TestDynamicKvConfig:
         )
 
     @pytest.fixture(autouse=True)
-    def _vllm_lane(self, monkeypatch):
-        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
+    def _dynamic_kv(self, monkeypatch):
+        # The path comes from `_cfg`, which states it on every config; the
+        # deprecated variable saying it too would be a conflict to resolve.
         monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
 
     def test_a_clean_config_passes(self):

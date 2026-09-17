@@ -322,21 +322,35 @@ def resolve_model_impl(additional_config: Any = None) -> ModelImpl:
     points of the processes it spawns.
     """
     if isinstance(additional_config, RBLNConfigBase):
-        return additional_config.model_impl
-
-    given = additional_config if isinstance(additional_config, dict) else {}
-    if "model_impl" in given:
-        return _as_model_impl(given["model_impl"])
+        given: ModelImpl | None = additional_config.model_impl
+    else:
+        keys = additional_config if isinstance(additional_config, dict) else {}
+        given = _as_model_impl(keys["model_impl"]) if "model_impl" in keys else None
 
     from vllm_rbln import envs
 
     # TODO(vllm-rbln>=0.12.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
     if "VLLM_RBLN_USE_VLLM_MODEL" in os.environ:
+        legacy: ModelImpl = "vllm" if envs.VLLM_RBLN_USE_VLLM_MODEL else "optimum"
+        if given is not None and given != legacy:
+            # Not the shadow warning `_resolve` gives an ordinary field, which
+            # the additional_config value simply wins. This one picks the config
+            # class, the device identity and the patch set, and the module
+            # import has already adopted the environment's answer by the time
+            # the key is read here.
+            raise ValueError(
+                f"VLLM_RBLN_USE_VLLM_MODEL selects the {legacy!r} model path "
+                f"and model_impl selects {given!r}. VLLM_RBLN_USE_VLLM_MODEL "
+                "is deprecated: unset it and keep --rbln-model-impl."
+            )
         logger.warning_once(
             "VLLM_RBLN_USE_VLLM_MODEL is deprecated and will be removed in "
             "0.12.0. Use --rbln-model-impl, or the additional_config key it "
             'writes, additional_config={"model_impl": "vllm"}, instead.'
         )
+
+    if given is not None:
+        return given
     return _as_model_impl(envs.model_impl_from_env())
 
 

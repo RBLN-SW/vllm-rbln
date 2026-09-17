@@ -37,6 +37,8 @@ def register_model():
 
 
 def register_ops():
+    import os
+
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
     from vllm_rbln import envs
     from vllm_rbln.platform import RblnPlatform
@@ -46,11 +48,12 @@ def register_ops():
     # point early enough to see every `create_engine_config` call.
     RblnPlatform._capture_model_impl()
 
-    # The environment is all there is here: this runs before the arguments are
-    # parsed. In the process that parses them that means "not yet", and the
-    # platform hook applies the same set afterwards; every other process was
-    # handed the resolved path by the one that spawned it.
-    if envs.model_impl_from_env() == "vllm":
+    # Only the path a parent already resolved can be acted on here: this runs
+    # before the arguments are parsed, so in the process that parses them the
+    # variable is unset and the platform hook applies the same set afterwards.
+    # Not `model_impl_from_env()`, which answers there too, from the deprecated
+    # variable: a patch applied on that guess outlives a flag that disagrees.
+    if os.environ.get(envs.RESOLVED_MODEL_IMPL_ENV) == "vllm":
         from vllm_rbln.patches import apply_registered_patches, apply_registrations
 
         apply_registrations()
