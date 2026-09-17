@@ -186,17 +186,19 @@ class TestSubBlockSizeInUse:
         eligible(True)
         assert self._call() == 512
 
-    def test_an_explicit_size_wins_and_needs_no_config_flag(self, eligible):
+    def test_an_explicit_size_wins_over_the_prefill_chunk(self, eligible):
         eligible(True)
-        assert self._call(sub_block_cache=False, sub_block_size=128) == 128
+        assert self._call(sub_block_size=128) == 128
 
     def test_none_without_prefix_caching(self, eligible):
         eligible(True)
         assert self._call(enable_prefix_caching=False) is None
 
-    def test_none_when_the_flag_is_off_and_no_size_is_given(self, eligible):
+    def test_the_flag_is_a_kill_switch(self, eligible):
+        # Off is off, whether or not a size came with it.
         eligible(True)
         assert self._call(sub_block_cache=False) is None
+        assert self._call(sub_block_cache=False, sub_block_size=128) is None
 
     def test_none_when_the_config_is_ineligible(self, eligible):
         eligible(False)

@@ -79,7 +79,8 @@ class RBLNConfig:
     """Use the custom RBLN kernels."""
 
     enable_sub_block_cache: bool = True
-    """Enable sub-block prefix caching, at `sub_block_size` granularity."""
+    """Enable sub-block prefix caching, at `sub_block_size` granularity. Off
+    keeps the upstream manager whatever `sub_block_size` says."""
 
     sub_block_size: int = 0
     """Sub-block size in tokens; 0 takes the prefill chunk
