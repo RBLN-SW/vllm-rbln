@@ -63,12 +63,7 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 
 class RBLNScheduler(Scheduler):
-    def __init__(
-        self,
-        *args,
-        sub_block_size: int | None = None,
-        **kwargs,
-    ) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
         self.num_lookahead_tokens: int = max(
@@ -79,14 +74,13 @@ class RBLNScheduler(Scheduler):
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
-        # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
-        # so that each prefill does not span multiple blocks.
         sub_block_size = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
             sub_block_cache=rbln_config.enable_sub_block_cache,
+            block_size=self.block_size,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             kv_cache_config=self.kv_cache_config,
-            sub_block_size=sub_block_size,
+            sub_block_size=rbln_config.sub_block_size,
         )
         if sub_block_size is not None:
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)

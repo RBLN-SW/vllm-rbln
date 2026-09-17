@@ -448,11 +448,14 @@ class DynamicKvSizer:
     def copy_stream_reserve_bytes(self) -> int:
         """Per-chiplet bytes to keep out of the KV budget when the scheduler
         will run sub-block prefix caching."""
+        rbln_config = self.vllm_config.additional_config
         in_use = sub_block_size_in_use(
             enable_prefix_caching=self.cache_config.enable_prefix_caching,
-            sub_block_cache=self.vllm_config.additional_config.enable_sub_block_cache,
+            sub_block_cache=rbln_config.enable_sub_block_cache,
+            block_size=self.cache_config.block_size,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             kv_cache_config=self.model_runner.kv_cache_config,
+            sub_block_size=rbln_config.sub_block_size,
         )
         return DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES if in_use is not None else 0
 

@@ -196,7 +196,11 @@ def create_rbln_scheduler(
         parallel_config=ParallelConfig(pipeline_parallel_size=pipeline_parallel_size),
         speculative_config=speculative_config,
         kv_transfer_config=kv_transfer_config,
-        additional_config=additional_config or {},
+        additional_config={
+            # RBLNConfig takes a size above zero or nothing at all.
+            **({"sub_block_size": sub_block_size} if sub_block_size else {}),
+            **(additional_config or {}),
+        },
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -211,7 +215,6 @@ def create_rbln_scheduler(
         block_size=block_size,
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
-        sub_block_size=sub_block_size,
     )
 
 

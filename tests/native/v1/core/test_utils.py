@@ -156,8 +156,8 @@ class TestShouldDeferSpecStep:
 
 
 class TestSubBlockSizeInUse:
-    """One predicate for the scheduler's manager choice and the worker's
-    copy-stream reserve."""
+    """The one place the sub-block configuration is decided: the scheduler's
+    manager choice, the worker's copy-stream reserve, and every rule."""
 
     @pytest.fixture
     def eligible(self, monkeypatch):
@@ -172,10 +172,20 @@ class TestSubBlockSizeInUse:
 
         return _set
 
+    @pytest.fixture(autouse=True)
+    def _not_cr13(self, monkeypatch):
+        # The runner's own card would otherwise decide the decoupled cases.
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+
     def _call(self, **kw):
         args = dict(
             enable_prefix_caching=True,
             sub_block_cache=True,
+            block_size=1024,
             max_num_batched_tokens=512,
             kv_cache_config=object(),
         )
@@ -186,18 +196,59 @@ class TestSubBlockSizeInUse:
         eligible(True)
         assert self._call() == 512
 
-    def test_an_explicit_size_wins_and_needs_no_config_flag(self, eligible):
-        eligible(True)
-        assert self._call(sub_block_cache=False, sub_block_size=128) == 128
-
     def test_none_without_prefix_caching(self, eligible):
         eligible(True)
         assert self._call(enable_prefix_caching=False) is None
 
-    def test_none_when_the_flag_is_off_and_no_size_is_given(self, eligible):
+    def test_none_when_the_flag_is_off(self, eligible):
         eligible(True)
         assert self._call(sub_block_cache=False) is None
 
     def test_none_when_the_config_is_ineligible(self, eligible):
         eligible(False)
         assert self._call() is None
+
+    @pytest.mark.parametrize(
+        ("off", "named"),
+        [
+            ({"sub_block_cache": False}, "enable_sub_block_cache"),
+            ({"enable_prefix_caching": False}, "enable_prefix_caching"),
+        ],
+    )
+    def test_a_size_that_something_turns_off_is_rejected(self, eligible, off, named):
+        # Without this the size is dropped and the run quietly has no sub-block
+        # caching at all.
+        eligible(True)
+        with pytest.raises(ValueError, match=named):
+            self._call(sub_block_size=128, **off)
+
+    def test_a_chunk_outside_the_block_bounds_is_rejected(self, eligible):
+        eligible(True)
+        with pytest.raises(ValueError, match="block_size >="):
+            self._call(block_size=256, max_num_batched_tokens=512, sub_block_size=256)
+
+    def test_a_size_the_kv_cache_cannot_hold_is_rejected(self, eligible):
+        # A size that is not a divisor of block_size, or a spec with no token
+        # axis to slice: without this the size is dropped and the run quietly
+        # has no sub-block caching at all.
+        eligible(False)
+        with pytest.raises(ValueError, match="not one this KV cache can hold"):
+            self._call(sub_block_size=128)
+
+    def test_the_derived_default_bows_out_where_it_does_not_fit(self, eligible):
+        # Nobody asked for sub-blocks here, so a chunk wider than the block
+        # steps aside rather than refusing to start.
+        eligible(True)
+        assert self._call(block_size=256, max_num_batched_tokens=512) is None
+
+    def test_a_size_below_the_chunk_needs_cr13(self, eligible, monkeypatch):
+        # The multi-block store the decoupled size needs is CR13-only.
+        from vllm_rbln import platform
+
+        eligible(True)
+        with pytest.raises(ValueError, match="REBEL CR13"):
+            self._call(sub_block_size=128)
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13"
+        )
+        assert self._call(sub_block_size=128) == 128
