@@ -171,12 +171,17 @@ def use_auto_port() -> bool:
 # does nothing the frontend does not overwrite.
 RESOLVED_MODEL_IMPL_ENV = "_VLLM_RBLN_RESOLVED_MODEL_IMPL"
 
+# Read once, at import: the variable names what the process that spawned this one
+# resolved, and `_apply_model_impl` overwrites it for the processes this one
+# spawns. Reading it later would hand this process its own answer back, and a
+# second engine built without a path of its own would take the first one's.
+INHERITED_MODEL_IMPL = os.environ.get(RESOLVED_MODEL_IMPL_ENV) or None
+
 
 def model_impl_from_env() -> str:
-    """The model path the environment names, for a reader with no config yet."""
-    resolved = os.environ.get(RESOLVED_MODEL_IMPL_ENV)
-    if resolved:
-        return resolved
+    """The model path this process was started on, for a reader with no config."""
+    if INHERITED_MODEL_IMPL:
+        return INHERITED_MODEL_IMPL
     # TODO(vllm-rbln>=0.12.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
     # Silent here on purpose: `vllm_rbln.platform` calls this while `vllm` is
     # still importing itself, and a logger would pull `vllm` back in.

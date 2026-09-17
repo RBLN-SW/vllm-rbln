@@ -23,6 +23,7 @@ import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+import vllm_rbln.envs as envs
 from vllm_rbln.config import (
     _GROUP_TITLE,
     OptimumRBLNConfig,
@@ -325,33 +326,35 @@ class TestResolveModelImpl:
         assert resolve_model_impl({"model_impl": "optimum"}) == "optimum"
 
     def test_nothing_given_is_the_default_path(self, monkeypatch):
-        # The suite conftest exports the deprecated variable, which is exactly
-        # what this asserts the absence of.
+        # Both names this suite sets are what the default is the absence of: the
+        # deprecated variable, and the path a parent hands down, which the
+        # conftest states for the whole session.
         monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
-        monkeypatch.delenv(RESOLVED_MODEL_IMPL_ENV, raising=False)
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
         assert resolve_model_impl() == "optimum"
         assert resolve_model_impl({}) == "optimum"
         assert resolve_model_impl(None) == "optimum"
 
     def test_the_deprecated_variable_still_selects_the_path(self, monkeypatch):
         # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         assert resolve_model_impl() == "vllm"
 
-    def test_the_published_path_wins_over_the_deprecated_variable(self, monkeypatch):
+    def test_the_inherited_path_wins_over_the_deprecated_variable(self, monkeypatch):
         # A spawned process is handed the resolved path; what the shell exported
         # has already been folded into it.
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
-        monkeypatch.setenv(RESOLVED_MODEL_IMPL_ENV, "optimum")
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", "optimum")
         assert resolve_model_impl() == "optimum"
 
-    def test_the_key_wins_over_the_published_path(self, monkeypatch):
+    def test_the_key_wins_over_the_inherited_path(self, monkeypatch):
         """A worker is handed the path, but an explicit key still decides.
 
         Nothing relies on this today; it keeps the ladder total, so a reader
         does not have to guess which of the two wins.
         """
-        monkeypatch.setenv(RESOLVED_MODEL_IMPL_ENV, "optimum")
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", "optimum")
         assert resolve_model_impl({"model_impl": "vllm"}) == "vllm"
 
     @pytest.mark.parametrize("value", ["transformers", "auto", True, None])

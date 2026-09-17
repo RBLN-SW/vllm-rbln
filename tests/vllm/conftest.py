@@ -413,8 +413,12 @@ def pytest_configure(config):
     # second call is what the platform hook makes right after; without it the
     # suite runs half-applied, RblnPlatform current yet every patched symbol
     # still upstream's.
+    from vllm_rbln import envs
     from vllm_rbln.platform import _apply_model_impl
 
+    # Said the way a parent says it, so a config built here with no path of
+    # its own resolves to this one rather than to the default.
+    envs.INHERITED_MODEL_IMPL = "vllm"
     _apply_model_impl("vllm")
 
     # Imported only now: it copies USE_DEVICE_TENSOR into its own namespace, as

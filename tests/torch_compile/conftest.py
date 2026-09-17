@@ -48,8 +48,12 @@ def pytest_configure(config):
     # adopts the path in create_engine_config, and no engine is built here. The
     # second call is what the platform hook makes right after, and register_ops
     # above could not, having run before any of this was known.
+    from vllm_rbln import envs
     from vllm_rbln.platform import _apply_model_impl
 
+    # Said the way a parent says it, so a config built here with no path of
+    # its own resolves to this one rather than to the default.
+    envs.INHERITED_MODEL_IMPL = "vllm"
     _apply_model_impl("vllm")
 
     from vllm_rbln.platform import vllm_impl
