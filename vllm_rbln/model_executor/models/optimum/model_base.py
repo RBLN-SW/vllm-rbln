@@ -250,30 +250,28 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
-            text_config = hf_config.get_text_config()
-            layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
-            if hasattr(text_config, "layer_types"):
-                layer_override["layer_types"] = text_config.layer_types
-            # gemma4 keys per-layer overrides by layer index and validates them
-            # against num_hidden_layers. optimum-rbln rebuilds the text config
-            # from the checkpoint's own config.json merged with these kwargs, so
-            # a reduced depth must bring its own pruned mapping or the
-            # checkpoint's full-depth keys outlive the smaller layer count.
-            if getattr(text_config, "is_heterogeneous", False):
-                layer_override["per_layer_config"] = {
-                    layer_idx: {
-                        attr: getattr(text_config.per_layer_config[layer_idx], attr)
-                        for attr in text_config.per_layer_attributes
-                    }
-                    for layer_idx in range(text_config.num_hidden_layers)
-                }
-            if text_config is not hf_config:
-                layer_override = {"text_config": layer_override}
+            # vLLM shadows some transformers config classes (qwen3_asr), and a
+            # shadowed class is not what the transformers model expects, so only
+            # those fall back to the layer count as HF config kwargs.
+            # FIXME(optimum-rbln): that fallback is not equivalent --
+            # RBLNGptOssForCausalLM.get_pytorch_model discards the kwargs.
+            if type(hf_config).__module__.startswith("transformers."):
+                config_override = {"config": hf_config}
+            else:
+                text_config = hf_config.get_text_config()
+                layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
+                if hasattr(text_config, "layer_types"):
+                    layer_override["layer_types"] = text_config.layer_types
+                config_override = (
+                    layer_override
+                    if text_config is hf_config
+                    else {"text_config": layer_override}
+                )
             model = spec.model_cls.from_pretrained(
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
                 dtype=self.model_config.dtype,
-                **layer_override,
+                **config_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
