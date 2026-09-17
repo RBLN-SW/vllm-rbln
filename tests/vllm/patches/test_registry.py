@@ -432,7 +432,7 @@ class TestApplySites:
 
     ``register_ops`` covers every process that inherits a resolved model path;
     the process that resolves it applies them from the platform hook instead.
-    Both apply the whole set, and a narrower one would leave a process
+    Both apply the whole registry, and a narrower set would leave a process
     half-patched, so that is pinned here rather than left to the call site.
     """
 
