@@ -43,8 +43,11 @@ since the two ask for opposite things.
 
 Left at `0`, the sub-block size is the prefill chunk size (`max_num_batched_tokens`),
 so each prefill does not span multiple blocks.
-A smaller value decouples the two, and the scheduler then requires
-`block_size >= max_num_batched_tokens >= sub_block_size`.
+A smaller value decouples the two, so a prefill chunk can span two blocks.
+Storing across that boundary needs the multi-block attention store,
+which REBEL CR13 alone carries — the scheduler rejects the decoupled setting on
+any other device.
+The scheduler also requires `block_size >= max_num_batched_tokens >= sub_block_size`.
 
 For cross-engine prefix-aware routing (e.g., llm-d):
 enable KV events via `--kv-events-config` in vLLM and

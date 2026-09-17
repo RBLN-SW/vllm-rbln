@@ -30,6 +30,10 @@ from tests.native.v1.core.utils import (
 BLOCK_SIZE = 16
 SUB_BLOCK_SIZE = 4
 
+# Every scheduler here picks a sub_block_size below the prefill chunk, which
+# only CR13 can run.
+pytestmark = pytest.mark.usefixtures("cr13")
+
 
 class TestScheduleSubBlockCopyOps:
     # The scheduler's own role: draining the manager's copy ops and releasing

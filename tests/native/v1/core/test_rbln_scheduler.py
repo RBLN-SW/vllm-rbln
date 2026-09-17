@@ -41,6 +41,7 @@ from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
 class TestSchedulerInit:
+    @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
         # prefix caching + eligible config + sub_block_size -> RBLNKVCacheManager.
         sched = create_rbln_scheduler(
@@ -64,6 +65,7 @@ class TestSchedulerInit:
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
 
+    @pytest.mark.usefixtures("cr13")
     def test_additional_config_sets_the_sub_block_size(self):
         # RBLNConfig.sub_block_size decouples the sub-block from the chunk.
         sched = create_rbln_scheduler(
@@ -90,6 +92,30 @@ class TestSchedulerInit:
         # prefix caching off -> plain KVCacheManager.
         sched = create_rbln_scheduler(enable_prefix_caching=False)
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+    def test_a_sub_block_below_the_chunk_needs_cr13(self, monkeypatch):
+        # Equal to the chunk runs anywhere; below it needs the multi-block
+        # store. Pinning the name keeps the answer off the runner's device.
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+        )
+        assert sched.kv_cache_manager.sub_block_size == 128
+        with pytest.raises(ValueError, match="REBEL CR13"):
+            create_rbln_scheduler(
+                enable_prefix_caching=True,
+                block_size=1024,
+                max_num_batched_tokens=128,
+                max_model_len=2048,
+                sub_block_size=64,
+            )
 
     def test_a_chunk_outside_the_block_bounds_is_rejected(self):
         # The prefill's multi-block store addresses at most block start_blk+1,
@@ -178,6 +204,7 @@ class TestUpdateFromOutput:
         with pytest.raises(AssertionError):
             sched.update_from_output(object(), None)
 
+    @pytest.mark.usefixtures("cr13")
     def test_calls_do_pending_indexing_with_rbln_manager(self):
         # With the RBLN manager, update_from_output runs sub-block indexing so
         # the full block's sub-blocks land in the index.
@@ -206,6 +233,7 @@ class TestUpdateFromOutput:
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
 
+@pytest.mark.usefixtures("cr13")
 class TestTrySubBlockMatch:
     @staticmethod
     def _seeded_scheduler():
@@ -1098,6 +1126,7 @@ class TestPriorityScheduling:
         assert all(r.is_finished() for r in reqs)
 
 
+@pytest.mark.usefixtures("cr13")
 class TestSpecDecodeRetroactiveTrim:
     # A decode-ready join whose backfill window would cross a block boundary
     # forces the whole decode batch to no-spec. Reachable only via a prefix
@@ -1388,6 +1417,7 @@ class TestDeferredBlockFree:
         assert output.total_num_scheduled_tokens == 0
         assert sched.sched_step_seq == 0
 
+    @pytest.mark.usefixtures("cr13")
     def test_deferred_free_settles_sub_block_state(self):
         # The fenced path releases blocks through pop_blocks_for_free(), so the
         # sub-block bookkeeping has to be settled there as free() settles it.

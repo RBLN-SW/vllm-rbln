@@ -85,7 +85,8 @@ class RBLNConfig:
     """Sub-block size in tokens; 0 takes the prefill chunk
     (`max_num_batched_tokens`). Giving one with `enable_sub_block_cache` off is
     rejected. The scheduler requires
-    `block_size >= max_num_batched_tokens >= sub_block_size`."""
+    `block_size >= max_num_batched_tokens >= sub_block_size`, and anything below
+    the chunk runs on REBEL CR13 only."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""

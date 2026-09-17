@@ -482,6 +482,18 @@ def whole_model(pytestconfig) -> bool:
     return pytestconfig.getoption("--num-hidden-layers") == 0
 
 
+@pytest.fixture
+def cr13(monkeypatch):
+    """Report the host as REBEL CR13, whatever it really is.
+
+    A sub_block_size below the prefill chunk is CR13-only, so a test that picks
+    one has to name the device rather than inherit the runner's.
+    """
+    from vllm_rbln import platform
+
+    monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13")
+
+
 @pytest.fixture(autouse=True)
 def _drop_envs_shadows():
     """Remove any ``vllm_rbln.envs`` attribute a test left behind.
