@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
+
 import time
 
 from vllm import LLM, SamplingParams
@@ -62,11 +62,9 @@ def main():
     # Create an LLM without prefix caching as a baseline.
     regular_llm = LLM(
         model=MODEL,
-        block_size=1024,
-        max_num_batched_tokens=1024,
+        block_size=4096,
         max_model_len=8192,
         max_num_seqs=3,
-        tensor_parallel_size=4,
         enable_prefix_caching=False,
     )
 
@@ -92,21 +90,19 @@ def main():
 
     # Destroy the LLM object and free up the GPU memory.
     del regular_llm
-    cleanup_dist_env_and_memory()
+    # cleanup_dist_env_and_memory()
 
     # Create an LLM with prefix caching enabled.
     prefix_cached_llm = LLM(
         model=MODEL,
-        block_size=1024,
-        max_num_batched_tokens=1024,
+        block_size=4096,
         max_model_len=8192,
         max_num_seqs=3,
-        tensor_parallel_size=4,
         enable_prefix_caching=True,
     )
 
     # Warmup so that the shared prompt's KV cache is computed.
-    prefix_cached_llm.generate(generating_prompts[0], sampling_params)
+    # prefix_cached_llm.generate(generating_prompts[0], sampling_params)
 
     # Generate with prefix caching.
     start_time = time.time()
