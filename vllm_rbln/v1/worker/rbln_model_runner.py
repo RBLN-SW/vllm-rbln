@@ -498,7 +498,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and self.rbln_config.specialize_moe_decode
         )
         # The batched dynamic decode kernel (REBEL CR13, or any device with
-        # VLLM_RBLN_BATCH_ATTN_OPT) processes the first valid_batch[p] rows of
+        # --rbln-use-batch-attn-opt) processes the first valid_batch[p] rows of
         # partition p and early-exits on the rest, which is only correct when
         # rows are sorted by descending sequence length.
         self.sort_batch_by_length = (
@@ -3204,7 +3204,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             raise NotImplementedError(
                 "Sub-block prefix caching does not support "
                 "multi-group KV caches yet.  "
-                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
+                "Pass --no-rbln-enable-sub-block-cache to disable."
             )
 
         kv_cache_config = deepcopy(kv_cache_config)
@@ -3652,7 +3652,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and self.rbln_config.compile_model
         ):
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
-            # in this path (VLLM_RBLN_USE_VLLM_MODEL).
+            # in this path (--rbln-model-impl vllm).
             for op in copy_ops:
                 runtime = self.runtime_holder[0]
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)

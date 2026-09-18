@@ -89,24 +89,18 @@ if TYPE_CHECKING:
 def get_num_devices_per_local_rank() -> int:
     """Number of NPU devices assigned to each local rank.
 
-    Resolves ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``. For backward
-    compatibility the deprecated ``VLLM_RBLN_TP_SIZE`` is still honored as a
-    fallback when the new variable is unset, and emits a deprecation warning.
+    Resolves ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``, and the older
+    ``VLLM_RBLN_TP_SIZE`` as a fallback when it is unset. Both are deprecated;
+    `_env_overrides` warns, naming the flag that replaces them. Nothing here
+    may log: this module has to stay importable while `vllm` is, and
+    `vllm_rbln.logger` imports `vllm`.
     """
     new_value = os.environ.get("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK")
+    if new_value is not None:
+        return int(new_value)
+
     legacy_value = os.environ.get("VLLM_RBLN_TP_SIZE")
-
-    if legacy_value is not None:
-        from vllm_rbln.logger import init_logger
-
-        init_logger(__name__).warning_once(
-            "VLLM_RBLN_TP_SIZE is deprecated and will be removed in a future "
-            "release. Please use VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK instead."
-        )
-        if new_value is None:
-            return int(legacy_value)
-
-    return int(new_value) if new_value is not None else 1
+    return int(legacy_value) if legacy_value is not None else 1
 
 
 def get_decode_batch_bucket_strategy() -> str:
@@ -167,6 +161,33 @@ def use_auto_port() -> bool:
         "true",
         "1",
     )
+
+
+# Not a knob, so it is a plain constant and has no entry below: the frontend
+# writes the resolved model path here for the processes it spawns, which run
+# their plugin entry points before the config reaches them. The leading
+# underscore keeps it out of the VLLM_RBLN_* namespace that `environment_variables`
+# owns, while leaving it where `env | grep RBLN` finds it. Setting it by hand
+# does nothing the frontend does not overwrite.
+RESOLVED_MODEL_IMPL_ENV = "_VLLM_RBLN_RESOLVED_MODEL_IMPL"
+
+# Read once, at import: the variable names what the process that spawned this one
+# resolved, and `_apply_model_impl` overwrites it for the processes this one
+# spawns. Reading it later would hand this process its own answer back, and a
+# second engine built without a path of its own would take the first one's.
+INHERITED_MODEL_IMPL = os.environ.get(RESOLVED_MODEL_IMPL_ENV) or None
+
+
+def model_impl_from_env() -> str:
+    """The model path this process was started on, for a reader with no config."""
+    if INHERITED_MODEL_IMPL:
+        return INHERITED_MODEL_IMPL
+    # TODO(vllm-rbln>=0.12.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
+    # Silent here on purpose: `vllm_rbln.platform` calls this while `vllm` is
+    # still importing itself, and a logger would pull `vllm` back in.
+    # `resolve_model_impl` warns instead.
+    legacy = os.environ.get("VLLM_RBLN_USE_VLLM_MODEL", "False")
+    return "vllm" if legacy.lower() in ("true", "1") else "optimum"
 
 
 # extended environments

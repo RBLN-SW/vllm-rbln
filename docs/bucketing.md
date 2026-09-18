@@ -6,7 +6,8 @@ small, reusable set of bucket sizes. Instead of compiling a new graph whenever
 supported bucket and padded before the model forward pass. Prefill always uses
 `batch_size = 1` and is unaffected by the settings below.
 
-> Bucketing is automatically enabled when `VLLM_RBLN_USE_VLLM_MODEL=1`.
+> Bucketing is automatically enabled on the vllm model path
+> (`--rbln-model-impl vllm`).
 
 Key components:
 
@@ -18,16 +19,17 @@ Key components:
 
 ## Enabling and Configuring
 
-Bucketing is controlled entirely through environment variables that the runner
-reads from `vllm_rbln.envs` at import time. Set them before launching the
-worker (e.g. in your launcher script or shell).
+Bucketing is controlled entirely through `--rbln-*` flags. `LLM(...)` takes the
+same options as `additional_config` keys, spelled without the prefix:
+`--rbln-decode-batch-bucket-min 2` is
+`additional_config={"decode_batch_bucket_min": 2}`.
 
-| Variable | Default | Description |
+| Flag | Default | Description |
 | --- | --- | --- |
-| `VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY` | `exponential` | Chooses the bucketing implementation. Accepts `exponential` (or `exp`) or `linear`. |
-| `VLLM_RBLN_DECODE_BATCH_BUCKET_MIN` | `1` | Smallest allowed decode batch size. Requests smaller than this are still padded to `1`. |
-| `VLLM_RBLN_DECODE_BATCH_BUCKET_STEP` | `2` | Controls how aggressively bucket sizes shrink. Meaning depends on the strategy (division factor for exponential, subtraction step for linear). Must be > 0, and > 1 for exponential. |
-| `VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT` | `32` | Maximum number of decode buckets to generate. |
+| `--rbln-decode-batch-bucket-strategy` | `exponential` | Chooses the bucketing implementation. Accepts `exponential` (or `exp`) or `linear`. |
+| `--rbln-decode-batch-bucket-min` | `1` | Smallest allowed decode batch size. Requests smaller than this are still padded to `1`. |
+| `--rbln-decode-batch-bucket-step` | `2` | Controls how aggressively bucket sizes shrink. Meaning depends on the strategy (division factor for exponential, subtraction step for linear). Must be > 0, and > 1 for exponential. |
+| `--rbln-decode-batch-bucket-limit` | `32` | Maximum number of decode buckets to generate. |
 
 ## Strategy Details
 
@@ -42,10 +44,10 @@ worker (e.g. in your launcher script or shell).
 Example:
 
 ```bash
-export VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY=exp
-export VLLM_RBLN_DECODE_BATCH_BUCKET_MIN=2
-export VLLM_RBLN_DECODE_BATCH_BUCKET_STEP=2
-export VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT=4
+--rbln-decode-batch-bucket-strategy exp
+--rbln-decode-batch-bucket-min 2
+--rbln-decode-batch-bucket-step 2
+--rbln-decode-batch-bucket-limit 4
 # vllm server launched with max_num_seqs=32, pipeline_parallel_size=1
 ```
 
@@ -64,10 +66,10 @@ For the configuration above the decode batch buckets are `[32, 16, 8, 4]`.
 Example:
 
 ```bash
-export VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY=linear
-export VLLM_RBLN_DECODE_BATCH_BUCKET_MIN=2
-export VLLM_RBLN_DECODE_BATCH_BUCKET_STEP=4
-export VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT=32
+--rbln-decode-batch-bucket-strategy linear
+--rbln-decode-batch-bucket-min 2
+--rbln-decode-batch-bucket-step 4
+--rbln-decode-batch-bucket-limit 32
 # vllm server launched with max_num_seqs=16, pipeline_parallel_size=1
 ```
 

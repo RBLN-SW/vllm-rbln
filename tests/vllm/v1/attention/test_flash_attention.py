@@ -650,7 +650,7 @@ class TestFlashImplInit:
     def test_fp8_with_custom_kernel_raises(self, cfg_custom_kernel):
         # The rbln_triton_ops variants drop the scales even on the flash
         # causal path.
-        with pytest.raises(NotImplementedError, match="CUSTOM_KERNEL"):
+        with pytest.raises(NotImplementedError, match="--rbln-use-custom-kernel"):
             make_impl(cfg_custom_kernel, kv_cache_dtype="fp8")
 
     def test_logits_soft_cap_disabled_with_warning(self, cfg, monkeypatch):

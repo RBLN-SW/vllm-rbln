@@ -26,7 +26,6 @@ from vllm_rbln.platform import USE_DEVICE_TENSOR
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     from vllm_rbln.config import RBLNConfig
 
@@ -34,13 +33,17 @@ logger = init_logger(__name__)
 
 
 def patch_upstream() -> None:
-    """The vllm model path replaces no upstream symbol from the platform hook."""
+    """Replace the upstream symbols the vllm model path needs.
 
+    This is the process that resolves the model path, so it is the one
+    ``register_ops`` cannot serve: that entry point runs before the arguments
+    are parsed. Every other process inherits the resolved path and applies the
+    same registry from there.
+    """
+    from vllm_rbln.patches import apply_registered_patches, apply_registrations
 
-def add_cli_args(parser: "FlexibleArgumentParser") -> None:
-    from vllm_rbln.config import add_rbln_cli_args
-
-    add_rbln_cli_args(parser)
+    apply_registrations()
+    apply_registered_patches()
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
@@ -106,9 +109,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
             or parallel_config.enable_expert_parallel
         ) and not rbln_config.use_moe_tokens_mask:
             raise ValueError(
-                "VLLM_RBLN_USE_MOE_TOKENS_MASK is required when DP or EP enabled: "
+                "--rbln-use-moe-tokens-mask is required when DP or EP enabled: "
                 "the mask marks padded tokens introduced by DP multicast. "
-                "Set VLLM_RBLN_USE_MOE_TOKENS_MASK=1 (default)."
+                "It is on by default; drop --no-rbln-use-moe-tokens-mask."
             )
 
     if (
@@ -305,7 +308,7 @@ def _wire(vllm_config: "VllmConfig") -> None:
         logger.warning(
             "Disabling asynchronous scheduling: it requires "
             "VLLM_RBLN_USE_DEVICE_TENSOR=1 (got %s), which carries the "
-            "in-flight sampled tokens, and VLLM_RBLN_SAMPLER=1 (got %s), "
+            "in-flight sampled tokens, and --rbln-use-custom-sampler (got %s), "
             "which puts the sampler on the device so those tokens never "
             "reach the host mid-step. Running synchronously.",
             int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
