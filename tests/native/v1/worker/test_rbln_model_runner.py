@@ -354,6 +354,9 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
         max_num_reqs=8,
+        input_batch=SimpleNamespace(
+            top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
+        ),
         rejection_sampler=SimpleNamespace(
             impl=SimpleNamespace(rejection_sample=rejection_sample)
         ),
@@ -361,17 +364,38 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
 
     runner._warmup_sampler_decode_batches()
 
-    # One call per bonus-token graph: the argmax-in-graph one an all-greedy
-    # step without logprobs takes, and the pre-sampled-ids one every other
-    # step takes. Both are warmed at the same batch bound.
-    assert rejection_sample.call_count == 2
+    # One call per graph, all at the batch bound; a filtered random pattern
+    # twice, once with buffer views and once with torch.cat metadata.
+    buffers = {runner.input_batch.top_k.data_ptr(), runner.input_batch.top_p.data_ptr()}
+    variants = []
     for call in rejection_sample.call_args_list:
         assert len(call.args[1]) == 4
-    variants = [
-        (call.args[6] is None, call.kwargs["bonus_logits"] is None)
-        for call in rejection_sample.call_args_list
-    ]
-    assert sorted(variants) == [(False, True), (True, False)]
+        metadata = call.args[7]
+        filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]
+        variants.append(
+            (
+                call.args[6] is None,
+                call.kwargs["bonus_logits"] is None,
+                metadata.all_greedy,
+                metadata.top_k is None,
+                metadata.top_p is None,
+                bool(filters) and filters[0].data_ptr() in buffers,
+            )
+        )
+    # (no bonus ids, no bonus logits, all_greedy, no top_k, no top_p, buffer view)
+    assert sorted(variants) == sorted(
+        [
+            (False, True, True, True, True, False),  # bonus ids (logprobs)
+            (True, False, True, True, True, False),  # all-greedy argmax in the graph
+            (True, False, False, True, True, False),  # random, no filter
+            (True, False, False, True, False, True),  # random, top_p, buffer view
+            (True, False, False, True, False, False),  # random, top_p, torch.cat
+            (True, False, False, False, True, True),  # random, top_k, buffer view
+            (True, False, False, False, True, False),  # random, top_k, torch.cat
+            (True, False, False, False, False, True),  # random, top_k+top_p, view
+            (True, False, False, False, False, False),  # random, top_k+top_p, cat
+        ]
+    )
 
 
 class TestPredicates:
