@@ -10,7 +10,7 @@ env:
 _if_changed: &if_changed
   include:
     - ".buildkite/**"
-    - "tests/native/**"
+    - "tests/vllm/**"
     - "vllm_rbln/**"
     - "pyproject.toml"
     - "uv.lock"

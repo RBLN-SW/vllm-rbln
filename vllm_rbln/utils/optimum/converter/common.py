@@ -117,7 +117,7 @@ def is_chunked_prefill_arch(hf_config) -> bool:
 def get_user_max_num_batched_tokens(vllm_config: VllmConfig) -> int | None:
     """Return the user's explicit ``max_num_batched_tokens`` (``None`` if unset).
 
-    Stashed by ``RblnPlatform._capture_user_max_num_batched_tokens`` before vLLM
+    Stashed by ``optimum_impl._capture_user_max_num_batched_tokens`` before vLLM
     fills in its default.
     """
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config

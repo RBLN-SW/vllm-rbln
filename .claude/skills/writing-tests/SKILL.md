@@ -1,13 +1,13 @@
 ---
 name: writing-tests
-description: Use when adding or modifying tests under tests/native/ — covers placement, the model_compile/use_device/maybe_use_device marks, the session options, and proving a new test fails before the change it covers.
+description: Use when adding or modifying tests under tests/vllm/ — covers placement, the model_compile/use_device/maybe_use_device marks, the session options, and proving a new test fails before the change it covers.
 ---
 
-# Writing tests in the native suite
+# Writing tests in the vllm suite
 
 ## Scope
 
-This skill covers `tests/native/`, the vLLM-native path.
+This skill covers `tests/vllm/`, the vllm model path.
 
 For `tests/optimum/` the conventions are not settled. Do not carry the rules below into that suite — the marks and session options gate nothing there. Follow the patterns in the nearest existing directory, and ask before introducing a new one.
 
@@ -25,10 +25,10 @@ Answer these four before you write a line. If you cannot, ask instead of guessin
 Mirror the source tree:
 
 ```
-vllm_rbln/<path>/<module>.py  ->  tests/native/<path>/test_<module>.py
+vllm_rbln/<path>/<module>.py  ->  tests/vllm/<path>/test_<module>.py
 ```
 
-Root modules (`envs.py`, `platform.py`, …) get root-level files in `tests/native/`.
+Root modules (`envs.py`, `platform/`, …) get root-level files in `tests/vllm/`.
 
 Two directories are not mirrors. They hold whole-model tests, split by the question the test asks:
 
@@ -62,9 +62,9 @@ There is no `e2e/` directory today; four such files sit in four different subsys
 
 ## 5. Session options
 
-Read `tests/native/conftest.py` for the full text; the constraints that bite:
+Read `tests/vllm/conftest.py` for the full text; the constraints that bite:
 
-- `--device-tensor {0,1}` is session-wide. `platform.py` resolves it at module scope and several modules copy the value into their own namespace, so it **cannot** be parametrized per test. Run the suite once per value.
+- `--device-tensor {0,1}` is session-wide. `platform/__init__.py` resolves it at module scope and several modules copy the value into their own namespace, so it **cannot** be parametrized per test. Run the suite once per value.
 - `--num-hidden-layers N` builds only the first N decoder layers to cut compile time, and `hf_runner` truncates to the same N so comparisons stay like-for-like. Default is 3; `0` means the whole model.
 - The suite scrubs exported `VLLM_RBLN_*` variables. These options are the way in — do not read the environment directly to get around them.
 
@@ -72,8 +72,8 @@ Read `tests/native/conftest.py` for the full text; the constraints that bite:
 
 Check before adding anything new:
 
-- `tests/native/conftest.py`, and the local `conftest.py` in your subdirectory
-- `tests/native/utils.py`, `runners.py`, `model_specs.py`, `vllm_config.py`
+- `tests/vllm/conftest.py`, and the local `conftest.py` in your subdirectory
+- `tests/vllm/utils.py`, `runners.py`, `model_specs.py`, `vllm_config.py`
 - the `utils.py` beside your target, e.g. `v1/worker/utils.py`
 
 Shared helpers go in the `utils.py` nearest to their users. Do not add a new `helpers_*.py`.
