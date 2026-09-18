@@ -230,6 +230,18 @@ class TestSpanningBlockAllocation:
             positions=torch.zeros(n * QUERY_LEN, dtype=torch.int64),
             _dropped_rows=None,
             _build_draft_attn_metadata=reached,
+            # The bucket lookup runs between the allocation check and the
+            # metadata build; a live count that is its own bucket keeps the
+            # shapes as they are.
+            _determine_batch_execution_and_padding=lambda num_reqs, *_a, **_k: (
+                SimpleNamespace(num_reqs_padded=num_reqs),
+                None,
+            ),
+            runner=SimpleNamespace(dp_status=None, kv_cache_bases=None),
+            dp_rank=0,
+            max_num_tokens=n * QUERY_LEN,
+            parallel_drafting_token_id=0,
+            input_ids=torch.zeros(n * QUERY_LEN, dtype=torch.int32),
         )
         cad = make_cad(
             [i * QUERY_LEN for i in range(n + 1)], [c + QUERY_LEN for c in ctx_lens]
