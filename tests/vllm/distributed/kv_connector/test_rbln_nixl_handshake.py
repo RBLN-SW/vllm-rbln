@@ -3519,14 +3519,16 @@ class TestSplitAxisConstraints:
     # by them, which is the one thing a count cannot say.
 
     @staticmethod
-    def _worker(*, axis, tp_ratio=1, host_buffer=False, trim=False, block_size=16):
+    def _worker(
+        *, axis, tp_ratio=1, host_buffer=False, trim=False, block_size=16, sw_ratio=None
+    ):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w.use_host_buffer = host_buffer
         w._kv_split_axis = axis
         w._chunk_mode = trim
         w.block_size = block_size
-        w._sw_ratio = None
+        w._sw_ratio = sw_ratio
         topo = MagicMock()
         topo.tp_size = 2
         topo.tp_ratio.return_value = tp_ratio
@@ -3562,8 +3564,17 @@ class TestSplitAxisConstraints:
         meta = _agent_meta(
             kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
         )
-        with pytest.raises(RuntimeError, match="the same chunks"):
+        with pytest.raises(RuntimeError, match="cut one the same way"):
             w._check_split_axis_constraints(meta, 2)
+
+    def test_a_windowed_peer_must_size_its_block_the_same(self):
+        # The window range divides the peer's block by OUR `_sw_ratio`, so an
+        # unequal block size names a length that is not the peer's window --
+        # and the descriptor counts match either way, so nothing reports it.
+        w = self._worker(axis=KVSplitAxis.HEAD, sw_ratio=4, block_size=16)
+        meta = _agent_meta(block_size=32)
+        with pytest.raises(RuntimeError, match="cut one the same way"):
+            w._check_split_axis_constraints(meta, 1)
 
     def test_a_matching_block_size_passes_while_trimming(self):
         w = self._worker(axis=KVSplitAxis.NON_HEAD, trim=True, block_size=16)

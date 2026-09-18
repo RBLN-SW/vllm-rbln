@@ -419,12 +419,19 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 "descriptors. Use equal TP on both sides, or "
                 "kv_buffer_device='cpu'."
             )
-        if self._chunk_mode and nixl_agent_meta.block_size != self.block_size:
+        # Both ranges that name less than a block cut it by a number derived
+        # from OUR block size -- the chunk grid from it, the window range from
+        # `_sw_ratio` -- and both lists are cut by that one number. A peer whose
+        # block holds a different count is then cut into pieces that are not its
+        # own, while every byte count still fits.
+        if (self._chunk_mode or self._own_engine_layout) and (
+            nixl_agent_meta.block_size != self.block_size
+        ):
             raise RuntimeError(
-                "RBLN NIXL D2D: leaving part of a last block out needs both "
-                "sides to cut a block into the same chunks, but the peer's "
-                f"block holds {nixl_agent_meta.block_size} tokens and this "
-                f"worker's holds {self.block_size}."
+                "RBLN NIXL D2D: naming less than a whole block needs both "
+                "sides to cut one the same way, but the peer's block holds "
+                f"{nixl_agent_meta.block_size} tokens and this worker's holds "
+                f"{self.block_size}."
             )
 
     def _cleanup_remote_engine(
