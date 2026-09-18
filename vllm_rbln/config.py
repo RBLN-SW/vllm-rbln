@@ -87,7 +87,7 @@ class RBLNConfigBase:
 
 @vllm_config_dataclass
 class RBLNConfig(RBLNConfigBase):
-    """RBLN NPU options for the vLLM-native model path."""
+    """RBLN NPU options for the vllm model path."""
 
     model_impl: ModelImpl = "vllm"
 

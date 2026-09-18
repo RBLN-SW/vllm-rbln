@@ -408,7 +408,7 @@ def pytest_configure(config):
 
     load_general_plugins()
 
-    # This suite is the native path's, and nothing has said so yet: production
+    # This suite is the vllm model path's, and nothing has said so yet: production
     # adopts the path in create_engine_config, and no engine is built here. The
     # second call is what the platform hook makes right after; without it the
     # suite runs half-applied, RblnPlatform current yet every patched symbol

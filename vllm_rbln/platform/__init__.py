@@ -215,7 +215,7 @@ class RblnPlatform(Platform):
         being the one hook both `vllm serve` and `LLM(...)` reach before the
         config is built. Not a registry patch: the registry applies from inside
         `create_engine_config`, too late to wrap it, and `patches/` is the
-        native path's alone while this has to run on both.
+        vllm model path's alone while this has to run on both.
         """
         from vllm.engine.arg_utils import EngineArgs
 
@@ -423,7 +423,7 @@ class RblnPlatform(Platform):
         # kv_buffer_device "cpu" is the host-bounce path; "rbln" is the D2D
         # path (upstream NixlConnectorWorker.__init__ rejects kv_buffer_device
         # values not listed here). Listed under both device_types because
-        # device_type is "rbln" only on the vLLM-native path, and only
+        # device_type is "rbln" only on the vllm model path, and only
         # with VLLM_RBLN_USE_DEVICE_TENSOR set.
         return {
             "cpu": ("cpu", "rbln"),
