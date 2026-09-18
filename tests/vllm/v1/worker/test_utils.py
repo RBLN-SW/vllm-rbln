@@ -19,6 +19,10 @@
 import json
 import math
 import os
+import subprocess
+import sys
+import textwrap
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -163,6 +167,58 @@ class TestWorkerFailFast:
             worker_utils.abort_worker(RuntimeError("device failed"), where="step")
         assert excinfo.value.code == 70
         assert exit_codes == [70]
+
+    def test_a_blocked_record_does_not_hold_the_exit(self, monkeypatch, exit_codes):
+        release = threading.Event()
+        monkeypatch.setattr(worker_utils, "_write_event_line", lambda _: release.wait())
+        monkeypatch.setattr(worker_utils, "_FATAL_RECORD_TIMEOUT_S", 0.2)
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+        finally:
+            release.set()
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
+
+    def test_exit_is_not_held_by_a_stalled_stderr_consumer(self):
+        # A container's stderr is a pipe. Fill one, make it fd 2 and abort: the
+        # event write and the log line both land on it, and the exit must not
+        # wait for a reader that never drains it.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent("""
+                    import os
+
+                    import vllm_rbln.v1.worker.utils as worker_utils
+
+                    read_end, write_end = os.pipe()
+                    os.set_blocking(write_end, False)
+                    try:
+                        while True:
+                            os.write(write_end, b"x" * 65536)
+                    except BlockingIOError:
+                        pass
+                    os.set_blocking(write_end, True)
+                    os.dup2(write_end, 2)
+                    print("aborting on a full stderr pipe", flush=True)
+                    worker_utils.abort_worker(
+                        RuntimeError("stderr consumer stalled"), where="step"
+                    )
+                """),
+            ],
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(sys.path),
+                "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": "0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert "aborting on a full stderr pipe" in result.stdout, result.stderr
+        assert result.returncode == 70, result.stdout + result.stderr
 
     @staticmethod
     def _event_lines(capfd):

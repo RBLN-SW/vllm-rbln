@@ -18,6 +18,7 @@ import json
 import math
 import os
 import platform
+import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Mapping
@@ -65,6 +66,9 @@ _FAIL_FAST_EXIT_CODE = 70
 _FATAL_EVENT = "rbln.worker.fatal"
 _EVENT_SCHEMA_VERSION = 1
 _EVENT_MESSAGE_LIMIT = 500
+# How long the exit waits for the fatal record. stderr is a pipe whose reader
+# may have stalled; past this the record is dropped, not the exit.
+_FATAL_RECORD_TIMEOUT_S = 1.0
 
 
 def _write_event_line(line: str) -> None:
@@ -108,6 +112,9 @@ def _worker_rank(worker: Any) -> int | None:
 def _worker_dp_rank(worker: Any) -> int | None:
     config = getattr(worker, "parallel_config", None)
     rank = getattr(config, "data_parallel_rank", None)
+    if rank is None:
+        # An async output carries the ranks it was built with, not a config.
+        rank = getattr(worker, "dp_rank", None)
     return rank if isinstance(rank, int) else None
 
 
@@ -118,30 +125,39 @@ def abort_worker(
     rank: int | None = None,
     dp_rank: int | None = None,
 ) -> NoReturn:
-    """Exit without device cleanup when logging returns or raises.
+    """Exit without device cleanup once the failure is recorded or the record
+    has had its chance.
 
-    The structured event goes out first and never blocks the exit; the readable
-    record follows. No exit deadline is guaranteed if logging blocks on a
-    handler lock or I/O.
+    The structured event and the readable log line are written from a helper
+    thread; the exit waits for them at most _FATAL_RECORD_TIMEOUT_S. A blocked
+    stderr pipe or handler lock therefore costs the record, not the exit.
     """
-    try:
-        # The exit must not depend on the event reaching the log.
+
+    def record() -> None:
         with contextlib.suppress(Exception):
             _write_event_line(
                 _fatal_event(exc, where=where, rank=rank, dp_rank=dp_rank)
             )
-        logger.error(
-            "RBLN worker %d: %s raised %s: %s. Ending this worker process "
-            "with exit code %d so the executor detects the failure.",
-            os.getpid(),
-            where,
-            type(exc).__name__,
-            exc,
-            _FAIL_FAST_EXIT_CODE,
-            exc_info=exc,
+        with contextlib.suppress(Exception):
+            logger.error(
+                "RBLN worker %d: %s raised %s: %s. Ending this worker process "
+                "with exit code %d so the executor detects the failure.",
+                os.getpid(),
+                where,
+                type(exc).__name__,
+                exc,
+                _FAIL_FAST_EXIT_CODE,
+                exc_info=exc,
+            )
+
+    try:
+        recorder = threading.Thread(
+            target=record, name="rbln-fatal-record", daemon=True
         )
+        recorder.start()
+        recorder.join(_FATAL_RECORD_TIMEOUT_S)
     finally:
-        # StreamHandler flushes each record; avoid shutdown's handler locks.
+        # os._exit ends the process even while the recorder is still blocked.
         os._exit(_FAIL_FAST_EXIT_CODE)
 
 

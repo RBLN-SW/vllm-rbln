@@ -43,8 +43,13 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         placeholder_pos: dict[str, int],
         logprobs_tensors: LogprobsTensors | None,
         fail_fast: bool,
+        rank: int | None = None,
+        dp_rank: int | None = None,
     ):
         self.fail_fast = fail_fast
+        # Named in the fatal event when get_output() fails on the output thread.
+        self.rank = rank
+        self.dp_rank = dp_rank
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
         # For the token_ids_cpu write-back, applied by the main thread.

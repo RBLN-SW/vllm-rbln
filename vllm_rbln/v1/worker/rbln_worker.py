@@ -199,7 +199,7 @@ class RBLNWorker(WorkerBase):
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
-            self.vllm_config, self.device
+            self.vllm_config, self.device, rank=self.rank
         )
         self.dynamic_kv = DynamicKvSizer(
             self.vllm_config, self.model_runner, foreign_dram_used_bytes
