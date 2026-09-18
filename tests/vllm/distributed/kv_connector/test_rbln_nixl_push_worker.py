@@ -71,7 +71,7 @@ def _push_worker():
     w = object.__new__(RblnNixlPushConnectorWorker)
     w._push_writer_thread = None
     w.tp_rank = 0
-    # What __init__ leaves on a D2D worker with the SWA view-opt off, which is
+    # What __init__ leaves on a D2D worker with the SWA window mode off, which is
     # the shape the pairing predicates read before an engine is registered.
     w.use_host_buffer = False
     w._sw_ratio = None

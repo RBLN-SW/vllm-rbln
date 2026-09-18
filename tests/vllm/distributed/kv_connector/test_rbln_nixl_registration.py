@@ -1092,7 +1092,7 @@ class TestPpConstraints:
 
     @pytest.mark.parametrize("sw_ratio", [2, None])
     def test_swa_pp_raises(self, sw_ratio):
-        # `sw_ratio=None` is the model with the view-opt off: a sliding window
+        # `sw_ratio=None` is the model with window mode off: a sliding window
         # bars pipelining on its own, which is what `_has_swa` exists for.
         with pytest.raises(RuntimeError, match="sliding-window attention"):
             self._worker(
@@ -1576,7 +1576,7 @@ class TestTailBlockTrim:
 
 
 class TestChunkModeWithASlidingWindow:
-    """A hybrid engine is let into chunk mode because the view opt already
+    """A hybrid engine is let into chunk mode because window mode already
     gave its list a second descriptor range, which a third can follow. The
     per-shard lists it would otherwise be sent to cannot name two KV groups:
     their region-to-group map holds one group per region, and under HMA both

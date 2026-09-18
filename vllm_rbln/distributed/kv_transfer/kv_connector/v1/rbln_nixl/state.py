@@ -437,7 +437,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 and replica_fanout == 1
                 and kv_runs == 1
             ):
-                # No SWA view opt, whole-engine peer: upstream's Full-only
+                # No SWA window mode, whole-engine peer: upstream's Full-only
                 # layout, one handle covering every region.
                 return super().register_local_xfer_handler(block_size)
             # Per-peer shard: only the regions this peer serves, each cut into
@@ -459,7 +459,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             and split == 1
             and replica_fanout == 1
         ), (
-            "RBLN NIXL: SWA view-opt is not supported with pipeline "
+            "RBLN NIXL: SWA window mode is not supported with pipeline "
             "parallelism or heterogeneous tensor parallelism"
         )
         assert not self._has_mamba, "RBLN NIXL connector does not support Mamba layers."
@@ -545,7 +545,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         `chunk_grid` is `(runs, chunks)`: how many byte runs one piece is
         spread over and how many token chunks each run is cut into. Given, a
         second range of descriptors follows the first over the same addresses,
-        naming those chunks -- the shape `swa_view_opt` already
+        naming those chunks -- the shape `swa_window_mode` already
         uses for a shorter view of the same blocks. A transfer picks one range
         or the other by index, so both can be selected in one call.
 

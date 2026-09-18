@@ -62,7 +62,7 @@ def make_worker(monkeypatch, tmp_path_factory):
         direction: str = "pull",
         draft_kv_heads: int | None = None,
         kv_cache: KvGeometry | None = None,
-        swa_view_opt: bool = False,
+        swa_window_mode: bool = False,
         register: bool = True,
     ) -> Any:
         geometry = kv_cache or KvGeometry()
@@ -78,7 +78,7 @@ def make_worker(monkeypatch, tmp_path_factory):
         # Left open for the test's duration: get_current_attn_backends reads it
         # during __init__, and later production calls read it again.
         stack.enter_context(set_current_vllm_config(config))
-        set_connector_options(monkeypatch, config, swa_view_opt=swa_view_opt)
+        set_connector_options(monkeypatch, config, swa_window_mode=swa_window_mode)
 
         if geometry.draft_layers:
             assert config.speculative_config is not None, (

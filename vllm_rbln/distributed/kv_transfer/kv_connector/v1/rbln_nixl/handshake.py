@@ -658,7 +658,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         """Whether this peer is served by ``_build_head_matched_remote``.
 
         Any unequal TP degree, in either direction, on D2D without SWA
-        view-opt. ``tp_ratio`` is pure arithmetic on the two TP sizes, so this
+        window mode. ``tp_ratio`` is pure arithmetic on the two TP sizes, so this
         is safe to ask before the engine is registered.
         """
         if self.use_host_buffer or self._own_engine_layout:
@@ -1421,10 +1421,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
         indexes_into_remote = not self.topo.is_kv_replicated(engine_id) and tp_ratio > 0
 
-        # SWA view-opt never meets fan-in: unequal TP is head-matched, and
+        # SWA window mode never meets fan-in: unequal TP is head-matched, and
         # _check_d2d_region_pairing rejects SWA with any of it.
         assert tp_ratio >= 0, (
-            "RBLN NIXL SWA view-opt does not support remote TP > local TP "
+            "RBLN NIXL SWA window mode does not support remote TP > local TP "
             f"(tp_ratio={tp_ratio})."
         )
 

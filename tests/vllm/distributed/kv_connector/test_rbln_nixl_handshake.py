@@ -673,7 +673,7 @@ class TestPpHandshakeFanout:
     def test_swa_plus_pp_raises(self, sw_ratio):
         # The consumer's own guard, hit when it discovers a PP producer while
         # it has a sliding window; _check_pp_constraints is the separate
-        # producer-side check. sw_ratio=None is the same model, view-opt off.
+        # producer-side check. sw_ratio=None is the same model, window mode off.
         w = _make_worker(sw_ratio=sw_ratio, has_swa=True)
         sock = _FakeSock(pp_size=2)
         with pytest.raises(RuntimeError, match="sliding-window"):
@@ -1406,7 +1406,7 @@ class TestShardLocalRegions:
         assert {ln for _, ln, _ in blocks[whole * 2 :]} == {full_len // (runs * chunks)}
 
     def test_register_local_xfer_handler_routes_to_the_shard_path(self):
-        # Dispatch to the shard path: no SWA view opt, layer names present. Miss
+        # Dispatch to the shard path: no SWA window mode, layer names present. Miss
         # it and a stage registers the whole model's regions, so the descriptor
         # math addresses layers it does not own.
         w = self._wired_worker()
@@ -3104,7 +3104,7 @@ class TestD2DRegionPairing:
     @pytest.mark.parametrize("sw_ratio", [4, None])
     def test_heterogeneous_tp_with_swa_raises(self, sw_ratio):
         # A sliding window is refused with model parallelism whether or not the
-        # view-opt is on: `sw_ratio=None` is the model with the flag off, which
+        # window mode is on: `sw_ratio=None` is the model with it off, which
         # keys on `_has_swa` alone.
         w = self._worker(
             host_buffer=False,
