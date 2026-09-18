@@ -501,31 +501,38 @@ class TestTailTokenCountOnTheReadPath:
         # and reports zero, which is not a last block anyone can size.
         assert self._meta_for(monkeypatch, 0).valid_tokens == {}
 
-    def test_the_flag_off_collects_nothing(self, monkeypatch):
+    def test_both_flags_off_collect_nothing(self, monkeypatch):
         # The worker would not read it, and an entry nobody pops outlives its
         # request.
+        assert self._with_knobs(chunk_mode=False).valid_tokens == {}
+
+    def test_window_mode_alone_collects_the_count(self, monkeypatch):
+        # The count is not the chunk range's alone: a window's group reads it
+        # to say which granule of a block its window sits in.
+        assert self._with_knobs(
+            chunk_mode=False, swa_window_mode=True
+        ).valid_tokens == {"r0": 33}
+
+    def _with_knobs(self, **knobs):
         sched = _scheduler()
-        sched.vllm_config = mock_vllm_config(chunk_mode=False)
+        sched.vllm_config = mock_vllm_config(**knobs)
         req = _Request("r0", num_prompt_tokens=33, kv_transfer_params=self._params(33))
         sched._reqs_need_recv["r0"] = (req, ([7],))
-
-        meta = sched.build_connector_meta(_sched_output("other", ([9],), 16))
-
-        assert meta.valid_tokens == {}
+        return sched.build_connector_meta(_sched_output("other", ([9],), 16))
 
 
 class TestTailTokenCountOnTheWritePath:
     """The producer takes its own count where it hands the blocks over."""
 
     @staticmethod
-    def _finish(monkeypatch, delay_free_blocks, trim=True):
+    def _finish(monkeypatch, delay_free_blocks, trim=True, window=False):
         monkeypatch.setattr(
             NixlPushConnectorScheduler,
             "request_finished",
             lambda self, request, block_ids: (delay_free_blocks, None),
         )
         sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
-        sched.vllm_config = mock_vllm_config(chunk_mode=trim)
+        sched.vllm_config = mock_vllm_config(chunk_mode=trim, swa_window_mode=window)
         sched.request_finished(
             # Apart, so taking the prompt length instead of what was computed
             # is a different answer.
@@ -569,9 +576,16 @@ class TestTailTokenCountOnTheWritePath:
         # Nothing is handed over, so there is no write to size.
         assert self._finish(monkeypatch, False)._valid_tokens == {}
 
-    def test_the_flag_off_collects_nothing(self, monkeypatch):
+    def test_both_flags_off_collect_nothing(self, monkeypatch):
         # Same handover, and nothing kept: the worker would not read it.
         assert self._finish(monkeypatch, True, trim=False)._valid_tokens == {}
+
+    def test_window_mode_alone_collects_the_count(self, monkeypatch):
+        # As on the read path: the granule a window sits in is read off this
+        # count, so a chunk range is not the only thing that asks for it.
+        sched = self._finish(monkeypatch, True, trim=False, window=True)
+
+        assert sched._valid_tokens == {"r0": 33}
 
     def test_the_handover_carries_the_count_to_the_worker(self):
         # The positive direction of the case below: the count the scheduler

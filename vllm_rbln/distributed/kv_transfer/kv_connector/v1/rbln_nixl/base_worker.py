@@ -43,6 +43,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import
     RblnNixlTransferMixin,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -189,7 +190,7 @@ class RblnNixlWorkerBase(
         self._chunk_grid: tuple[int, int] | None = None
         # How far the request being transferred fills its last block, parked
         # for the length of one upstream call (`_tail_viewed_as`).
-        self._request_tail: tuple[int | None, int] | None = None
+        self._request_tail: tuple[int | None, int | None] | None = None
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.
         self.local_seen_layer_names: list[str] = []
@@ -205,8 +206,6 @@ class RblnNixlWorkerBase(
         # SWA window mode: a second range at the same NIXL base addrs as the
         # Full range, cutting each block into the kernel blocks a window moves
         # in. Storage and host copies stay Full.
-        # TODO: a window lands in one or two of those, which the request's
-        # token count says -- so an SWA group still names all of them.
         self._group_specs: list[Any] = [
             g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
         ]
@@ -233,6 +232,17 @@ class RblnNixlWorkerBase(
                 ratio = spec.block_size // spec.sliding_window
                 if ratio == 1:
                     continue
+                # Which granule the range names is read off the request's token
+                # count, and that is where the window is only where it slides.
+                # This spec's manager leases one block a request and the runner
+                # reads its first granule, wherever the count points.
+                if isinstance(spec, RBLNSlidingWindowSpec):
+                    raise RuntimeError(
+                        "RBLN NIXL: a window range needs a window that moves "
+                        "through its block, and this engine pins every one to "
+                        "the block's first kernel block. Turn off whichever of "
+                        "swa_window_mode and chunk_mode asked for one."
+                    )
                 if self._sw_ratio is None:
                     self._sw_ratio = ratio
                 else:

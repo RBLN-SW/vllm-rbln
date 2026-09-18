@@ -43,6 +43,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker imp
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     _as_descs,
 )
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 
 def _merged_uniform_spec(inner):
@@ -645,3 +646,28 @@ class TestASlidingWindowOnThePeerSide(TestTheWindowRangeTilesABlock):
         ):
             w.add_remote_agent(meta)
         return w.nixl_wrapper.get_xfer_descs.call_args[0][0]
+
+
+class TestWindowModeNeedsAWindowThatMoves:
+    """Which granule the range names comes off the request's token count, and
+    that is where the window is only where it slides. `RBLNSlidingWindowSpec`
+    leases one block a request whose first granule is the one its runner reads,
+    wherever the count points -- so the two cannot be paired.
+    """
+
+    def test_a_pinned_window_is_refused(self, monkeypatch):
+        spec = MagicMock(spec=RBLNSlidingWindowSpec)
+        spec.block_size, spec.sliding_window = 64, 32
+
+        with pytest.raises(RuntimeError, match="window that moves"):
+            build_worker(monkeypatch, specs=[spec], swa_window_mode=True)
+
+    def test_a_window_that_moves_is_not(self, monkeypatch):
+        # The control: the same geometry under the spec whose window slides.
+        worker = build_worker(
+            monkeypatch,
+            specs=[sliding_window_spec(block_size=64, sliding_window=32)],
+            swa_window_mode=True,
+        )
+
+        assert worker._sw_ratio == 2
