@@ -1092,18 +1092,19 @@ class TestApplyResizesThenMaterializes:
         assert DynamicKvSizer.apply_num_blocks(sizer, None) is None
         assert calls == []
 
-    def test_materialize_runs_the_smallest_compiled_decode_bucket(self):
+    def test_materialize_runs_every_model_graph(self):
+        # One graph left unrun pays its relatch and its KV address patch on the
+        # first request that reaches it.
         ran: list = []
         sizer = SimpleNamespace(
             mode=dks.DynamicKvMode.ACTIVE,
             model_runner=SimpleNamespace(
-                bucketing_manager=SimpleNamespace(decode_batch_buckets=[8, 4, 16]),
                 offload_context=nullcontext,
-                _dummy_run=lambda *args: ran.append(args),
+                run_model_graphs=lambda: ran.append("graphs"),
             ),
         )
         DynamicKvSizer.materialize(sizer)
-        assert ran == [(4, 1, False)]
+        assert ran == ["graphs"]
 
 
 class TestReleaseKvCacheTensors:

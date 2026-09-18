@@ -801,11 +801,11 @@ class DynamicKvSizer:
         return target
 
     def materialize(self) -> None:
-        """One decode step so the pool's physical allocation lands at boot, not
-        on the first request."""
-        num_reqs = min(self.model_runner.bucketing_manager.decode_batch_buckets)
+        """Every model graph once, so the pool's physical allocation, the adaptive
+        latch and the patched KV addresses all land at boot, not on the first
+        request to reach a given graph."""
         with set_compile_stage("warmup"), self.model_runner.offload_context():
-            self.model_runner._dummy_run(num_reqs, 1, False)
+            self.model_runner.run_model_graphs()
 
     def release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
         """Drop every reference to the outgoing KV cache and free its device DRAM
