@@ -15,7 +15,7 @@
 # A real RBLN NIXL worker, and a real peer to hand it metadata.
 #
 # A vllm import has to be function-local here: a conftest is imported before the
-# native conftest's pytest_configure sets VLLM_RBLN_USE_VLLM_MODEL=1, and
+# suite conftest's pytest_configure sets VLLM_RBLN_USE_VLLM_MODEL=1, and
 # resolving RblnPlatform early would pin device_type for the session.
 
 from __future__ import annotations
@@ -130,9 +130,9 @@ def make_worker(monkeypatch, tmp_path_factory):
         assert worker.attn_backends and worker.attn_backends[0].__module__.startswith(
             "vllm_rbln"
         ), (
-            f"attn backend resolved to {worker.attn_backends} -- the native "
-            "path's 6-dim RBLN backend must be registered before the worker is "
-            "built, or every layout answer below is upstream's"
+            f"attn backend resolved to {worker.attn_backends} -- the vllm "
+            "model path's 6-dim RBLN backend must be registered before the worker "
+            "is built, or every layout answer below is upstream's"
         )
 
         if register:
