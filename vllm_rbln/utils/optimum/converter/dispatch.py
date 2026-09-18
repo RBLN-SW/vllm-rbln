@@ -66,7 +66,7 @@ def _generate_model_path_name(
     max_model_len = vllm_config.model_config.max_model_len
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
     num_devices = rbln_config.num_devices_per_local_rank
-    rbln_overrides = rbln_config.optimum_overrides
+    optimum_overrides = rbln_config.optimum_overrides
     # The user's explicit max_num_batched_tokens becomes the compiled prefill
     # chunk size (folded in by sync_from_vllm, which runs after this). Include
     # the raw value so runs that would compile different binaries don't collide
@@ -87,7 +87,9 @@ def _generate_model_path_name(
         "max_num_batched_tokens": user_max_num_batched_tokens,
         "memory_budget": memory_budget,
     }
-    stripped_config = _strip_runtime_only_keys(rbln_overrides) if rbln_overrides else {}
+    stripped_config = (
+        _strip_runtime_only_keys(optimum_overrides) if optimum_overrides else {}
+    )
     if stripped_config:
         config_dict["rbln_config"] = stripped_config
 

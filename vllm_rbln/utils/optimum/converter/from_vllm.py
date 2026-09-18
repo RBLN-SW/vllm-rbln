@@ -46,8 +46,8 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
     3. Validate the updated block size
     """
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
-    rbln_overrides = rbln_config.optimum_overrides
-    params = RBLNParams.from_rbln_config(vllm_config, rbln_overrides)
+    optimum_overrides = rbln_config.optimum_overrides
+    params = RBLNParams.from_rbln_config(vllm_config, optimum_overrides)
 
     if params.dtype is not None:
         raise ValueError(
@@ -102,7 +102,7 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
         vllm_config,
         params,
         precompiled=False,
-        override_prefill_chunk_size=rbln_overrides.get("prefill_chunk_size"),
+        override_prefill_chunk_size=optimum_overrides.get("prefill_chunk_size"),
     )
 
     # Persist the image-prefill buckets (gemma3/gemma4) into additional_config.

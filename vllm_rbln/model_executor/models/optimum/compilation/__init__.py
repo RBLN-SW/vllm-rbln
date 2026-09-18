@@ -105,7 +105,7 @@ class RBLNCompileSpec:
         num_devices: int,
         memory_budget: float,
         prefill_chunk_size: int | None = None,
-        rbln_overrides: dict[str, Any] | None = None,
+        optimum_overrides: dict[str, Any] | None = None,
     ) -> "RBLNCompileSpec":
         """Build a compile spec from vllm-rbln inputs, dispatched by architecture."""
         if is_generation_arch(config):
@@ -149,18 +149,18 @@ class RBLNCompileSpec:
                 f"Compilation is not implemented for architecture {architectures[0]}"
             )
 
-        # rbln_overrides must not overwrite fields vllm derives from its own
+        # optimum_overrides must not overwrite fields vllm derives from its own
         # config (batch_size, max_seq_len, memory_budget, ...); a silent
         # mismatch would compile a model that disagrees with the runtime. Adding
         # a new key not set by the builder is allowed.
-        if rbln_overrides:
-            conflicts = _find_conflicts(spec.rbln_config, rbln_overrides)
+        if optimum_overrides:
+            conflicts = _find_conflicts(spec.rbln_config, optimum_overrides)
             if conflicts:
                 raise ValueError(
-                    "rbln_overrides conflict with vllm-derived compile config: "
+                    "optimum_overrides conflict with vllm-derived compile config: "
                     + "; ".join(conflicts)
                 )
-            _deep_merge(spec.rbln_config, rbln_overrides)
+            _deep_merge(spec.rbln_config, optimum_overrides)
 
         # A submodule's tensor_parallel_size must match its device count.
         # The user only specifies ``device`` per submodule, so derive the

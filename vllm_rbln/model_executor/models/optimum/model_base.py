@@ -185,7 +185,7 @@ class RBLNOptimumModelBase(nn.Module):
         hf_config = self.model_config.hf_config
         rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
         cached_model_path = rbln_config.cached_model_path
-        rbln_overrides = rbln_config.optimum_overrides
+        optimum_overrides = rbln_config.optimum_overrides
         _, model_cls_name = get_rbln_model_info(hf_config)
         model_path = self.vllm_config.model_config.model
         if is_compiled_dir(model_path):
@@ -210,16 +210,16 @@ class RBLNOptimumModelBase(nn.Module):
                 # NOTE:
                 # ``sync_vllm_and_optimum`` already narrowed user overrides
                 # down to device-only keys; we forward only those here.
-                rbln_overrides = dict(rbln_overrides)
+                optimum_overrides = dict(optimum_overrides)
                 if self._is_ec_consumer_only():
                     if not ec_enabled_model:
                         raise ValueError(
                             "Disaggregation is not supported for this model."
                         )
-                    rbln_overrides["_load_visual_runtime"] = False
+                    optimum_overrides["_load_visual_runtime"] = False
                 model = model_cls.from_pretrained(
                     valid_path,
-                    rbln_config=rbln_overrides,
+                    rbln_config=optimum_overrides,
                 )
                 self.vllm_config.model_config.model = valid_path
         else:
@@ -238,7 +238,7 @@ class RBLNOptimumModelBase(nn.Module):
                 # model matches the value used for KV-cache block padding.
                 prefill_chunk_size=self.vllm_config.scheduler_config.max_num_batched_tokens,
                 memory_budget=self.vllm_config.cache_config.gpu_memory_utilization,
-                rbln_overrides=rbln_overrides,
+                optimum_overrides=optimum_overrides,
             )
             logger.info(
                 "Compiling %s via optimum-rbln (%s) with rbln_config:\n%s",
