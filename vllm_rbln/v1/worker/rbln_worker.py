@@ -172,6 +172,7 @@ class RBLNWorker(WorkerBase):
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(num_devices)
 
     @instrument(span_name="Init device")
+    @worker_fail_fast
     def init_device(self) -> None:
         self.device = self.device_config.device
 
@@ -198,7 +199,7 @@ class RBLNWorker(WorkerBase):
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
-            self.vllm_config, self.device
+            self.vllm_config, self.device, rank=self.rank
         )
         self.dynamic_kv = DynamicKvSizer(
             self.vllm_config, self.model_runner, foreign_dram_used_bytes
@@ -208,11 +209,13 @@ class RBLNWorker(WorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
+    @worker_fail_fast
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
     @torch.inference_mode()
+    @worker_fail_fast
     def determine_available_memory(self) -> int:
         """Estimate KV-cache DRAM, discounting the fixed command-stream buffers
         that warm-up's compiled decode runtimes reserve.
@@ -443,10 +446,12 @@ class RBLNWorker(WorkerBase):
         tp_rank = get_tp_group().rank_in_group
         return {(pp_rank, tp_rank): metadata}
 
+    @worker_fail_fast
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
     @instrument(span_name="Allocate KV cache")
+    @worker_fail_fast
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate RBLN KV cache with the specified kv_cache_config."""
 
@@ -485,6 +490,7 @@ class RBLNWorker(WorkerBase):
             return self.dynamic_kv.apply_num_blocks(n)
 
     @instrument(span_name="Warmup (NPU)")
+    @worker_fail_fast
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # NOTE(RBLN): Manual timing since RBLN does not support @support_torch_compile.
         st = time.perf_counter()

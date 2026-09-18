@@ -17,8 +17,10 @@
 # patched out. Device execution stays in the e2e tier.
 
 import inspect
+import json
 import os
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -209,6 +211,76 @@ class CustomMultiprocExecutor(MultiprocExecutor):
 
 
 class TestWorkerFailFast:
+    @pytest.mark.parametrize(
+        ("backend", "disabled", "should_exit"),
+        [("mp", "0", True), ("mp", "1", False), ("uni", "0", False)],
+    )
+    @pytest.mark.parametrize(
+        "phase",
+        [
+            "init_device",
+            "load_model",
+            "determine_available_memory",
+            "get_kv_cache_spec",
+            "initialize_from_config",
+            "compile_or_warm_up_model",
+        ],
+    )
+    def test_startup_failure_uses_executor_policy(
+        self, make_worker, monkeypatch, capfd, backend, disabled, should_exit, phase
+    ):
+        worker = make_worker(vllm_config=_make_vllm_config(backend=backend), rank=1)
+        error = RuntimeError("startup operation failed")
+        operation = Mock(side_effect=error)
+        worker.model_runner = Mock()
+        args: tuple[object, ...] = ()
+        if phase == "init_device":
+            monkeypatch.setattr(wm, "init_worker_distributed_environment", operation)
+        elif phase == "load_model":
+            monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
+            worker.model_runner.load_model = operation
+        elif phase == "determine_available_memory":
+            worker.model_runner.model.named_parameters = operation
+        elif phase == "get_kv_cache_spec":
+            worker.model_runner.get_kv_cache_spec = operation
+        elif phase == "initialize_from_config":
+            monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", operation)
+            args = (SimpleNamespace(num_blocks=1),)
+        else:
+            monkeypatch.setattr(
+                worker, "_ensure_rbln_host_threads_before_compile", Mock()
+            )
+            monkeypatch.setattr(
+                worker, "_ensure_rbln_cpu_affinity_after_warmup", Mock()
+            )
+            monkeypatch.setattr(wm, "compile_and_warmup_skip_reason", lambda _: None)
+            worker.dynamic_kv = dks.DynamicKvSizer(
+                worker.vllm_config, worker.model_runner, 0
+            )
+            worker.model_runner.warmup_model = operation
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", disabled)
+        exit_process = Mock(side_effect=SystemExit(70))
+        monkeypatch.setattr(worker_utils.os, "_exit", exit_process)
+
+        with pytest.raises(SystemExit if should_exit else RuntimeError) as excinfo:
+            getattr(worker, phase)(*args)
+
+        operation.assert_called_once()
+        if should_exit:
+            exit_process.assert_called_once_with(70)
+            events = [
+                json.loads(line)
+                for line in capfd.readouterr().err.splitlines()
+                if line.startswith('{"event":"rbln.worker.fatal"')
+            ]
+            assert len(events) == 1
+            assert events[0]["where"] == f"RBLNWorker.{phase}"
+            assert events[0]["rank"] == 1
+            assert events[0]["exception_message"] == str(error)
+        else:
+            exit_process.assert_not_called()
+            assert excinfo.value is error
+
     @pytest.mark.parametrize(
         ("backend", "ray_v2", "disabled", "should_exit"),
         [
@@ -1112,6 +1184,7 @@ class TestDynamicKvLayoutGuards:
 
         config = SimpleNamespace(num_blocks=4, kv_cache_tensors=[])
         worker = SimpleNamespace(
+            fail_fast=False,
             cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
             vllm_config=object(),
             model_runner=SimpleNamespace(

@@ -16,8 +16,13 @@
 # (device DRAM, NUMA, CPU affinity) only the inputs are mocked and the real
 # computed values asserted.
 
+import json
 import math
 import os
+import subprocess
+import sys
+import textwrap
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -158,6 +163,115 @@ class TestWorkerFailFast:
             raise OSError("log unavailable")
 
         monkeypatch.setattr(worker_utils.logger, "error", broken_log)
+        with pytest.raises(SystemExit) as excinfo:
+            worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
+
+    def test_a_blocked_record_does_not_hold_the_exit(self, monkeypatch, exit_codes):
+        release = threading.Event()
+        monkeypatch.setattr(worker_utils, "_write_event_line", lambda _: release.wait())
+        monkeypatch.setattr(worker_utils, "_FATAL_RECORD_TIMEOUT_S", 0.2)
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+        finally:
+            release.set()
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
+
+    def test_exit_is_not_held_by_a_stalled_stderr_consumer(self):
+        # A container's stderr is a pipe. Fill one, make it fd 2 and abort: the
+        # event write and the log line both land on it, and the exit must not
+        # wait for a reader that never drains it.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent("""
+                    import os
+
+                    import vllm_rbln.v1.worker.utils as worker_utils
+
+                    read_end, write_end = os.pipe()
+                    os.set_blocking(write_end, False)
+                    try:
+                        while True:
+                            os.write(write_end, b"x" * 65536)
+                    except BlockingIOError:
+                        pass
+                    os.set_blocking(write_end, True)
+                    os.dup2(write_end, 2)
+                    print("aborting on a full stderr pipe", flush=True)
+                    worker_utils.abort_worker(
+                        RuntimeError("stderr consumer stalled"), where="step"
+                    )
+                """),
+            ],
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(sys.path),
+                "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": "0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert "aborting on a full stderr pipe" in result.stdout, result.stderr
+        assert result.returncode == 70, result.stdout + result.stderr
+
+    @staticmethod
+    def _event_lines(capfd):
+        return [
+            json.loads(line)
+            for line in capfd.readouterr().err.splitlines()
+            if line.startswith('{"event":')
+        ]
+
+    def test_fatal_is_one_json_line_naming_the_failure_site(self, exit_codes, capfd):
+        error = RuntimeError("model step failed\nsecond line")
+
+        @worker_fail_fast
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(
+            fail_fast=True,
+            rank=3,
+            parallel_config=SimpleNamespace(data_parallel_rank=1),
+        )
+        with pytest.raises(SystemExit):
+            step(worker)
+        (event,) = self._event_lines(capfd)
+        assert event["event"] == "rbln.worker.fatal"
+        assert event["schema_version"] == 1
+        assert event["source"] == "vllm-rbln"
+        assert event["pid"] == os.getpid()
+        assert event["where"].endswith("step")
+        assert event["exception_type"] == "RuntimeError"
+        assert event["exception_message"] == str(error)
+        assert event["exit_code"] == 70
+        assert (event["rank"], event["dp_rank"]) == (3, 1)
+        # The worker cannot tell a device or storage fault from any other error.
+        assert event["cause"] == "unknown"
+        assert len(event["event_id"]) == 32
+        assert event["ts"].endswith("Z")
+
+    def test_fatal_event_leaves_unknown_ranks_null(self, exit_codes, capfd):
+        @worker_fail_fast
+        def step(worker):
+            raise ValueError("no rank on this receiver")
+
+        with pytest.raises(SystemExit):
+            step(SimpleNamespace(fail_fast=True))
+        (event,) = self._event_lines(capfd)
+        assert event["rank"] is None and event["dp_rank"] is None
+
+    def test_event_write_failure_does_not_prevent_exit(self, monkeypatch, exit_codes):
+        def broken_write(line):
+            raise OSError("stderr closed")
+
+        monkeypatch.setattr(worker_utils, "_write_event_line", broken_write)
         with pytest.raises(SystemExit) as excinfo:
             worker_utils.abort_worker(RuntimeError("device failed"), where="step")
         assert excinfo.value.code == 70
