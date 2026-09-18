@@ -17,7 +17,7 @@
 # test_gpu_model_runner.py::model_runner fixture, minus its dist_init.
 #
 # Every vllm import below is function-local: a conftest is imported before the
-# The suite conftest's pytest_configure adopts the native path, and
+# The suite conftest's pytest_configure adopts the vllm model path, and
 # resolving RblnPlatform early would pin device_type to "cpu" for the session.
 
 from __future__ import annotations

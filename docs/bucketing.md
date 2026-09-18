@@ -6,7 +6,7 @@ small, reusable set of bucket sizes. Instead of compiling a new graph whenever
 supported bucket and padded before the model forward pass. Prefill always uses
 `batch_size = 1` and is unaffected by the settings below.
 
-> Bucketing is automatically enabled on the vLLM-native path
+> Bucketing is automatically enabled on the vllm model path
 > (`--rbln-model-impl vllm`).
 
 Key components:

@@ -44,7 +44,7 @@ def pytest_configure(config):
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     load_general_plugins()
 
-    # This tree is the native path's, and nothing has said so yet: production
+    # This tree is the vllm model path's, and nothing has said so yet: production
     # adopts the path in create_engine_config, and no engine is built here. The
     # second call is what the platform hook makes right after, and register_ops
     # above could not, having run before any of this was known.
