@@ -157,7 +157,7 @@ def _run_pipeline(pp_size: int, aux_layers: tuple[int, ...], monkeypatch):
         )
         if rank < pp_size - 1:
             layers_sent.append(_stamped_layers(out.tensors.get(eagle3_pp.AUX_COMBINED)))
-            keys_sent.append(sorted(out.tensors))
+            keys_sent.append(list(out.tensors))
             carried = out
     return out, layers_sent, keys_sent
 
@@ -200,7 +200,7 @@ def test_the_handoff_carries_one_aux_tensor_whatever_it_holds(monkeypatch):
     _, layers_sent, keys_sent = _run_pipeline(4, CHECKPOINT_AUX_LAYERS, monkeypatch)
 
     assert layers_sent == [[1], [1, 30], [1, 30]]
-    assert keys_sent == [[eagle3_pp.AUX_COMBINED, "hidden_states", "residual"]] * 3
+    assert keys_sent == [["hidden_states", "residual", eagle3_pp.AUX_COMBINED]] * 3
 
 
 def test_the_handoff_placeholder_follows_a_later_setter_call(monkeypatch):
