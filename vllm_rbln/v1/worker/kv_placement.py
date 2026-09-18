@@ -174,13 +174,46 @@ def _program_name(program: Any) -> str:
     return f"program {name!r}" if name else "an unnamed program"
 
 
+def dynamic_dim(spec: Any) -> int:
+    """The index of `spec`'s dynamic dim."""
+    for index, dim in enumerate(spec.physical_placement.shape):
+        if not isinstance(dim, int):
+            return index
+    raise ValueError(f"input {spec.name!r} has a placement but no dynamic dim")
+
+
 def dynamic_extent(spec: Any) -> int:
     """The compiled extent of `spec`'s dynamic dim: the kernel block count the
     program was traced with."""
-    for index, dim in enumerate(spec.physical_placement.shape):
-        if not isinstance(dim, int):
-            return int(spec.shape[index])
-    raise ValueError(f"input {spec.name!r} has a placement but no dynamic dim")
+    return int(spec.shape[dynamic_dim(spec)])
+
+
+def rebound_extent(spec: Any, num_blocks: int, hint_blocks: int) -> int:
+    """`spec`'s dynamic dim at `num_blocks`. It counts kernel blocks, so it binds
+    to `num_blocks * dynamic_extent / hint_blocks`."""
+    extent = dynamic_extent(spec)
+    if extent % hint_blocks:
+        raise RuntimeError(
+            f"input {spec.name!r} was compiled with a dynamic extent of {extent}, "
+            f"not a multiple of the {hint_blocks}-block compile hint."
+        )
+    return (extent // hint_blocks) * num_blocks
+
+
+def relatched_shapes(
+    program: Any, num_blocks: int, hint_blocks: int
+) -> list[list[int]]:
+    """`program`'s input shapes at `num_blocks`: the compiled shapes with every
+    dynamic dim rebound."""
+    if hint_blocks <= 0:
+        raise ValueError(f"hint_blocks must be positive, got {hint_blocks}")
+    shapes = []
+    for spec in program.input_specs:
+        shape = [int(dim) for dim in spec.shape]
+        if spec.physical_placement is not None:
+            shape[dynamic_dim(spec)] = rebound_extent(spec, num_blocks, hint_blocks)
+        shapes.append(shape)
+    return shapes
 
 
 def kv_requests_per_unit(
@@ -194,13 +227,7 @@ def kv_requests_per_unit(
     requests: dict[Unit, list[int]] = {}
     for spec in specs:
         placement = spec.physical_placement
-        extent = dynamic_extent(spec)
-        if extent % hint_blocks:
-            raise RuntimeError(
-                f"input {spec.name!r} was compiled with a dynamic extent of {extent}, "
-                f"not a multiple of the {hint_blocks}-block compile hint."
-            )
-        symbol = (extent // hint_blocks) * num_blocks
+        symbol = rebound_extent(spec, num_blocks, hint_blocks)
         itemsize = placement_itemsize(placement.dtype)
         for shard in placement.shards:
             elems = math.prod(

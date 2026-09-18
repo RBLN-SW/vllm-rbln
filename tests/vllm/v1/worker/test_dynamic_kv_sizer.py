@@ -523,7 +523,69 @@ class TestWarmupCapturesPrograms:
                 _program([], runtime=object()),
             ]
         )
-        assert len(DynamicKvSizer.collect_runtimes(sizer)) == 2
+        assert len(DynamicKvSizer.collect_programs(sizer)) == 2
+
+
+class _Runtime:
+    """Records what the sizer latched, standing in for a rebel runtime."""
+
+    def __init__(self):
+        self.latched: list[list[list[int]]] = []
+
+    def relatch_adaptive_buffers(self, shapes):
+        self.latched.append([list(shape) for shape in shapes])
+
+
+class TestReallocateRelatchesAdaptiveBuffers:
+    """Resetting instead of relatching would leave every graph but materialize()'s
+    decode to re-apply on a real request."""
+
+    @staticmethod
+    def _sizer(programs, monkeypatch, current=4):
+        monkeypatch.setattr(
+            dks, "kv_cache_config_at", lambda cfg, n: SimpleNamespace(num_blocks=n)
+        )
+        sizer = SimpleNamespace(
+            programs=programs,
+            cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(num_blocks=current),
+                kv_caches=[],
+                _kernel_block_sizes=[16],
+                initialize_kv_cache_tensors=lambda cfg, sizes: None,
+            ),
+        )
+        sizer.collect_programs = lambda: DynamicKvSizer.collect_programs(sizer)
+        return sizer
+
+    def test_every_graph_is_relatched_at_the_new_count(self, monkeypatch):
+        kv, static = _Runtime(), _Runtime()
+        programs = [
+            _program([HEAD_SPLIT], runtime=kv),
+            _program([], name="0/1", runtime=static),
+        ]
+        DynamicKvSizer.reallocate(self._sizer(programs, monkeypatch), 128)
+
+        assert kv.latched == [[[1], [2, 128, 8, 1, 1024, 128]]]
+        assert static.latched == [[[1]]]
+
+    def test_an_extent_above_the_hint_scales_the_dynamic_dim(self, monkeypatch):
+        # The relatch follows the traced extent rather than assuming one per block.
+        runtime = _Runtime()
+        programs = [_program([HEAD_SPLIT], runtime=runtime, extent=8)]
+        DynamicKvSizer.reallocate(self._sizer(programs, monkeypatch), 128)
+
+        assert runtime.latched == [[[1], [2, 256, 8, 1, 1024, 128]]]
+
+    def test_programs_sharing_a_runtime_latch_once(self, monkeypatch):
+        runtime = _Runtime()
+        programs = [
+            _program([HEAD_SPLIT], runtime=runtime),
+            _program([HEAD_SPLIT], name="0/1", runtime=runtime),
+        ]
+        DynamicKvSizer.reallocate(self._sizer(programs, monkeypatch), 128)
+
+        assert len(runtime.latched) == 1
 
 
 class TestMaybeShrinkKvCacheForCompile:

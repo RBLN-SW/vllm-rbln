@@ -32,6 +32,7 @@ from vllm_rbln.v1.worker.kv_placement import (
     kv_growth,
     max_num_blocks,
     placement_itemsize,
+    relatched_shapes,
     select_kv_input_groups,
     snapshot_from_allocator,
     snapshot_from_driver,
@@ -139,6 +140,32 @@ class TestDynamicExtent:
         static = _placement([2, 4, 8], [_shard(0, 0, [2, 4, 8])])
         with pytest.raises(ValueError, match="no dynamic dim"):
             dynamic_extent(_spec(static))
+
+
+class TestRelatchedShapes:
+    """The shapes a run at a given block count passes."""
+
+    def test_static_inputs_keep_their_compiled_shape(self):
+        program = _program([HEAD_SHARDED], statics=2)
+        assert relatched_shapes(program, 8, HINT)[:2] == [[1], [1]]
+
+    def test_the_dynamic_dim_is_rebound_to_the_new_count(self):
+        program = _program([HEAD_SHARDED])
+        assert relatched_shapes(program, 8, HINT)[-1] == [2, 8, 8, 1, 1024, 128]
+
+    def test_an_extent_above_the_hint_scales_with_it(self):
+        # The dim counts kernel blocks; the ratio to the hint is what binds it.
+        program = _program([HEAD_SHARDED], extent=2 * HINT)
+        assert relatched_shapes(program, 8, HINT)[-1] == [2, 16, 8, 1, 1024, 128]
+
+    def test_an_extent_off_the_hint_is_refused(self):
+        program = _program([HEAD_SHARDED], extent=HINT + 1)
+        with pytest.raises(RuntimeError, match="not a multiple"):
+            relatched_shapes(program, 8, HINT)
+
+    def test_a_nonpositive_hint_is_refused(self):
+        with pytest.raises(ValueError, match="hint_blocks"):
+            relatched_shapes(_program([HEAD_SHARDED]), 8, 0)
 
 
 class TestBytesPerUnit:
