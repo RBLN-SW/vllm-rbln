@@ -126,8 +126,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _kv_slices: int
     _kv_split_axis: KVSplitAxis
     #: How many of K and V one region's block holds. Every lifetime reads it:
-    #: registration derives it, the handshake pairs and advertises on it, the
-    #: window and chunk ranges of a descriptor list are cut by it.
+    #: registration derives it, the handshake pairs and advertises on it, and
+    #: both a shard list's descriptors and a chunk range's runs are cut by it.
     _kv_per_block: int
     _chunk_mode: bool
     _logical_region_kv_heads: list[int | None]
@@ -471,15 +471,14 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         blocks_data: list[tuple[int, int, int]] = []
 
         # A whole block is one range whatever it packs, since K and V are
-        # adjacent in it. A window is a prefix and takes one inside each --
-        # a single prefix runs past K's end and never reaches V.
+        # adjacent in it. The window range cuts that same block into the
+        # `sw_ratio` blocks the kernel addresses it in, each one contiguous run
+        # of `sliding_window` tokens over whatever the region holds.
         # `_own_engine_layout` does not narrow the ratio -- read it once.
         sw_ratio = self._sw_ratio
         assert sw_ratio is not None
-        kv_per_block = self._kv_per_block
-        length_divisors = [1, sw_ratio]
         pieces: list[tuple[int, int, int, int]] = []
-        for divisor in length_divisors:
+        for units in (1, sw_ratio):
             for i, base_addr in enumerate(local_base_addresses):
                 kv_block_len = (
                     self.get_backend_aware_kv_block_len(
@@ -487,17 +486,15 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                     )
                     // block_size_ratio
                 )
-                kv_runs = 1 if divisor == 1 else kv_per_block
-                kv_stride = kv_block_len // kv_per_block
-                desc_len = kv_block_len // kv_runs // divisor
+                unit_len = kv_block_len // units
                 stride = self.block_len_per_layer[i] // block_size_ratio
-                if divisor == 1:
+                if units == 1:
                     pieces.append((base_addr, kv_block_len, stride, self.device_id))
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * stride
-                    for kv in range(kv_runs):
+                    for unit in range(units):
                         blocks_data.append(
-                            (addr + kv * kv_stride, desc_len, self.device_id)
+                            (addr + unit * unit_len, unit_len, self.device_id)
                         )
 
         # Asked for here rather than handed in, so that the block size it is
@@ -510,8 +507,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
 
         logger.info(
             "RBLN NIXL: %d local descriptor(s) for this engine over %d region(s) "
-            "x %d block(s): whole, a 1/%d sliding-window view, and %s. Built in "
-            "%.1fms.",
+            "x %d block(s): whole, %d sliding-window granule(s) each, and %s. "
+            "Built in %.1fms.",
             len(blocks_data),
             len(local_base_addresses),
             num_blocks,

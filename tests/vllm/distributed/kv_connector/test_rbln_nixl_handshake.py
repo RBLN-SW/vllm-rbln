@@ -1398,12 +1398,15 @@ class TestShardLocalRegions:
             _handle, blocks = w.register_local_xfer_handler(16)
 
         whole = w.num_regions * w.num_blocks
-        # Whole blocks, then the window's view of them, then the chunk range.
-        assert len(blocks) == whole * 2 + whole * runs * chunks
+        # Whole blocks, then the granules that tile them, then the chunk range.
+        window_end = whole * (1 + w._sw_ratio)
+        assert len(blocks) == window_end + whole * runs * chunks
         full_len = w.block_len_per_layer[0]
         assert {ln for _, ln, _ in blocks[:whole]} == {full_len}
-        assert {ln for _, ln, _ in blocks[whole : whole * 2]} == {full_len // 2}
-        assert {ln for _, ln, _ in blocks[whole * 2 :]} == {full_len // (runs * chunks)}
+        assert {ln for _, ln, _ in blocks[whole:window_end]} == {
+            full_len // w._sw_ratio
+        }
+        assert {ln for _, ln, _ in blocks[window_end:]} == {full_len // (runs * chunks)}
 
     def test_register_local_xfer_handler_routes_to_the_shard_path(self):
         # Dispatch to the shard path: no SWA window mode, layer names present. Miss
@@ -3734,10 +3737,12 @@ class TestAddRemoteAgentSwa:
             # The first block of the first region, as (offset in block, length).
             return [(addr - base, ln) for addr, ln, _ in descs[whole : whole + 4]]
 
+        # 2 regions x 8 blocks whole, then sw_ratio granules of each.
+        window_end = 2 * 8 * (1 + worker._sw_ratio)
         # Non-empty, or the comparison is two empty lists agreeing.
         assert (
-            cut(remote, 32, 0x5000)
-            == cut(local, 32, 0x1000)
+            cut(remote, window_end, 0x5000)
+            == cut(local, window_end, 0x1000)
             == [
                 (0, 64),
                 (64, 64),
@@ -3763,9 +3768,10 @@ class TestAddRemoteAgentSwa:
             worker.add_remote_agent(meta, 0, 1)
 
         blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
-        # 2 ranges x 2 regions x 8 blocks, then 2 regions x 8 blocks x 2 x 2.
-        assert len(blocks_data) == 32 + 64
-        assert blocks_data[32:36] == [
+        # 2 regions x 8 blocks, whole then sw_ratio granules of each, and last
+        # 2 regions x 8 blocks x 2 runs x 2 chunks.
+        assert len(blocks_data) == 16 * (1 + worker._sw_ratio) + 64
+        assert blocks_data[48:52] == [
             (0x5000, 64, 1),
             (0x5040, 64, 1),
             (0x5080, 64, 1),

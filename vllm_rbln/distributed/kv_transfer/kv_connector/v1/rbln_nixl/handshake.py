@@ -1438,17 +1438,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         blocks_data: list[tuple[int, int, int]] = []
         num_blocks = nixl_agent_meta.num_blocks
 
-        # Two passes when SWA is present: Full descs first, then SWA descs
-        # at the same base addresses (same `page_size` stride — the
-        # remote tensor's physical block stride is still Full-sized),
-        # shorter desc length.
+        # Two passes when SWA is present: Full descs first, then the window
+        # range over the same base addresses, cutting each block into the
+        # `sw_ratio` kernel blocks that tile it.
         # `_own_engine_layout` does not narrow the ratio -- read it once.
         sw_ratio = self._sw_ratio
         assert sw_ratio is not None
-        kv_per_block = self._kv_per_block
-        length_divisors = [1, sw_ratio]
         pieces: list[tuple[int, int, int, int]] = []
-        for divisor in length_divisors:
+        for units in (1, sw_ratio):
             for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
                 local_block_len = self.get_backend_aware_kv_block_len(
                     layer_idx=i, first_split=True, mamba_view=False
@@ -1456,18 +1453,18 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 remote_kv_block_len = local_block_len // block_size_ratio
                 if block_size_ratio > 1:
                     local_block_len = remote_kv_block_len
-                kv_runs = 1 if divisor == 1 else kv_per_block
-                desc_len = local_block_len // kv_runs // divisor
+                desc_len = local_block_len // units
                 rank_offset = (
                     self.tp_rank % tp_ratio * remote_kv_block_len
                     if indexes_into_remote
                     else 0
                 )
                 page_size = nixl_agent_meta.block_lens[i]
-                # The step from K to V is the peer's own, as in
-                # `_head_matched_desc`; the two ends hold the same layout here.
-                kv_stride = page_size // kv_per_block
-                if divisor == 1:
+                # The step from one granule to the next is the peer's own, as
+                # the K-to-V step was in `_head_matched_desc`; the two ends hold
+                # the same layout here.
+                unit_stride = page_size // units
+                if units == 1:
                     pieces.append(
                         (
                             base_addr + rank_offset,
@@ -1478,10 +1475,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     )
                 for block_id in range(num_blocks):
                     addr = base_addr + block_id * page_size + rank_offset
-                    for kv in range(kv_runs):
+                    for unit in range(units):
                         blocks_data.append(
                             (
-                                addr + kv * kv_stride,
+                                addr + unit * unit_stride,
                                 desc_len,
                                 nixl_agent_meta.device_id,
                             )
@@ -1498,8 +1495,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
 
         logger.info(
-            "RBLN NIXL: %d remote descriptor(s) for engine %s rank %d: whole, a "
-            "1/%d sliding-window view, and %s.",
+            "RBLN NIXL: %d remote descriptor(s) for engine %s rank %d: whole, "
+            "%d sliding-window granule(s) each, and %s.",
             len(blocks_data),
             engine_id,
             remote_tp_rank,

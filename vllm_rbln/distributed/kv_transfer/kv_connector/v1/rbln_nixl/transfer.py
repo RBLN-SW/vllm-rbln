@@ -41,9 +41,9 @@ def _chunk_desc_ids(
     """Descriptor ids for chunks `[lo, hi)` of one block, in `positions`.
 
     `start` is where the chunk range begins: one whole-block range before it on
-    a shard's lists, and on the whole-engine lists a sliding window's view as
-    well, which holds a block's halves where the whole-block range holds the
-    block. That offset is the only thing the two callers differ in, so the
+    a shard's lists, and on the whole-engine lists a window range as well,
+    which holds the granules that tile a block where the whole-block range
+    holds the block. That offset is the only thing the two callers differ in, so the
     arithmetic lives here -- an index computed one way and a descriptor emitted
     the other lands on bytes nothing reports.
     """
@@ -125,9 +125,10 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             num_blocks = int(num_blocks * block_size_ratio)
 
         # Both lists run region-major then block. A whole block is one
-        # descriptor, and the window range that follows holds `_kv_per_block`
-        # per block (`register_local_xfer_handler`).
-        kv_per_block = self._kv_per_block
+        # descriptor, and the window range that follows holds the `sw_ratio`
+        # kernel blocks that tile it (`register_local_xfer_handler`).
+        sw_ratio = self._sw_ratio
+        assert sw_ratio is not None
         region_ids = np.arange(self.num_regions)[:, None]
         num_whole_descs = self.num_regions * num_blocks
         # One number for the whole request, whichever list this call is for.
@@ -150,13 +151,12 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 return (region_ids * num_blocks + blocks_arr).flatten()
 
             if is_sw:
-                # A window's group keeps every block whole: its descriptor is
-                # the window, so there is no unwritten tail inside it.
+                # Every granule of the block, which is the block itself. Which
+                # one or two the window sits in follows from the request's
+                # token count, not from the block ids this is handed.
                 ids = whole(group_arr)[:, None]
                 all_descs.append(
-                    (
-                        ids * kv_per_block + np.arange(kv_per_block) + num_whole_descs
-                    ).ravel()
+                    (ids * sw_ratio + np.arange(sw_ratio) + num_whole_descs).ravel()
                 )
                 continue
             if needed is None:
@@ -168,7 +168,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             all_descs.append(whole(group_arr[:, :-1]))
             all_descs.append(
                 _chunk_desc_ids(
-                    start=num_whole_descs * (1 + kv_per_block),
+                    start=num_whole_descs * (1 + sw_ratio),
                     positions=np.arange(self.num_regions, dtype=np.int64),
                     num_blocks=num_blocks,
                     block_id=group[-1],

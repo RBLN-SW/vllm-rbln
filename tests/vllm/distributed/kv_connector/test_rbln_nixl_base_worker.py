@@ -319,8 +319,8 @@ class TestSwaWindowDelegation:
 
 class TestRegisterLocalXferHandlerSwa:
     # With a sliding-window group and window mode on, register_local_xfer_handler
-    # emits a dual desc range: Full then SWA over the same addresses, trimmed by
-    # _sw_ratio.
+    # emits a dual desc range: Full, then the `_sw_ratio` granules that tile a
+    # block, over the same addresses.
     def test_swa_builds_dual_desc_ranges(self, make_worker):
         geo = KvGeometry(spec="swa", sliding_window=512, block_size=1024, num_blocks=4)
         w = make_worker(kv_cache=geo, swa_window_mode=True)
@@ -328,10 +328,10 @@ class TestRegisterLocalXferHandlerSwa:
 
         blocks_data = w.src_blocks_data
         full_len = w.block_len_per_layer[0]
-        # A whole block is one descriptor whatever it packs; the window is a
-        # prefix, so it takes one inside K and one inside V.
+        # A whole block is one descriptor whatever it packs; the window range
+        # cuts that same block into the granules that tile it.
         whole_descs = w.num_regions * w.num_blocks
-        assert len(blocks_data) == whole_descs * (1 + w._kv_per_block)
+        assert len(blocks_data) == whole_descs * (1 + w._sw_ratio)
         full, swa = blocks_data[:whole_descs], blocks_data[whole_descs:]
         # The order is a contract, not a detail: a transfer turns (region, block)
         # into a desc id as region * num_blocks + block, so entry i of the list
@@ -347,15 +347,13 @@ class TestRegisterLocalXferHandlerSwa:
             for block in range(w.num_blocks)
         ]
         assert decode(swa, **decoded) == [
-            (region, block, kv * w._sw_ratio)
+            (region, block, unit)
             for region in range(w.num_regions)
             for block in range(w.num_blocks)
-            for kv in range(w._kv_per_block)
+            for unit in range(w._sw_ratio)
         ]
         assert {desc_len for _, desc_len, _ in full} == {full_len}
-        assert {desc_len for _, desc_len, _ in swa} == {
-            full_len // w._kv_per_block // w._sw_ratio
-        }
+        assert {desc_len for _, desc_len, _ in swa} == {full_len // w._sw_ratio}
 
     def test_a_chunk_grid_appends_a_third_range(self, monkeypatch):
         # A grid of (2 runs, 2 chunks) turns each region-block's one Full
@@ -380,12 +378,13 @@ class TestRegisterLocalXferHandlerSwa:
             worker.register_local_xfer_handler(64)
 
         blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
-        # 16 as before, then 2 regions x 4 blocks x 2 runs x 2 chunks.
-        assert len(blocks_data) == 16 + 32
+        # 8 whole and 8 x sw_ratio window, then 2 regions x 4 blocks x 2 runs
+        # x 2 chunks.
+        assert len(blocks_data) == 24 + 32
         # Region 0, block 0: two runs of two chunks, quarter length each. A run
         # is a head's stretch of the block, so the second run starts halfway.
         assert np.array_equal(
-            blocks_data[16:20],
+            blocks_data[24:28],
             _as_descs(
                 [
                     (0x1000, 64, 0),
@@ -445,7 +444,7 @@ class TestRegisterLocalXferHandlerSwa:
         ):
             worker.register_local_xfer_handler(64)
 
-        assert len(worker.nixl_wrapper.get_xfer_descs.call_args[0][0]) == 16
+        assert len(worker.nixl_wrapper.get_xfer_descs.call_args[0][0]) == 24
 
 
 class TestHmaRefusalSuppression:
@@ -538,18 +537,19 @@ PACKED = 2  # rbln_custom_ops: (num_blocks, 2, H, 1, S, D)
 SPLIT = 1  # rbln_triton_ops: (2, num_blocks, H, 1, S, D)
 
 
-class TestASlidingWindowInsideAPackedBlock:
-    """The window range is a byte prefix, so a packed block needs one per K/V.
+class TestTheWindowRangeTilesABlock:
+    """The window range cuts a block into the blocks the kernel addresses it in.
 
-    One prefix over the whole block would run twice as far into K and never
-    reach V. Refusing the pair instead is not open to us: gpt-oss is a
-    sliding-window model and the packed layout is what its kernels read.
+    `sw_ratio` of them tile it exactly and one is a contiguous run, so unlike
+    the byte prefix this replaced, what a block packs does not enter.
     """
 
     BLOCK_LEN = 256
     NUM_BLOCKS = 2
     SW_RATIO = 2
     BASES = [0x1000, 0x2000]
+    #: Which side's addresses the descriptors are read against.
+    DECODE_BASES = BASES
 
     def _worker(self, kv_per_block):
         w = object.__new__(RblnNixlPullConnectorWorker)
@@ -574,52 +574,45 @@ class TestASlidingWindowInsideAPackedBlock:
         w.register_local_xfer_handler(w.block_size)
         return w.nixl_wrapper.get_xfer_descs.call_args[0][0]
 
-    def test_a_window_is_taken_inside_k_and_inside_v(self):
-        half = self.BLOCK_LEN // 2
-        covered = {
-            (addr - base) % self.BLOCK_LEN // half
-            for addr, length, _ in self._descs(PACKED)
-            if length < self.BLOCK_LEN
-            for base in self.BASES
-            if base <= addr < base + self.BLOCK_LEN * self.NUM_BLOCKS
-        }
-        assert covered == {0, 1}
+    def _window_pieces(self, kv_per_block):
+        """The distinct (offset in its block, length) the window range names."""
+        return sorted(
+            {
+                (int(addr - base) % self.BLOCK_LEN, int(length))
+                for addr, length, _ in self._descs(kv_per_block)
+                if length < self.BLOCK_LEN
+                for base in self.DECODE_BASES
+                if base <= addr < base + self.BLOCK_LEN * self.NUM_BLOCKS
+            }
+        )
 
-    def test_a_window_descriptor_stays_inside_its_half(self):
-        half = self.BLOCK_LEN // 2
-        for addr, length, _ in self._descs(PACKED):
-            if length == self.BLOCK_LEN:
-                continue
-            within = (addr - self.BASES[0]) % self.BLOCK_LEN % half
-            assert within + length <= half
-
-    def test_separate_regions_keep_the_shipped_lengths(self):
-        # The layout the connector shipped with: one descriptor per block per
-        # pass, Full-length then trimmed. A byte of this changing is a
-        # regression, not a layout difference.
-        descs = self._descs(SPLIT)
-        assert len(descs) == 2 * len(self.BASES) * self.NUM_BLOCKS
-        assert descs[0][1] == self.BLOCK_LEN
-        assert descs[-1][1] == self.BLOCK_LEN // self.SW_RATIO
+    def test_the_window_descriptors_tile_the_block(self):
+        # A prefix of K and a prefix of V covers a fraction of the block and
+        # leaves the window's own bytes behind, at a count the two sides still
+        # agree on.
+        unit = self.BLOCK_LEN // self.SW_RATIO
+        assert self._window_pieces(PACKED) == [
+            (unit * i, unit) for i in range(self.SW_RATIO)
+        ]
 
     def test_a_whole_packed_block_stays_one_descriptor(self):
         # What the packing buys: the Full pass names the block once, since K
-        # and V are adjacent inside it. Only the window pass, whose descriptor
-        # is a prefix, has to take one in each half.
+        # and V are adjacent inside it.
         descs = self._descs(PACKED)
         whole = [d for d in descs if d[1] == self.BLOCK_LEN]
-        assert len(whole) == len(self.BASES) * self.NUM_BLOCKS
-        assert len(descs) == len(whole) * (1 + PACKED)
+        assert len(whole) == len(self.DECODE_BASES) * self.NUM_BLOCKS
+        assert len(descs) == len(whole) * (1 + self.SW_RATIO)
 
 
-class TestASlidingWindowOnThePeerSide(TestASlidingWindowInsideAPackedBlock):
+class TestASlidingWindowOnThePeerSide(TestTheWindowRangeTilesABlock):
     """The peer's list has to break the same way, or the two pair off by one.
 
-    Inherits the geometry so both sides are read at one set of numbers; the
-    local class builds our list and this one the peer's.
+    Inherits the geometry and the assertions so both sides are read at one set
+    of numbers; the base class builds our list and this one the peer's.
     """
 
     PEER_BASES = [0x9000, 0xA000]
+    DECODE_BASES = PEER_BASES
 
     def _descs(self, kv_per_block):
         w = self._worker(kv_per_block)
@@ -652,33 +645,3 @@ class TestASlidingWindowOnThePeerSide(TestASlidingWindowInsideAPackedBlock):
         ):
             w.add_remote_agent(meta)
         return w.nixl_wrapper.get_xfer_descs.call_args[0][0]
-
-    def test_a_window_is_taken_inside_k_and_inside_v(self):
-        half = self.BLOCK_LEN // 2
-        covered = {
-            (addr - self.PEER_BASES[0]) % self.BLOCK_LEN // half
-            for addr, length, _ in self._descs(PACKED)
-            if length < self.BLOCK_LEN
-            and self.PEER_BASES[0] <= addr < self.PEER_BASES[1]
-        }
-        assert covered == {0, 1}
-
-    def test_a_window_descriptor_stays_inside_its_half(self):
-        half = self.BLOCK_LEN // 2
-        for addr, length, _ in self._descs(PACKED):
-            if length == self.BLOCK_LEN:
-                continue
-            within = (addr - self.PEER_BASES[0]) % self.BLOCK_LEN % half
-            assert within + length <= half
-
-    def test_separate_regions_keep_the_shipped_lengths(self):
-        descs = self._descs(SPLIT)
-        assert len(descs) == 2 * len(self.PEER_BASES) * self.NUM_BLOCKS
-        assert descs[0][1] == self.BLOCK_LEN
-        assert descs[-1][1] == self.BLOCK_LEN // self.SW_RATIO
-
-    def test_a_whole_packed_block_stays_one_descriptor(self):
-        descs = self._descs(PACKED)
-        whole = [d for d in descs if d[1] == self.BLOCK_LEN]
-        assert len(whole) == len(self.PEER_BASES) * self.NUM_BLOCKS
-        assert len(descs) == len(whole) * (1 + PACKED)

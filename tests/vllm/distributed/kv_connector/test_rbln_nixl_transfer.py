@@ -65,8 +65,9 @@ class TestComputeDescIds:
         # dst_num_blocks=4 -> num_full_descs = num_regions(2) * 4 = 8.
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        # Full ids [0,1] -> r*4 + id: 0,1 then 4,5. SWA id [2] -> r*4 + 2 + 8.
-        assert list(out) == [0, 1, 4, 5, 10, 14]
+        # Full ids [0,1] -> r*4 + id: 0,1 then 4,5. SWA id [2] -> the granules
+        # of that block, (r*4 + 2) * sw_ratio + {0,1} + 8.
+        assert list(out) == [0, 1, 4, 5, 12, 13, 20, 21]
 
     def test_block_size_ratio_scales_block_span(self, monkeypatch):
         # A block_size_ratio widens the per-region block span (num_blocks *= ratio),
@@ -78,8 +79,8 @@ class TestComputeDescIds:
 
         # dst_num_blocks=2, ratio=2 -> num_blocks=4, num_full_descs = 1*4 = 4.
         out = worker._compute_desc_ids([[1]], 2, 2.0, 1)
-        # single region: 0*4 + 1 + offset(4) = 5.
-        assert list(out) == [5]
+        # single region: (0*4 + 1) * sw_ratio + {0,1} + offset(4) = 6, 7.
+        assert list(out) == [6, 7]
 
     def test_rejects_multi_physical_blocks_per_logical(self, monkeypatch):
         # The SWA desc formula indexes physical blocks directly; the connector
@@ -102,7 +103,7 @@ class TestComputeDescIds:
     @staticmethod
     def _hybrid_worker(monkeypatch, *, grid=(2, 2), tail=None):
         # Two groups over two regions, four blocks: num_full_descs = 8, so the
-        # SWA range is [8, 16) and the chunk range starts at 16.
+        # SWA range is [8, 24) at sw_ratio 2 a block, and chunks start at 24.
         worker = build_worker(monkeypatch, block_size=64)
         worker._sw_ratio = 2
         worker.num_regions = 2
@@ -125,21 +126,8 @@ class TestComputeDescIds:
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
         # Full group keeps block 0 (ids 0, 4) and drops block 1; block 1's
-        # first chunk arrives at 16 + (r*4 + 1)*runs*chunks + run*chunks:
-        # region 0 -> 16+4, 16+6; region 1 -> 16+20, 16+22.
-        assert list(out) == [0, 4, 20, 22, 36, 38, 10, 14]
-
-    def test_a_packed_block_moves_only_the_ranges_that_hold_its_halves(
-        self, monkeypatch
-    ):
-        # A whole block is one descriptor however it is packed; the window
-        # range holds two, and the chunk range starts past both.
-        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
-        worker._kv_per_block = 2
-
-        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
-
-        # Whole 0, 4 as before; chunks from 8 * (1 + 2); window at 8 + id * 2.
+        # first chunk arrives at 24 + (r*4 + 1)*runs*chunks + run*chunks:
+        # region 0 -> 24+4, 24+6; region 1 -> 24+20, 24+22.
         assert list(out) == [0, 4, 28, 30, 44, 46, 12, 13, 20, 21]
 
     def test_the_windowed_group_is_never_cut(self, monkeypatch):
@@ -149,8 +137,8 @@ class TestComputeDescIds:
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        # The SWA ids are the same two the range gave before chunking existed.
-        assert list(out)[-2:] == [10, 14]
+        # The SWA ids are the same four the range gave before chunking existed.
+        assert list(out)[-4:] == [12, 13, 20, 21]
 
     def test_a_last_block_needing_every_chunk_is_left_whole(self, monkeypatch):
         # The benefit test: the same bytes in more descriptors is a loss, so
@@ -159,7 +147,7 @@ class TestComputeDescIds:
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        assert list(out) == [0, 1, 4, 5, 10, 14]
+        assert list(out) == [0, 1, 4, 5, 12, 13, 20, 21]
 
     def test_no_parked_tail_is_todays_ids(self, monkeypatch):
         # Nothing said how far the request fills its last block -- every block
@@ -168,7 +156,7 @@ class TestComputeDescIds:
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        assert list(out) == [0, 1, 4, 5, 10, 14]
+        assert list(out) == [0, 1, 4, 5, 12, 13, 20, 21]
 
     def test_no_chunk_grid_is_todays_ids(self, monkeypatch):
         # A geometry whose span a chunk cannot cut registered no third range,
@@ -177,7 +165,7 @@ class TestComputeDescIds:
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        assert list(out) == [0, 1, 4, 5, 10, 14]
+        assert list(out) == [0, 1, 4, 5, 12, 13, 20, 21]
 
 
 # What each layout puts in one block.
@@ -217,9 +205,10 @@ class TestDescIdsForAPackedBlock:
     def test_the_sliding_window_range_starts_past_every_whole_desc(self):
         sw = MagicMock(spec=SlidingWindowSpec)
         # num_regions(2) * num_blocks(4) whole descs come first; the window
-        # range then names a packed block's halves in order.
+        # range then names the `sw_ratio` kernel blocks that tile each block,
+        # and one of those is a run of bytes however K and V sit in it.
         assert sorted(self._ids(PACKED, sw)) == [10, 11, 18, 19]
-        assert sorted(self._ids(SPLIT, sw)) == [9, 13]
+        assert sorted(self._ids(SPLIT, sw)) == [10, 11, 18, 19]
 
 
 class TestTailChunks:

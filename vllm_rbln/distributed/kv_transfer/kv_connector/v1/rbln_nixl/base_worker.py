@@ -198,11 +198,11 @@ class RblnNixlWorkerBase(
         self._physical_blocks_per_logical_kv_block = 1
         self._logical_num_blocks = self.num_blocks
 
-        # SWA window mode: a second sliding_window-length desc range at the same
-        # NIXL base addrs as the Full range, so an SWA group transports less than
-        # a whole block. Storage and host copies stay Full.
-        # TODO: that range names the block's leading bytes, which is where the
-        # window sits only while a kernel keeps it there. CR13 slides it.
+        # SWA window mode: a second range at the same NIXL base addrs as the
+        # Full range, cutting each block into the kernel blocks a window moves
+        # in. Storage and host copies stay Full.
+        # TODO: a window lands in one or two of those, which the request's
+        # token count says -- so an SWA group still names all of them.
         self._group_specs: list[Any] = [
             g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
         ]
@@ -252,8 +252,7 @@ class RblnNixlWorkerBase(
                         "describable only by the lists that range sits in."
                     )
                 logger.info(
-                    "SWA window mode on: trimming SWA-group RDMA payload by 1/%d "
-                    "(sliding_window-sized descs alongside Full descs at "
-                    "shared base addrs).",
+                    "SWA window mode on: %d sliding_window-sized desc(s) per "
+                    "block alongside the Full descs at shared base addrs.",
                     self._sw_ratio,
                 )
