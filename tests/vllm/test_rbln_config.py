@@ -197,7 +197,7 @@ def test_no_field_is_read_from_the_environment():
     that would ignore `--rbln-*` and `additional_config`. The options that stay
     in `envs.py` are not fields, so they are exempt by construction.
 
-    `build_rbln_config` only runs on the vLLM-native path, so the optimum-rbln
+    `build_rbln_config` only runs on the vllm model path, so the optimum-rbln
     path's own readers are outside the claim.
     """
     import vllm_rbln

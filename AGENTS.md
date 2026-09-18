@@ -38,18 +38,18 @@ They do not exist in `tests/optimum/`.
 
 The codebase already has a word for each of these. Use it, and do not reach for a synonym because the sentence reads better.
 
-- **model path** — which model implementation runs. The two are the **optimum-rbln path** and the **vLLM-native path**; `optimum` and `native` are the short forms in prose. Identifiers name a path after the model implementation it selects, `optimum` and `vllm`: `tests/optimum/` and `tests/vllm/`, `platform/optimum_impl.py` and `platform/vllm_impl.py`. Not "backend", not "mode". `torch.compile` describes how the native path works and is not its name.
+- **model impl path**, short form **model path** — which model implementation runs. The two are the **vllm model path** and the **optimum model path**, each named after the implementation it selects, and that name is the word in prose and in identifiers alike: `tests/vllm/` and `tests/optimum/`, `platform/vllm_impl.py` and `platform/optimum_impl.py`. Not "native", which used to be the prose form for the vllm model path and reads as a second concept next to it. Not "backend", not "mode". `torch.compile` describes how the vllm model path works and is not its name.
 - **suite** — a top-level test tree: `tests/vllm/`, `tests/optimum/`.
 - **lane** — a slice of a suite selected by a flag, a mark, or the device mode: the default lane, the `--model-compile` lane, the cpu and device lanes.
 
 ## Two model paths
 
-`VLLM_RBLN_USE_VLLM_MODEL` selects the model path at startup: unset or `0` is optimum-rbln, `1` is vLLM-native.
+`VLLM_RBLN_USE_VLLM_MODEL` selects the model path at startup: unset or `0` is the optimum model path, `1` is the vllm model path.
 
 | Path         | Owns                                                                        |
 | ------------ | --------------------------------------------------------------------------- |
-| optimum-rbln | `model_executor/models/optimum/`, `utils/optimum/`, `v1/worker/optimum_*.py`, `platform/optimum_impl.py` |
-| vLLM-native  | `patches/`, `compilation/`, `v1/worker/rbln_*.py`, `platform/vllm_impl.py` |
+| optimum      | `model_executor/models/optimum/`, `utils/optimum/`, `v1/worker/optimum_*.py`, `platform/optimum_impl.py` |
+| vllm         | `patches/`, `compilation/`, `v1/worker/rbln_*.py`, `platform/vllm_impl.py` |
 | shared       | everything else |
 
 **`envs.py` defines the flag; only `__init__.py` and `platform/__init__.py` branch on it.** Do not branch on `VLLM_RBLN_USE_VLLM_MODEL` anywhere else. Path-specific code belongs in the module that path owns.
@@ -62,7 +62,7 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 ## Patching upstream vLLM
 
-`vllm_rbln/patches/` adapts upstream vLLM for RBLN. Both mechanisms live in `patches/registry.py`, both take a required `reason`, and `register_ops()` applies registrations before patches — on the native path only.
+`vllm_rbln/patches/` adapts upstream vLLM for RBLN. Both mechanisms live in `patches/registry.py`, both take a required `reason`, and `register_ops()` applies registrations before patches — on the vllm model path only.
 
 **Use upstream's own extension points first.** `@add_registration` wraps a callback that registers through a vLLM API: `base_cls.register_oot(...)`, a `PlatformEnum.OOT` entry in a kernel registry, and so on. `patches/oot.py` is the worked example. A registration survives an upstream refactor; a replaced symbol does not.
 

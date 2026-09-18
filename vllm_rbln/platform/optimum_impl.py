@@ -28,7 +28,7 @@ logger = init_logger(__name__)
 
 
 def patch_upstream() -> None:
-    # Only sync_from_vllm reads the key the first one writes, and on the native
+    # Only sync_from_vllm reads the key the first one writes, and on the vllm
     # path it would be an unknown field of RBLNConfig.
     _capture_user_max_num_batched_tokens()
     _allow_gemma4_global_per_layer_attribute_access()

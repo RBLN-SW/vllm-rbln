@@ -95,7 +95,8 @@ def make_vllm_config(
     enable_chunked_prefill: bool = True,
     **engine_args,
 ) -> VllmConfig:
-    """Full-control native VllmConfig; extra EngineArgs fields pass through.
+    """Full-control VllmConfig on the vllm model path; extra EngineArgs fields
+    pass through.
 
     Nothing here loads the model, so ``model`` is resolved to its cache directory
     (see local_model_path) rather than fetched over and over.

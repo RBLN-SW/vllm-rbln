@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RBLN options for the vLLM-native model path.
+"""RBLN options for the vllm model path.
 
 On this path the config *is* `VllmConfig.additional_config`, which
 `check_and_update_config` replaces with the resolved object. Being a
@@ -55,7 +55,7 @@ DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
 
 @vllm_config_dataclass
 class RBLNConfig:
-    """RBLN NPU options for the vLLM-native model path."""
+    """RBLN NPU options for the vllm model path."""
 
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
@@ -209,7 +209,7 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
     if not isinstance(given, dict):
         raise ValueError(
             "additional_config must be an RBLNConfig or a mapping of its field "
-            f"names on the vLLM-native path, got {type(given).__name__}"
+            f"names on the vllm model path, got {type(given).__name__}"
         )
 
     known = {f.name for f in _FIELDS}
@@ -219,7 +219,7 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
         # arg_utils writes it into additional_config.
         raise ValueError(
             f"additional_config takes only RBLNConfig fields on the "
-            f"vLLM-native path, and {unknown} are not fields. The fields are "
+            f"vllm model path, and {unknown} are not fields. The fields are "
             f"{sorted(known)}."
         )
 
@@ -266,7 +266,7 @@ def get_rbln_config() -> RBLNConfig:
     if not isinstance(rbln_config, RBLNConfig):
         raise RuntimeError(
             "additional_config is not an RBLNConfig; "
-            "check_and_update_config resolves it on the vLLM-native path, so "
+            "check_and_update_config resolves it on the vllm model path, so "
             f"this is the optimum-rbln path or an unbuilt config: {rbln_config!r}"
         )
     return rbln_config

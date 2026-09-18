@@ -36,7 +36,7 @@ def _rope(*, head_size=64, rotary_dim=64, is_neox_style=True) -> Any:
     rope.head_size = head_size
     rope.rotary_dim = rotary_dim
     rope.is_neox_style = is_neox_style
-    rope.use_aiter = False  # RBLN default; the native path reads it on half dtypes
+    rope.use_aiter = False  # RBLN default; forward_native reads it on half dtypes
     # Deterministic fp32 stand-in for the precomputed [max_pos, rotary_dim] cos|sin
     # cache; forward_oot coerces it to the activation dtype at call time.
     rope.cos_sin_cache = torch.linspace(-1.0, 1.0, _MAX_POS * rotary_dim).reshape(

@@ -3,11 +3,11 @@ name: writing-tests
 description: Use when adding or modifying tests under tests/vllm/ — covers placement, the model_compile/use_device/maybe_use_device marks, the session options, and proving a new test fails before the change it covers.
 ---
 
-# Writing tests in the native suite
+# Writing tests in the vllm suite
 
 ## Scope
 
-This skill covers `tests/vllm/`, the vLLM-native path.
+This skill covers `tests/vllm/`, the vllm model path.
 
 For `tests/optimum/` the conventions are not settled. Do not carry the rules below into that suite — the marks and session options gate nothing there. Follow the patterns in the nearest existing directory, and ask before introducing a new one.
 

@@ -34,8 +34,8 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 from tests.vllm.vllm_config import local_weights_path
 
-# RBLN requires an explicit block_size; the rest are the known-good native config
-# for these small models (chunked prefill, small batch/token budget).
+# RBLN requires an explicit block_size; the rest are what the vllm model path
+# wants for these small models (chunked prefill, small batch/token budget).
 _RBLN_RUNNER_DEFAULTS = dict(
     block_size=1024,
     max_model_len=8192,
@@ -140,7 +140,8 @@ def rbln_engine_args(model: str, **kwargs) -> dict:
 
 
 class VllmRunner:
-    """System under test: ``vllm.LLM`` with the native RBLN config; kwargs override."""
+    """System under test: ``vllm.LLM`` with the vllm model path's RBLN config;
+    kwargs override."""
 
     def __init__(self, model: str, **kwargs) -> None:
         model = local_weights_path(model)
@@ -213,8 +214,8 @@ async def _build_async_engine(args: AsyncEngineArgs) -> AsyncLLM:
 
 
 class AsyncVllmRunner:
-    """System under test for data parallel: ``AsyncLLM`` with the native RBLN
-    config; kwargs override, same as VllmRunner.
+    """System under test for data parallel: ``AsyncLLM`` with the vllm model
+    path's RBLN config; kwargs override, same as VllmRunner.
 
     Not VllmRunner because the sync ``LLM`` rejects ``data_parallel_size > 1`` --
     the internal-load-balancing engine client only exists on the async side

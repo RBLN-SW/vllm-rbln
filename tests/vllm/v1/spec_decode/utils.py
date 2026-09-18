@@ -88,7 +88,7 @@ def make_eagle_proposer(
 
 
 # vLLM's tiny random medusa test pair. JackFram/llama-68m caps at 2048 positions,
-# so max_model_len must be lowered from the native default.
+# so max_model_len must be lowered from the default.
 MEDUSA_TARGET = "JackFram/llama-68m"
 MEDUSA_DRAFT = "abhigoyal/vllm-medusa-llama-68m-random"
 

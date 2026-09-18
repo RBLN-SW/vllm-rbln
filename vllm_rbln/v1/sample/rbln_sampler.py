@@ -187,7 +187,7 @@ class RBLNSampler(VLLMSampler):
         else:
             logger.warning_once(
                 f"RBLN Sampling does not support logprobs_mode: {logprobs_mode}. "
-                "Using native sampler instead."
+                "Using the upstream sampler instead."
             )
 
         self._compiled_greedy_sample = compile_sampler(

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The vLLM-native model path's half of the platform hooks."""
+"""The vllm model path's half of the platform hooks."""
 
 import os
 from typing import TYPE_CHECKING
@@ -34,7 +34,7 @@ logger = init_logger(__name__)
 
 
 def patch_upstream() -> None:
-    """The native path replaces no upstream symbol from the platform hook."""
+    """The vllm model path replaces no upstream symbol from the platform hook."""
 
 
 def add_cli_args(parser: "FlexibleArgumentParser") -> None:

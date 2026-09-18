@@ -24,7 +24,7 @@ How it works
 ``VLLM_RBLN_COMPILE_ONLY=1`` makes the rbln ``torch.compile`` backend compile +
 cache each graph while building its runtime on a *dummy* device, so no NPU is
 required. It is a torch.compile option, so it only has meaning on the
-vLLM-native model path; the optimum-rbln path is not torch.compile-based and
+vllm model path; the optimum model path is not torch.compile-based and
 the flag conflicts with it. This example therefore also sets
 ``VLLM_RBLN_USE_VLLM_MODEL=1`` to run the vLLM model implementation (the
 torch.compile pipeline). Three things follow from that:
@@ -81,8 +81,8 @@ def main():
     # rbln_envs reads these lazily from os.environ, so setting them here is
     # enough -- you can equally export them in the shell instead.
     os.environ["VLLM_RBLN_COMPILE_ONLY"] = "1"
-    # compile-only only applies to the vLLM-native (torch.compile) path, not
-    # the optimum-rbln path, so select it explicitly.
+    # compile-only only applies to the vllm model path (torch.compile), not
+    # the optimum model path, so select it explicitly.
     os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
     os.environ["RBLN_FORCE_NPU_NAME"] = args.target_npu
     # The cache is where compiled artifacts are written; it must stay enabled.

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnPlatform on the native path only (VLLM_RBLN_USE_VLLM_MODEL=1). Written
+# RblnPlatform on the vllm model path only (VLLM_RBLN_USE_VLLM_MODEL=1). Written
 # against outcomes rather than call paths -- a real config is built so the engine's
 # own entry point (VllmConfig.__post_init__ -> check_and_update_config) does the
 # work, and the assertions read the resulting config, the raised error, or the
-# process env. That survives splitting the optimum and native paths apart.
+# process env. That survives splitting the optimum and vllm model paths apart.
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def _build(**engine_kwargs) -> VllmConfig:
 
 @pytest.fixture(scope="module")
 def configured() -> VllmConfig:
-    """One plain native config, built once."""
+    """One plain config on the vllm model path, built once."""
     return _build()
 
 
@@ -340,7 +340,7 @@ class TestWorkerAndScheduler:
     def test_a_plain_build_lands_on_the_async_scheduler(self, monkeypatch):
         # Nobody passes --async-scheduling here: vLLM resolves the unset flag to
         # True before this platform hook, and with both carriers on nothing
-        # refuses it, so the native path selects the async scheduler. This is
+        # refuses it, so the vllm model path selects the async scheduler. This is
         # what the async support changed, and it went unasserted.
         for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
             monkeypatch.setenv(name, "1")
@@ -759,8 +759,8 @@ class TestKnownGaps:
 
     def test_sliding_window_keeps_prefix_caching_on(self):
         # disable_unsupported_prefix_caching runs on the optimum path only, so
-        # the native path has no SWA guard. SWA instead surfaces much later as
-        # the sub-block multi-group NotImplementedError in
+        # the vllm model path has no SWA guard. SWA instead surfaces much later
+        # as the sub-block multi-group NotImplementedError in
         # RBLNModelRunner.initialize_kv_cache, and the workaround in use is
         # VLLM_RBLN_SUB_BLOCK_CACHE=0.
         config = _build(
