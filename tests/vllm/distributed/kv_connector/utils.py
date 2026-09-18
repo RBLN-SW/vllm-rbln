@@ -17,7 +17,7 @@
 ``conftest.py::make_worker`` runs the worker's real ``__init__`` on a real
 VllmConfig and KVCacheConfig over real KV tensors, faking what it cannot reach
 here: the NIXL agent and its config, the ``nixl_rbln`` adapter, ``rebel``'s
-context lookup, ``get_device``, the TP-rank accessors and the view-opt env
+context lookup, ``get_device``, the TP-rank accessors and the window-mode env
 flag. ``build_worker`` below goes further and replaces upstream's ``__init__``.
 
 ``KvGeometry`` is why that is affordable. One object produces all three views of
@@ -692,7 +692,7 @@ def build_worker(
     block_size=64,
     specs=None,
     nixl_available=True,
-    swa_view_opt=False,
+    swa_window_mode=False,
     use_mla=False,
     pp_size=1,
     hma_disabled=False,
@@ -752,7 +752,7 @@ def build_worker(
 
     vllm_config = mock_vllm_config(
         chunk_mode=chunk_mode,
-        swa_view_opt=swa_view_opt,
+        swa_window_mode=swa_window_mode,
         chunk_bytes=chunk_bytes,
         stripe_width=stripe_width,
     )

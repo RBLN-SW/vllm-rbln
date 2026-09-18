@@ -202,28 +202,29 @@ class RblnNixlWorkerBase(
         self._physical_blocks_per_logical_kv_block = 1
         self._logical_num_blocks = self.num_blocks
 
-        # SWA view-opt: publish a second sliding_window-length desc range at the
-        # same NIXL base addrs as the Full range, so SWA groups transport only the
-        # populated prefix (kernel slot 0 is pinned at the block base). Storage and
-        # host copies stay Full; _sw_ratio is None collapses to upstream Full-only.
-        # `register_local_xfer_handler` builds that second range and documents it.
+        # SWA window mode: a second sliding_window-length desc range at the same
+        # NIXL base addrs as the Full range, so an SWA group transports less than
+        # a whole block. Storage and host copies stay Full.
+        # TODO: that range names the block's leading bytes, which is where the
+        # window sits only while a kernel keeps it there. CR13 slides it.
         self._group_specs: list[Any] = [
             g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
         ]
         # Whether the model has a sliding window at all, which decides the model
-        # parallelism guards; `_sw_ratio` is the view-opt's desc layout and only
+        # parallelism guards; `_sw_ratio` is the window mode's desc layout and only
         # ever set when that flag is on.
         self._has_swa = any(
             isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
         self._sw_ratio: int | None = None
-        # Chunk mode turns the view opt on rather than asking for it. Its
-        # descriptor ranges are ours to extend only where `_sw_ratio` is set --
-        # `_compute_desc_ids` hands the whole list to upstream otherwise, and
-        # upstream's has no room for a second range, let alone a third.
-        swa_view_opt = connector_option(self.vllm_config, "swa_view_opt", False)
+        # Chunk mode turns window mode on rather than asking for it: a hybrid
+        # is describable only by the whole-engine lists, and those carry a
+        # second range only in window mode. Without it `_own_engine_layout` is
+        # false and the whole list goes to upstream, which has room for neither
+        # that range nor the chunk range beside it.
+        swa_window_mode = connector_option(self.vllm_config, "swa_window_mode", False)
         if self._has_swa and (
-            swa_view_opt or connector_option(self.vllm_config, "chunk_mode", False)
+            swa_window_mode or connector_option(self.vllm_config, "chunk_mode", False)
         ):
             for spec in self._group_specs:
                 if not isinstance(spec, SlidingWindowSpec):
@@ -245,18 +246,17 @@ class RblnNixlWorkerBase(
                 # key-only latent have not been combined.
                 if self.use_mla:
                     raise RuntimeError(
-                        "RBLN NIXL: the SWA descriptor view is not supported "
-                        "with a sliding-window MLA cache."
+                        "RBLN NIXL: SWA window mode is not supported with a "
+                        "sliding-window MLA cache."
                     )
-                if not swa_view_opt:
+                if not swa_window_mode:
                     logger.warning(
-                        "RBLN NIXL: chunk_mode turned the SWA view on "
-                        "over swa_view_opt=0 -- a "
-                        "chunk range extends that layout and has nowhere "
-                        "else to sit."
+                        "RBLN NIXL: chunk_mode turned SWA window mode on over "
+                        "swa_window_mode=0 -- a hybrid engine is "
+                        "describable only by the lists that range sits in."
                     )
                 logger.info(
-                    "SWA view on: trimming SWA-group RDMA payload by 1/%d "
+                    "SWA window mode on: trimming SWA-group RDMA payload by 1/%d "
                     "(sliding_window-sized descs alongside Full descs at "
                     "shared base addrs).",
                     self._sw_ratio,

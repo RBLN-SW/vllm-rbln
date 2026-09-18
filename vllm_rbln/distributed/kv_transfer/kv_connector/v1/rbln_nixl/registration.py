@@ -440,7 +440,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             )
         # A chunk is a token range of a block, and a second attention shape
         # needs a descriptor of its own to be left out of one. A sliding
-        # window has that already -- the view opt's second range -- so it may
+        # window has that already -- window mode's second range -- so it may
         # sit beside the one full-attention group whose blocks a chunk cuts.
         # Exactly one, because every group's blocks are cut the same way.
         self._chunk_mode = connector_option(self.vllm_config, "chunk_mode", False)

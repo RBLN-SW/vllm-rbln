@@ -114,16 +114,16 @@ class TestLogicalBlockPinning:
         assert worker._pending_kv_caches is None
 
 
-class TestSwaViewRatio:
+class TestSwaWindowRatio:
     def test_opt_off_keeps_ratio_none(self, monkeypatch):
         worker = build_worker(
             monkeypatch,
-            swa_view_opt=False,
+            swa_window_mode=False,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
         assert worker._sw_ratio is None
         # The window is still detected -- it gates the model parallelism guards
-        # whether or not the view-opt is on.
+        # whether or not window mode is on.
         assert worker._has_swa
 
     def test_chunk_mode_turns_the_view_on_over_the_flag(self, monkeypatch):
@@ -133,7 +133,7 @@ class TestSwaViewRatio:
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="rbln",  # chunk mode is the direct path's
-            swa_view_opt=False,
+            swa_window_mode=False,
             chunk_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
@@ -145,7 +145,7 @@ class TestSwaViewRatio:
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="rbln",
-            swa_view_opt=False,
+            swa_window_mode=False,
             chunk_mode=True,
             specs=[MagicMock()],
         )
@@ -153,25 +153,25 @@ class TestSwaViewRatio:
 
     def test_pure_full_attention_keeps_ratio_none(self, monkeypatch):
         # A non-sliding-window group contributes no ratio.
-        worker = build_worker(monkeypatch, swa_view_opt=True, specs=[MagicMock()])
+        worker = build_worker(monkeypatch, swa_window_mode=True, specs=[MagicMock()])
         assert worker._sw_ratio is None
 
     def test_sliding_window_derives_block_over_window_ratio(self, monkeypatch):
         worker = build_worker(
             monkeypatch,
-            swa_view_opt=True,
+            swa_window_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
         assert worker._sw_ratio == 4
 
-    def test_chunk_mode_turning_the_view_on_says_so(self, monkeypatch, caplog):
+    def test_chunk_mode_turning_window_mode_on_says_so(self, monkeypatch, caplog):
         # The operator asked for no view and got one. This log is the only place
         # that says so, and a chunk range has nowhere else to sit.
         with caplog.at_level("WARNING"):
             worker = build_worker(
                 monkeypatch,
                 kv_buffer_device="rbln",
-                swa_view_opt=False,
+                swa_window_mode=False,
                 chunk_mode=True,
                 specs=[sliding_window_spec(block_size=64, sliding_window=16)],
             )
@@ -180,14 +180,14 @@ class TestSwaViewRatio:
         assert [
             r.getMessage()
             for r in caplog.records
-            if "turned the SWA view on" in r.getMessage()
+            if "turned SWA window mode on" in r.getMessage()
         ]
 
     def test_window_equal_to_block_collapses_to_none(self, monkeypatch):
-        # ratio 1 means the SWA view equals the full block -> no trimming.
+        # ratio 1 means the window equals the full block -> no trimming.
         worker = build_worker(
             monkeypatch,
-            swa_view_opt=True,
+            swa_window_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=64)],
         )
         assert worker._sw_ratio is None
@@ -197,7 +197,7 @@ class TestSwaViewRatio:
         # layers, so the ratio has to come from the windowed groups alone.
         worker = build_worker(
             monkeypatch,
-            swa_view_opt=True,
+            swa_window_mode=True,
             specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
         )
         assert worker._sw_ratio == 4
@@ -205,7 +205,7 @@ class TestSwaViewRatio:
     def test_consistent_ratio_across_groups(self, monkeypatch):
         worker = build_worker(
             monkeypatch,
-            swa_view_opt=True,
+            swa_window_mode=True,
             specs=[
                 sliding_window_spec(block_size=64, sliding_window=16),
                 sliding_window_spec(block_size=64, sliding_window=16),
@@ -217,7 +217,7 @@ class TestSwaViewRatio:
         with pytest.raises(AssertionError, match="single SWA ratio"):
             build_worker(
                 monkeypatch,
-                swa_view_opt=True,
+                swa_window_mode=True,
                 specs=[
                     sliding_window_spec(block_size=64, sliding_window=16),
                     sliding_window_spec(block_size=64, sliding_window=32),
@@ -228,23 +228,23 @@ class TestSwaViewRatio:
         with pytest.raises(AssertionError):
             build_worker(
                 monkeypatch,
-                swa_view_opt=True,
+                swa_window_mode=True,
                 specs=[sliding_window_spec(block_size=64, sliding_window=15)],
             )
 
-    def test_mla_with_view_opt_is_rejected_at_startup(self, monkeypatch):
+    def test_mla_with_window_mode_is_rejected_at_startup(self, monkeypatch):
         # The dual desc range and a key-only latent have not been combined,
         # so fail at construction rather than at the first handshake.
         with pytest.raises(RuntimeError, match="sliding-window MLA"):
             build_worker(
                 monkeypatch,
-                swa_view_opt=True,
+                swa_window_mode=True,
                 use_mla=True,
                 specs=[sliding_window_spec(block_size=64, sliding_window=16)],
             )
 
 
-class TestSwaViewDelegation:
+class TestSwaWindowDelegation:
     # Both collapse to the upstream Full-only implementation when _sw_ratio is
     # None; the SWA dual-range paths are exercised in the Swa classes below.
     def test_register_local_xfer_handler_delegates_when_no_swa(self, monkeypatch):
@@ -296,7 +296,7 @@ class TestSwaViewDelegation:
         # without re-registering (no super() / topology work).
         worker = build_worker(
             monkeypatch,
-            swa_view_opt=True,
+            swa_window_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
         # Flat rank 1 of a TP2 peer is its (pp 0, tp 1): no pipelining, which
@@ -318,12 +318,12 @@ class TestSwaViewDelegation:
 
 
 class TestRegisterLocalXferHandlerSwa:
-    # With a sliding-window group and the view-opt on, register_local_xfer_handler
+    # With a sliding-window group and window mode on, register_local_xfer_handler
     # emits a dual desc range: Full then SWA over the same addresses, trimmed by
     # _sw_ratio.
     def test_swa_builds_dual_desc_ranges(self, make_worker):
         geo = KvGeometry(spec="swa", sliding_window=512, block_size=1024, num_blocks=4)
-        w = make_worker(kv_cache=geo, swa_view_opt=True)
+        w = make_worker(kv_cache=geo, swa_window_mode=True)
         assert (w._has_swa, w._sw_ratio) == (True, 2)
 
         blocks_data = w.src_blocks_data
@@ -360,7 +360,7 @@ class TestRegisterLocalXferHandlerSwa:
     def test_a_chunk_grid_appends_a_third_range(self, monkeypatch):
         # A grid of (2 runs, 2 chunks) turns each region-block's one Full
         # descriptor into four quarter-length ones, appended after BOTH
-        # existing ranges -- the SWA view keeps its index space and the
+        # existing ranges -- the window range keeps its index space and the
         # transfer picks a range by offset.
         worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
         worker._sw_ratio = 2
@@ -539,7 +539,7 @@ SPLIT = 1  # rbln_triton_ops: (2, num_blocks, H, 1, S, D)
 
 
 class TestASlidingWindowInsideAPackedBlock:
-    """The SWA view is a byte prefix, so a packed block needs one per K/V.
+    """The window range is a byte prefix, so a packed block needs one per K/V.
 
     One prefix over the whole block would run twice as far into K and never
     reach V. Refusing the pair instead is not open to us: gpt-oss is a
