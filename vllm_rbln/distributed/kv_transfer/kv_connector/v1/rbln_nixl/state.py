@@ -320,12 +320,16 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             return None
         parts = self._kv_per_block // kv_runs
         span_tokens = block_size // spans
-        bytes_per_token = self.block_len_per_layer[0] // (
-            span_tokens * heads_per_span * parts
-        )
+        # The widest region rather than the first: one layer may register
+        # several of very different sizes -- a latent, its indexer, its scale
+        # -- and the byte target belongs on the one carrying the bytes. Off
+        # the first, registration order picks the grid, and a narrow region
+        # there sizes a chunk past the span and drops the range entirely.
+        widest = max(self.block_len_per_layer)
+        bytes_per_token = widest // (span_tokens * heads_per_span * parts)
         assert bytes_per_token > 0, (
-            f"RBLN NIXL: a region holds {self.block_len_per_layer[0]}B per block, "
-            f"which is under one byte per token for {span_tokens} token(s) of "
+            f"RBLN NIXL: the widest region holds {widest}B per block, which is "
+            f"under one byte per token for {span_tokens} token(s) of "
             f"{heads_per_span} head(s) in {parts} K/V part(s)"
         )
         chunk_tokens = kv_chunk_tokens(
