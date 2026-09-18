@@ -1753,6 +1753,23 @@ class TestChunkSizing:
 
         assert w._shard_chunk_grid(block_size=block_size, split=1) is None
 
+    def test_the_grid_is_sized_off_the_widest_region(self):
+        # One layer registers several regions of very different sizes -- a
+        # latent, its indexer, its scale. Read off whichever landed first, the
+        # two narrow ones put a chunk past the span and the range disappears,
+        # so the order the caches were registered in would decide the layout.
+        span_tokens = 8192 // 4
+
+        def grid(order):
+            w = self._grid_worker(block_len=order[0])
+            w.block_len_per_layer = [ln * span_tokens for ln in order for _ in range(4)]
+            return w._shard_chunk_grid(block_size=8192, split=1)
+
+        per_token = [768, 128, 2]
+        rotations = [per_token[i:] + per_token[:i] for i in range(len(per_token))]
+
+        assert {grid(order) for order in rotations} == {(1, 4)}
+
     def test_off_the_knob_there_is_no_grid(self):
         # Off, neither list may grow: a longer dlist is memory every peer pays.
         w = self._grid_worker(block_len=2048 * 256)
