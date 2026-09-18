@@ -41,6 +41,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, GrammarOutput, NewRequestData
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
@@ -156,12 +157,10 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float
         cache_dtype="auto",
         enable_prefix_caching=True,
     )
-    additional_config = {
-        "prefix_block_size": IB_SIZE,
-        "optimum_overrides": {
-            "prefill_chunk_size": IB_SIZE,
-        },
-    }
+    additional_config = OptimumRBLNConfig(
+        prefix_block_size=IB_SIZE,
+        optimum_overrides={"prefill_chunk_size": IB_SIZE},
+    )
     structured_outputs_config = StructuredOutputsConfig(
         backend="guidance",
     )

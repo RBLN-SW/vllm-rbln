@@ -17,6 +17,7 @@ from unittest.mock import patch
 import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.utils.optimum.converter.from_optimum import sync_from_optimum
 
 
@@ -36,14 +37,15 @@ def _vllm_config() -> VllmConfig:
                 is_encoder_decoder=False,
             ),
             cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
-            additional_config={"optimum_overrides": {"prefill_chunk_size": 4}},
+            additional_config=OptimumRBLNConfig(
+                optimum_overrides={"prefill_chunk_size": 4}
+            ),
         )
 
 
-def test_compiled_num_devices_lands_in_optimum_config(monkeypatch):
+def test_compiled_num_devices_lands_in_optimum_config():
     """The compiled model decides num_devices. It must reach the config every
     worker receives, not a module attribute of the front-end process."""
-    monkeypatch.setenv("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK", "1")
     vllm_config = _vllm_config()
     assert vllm_config.additional_config.num_devices_per_local_rank == 1
 

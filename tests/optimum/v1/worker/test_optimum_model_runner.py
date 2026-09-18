@@ -39,6 +39,7 @@ import vllm_rbln.v1.worker.optimum_model_runner as runner_module
 from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumMultimodalMixin,
 )
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
@@ -71,13 +72,11 @@ def get_vllm_config(async_scheduling=False, optimum_config: dict | None = None):
         cache_config=cache_config,
         model_config=model_config,
         scheduler_config=scheduler_config,
-        additional_config={
-            "prefix_block_size": 4,
-            "optimum_overrides": {
-                "prefill_chunk_size": 4,
-            },
+        additional_config=OptimumRBLNConfig(
+            prefix_block_size=4,
+            optimum_overrides={"prefill_chunk_size": 4},
             **(optimum_config or {}),
-        },
+        ),
     )
     return vllm_config
 

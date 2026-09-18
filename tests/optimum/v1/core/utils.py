@@ -38,6 +38,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 from vllm_rbln.v1.core.optimum_scheduler import (
     RBLNOptimumScheduler,
     RBLNSchedulerOutput,
@@ -99,12 +100,10 @@ def create_scheduler(
         model_config=model_config,
         cache_config=cache_config,
         structured_outputs_config=structured_outputs_config,
-        additional_config={
-            "prefix_block_size": block_size,
-            "optimum_overrides": {
-                "prefill_chunk_size": block_size,
-            },
-        },
+        additional_config=OptimumRBLNConfig(
+            prefix_block_size=block_size,
+            optimum_overrides={"prefill_chunk_size": block_size},
+        ),
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests

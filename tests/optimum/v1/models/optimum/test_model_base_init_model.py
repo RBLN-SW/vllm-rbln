@@ -26,6 +26,7 @@ import torch
 
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
+from vllm_rbln.optimum_config import OptimumRBLNConfig
 
 
 def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
@@ -62,7 +63,7 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
         max_num_seqs=1, max_num_batched_tokens=128
     )
     obj.vllm_config = types.SimpleNamespace(
-        additional_config={"cached_model_path": str(tmp_path)},
+        additional_config=OptimumRBLNConfig(cached_model_path=str(tmp_path)),
         model_config=obj.model_config,
         scheduler_config=obj.scheduler_config,
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
