@@ -47,6 +47,13 @@ RBLN_DEFAULT_MAX_NUM_SEQS = 1
 RBLN_DEFAULT_GPU_MEMORY_UTILIZATION = 0.93
 # Superseded by RblnPlatform.device_control_env_var.
 DEPRECATED_DEVICE_CONTROL_ENV_VAR = "RBLN_DEVICES"
+# The connectors the dynamic-KV resize is open for. The order it needs
+# (warm-up, reallocate, register) is driven from the worker and is
+# connector-agnostic, so one outside this set is untried, not known broken.
+DYNAMIC_KV_SUPPORTED_CONNECTORS = (
+    "RblnNixlConnector",
+    "RblnNixlPullConnector",
+)
 
 
 def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
@@ -298,10 +305,16 @@ class RblnPlatform(Platform):
                 "no dynamic KV dimension."
             )
 
-        if vllm_config.kv_transfer_config is not None:
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_connector not in DYNAMIC_KV_SUPPORTED_CONNECTORS
+        ):
             reject(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
-                "transfer connector; the resize invalidates its registrations."
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE reallocates the KV cache after "
+                "warm-up, and the connector registers what the resize allocated. "
+                f"That path is open for {', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)}"
+                f"; got kv_connector={kv_transfer_config.kv_connector!r}."
             )
 
     @classmethod

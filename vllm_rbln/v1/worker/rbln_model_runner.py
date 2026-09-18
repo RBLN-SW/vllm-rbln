@@ -3226,41 +3226,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        kv_caches = self.initialize_kv_cache_tensors(
-            kv_cache_config, kernel_block_sizes
-        )
-
-        if has_kv_transfer_group():
-            kv_transfer_group = get_kv_transfer_group()
-            if self.cross_layers_kv_cache is not None:
-                assert self.cross_layers_attn_backend is not None
-                kv_transfer_group.register_cross_layers_kv_cache(
-                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
-                )
-            else:
-                # Filter to one Full-preferred canonical layer per pool so
-                # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
-                # SWA-layer views alias the same storage, so no separate
-                # registration is needed.
-                canonical_layers = self._select_canonical_kv_layers_per_pool(
-                    kv_cache_config
-                )
-                missing = canonical_layers - kv_caches.keys()
-                assert not missing, (
-                    f"Canonical layers missing from kv_caches: {missing}"
-                )
-                # Iterate in layer-index order (self.kv_cache_names): NIXL
-                # assigns region indices in iteration order, and set iteration
-                # would vary with PYTHONHASHSEED, breaking the P/D region <->
-                # layer agreement.
-                filtered_kv_caches = {
-                    name: kv_caches[name]
-                    for name in self.kv_cache_names
-                    if name in canonical_layers
-                }
-                kv_transfer_group.register_kv_caches(filtered_kv_caches)
-
-            kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
+        self.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3273,6 +3239,45 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             len(kv_cache_config.kv_cache_tensors),
             total_gb,
         )
+
+    def register_kv_caches_with_connector(self) -> None:
+        """Hand the KV caches the runner holds to the KV transfer connector.
+
+        The worker drives this instead of `initialize_kv_cache`: a dynamic-KV
+        resize replaces every tensor after warm-up, so the caches worth
+        registering are the ones standing at that point.
+        """
+        if not has_kv_transfer_group():
+            return
+        kv_transfer_group = get_kv_transfer_group()
+        if self.cross_layers_kv_cache is not None:
+            assert self.cross_layers_attn_backend is not None
+            kv_transfer_group.register_cross_layers_kv_cache(
+                self.cross_layers_kv_cache, self.cross_layers_attn_backend
+            )
+        else:
+            kv_caches = dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
+            # Filter to one Full-preferred canonical layer per pool so
+            # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
+            # SWA-layer views alias the same storage, so no separate
+            # registration is needed.
+            canonical_layers = self._select_canonical_kv_layers_per_pool(
+                self.kv_cache_config
+            )
+            missing = canonical_layers - kv_caches.keys()
+            assert not missing, f"Canonical layers missing from kv_caches: {missing}"
+            # Iterate in layer-index order (self.kv_cache_names): NIXL
+            # assigns region indices in iteration order, and set iteration
+            # would vary with PYTHONHASHSEED, breaking the P/D region <->
+            # layer agreement.
+            filtered_kv_caches = {
+                name: kv_caches[name]
+                for name in self.kv_cache_names
+                if name in canonical_layers
+            }
+            kv_transfer_group.register_kv_caches(filtered_kv_caches)
+
+        kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
