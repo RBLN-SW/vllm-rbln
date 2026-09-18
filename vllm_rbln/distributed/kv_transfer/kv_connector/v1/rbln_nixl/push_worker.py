@@ -138,7 +138,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             # Chunk mode asks for per-shard state, so a request written in
             # pieces cannot arrive on this route -- unless a sliding window
             # kept it here.
-            assert not self._chunk_mode or self._sw_ratio is not None
+            assert not self._chunk_mode or self._own_engine_layout
             tail: AbstractContextManager = (
                 self._tail_viewed_as(
                     self._valid_tokens.get(req_id),

@@ -147,6 +147,18 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _request_tail: tuple[int | None, int] | None
 
     @property
+    def _own_engine_layout(self) -> bool:
+        """Whether the whole-engine lists carry a range upstream has no room for.
+
+        Upstream names a region's block once. A sliding window gets a second
+        range over the same addresses, and a chunk range can only follow where
+        that one already sits -- so this, not the ratio itself, is what every
+        builder, peer mirror and index arithmetic here dispatches on. A window
+        as wide as the block adds no range and does not count.
+        """
+        return self._sw_ratio is not None
+
+    @property
     def _spans_per_block(self) -> int:
         """Descriptors a block's token axis is spread over.
 
@@ -417,7 +429,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         window writes back is never read, and the two groups draw block ids
         from disjoint pools.
         """
-        if self._sw_ratio is None:
+        if not self._own_engine_layout:
             if (
                 registered_layer_names is None
                 and peer_areas is None
@@ -461,8 +473,11 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         # A whole block is one range whatever it packs, since K and V are
         # adjacent in it. A window is a prefix and takes one inside each --
         # a single prefix runs past K's end and never reaches V.
+        # `_own_engine_layout` does not narrow the ratio -- read it once.
+        sw_ratio = self._sw_ratio
+        assert sw_ratio is not None
         kv_per_block = self._kv_per_block
-        length_divisors = [1, self._sw_ratio]
+        length_divisors = [1, sw_ratio]
         pieces: list[tuple[int, int, int, int]] = []
         for divisor in length_divisors:
             for i, base_addr in enumerate(local_base_addresses):

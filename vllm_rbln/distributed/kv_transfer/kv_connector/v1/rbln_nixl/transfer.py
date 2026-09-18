@@ -104,8 +104,8 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         block_size_ratio: float | None,
         physical_blocks_per_logical: int,
     ) -> np.ndarray:
-        if self._sw_ratio is None:
-            # No SWA view opt: upstream's Full/SSM desc layout applies.
+        if not self._own_engine_layout:
+            # Upstream's Full/SSM desc layout applies.
             return super()._compute_desc_ids(
                 block_ids,
                 dst_num_blocks,

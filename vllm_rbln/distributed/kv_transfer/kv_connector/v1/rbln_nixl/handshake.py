@@ -661,7 +661,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         view-opt. ``tp_ratio`` is pure arithmetic on the two TP sizes, so this
         is safe to ask before the engine is registered.
         """
-        if self.use_host_buffer or self._sw_ratio is not None:
+        if self.use_host_buffer or self._own_engine_layout:
             return False
         return self.topo.tp_ratio(remote_tp_size) != 1
 
@@ -1122,7 +1122,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             or split > 1
             or fanout > 1
             or kv_runs > 1
-            or (self._chunk_mode and self._sw_ratio is None)
+            or (self._chunk_mode and not self._own_engine_layout)
         )
 
     def _register_shard_xfer_state(
@@ -1376,7 +1376,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         remote_tp_rank: int = 0,
         remote_tp_size: int = 1,
     ) -> str:
-        if self._sw_ratio is None:
+        if not self._own_engine_layout:
             if self._is_head_matched_peer(remote_tp_size):
                 # Different TP degrees, either direction: pair by head range
                 # instead of by position (_build_head_matched_remote).
@@ -1435,9 +1435,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # at the same base addresses (same `page_size` stride — the
         # remote tensor's physical block stride is still Full-sized),
         # shorter desc length.
-        # _sw_ratio is not None here (the None case returned early above).
+        # `_own_engine_layout` does not narrow the ratio -- read it once.
+        sw_ratio = self._sw_ratio
+        assert sw_ratio is not None
         kv_per_block = self._kv_per_block
-        length_divisors = [1, self._sw_ratio]
+        length_divisors = [1, sw_ratio]
         pieces: list[tuple[int, int, int, int]] = []
         for divisor in length_divisors:
             for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
