@@ -26,7 +26,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_rbln import envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TEMPERATURE,
     GREEDY_TOP_K,
@@ -341,11 +341,11 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             dynamic=False,
             fullgraph=True,
             compile_context=compile_context,
-            num_devices=1 if USE_DEVICE_TENSOR or HAS_TORCH_RBLN else None,
+            num_devices=1 if USE_DEVICE_TENSOR else None,
             model_trace_method="export" if USE_DEVICE_TENSOR else "",
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-            use_global_ctx=True if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
-            global_device_id=0 if HAS_TORCH_RBLN and not USE_DEVICE_TENSOR else None,
+            use_global_ctx=True if not USE_DEVICE_TENSOR else None,
+            global_device_id=0 if not USE_DEVICE_TENSOR else None,
             # Built only under VLLM_RBLN_SAMPLER, so a bundle saved with the
             # sampler off misses this op and forces a partial compile.
             use_cache=False,

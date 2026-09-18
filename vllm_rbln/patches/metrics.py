@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wall-clock metrics for the native runner, installed only under VLLM_RBLN_METRICS.
+"""Wall-clock metrics for the vllm runner, installed only under VLLM_RBLN_METRICS.
 
 Three ranges are timed with perf_counter: the pass (execute_model through
 sample_tokens), the model call, and the sampler call with the bookkeeping over its

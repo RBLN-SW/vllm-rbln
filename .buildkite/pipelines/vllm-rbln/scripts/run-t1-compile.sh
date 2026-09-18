@@ -6,7 +6,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 require_env HF_TOKEN
 
 args=(
-  tests/native
+  tests/vllm
   -m model_compile
   --model-compile
   -x

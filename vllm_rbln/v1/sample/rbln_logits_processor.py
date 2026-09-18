@@ -91,7 +91,7 @@ class RBLNMinPLogitsProcessor(MinPLogitsProcessor):
             return logits
 
         # update_state sizes min_p to the live request count, but on decode the
-        # native runner hands the sampler logits padded to the batch bucket.
+        # vllm runner hands the sampler logits padded to the batch bucket.
         # A min_p of 0 makes the padded rows no-ops.
         pad = logits.shape[0] - self.min_p.shape[0]
         assert pad >= 0

@@ -16,7 +16,8 @@
 ``EngineCore.post_step`` pulls the drafts out of the worker that produced them so
 the scheduler can size and allocate the next verification step. It runs whenever
 spec decode is on and async scheduling is off -- on RBLN that is every PP run,
-since PP under async scheduling is not supported yet (see ``platform.py``).
+since PP under async scheduling is not supported yet
+(see ``platform/vllm_impl.py``).
 
 Between decode steps the fetch is a true dependence: step N's drafts are what
 step N+1 verifies. Between prefill chunks there is none, and upstream's own
