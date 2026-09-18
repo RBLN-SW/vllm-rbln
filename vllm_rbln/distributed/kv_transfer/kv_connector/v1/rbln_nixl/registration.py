@@ -433,7 +433,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         )
         if self._chunk_mode and not (
             full_groups == 1
-            and (len(self._group_specs) == 1 or self._sw_ratio is not None)
+            and (len(self._group_specs) == 1 or self._own_engine_layout)
         ):
             raise RuntimeError(
                 "RBLN NIXL (D2D): chunk_mode needs one "
@@ -448,7 +448,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # the request's own blocks. A head cut leaves one span a block.
         if (
             self._chunk_mode
-            and self._sw_ratio is not None
+            and self._own_engine_layout
             and self._kv_split_axis is KVSplitAxis.NON_HEAD
         ):
             raise RuntimeError(

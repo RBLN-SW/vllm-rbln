@@ -34,6 +34,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import pathlib
 import pkgutil
 import textwrap
 
@@ -89,6 +90,50 @@ def _collisions(base: type, mixins: list[type]) -> list[str]:
         for name in sorted(_own_callables(cls) & shared)
     ]
     return sorted(found)
+
+
+def _sw_ratio_asked_as_a_question() -> list[str]:
+    """Where the package reads `_sw_ratio` for yes/no rather than for its value.
+
+    `_own_engine_layout` is that question. Asking it off the ratio again ties
+    the descriptor layout to one feature's knob, which is what the connector
+    spent a round untangling -- and the two stop agreeing the moment the layout
+    stops meaning "a window is present". Two reads are not the question and are
+    left out: deriving the ratio, and the property that answers it.
+    """
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import rbln_nixl
+
+    root = pathlib.Path(rbln_nixl.__file__).parent
+    found: list[str] = []
+    for path in sorted(root.glob("*.py")):
+        if path.name == "base_worker.py":
+            continue  # where the ratio is derived from the group specs
+        tree = ast.parse(path.read_text())
+        answers = {
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_own_engine_layout"
+        }
+        skip = {id(sub) for node in answers for sub in ast.walk(node)}
+        for node in ast.walk(tree):
+            if id(node) in skip:
+                continue
+            if isinstance(node, (ast.If, ast.IfExp, ast.While, ast.Assert)):
+                tests = [node.test]
+            elif isinstance(node, ast.BoolOp):
+                tests = node.values
+            else:
+                continue
+            for test in tests:
+                for sub in ast.walk(test):
+                    if (
+                        isinstance(sub, ast.Attribute)
+                        and sub.attr == "_sw_ratio"
+                        and isinstance(sub.value, ast.Name)
+                        and sub.value.id == "self"
+                    ):
+                        found.append(f"{path.name}:{sub.lineno}")
+    return sorted(set(found))
 
 
 def _self_reads(cls: type) -> set[str]:
@@ -222,3 +267,23 @@ def test_the_check_sees_a_read_across_two_lifetimes():
     # Nobody owns `owned_by_one` now, and a lifetime reading its own member
     # is what the rule permits -- both must come back clean.
     assert _cross_reads(CrossBase, [CrossSibling]) == []
+
+
+def test_the_layout_question_is_asked_in_one_place():
+    # `_own_engine_layout` is what every builder, peer mirror and index
+    # arithmetic dispatches on. Reading the ratio for yes/no instead binds the
+    # descriptor layout to whichever feature happens to set the ratio.
+    assert _sw_ratio_asked_as_a_question() == []
+
+
+def test_the_check_sees_a_ratio_asked_as_a_question():
+    # Without this the test above passes on a rule that matches nothing.
+    tree = ast.parse("if self._sw_ratio is None:\n    pass\n")
+    asked = [
+        sub
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        for sub in ast.walk(node.test)
+        if isinstance(sub, ast.Attribute) and sub.attr == "_sw_ratio"
+    ]
+    assert len(asked) == 1
