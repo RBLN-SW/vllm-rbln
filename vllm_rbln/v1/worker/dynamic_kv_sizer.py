@@ -44,6 +44,7 @@ from vllm_rbln.v1.worker.kv_placement import (
     format_placements,
     kv_growth,
     max_num_blocks,
+    relatched_shapes,
     select_kv_input_groups,
     snapshot_from_allocator,
     snapshot_from_driver,
@@ -383,17 +384,17 @@ class DynamicKvSizer:
             raise RuntimeError(message)
         return capture()
 
-    def collect_runtimes(self) -> list[Any]:
-        """Every rbln runtime warm-up built, deduplicated across programs."""
-        runtimes: list[Any] = []
+    def collect_programs(self) -> list[Any]:
+        """One program per rbln runtime warm-up built; two sharing a runtime are
+        the same graph."""
+        programs: list[Any] = []
         seen: set[int] = set()
         for program in self.programs:
-            runtime = program.runtime
-            if id(runtime) in seen:
+            if id(program.runtime) in seen:
                 continue
-            seen.add(id(runtime))
-            runtimes.append(runtime)
-        return runtimes
+            seen.add(id(program.runtime))
+            programs.append(program)
+        return programs
 
     def memory_snapshot(
         self, device: torch.device
@@ -800,11 +801,11 @@ class DynamicKvSizer:
         return target
 
     def materialize(self) -> None:
-        """One decode step so the pool's physical allocation lands at boot, not
-        on the first request."""
-        num_reqs = min(self.model_runner.bucketing_manager.decode_batch_buckets)
+        """Every model graph once, so the pool's physical allocation, the adaptive
+        latch and the patched KV addresses all land at boot, not on the first
+        request to reach a given graph."""
         with set_compile_stage("warmup"), self.model_runner.offload_context():
-            self.model_runner._dummy_run(num_reqs, 1, False)
+            self.model_runner.run_model_graphs()
 
     def release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
         """Drop every reference to the outgoing KV cache and free its device DRAM
@@ -905,12 +906,18 @@ class DynamicKvSizer:
             self.release_kv_cache_tensors(old_cfg)
         mr.initialize_kv_cache_tensors(new_cfg, mr._kernel_block_sizes)
 
-        # Warm-up latched the adaptive buffer sizes at the old num_blocks;
-        # without this the next forward raises "variable dim changed".
-        runtimes = self.collect_runtimes()
-        for runtime in runtimes:
-            runtime.reset_adaptive_buffers()
+        # Warm-up latched the buffer sizes at the old num_blocks; a run the latch does
+        # not describe raises "variable dim changed". Relatching rather than resetting
+        # keeps the re-apply off the first request: a reset leaves it to each graph's
+        # next run, and materialize() below runs only one of them.
+        programs = self.collect_programs()
+        for program in programs:
+            program.runtime.relatch_adaptive_buffers(
+                relatched_shapes(program, new_num_blocks, old_num_blocks)
+            )
         logger.info(
-            "[Dynamic KV] reset_adaptive_buffers() on %d runtime(s).",
-            len(runtimes),
+            "[Dynamic KV] relatched the adaptive buffers of %d runtime(s) at %d "
+            "blocks.",
+            len(programs),
+            new_num_blocks,
         )
