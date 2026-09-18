@@ -177,7 +177,12 @@ class RBLNEagleProposer(EagleProposer):
 
         # Early exit if it's an intermediate chunked prefill,
         # since the draft tokens are discarded anyway.
-        if self.runner.is_intermediate_chunked_prefill:
+        # Under DP with MoE drafters, we still need to run the full
+        # drafter steps for possible decoding peers.
+        if self.runner.is_intermediate_chunked_prefill and not (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+            and self.draft_has_moe
+        ):
             return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
 
         positions = target_positions[token_indices_to_sample]

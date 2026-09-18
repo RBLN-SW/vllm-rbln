@@ -427,6 +427,43 @@ class TestPropose:
         assert out.shape == (2, 3)
         assert out.cpu().tolist() == [[0, 0, 0], [0, 0, 0]]
 
+    @pytest.mark.parametrize("dp_size, expected_passes", [(1, 1), (2, 3)])
+    def test_a_draft_with_moe_keeps_drafting_only_under_dp(
+        self, dp_size, expected_passes, monkeypatch
+    ):
+        # Fused MoE dispatches across DP and nothing else, so only a DP group
+        # turns an extension pass into a cross-rank collective. The chunk phase
+        # is this rank's own, so a peer that is decoding runs every pass and
+        # would wait inside an all-gather a rank that skipped never enters.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2, intermediate_chunk=True)
+        proposer.draft_has_moe = True
+        if dp_size > 1:
+            monkeypatch.setattr(
+                proposer.vllm_config.parallel_config, "data_parallel_size", dp_size
+            )
+            # This rank on a chunk while the peer decodes: the split the skip makes.
+            proposer.runner.dp_status = DPStatus(
+                num_tokens=(4, 2),
+                num_reqs=(2, 2),
+                is_prefill=(True, False),
+                is_idle=(False, False),
+                num_tokens_across_dp=torch.tensor([4, 2], dtype=torch.int32),
+            )
+        echo = _echo_model_exec(proposer.hidden_size)
+        passes = []
+
+        def counting(**kwargs):
+            passes.append(1)
+            return echo(**kwargs)
+
+        proposer.model_executable = counting
+
+        _call_propose(proposer)
+
+        assert len(passes) == expected_passes
+
     def test_multi_step_handles_rejected_and_capped_positions(self, monkeypatch):
         # Drives the loop's seq_len adjustments (num_rejected_tokens, positions
         # hitting max_model_len). They feed a stubbed builder, so only the loop
