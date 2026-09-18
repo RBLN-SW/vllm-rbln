@@ -3563,6 +3563,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         ),
                     )
                 )
+        # Synthetic mode feeds one more input, i.e. a distinct compiled variant.
         for bonus_kwargs, sampling_metadata in variants:
             self.rejection_sampler.impl.rejection_sample(
                 draft_token_ids,
@@ -3573,6 +3574,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 target_logits,
                 bonus_kwargs.get("bonus_token_ids"),
                 sampling_metadata,
+                synthetic_mode=self.rejection_sampler.synthetic_mode,
+                synthetic_conditional_rates=(
+                    self.rejection_sampler.synthetic_conditional_rates
+                ),
                 bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
 

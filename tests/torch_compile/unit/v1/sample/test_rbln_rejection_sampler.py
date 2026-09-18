@@ -379,6 +379,7 @@ def run_rejection_sample(
     metadata: SamplingMetadata,
     num_draft_tokens: list[int] | None = None,
     bonus_from_logits: bool = False,
+    synthetic_conditional_rates: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the impl on a batch of drafts packed in `draft_token_ids` order.
 
@@ -401,6 +402,8 @@ def run_rejection_sample(
         if bonus_from_logits
         else torch.tensor(bonus_token_ids, dtype=torch.int64).unsqueeze(-1),
         sampling_metadata=metadata,
+        synthetic_mode=synthetic_conditional_rates is not None,
+        synthetic_conditional_rates=synthetic_conditional_rates,
         bonus_logits=make_target_probs(bonus_token_ids) if bonus_from_logits else None,
     )
 
@@ -547,3 +550,80 @@ def test_random_step_draws_the_bonus_token_in_the_graph(impl):
         assert int(output[0, 2]) == 6
         drawn.add(int(output[1, 2]))
     assert drawn == {2, 5}
+
+
+# ---------------------------------------------------------------------------
+# Synthetic acceptance (rejection_sample_method="synthetic")
+# ---------------------------------------------------------------------------
+
+# The drafts miss the target argmax at both positions, so standard rejection
+# would stop at position 0. Only a synthetic rate can accept them.
+SYNTHETIC_DRAFTS = [3, 5]
+SYNTHETIC_ARGMAX = [6, 7]
+
+
+def run_synthetic(impl, rates: list[float]) -> torch.Tensor:
+    return run_rejection_sample(
+        impl,
+        draft_token_ids=SYNTHETIC_DRAFTS,
+        target_argmax_token_ids=SYNTHETIC_ARGMAX,
+        bonus_token_ids=[1],
+        metadata=make_sampling_metadata(
+            temperature=None, all_greedy=True, all_random=False
+        ),
+        synthetic_conditional_rates=torch.tensor(rates),
+    )
+
+
+def test_synthetic_rate_one_accepts_a_draft_the_target_rejects(impl):
+    # Every draft accepted, so the row runs to its bonus token.
+    assert run_synthetic(impl, [1.0, 1.0]).tolist() == [[3, 5, 1]]
+
+
+def test_synthetic_rejection_reuses_the_token_the_op_itself_drew(impl):
+    """The op fills `recovered_token_ids` only where it rejected, so a synthetic
+    count landing elsewhere must carry that one token, never a zeroed slot."""
+    # The op rejects at position 0 and recovers its argmax, 6. A synthetic draw
+    # that rejects at position 1 has to reuse that 6 -- position 1's own slot
+    # holds a zero, which would leave token id 0 in the output.
+    assert run_synthetic(impl, [1.0, 0.0]).tolist() == [[3, 6, PLACEHOLDER_TOKEN_ID]]
+
+    # Rejecting where the op did keeps the same token in its own slot.
+    assert run_synthetic(impl, [0.0, 0.0]).tolist() == [
+        [6, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]
+    ]
+
+    # When the op accepted everything it recovered nothing, so its bonus token
+    # is the only one it drew; a synthetic rejection carries that instead.
+    output = run_rejection_sample(
+        impl,
+        draft_token_ids=SYNTHETIC_ARGMAX,
+        target_argmax_token_ids=SYNTHETIC_ARGMAX,
+        bonus_token_ids=[1],
+        metadata=make_sampling_metadata(
+            temperature=None, all_greedy=True, all_random=False
+        ),
+        synthetic_conditional_rates=torch.tensor([1.0, 0.0]),
+    )
+    assert output.tolist() == [[6, 1, PLACEHOLDER_TOKEN_ID]]
+
+
+def test_synthetic_acceptance_is_capped_by_the_drafted_count(impl):
+    """Rates that accept every position, against a request that brought fewer
+    drafts than the padded length: the slot it never drafted must not be
+    accepted, so its bonus token still lands right after its own last draft."""
+    output = run_rejection_sample(
+        impl,
+        draft_token_ids=[3, 2, 4],
+        target_argmax_token_ids=[6, 7, 7],
+        bonus_token_ids=[10, 11],
+        metadata=make_sampling_metadata(
+            temperature=None, all_greedy=True, all_random=False
+        ),
+        num_draft_tokens=[1, 2],
+        synthetic_conditional_rates=torch.ones(NUM_SPEC_TOKENS),
+    )
+    assert output.tolist() == [
+        [3, 10, PLACEHOLDER_TOKEN_ID],
+        [2, 4, 11],
+    ]
