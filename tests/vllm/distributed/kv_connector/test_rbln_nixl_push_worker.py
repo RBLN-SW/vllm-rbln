@@ -241,7 +241,7 @@ class TestPerShardWrite:
         # Written together with the group ids by _register_shard_xfer_state, so a
         # shard the write path can reach always has both.
         w._shard_descs_per_block = {("eng", r): 1 for r in range(ranks)}
-        w._shard_chunk_grids = {}
+        w._shard_chunk_grids = {("eng", r): None for r in range(ranks)}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(ranks)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(ranks)}}
         w._sending_transfers = defaultdict(list)

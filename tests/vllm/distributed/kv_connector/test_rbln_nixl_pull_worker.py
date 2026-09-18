@@ -57,7 +57,7 @@ class TestShardReadPath:
         # Written together with the group ids by _register_shard_xfer_state, so
         # a shard the read path can reach always has both.
         w._shard_descs_per_block = {("eng", 1): 1}
-        w._shard_chunk_grids = {}
+        w._shard_chunk_grids = {("eng", 1): None}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
         )
@@ -70,7 +70,7 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0)}  # 2 regions
         w._shard_descs_per_block = {("eng", 1): 2}
-        w._shard_chunk_grids = {}
+        w._shard_chunk_grids = {("eng", 1): None}
         descs = w._get_block_descs_ids_for_shard(
             "eng", 1, num_blocks=10, block_ids=[[2, 5]]
         )
@@ -84,7 +84,7 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 1): (0, 0, 0, 0)}
         w._shard_descs_per_block = {("eng", 1): 1}
-        w._shard_chunk_grids = {}
+        w._shard_chunk_grids = {("eng", 1): None}
         w._kv_areas = 2
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         return w
@@ -273,7 +273,7 @@ class TestShardReadPath:
         # an area, so the two would index different things.
         w = self._trim_worker()
         w._shard_descs_per_block = {("eng", 1): 2}
-        w._shard_chunk_grids = {}
+        w._shard_chunk_grids = {("eng", 1): None}
         with pytest.raises(AssertionError):
             w._get_block_descs_ids_for_shard(
                 "eng", 1, num_blocks=10, block_ids=[[2, 5]], keep_spans=1
@@ -283,7 +283,7 @@ class TestShardReadPath:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._shard_region_group_ids = {("eng", 0): (0, 0)}
         w._shard_descs_per_block = {("eng", 0): 1}
-        w._shard_chunk_grids = {}
+        w._shard_chunk_grids = {("eng", 0): None}
         descs = w._get_block_descs_ids_for_shard("eng", 0, num_blocks=4, block_ids=[[]])
         assert descs.size == 0
 
@@ -322,8 +322,7 @@ class TestShardReadPath:
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
-        # Off, as the default is; the chunk tests turn it on.
-        w._shard_chunk_grids = {}
+        w._shard_chunk_grids = {("eng", r): None for r in range(pp_size)}
         w._chunk_mode = False
         w._recv_valid_tokens = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}

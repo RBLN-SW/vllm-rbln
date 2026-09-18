@@ -247,7 +247,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         Empty where this shard has no such range, which is every peer the
         chunk grid was not derived for.
         """
-        grid = self._shard_chunk_grids.get((engine_id, global_rank))
+        grid = self._shard_chunk_grids[(engine_id, global_rank)]
         lo, hi = chunk_span
         if grid is None or hi <= lo:
             return np.empty(0, dtype=np.int64)
@@ -325,7 +325,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         the token count describes -- `block_ids` may have lost its prefix to a
         cache hit.
         """
-        grid = self._shard_chunk_grids.get((engine_id, global_rank))
+        grid = self._shard_chunk_grids[(engine_id, global_rank)]
         chunks_per_span = grid[1] if grid is not None else 1
         needed = self._tail_chunks(
             num_prompt_blocks, num_valid_tokens, chunks_per_span=chunks_per_span
