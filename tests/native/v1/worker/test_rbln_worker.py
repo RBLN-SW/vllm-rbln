@@ -26,6 +26,7 @@ import pytest
 import torch
 import vllm.platforms.interface as platform_interface
 from torch._dynamo.exc import BackendCompilerFailed
+from vllm.config import get_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -813,6 +814,7 @@ class TestCompileOrWarmUpModel:
         warm_up=True,
         warmup_side_effect=None,
         data_parallel_size=1,
+        kv_transfer=False,
     ):
         vcfg = _make_vllm_config(
             enforce_eager=enforce_eager,
@@ -822,7 +824,7 @@ class TestCompileOrWarmUpModel:
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
         monkeypatch.setattr(wm.envs, "VLLM_RBLN_ENABLE_WARM_UP", warm_up)
-        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: False)
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: kv_transfer)
         monkeypatch.setattr(wm, "set_random_seed", lambda s: None)
         monkeypatch.setattr(
             RBLNWorker, "_ensure_rbln_host_threads_before_compile", lambda self: None
@@ -869,6 +871,23 @@ class TestCompileOrWarmUpModel:
         result = worker.compile_or_warm_up_model()
         assert calls == ["warmup"]
         assert isinstance(result, CompilationTimes)
+
+    def test_kv_registration_runs_under_the_worker_config(
+        self, make_worker, monkeypatch
+    ):
+        # A deferred registration builds the KV cache shape, which resolves the
+        # RBLN config off the global vllm config rather than one it is handed.
+        worker, calls = self._worker(make_worker, monkeypatch, kv_transfer=True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "connector")
+        seen = []
+        monkeypatch.setattr(
+            wm,
+            "finalize_kv_cache_registrations",
+            lambda conn: seen.append((conn, get_current_vllm_config())),
+        )
+        worker.compile_or_warm_up_model()
+        assert calls == ["warmup"]
+        assert seen == [("connector", worker.vllm_config)]
 
     def test_dp_ranks_rendezvous_after_warmup(self, make_worker, monkeypatch):
         # The ranks must leave this method together: whatever skew survives it
