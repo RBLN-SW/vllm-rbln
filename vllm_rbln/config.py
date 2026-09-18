@@ -36,7 +36,7 @@ exists, and the rest are bring-up knobs -- are not fields here.
 
 import argparse
 import os
-from dataclasses import Field, field, fields
+from dataclasses import field, fields
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_args
 
 from pydantic import Field
@@ -45,6 +45,9 @@ from vllm.config.utils import config as vllm_config_dataclass
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
+    # `Field` here is pydantic's, which a field definition below calls.
+    from dataclasses import Field as DataclassField
+
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
@@ -249,7 +252,7 @@ _RENAMED_KEYS: dict[type[RBLNConfigBase], dict[str, str]] = {
 _C = TypeVar("_C", bound=RBLNConfigBase)
 
 
-def _fields_of(cls: type[RBLNConfigBase]) -> tuple["Field[Any]", ...]:
+def _fields_of(cls: type[RBLNConfigBase]) -> tuple["DataclassField[Any]", ...]:
     # `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
     # without vllm installed, so it cannot see that this makes a dataclass.
     return fields(cls)  # type: ignore[arg-type]
