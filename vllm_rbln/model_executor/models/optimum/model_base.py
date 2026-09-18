@@ -250,17 +250,30 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
-            text_config = hf_config.get_text_config()
-            layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
-            if hasattr(text_config, "layer_types"):
-                layer_override["layer_types"] = text_config.layer_types
-            if text_config is not hf_config:
-                layer_override = {"text_config": layer_override}
+            # Pass transformers config objects directly to preserve all settings.
+            # Config classes defined outside transformers (e.g. vLLM's qwen3_asr)
+            # may be incompatible with the transformers model implementation.
+            # For these configs, pass num_hidden_layers and, when available,
+            # layer_types as config kwargs instead.
+            # FIXME(optimum-rbln): Ensure RBLNGptOssForCausalLM.get_pytorch_model
+            # applies these config kwargs; it currently discards them.
+            if type(hf_config).__module__.startswith("transformers."):
+                config_override = {"config": hf_config}
+            else:
+                text_config = hf_config.get_text_config()
+                layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
+                if hasattr(text_config, "layer_types"):
+                    layer_override["layer_types"] = text_config.layer_types
+                config_override = (
+                    layer_override
+                    if text_config is hf_config
+                    else {"text_config": layer_override}
+                )
             model = spec.model_cls.from_pretrained(
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
                 dtype=self.model_config.dtype,
-                **layer_override,
+                **config_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path
