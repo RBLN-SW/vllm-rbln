@@ -27,8 +27,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from vllm.platforms import current_platform
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 
@@ -236,3 +239,70 @@ class DecodeBatchBudget:
     @property
     def count(self) -> int:
         return self._count
+
+
+def sub_block_size_in_use(
+    *,
+    enable_prefix_caching: bool,
+    sub_block_cache: bool,
+    block_size: int,
+    max_num_batched_tokens: int,
+    kv_cache_config: KVCacheConfig,
+    sub_block_size: int | None = None,
+) -> int | None:
+    """The sub-block size prefix caching runs at (None takes the prefill
+    chunk), or None when the scheduler stays on vLLM's manager.
+
+    Every rule on the sub-block configuration is here. A size the caller asked
+    for is honored or refused with a ValueError, never dropped on the way. The
+    derived default returns None wherever it does not fit instead, since a run
+    that never asked for sub-blocks should not fail over them.
+    """
+    # Imported here: the manager pulls in vllm.distributed.kv_events (numba).
+    from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
+
+    # RBLNConfig's `gt=0` already refused anything but a size or None.
+    wanted = sub_block_size
+    if not (sub_block_cache and enable_prefix_caching):
+        if wanted:
+            off = (
+                "enable_sub_block_cache"
+                if not sub_block_cache
+                else "enable_prefix_caching"
+            )
+            raise ValueError(
+                f"sub_block_size={wanted} asks for sub-block prefix caching and "
+                f"{off}=False turns it off."
+            )
+        return None
+
+    sub_block_size = wanted or max_num_batched_tokens
+    eligible = RBLNKVCacheManager.can_use_sub_block_caching(
+        kv_cache_config, sub_block_size
+    )
+    fits = block_size >= max_num_batched_tokens >= sub_block_size
+    if not wanted:
+        if not (eligible and fits):
+            return None
+    elif not fits:
+        raise ValueError(
+            "sub-block prefix caching needs block_size >= max_num_batched_tokens "
+            f">= sub_block_size, got {block_size} >= {max_num_batched_tokens} >= "
+            f"{sub_block_size}."
+        )
+    elif not eligible:
+        raise ValueError(
+            f"sub_block_size={sub_block_size} is not one this KV cache can hold: "
+            "every group needs a spec that stores per-token KV, and a block_size "
+            f"larger than {sub_block_size} and a multiple of it."
+        )
+    # Left until last: the equal case never asks, so a compile-only worker with
+    # no NPU to name still starts on the default setting.
+    if sub_block_size != max_num_batched_tokens and not current_platform.is_cr13():
+        raise ValueError(
+            f"sub_block_size={sub_block_size} below max_num_batched_tokens="
+            f"{max_num_batched_tokens} makes a prefill chunk span two blocks, "
+            "which needs the multi-block store that only REBEL CR13 carries; "
+            f"this is {current_platform.get_device_name()}."
+        )
+    return sub_block_size

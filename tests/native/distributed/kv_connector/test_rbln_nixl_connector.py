@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnNixlPullConnector's construction guards, role -> scheduler/worker wiring,
-# finalize delegation and the side-channel keying it hands upstream, with the
-# base __init__ and sub-connectors patched out.
+# The connectors' construction guards, role -> scheduler/worker wiring, finalize
+# delegation, that handshake metadata reaches the scheduler that serves it, and the
+# read the pull connector holds until a submission is in flight, with the base
+# __init__ and sub-connectors patched out.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -27,6 +28,9 @@ import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector import (
     RblnNixlPullConnector,
     RblnNixlPushConnector,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    flush_deferred_loads,
 )
 
 
@@ -116,56 +120,21 @@ class TestFinalizeDelegation:
 
 
 class TestSetXferHandshakeMetadataPpAware:
-    # Producer side: every (pp_rank, tp_rank) shard must reach the side channel.
-    #
-    # EngineCore hands the merged worker dicts to
-    # ``set_xfer_handshake_metadata_pp_aware``. Upstream's implementation rejects
-    # pp_rank > 0 and keys by tp_rank alone; this connector flattens the pair into
-    # the rank a consumer asks for in ``_nixl_handshake``.
-    #
+    # This connector no longer overrides the pp-aware setter, and that deletion
+    # is the fix: the override it replaced called a method 0.26 removed from
+    # NixlConnector, so the call fell through to KVConnectorBase_V1's no-op, the
+    # side channel served nothing and every consumer handshake timed out.
 
-    @staticmethod
-    def _connector(tp_size):
+    def test_the_flattening_override_stays_deleted(self):
         c = object.__new__(RblnNixlPullConnector)
-        vllm_config = MagicMock()
-        vllm_config.parallel_config.tensor_parallel_size = tp_size
-        c._vllm_config = vllm_config
-        return c
+        c.connector_scheduler = MagicMock()
+        metadata = {(0, 0): "a", (0, 1): "b", (1, 0): "c", (1, 1): "d"}
 
-    def _flatten(self, metadata, *, tp_size):
-        c = self._connector(tp_size)
-        with patch.object(
-            RblnNixlPullConnector, "set_xfer_handshake_metadata"
-        ) as forward:
-            c.set_xfer_handshake_metadata_pp_aware(metadata)
-        forward.assert_called_once()
-        return forward.call_args[0][0]
+        c.set_xfer_handshake_metadata_pp_aware(metadata)
 
-    def test_single_stage_reduces_to_tp_rank(self):
-        # pp_size == 1: flat rank == tp_rank, i.e. upstream's behavior.
-        assert self._flatten({(0, 0): "m0", (0, 1): "m1"}, tp_size=2) == {
-            0: "m0",
-            1: "m1",
-        }
-
-    def test_pp_stages_get_distinct_flat_ranks(self):
-        assert self._flatten({(0, 0): "s0", (1, 0): "s1"}, tp_size=1) == {
-            0: "s0",
-            1: "s1",
-        }
-        assert self._flatten(
-            {(0, 0): "a", (0, 1): "b", (1, 0): "c", (1, 1): "d"}, tp_size=2
-        ) == {0: "a", 1: "b", 2: "c", 3: "d"}
-
-    def test_pp_rank_gt_zero_is_accepted(self):
-        # Upstream would raise here; a PP-aware connector must not.
-        assert self._flatten({(3, 0): "s3"}, tp_size=1) == {3: "s3"}
-
-    def test_collision_is_rejected(self):
-        # A tp_size disagreeing with the reported ranks would silently drop a
-        # shard; fail loudly instead.
-        with pytest.raises(ValueError, match="Duplicate handshake metadata"):
-            self._flatten({(0, 1): "a", (1, 0): "b"}, tp_size=1)
+        c.connector_scheduler.set_xfer_handshake_metadata.assert_called_once_with(
+            metadata
+        )
 
 
 class TestConnectorWiring:
@@ -209,3 +178,101 @@ class TestConnectorWiring:
         # pin that this direction goes through it.
         with pytest.raises(AssertionError, match="kv_buffer_device"):
             push_connector(KVConnectorRole.WORKER, kv_buffer_device="gpu")
+
+
+class TestDeferredLoad:
+    """Holding a read until a model submission is in flight to run it behind."""
+
+    @pytest.fixture
+    def worker_connector(self, isolated_connector, monkeypatch):
+        def build():
+            connector = isolated_connector(_vllm_config(), role=KVConnectorRole.WORKER)
+            connector.connector_worker = SimpleNamespace(
+                started=[],
+                start_load_kv=lambda meta: connector.connector_worker.started.append(
+                    meta
+                ),
+            )
+            return connector
+
+        return build
+
+    @staticmethod
+    def _ctx(attn_metadata):
+        return SimpleNamespace(attn_metadata=attn_metadata)
+
+    def test_the_read_is_held(self, worker_connector):
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        assert connector.connector_worker.started == []
+
+    def test_upstream_is_never_reached_at_this_point(
+        self, worker_connector, monkeypatch
+    ):
+        # Upstream issues here; this override replaces that rather than adding to
+        # it. Patching the upstream method so a rename or a re-route on that side
+        # fails here (monkeypatch raises by default).
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        delegated = []
+        monkeypatch.setattr(
+            cm.NixlPullConnector,
+            "start_load_kv",
+            lambda self, forward_context, **kw: delegated.append(forward_context),
+        )
+
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        assert delegated == []
+
+    def test_holding_a_second_read_is_refused(self, worker_connector):
+        # The entry flush is what keeps this unreachable, so the assert is the
+        # only thing that would notice if that ordering were ever changed.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+
+        with pytest.raises(AssertionError):
+            connector.start_load_kv(self._ctx(None))
+
+    def test_flush_issues_the_held_read_once(self, worker_connector):
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == ["META"]
+
+    def test_flush_again_issues_nothing(self, worker_connector):
+        # A second flush in the same round -- the dummy step and the next
+        # execute_model both call it -- must not read every block twice.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx(None))
+        connector.flush_deferred_load()
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == ["META"]
+
+    def test_flush_with_nothing_held_issues_nothing(self, worker_connector):
+        connector = worker_connector()
+
+        connector.flush_deferred_load()
+
+        assert connector.connector_worker.started == []
+
+    def test_the_helper_reaches_this_connector(self, worker_connector):
+        # The runner flushes through the helper, which skips anything without the
+        # protocol -- so going through it is what proves this connector is reached.
+        connector = worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(self._ctx({"layer.0": "ATTN"}))
+
+        flush_deferred_loads(connector)
+
+        assert connector.connector_worker.started == ["META"]

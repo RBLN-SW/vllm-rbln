@@ -20,7 +20,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
-    KVConnectorHandshakeMetadata,
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -49,11 +48,16 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker imp
     RblnNixlPushConnectorWorker,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
+    SupportsDeferredLoad,
     SupportsKVCacheRegistrationFinalize,
 )
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
+    from vllm.forward_context import ForwardContext
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
@@ -105,30 +109,6 @@ class RblnNixlConnectorBase(NixlBaseConnector, SupportsKVCacheRegistrationFinali
         self.connector_scheduler = None
         self.connector_worker = None
 
-    def set_xfer_handshake_metadata_pp_aware(
-        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
-    ) -> None:
-        """Serve every producer shard, including pipeline-parallel stages.
-
-        Upstream rejects `pp_rank > 0` and keys the side channel by `tp_rank`
-        alone, so PP stages would overwrite each other. Flatten to the rank a
-        peer actually asks for in `_nixl_handshake`, using this engine's
-        `tp_size`; at `pp_size == 1` that is upstream's key again.
-        """
-        tp_size = self._vllm_config.parallel_config.tensor_parallel_size
-        flattened: dict[int, KVConnectorHandshakeMetadata] = {}
-        for (pp_rank, tp_rank), rank_metadata in metadata.items():
-            flat_rank = pp_rank * tp_size + tp_rank
-            if flat_rank in flattened:
-                raise ValueError(
-                    "Duplicate handshake metadata for flat rank "
-                    f"{flat_rank} (pp_rank={pp_rank}, tp_rank={tp_rank}); "
-                    f"tensor_parallel_size={tp_size} disagrees with the ranks "
-                    "reported by the workers."
-                )
-            flattened[flat_rank] = rank_metadata
-        self.set_xfer_handshake_metadata(flattened)
-
     def finalize_kv_cache_registration(self) -> None:
         """Run the worker's deferred NIXL registration after warm-up
         materializes the KV cache backing memory. No-op on host-bounce."""
@@ -136,7 +116,9 @@ class RblnNixlConnectorBase(NixlBaseConnector, SupportsKVCacheRegistrationFinali
             self.connector_worker.finalize_kv_cache_registration()
 
 
-class RblnNixlPullConnector(RblnNixlConnectorBase, NixlPullConnector):
+class RblnNixlPullConnector(
+    RblnNixlConnectorBase, NixlPullConnector, SupportsDeferredLoad
+):
     """Pull-based (READ) RBLN NIXL KV transfer connector.
 
     Registered under `RblnNixlConnector` as well: that is the name the read path
@@ -150,6 +132,7 @@ class RblnNixlPullConnector(RblnNixlConnectorBase, NixlPullConnector):
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
+        self._deferred_load_meta: NixlConnectorMetadata | None = None
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = RblnNixlPullConnectorScheduler(
                 vllm_config, self.engine_id, kv_cache_config
@@ -158,6 +141,40 @@ class RblnNixlPullConnector(RblnNixlConnectorBase, NixlPullConnector):
             self.connector_worker = RblnNixlPullConnectorWorker(
                 vllm_config, self.engine_id, kv_cache_config
             )
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        """Keep this step's read; `flush_deferred_load` issues it.
+
+        Safe because the scheduler withholds a request until its load is
+        reported finished, so the read and the forward touch disjoint blocks.
+        `clear_connector_metadata` rebinds that field to None, so the object
+        kept here survives the step.
+
+        The assert holds because every `execute_model` flushes on entry: losing
+        a held read strands its request as surely as never issuing one.
+        """
+        assert self._deferred_load_meta is None
+        self._deferred_load_meta = self._connector_metadata
+
+    def flush_deferred_load(self) -> None:
+        """Issue a held read, or nothing if none is held.
+
+        A request is listed for receive once, so a read nobody issues strands it
+        for good -- hence every site that can be a step's last chance flushes.
+
+        That another step comes at all rests on the scheduler counting
+        `skipped_waiting` as unfinished work, which a paused one does not: both
+        pause states leave it out, holding a read until the unpause.
+
+        The replay is the whole of `start_load_kv`, lease arming and heartbeats
+        included; their deadlines are absolute, so only their arrival shifts.
+        """
+        meta = self._deferred_load_meta
+        if meta is None:
+            return
+        self._deferred_load_meta = None
+        assert self.connector_worker is not None
+        self.connector_worker.start_load_kv(meta)
 
 
 class RblnNixlPushConnector(RblnNixlConnectorBase, NixlPushConnector):

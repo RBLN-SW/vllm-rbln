@@ -41,19 +41,21 @@ from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
 class TestSchedulerInit:
+    @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
         # prefix caching + eligible config + sub_block_size -> RBLNKVCacheManager.
         sched = create_rbln_scheduler(
-            enable_prefix_caching=True, block_size=16, sub_block_size=8
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
+            sub_block_size=8,
         )
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
-    def test_sub_block_size_defaults_to_max_num_batched_tokens(self, monkeypatch):
-        # With VLLM_RBLN_SUB_BLOCK_CACHE and no explicit sub_block_size, the
-        # scheduler uses max_num_batched_tokens as the sub_block_size.
-        import vllm_rbln.envs as envs
-
-        monkeypatch.setattr(envs, "VLLM_RBLN_SUB_BLOCK_CACHE", True)
+    def test_sub_block_size_defaults_to_max_num_batched_tokens(self):
+        # enable_sub_block_cache is on by default, so with no explicit
+        # sub_block_size the scheduler uses max_num_batched_tokens.
         sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,
@@ -63,31 +65,57 @@ class TestSchedulerInit:
         assert isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
         assert sched.kv_cache_manager.sub_block_size == 128
 
-    def test_additional_config_reaches_the_scheduler(self):
-        # EngineCore receives an already-built VllmConfig, so __init__ is the
-        # only place the section can be resolved. No env var is involved.
-        from vllm_rbln.config import get_rbln_config
-
-        create_rbln_scheduler(
+    @pytest.mark.usefixtures("cr13")
+    def test_additional_config_sets_the_sub_block_size(self):
+        # RBLNConfig.sub_block_size decouples the sub-block from the chunk.
+        sched = create_rbln_scheduler(
             enable_prefix_caching=True,
             block_size=1024,
             max_num_batched_tokens=128,
             max_model_len=2048,
-            additional_config={"sub_block_cache": False},
+            additional_config={"sub_block_size": 64},
         )
-        assert get_rbln_config().sub_block_cache is False
+        assert sched.kv_cache_manager.sub_block_size == 64
+
+    def test_additional_config_turns_sub_block_caching_off(self):
+        # Eligible otherwise, so the plain manager is the option's doing.
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=1024,
+            max_num_batched_tokens=128,
+            max_model_len=2048,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
     def test_disabled_falls_back_to_base_manager(self):
         # prefix caching off -> plain KVCacheManager.
         sched = create_rbln_scheduler(enable_prefix_caching=False)
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
-    def test_equal_block_and_sub_block_size_disables(self):
-        # sub_block_size == block_size is ineligible -> plain manager.
-        sched = create_rbln_scheduler(
-            enable_prefix_caching=True, block_size=16, sub_block_size=16
-        )
-        assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+    def test_the_scheduler_hands_its_own_geometry_to_the_rules(self):
+        # The rules themselves are covered on sub_block_size_in_use; this is
+        # the wiring, which a wrong block_size or chunk would silently pass.
+        with pytest.raises(ValueError, match="block_size >="):
+            create_rbln_scheduler(
+                enable_prefix_caching=True,
+                block_size=16,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                sub_block_size=8,
+            )
+
+    def test_equal_block_and_sub_block_size_is_rejected(self):
+        # sub_block_size == block_size leaves no sub-block to match, and the
+        # size was asked for, so it is refused rather than dropped.
+        with pytest.raises(ValueError, match="not one this KV cache can hold"):
+            create_rbln_scheduler(
+                enable_prefix_caching=True,
+                block_size=128,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                sub_block_size=128,
+            )
 
 
 class TestPendingRunnerBlockDeltas:
@@ -149,11 +177,16 @@ class TestUpdateFromOutput:
         with pytest.raises(AssertionError):
             sched.update_from_output(object(), None)
 
+    @pytest.mark.usefixtures("cr13")
     def test_calls_do_pending_indexing_with_rbln_manager(self):
         # With the RBLN manager, update_from_output runs sub-block indexing so
         # the full block's sub-blocks land in the index.
         sched = create_rbln_scheduler(
-            enable_prefix_caching=True, block_size=16, sub_block_size=8
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
+            sub_block_size=8,
         )
         req = create_requests(1, num_tokens=16, block_size=16)[0]
         sched.add_request(req)
@@ -173,6 +206,7 @@ class TestUpdateFromOutput:
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
 
+@pytest.mark.usefixtures("cr13")
 class TestTrySubBlockMatch:
     @staticmethod
     def _seeded_scheduler():
@@ -182,7 +216,8 @@ class TestTrySubBlockMatch:
             enable_prefix_caching=True,
             block_size=16,
             sub_block_size=8,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
+            max_model_len=128,
         )
         m = sched.kv_cache_manager
         seed = make_request("seed", list(range(16)), 16)
@@ -199,7 +234,7 @@ class TestTrySubBlockMatch:
         # match.num_tokens >= external -> match wins (ties favor local copy).
         sched = self._seeded_scheduler()
         query = make_request("q", list(range(8)) + [100] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         match, n = sched._try_sub_block_match(query, local, 8)
         assert match is not None
         assert n == 8
@@ -209,14 +244,14 @@ class TestTrySubBlockMatch:
         # external > match -> the match is released and (None, 0) returned.
         sched = self._seeded_scheduler()
         query = make_request("q", list(range(8)) + [100] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         assert sched._try_sub_block_match(query, local, 12) == (None, 0)
 
     def test_no_match_returns_none(self):
         # No sub-block match at all -> (None, 0).
         sched = self._seeded_scheduler()
         query = make_request("q", [500] * 16, 16)
-        _, local = sched.kv_cache_manager.get_computed_blocks(query)
+        _, local, _ = sched.kv_cache_manager.get_computed_blocks(query)
         assert sched._try_sub_block_match(query, local, 0) == (None, 0)
 
 
@@ -439,21 +474,17 @@ class TestScheduleSpecDecodeCap:
         assert out.num_scheduled_tokens[rid] == 5
         assert len(out.scheduled_spec_decode_tokens[rid]) == 4
 
-    def test_spec_clamped_when_crossing_block_boundary(self):
-        # A decode + spec window crossing into the next block is clamped to the
-        # block remainder: prompt 1020 leaves 4 tokens, so 1 + 4 becomes 1 + 3.
+    def test_spec_kept_when_crossing_block_boundary(self):
         sched = self._scheduler()
         req = self._request(1020, "A")
         advance_to_decode(sched, req)
         req.spec_token_ids = [1] * 4
         out = sched.schedule()
         rid = req.request_id
-        assert out.num_scheduled_tokens[rid] == 4
-        assert len(out.scheduled_spec_decode_tokens[rid]) == 3
+        assert out.num_scheduled_tokens[rid] == 5
+        assert len(out.scheduled_spec_decode_tokens[rid]) == 4
 
-    def test_no_spec_tokens_no_retroactive_trim(self):
-        # Without spec tokens the retroactive trim is skipped even when a decode
-        # sits mid-block; each running decode schedules exactly 1 token.
+    def test_no_spec_tokens_schedules_one_token(self):
         sched = self._scheduler()
         req_a = self._request(1024, "A")
         req_b = self._request(1023, "B")
@@ -465,10 +496,32 @@ class TestScheduleSpecDecodeCap:
         assert out.scheduled_spec_decode_tokens == {}
 
 
-class TestBackfillCrossBlockNoSpec:
-    # A decode-ready request entering exactly at a block boundary cannot backfill
-    # num_spec past tokens without crossing into the previous block, so the whole
-    # decode batch is forced to qlen=1 -- even a running decode that is safe.
+class TestFixedWindowReservation:
+    _BS = 16
+    _NUM_SPEC = 4
+
+    def test_the_window_fits_the_blocks_the_scheduler_reserved(self):
+        sched = create_rbln_scheduler(
+            num_speculative_tokens=self._NUM_SPEC,
+            block_size=self._BS,
+            num_blocks=256,
+            max_num_seqs=8,
+        )
+        assert sched.vllm_config.speculative_config.method == "ngram"
+        req = create_requests(
+            1, num_tokens=13, block_size=self._BS, max_tokens=64, req_ids=["R"]
+        )[0]
+        advance_to_decode(sched, req)
+        # Fewer drafts than the window, so the runner pads the rest behind them.
+        req.spec_token_ids = [1, 2]
+        sched.schedule()
+
+        blocks = sched.kv_cache_manager.coordinator.get_blocks(req.request_id)[0]
+        last_position = req.num_computed_tokens + self._NUM_SPEC
+        assert last_position // self._BS < len(blocks)
+
+
+class TestBlockBoundaryJoin:
     _BS = 16
     _NUM_SPEC = 4
 
@@ -483,7 +536,7 @@ class TestBackfillCrossBlockNoSpec:
 
     def _decode_ready_at_boundary(self, sched, seed_id, req_id):
         # prompt = block_size + 1 with the first block prefix-matched, so the
-        # request joins decode-ready right at the boundary (unsafe backfill).
+        # request joins decode-ready right at the boundary.
         seed, req = create_requests(
             2,
             num_tokens=self._BS + 1,
@@ -496,11 +549,10 @@ class TestBackfillCrossBlockNoSpec:
         sched.add_request(req)
         return req
 
-    def test_unsafe_decode_ready_peer_forces_batch_no_spec(self):
+    def test_peer_at_a_block_boundary_keeps_the_batch_on_spec(self):
         sched = self._scheduler()
 
-        # A running decode that, on its own, keeps full spec (block_size is far
-        # larger than num_spec, so its own backfill always fits in-block).
+        # A running decode that, on its own, keeps full spec.
         running = create_requests(
             1, num_tokens=20, block_size=self._BS, max_tokens=64, req_ids=["R"]
         )[0]
@@ -511,15 +563,12 @@ class TestBackfillCrossBlockNoSpec:
         assert out.scheduled_spec_decode_tokens["R"] == [1, 2, 3, 4]
         sched.update_from_output(out, make_model_runner_output(out, 1))
 
-        # Introduce an unsafe decode-ready peer at a block boundary.
         self._decode_ready_at_boundary(sched, "seed", "A")
         running.spec_token_ids = [1, 2, 3, 4]
         out = sched.schedule()
 
-        # The unsafe peer forces the whole decode batch to no-spec: the running
-        # decode loses its otherwise-valid drafts and drops to a single token.
-        assert out.num_scheduled_tokens["R"] == 1
-        assert "R" not in out.scheduled_spec_decode_tokens
+        assert out.num_scheduled_tokens["R"] == 1 + self._NUM_SPEC
+        assert out.scheduled_spec_decode_tokens["R"] == [1, 2, 3, 4]
         assert out.num_scheduled_tokens["A"] == 1
 
 
@@ -1064,10 +1113,8 @@ class TestPriorityScheduling:
         assert all(r.is_finished() for r in reqs)
 
 
-class TestSpecDecodeRetroactiveTrim:
-    # A decode-ready join whose backfill window would cross a block boundary
-    # forces the whole decode batch to no-spec. Reachable only via a prefix
-    # match, the one way a waiting request reaches decode un-prefilled.
+@pytest.mark.usefixtures("cr13")
+class TestSpecDecodeReadyJoin:
     @staticmethod
     def _running_decoder_with_spec():
         # req0: a running decode carrying 4 spec tokens, positioned mid-block so
@@ -1077,7 +1124,8 @@ class TestSpecDecodeRetroactiveTrim:
             block_size=16,
             sub_block_size=8,
             num_speculative_tokens=4,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
+            max_model_len=128,
             num_blocks=10000,
         )
         req0 = make_request("0", list(range(16)), 16, max_tokens=50)
@@ -1088,26 +1136,16 @@ class TestSpecDecodeRetroactiveTrim:
         req0.spec_token_ids = [1] * 4
         return sched, req0
 
-    def test_unsafe_decode_ready_join_trims_whole_batch(self):
-        # req1 matches the full 16-token prefix -> joins at the block start, so
-        # its backfill would cross the boundary -> the batch loses its spec.
+    # 16 lands the join on a block start and 8 mid-block; the removed check
+    # treated those as the unsafe and safe sides, and neither costs drafts now.
+    @pytest.mark.parametrize("prefix_len", [16, 8])
+    def test_a_decode_ready_join_keeps_the_batch_on_spec(self, prefix_len):
         sched, req0 = self._running_decoder_with_spec()
-        req1 = make_request("1", list(range(16)) + [999], 16, max_tokens=50)
+        req1 = make_request("1", list(range(prefix_len)) + [999], 16, max_tokens=50)
         sched.add_request(req1)
         out = sched.schedule()
         assert out.num_scheduled_tokens[req1.request_id] == 1  # decode-ready join
-        assert out.num_scheduled_tokens[req0.request_id] == 1  # retroactively trimmed
-        assert not out.scheduled_spec_decode_tokens.get(req0.request_id)
-
-    def test_safe_decode_ready_join_keeps_spec(self):
-        # req1 matches only the first sub-block -> joins mid-block where the
-        # backfill fits, proving it is the crossing that trims, not the join.
-        sched, req0 = self._running_decoder_with_spec()
-        req1 = make_request("1", list(range(8)) + [999], 16, max_tokens=50)
-        sched.add_request(req1)
-        out = sched.schedule()
-        assert out.num_scheduled_tokens[req1.request_id] == 1
-        assert out.num_scheduled_tokens[req0.request_id] == 5  # spec preserved
+        assert out.num_scheduled_tokens[req0.request_id] == 5
         assert len(out.scheduled_spec_decode_tokens[req0.request_id]) == 4
 
 
@@ -1353,6 +1391,7 @@ class TestDeferredBlockFree:
         assert output.total_num_scheduled_tokens == 0
         assert sched.sched_step_seq == 0
 
+    @pytest.mark.usefixtures("cr13")
     def test_deferred_free_settles_sub_block_state(self):
         # The fenced path releases blocks through pop_blocks_for_free(), so the
         # sub-block bookkeeping has to be settled there as free() settles it.
@@ -1362,17 +1401,20 @@ class TestDeferredBlockFree:
             enable_prefix_caching=True,
             block_size=16,
             sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=8192,
             pipeline_parallel_size=2,
             use_kv_connector=MockKVConfig(),
         )
         manager = sched.kv_cache_manager
-        # 24 tokens over a 16-token block with 8-token sub-blocks: one full block
-        # plus an 8-token partial. Ordinary caching hashes the full block only, so
-        # the partial one's hash can come from nothing but this path -- a multiple
-        # of the block size would leave no partial block at all and the assert
-        # below would hold either way.
+        # 24 tokens over a 16-token block with 8-token sub-blocks, prefilled in
+        # two chunks: one full block plus an 8-token partial. Ordinary caching
+        # hashes the full block only, so the partial one's hash can come from
+        # nothing but this path -- a multiple of the block size would leave no
+        # partial block at all and the assert below would hold either way.
         request = create_requests(1, num_tokens=24)[0]
         sched.add_request(request)
+        sched.schedule()
         sched.schedule()
         partial_block = manager.coordinator.get_blocks(request.request_id)[0][-1]
 

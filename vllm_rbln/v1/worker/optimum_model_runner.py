@@ -14,7 +14,7 @@
 import contextlib
 import logging
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
@@ -26,6 +26,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.models.interfaces import (
+    supports_mrope,
     supports_transcription,
 )
 from vllm.model_executor.models.interfaces_base import (
@@ -36,14 +37,16 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
+    MultiModalFeatureSpec,
 )
-from vllm.multimodal.utils import group_and_batch_mm_kwargs
+from vllm.multimodal.utils import get_mm_features_in_window, group_and_batch_mm_kwargs
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.jsontree import json_map_leaves
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, kv_cache_dtype_str_to_dtype
 
 # from vllm.utils import LazyLoader, is_pin_memory_available)
@@ -70,14 +73,12 @@ from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.model_loader.rbln_model_loader import get_optimum_model
-from vllm_rbln.model_executor.models.optimum import (
-    ModelInputForRBLN,
-    PartialPrefixInfo,
-)
+from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
 from vllm_rbln.model_executor.models.optimum.model_base import (
     KVCacheCopyError,
     RBLNOptimumDecoderMixin,
@@ -90,7 +91,6 @@ from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
-from vllm_rbln.v1.worker.ec_disagg_helpers import ECDisaggHelpersMixin
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
@@ -110,14 +110,11 @@ class ExecuteModelState(NamedTuple):
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
     hidden_states: torch.Tensor
-    sample_hidden_states: torch.Tensor
     is_prompt: bool
     ec_connector_output: "ECConnectorOutput | None" = None
 
 
-class RBLNOptimumModelRunner(
-    LoRAModelRunnerMixin, ECConnectorModelRunnerMixin, ECDisaggHelpersMixin
-):
+class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -168,11 +165,6 @@ class RBLNOptimumModelRunner(
         #     self.kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
         #         self.cache_config.cache_dtype]
         self.is_pooling_model = model_config.runner_type == "pooling"
-        # When `is_multimodal_raw_input_only_model` is True, it means that
-        # it extract multimodal raw inputs only and deliver as raw inputs to
-        # the model.
-        self.is_multimodal_raw_input_only_model = True
-
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
@@ -184,7 +176,6 @@ class RBLNOptimumModelRunner(
         # # As a workaround, VLLM_WORKER_MULTIPROC_METHOD should be set "spawn"
         # # in case of multi-modal encoder-decoder models.
         self.mm_registry = MULTIMODAL_REGISTRY
-        # self.uses_mrope = model_config.uses_mrope
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
         )
@@ -250,7 +241,7 @@ class RBLNOptimumModelRunner(
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
-            max_num_blocks_per_req=None,
+            max_num_blocks_per_req=[cdiv(self.max_model_len, cache_config.block_size)],
             logitsprocs=logitsprocs,
             num_spec_tokens=0,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
@@ -284,11 +275,11 @@ class RBLNOptimumModelRunner(
             self.model_performance_tracker = PerformanceTracker("MODEL")
             self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
 
-        # Encoder cache for EC disaggregation.
-        # Maps mm_hash → dict of prefill params (inputs_embeds, position_embed, etc.)
+        # Encoder output of every multimodal item by mm_hash, filled by
+        # _execute_mm_encoder (or the EC connector) and read by
+        # _gather_mm_embeddings; entries are freed when the scheduler reports
+        # the request finished.
         self.encoder_cache: dict[str, Any] = {}
-
-        self.mrope_position_deltas: dict[str, float] = {}
 
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
@@ -297,7 +288,6 @@ class RBLNOptimumModelRunner(
         # EC role flags — ec_transfer_config is static, so cache once.
         ec_cfg = getattr(self.vllm_config, "ec_transfer_config", None)
         self.is_ec_producer: bool = ec_cfg is not None and ec_cfg.is_ec_producer
-        self.is_ec_consumer: bool = ec_cfg is not None and not ec_cfg.is_ec_producer
 
         # FIXME async_scheduling?
 
@@ -321,6 +311,14 @@ class RBLNOptimumModelRunner(
     def load_model(self) -> None:
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             self.model = get_optimum_model(vllm_config=self.vllm_config)
+        if (
+            isinstance(self.model, RBLNOptimumDecoderMixin)
+            and not self.is_ec_producer_only
+        ):
+            assert self.model.kv_block_adapter is not None
+            self.available_blocks = torch.arange(
+                self.model.kv_block_adapter._estimated_num_blocks(), dtype=torch.int16
+            )
         assert self.model.dtype == self.dtype, (
             "Internal dtype mismatch: "
             f"runner dtype is {self.dtype!r}, but the compiled model dtype is "
@@ -380,85 +378,70 @@ class RBLNOptimumModelRunner(
                 # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
-            # EC Producer early-exit: run vision encoder only,
-            # save results to EC connector, then return empty output.
+            # The EC producer has no decoder: encode the new requests' items,
+            # publish them, and report the requests done.
             if self.is_ec_producer:
-                model_input, _ = self._prepare_inputs(scheduler_output)
-                if model_input.is_prompt and model_input.multi_modal_kwargs:
-                    with self.maybe_get_ec_connector_output(
-                        scheduler_output,
-                        encoder_cache=self.encoder_cache,
-                    ):
-                        self._run_encoder_and_save(model_input, scheduler_output)
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output, encoder_cache=self.encoder_cache
+                ):
+                    for new_req in scheduler_output.scheduled_new_reqs:
+                        self._execute_mm_encoder(
+                            self.requests[new_req.req_id].mm_features,
+                            0,
+                            len(new_req.prompt_token_ids),
+                        )
                 return self._make_producer_output(scheduler_output)
 
-            # Prepare the decoder inputs.
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
                 scheduler_output
             )
-
             if not self.try_copy_prefix_cached_kv(model_input, scheduler_output):
                 model_input, _ = self._prepare_inputs(
                     scheduler_output, use_cached_prefix=False
                 )
+            ec_connector_output = None
+            if isinstance(self.model, RBLNOptimumMultimodalMixin):
+                model_input, ec_connector_output = self._preprocess(
+                    model_input, scheduler_output
+                )
 
-        has_new_prefill = len(scheduler_output.scheduled_new_reqs) > 0
-        with self.maybe_get_ec_connector_output(
-            scheduler_output,
-            encoder_cache=self.encoder_cache,
-            blocking=has_new_prefill,
-        ) as ec_connector_output:
-            with record_function_or_nullcontext("rbln_model_runner: forward"):
-                if hasattr(rebel, "capture_reports"):
-                    capture_ctx = rebel.capture_reports()
-                else:
-                    # use a dummy context manager that does nothing
-                    capture_ctx = contextlib.nullcontext()
-                model_start_time = time.perf_counter()
-                # EC consumer with cached encoder output: run the decoder
-                # with pre-computed embeddings instead of the full model
-                # forward (which would require the vision encoder runtime).
+        with record_function_or_nullcontext("rbln_model_runner: forward"):
+            if hasattr(rebel, "capture_reports"):
+                capture_ctx = rebel.capture_reports()
+            else:
+                # use a dummy context manager that does nothing
+                capture_ctx = contextlib.nullcontext()
+            model_start_time = time.perf_counter()
+            with capture_ctx as model_reports:
+                hidden_states = self.model(model_input)
+            if not model_input.is_prompt:
+                # The decode graph returns every row of the padded batch;
+                # keep the running requests' rows in running order.
+                hidden_states = hidden_states[model_input.batch_rows]
+            if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
+                collect_metrics(
+                    self.model_performance_tracker,
+                    model_input.is_prompt,
+                    start_time=model_start_time,
+                    end_time=time.perf_counter(),
+                    reports=model_reports,
+                    token_count=0,
+                    # the performance of sampler doesn't depend on token count
+                )
 
-                new_reqs = scheduler_output.scheduled_new_reqs
-                prefill_has_mm = bool(new_reqs) and bool(new_reqs[0].mm_features)
-                if self.is_ec_consumer and model_input.is_prompt and prefill_has_mm:
-                    with capture_ctx as model_reports:
-                        hidden_states = self._run_prefill_with_cached_encoder(
-                            model_input, scheduler_output
-                        )
-                else:
-                    with capture_ctx as model_reports:
-                        model_input = self._build_forward_inputs(model_input)
-                        hidden_states = self.model(model_input)
-                if (
-                    envs.VLLM_RBLN_METRICS
-                    and self.model_performance_tracker is not None
-                ):
-                    collect_metrics(
-                        self.model_performance_tracker,
-                        model_input.is_prompt,
-                        start_time=model_start_time,
-                        end_time=time.perf_counter(),
-                        reports=model_reports,
-                        token_count=0,
-                        # the performance of sampler doesn't depend on token count
-                    )
-                sample_hidden_states = hidden_states.clone()
-
-            with record_function_or_nullcontext("rbln_model_runner: postprocess"):
-                if self.is_pooling_model:
-                    return self._pool(
-                        hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
-                    )
-                # [batch_size, 1, vocab_size] -> [batch_size, vocab_size]
-                hidden_states = hidden_states.squeeze(1)
-                logits = self.model.compute_logits(hidden_states, None)
+        with record_function_or_nullcontext("rbln_model_runner: postprocess"):
+            if self.is_pooling_model:
+                return self._pool(
+                    hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
+                )
+            # [batch_size, 1, vocab_size] -> [batch_size, vocab_size]
+            hidden_states = hidden_states.squeeze(1)
+            logits = self.model.compute_logits(hidden_states, None)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits=logits,
             hidden_states=hidden_states,
-            sample_hidden_states=sample_hidden_states,
             is_prompt=model_input.is_prompt,
             ec_connector_output=ec_connector_output,
         )
@@ -488,36 +471,41 @@ class RBLNOptimumModelRunner(
             return False
         return True
 
-    def _build_forward_inputs(
-        self, model_input: ModelInputForRBLN
-    ) -> ModelInputForRBLN:
-        model = self.model
-        if not isinstance(model, RBLNOptimumMultimodalMixin):
-            return model_input
-
-        if model_input.is_prompt:
-            return model.build_prefill_forward_inputs(
-                model_input, self.mrope_position_deltas
+    def _preprocess(
+        self, model_input: ModelInputForRBLN, scheduler_output: "SchedulerOutput"
+    ) -> tuple[ModelInputForRBLN, "ECConnectorOutput | None"]:
+        """Encode and gather this prefill's multimodal items, then let the model
+        build its graph inputs. Runs inside the EC connector context, which
+        loads the consumer's encoder outputs on entry."""
+        has_new_prefill = len(scheduler_output.scheduled_new_reqs) > 0
+        with self.maybe_get_ec_connector_output(
+            scheduler_output,
+            encoder_cache=self.encoder_cache,
+            blocking=has_new_prefill,
+        ) as ec_connector_output:
+            if not model_input.is_prompt:
+                return self.model.build_decode_forward_inputs(model_input), (
+                    ec_connector_output
+                )
+            mm_features = self.requests[model_input.running_requests_ids[0]].mm_features
+            start = int(model_input.input_positions[0, 0])
+            end = start + model_input.input_tokens.shape[1]
+            self._execute_mm_encoder(mm_features, start, end)
+            mm_embeds, is_mm_embed = self._gather_mm_embeddings(mm_features, start, end)
+            model_input = replace(
+                model_input, mm_embeds=mm_embeds, is_mm_embed=is_mm_embed
+            )
+            return self.model.build_prefill_forward_inputs(model_input), (
+                ec_connector_output
             )
 
-        position_embed = model.compute_decode_position_embed(
-            model_input, self.mrope_position_deltas
-        )
-        if position_embed is None:
-            return model_input
-        return replace(model_input, position_embed=position_embed)
+    @staticmethod
+    def mask_block_table(block_ids: torch.Tensor, num_blocks: int) -> torch.Tensor:
+        """Shift a block-table row to compiler ids and zero its unused tail.
 
-    def mask_block_table(
-        self,
-        block_ids: torch.Tensor,
-        num_blocks: int,
-        *,
-        pad_value: int = -1,
-    ) -> torch.Tensor:
-        """Mask (pad) unused block slots in-place.
-
-        Sets entries beyond `num_blocks` to `pad_value`.
-        Use `pad_value=0` for v1 (dummy block id 0), or pass your own padding.
+        Slots from index `num_blocks` on are set to compiler block 0. Padding must
+        be a valid block id: the attention kernel reads every slot of a live
+        partition.
         """
         if num_blocks < 0:
             raise ValueError("num_blocks must be >= 0")
@@ -530,9 +518,9 @@ class RBLNOptimumModelRunner(
         # The compiler, however, expects valid blocks to start from 0.
         block_ids = block_ids - 1
         max_blocks = block_ids.size(-1)
-        k = max(0, min(num_blocks, max_blocks))  # clamp to [0, max_blocks]
+        k = min(num_blocks, max_blocks)
         if k < max_blocks:
-            block_ids.narrow(-1, k, max_blocks - k).fill_(pad_value)
+            block_ids[..., k:] = 0
 
         return block_ids
 
@@ -541,6 +529,8 @@ class RBLNOptimumModelRunner(
         scheduler_output: "SchedulerOutput",
         use_cached_prefix: bool = True,
     ) -> tuple[ModelInputForRBLN, np.ndarray]:
+        """Build the graph-ready ModelInputForRBLN for this step (see its
+        docstring for the layout) and the per-request scheduled token counts."""
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -565,20 +555,10 @@ class RBLNOptimumModelRunner(
         ):
             is_prefill = True
 
-        partial_prefix = None
         if is_prefill:
-            (
-                input_ids,
-                positions,
-                block_tables,
-                multi_modal_kwargs,
-                running_request_ids,
-                partial_prefix,
-            ) = self._prepare_prefill(scheduler_output, use_cached_prefix)
+            model_input = self._prepare_prefill(scheduler_output, use_cached_prefix)
         else:
-            input_ids, positions, block_tables, running_request_ids = (
-                self._prepare_decode(scheduler_output)
-            )
+            model_input = self._prepare_decode(scheduler_output)
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -588,28 +568,6 @@ class RBLNOptimumModelRunner(
         self.seq_lens[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs]
             + num_scheduled_tokens_np[:num_reqs]
-        )
-
-        cache_slot_ids = torch.tensor(
-            [
-                scheduler_output.cache_slot_id_dict[req_id]
-                for req_id in running_request_ids
-            ],
-            dtype=torch.int16,
-        )
-
-        # TODO interemediate_tensor should be set
-        model_input = ModelInputForRBLN(
-            input_tokens=input_ids,
-            input_positions=positions,
-            multi_modal_kwargs=multi_modal_kwargs if is_prefill else None,
-            block_tables=block_tables,
-            cache_slot_ids=cache_slot_ids,
-            running_requests_ids=running_request_ids,
-            # FIXME unify the variable name is_prefill and is_prompt
-            is_prompt=is_prefill,
-            dummy_block=scheduler_output.dummy_block,
-            partial_prefix=partial_prefix,
         )
         return model_input, num_scheduled_tokens_np
 
@@ -642,16 +600,7 @@ class RBLNOptimumModelRunner(
         self,
         scheduler_output: "RBLNSchedulerOutput",
         use_cached_prefix: bool = True,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        BatchedTensorInputs | None,
-        list[str],
-        PartialPrefixInfo | None,
-    ]:
-        running_request_ids = []
-
+    ) -> ModelInputForRBLN:
         num_blocks_per_req = self.input_batch.block_table.block_tables[
             0
         ].num_blocks_per_row
@@ -680,11 +629,7 @@ class RBLNOptimumModelRunner(
             )
 
         seq_len = len(prompt_tokens)
-        input_positions = list(range(seq_len))
         num_blocks = num_blocks_per_req[req_index]
-        # Full prompt tokens before any prefix-cache trim; needed by MRoPE
-        # models to recompute positions over the whole prompt on a partial hit.
-        full_prompt_tokens = prompt_tokens
         if self.enable_prefix_caching:
             logger.debug(
                 "Request %s is now scheduled. Prompt tokens: %s, "
@@ -700,7 +645,6 @@ class RBLNOptimumModelRunner(
                 total_cached_length = sum(cached_length)
             if total_cached_length > 0:
                 prompt_tokens = prompt_tokens[total_cached_length:]
-                input_positions = input_positions[total_cached_length:]
                 assert len(prompt_tokens) > 0, (
                     "The prompt tokens is empty after removing the cached tokens."
                 )
@@ -716,164 +660,287 @@ class RBLNOptimumModelRunner(
                 block_table.tolist(),
             )
 
-        running_request_ids.append(req_id)
+        req_state = self.requests[req_id]
+        # RBLNOptimumMultimodalMixin models take their encoder output from
+        # mm_embeds; the raw kwargs feed the models that still encode inside
+        # forward (Whisper).
+        multi_modal_kwargs = None
+        if self.supports_mm_inputs and not isinstance(
+            self.model, RBLNOptimumMultimodalMixin
+        ):
+            multi_modal_kwargs = self._extract_mm_kwargs(
+                req_state.mm_features, total_cached_length, seq_len
+            )
+        mrope_positions = self._mrope_positions(req_state, total_cached_length, seq_len)
+        if mrope_positions is not None:
+            mrope_positions = mrope_positions.unsqueeze(1)
 
-        batched_mm_inputs, partial_prefix = self._extract_prefill_mm_inputs(
-            scheduler_output, total_cached_length, full_prompt_tokens
-        )
-
-        input_tokens = torch.tensor(prompt_tokens).unsqueeze(0)
-        input_positions = torch.tensor(input_positions).unsqueeze(0)
-        block_table = block_table.unsqueeze(0)
-        return (
-            input_tokens,
-            input_positions,
-            block_table,
-            batched_mm_inputs,
-            running_request_ids,
-            partial_prefix,
+        return ModelInputForRBLN(
+            input_tokens=torch.tensor(prompt_tokens, dtype=torch.int64).unsqueeze(0),
+            input_positions=torch.arange(
+                total_cached_length, seq_len, dtype=torch.int32
+            ).unsqueeze(0),
+            block_tables=block_table.to(torch.int16),
+            running_requests_ids=[req_id],
+            padded_batch_size=1,
+            batch_rows=slice(0, 1),
+            is_prompt=True,
+            multi_modal_kwargs=multi_modal_kwargs,
+            mrope_positions=mrope_positions,
+            dummy_block=scheduler_output.dummy_block,
+            cache_slot_ids=torch.tensor(
+                [scheduler_output.cache_slot_id_dict[req_id]], dtype=torch.int16
+            ),
         )
 
     def _prepare_decode(
         self,
-        scheduler_output: "SchedulerOutput",
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
-        input_tokens: list[list[int]] = []
-        input_positions: list[list[int]] = []
-        block_tables_list = []
-        running_request_ids = []
+        scheduler_output: "RBLNSchedulerOutput",
+    ) -> ModelInputForRBLN:
+        """Lay the running requests out in the decoder's padded batch.
+
+        The model chooses the layout: running order at rows [0, num_reqs)
+        padded to its batch bucket, or (for graphs with per-row on-device
+        state) each request pinned to a row of the full decoder batch. Padding
+        rows point at the scheduler's scratch block, or at a block no request in
+        the batch uses, and at a cache slot no running request owns.
+        """
         block_tables_cpu = self.input_batch.block_table.block_tables[0].get_cpu_tensor()
         num_blocks_per_req = self.input_batch.block_table.block_tables[
             0
         ].num_blocks_per_row
 
         req_ids = self.input_batch.req_ids
+        num_reqs = len(req_ids)
+        tokens: list[int] = []
+        positions: list[int] = []
+        block_tables_list = []
         for req_id in req_ids:
             req_index = self.input_batch.req_id_to_index[req_id]
-            input_position = int(self.input_batch.num_computed_tokens_cpu[req_index])
-            input_tokens.append(
-                [self.input_batch.token_ids_cpu[req_index][input_position]]
-            )
-            input_positions.append([input_position])
-            num_blocks = num_blocks_per_req[req_index]
+            position = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            tokens.append(int(self.input_batch.token_ids_cpu[req_index][position]))
+            positions.append(position)
             if self.enable_prefix_caching:
                 block_tables_list.append(scheduler_output.block_table_dict[req_id])
             else:
-                block_table = block_tables_cpu[req_index]
-                block_table = self.mask_block_table(block_table, num_blocks)
-                block_tables_list.append(block_table)
-            running_request_ids.append(req_id)
-
-        input_tokens = torch.tensor(input_tokens)
-        input_positions = torch.tensor(input_positions)
+                block_tables_list.append(
+                    self.mask_block_table(
+                        block_tables_cpu[req_index], num_blocks_per_req[req_index]
+                    )
+                )
         block_tables = torch.stack(block_tables_list)
-
-        return input_tokens, input_positions, block_tables, running_request_ids
-
-    def _extract_prefill_mm_inputs(
-        self,
-        scheduler_output: "SchedulerOutput",
-        total_cached_length: int,
-        full_prompt_tokens: np.ndarray,
-    ) -> tuple[BatchedTensorInputs | None, PartialPrefixInfo | None]:
-        """Build the prefill multimodal inputs.
-
-        Returns ``(batched_mm_inputs, partial_prefix)``. ``batched_mm_inputs``
-        encodes the not-fully-cached items; ``partial_prefix`` is set only on a
-        partial hit (``total_cached_length > 0``); see ``PartialPrefixInfo``.
-        """
-        if not self.supports_mm_inputs:
-            return None, None
-        batched_mm_inputs = self._extract_mm_kwargs(
-            scheduler_output, num_cached_tokens=total_cached_length
+        cache_slot_ids = torch.tensor(
+            [scheduler_output.cache_slot_id_dict[req_id] for req_id in req_ids],
+            dtype=torch.int16,
         )
-        if total_cached_length <= 0:
-            return batched_mm_inputs, None
-        partial_prefix = PartialPrefixInfo(
-            full_input_tokens=torch.tensor(full_prompt_tokens).unsqueeze(0),
-            num_cached_tokens=total_cached_length,
-            mrope_mm_kwargs=self._extract_mm_kwargs(
-                scheduler_output, num_cached_tokens=0
-            ),
-            mm_embed_tail_starts=self._mm_embed_tail_starts(
-                scheduler_output, total_cached_length
-            ),
+
+        padded_batch_size, rows = self.model.decode_layout(cache_slot_ids, block_tables)
+
+        input_tokens = torch.zeros(padded_batch_size, 1, dtype=torch.int64)
+        input_tokens[rows, 0] = torch.tensor(tokens, dtype=torch.int64)
+        input_positions = torch.zeros(padded_batch_size, 1, dtype=torch.int32)
+        input_positions[rows, 0] = torch.tensor(positions, dtype=torch.int32)
+
+        num_blocks = block_tables.shape[1]
+        if padded_batch_size > num_reqs:
+            pad_block = scheduler_output.dummy_block
+            if pad_block is None:
+                # Every running request is in this batch, so a block absent
+                # from its tables is free to take the padding rows' K/V writes.
+                pad_block = int(
+                    self.available_blocks[
+                        ~torch.isin(self.available_blocks, block_tables.flatten())
+                    ][0]
+                )
+            padded_block_tables = torch.full(
+                (padded_batch_size, num_blocks), pad_block, dtype=torch.int16
+            )
+        else:
+            padded_block_tables = torch.empty(
+                (padded_batch_size, num_blocks), dtype=torch.int16
+            )
+        padded_block_tables[rows] = block_tables.to(torch.int16)
+
+        used_slots = set(cache_slot_ids.tolist())
+        pad_slot = next((i for i in range(padded_batch_size) if i not in used_slots), 0)
+        padded_cache_slot_ids = torch.full(
+            (padded_batch_size, 1), pad_slot, dtype=torch.int16
         )
-        return batched_mm_inputs, partial_prefix
+        padded_cache_slot_ids[rows] = cache_slot_ids.unsqueeze(1)
+
+        mrope_positions = None
+        per_request = [
+            self._mrope_positions(self.requests[req_id], position, position + 1)
+            for req_id, position in zip(req_ids, positions)
+        ]
+        if per_request[0] is not None:
+            mrope_positions = torch.zeros(3, padded_batch_size, 1, dtype=torch.int64)
+            mrope_positions[:, rows] = torch.cat(per_request, dim=1).unsqueeze(-1)
+
+        return ModelInputForRBLN(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            block_tables=padded_block_tables,
+            running_requests_ids=list(req_ids),
+            padded_batch_size=padded_batch_size,
+            is_prompt=False,
+            dummy_block=scheduler_output.dummy_block,
+            batch_rows=rows,
+            cache_slot_ids=padded_cache_slot_ids,
+            mrope_positions=mrope_positions,
+        )
 
     def _extract_mm_kwargs(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_cached_tokens: int = 0,
+        self, mm_features: list[MultiModalFeatureSpec], start: int, end: int
     ) -> BatchedTensorInputs:
+        """Raw kwargs of the items overlapping [start, end), batched."""
+        lo, hi = get_mm_features_in_window(mm_features, start, end)
         mm_kwargs = [
             (feature.modality, feature.data)
-            for feature in self._iter_kept_mm_features(
-                scheduler_output, num_cached_tokens
-            )
+            for feature in mm_features[lo:hi]
+            if feature.data is not None
         ]
-        # Input all modalities at once
         mm_kwargs_combined: BatchedTensorInputs = {}
         for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs,
-            device=self.device,
-            pin_memory=PIN_MEMORY,
+            mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
         ):
             mm_kwargs_combined.update(mm_kwargs_batch)
-
         return mm_kwargs_combined
 
-    def _mm_embed_tail_starts(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_cached_tokens: int,
-    ) -> dict[str, list[int]]:
-        """For each kept item, where its uncached part begins.
-
-        When the prefix-cache boundary lands in the middle of an item, the
-        item's leading features are already cached (KV reused) and only the rest
-        need re-scattering into the uncached tail. This returns that split point
-        as a feature index per item, ``max(0, num_cached_tokens - offset)``.
-        Same items and order as ``_extract_mm_kwargs``.
-        """
-        tail_starts: dict[str, list[int]] = {}
-        for feature in self._iter_kept_mm_features(scheduler_output, num_cached_tokens):
-            pos = feature.mm_position
-            cached_tokens = max(0, num_cached_tokens - pos.offset)
-            # cached_tokens is a token count, but we need a feature index. They
-            # match 1:1 for most models, so the count is the index. Some models
-            # (e.g. idefics3) mix non-embedding tokens into the block (tile /
-            # global separators); there, is_embed flags the real feature
-            # positions, so count only those up to the boundary.
-            if pos.is_embed is None:
-                start = cached_tokens
-            else:
-                start = int(pos.is_embed[:cached_tokens].sum())
-            tail_starts.setdefault(feature.modality, []).append(start)
-        return tail_starts
-
-    def _iter_kept_mm_features(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_cached_tokens: int,
-    ) -> Iterator[Any]:
-        """Yield the multimodal items that still need work this step.
-
-        An item whose tokens are all already in the prefix cache is skipped
-        (its KV is reused, so it needs no re-encoding). ``_extract_mm_kwargs``
-        and ``_mm_embed_tail_starts`` both iterate through here, so they see the
-        same items in the same order.
-        """
-        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
+    def _init_mrope_positions(self, req_state: CachedRequestState) -> None:
+        """Compute the prompt's MRoPE positions once, when the request arrives.
+        Skipped on the EC producer, whose model proxy has no text config."""
+        if self.is_ec_producer or not supports_mrope(self.model):
             return
-        for req in scheduler_output.scheduled_new_reqs:
-            for feature in req.mm_features:
-                if feature.data is None:
-                    continue
-                pos = feature.mm_position
-                if pos.offset + pos.length <= num_cached_tokens:
-                    continue
-                yield feature
+        assert req_state.prompt_token_ids is not None
+        req_state.mrope_positions, req_state.mrope_position_delta = (
+            self.model.get_mrope_input_positions(
+                req_state.prompt_token_ids, req_state.mm_features
+            )
+        )
+
+    @staticmethod
+    def _mrope_positions(
+        req_state: CachedRequestState, start: int, end: int
+    ) -> torch.Tensor | None:
+        """MRoPE positions [3, end - start] of tokens [start, end): precomputed
+        for the prompt, continued from the delta for the completion. None for
+        requests without MRoPE."""
+        if req_state.mrope_positions is None:
+            return None
+        assert req_state.mrope_position_delta is not None
+        prompt_len = req_state.mrope_positions.shape[1]
+        parts = []
+        if start < prompt_len:
+            parts.append(req_state.mrope_positions[:, start : min(end, prompt_len)])
+        if end > prompt_len:
+            completion = (
+                torch.arange(max(start, prompt_len), end)
+                + req_state.mrope_position_delta
+            )
+            parts.append(completion.unsqueeze(0).expand(3, -1))
+        return torch.cat(parts, dim=1)
+
+    def _execute_mm_encoder(
+        self, mm_features: list[MultiModalFeatureSpec], start: int, end: int
+    ) -> None:
+        """Encode the items overlapping [start, end) that are not cached yet and
+        cache each under its mm_hash; the EC producer also publishes them. Items
+        fully inside the prefix-cache hit are skipped: their KV is reused."""
+        lo, hi = get_mm_features_in_window(mm_features, start, end)
+        mm_hashes: list[str] = []
+        mm_kwargs = []
+        for feature in mm_features[lo:hi]:
+            if feature.data is None or feature.identifier in self.encoder_cache:
+                continue
+            mm_hashes.append(feature.identifier)
+            mm_kwargs.append((feature.modality, feature.data))
+        if not mm_kwargs:
+            return
+
+        encoder_outputs: list[torch.Tensor] = []
+        for _, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
+        ):
+            # TODO: record this run into VLLM_RBLN_METRICS as an ENCODER tracker.
+            outputs = self.model.embed_multimodal(**mm_kwargs_batch)
+            sanity_check_mm_encoder_outputs(outputs, expected_num_items=num_items)
+            encoder_outputs.extend(outputs)
+
+        for mm_hash, output in zip(mm_hashes, encoder_outputs):
+            self.encoder_cache[mm_hash] = output
+            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+    def _gather_mm_embeddings(
+        self, mm_features: list[MultiModalFeatureSpec], start: int, end: int
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Cached encoder outputs of the items overlapping [start, end), in prompt
+        order and cut to that window, plus the [1, end - start] mask of the
+        positions they fill."""
+        mm_embeds: list[torch.Tensor] = []
+        is_mm_embed = torch.zeros(end - start, dtype=torch.bool)
+        lo, hi = get_mm_features_in_window(mm_features, start, end)
+        for feature in mm_features[lo:hi]:
+            pos = feature.mm_position
+            start_idx = max(start - pos.offset, 0)
+            end_idx = min(end - pos.offset, pos.length)
+            assert start_idx < end_idx
+            embeds_start, embeds_end = pos.get_embeds_indices_in_range(
+                start_idx, end_idx
+            )
+            if embeds_start == embeds_end:
+                continue
+            encoder_output = self.encoder_cache.get(feature.identifier)
+            if encoder_output is None:
+                raise RuntimeError(f"Encoder cache miss for {feature.identifier}.")
+            mm_embeds.append(encoder_output[embeds_start:embeds_end])
+            row = pos.offset + start_idx - start
+            rows = slice(row, row + end_idx - start_idx)
+            if pos.is_embed is None:
+                is_mm_embed[rows] = True
+            else:
+                is_mm_embed[rows] |= pos.is_embed[start_idx:end_idx]
+        return mm_embeds, is_mm_embed.unsqueeze(0)
+
+    def _make_producer_output(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ModelRunnerOutput:
+        """Build a ModelRunnerOutput that tells the engine core every
+        request is finished (by returning the EOS token).
+
+        Without this, the engine keeps scheduling decode steps for a
+        request that will never produce real tokens.
+        """
+        if not scheduler_output.num_scheduled_tokens:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        # Multimodal configs (e.g. Qwen3-VL) leave the top-level
+        # hf_config.eos_token_id as None and carry the real value inside
+        # text_config / generation_config. Walk the fallbacks so the
+        # scheduler never sees a None token id.
+        eos = None
+        for cfg in (
+            getattr(self.model_config, "hf_text_config", None),
+            self.model_config.hf_config,
+            getattr(self.model_config, "hf_generation_config", None),
+        ):
+            if cfg is None:
+                continue
+            cand = getattr(cfg, "eos_token_id", None)
+            if isinstance(cand, list):
+                cand = next((x for x in cand if x is not None), None)
+            if cand is not None:
+                eos = cand
+                break
+        if eos is None:
+            eos = 0
+
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: idx for idx, rid in enumerate(req_ids)},
+            sampled_token_ids=[[eos] for _ in req_ids],
+        )
 
     def _update_states(self, scheduler_output: "RBLNSchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -905,7 +972,6 @@ class RBLNOptimumModelRunner(
 
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            self.mrope_position_deltas.pop(req_id, None)
 
             # Gemma3's attention manager still keeps per-request state the
             # model forward produces (attention mask, pad length); free it
@@ -962,6 +1028,7 @@ class RBLNOptimumModelRunner(
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                self._init_mrope_positions(req_state)
                 reqs_to_add.append(req_state)
                 continue
 
@@ -1009,6 +1076,7 @@ class RBLNOptimumModelRunner(
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
             )
+            self._init_mrope_positions(req_state)
             self.requests[req_id] = req_state
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -1017,10 +1085,6 @@ class RBLNOptimumModelRunner(
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
                 )
-
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            # if self.uses_mrope:
-            #     self._init_mrope_positions(req_state)
 
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
             # if self.uses_xdrope_dim > 0:
@@ -1553,7 +1617,6 @@ class RBLNOptimumModelRunner(
             scheduler_output,
             logits,
             hidden_states,
-            sample_hidden_states,
             is_prompt,
             ec_connector_output,
         ) = self.execute_model_state

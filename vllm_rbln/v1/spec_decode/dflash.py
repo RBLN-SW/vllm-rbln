@@ -40,10 +40,12 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.compilation import build_process_group_dict, compile
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
+    attention_block_axis,
     build_kv_cache_forward_context_kwargs,
 )
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -86,9 +88,10 @@ class RBLNDFlashProposer(DFlashProposer):
     def __init__(self, vllm_config, device: torch.device, runner=None):
         # Checked before the base class does any work.
         self._require_single_sequence(vllm_config.scheduler_config)
+        rbln_config: RBLNConfig = vllm_config.additional_config
         if (
             vllm_config.speculative_config.enforce_eager
-            or not envs.VLLM_RBLN_COMPILE_MODEL
+            or not rbln_config.compile_model
         ):
             # The attention ops are pattern stubs the compiler replaces, so an
             # eager context write would silently write nothing.
@@ -202,8 +205,8 @@ class RBLNDFlashProposer(DFlashProposer):
             draft_ids = draft_ids + d2t[draft_ids]
         if bool(self._dropped_rows.any()):
             # An empty list, never zeros: the scheduler reads zeros as real
-            # token ids. The target-only step still advances the request to the
-            # aligned page, where speculation resumes.
+            # token ids. The target-only step still advances the request, and
+            # speculation resumes once its span has an allocated page.
             rows = draft_ids.tolist()
             return [
                 [] if bool(self._dropped_rows[i]) else rows[i] for i in range(num_reqs)
@@ -304,11 +307,12 @@ class RBLNDFlashProposer(DFlashProposer):
             # NOTE(RBLN): the greedy pick belongs in the graph.
             return torch.ops.rbln.argmax(logits)
 
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
         compile_kwargs = dict(
             dynamic=False,
             fullgraph=True,
             compile_context=self.runner.compile_context,
-            num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+            num_devices=rbln_config.num_devices_per_local_rank,
             model_trace_method="export" if USE_DEVICE_TENSOR else "",
             process_group_dict=build_process_group_dict(),
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
@@ -384,8 +388,8 @@ class RBLNDFlashProposer(DFlashProposer):
         if num_query_total > self.max_num_tokens:
             return
         cad = self._build_dummy_attn_metadata(num_reqs, num_query_per_req)
-        # Start every request at block 0 so no row crosses a page and the
-        # redirect path stays out of the warmup.
+        # Start every request at block 0 so no block spans a page and the
+        # give-up path stays out of the warmup.
         ctx_starts = torch.zeros(num_reqs, dtype=torch.int32)
         valid_ctx_lens = torch.zeros(num_reqs, dtype=torch.int32)
         self._run_query_pass(
@@ -668,6 +672,8 @@ class RBLNDFlashProposer(DFlashProposer):
         # same views in one call per layer instead of one index at a time.
         destinations: list[torch.Tensor] = []
         sources: list[torch.Tensor] = []
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
+        block_axis = attention_block_axis(rbln_config.use_custom_kernel)
         for layer_index, layer in enumerate(model.layers):
             cache = layer.self_attn.attn.kv_cache
             k_layer = keys[layer_index]
@@ -675,8 +681,9 @@ class RBLNDFlashProposer(DFlashProposer):
             for token_start, count, block, offset in runs:
                 token_slice = slice(token_start, token_start + count)
                 cache_slice = slice(offset, offset + count)
-                dst_k = cache[0, block, :, 0, cache_slice, :].unbind(0)
-                dst_v = cache[1, block, :, 0, cache_slice, :].unbind(0)
+                one_block = cache.select(block_axis, block)
+                dst_k = one_block[0, :, 0, cache_slice, :].unbind(0)
+                dst_v = one_block[1, :, 0, cache_slice, :].unbind(0)
                 src_k = k_layer[:, token_slice, :].unbind(0)
                 src_v = v_layer[:, token_slice, :].unbind(0)
                 # Interleave key/value per head to keep the original order.
@@ -714,32 +721,24 @@ class RBLNDFlashProposer(DFlashProposer):
             slot_mapping=torch.tensor(0),  # dummy
             causal=self.dflash_causal,
         )
-        # One dynamic offset per partition scatters the whole block, so a block
-        # cannot straddle two pages -- the last `num_query_per_req - 1` offsets
-        # would write into another request's. Redirect those rows to their next
-        # page start and drop their drafts; model-input positions stay true.
-        crossing = (seq_lens % self.block_size) + num_query_per_req > self.block_size
-        if bool(crossing.any()):
-            next_page = (seq_lens // self.block_size + 1) * self.block_size
-            pages = (next_page // self.block_size).to(torch.int64)
-            if int(pages.max()) >= cad.block_table_tensor.shape[-1]:
-                # Past the context ceiling, so the whole step gives up its
-                # drafts: returning here is what keeps the query graph -- and
-                # its scatter -- from running at all.
-                self._dropped_rows = torch.ones_like(crossing)
+
+        self._dropped_rows = torch.zeros(num_reqs, dtype=torch.bool)
+        spanning = (seq_lens % self.block_size) + num_query_per_req > self.block_size
+        if bool(spanning.any()):
+            last_page = ((seq_lens + num_query_per_req - 1) // self.block_size).to(
+                torch.int64
+            )
+            table = cad.block_table_tensor
+            if int(last_page.max()) >= table.shape[-1] or bool(
+                (table.cpu()[torch.arange(num_reqs), last_page] == 0).any()
+            ):
+                self._dropped_rows = torch.ones(num_reqs, dtype=torch.bool)
                 return self.positions.new_zeros(num_query_total)
-            rows = torch.arange(pages.shape[0])
-            assert not bool(
-                (cad.block_table_tensor.cpu()[rows, pages][crossing] == 0).any()
-            ), "the scheduler's lookahead reservation left a crossing row on block 0"
-            seq_lens = torch.where(crossing, next_page, seq_lens)
-        self._dropped_rows = crossing
 
         # The builder reads one thing out of the positions it is given --
         # `positions[query_start_loc_cpu[:num_reqs]]` -- and that becomes the
-        # kernel's block write offset. Real query positions would leave no way
-        # to redirect a crossing row, so the block start travels in its own
-        # host-side probe and the model keeps the true positions for RoPE.
+        # kernel's block write offset.
+
         query_cad.seq_lens = seq_lens
         block_starts = torch.zeros(num_query_total, dtype=torch.int64)
         block_starts[self.arange_cpu[:num_reqs] * num_query_per_req] = seq_lens.to(

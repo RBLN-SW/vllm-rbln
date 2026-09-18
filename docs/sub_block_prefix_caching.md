@@ -29,12 +29,25 @@ if the KV cache tensor has a token dimension that can be sliced for partial copy
 
 ## Configuration
 
-| Environment variable | Default | Description |
-|---|---|---|
-| `VLLM_RBLN_SUB_BLOCK_CACHE` | `true` | Enable sub-block prefix caching. |
+Both options are `RBLNConfig` fields,
+so each takes a `--rbln-*` flag, an `additional_config` key, or the environment variable.
 
-The `sub_block_size` is automatically set to prefill chunk size (`max_num_batched_tokens`)
-so that each prefill does not span multiple blocks.
+| Field | Flag | Environment variable | Default | Description |
+|---|---|---|---|---|
+| `enable_sub_block_cache` | `--rbln-enable-sub-block-cache` | `VLLM_RBLN_SUB_BLOCK_CACHE` | `true` | Enable sub-block prefix caching. |
+| `sub_block_size` | `--rbln-sub-block-size` | `VLLM_RBLN_SUB_BLOCK_SIZE` | unset | Sub-block size in tokens; unset takes the prefill chunk. A value has to be above zero. |
+
+`enable_sub_block_cache` decides whether the path runs at all.
+Turning it off while giving a `sub_block_size` is rejected,
+since the two ask for opposite things.
+
+Left unset, the sub-block size is the prefill chunk size (`max_num_batched_tokens`),
+so each prefill does not span multiple blocks.
+A smaller value decouples the two, so a prefill chunk can span two blocks.
+Storing across that boundary needs the multi-block attention store,
+which REBEL CR13 alone carries — the scheduler rejects the decoupled setting on
+any other device.
+The scheduler also requires `block_size >= max_num_batched_tokens >= sub_block_size`.
 
 For cross-engine prefix-aware routing (e.g., llm-d):
 enable KV events via `--kv-events-config` in vLLM and
@@ -193,10 +206,11 @@ The scheduler returns `RBLNSchedulerOutput` containing `kv_cache_copy_ops`.
 Before the forward pass, the model runner copies sub-block KV data:
 
 ```python
-# For each copy op targeting a specific group's layers:
-# kv_cache tensor (shape: 2, num_blocks, H, 1, block_size, D):
-kv_cache[:, dst_block_id, :, :, :num_tokens, :] = \
-    kv_cache[:, src_block_id, :, :, :num_tokens, :]
+# For each copy op targeting a specific group's layers. `block_axis` is 0 for
+# the (num_blocks, 2, H, 1, block_size, D) cache the rbln_custom_ops kernels
+# read, 1 for the (2, num_blocks, ...) one rbln_triton_ops still reads:
+kv_cache.select(block_axis, dst_block_id)[..., :num_tokens, :] = \
+    kv_cache.select(block_axis, src_block_id)[..., :num_tokens, :]
 ```
 
 ### Block lifecycle

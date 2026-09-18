@@ -52,6 +52,8 @@ USE_DEVICE_TENSOR: bool = (
 )
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
+# RBLN default for gpu_memory_utilization (upstream vLLM defaults to 0.92).
+RBLN_DEFAULT_GPU_MEMORY_UTILIZATION = 0.93
 # Superseded by RblnPlatform.device_control_env_var.
 DEPRECATED_DEVICE_CONTROL_ENV_VAR = "RBLN_DEVICES"
 
@@ -225,6 +227,29 @@ class RblnPlatform(Platform):
         EngineArgs._rbln_user_mnbt_patched = True
 
     @classmethod
+    def _allow_gemma4_global_per_layer_attribute_access(cls) -> None:
+        """Let vLLM's gemma4 config convertor read ``head_dim`` on transformers 5.15.
+
+        transformers 5.15 makes it per-layer and raises on a top-level read.
+        Fixed upstream in vllm-project/vllm#49797. TODO(vllm>=0.28.0): delete.
+        """
+        from vllm.config import model as vllm_model_config
+
+        if getattr(vllm_model_config, "_rbln_gemma4_get_config_patched", False):
+            return
+
+        orig_get_config = vllm_model_config.get_config
+
+        def get_config(*args, **kwargs):
+            config = orig_get_config(*args, **kwargs)
+            if config.model_type == "gemma4":
+                config.text_config.allow_global_per_layer_attribute_access = True
+            return config
+
+        vllm_model_config.get_config = get_config
+        vllm_model_config._rbln_gemma4_get_config_patched = True
+
+    @classmethod
     def _adopt_deprecated_device_control_env_var(cls) -> None:
         """Fold ``RBLN_DEVICES`` into ``device_control_env_var`` and unset it.
 
@@ -257,6 +282,7 @@ class RblnPlatform(Platform):
             # Only sync_from_vllm reads the key it writes, and on the native
             # path it would be an unknown field of RBLNConfig.
             cls._capture_user_max_num_batched_tokens()
+            cls._allow_gemma4_global_per_layer_attribute_access()
 
         if parser is None:
             return
@@ -264,10 +290,10 @@ class RblnPlatform(Platform):
         for action in parser._actions:
             if action.dest == "device":
                 action.choices.append("rbln")
-
-        for action in parser._actions:
-            if action.dest == "block_size":
+            elif action.dest == "block_size":
                 action.choices = None  # Override choices
+            elif action.dest == "gpu_memory_utilization":
+                action.default = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
             from vllm_rbln.config import add_rbln_cli_args
@@ -279,8 +305,23 @@ class RblnPlatform(Platform):
             add_optimum_rbln_cli_args(parser)
 
     @classmethod
+    def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
+        """Default gpu_memory_utilization to RBLN_DEFAULT_GPU_MEMORY_UTILIZATION.
+
+        The field has no unset sentinel: EngineArgs and LLM.__init__ both bake
+        upstream's default in before any platform hook runs, so a value equal to
+        upstream's own default is the only sign that the user left it alone. An
+        explicit value equal to that default is therefore raised as well.
+        """
+        from vllm.config import CacheConfig
+
+        cache_config = vllm_config.cache_config
+        if cache_config.gpu_memory_utilization == CacheConfig.gpu_memory_utilization:
+            cache_config.gpu_memory_utilization = RBLN_DEFAULT_GPU_MEMORY_UTILIZATION
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        from vllm_rbln.config import build_rbln_config, set_rbln_config
+        from vllm_rbln.config import build_rbln_config
         from vllm_rbln.optimum_config import build_optimum_rbln_config
         from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
         from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
@@ -302,17 +343,15 @@ class RblnPlatform(Platform):
             cls._validate_dynamic_kv_config(vllm_config)
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            vllm_config.additional_config = build_rbln_config(
-                vllm_config.additional_config
-            )
-            set_rbln_config(vllm_config.additional_config)
+            rbln_config = build_rbln_config(vllm_config.additional_config)
+            vllm_config.additional_config = rbln_config
 
             if vllm_config.lora_config is not None:
                 raise ValueError("LoRA is not supported on RBLN.")
 
             cls.validate_and_setup_prerequisite(vllm_config)
 
-            if envs.VLLM_RBLN_ENFORCE_MODEL_FP32:
+            if rbln_config.enforce_model_fp32:
                 if model_config.dtype != torch.float32:
                     # FIXME(RBLN): force model dtype into fp32 for graph compilation
                     original_dtype = model_config.dtype
@@ -347,7 +386,7 @@ class RblnPlatform(Platform):
             # only reader of the flag, and on the optimum path the refusal
             # below is the whole story.
             if scheduler_config.async_scheduling and not (
-                envs.VLLM_RBLN_USE_DEVICE_TENSOR and envs.VLLM_RBLN_SAMPLER
+                envs.VLLM_RBLN_USE_DEVICE_TENSOR and rbln_config.use_custom_sampler
             ):
                 logger.warning(
                     "Disabling asynchronous scheduling: it requires "
@@ -356,7 +395,7 @@ class RblnPlatform(Platform):
                     "which puts the sampler on the device so those tokens never "
                     "reach the host mid-step. Running synchronously.",
                     int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
-                    int(envs.VLLM_RBLN_SAMPLER),
+                    int(rbln_config.use_custom_sampler),
                 )
                 scheduler_config.async_scheduling = False
 
@@ -558,15 +597,10 @@ class RblnPlatform(Platform):
             cls.disable_unsupported_prefix_caching(vllm_config)
             sync_vllm_and_optimum(vllm_config)
 
-        if (
-            parallel_config.distributed_executor_backend is not None
-            and parallel_config.distributed_executor_backend != "mp"
-        ):
+        if parallel_config.distributed_executor_backend not in (None, "mp", "uni"):
             logger.warning(
-                (
-                    "%s is not supported on RBLN, fallback to mp "
-                    "distributed executor backend."
-                ),
+                "%s is not supported on RBLN. Keeping the selected distributed "
+                "executor backend; use 'mp' for supported multi-worker execution.",
                 parallel_config.distributed_executor_backend,
             )
 
@@ -612,36 +646,33 @@ class RblnPlatform(Platform):
     def _validate_dynamic_kv_config(vllm_config: VllmConfig) -> None:
         """Reject configurations the dynamic-KV path cannot size.
 
-        Reasons per shape: docs/dynamic_kv_cache.md, "Unsupported
-        Configurations".
+        A dry run reports them instead: it changes nothing, so refusing would
+        stop a run that the flag off would have served. Reasons per shape:
+        docs/dynamic_kv_cache.md, "Unsupported Configurations".
         """
+        dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
+
+        def reject(message: str) -> None:
+            if dry_run:
+                logger.warning("dynamic KV cache dry run: %s", message)
+                return
+            raise ValueError(message)
+
         if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
                 "VLLM_RBLN_USE_VLLM_MODEL=1; see docs/dynamic_kv_cache.md."
             )
 
-        if vllm_config.model_config.use_mla:
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support MLA models. "
-                "Run with the flag off, or with VLLM_MLA_DISABLE=1."
-            )
-
-        if vllm_config.speculative_config is not None:
-            raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE does not support speculative "
-                "decoding; the merged profiles cannot be attributed per artifact."
-            )
-
         if not USE_DEVICE_TENSOR:
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE requires "
                 "VLLM_RBLN_USE_DEVICE_TENSOR=1; without it the artifact carries "
                 "no dynamic KV dimension."
             )
 
         if vllm_config.kv_transfer_config is not None:
-            raise ValueError(
+            reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE cannot be combined with a KV "
                 "transfer connector; the resize invalidates its registrations."
             )
@@ -672,6 +703,8 @@ class RblnPlatform(Platform):
 
     @classmethod
     def validate_and_setup_prerequisite(cls, vllm_config: VllmConfig) -> None:
+        from vllm_rbln.config import RBLNConfig
+
         scheduler_config = vllm_config.scheduler_config
         if not scheduler_config.enable_chunked_prefill:
             raise ValueError(
@@ -724,10 +757,11 @@ class RblnPlatform(Platform):
                     "when DP enabled."
                 )
 
+            rbln_config: RBLNConfig = vllm_config.additional_config
             if (
                 parallel_config.data_parallel_size > 1
                 or parallel_config.enable_expert_parallel
-            ) and not envs.VLLM_RBLN_USE_MOE_TOKENS_MASK:
+            ) and not rbln_config.use_moe_tokens_mask:
                 raise ValueError(
                     "VLLM_RBLN_USE_MOE_TOKENS_MASK is required when DP or EP enabled: "
                     "the mask marks padded tokens introduced by DP multicast. "

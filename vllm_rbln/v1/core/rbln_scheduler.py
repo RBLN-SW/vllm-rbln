@@ -36,7 +36,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
-from vllm_rbln.config import build_rbln_config, get_rbln_config, set_rbln_config
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
     KVCacheCopyOp,
@@ -48,6 +48,7 @@ from vllm_rbln.v1.core.utils import (
     is_prefill,
     num_base_tokens,
     should_defer_spec_step,
+    sub_block_size_in_use,
 )
 
 logger = init_logger(__name__)
@@ -62,29 +63,26 @@ class RBLNSchedulerOutput(SchedulerOutput):
 
 
 class RBLNScheduler(Scheduler):
-    def __init__(
-        self,
-        *args,
-        sub_block_size: int | None = None,
-        **kwargs,
-    ) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        set_rbln_config(build_rbln_config(self.vllm_config.additional_config))
+        self.num_lookahead_tokens: int = max(
+            self.num_lookahead_tokens, self.num_spec_tokens
+        )
+
+        rbln_config: RBLNConfig = self.vllm_config.additional_config
 
         # Replace the upstream KVCacheManager with RBLNKVCacheManager
         # when sub-block prefix caching is enabled.
-        # Sub-block size equals the prefill chunk size (max_num_batched_tokens)
-        # so that each prefill does not span multiple blocks.
-        if sub_block_size is None and get_rbln_config().sub_block_cache:
-            sub_block_size = self.scheduler_config.max_num_batched_tokens
-        if (
-            self.cache_config.enable_prefix_caching
-            and sub_block_size
-            and RBLNKVCacheManager.can_use_sub_block_caching(
-                self.kv_cache_config, sub_block_size
-            )
-        ):
+        sub_block_size = sub_block_size_in_use(
+            enable_prefix_caching=self.cache_config.enable_prefix_caching,
+            sub_block_cache=rbln_config.enable_sub_block_cache,
+            block_size=self.block_size,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            kv_cache_config=self.kv_cache_config,
+            sub_block_size=rbln_config.sub_block_size,
+        )
+        if sub_block_size is not None:
             hash_fn = get_hash_fn_by_name(self.cache_config.prefix_caching_hash_algo)
             init_none_hash(hash_fn)
 
@@ -218,7 +216,6 @@ class RBLNScheduler(Scheduler):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-        unsafe_backfill_req_ids: set[str] = set()
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -315,24 +312,6 @@ class RBLNScheduler(Scheduler):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
-
-            # NOTE(RBLN): A decode query is written as one contiguous KV window.
-            # Keep the fixed num_spec_tokens + 1 query only when the required
-            # backfill prefix stays within the current KV block. If it would reach into
-            # the previous block, remember this request and force the finalized decode
-            # batch to single-token decode only if this request remains scheduled.
-            if self.num_spec_tokens > 0 and not is_prefill(request):
-                tokens_used_in_block = request.num_computed_tokens % self.block_size
-                remaining_in_block = self.block_size - tokens_used_in_block
-                num_new_tokens = min(remaining_in_block, num_new_tokens)
-
-                if num_new_tokens > 0:
-                    required_backfill = max(
-                        0, self.num_spec_tokens + 1 - num_new_tokens
-                    )
-                    if required_backfill > tokens_used_in_block:
-                        unsafe_backfill_req_ids.add(request.request_id)
-                        num_new_tokens = 1
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -545,9 +524,15 @@ class RBLNScheduler(Scheduler):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens (full-block matches only).
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    (
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        # Junction to pin (Marconi-style APC) so its
+                        # sparse-retention state (Mamba block / sliding-window
+                        # tail) survives retention and serves a later hit; 0
+                        # if no uncached shared prefix was detected.
+                        request.shared_prefix_boundary,
+                    ) = self.kv_cache_manager.get_computed_blocks(request)
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -732,10 +717,13 @@ class RBLNScheduler(Scheduler):
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens,
-                    num_new_computed_tokens=(
-                        num_new_local_computed_tokens + num_sub_block_tokens
-                    ),
+                    # Sub-block tokens count as tokens to compute, never as
+                    # computed: upstream contracts the computed count to
+                    # len(new_computed_blocks) * block_size, and a count that is
+                    # not block-aligned tells it the tail block is shared, so it
+                    # CoWs a block we never handed it. Only the sum is used.
+                    num_new_tokens + num_sub_block_tokens,
+                    num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
@@ -860,19 +848,6 @@ class RBLNScheduler(Scheduler):
                         f"decode-ready request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
                     )
-                    # NOTE(RBLN): This path skips the running-loop backfill guard.
-                    # A decode-ready req enters as a single-token decode (new_n==1,
-                    # asserted above) that the runner backfills to num_spec+1; if the
-                    # num_spec past tokens don't fit the current block the backfill
-                    # would cross into the previous one -> mark unsafe so the batch
-                    # drops to no-spec.
-                    if self.num_spec_tokens > 0:
-                        tokens_used_in_block = (
-                            request.num_computed_tokens % self.block_size
-                        )
-                        required_backfill = self.num_spec_tokens  # (num_spec+1)-1
-                        if required_backfill > tokens_used_in_block:
-                            unsafe_backfill_req_ids.add(request.request_id)
                     # NOTE(RBLN): this decode-ready request has just joined the
                     # decode batch (any route -- full remote-KV match or full
                     # local prefix-cache match), so count it against the shared
@@ -917,30 +892,6 @@ class RBLNScheduler(Scheduler):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
-
-        # NOTE(RBLN): The runner chooses the full-spec query path from
-        # scheduled_spec_decode_tokens. If any finally scheduled decode request cannot
-        # safely backfill within its current block, force the whole scheduled decode
-        # batch to qlen=1 by trimming logical advance and clearing drafts.
-        scheduled_running_req_ids = {req.request_id for req in scheduled_running_reqs}
-        # NOTE(RBLN): Also cover decode-ready reqs that joined via the
-        # not-is_prefill path above (new/resumed: remote-KV or prefix-cache
-        # matches): an unsafe one must force the batch to no-spec too. True
-        # prefill new reqs never enter unsafe_backfill_req_ids, so widening the
-        # set is a no-op for them.
-        scheduled_running_req_ids |= {
-            req.request_id
-            for req in itertools.chain(scheduled_new_reqs, scheduled_resumed_reqs)
-        }
-        if unsafe_backfill_req_ids & scheduled_running_req_ids:
-            for req in scheduled_running_reqs:
-                req_id = req.request_id
-
-                if (old_n := num_scheduled_tokens[req_id]) > 1:
-                    token_budget += old_n - 1
-                    num_scheduled_tokens[req_id] = 1
-
-                scheduled_spec_decode_tokens.pop(req_id, None)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

@@ -21,14 +21,14 @@
 from typing import Any
 
 from vllm.config import VllmConfig
-from vllm.utils.math_utils import cdiv
+from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.registry import register_patch
-from vllm_rbln.v1.worker.utils import rescale_kv_cache_config
+from vllm_rbln.v1.worker.utils import minimum_kv_blocks, rescale_kv_cache_config
 
 logger = init_logger(__name__)
 
@@ -69,6 +69,16 @@ def patched_initialize_kv_caches(
     # The worker gates on the override too, so nothing has been resized here.
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
+        if envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN:
+            # The workers report the count they would have picked; the pool stays.
+            self.model_executor.collective_rpc("compute_dynamic_kv_num_blocks")
+            logger.warning(
+                "dynamic KV cache: dry run under --num-gpu-blocks-override=%d; the "
+                "block pool stays at %d.",
+                override,
+                kv_cache_config.num_blocks,
+            )
+            return kv_cache_config
         # WARNING: two features that each size the KV cache are on, one ignored.
         logger.warning(
             "dynamic KV cache: --num-gpu-blocks-override=%d wins over "
@@ -102,35 +112,43 @@ def patched_initialize_kv_caches(
     vllm_config.cache_config.num_gpu_blocks = num_blocks
     # The frontend picks this up on its own: EngineCoreReadyResponse is built
     # from cache_config.num_gpu_blocks after __init__ has finished.
+    # The capacity `_initialize_kv_caches` derived is the shrunk cache's, and
+    # nothing recomputes it after this point.
+    num_tokens, max_concurrency = get_kv_cache_capacity(vllm_config, kv_cache_config)
+    vllm_config.cache_config.kv_cache_size_tokens = num_tokens
+    vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
 
     logger.info(
         "dynamic KV cache: scheduler block pool resized %d -> %d blocks",
         old_num_blocks,
         num_blocks,
     )
-    assert_kv_cache_fits_one_request(vllm_config, kv_cache_config)
+    assert_kv_cache_minimum(vllm_config, kv_cache_config)
     _log_gpu_kv_cache_size(vllm_config, kv_cache_config)
     return kv_cache_config
 
 
-def assert_kv_cache_fits_one_request(
+def assert_kv_cache_minimum(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
-    """Fail loudly when the resized pool cannot hold a single max-length request."""
+    """Fail loudly when the resized pool cannot hold one max-length request or
+    one full decode batch."""
     # NOTE(RBLN): upstream's `check_enough_kv_cache_memory` runs against the
     # pre-compile estimate and nothing re-checks the number substituted here, so
     # without this the server starts and then rejects every request.
-    block_size = vllm_config.cache_config.block_size
-    max_model_len = vllm_config.model_config.max_model_len
-    needed = cdiv(max_model_len, block_size)
-    if kv_cache_config.num_blocks >= needed:
+    minimum = minimum_kv_blocks(vllm_config, kv_cache_config)
+    if kv_cache_config.num_blocks >= minimum.needed:
         return
     raise ValueError(
-        f"The KV cache sized from the compiled profile holds "
-        f"{kv_cache_config.num_blocks} blocks, but a single request of "
-        f"max_model_len={max_model_len} needs {needed} at block_size="
-        f"{block_size}. Reduce max_model_len, raise gpu_memory_utilization, or "
-        f"give the model more devices."
+        f"The KV cache sized from the compiled placement holds "
+        f"{kv_cache_config.num_blocks} blocks, but it needs {minimum.needed}: "
+        f"{minimum.one_request} for one request of max_model_len="
+        f"{vllm_config.model_config.max_model_len} across "
+        f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), "
+        f"{minimum.decode_batch} for max_num_seqs="
+        f"{vllm_config.scheduler_config.max_num_seqs} decode steps, plus the null "
+        "block. Reduce max_model_len or max_num_seqs, raise "
+        "gpu_memory_utilization, or give the model more devices."
     )
 
 
@@ -142,15 +160,12 @@ def _log_gpu_kv_cache_size(
     Upstream emits its line before warm-up and `info_once` will not repeat it,
     so these keep upstream's wording for whatever parses the first one.
     """
-    from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
-
     max_model_len = vllm_config.model_config.max_model_len
-    max_concurrency = get_max_concurrency_for_kv_cache_config(
-        vllm_config, kv_cache_config
-    )
+    num_tokens = vllm_config.cache_config.kv_cache_size_tokens
+    max_concurrency = vllm_config.cache_config.kv_cache_max_concurrency
     logger.info(
         "GPU KV cache size: %s tokens (num_blocks=%d, after the dynamic KV resize)",
-        f"{int(max_concurrency * max_model_len):,}",
+        f"{num_tokens:,}",
         kv_cache_config.num_blocks,
     )
     logger.info(

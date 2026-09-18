@@ -39,14 +39,16 @@ dependencies = [
     "pyyaml",
     "datasets>=4.0.0",
     "qwen_vl_utils",
-    "vllm==0.24.0+cpu",
+    "vllm==0.26.0+cpu",
+    # vllm 0.26.0 imports openai.types.responses.NamespaceTool (openai>=2.25.0) but declares openai>=2.0.0
+    "openai>=2.25.0",
     "fastapi[standard]<0.137",
     "torch",
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln>=0.5.0rc0,<0.5.1 ; platform_machine == 'x86_64'",
-    "optimum-rbln>=0.11.3a6,<0.11.4",
+    "torch-rbln>=0.5.0rc1,<0.5.1 ; platform_machine == 'x86_64'",
+    "optimum-rbln>=0.11.3a8,<0.11.4",
 ]
 
 [project.optional-dependencies]
@@ -71,7 +73,7 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler~=0.11.3.dev237",
+    "rebel-compiler~=0.11.3.dev499",
 ]
 
 
@@ -183,7 +185,7 @@ prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prer
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.24.0/cpu"
+url = "https://wheels.vllm.ai/0.26.0/cpu"
 explicit = true
 
 [[tool.uv.index]]

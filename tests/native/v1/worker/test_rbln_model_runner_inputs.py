@@ -24,32 +24,51 @@ import torch
 from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
-from tests.native.v1.worker.utils import make_scheduler_output, schedule_new
+from tests.native.v1.worker.utils import (
+    MAX_MODEL_LEN,
+    make_scheduler_output,
+    make_speculative_config,
+    schedule_new,
+)
 
 pytestmark = pytest.mark.maybe_use_device
 
 
-def _decode_ready(runner, monkeypatch, *, num_spec_tokens: int) -> None:
+def _decode_ready(
+    runner,
+    monkeypatch,
+    *,
+    num_spec_tokens: int,
+    num_computed: int = 3,
+    fixed_window: bool = True,
+) -> None:
     """One request past its prompt in the decode phase, so the spec branch is
     reachable. The phase comes from the scheduler output, so it is set through
     _is_prefill_step rather than derived from input_batch."""
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     runner._update_states(schedule_new("a"))
-    runner.input_batch.num_computed_tokens_cpu[0] = 3
-    runner.input_batch.num_tokens_no_spec[0] = 3
+    runner.input_batch.num_computed_tokens_cpu[0] = num_computed
+    runner.input_batch.num_tokens_no_spec[0] = num_computed
     # Patched rather than configured: a real speculative_config would pull in a
-    # drafter, and none of the arithmetic under test depends on one.
+    # drafter, and the only thing the arithmetic reads off it is whether the
+    # drafter is model-based, which decides the fixed decode window.
     monkeypatch.setattr(runner, "num_spec_tokens", num_spec_tokens)
+    monkeypatch.setattr(
+        runner,
+        "speculative_config",
+        make_speculative_config("mtp" if fixed_window else "ngram"),
+    )
     runner._is_prefill_step = False
     assert runner.is_prefill is False
 
 
 class TestPrepareInputsSpecDecode:
-    def test_pads_query_to_full_spec_and_backfills_positions(
+    def test_pads_query_to_full_spec_behind_the_scheduled_tokens(
         self, make_model_runner, monkeypatch
     ):
         # 1 real + 1 draft = 2 logical tokens, but the decode query is fixed at
-        # num_spec_tokens + 1 = 3, so one already-computed token is backfilled.
+        # num_spec_tokens + 1 = 3, so one slot is padded. Away from the sequence's
+        # end the padding goes behind, leaving the scheduled tokens at the front.
         runner = make_model_runner()
         _decode_ready(runner, monkeypatch, num_spec_tokens=2)
 
@@ -62,8 +81,8 @@ class TestPrepareInputsSpecDecode:
 
         assert query_lengths.tolist() == [3]
         assert total == 3
-        # Positions start one token earlier (num_computed 3 - backfill 1).
-        assert runner.positions[:3].tolist() == [2, 3, 4]
+        # The scheduled tokens land in slots 0 and 1; slot 2 is the back padding.
+        assert runner.positions[:3].tolist() == [3, 4, 5]
         # seq_lens follows the logical count (3 + 2), not the padded query
         # length, or attention would read a KV slot this step never wrote.
         assert runner.seq_lens[:1].tolist() == [5]
@@ -72,13 +91,9 @@ class TestPrepareInputsSpecDecode:
         assert spec_md.num_draft_tokens == [1]
         assert logits_indices.tolist() == spec_md.logits_indices.tolist()
 
-    def test_no_padding_when_scheduler_kept_no_drafts(
-        self, make_model_runner, monkeypatch
-    ):
-        # num_spec_tokens alone must not force the full-spec query: zero-draft
-        # steps and the unsafe-boundary fallback expect the plain qlen=1 decode.
+    def test_drafter_runs_the_logical_length(self, make_model_runner, monkeypatch):
         runner = make_model_runner()
-        _decode_ready(runner, monkeypatch, num_spec_tokens=2)
+        _decode_ready(runner, monkeypatch, num_spec_tokens=2, fixed_window=False)
 
         logits_indices, spec_md, query_lengths, total = runner._prepare_inputs(
             make_scheduler_output(num_scheduled_tokens={"a": 1}),
@@ -91,6 +106,109 @@ class TestPrepareInputsSpecDecode:
         assert runner.positions[:1].tolist() == [3]
         assert runner.seq_lens[:1].tolist() == [4]
         assert logits_indices.tolist() == [0]
+
+
+class TestPrepareInputsFixedWindow:
+    # A decode with a model-based drafter always stages num_spec_tokens + 1
+    # slots and puts the slack behind the scheduled token, so everything
+    # downstream has to follow the token, not the window.
+    BLOCK = 1024
+    NUM_SPEC = 2
+
+    @pytest.mark.parametrize(
+        "num_computed, front_pad",
+        [
+            # The formula switches on `max_model_len`, not on the block: the
+            # window only shifts once it would run past the last KV slot the
+            # request will ever own.
+            (3, 0),
+            (MAX_MODEL_LEN - NUM_SPEC - 1, 0),
+            (MAX_MODEL_LEN - NUM_SPEC, 1),
+        ],
+        ids=["mid_sequence", "last_placement_that_fits", "overshoots_by_one"],
+    )
+    def test_the_window_is_fixed_and_shifts_only_at_max_model_len(
+        self, make_model_runner, monkeypatch, num_computed, front_pad
+    ):
+        runner = make_model_runner()
+        _decode_ready(
+            runner,
+            monkeypatch,
+            num_spec_tokens=self.NUM_SPEC,
+            num_computed=num_computed,
+        )
+        window = self.NUM_SPEC + 1
+
+        logits_indices, _, query_lengths, _ = runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 1}),
+            np.array([1], dtype=np.int32),
+        )
+
+        assert query_lengths.tolist() == [window]
+        start = num_computed - front_pad
+        assert runner.positions[:window].tolist() == list(range(start, start + window))
+        assert runner.positions[window - 1] < runner.max_model_len
+        assert logits_indices.tolist() == [front_pad]
+        assert runner.decode_back_pad_np[0] == self.NUM_SPEC - front_pad
+        assert runner.seq_lens[:1].tolist() == [num_computed + 1]
+
+    def test_only_the_request_near_the_end_shifts(self, make_model_runner, monkeypatch):
+        """front_pad is per request, so a request at the end of its context must
+        not move the rest of the batch."""
+        runner = make_model_runner()
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner._update_states(schedule_new("a", "b"))
+        near_end = MAX_MODEL_LEN - self.NUM_SPEC
+        for i, num_computed in enumerate((10, near_end)):
+            runner.input_batch.num_computed_tokens_cpu[i] = num_computed
+            runner.input_batch.num_tokens_no_spec[i] = num_computed
+        monkeypatch.setattr(runner, "num_spec_tokens", self.NUM_SPEC)
+        monkeypatch.setattr(
+            runner, "speculative_config", make_speculative_config("mtp")
+        )
+        runner._is_prefill_step = False
+        window = self.NUM_SPEC + 1
+
+        _, _, query_lengths, total = runner._prepare_inputs(
+            make_scheduler_output(num_scheduled_tokens={"a": 1, "b": 1}),
+            np.array([1, 1], dtype=np.int32),
+        )
+
+        assert query_lengths.tolist() == [window, window]
+        assert runner.positions[:total].tolist() == [10, 11, 12] + list(
+            range(near_end - 1, near_end + 2)
+        )
+        assert runner.decode_back_pad_np[:2].tolist() == [self.NUM_SPEC, 1]
+
+    def test_kept_drafts_sample_before_the_back_padding(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        _decode_ready(
+            runner, monkeypatch, num_spec_tokens=self.NUM_SPEC, num_computed=self.BLOCK
+        )
+        window = self.NUM_SPEC + 1
+
+        logits_indices, spec_md, query_lengths, total = runner._prepare_inputs(
+            make_scheduler_output(
+                num_scheduled_tokens={"a": 2}, spec_decode_tokens={"a": [11]}
+            ),
+            np.array([2], dtype=np.int32),
+        )
+
+        assert query_lengths.tolist() == [window]
+        assert total == window
+        positions = runner.positions[:window].tolist()
+        assert positions == [self.BLOCK, self.BLOCK + 1, self.BLOCK + 2]
+        assert runner.decode_back_pad_np[0] == 1
+
+        assert spec_md is not None
+        assert spec_md.num_draft_tokens == [1]
+        assert spec_md.logits_indices.tolist() == [0, 1]
+        assert logits_indices.tolist() == [0, 1]
+        assert runner.seq_lens[:1].tolist() == [self.BLOCK + 2]
 
 
 class TestBookkeepingSyncSpecDecode:

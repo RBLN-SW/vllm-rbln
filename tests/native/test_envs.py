@@ -203,6 +203,8 @@ def test_unrecognized_value_disables_a_default_on_variable(monkeypatch):
 _PROBE_OVERRIDES = {
     "VLLM_RBLN_DECODE_BATCH_BUCKET_STRATEGY": "linear",
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": "3,5",
+    # Defaults to None, which _probe_value has no number to step off.
+    "VLLM_RBLN_SUB_BLOCK_SIZE": "128",
 }
 
 # Keys that resolve from a differently named variable: custom kernels follow the
@@ -243,6 +245,15 @@ def test_custom_kernel_follows_the_compiler_flag(monkeypatch):
 
     monkeypatch.setenv("RBLN_USE_CUSTOM_KERNEL", "1")
     assert envs.VLLM_RBLN_USE_CUSTOM_KERNEL is True
+
+
+def _annotation_names(annotation: str) -> set[str]:
+    """The type names an annotation allows, as ``type(...).__name__`` spells
+    them. A union lists each member, and ``None`` there means ``NoneType``."""
+    return {
+        "NoneType" if part == "None" else part.split("[")[0]
+        for part in (p.strip() for p in annotation.split("|"))
+    }
 
 
 def _declared_in_type_checking() -> dict[str, tuple[str, Any]]:
@@ -288,7 +299,7 @@ def test_declared_default_matches_resolved(monkeypatch, name):
 
     resolved = read(name)
     assert resolved == declared_default
-    assert type(resolved).__name__ == annotation.split("[")[0]
+    assert type(resolved).__name__ in _annotation_names(annotation)
 
 
 @pytest.mark.parametrize(
@@ -334,9 +345,33 @@ def test_compile_env_partition_is_disjoint():
     assert not overlap, f"classified twice: {sorted(overlap)}"
 
 
+def test_config_fields_are_not_hashed_into_the_bundle_key():
+    """`RBLNConfig.compute_hash` already keys the bundle on a field's value.
+
+    Hashing the variable too keys it on how the value was supplied instead:
+    `--rbln-use-w8a8` and `VLLM_RBLN_USE_W8A8=1` build the same artifact, so
+    they must not land in different bundle directories. A field `compute_hash`
+    ignores does not change the artifact, so it has no claim on the key either.
+    """
+    import dataclasses
+
+    from vllm_rbln.config import RBLNConfig
+
+    fields = {f"VLLM_RBLN_{f.name.upper()}" for f in dataclasses.fields(RBLNConfig)}
+    double_keyed = envs.RBLN_COMPILE_ENV & fields
+    assert not double_keyed, f"keyed twice: {sorted(double_keyed)}"
+
+
 def test_unknown_variable_raises():
     with pytest.raises(AttributeError, match="VLLM_RBLN_NOT_A_REAL_VARIABLE"):
         getattr(envs, "VLLM_RBLN_NOT_A_REAL_VARIABLE")  # noqa: B009
+
+
+def test_dynamic_kv_dry_run_implies_the_flag(monkeypatch):
+    monkeypatch.delenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", raising=False)
+    monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "1")
+    assert envs.environment_variables["VLLM_RBLN_USE_DYNAMIC_KV_CACHE"]() is True
+    assert envs.environment_variables["VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN"]() is True
 
 
 def test_dynamic_kv_cache_is_opt_in(monkeypatch):

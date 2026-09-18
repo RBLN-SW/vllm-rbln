@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -31,6 +30,7 @@ from .model_base import (
     RBLNOptimumModelBase,
     RBLNOptimumMultimodalMixin,
 )
+from .qwen2_vl import split_by_grid_thw
 
 logger = init_logger(__name__)
 
@@ -62,71 +62,8 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
             ),
             default_batch_size=self.scheduler_config.max_num_seqs,
             decoder_batch_sizes=self.model.rbln_config.decoder_batch_sizes,
-            num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
         self.is_hybrid = getattr(self.model.rbln_config, "cache_impl", None) == "hybrid"
-
-    def preprocess_prefill(self, input_ids, attention_mask, image_input, video_input):
-        """
-        Common preprocessing logic for prefill inputs.
-        Calls model-specific parameter preparation method.
-
-        Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            image_input: Image input data
-            video_input: Video input data
-
-        Returns:
-            Prefill input embeddings tensor.
-        """
-
-        # Prepare base arguments common to all models
-        preprocess_args = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "pixel_values": image_input["pixel_values"]
-            if image_input is not None
-            else None,
-            "image_grid_thw": image_input["image_grid_thw"]
-            if image_input is not None
-            else None,
-            "pixel_values_videos": video_input["pixel_values_videos"]
-            if video_input is not None
-            else None,
-            "video_grid_thw": video_input["video_grid_thw"]
-            if video_input is not None
-            else None,
-        }
-
-        # Call the actual preprocessing
-        return self.model._preprocess_prefill(**preprocess_args)
-
-    def build_prefill_forward_inputs(
-        self,
-        model_input: ModelInputForRBLN,
-        mrope_position_deltas: dict[str, float],
-    ) -> ModelInputForRBLN:
-        """Prefill: merge text + multimodal embeddings and return a
-        ``model_input`` with ``inputs_embeds`` filled in. EXAONE-4.5 does not use
-        MRoPE, so ``mrope_position_deltas`` is left untouched.
-        """
-        input_ids = model_input.input_tokens
-        image_input = None
-        video_input = None
-        if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
-                **model_input.multi_modal_kwargs
-            )
-            video_input = self._parse_and_validate_video_input(
-                **model_input.multi_modal_kwargs
-            )
-
-        attention_mask = torch.ones_like(input_ids)
-        inputs_embeds = self.preprocess_prefill(
-            input_ids, attention_mask, image_input, video_input
-        )
-        return replace(model_input, inputs_embeds=inputs_embeds)
 
     def get_language_model(self):
         return self.model
@@ -136,55 +73,34 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         # (not `image_token_index` as the mixin default assumes).
         return self.model.config.image_token_id
 
-    def _process_image_input(self, image_input) -> dict:
-        result = {}
-        if image_input is not None and image_input.get("type") == "pixel_values":
-            image_embeds = self.model.visual(
-                image_input["pixel_values"], grid_thw=image_input["image_grid_thw"]
-            )
-            result["image_embeds"] = image_embeds
-            result["image_grid_thw"] = image_input["image_grid_thw"]
-        return result
+    def _embed_text_tokens(
+        self, input_ids: torch.Tensor, is_multimodal: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids).to(self.dtype)
 
-    def _process_video_input(self, video_input) -> dict:
-        result = {}
-        if video_input is not None and video_input.get("type") == "pixel_values_videos":
-            video_embeds = self.model.visual(
-                video_input["pixel_values_videos"],
-                grid_thw=video_input["video_grid_thw"],
-            )
-            result["video_embeds"] = video_embeds
-            result["video_grid_thw"] = video_input["video_grid_thw"]
-        return result
+    def _process_image_input(self, image_input) -> list[torch.Tensor]:
+        if image_input is None or image_input.get("type") != "pixel_values":
+            return []
+        grid_thw = image_input["image_grid_thw"]
+        embeds = self.model.visual(image_input["pixel_values"], grid_thw=grid_thw)
+        return split_by_grid_thw(embeds, grid_thw)
 
-    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | dict:
+    def _process_video_input(self, video_input) -> list[torch.Tensor]:
+        if video_input is None or video_input.get("type") != "pixel_values_videos":
+            return []
+        grid_thw = video_input["video_grid_thw"]
+        embeds = self.model.visual(
+            video_input["pixel_values_videos"], grid_thw=grid_thw
+        )
+        return split_by_grid_thw(embeds, grid_thw)
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
         video_input = self._parse_and_validate_video_input(**kwargs)
-        if image_input is None and video_input is None:
-            return []
-
-        result = {}
-        result.update(self._process_image_input(image_input))
-        result.update(self._process_video_input(video_input))
-        return result
-
-    def build_prefill_inputs(
-        self,
-        input_ids: torch.Tensor,
-        cached_mm_outputs: list,
-        *,
-        cache_position: torch.Tensor | None = None,
-        running_requests_ids: list[str] | None = None,
-    ) -> dict:
-        # NOTE: this guard is currently unreachable — init_model() only enables
-        # the EC path for "RBLNQwen3VLForConditionalGeneration", so EXAONE-4.5
-        # never enters here today. It documents the contract for when EC is
-        # extended: the sliding-window/hybrid-cache prefill needs the cache
-        # slot ids from ModelInputForRBLN, which build_prefill_inputs does
-        # not receive.
-        raise NotImplementedError(
-            "EC disaggregation is not implemented for EXAONE-4.5."
-        )
+        return [
+            *self._process_image_input(image_input),
+            *self._process_video_input(video_input),
+        ]
 
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
         return Qwen2_5_VLImagePixelInputs(
@@ -224,47 +140,27 @@ class RBLNOptimumExaone4_5_ForConditionalGeneration(
         )
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        input_ids = model_input.input_tokens
-        cache_position = model_input.input_positions
-        block_tables = model_input.block_tables
         cache_slot_ids = model_input.cache_slot_ids
         assert cache_slot_ids is not None
+        block_tables = model_input.block_tables if self.is_hybrid else None
 
-        request_nums = input_ids.shape[0]
-        is_prompt = model_input.is_prompt
-
-        kwargs = self.preprocess_for_decoder(
-            is_prompt, block_tables, input_ids, cache_position
-        )
-
-        padded_batch_size = kwargs.pop("padded_batch_size", self.decoder_batch_size)
-        cache_position = kwargs.pop("cache_position")
-        input_ids = kwargs.pop("input_ids")
-        block_tables = kwargs.pop("block_tables")
-
-        if is_prompt:
-            inputs_embeds = model_input.inputs_embeds
-            logits = self.model.prefill_decoder(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
+        if model_input.is_prompt:
+            return self.model.prefill_decoder(
+                input_ids=model_input.input_tokens,
+                inputs_embeds=model_input.inputs_embeds,
+                cache_position=model_input.input_positions,
                 local_block_tables=cache_slot_ids,
-                block_tables=block_tables if self.is_hybrid else None,
+                block_tables=block_tables,
             ).logits
-        else:
-            self.model.decoder = self.model.decoders[padded_batch_size]
-            inputs_embeds = self.model.embed_tokens(input_ids)
-            logits = self.model.decoder(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                local_block_tables=self.pad_cache_slot_ids(
-                    cache_slot_ids, padded_batch_size
-                ),
-                block_tables=block_tables if self.is_hybrid else None,
-            ).logits
-            logits = logits[:request_nums]
-        return logits
+
+        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
+        return self.model.decoder(
+            input_ids=model_input.input_tokens,
+            inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
+            cache_position=model_input.input_positions,
+            local_block_tables=cache_slot_ids,
+            block_tables=block_tables,
+        ).logits
 
     def _parse_and_validate_image_input(self, **kwargs: Any) -> Any | None:
         pixel_values = kwargs.pop("pixel_values", None)

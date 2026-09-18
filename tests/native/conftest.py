@@ -482,6 +482,18 @@ def whole_model(pytestconfig) -> bool:
     return pytestconfig.getoption("--num-hidden-layers") == 0
 
 
+@pytest.fixture
+def cr13(monkeypatch):
+    """Report the host as REBEL CR13, whatever it really is.
+
+    A sub_block_size below the prefill chunk is CR13-only, so a test that picks
+    one has to name the device rather than inherit the runner's.
+    """
+    from vllm_rbln import platform
+
+    monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13")
+
+
 @pytest.fixture(autouse=True)
 def _drop_envs_shadows():
     """Remove any ``vllm_rbln.envs`` attribute a test left behind.
@@ -498,35 +510,6 @@ def _drop_envs_shadows():
     yield
     for name in set(vars(envs)) - before:
         delattr(envs, name)
-
-
-@pytest.fixture(autouse=True)
-def _reset_rbln_config(monkeypatch):
-    """`vllm_rbln.config` publishes the resolved config in a module global.
-
-    A worker or scheduler built by one test leaves it behind, so a test that
-    never published one would silently read another test's.
-    """
-    from vllm_rbln import config
-
-    monkeypatch.setattr(config, "_rbln_config", None)
-
-
-@pytest.fixture
-def rbln_config():
-    """Publish an `RBLNConfig` for code that reads it without an engine.
-
-    Only a process with an engine resolves one by itself, so a unit test has
-    to say what it wants to read.
-    """
-    from vllm_rbln.config import RBLNConfig, set_rbln_config
-
-    def _publish(**overrides) -> RBLNConfig:
-        config = RBLNConfig(**overrides)
-        set_rbln_config(config)
-        return config
-
-    return _publish
 
 
 @pytest.fixture(autouse=True)

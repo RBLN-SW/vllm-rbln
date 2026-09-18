@@ -28,8 +28,9 @@ Resolution order, highest first:
      applies. `_ENV_PROBE` lists the names that break the pattern.
   3. the field default
 
-Most call sites still read `envs.py` directly. They move over one subsystem
-at a time.
+`envs.py` still carries the variables and their parsing. The options that stay
+there rather than move -- a patch condition reads two of them before this config
+exists, and the rest are bring-up knobs -- are not fields here.
 """
 
 import argparse
@@ -37,6 +38,7 @@ import os
 from dataclasses import field, fields
 from typing import TYPE_CHECKING, Any, Literal
 
+from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
 
 from vllm_rbln.logger import init_logger
@@ -58,40 +60,32 @@ class RBLNConfig:
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
 
-    sampler: bool = True
+    use_custom_sampler: bool = True
     """Use the customized RBLN sampler."""
 
     compile_model: bool = True
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
     possible."""
 
-    compile_strict_mode: bool = False
-    """Compile with torch.compile's strict mode, which fails on a graph break
-    instead of falling back to eager."""
-
-    num_hidden_layers: int = 0
-    """Build only the first N decoder layers and leave the rest as
-    `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
-    truncation."""
-
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
 
-    use_dynamic_kv_cache: bool = False
-    """Size the KV cache from the compiled artifact instead of the estimate."""
-
-    flash_causal_attn: bool = True
+    use_flash_causal_attn: bool = True
     """Use flash attention for causal attention."""
 
-    batch_attn_opt: bool = False
+    use_batch_attn_opt: bool = False
     """Use the batch attention optimization for paged attention."""
 
     use_custom_kernel: bool = False
     """Use the custom RBLN kernels."""
 
-    sub_block_cache: bool = True
-    """Enable sub-block prefix caching. The sub-block size equals
-    max_num_batched_tokens (the prefill chunk size)."""
+    enable_sub_block_cache: bool = True
+    """Enable sub-block prefix caching, at `sub_block_size` granularity."""
+
+    sub_block_size: int | None = Field(default=None, gt=0)
+    """Sub-block size in tokens; unset takes the prefill chunk
+    (`max_num_batched_tokens`). `sub_block_size_in_use()` holds the rules a
+    given size has to meet."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
@@ -99,10 +93,10 @@ class RBLNConfig:
     use_moe_tokens_mask: bool = True
     """Apply the tokens mask to the MoE expert kernel."""
 
-    dispatch_all2all: bool = False
+    use_all2all_dispatch: bool = False
     """Use all2all dispatch instead of all-gather for MoE DP dispatch."""
 
-    combine_all2all: bool = False
+    use_all2all_combine: bool = False
     """Use all2all combine instead of reduce-scatter for MoE DP combine."""
 
     decode_batch_bucket_strategy: DecodeBatchBucketStrategy = "exponential"
@@ -120,11 +114,6 @@ class RBLNConfig:
     decode_batch_bucket_manual_buckets: list[int] = field(default_factory=list)
     """Explicit decode batch sizes, used when the strategy is `manual`."""
 
-    nixl_swa_view_opt: bool = False
-    """Publish a second SWA-sized descriptor range alongside the Full-sized
-    range at the same NIXL base addresses, so SWA groups transfer only
-    `sliding_window` bytes per block over RDMA."""
-
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
@@ -140,11 +129,10 @@ class RBLNConfig:
 
         ignored_factors = {
             # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. The rest change what runs, not what is built.
-            "sampler",
-            "compile_strict_mode",
-            "sub_block_cache",
-            "nixl_swa_view_opt",
+            # the bundle. Sub-block caching changes what runs, not what is built.
+            "use_custom_sampler",
+            "enable_sub_block_cache",
+            "sub_block_size",
         }
         return hash_factors(get_hash_factors(self, ignored_factors))
 
@@ -168,6 +156,16 @@ _FIELDS = fields(RBLNConfig)  # type: ignore[arg-type]
 
 # Which env name means "the user set this field". It is VLLM_RBLN_<FIELD>
 # unless listed here.
+# The envs.py attribute a renamed field reads. Goes away with the env vars.
+_ENV_NAME: dict[str, str] = {
+    "use_custom_sampler": "VLLM_RBLN_SAMPLER",
+    "use_flash_causal_attn": "VLLM_RBLN_FLASH_CAUSAL_ATTN",
+    "use_batch_attn_opt": "VLLM_RBLN_BATCH_ATTN_OPT",
+    "use_all2all_dispatch": "VLLM_RBLN_DISPATCH_ALL2ALL",
+    "use_all2all_combine": "VLLM_RBLN_COMBINE_ALL2ALL",
+    "enable_sub_block_cache": "VLLM_RBLN_SUB_BLOCK_CACHE",
+}
+
 _ENV_PROBE: dict[str, tuple[str, ...]] = {
     # `envs.py` still honors the deprecated VLLM_RBLN_TP_SIZE alias.
     "num_devices_per_local_rank": (
@@ -178,15 +176,22 @@ _ENV_PROBE: dict[str, tuple[str, ...]] = {
 }
 
 
+def _env_source(field_name: str) -> tuple[str, tuple[str, ...]]:
+    """The envs.py attribute a field reads, and the os.environ names that mean
+    the user set it."""
+    attr = _ENV_NAME.get(field_name, f"VLLM_RBLN_{field_name.upper()}")
+    return attr, _ENV_PROBE.get(field_name, (attr,))
+
+
 def _env_overrides() -> dict[str, Any]:
     from vllm_rbln import envs
 
     overrides: dict[str, Any] = {}
     for f in _FIELDS:
-        env_name = f"VLLM_RBLN_{f.name.upper()}"
-        for probe in _ENV_PROBE.get(f.name, (env_name,)):
+        attr, probes = _env_source(f.name)
+        for probe in probes:
             if probe in os.environ:
-                overrides[f.name] = getattr(envs, env_name)
+                overrides[f.name] = getattr(envs, attr)
                 break
     return overrides
 
@@ -224,50 +229,47 @@ def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
 
     if shadowed:
         logger.warning_once(
-            "Ignoring the environment variables for %s; the CLI value wins.",
+            "Both the environment and additional_config set %s; RBLNConfig "
+            "takes the additional_config value.",
             ", ".join(shadowed),
         )
 
-    return RBLNConfig(**overrides)
+    resolved = RBLNConfig(**overrides)
 
-
-_rbln_config: RBLNConfig | None = None
-
-
-def set_rbln_config(config: RBLNConfig) -> None:
-    """Publish the resolved config for this process.
-
-    Each process does this at its own entry point. A worker and EngineCore
-    receive an already-built `VllmConfig`, so its `__post_init__` -- where the
-    platform hook runs -- does not run again there.
-    """
-    global _rbln_config
-    _rbln_config = config
-
+    # Upstream's `non-default args` covers what the CLI was given, but not what
+    # the environment resolved to, and `VllmConfig.__str__` leaves
+    # additional_config out entirely. This is the only record of the values a
+    # run actually used.
     defaults = RBLNConfig()
     changed = {
-        f.name: getattr(config, f.name)
+        f.name: getattr(resolved, f.name)
         for f in _FIELDS
-        if getattr(config, f.name) != getattr(defaults, f.name)
+        if getattr(resolved, f.name) != getattr(defaults, f.name)
     }
     logger.info("RBLN config: %s", changed or "all defaults")
 
+    return resolved
+
 
 def get_rbln_config() -> RBLNConfig:
-    """The resolved RBLN config for this process.
+    """The RBLN section of the config the current model is being built under.
 
-    There is deliberately no fallback to the environment. A child process
-    inherits env vars but not `--rbln-*` values, so a fallback would be right
-    when the option came from the environment and wrong when it came from the
-    command line.
+    For code that cannot reach a `vllm_config` of its own -- a free function, or
+    a constructor whose signature upstream owns. Every such call site runs
+    inside `set_current_vllm_config`, which upstream opens around worker start-up,
+    device init and model construction. Read `vllm_config.additional_config`
+    directly wherever one is in hand.
     """
-    if _rbln_config is None:
+    from vllm.config import get_current_vllm_config
+
+    rbln_config = get_current_vllm_config().additional_config
+    if not isinstance(rbln_config, RBLNConfig):
         raise RuntimeError(
-            "RBLNConfig was never resolved in this process. Call "
-            "set_rbln_config(build_rbln_config(vllm_config.additional_config)) "
-            "from this process's entry point."
+            "additional_config is not an RBLNConfig; "
+            "check_and_update_config resolves it on the vLLM-native path, so "
+            f"this is the optimum-rbln path or an unbuilt config: {rbln_config!r}"
         )
-    return _rbln_config
+    return rbln_config
 
 
 # `from_cli_args` only copies dataclass fields, so a `--rbln-*` flag cannot
