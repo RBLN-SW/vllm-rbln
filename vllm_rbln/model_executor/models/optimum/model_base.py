@@ -250,11 +250,13 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
-            # vLLM shadows some transformers config classes (qwen3_asr), and a
-            # shadowed class is not what the transformers model expects, so only
-            # those fall back to the layer count as HF config kwargs.
-            # FIXME(optimum-rbln): that fallback is not equivalent --
-            # RBLNGptOssForCausalLM.get_pytorch_model discards the kwargs.
+            # Pass transformers config objects directly to preserve all settings.
+            # Config classes defined outside transformers (e.g. vLLM's qwen3_asr)
+            # may be incompatible with the transformers model implementation.
+            # For these configs, pass num_hidden_layers and, when available,
+            # layer_types as config kwargs instead.
+            # FIXME(optimum-rbln): Ensure RBLNGptOssForCausalLM.get_pytorch_model
+            # applies these config kwargs; it currently discards them.
             if type(hf_config).__module__.startswith("transformers."):
                 config_override = {"config": hf_config}
             else:

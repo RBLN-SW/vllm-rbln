@@ -11,13 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for what optimum-rbln receives on a cache-miss compile.
+"""Test config forwarding to optimum-rbln during compilation on a cache miss.
 
-``init_model`` forwards vLLM's ``hf_config`` object. A vLLM-private config
-class (e.g. qwen3_asr) is not what the transformers model expects, so those
-models instead get the layer count and the per-layer attention types as HF
-config kwargs, nested under ``text_config`` for composite models. Everything
-that needs an NPU is faked.
+Configs defined in transformers are passed directly as objects. Other configs
+are passed as kwargs containing ``num_hidden_layers`` and, when available,
+``layer_types``, nested under ``text_config`` for composite models.
+NPU-dependent operations are replaced with test doubles.
 """
 
 import types
@@ -74,8 +73,8 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
 
 
 def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_path):
-    # A shadowed text-only config: the layer count lands on the top level, and
-    # vLLM's config object stays out.
+    # For a flat non-transformers config, pass layer settings as top-level
+    # kwargs rather than passing the config object.
     hf_config = types.SimpleNamespace(
         architectures=["Qwen3ForCausalLM"],
         num_hidden_layers=2,
@@ -92,8 +91,8 @@ def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_pat
 
 
 def test_composite_config_nests_layer_count_under_text_config(monkeypatch, tmp_path):
-    # A vLLM-private composite config (qwen3_asr keeps the text config under
-    # thinker_config): the override must reach HF's text_config sub-config.
+    # For a composite non-transformers config, nest the layer override under
+    # text_config rather than passing it as a top-level kwarg.
     text_config = types.SimpleNamespace(num_hidden_layers=2)
     hf_config = types.SimpleNamespace(
         architectures=["Qwen3ASRForConditionalGeneration"],
