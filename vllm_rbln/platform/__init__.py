@@ -38,13 +38,6 @@ logger = init_logger(__name__)
 # any engine code reads a variable.
 envs.publish_to_vllm_envs()
 
-try:
-    import torch.rbln  # noqa: F401
-
-    HAS_TORCH_RBLN: bool = True
-except ImportError:
-    HAS_TORCH_RBLN = False
-
 USE_DEVICE_TENSOR: bool = (
     envs.VLLM_RBLN_USE_VLLM_MODEL and envs.VLLM_RBLN_USE_DEVICE_TENSOR
 )

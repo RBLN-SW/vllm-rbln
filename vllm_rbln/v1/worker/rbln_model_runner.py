@@ -118,7 +118,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
 )
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import HAS_TORCH_RBLN, USE_DEVICE_TENSOR
+from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -514,7 +514,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         self.offload_context = nullcontext
-        if HAS_TORCH_RBLN and USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
+        if USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             self.offload_context = torch.rbln.offload
 
         # What this step's ranks reported. The draft decides its own shapes from
