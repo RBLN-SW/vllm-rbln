@@ -528,6 +528,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "cannot describe. Mixed full and sliding-window attention is a "
                 "different thing and is supported."
             )
+        # `__init__` copied the count vllm estimated before the compile. A
+        # dynamic-KV resize settles the real one after warm-up and registers
+        # only then, so take what the worker last allocated for.
+        num_gpu_blocks = self.vllm_config.cache_config.num_gpu_blocks
+        assert num_gpu_blocks is not None
+        self.num_blocks = num_gpu_blocks
+        self._logical_num_blocks = num_gpu_blocks
+
         # Capture the ordered local layer names before any deferral so the PP
         # metadata publish (and the consumer-side name->region matching) can
         # use them; the D2D path re-uses these at finalize time.

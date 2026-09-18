@@ -198,6 +198,19 @@ class TestRegisterKvCaches:
         worker.register_kv_caches({"layer0": "tensor"})
         assert worker._pending_kv_caches == {"layer0": "tensor"}
 
+    def test_the_block_count_comes_from_the_allocation_not_the_estimate(
+        self, monkeypatch
+    ):
+        # A dynamic-KV resize settles the count after warm-up and registers
+        # only then, so what `__init__` copied is the pre-compile estimate.
+        worker = build_worker(monkeypatch, kv_buffer_device="rbln", num_blocks=4)
+        worker.vllm_config.cache_config.num_gpu_blocks = 128
+
+        worker.register_kv_caches({"layer0": "tensor"})
+
+        assert worker.num_blocks == 128
+        assert worker._logical_num_blocks == 128
+
     def test_host_bounce_creates_backend_and_delegates(self, monkeypatch):
         # Host-bounce with the adapter creates the RBLN backend on the agent,
         # then delegates registration to upstream.

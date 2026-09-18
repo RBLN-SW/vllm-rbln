@@ -693,6 +693,9 @@ def build_worker(
 
     vllm_config = MagicMock()
     vllm_config.cache_config = CacheConfig(block_size=block_size)
+    # What the worker sets before it builds the connector; `register_kv_caches`
+    # takes the count from here.
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
     # No speculative decoding: the compat hash then folds what it always did.
     vllm_config.speculative_config = None
     # _check_pp_constraints compares pipeline_parallel_size <= 1; a MagicMock

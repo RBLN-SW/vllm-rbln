@@ -630,6 +630,30 @@ class TestMaybeShrinkKvCacheForCompile:
         assert "compile/warm-up is skipped" in caplog.text
         assert "does nothing for this run" in caplog.text
 
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"dynamic": False},
+            {"dry_run": True},
+            {"override": 64},
+            {"warmup_skipped": True},
+        ],
+        ids=["active", "disabled", "dry_run", "pinned", "inert"],
+    )
+    def test_a_connector_waits_exactly_where_the_shrink_latched(self, kwargs):
+        # A KV connector registers the addresses it is handed. It may only be
+        # made to wait where the cache it would see now is the placeholder the
+        # resize replaces -- which is the branch that shrinks, and no other.
+        config = self._config()
+        sizer, out = self._shrink(config, **kwargs)
+
+        # A bare instance: the property reads the mode and nothing else, while
+        # __init__ wants a device.
+        probe = object.__new__(DynamicKvSizer)
+        probe.mode = sizer.mode
+        assert probe.defers_kv_registration == (out is not config)
+
 
 class TestDynamicKvLayoutGuards:
     """The layout guard is split across `initialize_kv_cache`: the attention half
