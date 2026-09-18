@@ -104,7 +104,7 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                 self._tail_viewed_as(
                     valid_tokens, self._prompt_blocks(meta.remote.block_ids)
                 )
-                if self._chunk_mode
+                if self._chunk_mode or self._own_engine_layout
                 else nullcontext()
             )
             with tail:

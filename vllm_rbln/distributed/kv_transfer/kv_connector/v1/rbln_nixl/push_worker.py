@@ -147,7 +147,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     # own blocks.
                     self._prompt_blocks(meta.local_physical_block_ids),
                 )
-                if self._chunk_mode
+                if self._chunk_mode or self._own_engine_layout
                 else nullcontext()
             )
             # NOTE(RBLN): upstream aligns by truncating the longer list and

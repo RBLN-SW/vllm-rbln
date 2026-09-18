@@ -324,6 +324,9 @@ class TestShardReadPath:
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w._shard_chunk_grids = {("eng", r): None for r in range(pp_size)}
         w._chunk_mode = False
+        # The whole-engine route parks a token count for either mode, so both
+        # knobs are read here.
+        w._sw_ratio = None
         w._recv_valid_tokens = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
@@ -510,6 +513,9 @@ class TestShardReadPath:
         w._remote_pp_size = {}  # unknown engine defaults to a single stage
         w._overlapping_ranks = {}  # nothing narrowed -> upstream's handle covers it
         w._chunk_mode = False
+        # The whole-engine route parks a token count for either mode, so both
+        # knobs are read here.
+        w._sw_ratio = None
         w._recv_valid_tokens = {}
         w.transfer_topo = MagicMock()
         meta = MagicMock()

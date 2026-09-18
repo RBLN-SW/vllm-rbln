@@ -144,7 +144,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _shard_descs_per_block: dict[tuple[str, int], int]
     _shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None]
     _chunk_grid: tuple[int, int] | None
-    _request_tail: tuple[int | None, int] | None
+    _request_tail: tuple[int | None, int | None] | None
 
     @property
     def _own_engine_layout(self) -> bool:

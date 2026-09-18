@@ -28,7 +28,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler 
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RblnNixlConnectorMetadata,
-    connector_option,
 )
 
 if TYPE_CHECKING:
@@ -64,9 +63,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         self, request: "Request", block_ids: "BlockIds"
     ) -> tuple[bool, dict[str, Any] | None]:
         delay_free_blocks, out_params = super().request_finished(request, block_ids)
-        if delay_free_blocks and connector_option(
-            self.vllm_config, "chunk_mode", False
-        ):
+        if delay_free_blocks and self._sends_token_count:
             # The same count upstream reports as `remote_num_tokens`, taken
             # here because it is the one that matches the handed-over blocks.
             self._valid_tokens[request.request_id] = request.num_computed_tokens

@@ -68,7 +68,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
     """
 
     @contextmanager
-    def _tail_viewed_as(self, valid_tokens: int | None, prompt_blocks: int):
+    def _tail_viewed_as(self, valid_tokens: int | None, prompt_blocks: int | None):
         """Park how far a request's last block is filled, for upstream's call.
 
         `_compute_desc_ids` is what selects the descriptors, and it takes block
@@ -84,18 +84,49 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         finally:
             self._request_tail = prev
 
-    def _prompt_blocks(self, block_ids: BlockIds) -> int:
+    def _prompt_blocks(self, block_ids: BlockIds) -> int | None:
         """How many blocks the request holds, read off the group a chunk cuts.
 
         A sliding-window group's list is clipped to its own window, so summing
         the groups describes no request. Chunk mode registers against exactly
-        one full-attention group, which is the one the token count describes.
+        one full-attention group, which is the one the token count describes;
+        an engine without one has no chunk range for this to size.
         """
         return next(
-            len(group)
-            for g, group in enumerate(block_ids)
-            if not isinstance(self._group_specs[g], SlidingWindowSpec)
+            (
+                len(group)
+                for g, group in enumerate(block_ids)
+                if not isinstance(self._group_specs[g], SlidingWindowSpec)
+            ),
+            None,
         )
+
+    def _window_granules(
+        self, blocks: list[int], valid_tokens: int, sw_ratio: int
+    ) -> list[tuple[int, int]]:
+        """(block, the granule in it) the request's window lands in.
+
+        A window is the last `sliding_window` tokens, so the group's last block
+        holds the newest one and the token count says where inside. It spans one
+        granule, or two when it straddles a boundary -- and the second of those
+        sits in the block before, so a list too short to reach it names one and
+        says nothing. What keeps the two ends agreeing is that every path here
+        equalises their lists from the tail and clips the group to
+        `cdiv(sliding_window, block_size) + 1` blocks, which is what a straddle
+        reaches back over.
+        """
+        sw = self.block_size // sw_ratio
+        newest = (valid_tokens - 1) // sw
+        oldest = max(0, valid_tokens - sw) // sw
+        # The group's list ends at the block holding the newest token, so a
+        # position in it is a logical block counted back from there.
+        last_block = newest // sw_ratio
+        return [
+            (block_id, granule % sw_ratio)
+            for i, block_id in enumerate(blocks)
+            for granule in range(oldest, newest + 1)
+            if granule // sw_ratio == last_block - (len(blocks) - 1 - i)
+        ]
 
     def _compute_desc_ids(
         self,
@@ -133,13 +164,16 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         num_whole_descs = self.num_regions * num_blocks
         # One number for the whole request, whichever list this call is for.
         tail = self._request_tail
-        needed = (
-            None
-            if tail is None or self._chunk_grid is None
-            else self._tail_chunks(
-                tail[1], tail[0], chunks_per_span=self._chunk_grid[1]
+        if tail is None or self._chunk_grid is None:
+            needed = None
+        else:
+            # A chunk range exists only where a full-attention group does, and
+            # that group is what `_prompt_blocks` counts.
+            prompt_blocks = tail[1]
+            assert prompt_blocks is not None
+            needed = self._tail_chunks(
+                prompt_blocks, tail[0], chunks_per_span=self._chunk_grid[1]
             )
-        )
         all_descs: list[np.ndarray] = []
         for g, group in enumerate(block_ids):
             if not group:
@@ -151,12 +185,21 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 return (region_ids * num_blocks + blocks_arr).flatten()
 
             if is_sw:
-                # Every granule of the block, which is the block itself. Which
-                # one or two the window sits in follows from the request's
-                # token count, not from the block ids this is handed.
-                ids = whole(group_arr)[:, None]
+                # Nothing having said how many tokens the request holds leaves
+                # nothing to say where its window is, so every granule goes --
+                # which is the block itself.
+                picked = (
+                    [(block, gran) for block in group for gran in range(sw_ratio)]
+                    if tail is None or tail[0] is None
+                    else self._window_granules(group, tail[0], sw_ratio)
+                )
+                ids = (
+                    region_ids * num_blocks
+                    + np.asarray([block for block, _ in picked])[None, :]
+                )
+                granules = np.asarray([gran for _, gran in picked], dtype=np.int64)
                 all_descs.append(
-                    (ids * sw_ratio + np.arange(sw_ratio) + num_whole_descs).ravel()
+                    (ids * sw_ratio + granules[None, :] + num_whole_descs).ravel()
                 )
                 continue
             if needed is None:
