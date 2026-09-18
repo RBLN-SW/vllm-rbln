@@ -14,8 +14,8 @@
 
 # RBLN's attention cache is K/V-first on the rbln_triton_ops kernels, where K
 # and V become two regions, and blocks-first on rbln_custom_ops, where they
-# share a block the descriptor path cannot cut in two; the MLA and Mamba caches
-# are upstream's own shapes and register either way. Upstream's own
+# share one and the descriptor path cuts the halves itself; the MLA and Mamba
+# caches are upstream's own shapes and register either way. Upstream's own
 # registration path builds the topology, so every test here constructs one
 # directly.
 
@@ -54,14 +54,14 @@ class TestRblnTransferTopology:
             make_vllm_config(additional_config={"use_custom_kernel": use_custom_kernel})
         )
 
-    def test_the_blocks_first_attention_cache_is_refused(self):
-        # K and V share a block there, so the descriptors have no second region
-        # to name; refusing here beats transferring halves of a block.
-        with (
-            self._kernel_config(False),
-            pytest.raises(NotImplementedError, match="interleaves inside each"),
-        ):
-            self._topology(RBLNFlashAttentionBackend)
+    def test_the_blocks_first_attention_cache_is_one_region(self):
+        # K and V share a block there, so there is no second region to name:
+        # the block registers whole and the descriptor path cuts the halves.
+        with self._kernel_config(False):
+            topo = self._topology(RBLNFlashAttentionBackend)
+            cache = torch.zeros(4, 2, 1, 1, 64, 8)
+
+        assert len(topo.get_transfer_cache_regions(cache, object())) == 1
 
     def test_the_kv_first_attention_cache_splits_k_from_v(self):
         # Upstream packs K and V into one region; this layout keeps them apart,
@@ -125,7 +125,9 @@ class TestRblnTransferTopology:
     def test_it_sets_what_upstream_s_post_init_sets(self):
         # __post_init__ is reimplemented rather than extended, so a field
         # upstream adds to it is simply absent here and nothing fails until
-        # the first handshake reads it.
+        # the first handshake reads it. State of our own on top is fine --
+        # `_kv_shares_a_block` is read where the config that decides it is no
+        # longer set -- so this is containment, not equality.
         class BlocksFirst:
             @staticmethod
             def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
@@ -145,7 +147,7 @@ class TestRblnTransferTopology:
 
         ours = self._topology(RBLNFlashAttnMLABackend, is_mla=True)
 
-        assert vars(ours).keys() == vars(theirs).keys()
+        assert vars(theirs).keys() <= vars(ours).keys()
 
     def test_only_a_mamba_state_asks_for_the_block_split(self):
         # The connector doubles its region count off this upstream property,

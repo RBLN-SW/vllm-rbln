@@ -63,6 +63,8 @@ class TestRblnNixlAgentMetadata:
         assert (m.kv_areas, m.kv_slices) == (1, 1)
         # The axis default is what the two counts above used to mean on their own.
         assert m.kv_split_axis is KVSplitAxis.HEAD
+        # Separate K and V regions is what every version through 4 registered.
+        assert m.kv_per_block == 1
 
     def test_roundtrip_preserves_pp_fields(self):
         # msgspec encode→decode with the RBLN type preserves PP descriptors.
@@ -111,6 +113,15 @@ class TestRblnNixlAgentMetadata:
             msgspec.msgpack.Encoder().encode(m)
         )
         assert back.registered_layer_names == names
+
+    def test_roundtrip_preserves_what_a_block_holds(self):
+        # A per-process setting, so a peer cannot recompute it from the rest of
+        # the blob -- two workers off one build can hold different layouts.
+        m = _make(kv_per_block=2)
+        back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            msgspec.msgpack.Encoder().encode(m)
+        )
+        assert back.kv_per_block == 2
 
     def test_roundtrip_preserves_the_split_axis(self):
         # The axis crosses the wire as an enum member, and it is the one field a

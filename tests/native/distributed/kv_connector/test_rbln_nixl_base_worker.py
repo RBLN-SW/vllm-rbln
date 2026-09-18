@@ -19,13 +19,14 @@
 import collections
 import sys
 import types
+from collections import defaultdict
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, SchedulerConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
 from vllm.v1.kv_cache_interface import (
@@ -38,12 +39,29 @@ from vllm.v1.kv_cache_interface import (
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker as wm
 import vllm_rbln.envs as envs
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
+    RblnNixlWorkerBase,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
+
+
+def _merged_uniform_spec(inner):
+    """One group of same-type-but-not-identical layers, which is what
+    `get_kv_cache_groups` merges an MLA model with a sparse indexer into."""
+    return UniformTypeKVCacheSpecs(
+        block_size=inner.block_size, kv_cache_specs={"layer.0": inner}
+    )
+
+
+def _full_attention_spec(block_size=64):
+    return FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
 
 
 def _sliding_window_spec(*, block_size, sliding_window):
@@ -64,6 +82,8 @@ def _build_worker(
     swa_view_opt=False,
     use_mla=False,
     stripe_width=None,
+    pp_size=1,
+    hma_disabled=False,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -72,6 +92,13 @@ def _build_worker(
     monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_SWA_VIEW_OPT", swa_view_opt)
 
     def fake_super_init(self, vllm_config, engine_id, kv_cache_config):
+        # Upstream reads `disable_hybrid_kv_cache_manager` once in its own
+        # __init__, for its PP refusal and for `_is_hma_required`. Record what
+        # it was shown rather than restating its condition here, and leave
+        # `_is_hma_required` unset so only the override can produce it.
+        self.hma_flag_seen_by_upstream_init = (
+            vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        )
         self.vllm_config = vllm_config
         self.engine_id = engine_id
         self.kv_cache_config = kv_cache_config
@@ -100,15 +127,107 @@ def _build_worker(
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # No speculative decoding: the compat hash then folds what it always did.
     vllm_config.speculative_config = None
-    # _check_pp_constraints compares pipeline_parallel_size <= 1; give it a real
-    # int (a MagicMock would raise TypeError). 1 == the non-PP default here.
-    vllm_config.parallel_config.pipeline_parallel_size = 1
+    # _check_pp_constraints compares pipeline_parallel_size <= 1; a MagicMock
+    # would raise TypeError there, so give it a real int.
+    vllm_config.parallel_config.pipeline_parallel_size = pp_size
+    # Real, so that renaming the flag the override suppresses fails here rather
+    # than being absorbed. `VllmConfig.__post_init__` resolves it before a
+    # worker is built, so a bool is what production sees.
+    vllm_config.scheduler_config = SchedulerConfig(
+        is_encoder_decoder=False, max_model_len=128
+    )
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     kv_cache_config.kv_cache_groups = [
         MagicMock(kv_cache_spec=spec) for spec in (specs or [])
     ]
     return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+
+
+class TestHmaRefusalSuppression:
+    """The override suppresses the hybrid-KV-manager flag across
+    `super().__init__()` for one merged group of full attention specs, and
+    puts it back. These build that layout and the ones it must leave alone.
+    """
+
+    @staticmethod
+    def _pp_worker(monkeypatch, specs, **kwargs):
+        return _build_worker(monkeypatch, specs=specs, pp_size=4, **kwargs)
+
+    def test_the_flag_is_off_while_upstream_looks_at_it(self, monkeypatch):
+        # The refusal reads the flag inside `super().__init__()`, so that call
+        # is the only point where the suppression is observable at all.
+        specs = [_merged_uniform_spec(_full_attention_spec())]
+        worker = self._pp_worker(monkeypatch, specs)
+
+        assert worker.hma_flag_seen_by_upstream_init is True
+
+    def test_the_suppression_is_undone(self, monkeypatch):
+        # Both halves matter. `_is_hma_required` still gates the block-size
+        # and permute guards downstream, and the config object is shared, so a
+        # flag left flipped would outlive this constructor.
+        specs = [_merged_uniform_spec(_full_attention_spec())]
+        worker = self._pp_worker(monkeypatch, specs)
+
+        assert worker._is_hma_required is True
+        scheduler_config = worker.vllm_config.scheduler_config
+        assert scheduler_config.disable_hybrid_kv_cache_manager is False
+
+    def test_hma_switched_off_by_the_operator_stays_off(self, monkeypatch):
+        # The suppression is the manager's own flag, so for someone who turned
+        # the manager off there is nothing to suppress and nothing to require.
+        specs = [_merged_uniform_spec(_full_attention_spec())]
+        worker = self._pp_worker(monkeypatch, specs, hma_disabled=True)
+
+        assert worker.hma_flag_seen_by_upstream_init is True
+        assert worker._is_hma_required is False
+
+    @pytest.mark.parametrize("hma_disabled", [False, True])
+    @pytest.mark.parametrize(
+        "specs",
+        [
+            pytest.param(
+                [
+                    _merged_uniform_spec(
+                        MambaSpec(
+                            block_size=64, shapes=((1, 1),), dtypes=(torch.float16,)
+                        )
+                    )
+                ],
+                id="merged-mamba",
+            ),
+            pytest.param(
+                [
+                    _merged_uniform_spec(
+                        SlidingWindowSpec(
+                            block_size=64,
+                            num_kv_heads=1,
+                            head_size=64,
+                            dtype=torch.float16,
+                            sliding_window=128,
+                        )
+                    )
+                ],
+                id="merged-swa",
+            ),
+            pytest.param([_full_attention_spec()], id="unmerged"),
+            pytest.param(
+                [_merged_uniform_spec(_full_attention_spec())] * 2, id="two-groups"
+            ),
+        ],
+    )
+    def test_a_layout_upstream_judges_right_is_left_alone(
+        self, monkeypatch, specs, hma_disabled
+    ):
+        # Every later net -- upstream's `_has_mamba`, our `_has_swa` and
+        # `_check_pp_constraints` -- reads the group spec, not what a merged
+        # group wraps, so a merged Mamba or SWA group suppressed here would
+        # reach the PP region slicing with nothing left to refuse it.
+        worker = self._pp_worker(monkeypatch, specs, hma_disabled=hma_disabled)
+
+        assert worker.hma_flag_seen_by_upstream_init is hma_disabled
+        assert not hasattr(worker, "_is_hma_required")
 
 
 class TestBackendSelection:
@@ -593,6 +712,28 @@ def _impl_xfer_result(
     return xfer
 
 
+def _packed_kv(num_blocks):
+    # The other layout: K and V share a block, so a layer registers one region
+    # whose span is the whole page rather than half of it.
+    def _packed(cache, spec):
+        region = MagicMock()
+        region.shape = (num_blocks, spec.page_size_bytes)
+        region.numel.return_value = num_blocks * spec.page_size_bytes
+        region.element_size.return_value = 1
+        region.data_ptr.return_value = cache.data_ptr()
+        return [region]
+
+    return _packed
+
+
+def _three_regions(num_blocks):
+    # Neither layout: `2 // 3` is 0, which the descriptor arithmetic divides by.
+    def _three(cache, spec):
+        return [MagicMock() for _ in range(3)]
+
+    return _three
+
+
 def _fake_nixl_rbln(xfer_result):
     module: Any = types.ModuleType("nixl_rbln")
     module.register_kv_regions = MagicMock(return_value=xfer_result)
@@ -603,6 +744,90 @@ def _fake_nixl_rbln(xfer_result):
 class TestRegisterKvCachesImpl:
     # The deferred D2D body: hands the logical K/V regions to
     # nixl_rbln.register_kv_regions and absorbs the returned transfer tables.
+    def test_one_region_per_layer_means_the_block_holds_both(self, monkeypatch):
+        # How many of K and V a block holds is read off what the layout handed
+        # back, not from the config that chose it -- the descriptor path is then
+        # right about the bytes that actually registered. Two regions per layer
+        # is the split layout and leaves it at one.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec()
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = _packed_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(
+                sys.modules,
+                {
+                    "nixl_rbln": _fake_nixl_rbln(
+                        _impl_xfer_result(
+                            base_addrs=(0x20000, 0x30000), block_lens=(512, 512)
+                        )
+                    )
+                },
+            ),
+            patch.object(wm, "rebel"),
+            patch.object(
+                worker,
+                "register_local_xfer_handler",
+                return_value=("local-handle", [(0x0, 0, 0)]),
+            ),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert worker._kv_per_block == 2
+
+    @pytest.mark.parametrize(
+        "regions_per_layer, message",
+        [
+            pytest.param(
+                [_packed_kv, _packed_kv, _split_kv],
+                "disagree on whether K and V share a block",
+                id="layers_disagree",
+            ),
+            pytest.param(
+                [_three_regions],
+                "registers K and V as one region or as two",
+                id="neither_one_nor_two",
+            ),
+        ],
+    )
+    def test_a_layer_count_the_descriptor_path_cannot_encode_is_refused(
+        self, monkeypatch, regions_per_layer, message
+    ):
+        # `2 // len(cache_list)` is the whole derivation, and it is model-wide:
+        # three regions make it 0 and surface as a division much later, and a
+        # layer that disagrees with its neighbours is silently the last one.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec()
+        worker._layer_specs = {f"l{i}": spec for i in range(len(regions_per_layer))}
+        kv_caches = _impl_kv_caches(
+            num_blocks=worker.num_blocks, names=list(worker._layer_specs)
+        )
+
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = [
+            build(worker.num_blocks)(kv_caches[name], spec)
+            for build, name in zip(regions_per_layer, kv_caches, strict=True)
+        ]
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            pytest.raises(AssertionError, match=message),
+        ):
+            worker._register_kv_caches_impl(kv_caches)
+
     @pytest.mark.parametrize("stripe_width", [None, 0, 1])
     def test_registers_with_vram_segment_and_captures_xfer_tables(
         self, monkeypatch, stripe_width
@@ -1539,3 +1764,264 @@ class TestComputeDescIds:
         worker._group_specs = [MagicMock()]
         out = worker._compute_desc_ids([[]], 4, None, 1)
         assert out.size == 0
+
+
+# What each layout puts in one block.
+PACKED = 2  # rbln_custom_ops: (num_blocks, 2, H, 1, S, D)
+SPLIT = 1  # rbln_triton_ops: (2, num_blocks, H, 1, S, D)
+
+
+class TestKvRuns:
+    """`_kv_runs`: how many ranges one piece of a block breaks into."""
+
+    @pytest.mark.parametrize(
+        "cuts_l, cuts_r",
+        [
+            pytest.param(4, 8, id="peer_cuts_finer"),
+            pytest.param(8, 4, id="we_cut_finer"),
+        ],
+    )
+    def test_a_packed_block_breaks_in_two_when_the_cuts_differ(self, cuts_l, cuts_r):
+        # One side reads a head band out of the other's block, and under a packed
+        # block that band sits once in K and once in V.
+        assert RblnNixlWorkerBase._kv_runs(PACKED, cuts_l, cuts_r) == 2
+
+    def test_a_packed_block_stays_one_range_at_equal_cuts(self):
+        # Both sides name whole blocks, and K and V are adjacent inside one.
+        assert RblnNixlWorkerBase._kv_runs(PACKED, 8, 8) == 1
+
+    @pytest.mark.parametrize(
+        "cuts_l, cuts_r",
+        [
+            pytest.param(4, 8, id="peer_cuts_finer"),
+            pytest.param(8, 4, id="we_cut_finer"),
+            pytest.param(8, 8, id="equal"),
+        ],
+    )
+    def test_separate_regions_never_break(self, cuts_l, cuts_r):
+        # A region is K or V alone, so a head band is contiguous however the two
+        # sides cut heads. This is the arithmetic the connector shipped with.
+        assert RblnNixlWorkerBase._kv_runs(SPLIT, cuts_l, cuts_r) == 1
+
+
+class TestTheLayoutReachesTheDescriptors:
+    """`_kv_per_block` is worker state; these pin what reads it."""
+
+    @staticmethod
+    def _worker(kv_per_block, *, kv_slices=1, tp_size=1):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.use_host_buffer = False
+        w._sw_ratio = None
+        w._kv_areas = 1
+        w._kv_slices = kv_slices
+        w._kv_per_block = kv_per_block
+        topo = MagicMock()
+        topo.tp_size = tp_size
+        topo.tp_ratio.return_value = 2
+        w.transfer_topo = topo
+        return w
+
+    @pytest.mark.parametrize(
+        "kv_per_block, expected",
+        [pytest.param(SPLIT, 1, id="separate"), pytest.param(PACKED, 2, id="packed")],
+    )
+    def test_a_peer_of_a_different_width_takes_the_layout_s_kv_count(
+        self, kv_per_block, expected
+    ):
+        w = self._worker(kv_per_block)
+        meta = MagicMock()
+        meta.kv_slices = 2
+        assert w._peer_kv_runs(meta, remote_tp_size=1) == expected
+
+    def test_a_peer_of_our_own_width_never_splits(self):
+        # Both sides name whole blocks, so the layout does not matter.
+        w = self._worker(PACKED)
+        meta = MagicMock()
+        meta.kv_slices = 1
+        assert w._peer_kv_runs(meta, remote_tp_size=1) == 1
+
+    def test_a_split_alone_keeps_the_handler_off_upstream_s_fast_path(self):
+        # `register_local_xfer_handler` hands a whole-engine peer to upstream's
+        # one handle. A packed block is not that peer even when nothing else
+        # narrowed: upstream names a block once and our list names it per range.
+        w = self._worker(PACKED)
+        w.local_seen_layer_names = ["layer.0"]
+
+        with patch.object(
+            RblnNixlPullConnectorWorker, "_register_shard_local_xfer_handler"
+        ) as shard:
+            w.register_local_xfer_handler(16, kv_runs=2)
+
+        assert shard.call_args.kwargs["kv_runs"] == 2
+
+    def test_host_staging_never_splits(self):
+        # Host staging registers whole logical buffers and is kept off every
+        # head-matched path, so it reads a block as one range.
+        w = self._worker(PACKED)
+        w.use_host_buffer = True
+        meta = MagicMock()
+        meta.kv_slices = 2
+        assert w._peer_kv_runs(meta, remote_tp_size=1) == 1
+
+
+class TestASlidingWindowInsideAPackedBlock:
+    """The SWA view is a byte prefix, so a packed block needs one per K/V.
+
+    One prefix over the whole block would run twice as far into K and never
+    reach V. Refusing the pair instead is not open to us: gpt-oss is a
+    sliding-window model and the packed layout is what its kernels read.
+    """
+
+    BLOCK_LEN = 256
+    NUM_BLOCKS = 2
+    SW_RATIO = 2
+    BASES = [0x1000, 0x2000]
+
+    def _worker(self, kv_per_block):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._sw_ratio = self.SW_RATIO
+        w._has_mamba = False
+        w._kv_per_block = kv_per_block
+        w.engine_id = "local"
+        w.tp_rank = 0
+        w.device_id = 0
+        w.block_size = 64
+        w.num_blocks = self.NUM_BLOCKS
+        w.kv_caches_base_addr = {"local": {0: self.BASES}}
+        w.block_len_per_layer = [self.BLOCK_LEN] * len(self.BASES)
+        w.nixl_memory_type = "DRAM"
+        w.nixl_wrapper = MagicMock()
+        w.get_backend_aware_kv_block_len = lambda **_: self.BLOCK_LEN
+        return w
+
+    def _descs(self, kv_per_block):
+        w = self._worker(kv_per_block)
+        w.register_local_xfer_handler(w.block_size)
+        return w.nixl_wrapper.get_xfer_descs.call_args[0][0]
+
+    def test_a_window_is_taken_inside_k_and_inside_v(self):
+        half = self.BLOCK_LEN // 2
+        covered = {
+            (addr - base) % self.BLOCK_LEN // half
+            for addr, _, _ in self._descs(PACKED)
+            for base in self.BASES
+            if base <= addr < base + self.BLOCK_LEN * self.NUM_BLOCKS
+        }
+        assert covered == {0, 1}
+
+    def test_no_descriptor_reaches_out_of_the_half_it_starts_in(self):
+        half = self.BLOCK_LEN // 2
+        for addr, length, _ in self._descs(PACKED):
+            within = (addr - self.BASES[0]) % self.BLOCK_LEN % half
+            assert within + length <= half
+
+    def test_separate_regions_keep_the_shipped_lengths(self):
+        # The layout the connector shipped with: one descriptor per block per
+        # pass, Full-length then trimmed. A byte of this changing is a
+        # regression, not a layout difference.
+        descs = self._descs(SPLIT)
+        assert len(descs) == 2 * len(self.BASES) * self.NUM_BLOCKS
+        assert descs[0][1] == self.BLOCK_LEN
+        assert descs[-1][1] == self.BLOCK_LEN // self.SW_RATIO
+
+    def test_a_packed_block_doubles_the_descriptors_of_both_passes(self):
+        # Both passes carry the same count so `_compute_desc_ids` can space a
+        # block's ids by one number.
+        assert len(self._descs(PACKED)) == 2 * len(self._descs(SPLIT))
+
+
+class TestASlidingWindowOnThePeerSide(TestASlidingWindowInsideAPackedBlock):
+    """The peer's list has to break the same way, or the two pair off by one.
+
+    Inherits the geometry so both sides are read at one set of numbers; the
+    local class builds our list and this one the peer's.
+    """
+
+    PEER_BASES = [0x9000, 0xA000]
+
+    def _descs(self, kv_per_block):
+        w = self._worker(kv_per_block)
+        w._has_swa = True
+        w._remote_agents = {}
+        w.dst_num_blocks = {}
+        w.dst_xfer_side_handles = defaultdict(dict)
+        w.kv_caches_base_addr = defaultdict(dict)
+        topo = MagicMock()
+        topo.block_size_ratio.return_value = 1
+        topo.tp_ratio.return_value = 1
+        topo.is_kv_replicated.return_value = True
+        w.transfer_topo = topo
+
+        meta = MagicMock()
+        meta.engine_id = "peer"
+        meta.block_size = w.block_size
+        meta.num_blocks = self.NUM_BLOCKS
+        meta.kv_caches_base_addr = self.PEER_BASES
+        meta.block_lens = [self.BLOCK_LEN] * len(self.PEER_BASES)
+        meta.device_id = 1
+
+        with (
+            patch.object(
+                RblnNixlPullConnectorWorker, "_register_remote_engine_prelude"
+            ),
+            patch.object(
+                RblnNixlPullConnectorWorker, "_validate_remote_agent_handshake"
+            ),
+        ):
+            w.add_remote_agent(meta)
+        return w.nixl_wrapper.get_xfer_descs.call_args[0][0]
+
+    def test_a_window_is_taken_inside_k_and_inside_v(self):
+        half = self.BLOCK_LEN // 2
+        covered = {
+            (addr - self.PEER_BASES[0]) % self.BLOCK_LEN // half
+            for addr, _, _ in self._descs(PACKED)
+            if self.PEER_BASES[0] <= addr < self.PEER_BASES[1]
+        }
+        assert covered == {0, 1}
+
+    def test_no_descriptor_reaches_out_of_the_half_it_starts_in(self):
+        half = self.BLOCK_LEN // 2
+        for addr, length, _ in self._descs(PACKED):
+            within = (addr - self.PEER_BASES[0]) % self.BLOCK_LEN % half
+            assert within + length <= half
+
+    def test_separate_regions_keep_the_shipped_lengths(self):
+        descs = self._descs(SPLIT)
+        assert len(descs) == 2 * len(self.PEER_BASES) * self.NUM_BLOCKS
+        assert descs[0][1] == self.BLOCK_LEN
+        assert descs[-1][1] == self.BLOCK_LEN // self.SW_RATIO
+
+
+class TestDescIdsSpaceABlockByItsKvCount:
+    """`_compute_desc_ids` indexes the lists the class above builds."""
+
+    @staticmethod
+    def _worker(kv_per_block, spec):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._sw_ratio = 2
+        w._kv_per_block = kv_per_block
+        w.num_regions = 2
+        w._group_specs = [spec]
+        return w
+
+    def _ids(self, kv_per_block, spec):
+        return self._worker(kv_per_block, spec)._compute_desc_ids(
+            [[1]],
+            dst_num_blocks=4,
+            block_size_ratio=None,
+            physical_blocks_per_logical=1,
+        )
+
+    def test_a_packed_block_names_both_of_its_halves(self):
+        full = MagicMock()
+        ids = self._ids(PACKED, full)
+        # Region 0 block 1 -> ids 2,3; region 1 block 1 -> ids 10,11.
+        assert sorted(ids) == [2, 3, 10, 11]
+
+    def test_the_sliding_window_range_starts_past_every_full_desc(self):
+        sw = MagicMock(spec=SlidingWindowSpec)
+        packed = min(self._ids(PACKED, sw))
+        # num_regions(2) * num_blocks(4) * kv(2) full descs come first.
+        assert packed == 16 + 2
+        assert min(self._ids(SPLIT, sw)) == 8 + 1

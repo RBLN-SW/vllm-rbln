@@ -217,6 +217,12 @@ def _make_worker(
     w.enforce_compat_hash = True
     w._sw_ratio = sw_ratio
     w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
+    # The chiplet geometry `RblnNixlWorkerBase.__init__` starts from: one area,
+    # one slice, and K and V in separate regions. A test that wants another
+    # shape sets it, or stubs the helper that reads it.
+    w._kv_areas = 1
+    w._kv_slices = 1
+    w._kv_per_block = 1
     w._remote_shard_layer_names = defaultdict(dict)
     w._remote_pp_size = {}
     w._overlapping_ranks = defaultdict(list)
@@ -361,6 +367,22 @@ class TestUpstreamReachesTheHandshake:
         w.add_remote_agent.assert_not_called()
         w._register_shard_xfer_state.assert_not_called()
         assert w._overlapping_ranks == {"eng": []}
+
+    def test_a_packed_block_alone_keeps_the_transfer_off_the_upstream_handle(self):
+        # Cutting heads finer than the peer leaves the head split at 1, so with
+        # one stage and full overlap nothing else narrows -- but a packed block
+        # still makes us name it twice where upstream's handle names it once.
+        # Delegating there pairs two lists of different lengths.
+        w = _make_worker(host_buffer=False, tp_ratio=2)
+        w.transfer_topo.tp_size = 4
+        w._kv_per_block = 2
+        # Unequal TP registers the agent by head band; that path has its own
+        # tests, and what this one is about happens after it.
+        w._add_remote_agent_head_matched = MagicMock(return_value="agent-0")
+
+        _handshake(w, _FakeSock(pp_size=1))
+
+        assert w._register_shard_xfer_state.call_args.kwargs["kv_runs"] == 2
 
 
 class TestPpHandshakeFanout:
@@ -725,6 +747,7 @@ class TestPeerRegionView:
         ] * cls.RPL
         w._region_is_mla = [False] * w.num_regions
         w._kv_areas = 1
+        w._kv_per_block = 1
         w.device_id = 0
         w.transfer_topo = MagicMock()
         w.transfer_topo.virtually_split_kv_in_blocks = False
@@ -940,6 +963,37 @@ class TestShardLocalRegions:
         # regions used are exactly the shard's (no addr below 4000).
         assert blocks[:, 0].min() == 4000
 
+    def test_a_packed_block_is_named_once_in_k_and_once_in_v(self):
+        # `kv_runs=2` is the packed layout read by a peer that cuts heads
+        # differently: the head piece sits once in each half, so a block hands
+        # back two descriptors `kv_stride` apart rather than one whole one.
+        w = self._wired_worker()
+
+        _, blocks = w._register_shard_local_xfer_handler(16, ("l2", "l3"), kv_runs=2)
+
+        assert blocks.shape == (32, 3)
+        # Region 4 block 0: K at the base, V half a block in, each half as long.
+        assert blocks[0].tolist() == [4000, 32, 0]
+        assert blocks[1].tolist() == [4000 + 32, 32, 0]
+        # Block 1 steps by the whole block, not by the half.
+        assert blocks[2].tolist() == [4000 + 64, 32, 0]
+
+    def test_a_packed_block_spaces_the_desc_ids_it_records(self):
+        # `_shard_descs_per_block` is what `_get_block_descs_ids_for_shard`
+        # rides; naming a block twice locally while indexing it once would pair
+        # the two lists off by one from the first split block onward.
+        w = self._wired_worker()
+        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.src_xfer_handles_by_remote = {}
+        w._shard_region_group_ids = {}
+
+        w._register_shard_xfer_state("eng", 2, 16, ("l2", "l3"), kv_runs=2)
+
+        assert w._shard_descs_per_block[("eng", 2)] == 2
+        ids = w._get_block_descs_ids_for_shard("eng", 2, num_blocks=4, block_ids=[[1]])
+        # Region 0 block 1 -> ids 2,3; region 1 block 1 -> 10,11; and so on.
+        assert ids[:4].tolist() == [2, 3, 10, 11]
+
     def test_register_local_xfer_handler_routes_to_the_shard_path(self):
         # Dispatch to the shard path: no SWA view opt, layer names present. Miss
         # it and a stage registers the whole model's regions, so the descriptor
@@ -960,6 +1014,7 @@ class TestShardLocalRegions:
             split=1,
             region_ids=None,
             replica_fanout=1,
+            kv_runs=1,
         )
 
     def test_a_borrowed_handle_is_recorded_as_borrowed(self):
@@ -1087,6 +1142,7 @@ class TestValidateRemoteAgentHandshake:
         w.vllm_config.speculative_config = None
         w._kv_areas = 1
         w._kv_slices = 1
+        w._kv_per_block = 1
         w._kv_split_axis = KVSplitAxis.HEAD
         w._sw_ratio = None
         w._has_swa = False
@@ -1350,13 +1406,24 @@ class TestHeadBandMatching:
     """
 
     @staticmethod
-    def _worker(*, tp_rank, tp_size, areas, slices, n_logical, block_len, kv_heads=8):
+    def _worker(
+        *,
+        tp_rank,
+        tp_size,
+        areas,
+        slices,
+        n_logical,
+        block_len,
+        kv_heads=8,
+        kv_per_block=1,
+    ):
         # `block_len` and `kv_heads` take a list to give each logical region its
         # own geometry; a scalar applies to every region.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.tp_rank = tp_rank
         w._kv_areas = areas
         w._kv_slices = slices
+        w._kv_per_block = kv_per_block
         block_lens = (
             list(block_len) if isinstance(block_len, list) else [block_len] * n_logical
         )
@@ -1452,6 +1519,56 @@ class TestHeadBandMatching:
             (1256, 256),
             (1768, 256),  # area3 (replica of h1) -> same
         ]
+
+    def test_a_packed_peer_names_each_block_in_k_and_in_v(self):
+        # Same pairing as test_offset_into_coarser_remote_area, with the peer's
+        # block holding K and V together: every descriptor above becomes two,
+        # a half-block apart, and the head offset is read inside a half.
+        w = self._worker(
+            tp_rank=0,
+            tp_size=4,
+            areas=4,
+            slices=2,
+            n_logical=1,
+            block_len=256,
+            kv_per_block=2,
+        )
+        meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
+
+        out = w._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
+
+        # K at the area's base, V 256B in; head 1 sits 128B inside each half.
+        assert [(a, ln) for a, ln, _ in out[:4]] == [
+            (1000, 128),
+            (1256, 128),
+            (1512, 128),
+            (1768, 128),
+        ]
+        assert len(out) == 16
+
+    def test_a_packed_block_is_named_once_in_k_and_once_in_v(self):
+        # The count is the wiring: `_head_matched_desc` takes how many ranges a
+        # block breaks into, and only this builder derives it. Testing that
+        # method directly leaves the derivation and the hand-off unpinned, and
+        # a peer then reads a whole packed block where it wanted K.
+        split = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
+        packed = self._worker(
+            tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
+        )
+        packed._kv_per_block = 2
+
+        one = split._build_head_matched_remote(meta, remote_tp_rank=0, remote_tp_size=1)
+        two = packed._build_head_matched_remote(
+            meta, remote_tp_rank=0, remote_tp_size=1
+        )
+
+        # Unequal cuts, so a packed block is read once inside K and once inside
+        # V where a split one is read whole.
+        assert len(two) == len(one) * 2
+        assert {ln for _, ln, _ in two} == {128}
 
     def test_area_index_permutation_zero_offset(self):
         """P TP2 -> D TP4: head widths match so the offset is 0, but local area
@@ -1743,6 +1860,7 @@ class TestFanInAreaPartition:
         w.tp_rank = tp_rank
         w._kv_areas = areas
         w._kv_slices = slices
+        w._kv_per_block = 1
         w.use_host_buffer = host_buffer
         topo = MagicMock()
         topo.tp_size = tp_size
@@ -1829,6 +1947,7 @@ class TestShardRegionAreaFilter:
     def _worker(*, areas, n_layers):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_areas = areas
+        w._kv_per_block = 1
         # One K and one V region per layer, each expanded over `areas`.
         w.num_regions = n_layers * 2 * areas
         w.local_seen_layer_names = [f"l{i}" for i in range(n_layers)]
@@ -1884,6 +2003,8 @@ class TestD2DRegionPairing:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.use_host_buffer = host_buffer
         w.block_len_per_layer = [64] * n_local
+        # Same layout on both ends; the layout mismatch has its own test.
+        w._kv_per_block = 1
         # The check compares regions PER LAYER, so it needs both figures.
         w.num_regions = n_local
         w.local_seen_layer_names = [f"layer.{i}" for i in range(n_layers)]
@@ -2046,6 +2167,7 @@ class TestPublishHandshakeMetadata:
         areas=1,
         slices=1,
         axis=KVSplitAxis.HEAD,
+        kv_per_block=1,
         cls=None,
     ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
@@ -2068,6 +2190,7 @@ class TestPublishHandshakeMetadata:
         # permanent values (one logical region, never expanded per area).
         w._kv_areas = areas
         w._kv_slices = slices
+        w._kv_per_block = kv_per_block
         w._kv_split_axis = axis
         pp_group = MagicMock()
         pp_group.rank_in_group = pp_rank
@@ -2103,6 +2226,16 @@ class TestPublishHandshakeMetadata:
             w.xfer_handshake_metadata.agent_metadata_bytes
         )
         assert decoded.kv_split_axis is KVSplitAxis.NON_HEAD
+
+    def test_advertises_how_many_of_k_and_v_a_block_holds(self):
+        # A consumer cannot derive it either: it is a per-process setting, so two
+        # workers off one build can hold different layouts and every other number
+        # in this blob reads the same under both.
+        w = self._publish(pp_rank=0, pp_size=1, layer_names=["l0"], kv_per_block=2)
+        decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            w.xfer_handshake_metadata.agent_metadata_bytes
+        )
+        assert decoded.kv_per_block == 2
 
     def test_advertises_chiplet_geometry(self):
         """Head-band matching on the consumer needs the producer's areas/slices;
@@ -2572,3 +2705,221 @@ class TestSplitAxisConstraints:
         w = self._worker(axis=KVSplitAxis.HEAD, tp_ratio=2, host_buffer=True)
         meta = _agent_meta(kv_split_axis=KVSplitAxis.NON_HEAD)
         w._check_split_axis_constraints(meta, 1)  # no raise
+
+
+# What each layout puts in one block.
+PACKED = 2  # rbln_custom_ops: (num_blocks, 2, H, 1, S, D)
+SPLIT = 1  # rbln_triton_ops: (2, num_blocks, H, 1, S, D)
+
+
+class TestDescriptorsNameTheRightElement:
+    """What a remote descriptor actually points at, not where it points.
+
+    A descriptor test that asserts addresses passes whatever those addresses
+    mean, which is how a head band came to name the wrong half. These decode
+    each address back into `(K-or-V, head)` and compare it against the head the
+    pairing asked for.
+    """
+
+    # One region, one area. The peer holds 4 heads per slice where we hold 2, so
+    # our band starts 2 heads into its block -- the case where the offset is not
+    # zero and the layout decides what it lands on.
+    PEER_PAGE = 512
+    LOCAL_PAGE = 256
+    PEER_HEADS = 4
+    PEER_BASE = 1000
+    NUM_BLOCKS = 2
+    WANTED_HEAD = 2
+
+    @staticmethod
+    def _worker(local_page):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.block_len_per_layer = [local_page]
+        w.get_backend_aware_kv_block_len = lambda layer_idx, **_: local_page
+        return w
+
+    def _descs(self, kv_runs):
+        return self._worker(self.LOCAL_PAGE)._head_matched_desc(
+            region_id=0,
+            logical_r=0,
+            area_l=0,
+            geom=(self.WANTED_HEAD, 2, 1),
+            peer=(0, self.PEER_HEADS, 1, 2),
+            areas_r=2,
+            remote_bases=[self.PEER_BASE, 2000],
+            remote_lens=[self.PEER_PAGE, self.PEER_PAGE],
+            device_id=0,
+            num_blocks=self.NUM_BLOCKS,
+            split=1,
+            kv_runs=kv_runs,
+        )
+
+    def _decode(self, addr, kv_runs):
+        """(block, K-or-V, head) for an address inside the peer's region."""
+        off = addr - self.PEER_BASE
+        block, within_block = divmod(off, self.PEER_PAGE)
+        kv_stride = self.PEER_PAGE // kv_runs
+        kv, within_kv = divmod(within_block, kv_stride)
+        return block, kv, within_kv // (kv_stride // self.PEER_HEADS)
+
+    def test_a_packed_block_is_read_at_the_head_the_pairing_asked_for(self):
+        descs = self._descs(kv_runs=2)
+        # Two blocks, each named once in K and once in V, all at our head.
+        assert [self._decode(a, 2) for a, _, _ in descs] == [
+            (0, 0, self.WANTED_HEAD),
+            (0, 1, self.WANTED_HEAD),
+            (1, 0, self.WANTED_HEAD),
+            (1, 1, self.WANTED_HEAD),
+        ]
+
+    def test_a_packed_block_read_as_one_range_names_the_wrong_element(self):
+        # The arithmetic the connector shipped with, against a packed peer: one
+        # descriptor per block, and the offset that used to mean "head 2" now
+        # lands in V at head 0. This is the silent corruption the split avoids.
+        wrong = [self._decode(a, 2) for a, _, _ in self._descs(kv_runs=1)]
+        assert wrong == [(0, 1, 0), (1, 1, 0)]
+        assert all(head != self.WANTED_HEAD for _, _, head in wrong)
+
+    @pytest.mark.parametrize("kv_runs", [1, 2])
+    def test_no_descriptor_runs_off_the_end_of_its_half(self, kv_runs):
+        kv_stride = self.PEER_PAGE // kv_runs
+        for addr, length, _ in self._descs(kv_runs):
+            within_kv = (addr - self.PEER_BASE) % self.PEER_PAGE % kv_stride
+            assert within_kv + length <= kv_stride
+
+    def test_a_peer_block_that_does_not_halve_is_refused(self):
+        # The length comes off the wire, so it is the peer's claim rather than
+        # ours; halving it silently would move a byte short of every V.
+        w = self._worker(self.LOCAL_PAGE)
+        with pytest.raises(RuntimeError, match="range"):
+            w._head_matched_desc(
+                region_id=0,
+                logical_r=0,
+                area_l=0,
+                geom=(self.WANTED_HEAD, 2, 1),
+                peer=(0, self.PEER_HEADS, 1, 2),
+                areas_r=2,
+                remote_bases=[self.PEER_BASE, 2000],
+                remote_lens=[self.PEER_PAGE + 1, self.PEER_PAGE],
+                device_id=0,
+                num_blocks=1,
+                split=1,
+                kv_runs=2,
+            )
+
+    def test_the_two_halves_are_a_stride_apart(self):
+        addrs = [a for a, _, _ in self._descs(kv_runs=2)]
+        kv_stride = self.PEER_PAGE // 2
+        # K and V of the same block sit `kv_stride` apart, K first.
+        assert addrs[1] - addrs[0] == kv_stride
+        assert addrs[3] - addrs[2] == kv_stride
+
+
+class TestTwoLayoutsNeverPair:
+    """One process picks the layout, so the version cannot tell peers apart.
+
+    `use_custom_kernel` is a per-process setting: two workers off the same build
+    can register different numbers of regions. The layout therefore travels in
+    the handshake and is checked like any other geometry.
+    """
+
+    @staticmethod
+    def _worker(kv_per_block):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.use_host_buffer = False
+        w._has_swa = False
+        w._kv_per_block = kv_per_block
+        w.block_len_per_layer = [64]
+        w.num_regions = 1
+        w.local_seen_layer_names = ["layer.0"]
+        topo = MagicMock()
+        topo.tp_ratio.return_value = 1
+        w.transfer_topo = topo
+        return w
+
+    @staticmethod
+    def _meta(kv_per_block):
+        meta = MagicMock()
+        meta.kv_per_block = kv_per_block
+        meta.kv_caches_base_addr = [1000]
+        meta.registered_layer_names = ["layer.0"]
+        return meta
+
+    @pytest.mark.parametrize(
+        "ours, theirs",
+        [
+            pytest.param(SPLIT, PACKED, id="we_split_they_pack"),
+            pytest.param(PACKED, SPLIT, id="we_pack_they_split"),
+        ],
+    )
+    def test_a_peer_on_the_other_layout_is_refused(self, ours, theirs):
+        with pytest.raises(RuntimeError, match="use_custom_kernel"):
+            self._worker(ours)._check_d2d_region_pairing(
+                self._meta(theirs), remote_tp_size=1
+            )
+
+    @pytest.mark.parametrize("kv_per_block", [SPLIT, PACKED])
+    def test_a_peer_on_our_layout_pairs(self, kv_per_block):
+        self._worker(kv_per_block)._check_d2d_region_pairing(
+            self._meta(kv_per_block), remote_tp_size=1
+        )
+
+
+class TestAPackedBlockNeedsAnEqualPeerBlockSize:
+    """The equal-TP peer hands its descriptors to upstream unchanged, and
+    upstream cuts a block into `block_size_ratio` equal pieces to pair each with
+    one peer block. Under a packed block that cut falls on the K/V boundary, so
+    the combination is refused rather than transferred wrong.
+    """
+
+    @staticmethod
+    def _worker(kv_per_block, block_size_ratio):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._kv_per_block = kv_per_block
+        w.transfer_topo = MagicMock()
+        w.transfer_topo.block_size_ratio.return_value = block_size_ratio
+        for check in (
+            "_check_split_axis_constraints",
+            "_check_mla_constraints",
+            "_check_d2d_region_pairing",
+        ):
+            setattr(w, check, lambda *a, **k: None)
+        # Unequal TP pairs by head band and refuses this on its own; the path
+        # this guards is the one that reaches upstream.
+        w._is_head_matched_peer = lambda _: False
+        return w
+
+    @staticmethod
+    def _meta():
+        meta = MagicMock(spec=RblnNixlAgentMetadata)
+        meta.pp_size = 1
+        meta.block_size = 64
+        return meta
+
+    def test_a_peer_with_a_different_block_size_is_refused(self):
+        worker = self._worker(PACKED, block_size_ratio=2)
+
+        with pytest.raises(RuntimeError, match="equal P/D block sizes"):
+            worker._validate_remote_agent_handshake(self._meta(), remote_tp_size=1)
+
+    @pytest.mark.parametrize(
+        "kv_per_block, block_size_ratio",
+        [
+            pytest.param(PACKED, 1, id="packed_equal_block_size"),
+            pytest.param(SPLIT, 2, id="separate_regions_unequal_block_size"),
+        ],
+    )
+    def test_upstream_still_gets_the_cases_it_handles(
+        self, kv_per_block, block_size_ratio
+    ):
+        # Separate regions are a whole block of K or of V, so upstream's cut
+        # stays between token ranges however the two sides size their blocks.
+        worker = self._worker(kv_per_block, block_size_ratio)
+        meta = self._meta()
+
+        with patch.object(
+            NixlBaseConnectorWorker, "_validate_remote_agent_handshake"
+        ) as upstream:
+            worker._validate_remote_agent_handshake(meta, remote_tp_size=1)
+
+        upstream.assert_called_once_with(meta, 1)

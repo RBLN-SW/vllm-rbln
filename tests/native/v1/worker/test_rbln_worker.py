@@ -850,6 +850,28 @@ class TestCompileOrWarmUpModel:
         _attach_sizer(worker)
         return worker, calls
 
+    def test_deferred_kv_registration_runs_with_the_vllm_config_set(
+        self, make_worker, monkeypatch
+    ):
+        # Without a scope of its own the connector raises "Current vLLM config
+        # is not set" and kills the rank: warm-up runs after the executor's has
+        # closed, and registration reads the config to find the block axis.
+        worker, _ = self._worker(make_worker, monkeypatch)
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "group")
+        seen: list = []
+        monkeypatch.setattr(
+            wm,
+            "finalize_kv_cache_registrations",
+            lambda g: seen.append(get_current_vllm_config()),
+        )
+
+        worker.compile_or_warm_up_model()
+
+        # Identity, not just "something was set": an outer scope holding a
+        # different config would satisfy a bare call.
+        assert seen == [worker.vllm_config]
+
     def test_skips_when_enforce_eager(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch, enforce_eager=True)
         worker.compile_or_warm_up_model()

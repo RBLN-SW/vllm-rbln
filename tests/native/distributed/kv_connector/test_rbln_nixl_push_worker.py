@@ -131,6 +131,7 @@ class TestMlaOnTheWritePath:
         worker.use_mla = True
         worker.transfer_topo = SimpleNamespace(tp_ratio=lambda peer: 1, tp_size=1)
         worker._kv_areas, worker._kv_slices = 4, 1
+        worker._kv_per_block = 1
 
         with pytest.raises(RuntimeError, match="chiplet geometry"):
             worker._check_mla_constraints(
@@ -142,6 +143,7 @@ class TestMlaOnTheWritePath:
         worker.use_mla = True
         worker.transfer_topo = SimpleNamespace(tp_ratio=lambda peer: 1, tp_size=1)
         worker._kv_areas, worker._kv_slices = 4, 1
+        worker._kv_per_block = 1
 
         worker._check_mla_constraints(
             SimpleNamespace(kv_areas=4, kv_slices=1), remote_tp_size=1
@@ -596,6 +598,7 @@ class TestReplicaFanOut:
         w = object.__new__(cls)
         w.shutdown = lambda: None
         w._kv_areas, w._kv_slices = areas, slices
+        w._kv_per_block = 1
         w._sw_ratio = None
         w.use_host_buffer = False
         w.device_id = 0
@@ -687,6 +690,7 @@ class TestTheThreeListsAgree:
         w = object.__new__(cls)
         w.shutdown = lambda: None
         w._kv_areas, w._kv_slices = 4, 4
+        w._kv_per_block = 1
         w._sw_ratio = None
         w.use_host_buffer = False
         w.device_id = 0
