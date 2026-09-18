@@ -31,7 +31,6 @@ RUNNER_UP_TOKEN_ID = 5
 
 @pytest.fixture(autouse=True)
 def _rbln_sampler_env(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
@@ -145,8 +144,7 @@ def _get_min_p_proc(runner) -> MinPLogitsProcessor:
         ),
     ],
 )
-def test_get_bucket_sizes(monkeypatch, num_seqs: int, expected_bucket_sizes: list[int]):
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+def test_get_bucket_sizes(num_seqs: int, expected_bucket_sizes: list[int]):
     runner = create_model_runner(max_num_seqs=num_seqs)
     fake_load_model(runner)
     bucket_sizes = runner.get_bucket_sizes(num_seqs)

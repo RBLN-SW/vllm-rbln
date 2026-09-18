@@ -41,9 +41,8 @@ DEVICE = current_platform.device_type
 
 @pytest.fixture
 def rbln_sampler_env(monkeypatch):
-    """RBLN sampler on, strict compile, no warm-up — the setup every test
-    here shares unless it parametrizes one of these itself."""
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
+    """Strict compile, no warm-up — the setup every test here shares unless
+    it parametrizes one of these itself. The RBLN sampler is on by default."""
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
@@ -72,7 +71,6 @@ def test_forward_sampler_mode_and_structured_output(
 ):
     """Test sampler logic for both use_rbln_sampler=True and False."""
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1" if use_rbln_sampler else "0")
     reqs = []
     for i in range(3):
         reqs.append(
@@ -83,7 +81,7 @@ def test_forward_sampler_mode_and_structured_output(
                 top_p=0.7,
             )
         )
-    forward_steps(reqs)
+    forward_steps(reqs, sampler=use_rbln_sampler)
 
 
 @pytest.mark.parametrize("top_p", [0.7, 1.0])
@@ -135,7 +133,7 @@ def test_forward_sampling_parameters(
 
 
 @pytest.mark.parametrize(
-    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+    "use_rbln_sampler", [True, False], ids=["rbln_sampler", "vllm_sampler"]
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampler):
@@ -143,11 +141,10 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
     generated, then release them. The bf16 + RBLN sampler case is a
     regression test for the mixed-dtype index_put_ crash.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
-    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype, sampler=use_rbln_sampler)
 
     stop_token_id = 9
     runner_up_token_id = 5
@@ -192,7 +189,7 @@ def test_forward_min_tokens_masks_stop_tokens(monkeypatch, dtype, use_rbln_sampl
 
 
 @pytest.mark.parametrize(
-    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+    "use_rbln_sampler", [True, False], ids=["rbln_sampler", "vllm_sampler"]
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sampler):
@@ -200,11 +197,10 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
     greedy sampling. The bf16 + RBLN sampler case is a regression test
     for bias_tensor staying float32 against model-dtype logits.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
-    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype, sampler=use_rbln_sampler)
 
     top_token_id = 9
     biased_token_id = 5
@@ -251,7 +247,7 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
         for p in runner.input_batch.logitsprocs.all
         if isinstance(p, LogitBiasLogitsProcessor)
     )
-    if use_rbln_sampler == "1":
+    if use_rbln_sampler:
         assert isinstance(bias_proc, RBLNLogitBiasLogitsProcessor)
         assert bias_proc.bias_tensor.dtype == dtype
     else:
@@ -262,7 +258,7 @@ def test_forward_logit_bias_overrides_argmax(monkeypatch, dtype, use_rbln_sample
 
 
 @pytest.mark.parametrize(
-    "use_rbln_sampler", ["1", "0"], ids=["rbln_sampler", "vllm_sampler"]
+    "use_rbln_sampler", [True, False], ids=["rbln_sampler", "vllm_sampler"]
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_forward_min_p_masks_low_probability_tokens(
@@ -272,11 +268,10 @@ def test_forward_min_p_masks_low_probability_tokens(
     RBLN sampler case is a regression test for min_p staying float32
     against model-dtype logits.
     """
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", use_rbln_sampler)
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
-    runner = create_model_runner(max_num_seqs=1, dtype=dtype)
+    runner = create_model_runner(max_num_seqs=1, dtype=dtype, sampler=use_rbln_sampler)
 
     top_token_id = 5
     num_decodes = 4
@@ -322,7 +317,7 @@ def test_forward_min_p_masks_low_probability_tokens(
         for p in runner.input_batch.logitsprocs.all
         if isinstance(p, MinPLogitsProcessor)
     )
-    if use_rbln_sampler == "1":
+    if use_rbln_sampler:
         assert isinstance(min_p_proc, RBLNMinPLogitsProcessor)
         assert min_p_proc.min_p.dtype == dtype
     else:

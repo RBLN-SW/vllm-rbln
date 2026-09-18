@@ -136,7 +136,9 @@ def make_request(
     )
 
 
-def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float):
+def get_vllm_config(
+    async_scheduling=False, max_num_seqs=None, dtype=torch.float, sampler=True
+):
     max_model_len = MAX_MODEL_LEN
     max_num_batched_tokens = max(max_num_seqs, MAX_MODEL_LEN)
     scheduler_config = SchedulerConfig(
@@ -158,6 +160,7 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float
         enable_prefix_caching=True,
     )
     additional_config = OptimumRBLNConfig(
+        sampler=sampler,
         prefix_block_size=IB_SIZE,
         optimum_overrides={"prefill_chunk_size": IB_SIZE},
     )
@@ -325,8 +328,11 @@ def create_model_runner(
     max_num_seqs: int = MAX_NUM_SEQ,
     dtype: torch.dtype = torch.float,
     decoder_batch_sizes: tuple[int, ...] | None = None,
+    sampler: bool = True,
 ):
-    vllm_config = get_vllm_config(max_num_seqs=max_num_seqs, dtype=dtype)
+    vllm_config = get_vllm_config(
+        max_num_seqs=max_num_seqs, dtype=dtype, sampler=sampler
+    )
     with set_current_vllm_config(vllm_config, check_compile=False):
         temp_file = tempfile.mkstemp()[1]
         init_distributed_environment(
@@ -370,8 +376,8 @@ def get_grammar_bitmask(
     return GrammarOutput(structured_output_request_ids, bitmask)
 
 
-def forward_steps(reqs: list[Request]):
-    runner = create_model_runner(max_num_seqs=4)
+def forward_steps(reqs: list[Request], sampler: bool = True):
+    runner = create_model_runner(max_num_seqs=4, sampler=sampler)
     structured_output_manager = StructuredOutputManager(runner.vllm_config)
     requests: dict[str, Request] = {}
     # Prefill
