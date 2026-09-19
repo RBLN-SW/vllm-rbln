@@ -154,12 +154,18 @@ class TestSwaWindowRatio:
 
     def test_pure_full_attention_keeps_ratio_none(self, monkeypatch):
         # A non-sliding-window group contributes no ratio.
-        worker = build_worker(monkeypatch, swa_window_mode=True, specs=[MagicMock()])
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",  # window mode is the direct path's
+            swa_window_mode=True,
+            specs=[MagicMock()],
+        )
         assert worker._sw_ratio is None
 
     def test_sliding_window_derives_block_over_window_ratio(self, monkeypatch):
         worker = build_worker(
             monkeypatch,
+            kv_buffer_device="rbln",
             swa_window_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
@@ -188,6 +194,7 @@ class TestSwaWindowRatio:
         # ratio 1 means the window equals the full block -> no trimming.
         worker = build_worker(
             monkeypatch,
+            kv_buffer_device="rbln",
             swa_window_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=64)],
         )
@@ -198,6 +205,7 @@ class TestSwaWindowRatio:
         # layers, so the ratio has to come from the windowed groups alone.
         worker = build_worker(
             monkeypatch,
+            kv_buffer_device="rbln",
             swa_window_mode=True,
             specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
         )
@@ -206,6 +214,7 @@ class TestSwaWindowRatio:
     def test_consistent_ratio_across_groups(self, monkeypatch):
         worker = build_worker(
             monkeypatch,
+            kv_buffer_device="rbln",
             swa_window_mode=True,
             specs=[
                 sliding_window_spec(block_size=64, sliding_window=16),
@@ -218,6 +227,7 @@ class TestSwaWindowRatio:
         with pytest.raises(AssertionError, match="single SWA ratio"):
             build_worker(
                 monkeypatch,
+                kv_buffer_device="rbln",
                 swa_window_mode=True,
                 specs=[
                     sliding_window_spec(block_size=64, sliding_window=16),
@@ -229,6 +239,7 @@ class TestSwaWindowRatio:
         with pytest.raises(AssertionError):
             build_worker(
                 monkeypatch,
+                kv_buffer_device="rbln",
                 swa_window_mode=True,
                 specs=[sliding_window_spec(block_size=64, sliding_window=15)],
             )
@@ -239,6 +250,7 @@ class TestSwaWindowRatio:
         with pytest.raises(RuntimeError, match="sliding-window MLA"):
             build_worker(
                 monkeypatch,
+                kv_buffer_device="rbln",
                 swa_window_mode=True,
                 use_mla=True,
                 specs=[sliding_window_spec(block_size=64, sliding_window=16)],
@@ -297,6 +309,7 @@ class TestSwaWindowDelegation:
         # without re-registering (no super() / topology work).
         worker = build_worker(
             monkeypatch,
+            kv_buffer_device="rbln",
             swa_window_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
@@ -660,13 +673,19 @@ class TestWindowModeNeedsAWindowThatMoves:
         spec.block_size, spec.sliding_window = 64, 32
 
         with pytest.raises(RuntimeError, match="window that moves"):
-            build_worker(monkeypatch, specs=[spec], swa_window_mode=True)
+            build_worker(
+                monkeypatch,
+                specs=[spec],
+                kv_buffer_device="rbln",
+                swa_window_mode=True,
+            )
 
     def test_a_window_that_moves_is_not(self, monkeypatch):
         # The control: the same geometry under the spec whose window slides.
         worker = build_worker(
             monkeypatch,
             specs=[sliding_window_spec(block_size=64, sliding_window=32)],
+            kv_buffer_device="rbln",
             swa_window_mode=True,
         )
 

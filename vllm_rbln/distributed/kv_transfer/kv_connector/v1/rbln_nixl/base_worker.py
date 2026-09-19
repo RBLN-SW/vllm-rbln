@@ -117,13 +117,18 @@ class RblnNixlWorkerBase(
         # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self.kv_buffer_device == "cpu"
-        if self.use_host_buffer and connector_option(vllm_config, "chunk_mode", False):
-            raise RuntimeError(
-                "RBLN NIXL: chunk_mode needs the descriptor "
-                "lists of the direct path; host staging registers one "
-                "full-shape buffer per layer and gives a narrowed peer a "
-                "handle upstream built, and a chunk range extends neither."
-            )
+        if self.use_host_buffer:
+            # Either knob puts a second descriptor range on the lists. Refused
+            # here rather than left inert, since an operator who named one is
+            # owed the reason it cannot be served.
+            for knob in ("chunk_mode", "swa_window_mode"):
+                if connector_option(vllm_config, knob, False):
+                    raise RuntimeError(
+                        f"RBLN NIXL: {knob} needs the descriptor lists of the "
+                        "direct path; host staging registers one full-shape "
+                        "buffer per layer and gives a narrowed peer a handle "
+                        "upstream built, and a second range extends neither."
+                    )
 
         # 0 is "nobody named one": a stripe is a byte width, so no width is a
         # width the adapter is never handed.
