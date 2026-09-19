@@ -1471,3 +1471,15 @@ class TestDynamicKvUnsupportedReason:
             )
             is None
         )
+
+    def test_the_flag_alone_does_not_enable_it(self):
+        # `mark_dynamic` follows this, not the flag: marking a dim nothing will
+        # resize leaves the compile with a symbolic extent it cannot lower.
+        assert worker_utils.dynamic_kv_enabled(self._cfg(use_custom_kernel=True)) is (
+            False
+        )
+        assert worker_utils.dynamic_kv_enabled(self._cfg()) is True
+
+    def test_the_flag_off_disables_it(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0")
+        assert worker_utils.dynamic_kv_enabled(self._cfg()) is False
