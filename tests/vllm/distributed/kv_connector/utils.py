@@ -17,7 +17,7 @@
 ``conftest.py::make_worker`` runs the worker's real ``__init__`` on a real
 VllmConfig and KVCacheConfig over real KV tensors, faking what it cannot reach
 here: the NIXL agent and its config, the ``nixl_rbln`` adapter, ``rebel``'s
-context lookup, ``get_device``, the TP-rank accessors and the view-opt env
+context lookup, ``get_device``, the TP-rank accessors and the window-mode env
 flag. ``build_worker`` below goes further and replaces upstream's ``__init__``.
 
 ``KvGeometry`` is why that is affordable. One object produces all three views of
@@ -82,6 +82,53 @@ def engine_config(
             kv_buffer_device=kv_buffer_device,
         ),
         **extra,
+    )
+
+
+def set_connector_options(monkeypatch, vllm_config, **options) -> None:
+    """Put this connector's knobs on a config, for the test's duration.
+
+    They live in ``kv_connector_extra_config`` rather than the environment, so
+    a test sets them where production reads them. ``setitem`` rather than a
+    fresh config because `vllm_config_for` caches on its keyword tuple and the
+    object is shared -- monkeypatch takes the entries back out.
+    """
+    for key, value in options.items():
+        monkeypatch.setitem(
+            vllm_config.kv_transfer_config.kv_connector_extra_config, key, value
+        )
+
+
+def mock_vllm_config(**options) -> Any:
+    """A mocked config that answers this connector's knob lookups.
+
+    A bare ``MagicMock`` answers every attribute with a truthy mock, so a knob
+    read from one would come back ON -- the opposite of every default here, and
+    silently. This asks for the knobs the test means and leaves the rest at
+    their defaults, so a test that forgets one gets the default rather than a
+    mock.
+    """
+    from unittest.mock import MagicMock
+
+    config = MagicMock()
+    # The one attribute outside the knobs that a mock answers wrongly rather
+    # than harmlessly: a chunk size is floored by it, and arithmetic on a mock
+    # raises instead of producing a chunk size that is merely wrong. The value
+    # is the one `engine_config` builds, so a mocked config and a real one size
+    # a chunk the same way.
+    config.scheduler_config.max_num_batched_tokens = 128
+    set_mock_connector_options(config, **options)
+    return config
+
+
+def set_mock_connector_options(vllm_config, **options) -> None:
+    """The same, on a mocked config a test already has.
+
+    Replacing it would take the rest of the mock's shape with it -- the
+    scheduler config a chunk size is floored by, for one.
+    """
+    vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
+        lambda key, default: options.get(key, default)
     )
 
 
@@ -634,10 +681,13 @@ def build_worker(
     block_size=64,
     specs=None,
     nixl_available=True,
-    swa_view_opt=False,
+    swa_window_mode=False,
     use_mla=False,
     pp_size=1,
     hma_disabled=False,
+    chunk_mode=False,
+    chunk_bytes=0,
+    stripe_width=0,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -650,14 +700,12 @@ def build_worker(
         NixlBaseConnectorWorker,
     )
 
-    import vllm_rbln.envs as envs
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (  # noqa: E501
         RblnNixlPullConnectorWorker,
     )
 
     module = types.ModuleType("nixl_rbln") if nixl_available else None
     monkeypatch.setitem(sys.modules, "nixl_rbln", module)
-    monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_SWA_VIEW_OPT", swa_view_opt)
 
     def fake_super_init(self, vllm_config, engine_id, kv_cache_config):
         # Upstream reads `disable_hybrid_kv_cache_manager` once in its own
@@ -691,7 +739,12 @@ def build_worker(
 
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
-    vllm_config = MagicMock()
+    vllm_config = mock_vllm_config(
+        chunk_mode=chunk_mode,
+        swa_window_mode=swa_window_mode,
+        chunk_bytes=chunk_bytes,
+        stripe_width=stripe_width,
+    )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # No speculative decoding: the compat hash then folds what it always did.
     vllm_config.speculative_config = None
@@ -702,7 +755,12 @@ def build_worker(
     # than being absorbed. `VllmConfig.__post_init__` resolves it before a
     # worker is built, so a bool is what production sees.
     vllm_config.scheduler_config = SchedulerConfig(
-        is_encoder_decoder=False, max_model_len=128
+        is_encoder_decoder=False,
+        max_model_len=128,
+        # A chunk size is floored by this, and the real default is wide enough
+        # to collapse every grid a test builds; keep the one `mock_vllm_config`
+        # names so replacing the mocked config here does not resize a chunk.
+        max_num_batched_tokens=128,
     )
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
     kv_cache_config = MagicMock()
