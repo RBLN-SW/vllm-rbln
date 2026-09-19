@@ -350,6 +350,19 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
     return None
 
 
+def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether this run sizes its KV cache from the compiled placement.
+
+    The flag alone is not the answer: a configuration the path cannot size
+    turns it off, and `mark_dynamic` must follow that decision or the artifact
+    carries a dynamic dim nothing will ever resize.
+    """
+    return (
+        envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
+        and dynamic_kv_unsupported_reason(vllm_config) is None
+    )
+
+
 @dataclass(frozen=True)
 class KvMinimum:
     """The fewest blocks a KV cache pool can serve with."""
