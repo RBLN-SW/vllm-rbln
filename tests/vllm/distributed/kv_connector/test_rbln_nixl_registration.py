@@ -1574,6 +1574,12 @@ class TestTailBlockTrim:
         with pytest.raises(RuntimeError, match="host staging"):
             build_worker(monkeypatch, kv_buffer_device="cpu", chunk_mode=True)
 
+    def test_host_staging_refuses_the_window_knob_too(self, monkeypatch):
+        # The window range sits in the same lists a chunk range would, so host
+        # staging has no more room for one than for the other.
+        with pytest.raises(RuntimeError, match="host staging"):
+            build_worker(monkeypatch, kv_buffer_device="cpu", swa_window_mode=True)
+
 
 class TestChunkModeWithASlidingWindow:
     """A hybrid engine is let into chunk mode because window mode already
