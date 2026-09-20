@@ -1305,9 +1305,14 @@ class RblnNixlWorkerBase(NixlBaseConnectorWorker):
         self, sock: "zmq.Socket", remote_rank: int, expected_engine_id: str
     ) -> RblnNixlAgentMetadata:
         sock.send(msgspec.msgpack.encode((GET_META_MSG, remote_rank)))
+        payload_bytes = sock.recv()
+        if not payload_bytes:
+            raise RuntimeError(
+                f"engine {expected_engine_id} reports every RDMA link down"
+            )
         try:
             handshake_payload = msgspec.msgpack.Decoder(NixlHandshakePayload).decode(
-                sock.recv()
+                payload_bytes
             )
         except (msgspec.DecodeError, msgspec.ValidationError) as e:
             raise RuntimeError(

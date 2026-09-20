@@ -473,6 +473,14 @@ class TestPpHandshakeFanout:
         with pytest.raises(RuntimeError, match="engine ID"):
             _handshake(w, sock, engine_id="eng")
 
+    def test_a_peer_with_every_link_down_refuses_the_handshake(self, monkeypatch):
+        # The refusal is an empty frame; it must not read as a version mismatch.
+        w = _make_worker()
+        sock = _FakeSock(pp_size=1)
+        monkeypatch.setattr(sock, "recv", lambda: b"")
+        with pytest.raises(RuntimeError, match="every RDMA link down"):
+            _handshake(w, sock)
+
 
 class TestLayerOverlap:
     # Name-based matching of a producer shard's layers to ours. Only the local
