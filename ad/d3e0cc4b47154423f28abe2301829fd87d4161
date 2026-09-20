@@ -1,0 +1,21 @@
+vllm_rbln/distributed/kv_transfer/kv_connector/v1/rbln_nixl/base_scheduler.py
+  s_87dfba6548eb97::t_6c912d22cbf732 15,19-21,32,35-36,90-120
+vllm_rbln/distributed/kv_transfer/kv_connector/v1/rbln_nixl/base_worker.py
+  s_87dfba6548eb97::t_685464910fce16 1308-1312,1315
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "add3e0cc4b47154423f28abe2301829fd87d4161",
+  "prompts": {},
+  "sessions": {
+    "s_87dfba6548eb97": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a8627982-2c85-4962-8060-75802a4ec832",
+        "model": "claude-opus-5"
+      },
+      "human_author": "rebel-jinmoo <jinmoo_seok@rebellions.ai>"
+    }
+  }
+}
