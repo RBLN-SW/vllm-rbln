@@ -229,7 +229,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
         self._early_push_enabled = push_stream_enabled(
             vllm_config,
-            is_hma_required=self._is_hma_required,
             use_host_buffer=self.use_host_buffer,
             specs=self._group_specs,
         )
@@ -756,16 +755,17 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # One window serves every peer of this request, and `issued_hwm` is
         # the request's, so the peers have to agree on the unit it counts in.
         # Where they do not, none of them gets chunks.
-        grids = {self._shard_chunk_grids.get((engine_id, r)) for r in peer_ranks}
+        grids = {self._shard_chunk_grids[(engine_id, r)] for r in peer_ranks}
         chunk_grid = grids.pop() if len(grids) == 1 else None
-        gpb = 1 if chunk_grid is None else chunk_grid[1]
+        cps = 1 if chunk_grid is None else chunk_grid[1]
+        cpb = self._chunks_per_block(chunk_grid)
         # Only the handover carries the request's final token count, and that
         # is what says how many chunks of its last block hold tokens. The
         # descriptor builders below derive the same number from the count they
         # are handed; the window needs it too, to stop a block it writes in
         # pieces at the same place.
         needed = self._tail_chunks(
-            n_prompt_blocks, self._valid_tokens.get(req_id), chunks_per_span=gpb
+            n_prompt_blocks, self._valid_tokens.get(req_id), chunks_per_span=cps
         )
         window = self._stream_window(
             req_id,
@@ -780,15 +780,15 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             local_block_ids = self._trim_to_consumer_blocks(
                 local_block_ids, remote_block_ids, engine_id, meta.remote.request_id
             )
-            span = (0, registered * gpb)
+            span = (0, registered * cpb)
         else:
             local_block_ids, remote_block_ids, span, _ = window
-        notif_id = self._with_coverage(notif_id, span, gpb)
+        notif_id = self._with_coverage(notif_id, span, cpb)
         # Only the write that carries the request's last block may cut it. The
         # span counts in chunks now, so the consumer's end is that many past
         # its last block rather than the block count itself.
         tail_tokens = (
-            self._valid_tokens.get(req_id) if span[1] == registered * gpb else None
+            self._valid_tokens.get(req_id) if span[1] == registered * cpb else None
         )
         n_write_blocks = sum(len(g) for g in local_block_ids)
         if not n_write_blocks and not pieces:
@@ -827,7 +827,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             # The chunks come from the second range of the same two lists, so
             # they join this batch rather than costing it a second transfer --
             # and one range keeps the notification single.
-            for local_block, remote_block, chunk_span in pieces:
+            for local_block, remote_block, span_ix, chunk_span in pieces:
                 remote_descs = np.concatenate(
                     (
                         remote_descs,
@@ -837,6 +837,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                             self.dst_num_blocks[engine_id],
                             remote_block,
                             chunk_span,
+                            span_ix=span_ix,
                         ),
                     )
                 )
@@ -849,6 +850,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                             self.num_blocks,
                             local_block,
                             chunk_span,
+                            span_ix=span_ix,
                         ),
                     )
                 )
@@ -905,9 +907,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # which is what would leave nothing to count in.
         assert n_prompt_blocks is not None and counted is not None
         registered = len(remote_block_ids[counted])
-        gpb = 1 if self._chunk_grid is None else self._chunk_grid[1]
+        cps = 1 if self._chunk_grid is None else self._chunk_grid[1]
+        cpb = self._chunks_per_block(self._chunk_grid)
         needed = self._tail_chunks(
-            n_prompt_blocks, self._valid_tokens.get(req_id), chunks_per_span=gpb
+            n_prompt_blocks, self._valid_tokens.get(req_id), chunks_per_span=cps
         )
         window = self._stream_window(
             req_id,
@@ -937,10 +940,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 engine_id, meta.remote.request_id, remote_info.remote_tp_size
             ),
             span,
-            gpb,
+            cpb,
         )
         tail_tokens = (
-            self._valid_tokens.get(req_id) if span[1] == registered * gpb else None
+            self._valid_tokens.get(req_id) if span[1] == registered * cpb else None
         )
         if not sum(len(g) for g in local_block_ids) and not pieces:
             logger.debug("streamed write req %s: nothing new to push", req_id)
@@ -949,7 +952,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # Each side parks its own pieces: one call describes one list, and the
         # block ids in it are that side's.
         with self._tail_viewed_as(
-            tail_tokens, n_prompt_blocks, tuple((b, c) for _, b, c in pieces)
+            tail_tokens, n_prompt_blocks, tuple((b, s, c) for _, b, s, c in pieces)
         ):
             remote_descs = self._compute_desc_ids(
                 remote_block_ids,
@@ -958,7 +961,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 remote_info.remote_physical_blocks_per_logical,
             )
         with self._tail_viewed_as(
-            tail_tokens, n_prompt_blocks, tuple((b, c) for b, _, c in pieces)
+            tail_tokens, n_prompt_blocks, tuple((b, s, c) for b, _, s, c in pieces)
         ):
             local_descs = self._compute_desc_ids(
                 local_block_ids,
@@ -1048,7 +1051,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         chunk_grid: tuple[int, int] | None = None,
         offered_tokens: int = 0,
         tail: int | None = None,
-    ) -> "tuple[BlockIds, BlockIds, Span, tuple[tuple[int, int, Span], ...]] | None":
+    ) -> (
+        "tuple[BlockIds, BlockIds, Span, tuple[tuple[int, int, int | None, Span], ...]]"
+        " | None"
+    ):
         """The part of the consumer's list this batch is the first to fill.
 
         Whole blocks, then the pieces of a block written in chunks: at most the
@@ -1079,7 +1085,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         offset = total * expand - registered
         have = len(local_block_ids[f])
         assert send is not None
-        gpb = 1 if chunk_grid is None else chunk_grid[1]
+        # Chunks of a BLOCK. The grid cuts one span and a context cut gives a
+        # block several, so a count taken off the token total has to divide by
+        # the block's own number -- the unit `_tail_chunks` and the coverage
+        # range are already in.
+        cps = 1 if chunk_grid is None else chunk_grid[1]
+        cpb = self._chunks_per_block(chunk_grid)
         lo = send.issued_hwm
         # How many of our blocks the offer has CLOSED. Its length says so only
         # while it holds nothing else; once it carries the block being filled, a
@@ -1089,26 +1100,26 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         closed = offered_tokens // self.block_size if offered_tokens else have
         hi = max(0, min(registered, closed - offset))
 
-        # Chunks the offer holds of the block after those. Without a grid there
-        # are none, which is a block written whole or not at all. An offer that
-        # has not reached the consumer's window holds none either: `hi` clamps
-        # to 0 there, and the block it would take them from is one the offer
-        # does not have.
+        # Chunks the offer holds of the block after those. None without a grid
+        # -- `_shard_chunk_grid` returns None rather than a grid of one chunk
+        # -- and none while the offer is short of the consumer's window: `hi`
+        # clamps to 0 there, and the block they would come from is one the
+        # offer does not have.
         tail_chunks = 0
         if (
-            gpb > 1
+            chunk_grid
             and offered_tokens
             and offset <= closed < have
             and 0 <= hi < registered
         ):
             rem = offered_tokens - closed * self.block_size
             if rem > 0:
-                tail_chunks = rem * gpb // self.block_size
+                tail_chunks = rem * cpb // self.block_size
         # Chunks of the block at `lo` that earlier batches already wrote.
         head_chunks = send.issued_chunks
 
         if hi <= lo and tail_chunks <= head_chunks:
-            reach = lo * gpb + head_chunks
+            reach = lo * cpb + head_chunks
             return (
                 self._windowed(local_block_ids, f, []),
                 self._windowed(remote_block_ids, f, []),
@@ -1116,28 +1127,54 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 (),
             )
 
-        def piece(index: int, chunk_span: "Span") -> tuple[int, int, "Span"]:
+        def piece(
+            index: int, span_ix: int | None, chunk_span: "Span"
+        ) -> tuple[int, int, int | None, "Span"]:
             return (
                 local_block_ids[f][offset + index],
                 remote_block_ids[f][index],
+                span_ix,
                 chunk_span,
             )
+
+        def over_spans(
+            index: int, first_chunk: int, past: int
+        ) -> list[tuple[int, int, int | None, "Span"]]:
+            """One piece per span the chunks `[first_chunk, past)` touch.
+
+            A chunk range is indexed inside a span, and every span carries the
+            same indices, so a range crossing one cannot be a single piece.
+            `None` is the head cut, whose one span is the block itself.
+            """
+            out = []
+            while first_chunk < past:
+                span_ix, within = divmod(first_chunk, cps)
+                end = min(past, (span_ix + 1) * cps)
+                out.append(
+                    piece(
+                        index,
+                        span_ix if cpb > cps else None,
+                        (within, end - span_ix * cps),
+                    )
+                )
+                first_chunk = end
+            return out
 
         # The block at `lo` closes with part of it already gone, so the write takes
         # the rest in chunks and the whole-block range starts after it; writing it
         # whole would repeat what a previous batch sent. That rest stops at `tail`
         # where the block is the request's last, since the chunks past its tokens
         # are the ones this mode exists not to send.
-        pieces: list[tuple[int, int, Span]] = []
+        pieces: list[tuple[int, int, int | None, Span]] = []
         first = lo
         if hi > lo and head_chunks:
-            end = tail if tail is not None and lo == registered - 1 else gpb
+            end = tail if tail is not None and lo == registered - 1 else cpb
             if end > head_chunks:
-                pieces.append(piece(lo, (head_chunks, end)))
+                pieces += over_spans(lo, head_chunks, end)
             first = lo + 1
         tail_lo = head_chunks if hi == lo else 0
         if tail_chunks > tail_lo:
-            pieces.append(piece(hi, (tail_lo, tail_chunks)))
+            pieces += over_spans(hi, tail_lo, tail_chunks)
 
         send.issued_hwm = hi
         send.issued_chunks = (
@@ -1148,7 +1185,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 local_block_ids, f, local_block_ids[f][offset + first : offset + hi]
             ),
             self._windowed(remote_block_ids, f, remote_block_ids[f][first:hi]),
-            (lo * gpb + head_chunks, hi * gpb + tail_chunks),
+            (lo * cpb + head_chunks, hi * cpb + tail_chunks),
             tuple(pieces),
         )
 

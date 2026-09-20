@@ -72,7 +72,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         self,
         valid_tokens: int | None,
         prompt_blocks: int | None,
-        pieces: tuple[tuple[int, tuple[int, int]], ...] = (),
+        pieces: tuple[tuple[int, int | None, tuple[int, int]], ...] = (),
     ):
         """Park which part of a request's blocks this transfer names.
 
@@ -208,8 +208,13 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         def whole(blocks: list[int]) -> np.ndarray:
             return (region_ids * num_blocks + np.asarray(blocks)[None, :]).flatten()
 
-        def chunks_of(block_id: int, chunk_span: tuple[int, int]) -> np.ndarray:
+        def chunks_of(
+            block_id: int, span_ix: int | None, chunk_span: tuple[int, int]
+        ) -> np.ndarray:
             assert self._chunk_grid is not None
+            # A context cut never reaches these lists: registration refuses one
+            # beside a window range, so no piece parked here names a span.
+            assert span_ix is None
             return _chunk_desc_ids(
                 start=num_whole_descs * (1 + window_units),
                 positions=np.arange(self.num_regions, dtype=np.int64),
@@ -268,8 +273,10 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             if needed is not None and group:
                 # The last block leaves the whole-block range and comes back as
                 # the chunks that hold tokens, from the third range.
-                all_descs.append(chunks_of(group[-1], (0, needed)))
-            all_descs += [chunks_of(block_id, span) for block_id, span in pieces]
+                all_descs.append(chunks_of(group[-1], None, (0, needed)))
+            all_descs += [
+                chunks_of(block_id, span_ix, span) for block_id, span_ix, span in pieces
+            ]
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
 
     def _get_block_descs_ids_for_shard(
@@ -348,7 +355,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         if not 0 <= lo < hi <= chunks:
             raise RuntimeError(
                 f"RBLN NIXL: chunk range [{lo}, {hi}) is outside the "
-                f"{chunks} chunk(s) a block holds"
+                f"{chunks} chunk(s) a span holds"
             )
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]

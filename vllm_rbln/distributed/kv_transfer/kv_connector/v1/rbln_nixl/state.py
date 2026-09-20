@@ -32,7 +32,9 @@ logger = init_logger(__name__)
 #: What a transfer parks for `_compute_desc_ids`, whose signature is
 #: upstream's: the request's final token count and block count, and the chunk
 #: ranges a streamed batch named on the side that call is for.
-RequestTail = tuple[int | None, int | None, tuple[tuple[int, tuple[int, int]], ...]]
+RequestTail = tuple[
+    int | None, int | None, tuple[tuple[int, int | None, tuple[int, int]], ...]
+]
 
 
 def kv_chunk_tokens(
@@ -204,6 +206,15 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         area every token of some heads, so they are one.
         """
         return self._kv_areas if self._kv_split_axis is KVSplitAxis.NON_HEAD else 1
+
+    def _chunks_per_block(self, chunk_grid: tuple[int, int] | None) -> int:
+        """Chunks a whole block is cut into.
+
+        The grid cuts one span, and a context cut gives a block several. Every
+        count that names part of a block -- what `_tail_chunks` returns, the
+        coverage unit, the window's own high-water mark -- is in this one.
+        """
+        return self._spans_per_block * (1 if chunk_grid is None else chunk_grid[1])
 
     @property
     def topo(self) -> TransferTopology:

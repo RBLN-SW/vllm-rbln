@@ -47,18 +47,18 @@ if TYPE_CHECKING:
 def push_stream_enabled(
     vllm_config: VllmConfig,
     *,
-    is_hma_required: bool,
     use_host_buffer: bool,
     specs: list["KVCacheSpec"],
 ) -> bool:
     """Whether a prefill's closed prefix leaves before the request ends.
 
-    A hybrid model streams only what a sliding window it can view lets it: the
-    offer carries the full-attention group and the handover carries the
-    window's block, and the write path can only tell them apart on the one
-    descriptor list able to name two groups, which is the list that view
-    builds. A hybrid without one is left out, as is host staging, which holds
-    no areas to write out of.
+    What decides it is how many KV-cache groups the engine has, not whether
+    upstream calls it hybrid. A second group is carried at a different time --
+    the offer takes the full-attention one and the handover takes the window's
+    block -- and telling them apart on the wire needs the one descriptor list
+    able to name two groups, which only a viewable sliding window builds. One
+    group has nothing to tell apart. Host staging holds no areas to write out
+    of and is left out either way.
 
     Derived in one place because the two sides decide different things from it
     and must not disagree: the scheduler stops building offers, and the worker
@@ -67,7 +67,7 @@ def push_stream_enabled(
     """
     if not connector_option(vllm_config, "push_stream", False) or use_host_buffer:
         return False
-    return not is_hma_required or sliding_window_ratio(specs) is not None
+    return len(specs) == 1 or sliding_window_ratio(specs) is not None
 
 
 class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorScheduler):
@@ -92,7 +92,6 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         # known until the handshake, so that part is settled per write.
         self._early_push_enabled = push_stream_enabled(
             vllm_config,
-            is_hma_required=self._is_hma_required,
             use_host_buffer=self.use_host_buffer,
             specs=[g.kv_cache_spec for g in kv_cache_config.kv_cache_groups],
         )

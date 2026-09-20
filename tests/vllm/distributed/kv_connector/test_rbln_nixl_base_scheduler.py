@@ -782,36 +782,55 @@ def _kv_config(specs):
 
 class TestEarlyPushGate:
     @pytest.mark.parametrize(
-        ("flag", "pp_size", "hybrid", "host_buffer", "expected"),
+        ("flag", "pp_size", "groups", "host_buffer", "expected"),
         [
-            (True, 4, False, False, True),
+            (True, 4, 1, False, True),
             # One stage still closes blocks one chunk at a time, so what a
             # prefill has finished can leave before the request does.
-            (True, 1, False, False, True),
-            (False, 4, False, False, False),
-            # A hybrid model streams only over the descriptor list its
-            # sliding-window view builds, which is the one able to name both
-            # of its groups. Without a window to view there is no such list.
-            (True, 4, True, False, False),
+            (True, 1, 1, False, True),
+            (False, 4, 1, False, False),
+            # A second group is carried at a different time, and telling the
+            # two apart on the wire needs the descriptor list a sliding
+            # window's view builds. Without a window there is no such list.
+            (True, 4, 2, False, False),
             # Host staging holds no areas to write out of.
-            (True, 4, False, True, False),
+            (True, 4, 1, True, False),
         ],
     )
     def test_the_gate_needs_the_flag_and_one_block_scale(
-        self, monkeypatch, flag, pp_size, hybrid, host_buffer, expected
+        self, monkeypatch, flag, pp_size, groups, host_buffer, expected
     ):
         def stub_init(self, *a, **k):
-            # Upstream sets this before our gate reads it.
-            self._is_hma_required = hybrid
+            # Upstream sets this before our gate reads it. The gate does not,
+            # any more: a merged cache reports hybrid while holding one group.
+            self._is_hma_required = groups > 1
 
         monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
         config = mock_vllm_config(push_stream=flag)
         config.parallel_config.pipeline_parallel_size = pp_size
         config.kv_transfer_config.kv_buffer_device = "cpu" if host_buffer else "rbln"
 
-        sched = RblnNixlPushConnectorScheduler(config, "eng", _kv_config([]))
+        sched = RblnNixlPushConnectorScheduler(
+            config, "eng", _kv_config([MagicMock() for _ in range(groups)])
+        )
 
         assert sched._early_push_enabled is expected
+
+    def test_one_group_streams_although_upstream_calls_it_hybrid(self, monkeypatch):
+        # A merged MLA-plus-indexer cache is reported as hybrid and is ONE
+        # group. The reason a windowless hybrid is left out -- that the offer
+        # and the handover carry different groups and the wire cannot tell
+        # them apart -- has nothing to apply to here, and the two models this
+        # connector cuts on the context axis are both this shape.
+        def stub_init(self, *a, **k):
+            self._is_hma_required = True
+
+        monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
+        config = mock_vllm_config(push_stream=True)
+
+        sched = RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
+
+        assert sched._early_push_enabled is True
 
     def test_a_hybrid_streams_where_its_window_can_be_viewed(self, monkeypatch):
         # The offer carries the full-attention group and the handover carries
@@ -916,6 +935,13 @@ class TestTailTokenCountOnTheReadPath:
             chunk_mode=False, swa_window_mode=True
         ).valid_tokens == {"r0": 33}
 
+    def test_streaming_alone_collects_the_count(self, monkeypatch):
+        # Streaming turns the window on without naming it, so it reaches the
+        # same granule question by a third knob.
+        assert self._with_knobs(chunk_mode=False, push_stream=True).valid_tokens == {
+            "r0": 33
+        }
+
     def _with_knobs(self, **knobs):
         sched = _scheduler()
         sched.vllm_config = mock_vllm_config(**knobs)
@@ -928,14 +954,16 @@ class TestTailTokenCountOnTheWritePath:
     """The producer takes its own count where it hands the blocks over."""
 
     @staticmethod
-    def _finish(monkeypatch, delay_free_blocks, trim=True, window=False):
+    def _finish(monkeypatch, delay_free_blocks, trim=True, window=False, stream=False):
         monkeypatch.setattr(
             NixlPushConnectorScheduler,
             "request_finished",
             lambda self, request, block_ids: (delay_free_blocks, None),
         )
         sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
-        sched.vllm_config = mock_vllm_config(chunk_mode=trim, swa_window_mode=window)
+        sched.vllm_config = mock_vllm_config(
+            chunk_mode=trim, swa_window_mode=window, push_stream=stream
+        )
         sched.request_finished(
             # Apart, so taking the prompt length instead of what was computed
             # is a different answer.
@@ -991,6 +1019,12 @@ class TestTailTokenCountOnTheWritePath:
         # As on the read path: the granule a window sits in is read off this
         # count, so a chunk range is not the only thing that asks for it.
         sched = self._finish(monkeypatch, True, trim=False, window=True)
+
+        assert sched._valid_tokens == {"r0": 33}
+
+    def test_streaming_alone_collects_the_count(self, monkeypatch):
+        # And the third knob that turns the window on asks for it too.
+        sched = self._finish(monkeypatch, True, trim=False, stream=True)
 
         assert sched._valid_tokens == {"r0": 33}
 

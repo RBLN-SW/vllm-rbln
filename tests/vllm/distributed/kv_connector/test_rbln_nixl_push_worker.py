@@ -106,6 +106,10 @@ def _push_worker():
     w._recving_transfers = {}
     # Off, as the connector option is; the trim tests turn it on.
     w._chunk_mode = False
+    # The geometry `__init__` leaves until registration reports one, which is
+    # also the permanent value on host staging. `_spans_per_block` reads both.
+    w._kv_areas = 1
+    w._kv_split_axis = KVSplitAxis.HEAD
     w._valid_tokens = {}
     w._physical_blocks_per_logical_kv_block = 1
     w._recving_metadata = {}
@@ -997,7 +1001,7 @@ class TestStreamedEngineHandleWrite:
     batch itself: the notification upstream builds has no room for a range."""
 
     @staticmethod
-    def _worker(*, total=4, grid=(2, 2)):
+    def _worker(*, total=4, grid=(2, 2), kv_per_block=1):
         w = TestPerShardWrite._writing_worker(ranks=1)
         w._overlapping_ranks = {}  # nothing narrowed: the engine handle
         w._sw_ratio = 2
@@ -1005,7 +1009,7 @@ class TestStreamedEngineHandleWrite:
         w._chunk_grid = grid
         w._request_tail = None
         w.num_regions = 2
-        w._kv_per_block = 1
+        w._kv_per_block = kv_per_block
         w._kv_areas = 1
         w._kv_split_axis = KVSplitAxis.HEAD
         w._physical_blocks_per_logical_kv_block = 1
@@ -1082,6 +1086,28 @@ class TestStreamedEngineHandleWrite:
         assert remote[2:6] == [68, 70, 100, 102]
         assert remote[6:] == [28, 44]
 
+    def test_a_handover_after_a_partial_block_stops_at_its_tokens(self):
+        # The batch before this one sent the half of the last block that held
+        # tokens. The handover owes the rest of that block only as far as the
+        # count reaches -- which is nowhere, so the chunk range is untouched
+        # and what is left to carry is the window's granule.
+        worker = self._worker()
+        worker._valid_tokens = {"r0": 3 * 16 + 8}
+        worker._xfer_blocks_for_req(
+            "r0", self._offer(([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16 + 8)
+        )
+        first = list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
+
+        worker._xfer_blocks_for_req(
+            "r0", self._offer(([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
+        )
+        second = list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
+
+        # The first batch took the block that closed and the one chunk of the
+        # next that holds tokens; the second repeats neither.
+        assert first == [4, 12, 68, 70, 100, 102]
+        assert second == [28, 44]
+
     def test_a_window_that_straddles_names_a_granule_either_side(self):
         # 57 tokens leave the window over two granules of the block -- a
         # count that does not end on a granule boundary, which is where
@@ -1094,6 +1120,22 @@ class TestStreamedEngineHandleWrite:
 
         remote = list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
         assert remote[-4:] == [28, 29, 44, 45]
+
+    def test_the_packing_does_not_move_what_the_batch_indexes(self):
+        # A whole block is one descriptor whatever it packs, and the window
+        # range is counted in kernel blocks either way, so neither the offsets
+        # a batch indexes into nor the granules it picks move with the packing.
+        offer = (([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
+        remotes = []
+        for kv_per_block in (2, 1):
+            worker = self._worker(kv_per_block=kv_per_block)
+            worker._valid_tokens = {"r0": 3 * 16 + 8}
+            worker._xfer_blocks_for_req("r0", self._offer(*offer))
+            remotes.append(
+                list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
+            )
+
+        assert remotes[0] == remotes[1]
 
     def test_a_batch_that_writes_nothing_still_counts_toward_the_seal(self):
         # The per-shard route has the same guard: a batch issuing no write
@@ -2276,21 +2318,24 @@ class TestStreamWindow:
         hwm=0,
         chunks=0,
         valid=None,
+        areas=1,
     ):
         """Call the window directly with a grid. The offer's block list is
         `have` long and holds `offered` tokens; the consumer registered
         `registered` blocks of the prompt's `total`. `valid` is the request's
-        final token count, which only the handover carries."""
+        final token count, which only the handover carries. `areas` above one
+        is a context cut, where an area IS a token range of the block and
+        `gpb` counts the chunks of one area rather than of the block."""
         w = self._worker(total=total)
         w.block_size = 16
+        w._kv_areas = areas
+        w._kv_split_axis = KVSplitAxis.NON_HEAD if areas > 1 else KVSplitAxis.HEAD
         send = w._streamed["r0"]
         send.issued_hwm = hwm
         send.issued_chunks = chunks
         tail = None
         if valid is not None:
             w._chunk_mode = True
-            w._kv_areas = 1
-            w._kv_split_axis = KVSplitAxis.HEAD
             tail = w._tail_chunks(total, valid, chunks_per_span=gpb)
         return w, w._stream_window(
             "r0",
@@ -2314,6 +2359,27 @@ class TestStreamWindow:
         assert span == (0, 0)
         assert w._streamed["r0"].issued_chunks == 0
 
+    def test_a_context_cut_counts_the_chunks_of_the_block_not_of_one_area(self):
+        # Two areas, two chunks each, so the block is four chunks of four
+        # tokens. Eight tokens of it are computed: that is the whole of area 0,
+        # and the piece has to say which area it is -- the chunk range is
+        # indexed inside one, and every area carries the same indices.
+        w, out = self._chunked(total=4, offered=3 * 16 + 8, have=4, gpb=2, areas=2)
+        _, _, span, pieces = out
+
+        assert pieces == ((3, 101, 0, (0, 2)),)
+        assert span == (0, 1 * 4 + 2)
+        assert w._streamed["r0"].issued_chunks == 2
+
+    def test_a_context_cut_splits_a_piece_that_crosses_an_area(self):
+        # Twelve of sixteen tokens is three of the block's four chunks, which
+        # is area 0 whole and the first chunk of area 1. One range cannot name
+        # both, since each is indexed inside its own area.
+        _, out = self._chunked(total=4, offered=3 * 16 + 12, have=4, gpb=2, areas=2)
+        _, _, _, pieces = out
+
+        assert pieces == ((3, 101, 0, (0, 2)), (3, 101, 1, (0, 1)))
+
     def test_a_partial_last_block_leaves_as_chunks(self):
         # Four blocks held, three closed and the fourth holding 8 of 16 tokens.
         # The consumer registered two, so its block 0 goes whole and its block
@@ -2323,7 +2389,7 @@ class TestStreamWindow:
 
         assert local == ([2],) and remote == ([100],)
         assert span == (0, 1 * 2 + 1)
-        assert pieces == ((3, 101, (0, 1)),)  # our block 3, their 101, chunk 0
+        assert pieces == ((3, 101, None, (0, 1)),)  # block 3, their 101, chunk 0
         assert w._streamed["r0"].issued_chunks == 1
 
     def test_the_next_batch_only_advances_the_chunks(self):
@@ -2338,7 +2404,7 @@ class TestStreamWindow:
         assert local == ([],) and remote == ([],)
         assert span == (1 * 4 + 2, 1 * 4 + 3)
         # Picks up where the last batch stopped.
-        assert pieces == ((3, 101, (2, 3)),)
+        assert pieces == ((3, 101, None, (2, 3)),)
 
     def test_a_block_that_closes_sends_only_the_chunks_still_missing(self):
         # Half of the consumer's block 1 went out as a chunk last batch. It has
@@ -2349,7 +2415,7 @@ class TestStreamWindow:
         local, remote, span, pieces = out
 
         assert local == ([],) and remote == ([],)
-        assert pieces == ((3, 101, (1, 2)),)  # chunk 1 only, not the block
+        assert pieces == ((3, 101, None, (1, 2)),)  # chunk 1 only, not the block
         assert span == (1 * 2 + 1, 2 * 2)
         assert w._streamed["r0"].issued_hwm == 2
         assert w._streamed["r0"].issued_chunks == 0
@@ -2374,7 +2440,7 @@ class TestStreamWindow:
         )
         _local, _remote, span, pieces = out
 
-        assert pieces == ((3, 101, (1, 2)),)  # chunk 1 only, not chunks 1..4
+        assert pieces == ((3, 101, None, (1, 2)),)  # chunk 1 only, not chunks 1..4
         # The range still names the whole request: it says what the write is
         # responsible for, not which descriptors went out.
         assert span == (1 * 4 + 1, 2 * 4)
@@ -2416,6 +2482,47 @@ class TestStreamWindow:
         notif = worker.nixl_wrapper.make_prepped_xfer.call_args.kwargs["notif_msg"]
         assert notif.startswith(b"RBLNS:0:0:3:2:")
 
+    def test_a_context_cut_writes_the_chunks_of_one_area_only(self):
+        # Two areas, so a position IS a token range: area 0 holds the block's
+        # first half and area 1 the second. Eight of sixteen tokens are
+        # computed, which is area 0 whole -- and area 1 holds nothing yet, so
+        # its descriptors must not go out.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        worker._kv_areas = 2
+        worker._kv_split_axis = KVSplitAxis.NON_HEAD
+        worker._shard_chunk_grids = {("eng", 0): (1, 2)}
+        meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 8)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        local = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
+        whole = 2 * worker.num_blocks
+        # Our block 2 whole in both regions, then area 0's two chunks of our
+        # block 3 -- not the four that naming every area would give.
+        assert sorted(d for d in local if d < whole) == [2, 10]
+        assert sorted(d for d in local if d >= whole) == [22, 23]
+
+    def test_a_context_cut_writes_the_second_area_at_its_own_positions(self):
+        # Twelve of sixteen tokens: area 0 whole and the first chunk of area 1.
+        # The two pieces land in different regions, which is the whole point of
+        # the span index -- every area holds chunk 0 of this block.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        worker._kv_areas = 2
+        worker._kv_split_axis = KVSplitAxis.NON_HEAD
+        worker._shard_chunk_grids = {("eng", 0): (1, 2)}
+        meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 12)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        local = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
+        whole = 2 * worker.num_blocks
+        # Area 0's chunks 0 and 1 at region 0, area 1's chunk 0 at region 1.
+        assert sorted(d for d in local if d >= whole) == [22, 23, 38]
+
     def test_the_next_batch_does_not_repeat_a_chunk_it_already_sent(self):
         """A block that closes after part of it went out is written from where
         that part stopped. Writing it whole instead moves those bytes a second
@@ -2440,6 +2547,28 @@ class TestStreamWindow:
         whole = 2 * worker.num_blocks
         assert all(d >= whole for d in descs)
         assert len(descs) == 2 * 2  # 2 regions x 2 heads x 1 chunk
+
+    def test_the_closing_batch_stops_at_the_tokens_the_last_block_holds(self):
+        # The same two batches as above, with a token count on the request.
+        # Half the last block went out with the first batch and the rest of it
+        # holds no tokens, so the batch that closes the request owes nothing --
+        # sending those chunks would move KV the prefill never wrote.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        worker._chunk_mode = True
+        worker._shard_chunk_grids = {("eng", 0): (2, 2)}
+        worker._valid_tokens = {"r0": 3 * 16 + 8}
+
+        first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        first.local_block_ids = pw.OfferedBlocks(first.local_block_ids, 3 * 16 + 8)
+        worker._xfer_blocks_for_req("r0", first)
+
+        second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        second.local_block_ids = pw.OfferedBlocks(second.local_block_ids, 4 * 16)
+        worker._xfer_blocks_for_req("r0", second)
+
+        # One transfer, the first batch's. The second names no descriptor.
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 1
 
     def test_a_peer_with_a_grid_is_counted_in_chunks_even_unstreamed(self):
         # No total, so there is no window and the whole list goes at once -- but

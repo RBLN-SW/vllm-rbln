@@ -1170,7 +1170,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # descriptors on one block. A head cut names no span with a position,
         # so none of that applies to it.
         assert (
-            not self._chunk_mode
+            not (self._chunk_mode or self._writes_less_than_a_request())
             or self._spans_per_block == 1
             or (peer_areas is None and split == 1 and replica_fanout == 1)
         )

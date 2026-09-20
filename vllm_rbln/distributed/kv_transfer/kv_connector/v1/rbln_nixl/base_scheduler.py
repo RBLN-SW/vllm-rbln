@@ -65,13 +65,17 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
         """Whether the worker needs a request's token count in the metadata.
 
         Chunk mode sizes the last block's chunks by it; window mode picks which
-        granules of a block the window sits in. Block ids say neither. Asked of
-        the knobs rather than of the cache, since the worker is where the two
-        combine and an unused count costs an int a request.
+        granules of a block the window sits in. Block ids say neither. Streaming
+        turns the window on as well, so it asks for the count for that second
+        reason even where it never cuts a chunk. Asked of the knobs rather than
+        of the cache, since the worker is where they combine and an unused count
+        costs an int a request.
         """
-        return connector_option(
-            self.vllm_config, "chunk_mode", False
-        ) or connector_option(self.vllm_config, "swa_window_mode", False)
+        return (
+            connector_option(self.vllm_config, "chunk_mode", False)
+            or connector_option(self.vllm_config, "swa_window_mode", False)
+            or connector_option(self.vllm_config, "push_stream", False)
+        )
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
