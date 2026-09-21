@@ -105,6 +105,9 @@ class RblnPlatform(Platform):
     ray_device_key: str = "RBLN"
     device_control_env_var: str = "RBLN_VISIBLE_DEVICES"
     simple_compile_backend = "bypass"
+    # Ray copies only the names `get_env_vars_to_copy` selects, and the leading
+    # underscore that keeps the resolved path out of VLLM_RBLN_* misses its prefixes.
+    additional_env_vars: list[str] = [envs.RESOLVED_MODEL_IMPL_ENV]
 
     @classmethod
     def import_kernels(cls) -> None:

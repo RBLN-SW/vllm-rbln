@@ -1054,6 +1054,22 @@ class TestModelImpl:
         assert isinstance(config.additional_config, RBLNConfig)
         assert config.model_config.model_impl == "auto"
 
+    def test_a_ray_actor_is_told_the_path(self):
+        """Ray copies a chosen set of names, not the environment.
+
+        The leading underscore keeps the resolved path out of the VLLM_RBLN_*
+        namespace, and out of the `VLLM_` prefix Ray copies on. Without the
+        platform listing it, an actor would start on the default path and run
+        the worker against upstream nobody patched.
+        """
+        from vllm.ray.ray_env import get_env_vars_to_copy
+
+        copied = get_env_vars_to_copy(
+            additional_vars=set(RblnPlatform.additional_env_vars)
+        )
+
+        assert platform.envs.RESOLVED_MODEL_IMPL_ENV in copied
+
     def test_a_bare_string_additional_config_is_left_to_upstream(self):
         """`_MergeAdditionalConfig` keeps the bare string the CLI action takes,
         and `VllmConfig`, which types the field, is what refuses it. Merging the
