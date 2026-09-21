@@ -20,6 +20,7 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorOutput
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
@@ -31,9 +32,11 @@ from tests.vllm.v1.core.utils import (
     advance_to_decode,
     create_rbln_scheduler,
     create_requests,
+    full_attention_spec,
     make_model_runner_output,
     make_request,
     prefill_request,
+    sliding_window_spec,
 )
 from vllm_rbln.v1.core.rbln_kv_cache_manager import RBLNKVCacheManager
 from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
@@ -116,6 +119,232 @@ class TestSchedulerInit:
                 max_model_len=128,
                 sub_block_size=128,
             )
+
+
+class TestHybridLoadFailure:
+    @staticmethod
+    def _scheduler(*, is_async=False, async_scheduling=False):
+        sched = create_rbln_scheduler(
+            block_size=16,
+            num_blocks=32,
+            max_num_batched_tokens=16,
+            max_model_len=256,
+            enable_prefix_caching=True,
+            additional_config={"enable_sub_block_cache": False},
+            use_kv_connector=MockKVConfig(matched_tokens=48, is_async=is_async),
+            async_scheduling=async_scheduling,
+            kv_cache_specs=[full_attention_spec(16), sliding_window_spec(16, 4)],
+        )
+        sched.recompute_kv_load_failures = True
+        return sched
+
+    @staticmethod
+    def _request(num_tokens=72):
+        request = make_request("load", list(range(num_tokens)), 16, max_tokens=2)
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        return request
+
+    @pytest.mark.parametrize("failed_group", [0, 1])
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    def test_failed_load_reallocates_reclaimed_window(
+        self, failed_group, async_scheduling
+    ):
+        sched = self._scheduler(async_scheduling=async_scheduling)
+        request = self._request()
+        sched.add_request(request)
+        output = sched.schedule()
+        groups = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        assert groups[1][0].is_null
+        failed_block = groups[failed_group][2].block_id
+        result = make_model_runner_output(output)
+        result.kv_connector_output = KVConnectorOutput(invalid_block_ids={failed_block})
+
+        sched.update_from_output(output, result)
+
+        assert request.status == RequestStatus.PREEMPTED
+        assert request.num_computed_tokens == 0
+        assert request.skip_reading_prefix_cache
+        assert not request.output_token_ids
+        retry = sched.schedule()
+        assert request.request_id in retry.preempted_req_ids
+        assert request.num_external_computed_tokens == 0
+        groups = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        assert all(not group[0].is_null for group in groups)
+        sched.update_from_output(retry, make_model_runner_output(retry))
+        _drain(sched)
+        assert request.is_finished()
+
+    @pytest.mark.parametrize("is_async", [False, True])
+    def test_fail_policy_finishes_request_without_crashing(self, is_async):
+        sched = self._scheduler(is_async=is_async)
+        sched.recompute_kv_load_failures = False
+        request = self._request()
+        sched.add_request(request)
+        output = sched.schedule()
+        groups = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        failed_block = groups[1][2].block_id
+        result = make_model_runner_output(output)
+        result.kv_connector_output = KVConnectorOutput(
+            invalid_block_ids={failed_block},
+            finished_recving={request.request_id} if is_async else None,
+        )
+
+        sched.update_from_output(output, result)
+
+        assert request.status == RequestStatus.FINISHED_ERROR
+        assert request.request_id not in sched.requests
+        assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == 31
+
+    def test_async_load_waits_for_transfer_before_reallocating(self):
+        sched = self._scheduler(is_async=True)
+        request = self._request()
+        sched.add_request(request)
+        output = sched.schedule()
+        assert not output.num_scheduled_tokens
+        groups = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        failed_block = groups[1][2].block_id
+        result = make_model_runner_output(output)
+        result.kv_connector_output = KVConnectorOutput(invalid_block_ids={failed_block})
+        free_before = sched.kv_cache_manager.block_pool.get_num_free_blocks()
+
+        sched.update_from_output(output, result)
+
+        assert request.num_computed_tokens == 0
+        assert request.skip_reading_prefix_cache
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == free_before
+        empty = sched.schedule()
+        assert not empty.num_scheduled_tokens
+        sched.update_from_output(
+            empty,
+            make_model_runner_output(empty, finished_recving={request.request_id}),
+        )
+        retry = sched.schedule()
+        assert request.num_external_computed_tokens == 0
+        groups = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        assert all(not group[0].is_null for group in groups)
+        sched.update_from_output(retry, make_model_runner_output(retry))
+        _drain(sched)
+        assert request.is_finished()
+
+    @pytest.mark.parametrize("queued_draft_tokens", [0, 3])
+    def test_queued_outputs_are_discarded_before_recompute(self, queued_draft_tokens):
+        sched = self._scheduler(async_scheduling=True)
+        request = self._request(num_tokens=64)
+        sched.add_request(request)
+        first = sched.schedule()
+        groups = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        failed_block = groups[0][2].block_id
+        queued = sched.schedule()
+        assert request.request_id in queued.num_scheduled_tokens
+        if queued_draft_tokens:
+            queued.scheduled_spec_decode_tokens[request.request_id] = [10, 11, 12]
+            queued.num_scheduled_tokens[request.request_id] += queued_draft_tokens
+            queued.total_num_scheduled_tokens += queued_draft_tokens
+            request.num_computed_tokens += queued_draft_tokens
+            request.num_in_flight_tokens += queued_draft_tokens
+            request.num_output_placeholders += queued_draft_tokens
+        result = make_model_runner_output(first, 100)
+        result.kv_connector_output = KVConnectorOutput(invalid_block_ids={failed_block})
+
+        sched.update_from_output(first, result)
+
+        reset = sched.schedule()
+        assert request.request_id in reset.preempted_req_ids
+        assert request.request_id not in reset.num_scheduled_tokens
+        sched.update_from_output(queued, make_model_runner_output(queued, 101))
+        assert not request.output_token_ids
+        assert request.num_computed_tokens == request.num_output_placeholders == 0
+        assert request.num_in_flight_tokens == 0
+        sched.update_from_output(reset, make_model_runner_output(reset))
+        _drain(sched)
+        assert list(request.output_token_ids) == [0, 0]
+
+    def test_cancelled_failed_load_evicts_cached_blocks(self):
+        sched = self._scheduler()
+        request = self._request()
+        sched.add_request(request)
+        output = sched.schedule()
+        manager = sched.kv_cache_manager
+        failed = manager.get_blocks(request.request_id).blocks[0][2].block_id
+        sched.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+        probe = make_request("probe", list(range(72)), 16)
+        assert manager.get_computed_blocks(probe)[1] == 64
+        result = make_model_runner_output(output)
+        result.kv_connector_output = KVConnectorOutput(invalid_block_ids={failed})
+
+        sched.update_from_output(output, result)
+
+        assert manager.get_computed_blocks(probe)[1] <= 32
+
+    def test_normal_preemption_preserves_outputs_with_lookup_disabled(self):
+        sched = self._scheduler(async_scheduling=True)
+        request = self._request(num_tokens=16)
+        request.skip_reading_prefix_cache = True
+        sched.add_request(request)
+        output = sched.schedule()
+        assert request.num_output_placeholders == 1
+        sched.running.remove(request)
+        sched._preempt_request(request, 0.0)
+
+        sched.update_from_output(output, make_model_runner_output(output, 9))
+
+        assert list(request.output_token_ids) == [9]
+        assert request.num_output_placeholders == 0
+        _drain(sched)
+        assert request.is_finished()
+
+    def test_failure_does_not_propagate_through_valid_shared_prefix(self):
+        sched = self._scheduler()
+        manager = sched.kv_cache_manager
+        first = self._request()
+        manager.allocate_slots(first, 16)
+        first.num_computed_tokens = 16
+        manager.cache_blocks(first, 16)
+        second = make_request("shared", list(range(16)) + [99] * 56, 16)
+        cached, count, _ = manager.get_computed_blocks(second)
+        assert count == 16
+        manager.allocate_slots(second, 16, count, cached)
+        manager.allocate_slots(first, 48)
+        for request, computed in ((second, 32), (first, 64)):
+            request.status = RequestStatus.RUNNING
+            request.num_computed_tokens = computed
+            sched.requests[request.request_id] = request
+            sched.running.append(request)
+        failed = manager.get_blocks(first.request_id).blocks[0][2].block_id
+
+        affected = sched._handle_invalid_blocks({failed}, {first.request_id: 16})
+
+        assert affected == {first.request_id}
+        assert second.status == RequestStatus.RUNNING
+
+    def test_shared_failed_blocks_invalidate_all_consumers(self):
+        sched = self._scheduler()
+        first = self._request()
+        manager = sched.kv_cache_manager
+        manager.allocate_slots(first, 16, num_external_computed_tokens=48)
+        second = make_request("shared", list(range(72)), 16)
+        cached, count, _ = manager.get_computed_blocks(second)
+        assert count == 64
+        manager.allocate_slots(second, 8, count, cached)
+        for request, computed in ((second, 72), (first, 64)):
+            request.status = RequestStatus.RUNNING
+            request.num_computed_tokens = computed
+            sched.requests[request.request_id] = request
+            sched.running.append(request)
+        failed = manager.get_blocks(first.request_id).blocks[1][2].block_id
+
+        affected = sched._handle_invalid_blocks(
+            {failed}, {first.request_id: 16, second.request_id: 8}
+        )
+
+        assert affected == {first.request_id, second.request_id}
+        assert all(
+            request.status == RequestStatus.PREEMPTED for request in (first, second)
+        )
+        assert manager.block_pool.get_num_free_blocks() == 31
+        probe = make_request("probe", list(range(72)), 16)
+        assert manager.get_computed_blocks(probe)[1] == 0
 
 
 class TestPendingRunnerBlockDeltas:

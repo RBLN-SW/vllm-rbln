@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorOutput,
+    SupportsHMA,
 )
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
@@ -84,7 +85,7 @@ class _MockKVConnectorMetadata(KVConnectorMetadata):
         self.req_ids: list[str] = []
 
 
-class MockKVConnector(KVConnectorBase_V1):
+class MockKVConnector(KVConnectorBase_V1, SupportsHMA):
     """Only what RBLNScheduler.schedule() calls. External tokens are reported
     solely for requests carrying do_remote_prefill, so a test can decide per
     request whether the remote holds its KV."""
@@ -97,6 +98,8 @@ class MockKVConnector(KVConnectorBase_V1):
         )
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        if request.skip_reading_prefix_cache:
+            return 0, False
         params = getattr(request, "kv_transfer_params", None)
         if params and params.get("do_remote_prefill"):
             return self.config.matched_tokens, self.config.is_async
@@ -125,6 +128,9 @@ class MockKVConnector(KVConnectorBase_V1):
     def wait_for_save(self):
         pass
 
+    def request_finished_all_groups(self, request, block_ids):
+        return False, None
+
 
 if "MockKVConnector" not in KVConnectorFactory._registry:
     KVConnectorFactory.register_connector(
@@ -150,6 +156,7 @@ def create_rbln_scheduler(
     use_kv_connector: MockKVConfig | None = None,
     async_scheduling: bool = False,
     additional_config: dict | None = None,
+    kv_cache_specs: Sequence[KVCacheSpec] | None = None,
 ) -> RBLNScheduler:
     """Build an RBLNScheduler on CPU (ported from upstream tests/v1/core/utils):
     opt-125m config only, num_gpu_blocks set manually, no KV connector."""
@@ -205,7 +212,11 @@ def create_rbln_scheduler(
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer"], full_attention_spec(block_size))],
+        kv_cache_groups=(
+            make_kv_cache_config(kv_cache_specs).kv_cache_groups
+            if kv_cache_specs is not None
+            else [KVCacheGroupSpec(["layer"], full_attention_spec(block_size))]
+        ),
     )
     cache_config.num_gpu_blocks = num_blocks
     scheduler_cls = RBLNAsyncScheduler if async_scheduling else RBLNScheduler
@@ -453,7 +464,11 @@ def _drain(sched, *, token=0, max_steps=300, per_step=None):
             break
         if per_step is not None:
             per_step(out)
-        sched.update_from_output(out, make_model_runner_output(out, token))
+        runner_output = make_model_runner_output(out, token)
+        for req_id, index in runner_output.req_id_to_index.items():
+            if sched.requests[req_id].is_prefill_chunk:
+                runner_output.sampled_token_ids[index] = []
+        sched.update_from_output(out, runner_output)
         steps += 1
         assert steps < max_steps, "run did not converge"
     return steps
