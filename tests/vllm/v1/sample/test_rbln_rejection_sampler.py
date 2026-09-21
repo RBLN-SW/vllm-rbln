@@ -31,7 +31,6 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import (
     GREEDY_TEMPERATURE,
     PLACEHOLDER_TOKEN_ID,
     RBLNRejectionSamplerImpl,
-    draw_synthetic_acceptance,
 )
 
 DEVICE = torch.device("cpu")
@@ -609,12 +608,22 @@ def test_synthetic_rejection_reuses_the_token_the_op_itself_drew(impl):
     assert output.tolist() == [[6, 1, PLACEHOLDER_TOKEN_ID]]
 
 
-def test_synthetic_acceptance_is_capped_by_the_drafted_count():
-    # Rates that accept every position, against a request that drafted one of
-    # the two padded slots: the second must not be invented.
-    drawn = draw_synthetic_acceptance(
-        batch_size=2,
-        num_draft_tokens=torch.tensor([1, 2], dtype=torch.int32),
-        conditional_rates=torch.ones(NUM_SPEC_TOKENS),
+def test_synthetic_acceptance_is_capped_by_the_drafted_count(impl):
+    """Rates that accept every position, against a request that brought fewer
+    drafts than the padded length: the slot it never drafted must not be
+    accepted, so its bonus token still lands right after its own last draft."""
+    output = run_rejection_sample(
+        impl,
+        draft_token_ids=[3, 2, 4],
+        target_argmax_token_ids=[6, 7, 7],
+        bonus_token_ids=[10, 11],
+        metadata=make_sampling_metadata(
+            temperature=None, all_greedy=True, all_random=False
+        ),
+        num_draft_tokens=[1, 2],
+        synthetic_conditional_rates=torch.ones(NUM_SPEC_TOKENS),
     )
-    assert drawn.tolist() == [1, 2]
+    assert output.tolist() == [
+        [3, 10, PLACEHOLDER_TOKEN_ID],
+        [2, 4, 11],
+    ]
