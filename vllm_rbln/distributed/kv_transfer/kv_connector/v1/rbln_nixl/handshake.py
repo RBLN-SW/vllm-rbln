@@ -327,7 +327,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if self.use_host_buffer:
             return
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
-        if tp_ratio != 1 and self._has_swa:
+        if tp_ratio != 1 and self._shape.has_swa:
             raise RuntimeError(
                 "RBLN NIXL D2D: sliding-window attention is not supported with "
                 f"heterogeneous tensor parallelism (tp_ratio={tp_ratio})."
@@ -438,10 +438,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
         # Both ranges that name less than a block cut it by a number derived
         # from OUR block size -- the chunk grid from it, the window range from
-        # `_sw_ratio` -- and both lists are cut by that one number. A peer whose
+        # `window_ratio` -- and both lists are cut by that one number. A peer whose
         # block holds a different count is then cut into pieces that are not its
         # own, while every byte count still fits.
-        if (self._chunk_mode or self._own_engine_layout) and (
+        if (self._shape.chunk_mode or self._own_engine_layout) and (
             nixl_agent_meta.block_size != self.block_size
         ):
             raise RuntimeError(
@@ -765,7 +765,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             # runs none in the reverse shape, where ours is the finer one.
             local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
             if pp_size > 1 or local_pp > 1:
-                if self._has_swa:
+                if self._shape.has_swa:
                     raise RuntimeError(
                         "RBLN NIXL: sliding-window attention combined with "
                         "pipeline-parallel P/D is not supported."
@@ -1146,10 +1146,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             or split > 1
             or fanout > 1
             or kv_runs > 1
-            or (
-                (self._chunk_mode or self._writes_less_than_a_request())
-                and not self._own_engine_layout
-            )
+            or ((self._shape.writes_part_of_a_block) and not self._own_engine_layout)
         )
 
     def _register_shard_xfer_state(
@@ -1170,7 +1167,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # descriptors on one block. A head cut names no span with a position,
         # so none of that applies to it.
         assert (
-            not (self._chunk_mode or self._writes_less_than_a_request())
+            not (self._shape.writes_part_of_a_block)
             or self._spans_per_block == 1
             or (peer_areas is None and split == 1 and replica_fanout == 1)
         )

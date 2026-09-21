@@ -391,7 +391,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
 
         Rounds up, because every token counted has to reach the peer.
         """
-        if not self._chunk_mode or not num_valid_tokens or num_blocks <= 0:
+        if not self._shape.chunk_mode or not num_valid_tokens or num_blocks <= 0:
             return None
         rem = num_valid_tokens - (num_blocks - 1) * self.block_size
         if not 1 <= rem <= self.block_size:

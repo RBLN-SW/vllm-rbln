@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
@@ -29,7 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    connector_option,
+    transfer_shape,
 )
 from vllm_rbln.logger import init_logger
 
@@ -52,30 +52,29 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
+        # The same reduction the worker runs, over the same two arguments, so
+        # the two sides cannot answer differently about any of it.
+        self._shape = transfer_shape(
+            vllm_config,
+            kv_cache_config.kv_cache_groups,
+            writes_into_peer=self._writes_into_peer,
+        )
         # NOTE(RBLN): the platform reports device_type "cpu" when device tensors
         # are off, which upstream reads as "no host staging" -- the very setup
         # that needs it. Decide from the requested buffer device instead.
-        self.use_host_buffer = vllm_config.kv_transfer_config.kv_buffer_device == "cpu"
+        self.use_host_buffer = self._shape.use_host_buffer
 
         # Blocks collected so far for a prefill that is still being chunked.
         self._block_ids_need_save: dict[ReqId, BlockIds] = {}
 
+    #: Whether this side originates the bytes into the peer's memory. Mirrors
+    #: the worker's, so one reduction answers for both.
+    _writes_into_peer: ClassVar[bool] = False
+
     @property
     def _sends_token_count(self) -> bool:
-        """Whether the worker needs a request's token count in the metadata.
-
-        Chunk mode sizes the last block's chunks by it; window mode picks which
-        granules of a block the window sits in. Block ids say neither. Streaming
-        turns the window on as well, so it asks for the count for that second
-        reason even where it never cuts a chunk. Asked of the knobs rather than
-        of the cache, since the worker is where they combine and an unused count
-        costs an int a request.
-        """
-        return (
-            connector_option(self.vllm_config, "chunk_mode", False)
-            or connector_option(self.vllm_config, "swa_window_mode", False)
-            or connector_option(self.vllm_config, "push_stream", False)
-        )
+        """Whether the worker needs a request's token count in the metadata."""
+        return self._shape.sends_token_count
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int

@@ -32,6 +32,7 @@ from vllm.v1.request import RequestStatus
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
 from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
+    shape,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
     RblnNixlSchedulerBase,
@@ -41,6 +42,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker imp
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RblnNixlConnectorMetadata,
+    transfer_shape,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
     RblnNixlPullConnectorScheduler,
@@ -111,6 +113,21 @@ def _sched_output(
     )
 
 
+def _state_knobs(sched, *, specs=None, **knobs) -> None:
+    """Set the config and the shape together, the way `__init__` does.
+
+    Setting one without the other is how a test comes to assert a knob the
+    code under test never saw -- the drift this shape exists to remove.
+    """
+    sched.vllm_config = mock_vllm_config(**knobs)
+    sched.vllm_config.parallel_config.tensor_parallel_size = 1
+    sched._shape = transfer_shape(
+        sched.vllm_config,
+        _kv_config(specs if specs is not None else [MagicMock()]).kv_cache_groups,
+        writes_into_peer=type(sched)._writes_into_peer,
+    )
+
+
 def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched = object.__new__(cls)
     sched.vllm_config = mock_vllm_config()
@@ -122,6 +139,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched.side_channel_port = 5000
     # The save path is gated on this, so save tests must turn it on.
     sched.use_host_buffer = use_host_buffer
+    _state_knobs(sched)
     sched._is_hma_required = False  # get_sw_clipped_blocks (inherited) reads this
     sched.blocks_per_sw = [0]
     sched._kv_lease_duration = 30
@@ -150,7 +168,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
         sched._finished_request_blocks = {}
         sched._newly_finished_push_blocks = {}
         # Off by default, as the environment variable is.
-        sched._early_push_enabled = False
+        sched._shape = shape(streams_prefix=False)
         sched._early_sent = set()
     return sched
 
@@ -167,11 +185,12 @@ class TestInit:
         monkeypatch.setattr(
             sm.NixlPullConnectorScheduler, "__init__", lambda self, *a, **k: None
         )
-        vllm_config = SimpleNamespace(
-            kv_transfer_config=SimpleNamespace(kv_buffer_device=kv_buffer_device)
-        )
+        vllm_config = mock_vllm_config()
+        vllm_config.kv_transfer_config.kv_buffer_device = kv_buffer_device
         sched = object.__new__(RblnNixlPullConnectorScheduler)
-        RblnNixlPullConnectorScheduler.__init__(sched, vllm_config, "eng", {"kv": 1})
+        RblnNixlPullConnectorScheduler.__init__(
+            sched, vllm_config, "eng", _kv_config([MagicMock()])
+        )
         assert sched.use_host_buffer is expected
         assert sched._block_ids_need_save == {}
 
@@ -497,7 +516,7 @@ class TestEarlyOfferOnTheWritePath:
         sched = _scheduler(
             use_host_buffer=use_host_buffer, cls=RblnNixlPushConnectorScheduler
         )
-        sched._early_push_enabled = enabled
+        sched._shape = shape(streams_prefix=enabled)
         return sched
 
     @staticmethod
@@ -800,10 +819,10 @@ class TestEarlyPushGate:
     def test_the_gate_needs_the_flag_and_one_block_scale(
         self, monkeypatch, flag, pp_size, groups, host_buffer, expected
     ):
-        def stub_init(self, *a, **k):
-            # Upstream sets this before our gate reads it. The gate does not,
-            # any more: a merged cache reports hybrid while holding one group.
-            self._is_hma_required = groups > 1
+        def stub_init(self, cfg, _engine_id, kv_cache_config):
+            self._shape = transfer_shape(
+                cfg, kv_cache_config.kv_cache_groups, writes_into_peer=True
+            )
 
         monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
         config = mock_vllm_config(push_stream=flag)
@@ -814,7 +833,7 @@ class TestEarlyPushGate:
             config, "eng", _kv_config([MagicMock() for _ in range(groups)])
         )
 
-        assert sched._early_push_enabled is expected
+        assert sched._shape.streams_prefix is expected
 
     def test_one_group_streams_although_upstream_calls_it_hybrid(self, monkeypatch):
         # A merged MLA-plus-indexer cache is reported as hybrid and is ONE
@@ -822,22 +841,26 @@ class TestEarlyPushGate:
         # and the handover carry different groups and the wire cannot tell
         # them apart -- has nothing to apply to here, and the two models this
         # connector cuts on the context axis are both this shape.
-        def stub_init(self, *a, **k):
-            self._is_hma_required = True
+        def stub_init(self, cfg, _engine_id, kv_cache_config):
+            self._shape = transfer_shape(
+                cfg, kv_cache_config.kv_cache_groups, writes_into_peer=True
+            )
 
         monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
         config = mock_vllm_config(push_stream=True)
 
         sched = RblnNixlPushConnectorScheduler(config, "eng", _kv_config([MagicMock()]))
 
-        assert sched._early_push_enabled is True
+        assert sched._shape.streams_prefix is True
 
     def test_a_hybrid_streams_where_its_window_can_be_viewed(self, monkeypatch):
         # The offer carries the full-attention group and the handover carries
         # the window's block; telling them apart on the wire needs the one
         # descriptor list that names two groups, which the view builds.
-        def stub_init(self, *a, **k):
-            self._is_hma_required = True
+        def stub_init(self, cfg, _engine_id, kv_cache_config):
+            self._shape = transfer_shape(
+                cfg, kv_cache_config.kv_cache_groups, writes_into_peer=True
+            )
 
         monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
         config = mock_vllm_config(push_stream=True)
@@ -846,7 +869,7 @@ class TestEarlyPushGate:
             config, "eng", _kv_config([_sw_spec(block_size=1024, sliding_window=128)])
         )
 
-        assert sched._early_push_enabled is True
+        assert sched._shape.streams_prefix is True
 
     @pytest.mark.parametrize("hybrid", [False, True])
     @pytest.mark.parametrize("host_buffer", [False, True])
@@ -859,11 +882,12 @@ class TestEarlyPushGate:
         group count a hybrid model has."""
         specs = [_sw_spec(block_size=1024, sliding_window=128)] if hybrid else []
 
-        def stub_init(self, *a, **k):
-            # Both bases derive these identically; stub them at the same depth
-            # so the gate line is the only thing left that can differ.
-            self._is_hma_required = hybrid
-            self.use_host_buffer = host_buffer
+        def stub_init(self, cfg, _engine_id, kv_cache_config):
+            # Both bases run the same reduction over the same arguments; stub
+            # them at the same depth so nothing but that is left to differ.
+            self._shape = transfer_shape(
+                cfg, kv_cache_config.kv_cache_groups, writes_into_peer=True
+            )
             self._group_specs = specs
 
         monkeypatch.setattr(RblnNixlSchedulerBase, "__init__", stub_init)
@@ -875,9 +899,7 @@ class TestEarlyPushGate:
         worker = RblnNixlPushConnectorWorker(config, "eng", _kv_config(specs))
         worker.shutdown = lambda: None  # the base __init__ was stubbed out
 
-        assert worker._early_push_enabled is sched._early_push_enabled
-        # The routing predicate is what carries the gate into the handshake.
-        assert worker._writes_less_than_a_request() is sched._early_push_enabled
+        assert worker._shape.streams_prefix is sched._shape.streams_prefix
 
 
 class TestTailTokenCountOnTheReadPath:
@@ -900,7 +922,7 @@ class TestTailTokenCountOnTheReadPath:
 
     def _meta_for(self, monkeypatch, remote_num_tokens):
         sched = _scheduler()
-        sched.vllm_config = mock_vllm_config(chunk_mode=True)
+        _state_knobs(sched, chunk_mode=True)
         req = _Request(
             "r0",
             # Apart from the producer's count: a consumer's own prompt length
@@ -944,7 +966,7 @@ class TestTailTokenCountOnTheReadPath:
 
     def _with_knobs(self, **knobs):
         sched = _scheduler()
-        sched.vllm_config = mock_vllm_config(**knobs)
+        _state_knobs(sched, **knobs)
         req = _Request("r0", num_prompt_tokens=33, kv_transfer_params=self._params(33))
         sched._reqs_need_recv["r0"] = (req, ([7],))
         return sched.build_connector_meta(_sched_output("other", ([9],), 16))
@@ -961,9 +983,7 @@ class TestTailTokenCountOnTheWritePath:
             lambda self, request, block_ids: (delay_free_blocks, None),
         )
         sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
-        sched.vllm_config = mock_vllm_config(
-            chunk_mode=trim, swa_window_mode=window, push_stream=stream
-        )
+        _state_knobs(sched, chunk_mode=trim, swa_window_mode=window, push_stream=stream)
         sched.request_finished(
             # Apart, so taking the prompt length instead of what was computed
             # is a different answer.
@@ -993,7 +1013,7 @@ class TestTailTokenCountOnTheWritePath:
         sched = RblnNixlPushConnectorScheduler(
             mock_vllm_config(chunk_mode=True), "eng", MagicMock()
         )
-        sched.vllm_config = mock_vllm_config(chunk_mode=True)
+        _state_knobs(sched, chunk_mode=True)
 
         sched.request_finished(
             # Apart, so taking the prompt length instead of what was computed

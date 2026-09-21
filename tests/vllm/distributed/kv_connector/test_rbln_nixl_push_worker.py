@@ -34,7 +34,9 @@ import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker a
 from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
     set_mock_connector_options,
+    set_shape,
     setattr_in_package,
+    shape,
     window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
@@ -98,14 +100,12 @@ def _push_worker():
     # What __init__ leaves on a D2D worker with the SWA window mode off, which is
     # the shape the pairing predicates read before an engine is registered.
     w.use_host_buffer = False
-    window_mode(w, None)
-    # Off, as the connector option is; the early-write tests turn it on.
-    w._early_push_enabled = False
+    window_mode(w, None, streams_prefix=False)
     w._streamed = {}
     w._empty_receives = set()
     w._recving_transfers = {}
     # Off, as the connector option is; the trim tests turn it on.
-    w._chunk_mode = False
+    set_shape(w, chunk_mode=False)
     # The geometry `__init__` leaves until registration reports one, which is
     # also the permanent value on host staging. `_spans_per_block` reads both.
     w._kv_areas = 1
@@ -347,7 +347,7 @@ class TestPerShardWrite:
         # 2 regions over 2 areas, 16-token blocks: area 0 holds the first 8
         # in-block positions and area 1 the rest.
         w = cls._writing_worker(ranks=1)
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._kv_areas = 2
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         w.block_size = 16
@@ -822,7 +822,6 @@ class TestReplicaFanOut:
         w._kv_areas, w._kv_slices = areas, slices
         w._kv_per_block = 1
         window_mode(w, None)
-        w._chunk_mode = False
         w.use_host_buffer = False
         w.device_id = 0
         w.block_len_per_layer = [4096] * 2
@@ -942,7 +941,7 @@ class TestTheThreeListsAgree:
         w.nixl_memory_type = "VRAM"
         # A block of 16 tokens whose 2-head region costs 16B a token: a 128B
         # descriptor target is 8 tokens, so a block is two chunks.
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._kv_split_axis = KVSplitAxis.HEAD
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = 8
@@ -1004,8 +1003,7 @@ class TestStreamedEngineHandleWrite:
     def _worker(*, total=4, grid=(2, 2), kv_per_block=1):
         w = TestPerShardWrite._writing_worker(ranks=1)
         w._overlapping_ranks = {}  # nothing narrowed: the engine handle
-        w._sw_ratio = 2
-        w._chunk_mode = True
+        window_mode(w, 2, chunk_mode=True)
         w._chunk_grid = grid
         w._request_tail = None
         w.num_regions = 2
@@ -1202,8 +1200,7 @@ class TestDelegatedRouteAlignment:
         # without it is a bug -- except where a sliding window's view already
         # put the extra range on the whole-engine list.
         w = self._worker()
-        w._chunk_mode = True
-        window_mode(w, sw_ratio)
+        window_mode(w, sw_ratio, chunk_mode=True)
         w._chunk_grid = None
         w._request_tail = None
         w._group_specs = [MagicMock()]  # one full-attention group
@@ -1285,7 +1282,7 @@ class TestEarlySend:
         # Derived rather than assigned: host staging is folded into the gate,
         # so "streaming on with a host buffer" is a state __init__ cannot
         # produce and a test must not invent.
-        w._early_push_enabled = enabled and not use_host_buffer
+        w._shape = shape(streams_prefix=enabled and not use_host_buffer)
         w.use_host_buffer = use_host_buffer
         w._finished_blocks_inbox = queue.Queue()
         w._evict_finished_inbox = queue.Queue()
@@ -1549,7 +1546,7 @@ class TestEarlySend:
     def test_the_delegated_route_never_carries_an_early_write(self, monkeypatch):
         # That route's notification has no room for the range a write filled,
         # so a prefix over it would settle nothing. The handshake is what keeps
-        # this unreachable -- see `_writes_less_than_a_request`.
+        # this unreachable -- see `TransferShape.streams_prefix`.
         monkeypatch.setattr(
             NixlPushConnectorWorker,
             "_xfer_blocks_for_req",
@@ -1561,25 +1558,6 @@ class TestEarlySend:
 
         with pytest.raises(AssertionError, match="whole-engine handle"):
             worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1],), ([3],)))
-
-    @pytest.mark.parametrize(
-        ("enabled", "host_buffer", "expected"),
-        [(True, False, True), (False, False, False), (True, True, False)],
-    )
-    def test_streaming_asks_every_peer_for_its_own_descriptors(
-        self, enabled, host_buffer, expected
-    ):
-        # The handshake reads this to decide whether a peer that narrows
-        # nothing still needs per-shard state. Host staging moves a request at
-        # a time, so it wants the ordinary route.
-        worker = self._worker(enabled=enabled, use_host_buffer=host_buffer)
-
-        assert worker._writes_less_than_a_request() is expected
-
-    def test_the_read_path_never_asks_for_its_own_descriptors(self):
-        # The predicate lives on the shared layer and the read path inherits
-        # it; answering yes there would register shards nothing reads.
-        assert RblnNixlWorkerBase._writes_less_than_a_request(object()) is False
 
 
 class TestFlushEarlySends:
@@ -2335,7 +2313,7 @@ class TestStreamWindow:
         send.issued_chunks = chunks
         tail = None
         if valid is not None:
-            w._chunk_mode = True
+            set_shape(w, chunk_mode=True)
             tail = w._tail_chunks(total, valid, chunks_per_span=gpb)
         return w, w._stream_window(
             "r0",
@@ -2555,7 +2533,7 @@ class TestStreamWindow:
         # sending those chunks would move KV the prefill never wrote.
         worker = self._worker(total=4)
         worker.block_size = 16
-        worker._chunk_mode = True
+        set_shape(worker, chunk_mode=True)
         worker._shard_chunk_grids = {("eng", 0): (2, 2)}
         worker._valid_tokens = {"r0": 3 * 16 + 8}
 

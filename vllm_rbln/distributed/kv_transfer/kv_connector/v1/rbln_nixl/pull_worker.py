@@ -96,7 +96,7 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
             # Chunk mode registers per-shard state against every peer unless
             # a sliding window kept it on this route, so reaching upstream's
             # whole-engine read without one means it did not.
-            assert not self._chunk_mode or self._own_engine_layout
+            assert not self._shape.chunk_mode or self._own_engine_layout
             # Counted before the call: upstream trims the front of both lists
             # against the local prefix cache, and the token count describes the
             # request's own blocks.
@@ -104,7 +104,7 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                 self._tail_viewed_as(
                     valid_tokens, self._prompt_blocks(meta.remote.block_ids)
                 )
-                if self._chunk_mode or self._own_engine_layout
+                if self._shape.chunk_mode or self._own_engine_layout
                 else nullcontext()
             )
             with tail:

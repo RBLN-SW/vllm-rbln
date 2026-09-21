@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
+    set_shape,
     sliding_window_spec,
     window_mode,
 )
@@ -39,7 +40,7 @@ class TestComputeDescIds:
     # Routes block ids into the Full range (offset 0) or the SWA range (offset
     # num_full_descs) by group spec, expanded across regions.
     def test_none_ratio_delegates_to_super(self, monkeypatch):
-        worker = build_worker(monkeypatch)  # _sw_ratio is None
+        worker = build_worker(monkeypatch)  # window_ratio is None
         captured = []
 
         def super_impl(self, block_ids, dst, ratio, phys):
@@ -108,7 +109,7 @@ class TestComputeDescIds:
         worker = build_worker(monkeypatch, block_size=64)
         window_mode(worker, 2)
         worker.num_regions = 2
-        worker._chunk_mode = True
+        set_shape(worker, chunk_mode=True)
         worker._kv_areas = 1
         worker._kv_split_axis = KVSplitAxis.HEAD
         worker._chunk_grid = grid
@@ -144,7 +145,9 @@ class TestComputeDescIds:
 
         whole = worker.num_regions * 4
         assert list(out)[-2:] == [12, 20]
-        assert all(whole <= i < whole * (1 + worker._sw_ratio) for i in out[-2:])
+        assert all(
+            whole <= i < whole * (1 + worker._shape.window_ratio) for i in out[-2:]
+        )
 
     def test_a_write_owing_only_the_window_asks_for_no_chunks(self, monkeypatch):
         # A prefill ending on a chunk boundary leaves the full-attention group
@@ -182,8 +185,7 @@ class TestComputeDescIds:
         # -- right after the whole-block range, not after a window range that
         # was never built.
         worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
-        window_mode(worker, None)
-        worker._has_swa = True
+        window_mode(worker, None, chunk_mode=True, has_swa=True)
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
@@ -272,7 +274,7 @@ class TestTailChunks:
         w = build_worker(monkeypatch, block_size=64)
         w._kv_areas = 4
         w._kv_split_axis = axis
-        w._chunk_mode = chunked
+        set_shape(w, chunk_mode=chunked)
         return w
 
     @pytest.mark.parametrize(

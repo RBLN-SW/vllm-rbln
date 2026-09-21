@@ -190,10 +190,10 @@ class TestSwaWindowRatio:
             swa_window_mode=False,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
         # The window is still detected -- it gates the model parallelism guards
         # whether or not window mode is on.
-        assert worker._has_swa
+        assert worker._shape.has_swa
 
     def test_chunk_mode_leaves_the_window_knob_alone(self, monkeypatch):
         # The two knobs name different ranges. Chunk mode used to turn this one
@@ -206,7 +206,7 @@ class TestSwaWindowRatio:
             chunk_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
 
     def test_chunk_mode_invents_no_ratio_without_a_window(self, monkeypatch):
         # The override rides on the window, not on the knob: an engine with no
@@ -218,7 +218,7 @@ class TestSwaWindowRatio:
             chunk_mode=True,
             specs=[MagicMock()],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
 
     def test_pure_full_attention_keeps_ratio_none(self, monkeypatch):
         # A non-sliding-window group contributes no ratio.
@@ -228,7 +228,7 @@ class TestSwaWindowRatio:
             swa_window_mode=True,
             specs=[MagicMock()],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
 
     def test_a_window_as_wide_as_its_block_says_the_knob_did_nothing(
         self, monkeypatch, caplog
@@ -244,7 +244,7 @@ class TestSwaWindowRatio:
                 specs=[sliding_window_spec(block_size=64, sliding_window=64)],
             )
 
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
         assert [
             r.getMessage()
             for r in caplog.records
@@ -258,7 +258,7 @@ class TestSwaWindowRatio:
             swa_window_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio == 4
+        assert worker._shape.window_ratio == 4
 
     def test_a_hybrid_in_chunk_mode_owns_its_lists_without_a_window(self, monkeypatch):
         # What the coupling above used to buy. A shard list names one KV group,
@@ -271,24 +271,8 @@ class TestSwaWindowRatio:
             chunk_mode=True,
             specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        worker._chunk_mode = True  # registration reads the knob, not __init__
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
         assert worker._own_engine_layout
-
-    def test_chunk_mode_on_one_group_stays_off_the_whole_engine_lists(
-        self, monkeypatch
-    ):
-        # The other half of the split: a single-group engine's chunk range
-        # rides the per-shard lists, which is where it rode before any of this.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            swa_window_mode=False,
-            chunk_mode=True,
-            specs=[MagicMock()],
-        )
-        worker._chunk_mode = True
-        assert not worker._own_engine_layout
 
     def test_window_equal_to_block_collapses_to_none(self, monkeypatch):
         # ratio 1 means the window equals the full block -> no trimming.
@@ -298,7 +282,7 @@ class TestSwaWindowRatio:
             swa_window_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=64)],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
 
     def test_full_attention_groups_are_skipped(self, monkeypatch):
         # The hybrid shape: a model interleaves full-attention and sliding-window
@@ -309,7 +293,7 @@ class TestSwaWindowRatio:
             swa_window_mode=True,
             specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio == 4
+        assert worker._shape.window_ratio == 4
 
     def test_consistent_ratio_across_groups(self, monkeypatch):
         worker = build_worker(
@@ -321,7 +305,7 @@ class TestSwaWindowRatio:
                 sliding_window_spec(block_size=64, sliding_window=16),
             ],
         )
-        assert worker._sw_ratio == 4
+        assert worker._shape.window_ratio == 4
 
     def test_mismatched_ratios_are_rejected(self, monkeypatch):
         with pytest.raises(RuntimeError, match="same number of kernel blocks"):
@@ -386,10 +370,10 @@ class TestSwaWindowRatio:
 
 
 class TestSwaWindowDelegation:
-    # Both collapse to the upstream Full-only implementation when _sw_ratio is
+    # Both collapse to the upstream Full-only implementation when window_ratio is
     # None; the SWA dual-range paths are exercised in the Swa classes below.
     def test_register_local_xfer_handler_delegates_when_no_swa(self, monkeypatch):
-        worker = build_worker(monkeypatch)  # _sw_ratio is None
+        worker = build_worker(monkeypatch)  # window_ratio is None
         calls: list = []
 
         def super_handler(self, block_size):
@@ -405,7 +389,7 @@ class TestSwaWindowDelegation:
     def test_a_fanned_out_peer_does_not_take_the_whole_engine_path(self, monkeypatch):
         # One handle covers every region once, which cannot express a slice the
         # peer holds on several of its chiplets.
-        worker = build_worker(monkeypatch)  # _sw_ratio is None
+        worker = build_worker(monkeypatch)  # window_ratio is None
 
         monkeypatch.setattr(
             NixlBaseConnectorWorker,
@@ -421,7 +405,7 @@ class TestSwaWindowDelegation:
         assert worker.register_local_xfer_handler(64, replica_fanout=2) == "shard"
 
     def test_add_remote_agent_delegates_when_no_swa(self, monkeypatch):
-        worker = build_worker(monkeypatch)  # _sw_ratio is None
+        worker = build_worker(monkeypatch)  # window_ratio is None
         calls: list = []
 
         def super_agent(self, meta, rank=0, size=1):
@@ -461,7 +445,7 @@ class TestSwaWindowDelegation:
 
 class TestRegisterLocalXferHandlerSwa:
     # With a sliding-window group and window mode on, register_local_xfer_handler
-    # emits a dual desc range: Full, then the `_sw_ratio` granules that tile a
+    # emits a dual desc range: Full, then the `window_ratio` granules that tile a
     # block, over the same addresses.
     @pytest.mark.parametrize(
         "kernel_block, runs", [(512, 1), (None, 16)], ids=["window-wide", "block-wide"]
@@ -480,15 +464,14 @@ class TestRegisterLocalXferHandlerSwa:
             swa_kernel_block=kernel_block,
         )
         w = make_worker(kv_cache=geo, swa_window_mode=True)
-        assert (w._has_swa, w._sw_ratio) == (True, 2)
-        assert w._window_grid_cut == (runs, 2)
+        assert (w._shape.has_swa, w._shape.window_ratio) == (True, 2)
 
         blocks_data = w.src_blocks_data
         full_len = w.block_len_per_layer[0]
         # A whole block is one descriptor whatever it packs; the window range
         # cuts that same block into the pieces that tile it.
         whole_descs = w.num_regions * w.num_blocks
-        pieces = runs * w._sw_ratio
+        pieces = runs * w._shape.window_ratio
         assert len(blocks_data) == whole_descs * (1 + pieces)
         full, swa = blocks_data[:whole_descs], blocks_data[whole_descs:]
         # The order is a contract, not a detail: a transfer turns (region, block)
@@ -680,7 +663,7 @@ class TestHmaRefusalSuppression:
     def test_a_layout_upstream_judges_right_is_left_alone(
         self, monkeypatch, specs, hma_disabled
     ):
-        # Every later net -- upstream's `_has_mamba`, our `_has_swa` and
+        # Every later net -- upstream's `_has_mamba`, our `has_swa` and
         # `_check_pp_constraints` -- reads the group spec, not what a merged
         # group wraps, so a merged Mamba or SWA group suppressed here would
         # reach the PP region slicing with nothing left to refuse it.
@@ -720,7 +703,6 @@ class TestTheWindowRangeTilesABlock:
         w.block_size = 64
         window_mode(w, self.SW_RATIO, runs=self.RUNS)
         w._has_mamba = False
-        w._chunk_mode = False
         w._kv_per_block = kv_per_block
         w.engine_id = "local"
         w.tp_rank = 0
@@ -780,7 +762,6 @@ class TestASlidingWindowOnThePeerSide(TestTheWindowRangeTilesABlock):
 
     def _descs(self, kv_per_block):
         w = self._worker(kv_per_block)
-        w._has_swa = True
         w._remote_agents = {}
         w.dst_num_blocks = {}
         w.dst_xfer_side_handles = defaultdict(dict)
@@ -832,7 +813,7 @@ class TestAWindowRangeNeedsAGeometryItCanCut:
     def _worker(blocks, *, axis=KVSplitAxis.HEAD, areas=1):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.block_size = 64
-        w._sw_ratio = 4
+        window_mode(w, 4)
         w._swa_kernel_blocks = blocks
         w._kv_split_axis = axis
         w._kv_areas, w._kv_slices = areas, areas
@@ -900,7 +881,7 @@ class TestWindowModeNeedsAWindowThatMoves:
             push_stream=True,
         )
 
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
 
     def test_a_window_that_moves_is_not(self, monkeypatch):
         # The control: the same geometry under the spec whose window slides.
@@ -911,4 +892,4 @@ class TestWindowModeNeedsAWindowThatMoves:
             swa_window_mode=True,
         )
 
-        assert worker._sw_ratio == 2
+        assert worker._shape.window_ratio == 2

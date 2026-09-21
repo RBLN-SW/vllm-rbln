@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
+    TransferShape,
     connector_option,
 )
 from vllm_rbln.logger import init_logger
@@ -106,28 +107,19 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: moving bytes the other way must not pass the handshake (`rbln_compat_hash`).
     _writes_into_peer: ClassVar[bool] = False
 
-    def _writes_less_than_a_request(self) -> bool:
-        """Whether this side ever moves part of a request at a time.
-
-        A peer that narrows nothing is described by upstream's whole-engine
-        handle, and that handle's notification has no room to say which blocks
-        a transfer filled. Anything sending a request in pieces needs its own
-        descriptors for that reason alone, so it has to be asked for even when
-        the two sides are shaped identically.
-        """
-        return False
-
     # While registering one peer, the local region ids that peer's regions
     # correspond to, in ITS order -- see `_regions_viewed_as`.
     _viewed_region_ids: list[int] | None = None
 
     _group_specs: list[Any]
-    _has_swa: bool
-    _sw_ratio: int | None
+    #: What the knobs and the groups settled, before any geometry. Both sides
+    #: derive it from the same inputs (`transfer_shape`), so neither can hold
+    #: an answer of its own.
+    _shape: TransferShape
     #: Tokens one block holds in the view the sliding-window kernel reads, per
     #: sliding-window group, which is not `block_size` where that kernel takes
-    #: a window a block. Observed at registration, not derived. Empty where
-    #: this rank holds no such group.
+    #: a window a block. Geometry, so the shape does not carry it: observed at
+    #: registration, not derived. Empty where this rank holds no such group.
     _swa_kernel_blocks: set[int]
 
     _kv_areas: int
@@ -137,7 +129,6 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: registration derives it, the handshake pairs and advertises on it, and
     #: both a shard list's descriptors and a chunk range's runs are cut by it.
     _kv_per_block: int
-    _chunk_mode: bool
     _logical_region_kv_heads: list[int | None]
     _logical_region_slices: list[int]
     local_seen_layer_names: list[str]
@@ -195,7 +186,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         belongs here too, while a single-group engine's chunk range rides the
         shard lists. A window as wide as the block adds no range at all.
         """
-        return self._sw_ratio is not None or (self._chunk_mode and self._has_swa)
+        return self._shape.owns_engine_lists
 
     @property
     def _spans_per_block(self) -> int:
@@ -344,7 +335,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         at or above one asks for -- so neither list grows. A side that writes a
         request in pieces asks for a grid as the knob does.
         """
-        if not (self._chunk_mode or self._writes_less_than_a_request()):
+        if not (self._shape.writes_part_of_a_block):
             return None
         cut = self._block_runs(split=split, kv_runs=kv_runs)
         if cut is None:
@@ -410,9 +401,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         Where it addresses whole blocks, a piece is a token range of one, which
         the head cut spreads exactly as it spreads a chunk.
         """
-        if self._sw_ratio is None:
+        ratio = self._shape.window_ratio
+        if ratio is None:
             return None
-        window = self.block_size // self._sw_ratio
+        window = self.block_size // ratio
         if self._swa_kernel_blocks != {window} and self._swa_kernel_blocks != {
             self.block_size
         }:
@@ -425,7 +417,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 f"and this engine's are {sorted(self._swa_kernel_blocks)}."
             )
         if self._swa_kernel_blocks == {window}:
-            return 1, self._sw_ratio
+            return 1, ratio
         cut = self._block_runs(split=1, kv_runs=1)
         if cut is None:
             raise RuntimeError(
@@ -440,7 +432,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 f"is cut on the {self._kv_split_axis.name} axis into "
                 f"{self._kv_areas} area(s)."
             )
-        return cut[1], self._sw_ratio
+        return cut[1], ratio
 
     @staticmethod
     def _slice_head_bounds(

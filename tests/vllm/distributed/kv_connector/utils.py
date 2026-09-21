@@ -34,9 +34,14 @@ import contextlib
 import functools
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (  # noqa: E501
+        TransferShape,
+    )
 
 # A hub id would revalidate config.json over the network on every build.
 MODEL = "meta-llama/Llama-3.2-1B-Instruct"
@@ -710,6 +715,51 @@ def patched_in_package(name: str, value: Any = None) -> Any:
 # that pin a spec or a missing `nixl_rbln` and have no geometry to go with it.
 
 
+def shape(**over) -> TransferShape:
+    """A `TransferShape` with the fields a test means and the rest switched off.
+
+    Hand-built workers skip `__init__`, so they have to be handed the shape the
+    reduction would have produced. Naming only the fields under test keeps a
+    case from asserting a value it never meant to pin.
+    """
+    from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+        TransferShape,
+    )
+
+    fields = dict(
+        chunk_mode=False,
+        wants_window=False,
+        wants_stream=False,
+        streams_prefix=False,
+        window_ratio=None,
+        counted_group=0,
+        has_swa=False,
+        groups_uniform_per_layer=False,
+        use_host_buffer=False,
+        writes_into_peer=False,
+    )
+    # A ratio without a window is a shape the reduction cannot produce.
+    if over.get("window_ratio") is not None:
+        fields["has_swa"] = True
+    fields.update(over)
+    return TransferShape(**fields)
+
+
+def set_shape(worker, **over) -> None:
+    """Change named fields of a worker's shape, leaving the rest as they were.
+
+    A hand-built worker states its shape once; a case that turns one knob on
+    says only that, rather than restating the whole shape and pinning fields it
+    never meant to. A worker with no shape yet starts from `shape`'s, where
+    everything is off.
+    """
+    import dataclasses
+
+    worker._shape = dataclasses.replace(
+        getattr(worker, "_shape", None) or shape(), **over
+    )
+
+
 def sliding_window_spec(*, block_size, sliding_window):
     from unittest.mock import MagicMock
 
@@ -721,29 +771,22 @@ def sliding_window_spec(*, block_size, sliding_window):
     return spec
 
 
-def window_mode(worker: Any, ratio: int | None, *, runs: int = 1) -> None:
+def window_mode(worker: Any, ratio: int | None, *, runs: int = 1, **over) -> None:
     """Put a worker in window mode the way registration would.
 
-    Three values, not one. The ratio says how many granules tile a block; the
-    grid says how one granule's bytes are laid out, defaulting to the geometry
-    where a granule IS a kernel block and so one run; the observation is the
-    geometry that grid belongs to, which a peer is refused against.
+    The shape and the geometry, which registration settles at different times:
+    `shape` carries the ratio the knobs asked for, and the two fields after it
+    carry what the runner's binding turned out to be. The default is the
+    geometry where a granule IS a kernel block and so one byte run.
 
-    `_has_swa` follows a ratio, which cannot exist without a window. Turning
-    the mode off says nothing about whether the engine has one, so a stub that
-    means a hybrid sets that itself.
+    Extra keywords go to `shape`, for a case that means more than a window.
     """
-    worker._sw_ratio = ratio
+    worker._shape = shape(window_ratio=ratio, **over)
     if ratio is None:
         worker._swa_kernel_blocks = set()
         worker._window_grid_cut = None
-        if not hasattr(worker, "_has_swa"):
-            worker._has_swa = False
         return
-    worker._has_swa = True
     block_size = getattr(worker, "block_size", None)
-    # The observation the grid was chosen from, so a stub pairs with a peer the
-    # way the engine it stands for would.
     worker._swa_kernel_blocks = (
         set()
         if block_size is None
@@ -768,10 +811,15 @@ def build_worker(
     chunk_mode=False,
     chunk_tokens=0,
     push_stream=False,
+    cls=None,
     swa_kernel_block=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent.
+
+    `cls` picks the direction. It is the read side by default, and the write
+    side is asked for by name -- the shape puts the direction in, so a knob
+    only the writer acts on is inert on the other.
 
     ``swa_kernel_block`` is the runner's choice of how many tokens a block holds
     in the view the sliding-window kernel reads; the default is the geometry
@@ -836,6 +884,9 @@ def build_worker(
     # What the worker sets before it builds the connector; `register_kv_caches`
     # takes the count from here.
     vllm_config.cache_config.num_gpu_blocks = num_blocks
+    # The shape reads the requested buffer device off the config, which is
+    # where an engine states it; the worker attribute is derived from it.
+    vllm_config.kv_transfer_config.kv_buffer_device = kv_buffer_device
     # No speculative decoding: the compat hash then folds what it always did.
     vllm_config.speculative_config = None
     # _check_pp_constraints compares pipeline_parallel_size <= 1; a MagicMock
@@ -871,4 +922,5 @@ def build_worker(
         tokens = spec.sliding_window if swa_kernel_block is None else swa_kernel_block
         ctx[f"g{i}.l0"] = SimpleNamespace(kv_cache=torch.zeros(1, 1, tokens, 1))
     vllm_config.compilation_config.static_forward_context = ctx
-    return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+    worker_cls = cls or RblnNixlPullConnectorWorker
+    return worker_cls(vllm_config, "test-engine", kv_cache_config)

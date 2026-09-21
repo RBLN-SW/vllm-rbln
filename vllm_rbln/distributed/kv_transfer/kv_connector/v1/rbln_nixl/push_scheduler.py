@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -31,43 +31,13 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler 
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RblnNixlConnectorMetadata,
-    connector_option,
-)
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.registration import (
-    sliding_window_ratio,
 )
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
-
-
-def push_stream_enabled(
-    vllm_config: VllmConfig,
-    *,
-    use_host_buffer: bool,
-    specs: list["KVCacheSpec"],
-) -> bool:
-    """Whether a prefill's closed prefix leaves before the request ends.
-
-    What decides it is how many KV-cache groups the engine has, not whether
-    upstream calls it hybrid. A second group is carried at a different time --
-    the offer takes the full-attention one and the handover takes the window's
-    block -- and telling them apart on the wire needs the one descriptor list
-    able to name two groups, which only a viewable sliding window builds. One
-    group has nothing to tell apart. Host staging holds no areas to write out
-    of and is left out either way.
-
-    Derived in one place because the two sides decide different things from it
-    and must not disagree: the scheduler stops building offers, and the worker
-    stops asking a peer for per-shard descriptors. A side that takes one
-    without the other routes its peers to a path nothing feeds.
-    """
-    if not connector_option(vllm_config, "push_stream", False) or use_host_buffer:
-        return False
-    return len(specs) == 1 or sliding_window_ratio(specs) is not None
 
 
 class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorScheduler):
@@ -81,6 +51,8 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
     offered; the end still carries the block that prefix never closes.
     """
 
+    _writes_into_peer: ClassVar[bool] = True
+
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
@@ -90,11 +62,6 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         # rest of it is still running on later pipeline stages or in this
         # rank's own later chunks. Which peers can be written a prefix is not
         # known until the handshake, so that part is settled per write.
-        self._early_push_enabled = push_stream_enabled(
-            vllm_config,
-            use_host_buffer=self.use_host_buffer,
-            specs=[g.kv_cache_spec for g in kv_cache_config.kv_cache_groups],
-        )
         # How much of each request's prefix has already been offered, so a
         # step that closes no new block offers nothing.
         self._streamed_chunks: dict[str, int] = {}
@@ -113,7 +80,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         # host staging, and the accumulation that path builds is what the
         # early offer reads.
         params = request.kv_transfer_params
-        if self._early_push_enabled and params and params.get("do_remote_decode"):
+        if self._shape.streams_prefix and params and params.get("do_remote_decode"):
             self._reqs_need_save[request.request_id] = request
 
     def build_connector_meta(
@@ -123,7 +90,7 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         assert isinstance(base_meta, NixlConnectorMetadata)
         meta = RblnNixlConnectorMetadata.promote(base_meta)
 
-        if self._early_push_enabled:
+        if self._shape.streams_prefix:
             # Upstream fills `reqs_to_save` for host staging only (see
             # `_build_stream_meta`).
             self._build_stream_meta(meta, scheduler_output)

@@ -43,9 +43,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RBLN_COVERAGE_NOTIF_PREFIX,
     RblnNixlConnectorMetadata,
 )
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_scheduler import (
-    push_stream_enabled,
-)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -227,11 +224,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # one and nothing can reach it unstripped.
         self._pending_completion_notifs = _CoverageNotifQueue(self)
 
-        self._early_push_enabled = push_stream_enabled(
-            vllm_config,
-            use_host_buffer=self.use_host_buffer,
-            specs=self._group_specs,
-        )
         # Per request, for as long as it is being pushed in pieces. Created
         # when this rank first closes a chunk of it, dropped when the send is
         # over -- see _StreamedSend.
@@ -308,16 +300,13 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 send.queued += 1
                 send.expected = send.queued
 
-    def _writes_less_than_a_request(self) -> bool:
-        return self._early_push_enabled
-
     def start_early_push(self, metadata: "RblnNixlConnectorMetadata") -> None:
         """Hold the prefill this stage has just closed, for the writer.
 
         NOTE(RBLN): `reqs_to_save` says a request's KV for this rank's layers
         is complete. Host staging reads that to fill its buffer, and this
         reads it to write straight out of device memory. The two never run on
-        the same request because `push_stream_enabled` refuses host staging.
+        the same request because the shape refuses host staging.
 
         Held rather than handed over, because the forward that produced the KV
         completes asynchronously: a write issued from here would read KV still
@@ -328,7 +317,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         for the step is already done: speculative decoding on the last stage
         defers `wait_for_save` past `get_finished`, which would reverse them.
         """
-        if not self._early_push_enabled:
+        if not self._shape.streams_prefix:
             return
         if not metadata.reqs_to_save:
             return
@@ -682,7 +671,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             # Chunk mode asks for per-shard state, because those ids are what
             # can leave part of a block out -- unless a sliding window kept it
             # on this route, whose list carries the range instead.
-            assert not self._chunk_mode or self._own_engine_layout
+            assert not self._shape.chunk_mode or self._own_engine_layout
             send = self._streamed.get(req_id)
             if send is not None and send.released:
                 # Streaming asks for the same state, and for the same reason
@@ -704,7 +693,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     # own blocks.
                     self._prompt_blocks(meta.local_physical_block_ids),
                 )
-                if self._chunk_mode or self._own_engine_layout
+                if self._shape.chunk_mode or self._own_engine_layout
                 else nullcontext()
             )
             # NOTE(RBLN): upstream aligns by truncating the longer list and
