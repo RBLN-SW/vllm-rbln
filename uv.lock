@@ -3529,7 +3529,7 @@ requires-dist = [
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0.dev0,<0.12.1" },
-    { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = "~=0.1.0.dev0" },
+    { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.1.0.dev0,<0.1.1" },
     { name = "openai", specifier = ">=2.25.0" },
     { name = "optimum-rbln", specifier = ">=0.11.3a8,<0.11.4" },
     { name = "packaging", marker = "extra == 'dev'" },
