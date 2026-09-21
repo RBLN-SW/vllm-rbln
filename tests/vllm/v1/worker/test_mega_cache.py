@@ -44,7 +44,21 @@ def _raiser(exc):
 
 
 def _stub_config(digest: str = "cfghash"):
-    return SimpleNamespace(compute_hash=lambda: digest)
+    return SimpleNamespace(
+        compute_hash=lambda: digest,
+        additional_config=SimpleNamespace(
+            use_custom_kernel=False,
+            use_flash_causal_attn=True,
+        ),
+        attention_config=SimpleNamespace(use_non_causal=False),
+        cache_config=SimpleNamespace(
+            block_size=16,
+            num_gpu_blocks_override=None,
+            gpu_memory_utilization=0.9,
+        ),
+        model_config=SimpleNamespace(max_model_len=32),
+        kv_transfer_config=None,
+    )
 
 
 class TestRebelVersion:
@@ -86,6 +100,19 @@ class TestSignatureComposition:
         before = mega_cache.config_signature(_stub_config())
         monkeypatch.setattr(mega_cache, "_rebel_major_minor", lambda: "0.12")
         assert mega_cache.config_signature(_stub_config()) != before
+
+    def test_resolved_dynamic_kv_decision_invalidates(self, monkeypatch):
+        enabled = True
+        monkeypatch.setattr(
+            mega_cache,
+            "dynamic_kv_enabled",
+            lambda config: enabled,
+            raising=False,
+        )
+        dynamic = mega_cache.config_signature(_stub_config())
+        enabled = False
+        static = mega_cache.config_signature(_stub_config())
+        assert dynamic != static
 
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this

@@ -334,6 +334,24 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "RBLN_USE_CUSTOM_KERNEL is on, and the rbln_triton_ops kernels take "
             "no dynamic KV input"
         )
+    if not rbln_config.use_flash_causal_attn:
+        return (
+            "flash causal attention is off, so the model dispatches to an "
+            "attention kernel that does not accept a dynamic KV input"
+        )
+    if vllm_config.attention_config.use_non_causal:
+        return (
+            "non-causal attention dispatches to a kernel that does not accept "
+            "a dynamic KV input"
+        )
+    if vllm_config.cache_config.block_size == vllm_config.model_config.max_model_len:
+        # This selects the normal-attention kernels unless the model supplies
+        # attention sinks. The decision runs before the layers exist, so keep
+        # that uncommon shape on the safe static path too.
+        return (
+            "block_size == max_model_len selects normal attention, whose kernel "
+            "does not accept a dynamic KV input"
+        )
     kv_transfer = vllm_config.kv_transfer_config
     if (
         kv_transfer is not None

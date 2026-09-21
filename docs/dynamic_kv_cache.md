@@ -106,9 +106,9 @@ from the environment. It is a trace hint for the dynamic dimension, not a
 capacity: the count that ends up in service comes from the placement and the
 snapshot.
 
-Use a separate `VLLM_CACHE_ROOT` per configuration. The compile cache hash does
-not include dynamism, so a static and a dynamic build of the same model share one
-signature and can replay each other's codegen.
+The mega-cache bundle key includes the resolved dynamic-KV decision, not only
+the environment flag. A configuration that turns the feature off therefore
+cannot replay a dynamic artifact, or vice versa.
 
 When the pre-compile estimate falls short of one max-length request, it is
 raised to exactly that with a warning instead of letting vllm refuse the compile:
@@ -133,6 +133,8 @@ feature is absent there rather than disabled.
 | --- | --- |
 | `VLLM_RBLN_USE_DEVICE_TENSOR=0` | The artifact carries no dynamic KV dimension. |
 | `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
+| Flash causal attention disabled, or non-causal attention enabled | These dispatch to attention kernels that do not accept a dynamic KV input. |
+| `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
 | A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. |
 
 ## When Start-up Refuses

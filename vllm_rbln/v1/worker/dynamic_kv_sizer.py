@@ -175,12 +175,6 @@ class DynamicKvSizer:
         self.kv_blocks_before_shrink: int | None = None
         self.programs: list[Any] = []
         self.expected_used: dict[Unit, int] = {}
-        if self.mode is DynamicKvMode.DISABLED:
-            logger.warning(
-                "[Dynamic KV] off for this run (%s); the KV cache is sized from "
-                "the pre-compile estimate, which has no notion of chiplets.",
-                self.mode_reason,
-            )
         # Other tenants' card DRAM at init; the allocator-snapshot fallback only.
         self.foreign_dram_used_bytes = foreign_dram_used_bytes
         device_env = current_platform.device_control_env_var

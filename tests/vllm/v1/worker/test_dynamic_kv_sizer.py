@@ -378,6 +378,33 @@ class TestModeResolution:
     """One decision at init: every input is static config or env, so the rest of
     the sizer branches on the mode instead of re-reading them."""
 
+    def test_explicit_off_is_silent_in_the_worker(self, monkeypatch, caplog):
+        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0")
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+        config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=None,
+                block_size=16,
+            ),
+            scheduler_config=SimpleNamespace(),
+            device_config=SimpleNamespace(device=torch.device("cpu")),
+            parallel_config=SimpleNamespace(rank=0),
+            model_config=SimpleNamespace(enforce_eager=False, max_model_len=32),
+            additional_config=SimpleNamespace(
+                compile_model=True,
+                use_custom_kernel=False,
+                use_flash_causal_attn=True,
+            ),
+            attention_config=SimpleNamespace(use_non_causal=False),
+            kv_transfer_config=None,
+        )
+
+        with caplog.at_level("WARNING"):
+            sizer = DynamicKvSizer(config, object(), foreign_dram_used_bytes=0)
+
+        assert sizer.mode is dks.DynamicKvMode.DISABLED
+        assert "[Dynamic KV] off for this run" not in caplog.text
+
     @staticmethod
     def _mode(**kwargs):
         args = dict(

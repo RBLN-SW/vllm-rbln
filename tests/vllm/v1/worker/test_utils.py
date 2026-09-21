@@ -1421,9 +1421,22 @@ class TestDynamicKvUnsupportedReason:
     have served."""
 
     @staticmethod
-    def _cfg(use_custom_kernel=False, kv_transfer_config=None):
+    def _cfg(
+        use_custom_kernel=False,
+        use_flash_causal_attn=True,
+        use_non_causal=False,
+        block_size=16,
+        max_model_len=32,
+        kv_transfer_config=None,
+    ):
         return SimpleNamespace(
-            additional_config=RBLNConfig(use_custom_kernel=use_custom_kernel),
+            additional_config=RBLNConfig(
+                use_custom_kernel=use_custom_kernel,
+                use_flash_causal_attn=use_flash_causal_attn,
+            ),
+            attention_config=SimpleNamespace(use_non_causal=use_non_causal),
+            cache_config=SimpleNamespace(block_size=block_size),
+            model_config=SimpleNamespace(max_model_len=max_model_len),
             kv_transfer_config=kv_transfer_config,
         )
 
@@ -1445,6 +1458,20 @@ class TestDynamicKvUnsupportedReason:
         # KV input never reaches a whitelisted paged_* custom op.
         reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))
         assert "RBLN_USE_CUSTOM_KERNEL" in reason
+
+    @pytest.mark.parametrize(
+        ("config_overrides", "expected"),
+        [
+            ({"block_size": 32}, "block_size == max_model_len"),
+            ({"use_flash_causal_attn": False}, "flash causal attention is off"),
+            ({"use_non_causal": True}, "non-causal attention"),
+        ],
+        ids=["normal-attention", "flash-causal-off", "non-causal"],
+    )
+    def test_non_paged_attention_is_unsupported(self, config_overrides, expected):
+        reason = dynamic_kv_unsupported_reason(self._cfg(**config_overrides))
+        assert reason is not None
+        assert expected in reason
 
     def test_an_unlisted_kv_transfer_connector_is_unsupported(self):
         # The worker drives the registration behind the resize, so the set is
