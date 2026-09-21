@@ -153,10 +153,74 @@ class TestHostBufferCopyOp:
 
         runner = make_model_runner(init_kv_cache=False)
         runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[("layer.0",)]))
+        runner.register_kv_caches_with_connector()
         runner.kv_cache_block_axes = {"layer.0": 1}
         captured[0]({}, {}, [], [], "h2d")
 
         assert seen == {"block_axes": {"layer.0": 1}}
+
+
+class TestRegisterKvCachesWithConnector:
+    """The connector is handed whatever the runner holds when it is called.
+
+    The worker calls it after `initialize_kv_cache` on a run that keeps that
+    cache, and again after a dynamic-KV resize has rebuilt every tensor.
+    """
+
+    @staticmethod
+    def _registrations(monkeypatch) -> list[dict]:
+        registered: list[dict] = []
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(
+            mr,
+            "get_kv_transfer_group",
+            lambda: SimpleNamespace(
+                register_kv_caches=registered.append,
+                set_host_xfer_buffer_ops=lambda _op: None,
+            ),
+        )
+        return registered
+
+    def test_the_caches_registered_are_the_ones_bound(
+        self, make_model_runner, monkeypatch
+    ):
+        registered = self._registrations(monkeypatch)
+        # One layer per group, so both survive the canonical-layer filter that
+        # keeps aliasing SWA views out of the registration.
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            additional_config={"enable_sub_block_cache": False},
+        )
+
+        runner.register_kv_caches_with_connector()
+
+        # In layer-index order: NIXL numbers its transfer regions by iteration
+        # order, and the peer matches regions to layers by that same order.
+        assert list(registered[0]) == runner.kv_cache_names
+        assert [id(t) for t in registered[0].values()] == [
+            id(t) for t in runner.kv_caches
+        ]
+
+    def test_a_rebuilt_cache_is_what_the_second_call_registers(
+        self, make_model_runner, monkeypatch
+    ):
+        # `DynamicKvSizer.reallocate` rebuilds the tensors after warm-up. A
+        # registration holding the first set would name freed memory.
+        registered = self._registrations(monkeypatch)
+        runner = make_model_runner()
+        runner.register_kv_caches_with_connector()
+
+        runner.initialize_kv_cache_tensors(
+            runner.kv_cache_config, runner._kernel_block_sizes
+        )
+        runner.register_kv_caches_with_connector()
+
+        first, second = registered
+        assert all(
+            before is not after
+            for before, after in zip(first.values(), second.values(), strict=True)
+        )
+        assert [id(t) for t in second.values()] == [id(t) for t in runner.kv_caches]
 
 
 class TestBuildAttentionMetadata:

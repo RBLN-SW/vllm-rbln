@@ -803,11 +803,25 @@ class TestDynamicKvConfig:
             self._cfg(speculative_config=SimpleNamespace())
         )
 
-    def test_a_kv_transfer_connector_is_rejected(self):
-        with pytest.raises(ValueError, match="KV transfer"):
+    def test_an_unlisted_kv_transfer_connector_is_rejected(self):
+        # The resize reallocates the cache after warm-up and the worker drives
+        # the registration behind it. That is connector-agnostic, so the set is
+        # a policy and the message names the connector that was asked for.
+        with pytest.raises(ValueError, match="RBLNLMCacheConnectorV1"):
             RblnPlatform._validate_dynamic_kv_config(
-                self._cfg(kv_transfer_config=SimpleNamespace())
+                self._cfg(
+                    kv_transfer_config=SimpleNamespace(
+                        kv_connector="RBLNLMCacheConnectorV1"
+                    )
+                )
             )
+
+    def test_the_rbln_nixl_read_path_passes(self):
+        RblnPlatform._validate_dynamic_kv_config(
+            self._cfg(
+                kv_transfer_config=SimpleNamespace(kv_connector="RblnNixlPullConnector")
+            )
+        )
 
     def test_a_dry_run_reports_every_refusal_instead_of_raising(
         self, monkeypatch, caplog
@@ -821,11 +835,15 @@ class TestDynamicKvConfig:
             caplog.at_level("WARNING"),
         ):
             RblnPlatform._validate_dynamic_kv_config(
-                self._cfg(kv_transfer_config=SimpleNamespace())
+                self._cfg(
+                    kv_transfer_config=SimpleNamespace(
+                        kv_connector="RBLNLMCacheConnectorV1"
+                    )
+                )
             )
         assert "VLLM_RBLN_USE_VLLM_MODEL=1" in caplog.text
         assert "VLLM_RBLN_USE_DEVICE_TENSOR=1" in caplog.text
-        assert "KV transfer connector" in caplog.text
+        assert "RBLNLMCacheConnectorV1" in caplog.text
         assert caplog.text.count("dynamic KV cache dry run:") == 3
 
     def test_device_tensor_off_is_refused(self):

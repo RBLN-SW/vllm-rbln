@@ -209,6 +209,16 @@ class DynamicKvSizer:
     def compiled_with_shrunk_cache(self) -> bool:
         return self.kv_blocks_before_shrink is not None
 
+    @property
+    def defers_kv_registration(self) -> bool:
+        """Whether a KV connector has to wait for `apply_num_blocks`.
+
+        ACTIVE is the one mode that replaces the KV cache tensors after
+        warm-up. A connector registering before that would pin addresses the
+        reallocation frees, at a block count the resize then changes.
+        """
+        return self.mode is DynamicKvMode.ACTIVE
+
     def record_programs(self, programs: list[Any]) -> None:
         self.programs.extend(programs)
         logger.info(
