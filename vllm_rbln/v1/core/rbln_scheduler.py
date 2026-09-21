@@ -32,6 +32,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
@@ -122,6 +123,7 @@ class RBLNScheduler(Scheduler):
         # lifecycle hooks clear its pending delta before it can resume with
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
+        self._kv_load_failure_req_ids: set[str] = set()
 
         # NOTE(RBLN): PP degree for the per-step decode-admission budget
         # (DecodeBatchBudget.for_step): hard cap = max_num_seqs // pp, soft cap =
@@ -476,6 +478,14 @@ class RBLNScheduler(Scheduler):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if request_id in self._kv_load_failure_req_ids:
+                    if request.num_in_flight_tokens:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                    request.async_tokens_to_discard = 0
+                    self._kv_load_failure_req_ids.remove(request_id)
 
                 # NOTE(RBLN): gate every waiting admission by the shared decode
                 # budget so running + waiting stay within the compiled shape
@@ -978,7 +988,7 @@ class RBLNScheduler(Scheduler):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
-            preempted_req_ids={req.request_id for req in preempted_reqs},
+            preempted_req_ids=self.reset_preempted_req_ids,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -1022,6 +1032,91 @@ class RBLNScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _handle_invalid_blocks(
+        self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
+    ) -> set[str]:
+        groups = self.kv_cache_config.kv_cache_groups
+        if len(groups) == 1 and not isinstance(
+            groups[0].kv_cache_spec, SlidingWindowSpec
+        ):
+            return super()._handle_invalid_blocks(
+                invalid_block_ids, num_scheduled_tokens
+            )
+
+        affected = []
+        blocks_to_evict = set(invalid_block_ids)
+        pending = [
+            request
+            for request in itertools.chain(self.running, self.skipped_waiting)
+            if request.status
+            in (
+                RequestStatus.RUNNING,
+                RequestStatus.WAITING_FOR_REMOTE_KVS,
+            )
+        ]
+        # A consumer may have reclaimed the failed SWA block while retaining
+        # full-attention blocks produced from it. Follow shared dependencies.
+        while pending:
+            previous_count = len(pending)
+            for request in list(pending):
+                blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks
+                computed = request.num_computed_tokens - num_scheduled_tokens.get(
+                    request.request_id, 0
+                )
+                first_invalid_token = min(
+                    (
+                        index * group.kv_cache_spec.block_size
+                        for group, group_blocks in zip(groups, blocks, strict=True)
+                        for index, block in enumerate(group_blocks)
+                        if not block.is_null
+                        and block.block_id in blocks_to_evict
+                        and index * group.kv_cache_spec.block_size < computed
+                    ),
+                    default=None,
+                )
+                if first_invalid_token is not None:
+                    affected.append(request)
+                    pending.remove(request)
+                    blocks_to_evict.update(
+                        block.block_id
+                        for group, group_blocks in zip(groups, blocks, strict=True)
+                        for index, block in enumerate(group_blocks)
+                        if not block.is_null
+                        and (index + 1) * group.kv_cache_spec.block_size
+                        > first_invalid_token
+                    )
+            if len(pending) == previous_count:
+                break
+
+        # Rewinding alone cannot refill reclaimed SWA holes. Invalidate every
+        # affected request before freeing shared blocks, then allocate afresh.
+        self.kv_cache_manager.evict_blocks(blocks_to_evict)
+        if self.recompute_kv_load_failures and affected:
+            for request in reversed(affected):
+                request.skip_reading_prefix_cache = True
+                if request.status == RequestStatus.RUNNING:
+                    self.running.remove(request)
+                    self._preempt_request(request, time.monotonic())
+                    self._kv_load_failure_req_ids.add(request.request_id)
+                    request.num_output_placeholders = 0
+                    # Keep stale speculative outputs suppressed until all
+                    # in-flight frames drain and the waiting request resumes.
+                    request.async_tokens_to_discard = 1
+                else:
+                    request.num_computed_tokens = 0
+                    self.failed_recving_kv_req_ids.add(request.request_id)
+            logger.warning(
+                "Recomputing %d requests after hybrid KV load failure", len(affected)
+            )
+        return {request.request_id for request in affected}
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int]
+    ) -> tuple[list[int], bool]:
+        if request.request_id in self._kv_load_failure_req_ids:
+            return [], False
+        return super()._update_request_with_output(request, new_token_ids)
 
     def _preempt_request(
         self, request: Request, timestamp: float
@@ -1075,6 +1170,7 @@ class RBLNScheduler(Scheduler):
         # Drop any pending runner block delta; the request is finishing and will
         # never be scheduled again.
         self._pending_runner_block_deltas.pop(request.request_id, None)
+        self._kv_load_failure_req_ids.discard(request.request_id)
         return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(
