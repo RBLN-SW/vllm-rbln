@@ -18,9 +18,7 @@ version = "1.14.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "huggingface-hub" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "packaging" },
     { name = "psutil" },
     { name = "pyyaml" },
@@ -30,6 +28,48 @@ dependencies = [
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/accelerate/1.14.0/accelerate-1.14.0.tar.gz", hash = "sha256:41b9c4377a54e0b460a959b0defa1b736e4ca0a2373252d9a539964c2afe3c8d" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/accelerate/1.14.0/accelerate-1.14.0-py3-none-any.whl", hash = "sha256:e94390c2863b873be18f623f9df48a0d8fe5eff13ea7f1a00092b0a7904888c6" },
+]
+
+[[package]]
+name = "aiofile"
+version = "3.9.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+resolution-markers = [
+    "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "caio", version = "0.9.25", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" } },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/aiofile/3.9.0/aiofile-3.9.0.tar.gz", hash = "sha256:e5ad718bb148b265b6df1b3752c4d1d83024b93da9bd599df74b9d9ffcf7919b" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/aiofile/3.9.0/aiofile-3.9.0-py3-none-any.whl", hash = "sha256:ce2f6c1571538cbdfa0143b04e16b208ecb0e9cb4148e528af8a640ed51cc8aa" },
+]
+
+[[package]]
+name = "aiofile"
+version = "3.12.3"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+dependencies = [
+    { name = "caio", version = "0.12.4", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" } },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/aiofile/3.12.3/aiofile-3.12.3.tar.gz", hash = "sha256:caa6aa746b5e47e2165f7abd741b6415e49cf4d44fddc0f61844612cc3924d41" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/aiofile/3.12.3/aiofile-3.12.3-py3-none-any.whl", hash = "sha256:5c1bcc9e929c50834608e8cc1a4cc1d7503eb60c15a535b779fd39e2f372c017" },
+]
+
+[[package]]
+name = "aiofiles"
+version = "25.1.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/aiofiles/25.1.0/aiofiles-25.1.0.tar.gz", hash = "sha256:a8d728f0a29de45dc521f18f07297428d56992a742f0cd2701ba86e44d23d5b2" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/aiofiles/25.1.0/aiofiles-25.1.0-py3-none-any.whl", hash = "sha256:abe311e527c862958650f9438e859c1fa7568a141b22abcd015e120e86a85695" },
 ]
 
 [[package]]
@@ -226,6 +266,22 @@ wheels = [
 ]
 
 [[package]]
+name = "awscrt"
+version = "0.36.4"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4.tar.gz", hash = "sha256:5b6a53f10e8dd060e7c0c91d063831137239c234877a6d1f03b277dfbac0c507" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8238c7544316b9d1739d02cb4e26b1b0626eba0e0ecd02de331e89361327d3bf" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4-cp310-cp310-musllinux_1_1_x86_64.whl", hash = "sha256:95bb33fd141cbf259cc068e929ef6a58acb726405e328ebb1523f2606b0ff601" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:226f6ca82f8f2b022453f39e5601e547dc35ef79325f423b789683475dd9aa7d" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4-cp311-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:fd5215f720316272f3d7a5f2400199fc44d840f6b8ea9e65d9311275417c30a8" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4-cp313-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:4004cc6bf45281e4a7144c36a202d934f465f64a785c4df5a24919d36b05e158" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4-cp313-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:2cb372a40cb14918a952a1caedb207c179096d3baab58fa36d0b8b6d3a0ea3bf" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4-cp313-cp313t-musllinux_1_1_x86_64.whl", hash = "sha256:3e0e590237970d4cadb4e58f1aa3e4bb1d3a84a534b01e2d4b1c4a98b9bccc4b" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/awscrt/0.36.4/awscrt-0.36.4-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:7f444666795fb41bbcf23387fdcb03b28b0c00baad80f60d19a3e1b3a719eba0" },
+]
+
+[[package]]
 name = "backports-asyncio-runner"
 version = "1.2.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -279,6 +335,55 @@ source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cachetools/7.1.6/cachetools-7.1.6.tar.gz", hash = "sha256:c7a79e7f30ba9943c1cefd08cc36f006aaae086e017af9166f1d59d6170c47e1" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cachetools/7.1.6/cachetools-7.1.6-py3-none-any.whl", hash = "sha256:2c12e255780330af28b91bb7fb96cce4c766f04e38396b9a24510190a5827096" },
+]
+
+[[package]]
+name = "caio"
+version = "0.9.25"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+resolution-markers = [
+    "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25.tar.gz", hash = "sha256:16498e7f81d1d0f5a4c0ad3f2540e65fe25691376e0a5bd367f558067113ed10" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp310-cp310-manylinux2010_x86_64.manylinux2014_x86_64.manylinux_2_12_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:db9b5681e4af8176159f0d6598e73b2279bb661e718c7ac23342c550bd78c241" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:ab52e5b643f8bbd64a0605d9412796cd3464cb8ca88593b13e95a0f0b10508ae" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp311-cp311-manylinux2010_x86_64.manylinux2014_x86_64.manylinux_2_12_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:bf84bfa039f25ad91f4f52944452a5f6f405e8afab4d445450978cd6241d1478" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:fc220b8533dcf0f238a6b1a4a937f92024c71e7b10b5a2dfc1c73604a25709bc" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp312-cp312-manylinux2010_x86_64.manylinux2014_x86_64.manylinux_2_12_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:97084e4e30dfa598449d874c4d8e0c8d5ea17d2f752ef5e48e150ff9d240cd64" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:6bebf6f079f1341d19f7386db9b8b1f07e8cc15ae13bfdaff573371ba0575d69" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp313-cp313-manylinux2010_x86_64.manylinux2014_x86_64.manylinux_2_12_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0998210a4d5cd5cb565b32ccfe4e53d67303f868a76f212e002a8554692870e6" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:9ed3cfb28c0e99fec5e208c934e5c157d0866aa9c32aa4dc5e9b6034af6286b7" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp314-cp314-manylinux2010_x86_64.manylinux2014_x86_64.manylinux_2_12_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:44a6b58e52d488c75cfaa5ecaa404b2b41cc965e6c417e03251e868ecd5b6d77" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "sha256:0ba16aa605ccb174665357fc729cf500679c2d94d5f1458a6f0d5ca48f2060a7" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.9.25/caio-0.9.25-py3-none-any.whl", hash = "sha256:06c0bb02d6b929119b1cfbe1ca403c768b2013a369e2db46bfa2a5761cf82e40" },
+]
+
+[[package]]
+name = "caio"
+version = "0.12.4"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4.tar.gz", hash = "sha256:32d8e9f3e2099c8db29446679252766c9bcd806eb88b4fb60ad274f73df2a5e9" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:97bff8f7da696321552b42629d1869983a8ced2f010bac9731b2719c1195a20c" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:20f1d3fe05be285d82413b00bd8061eeb62d3027d3f565adaf7db10bebc594dc" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:67f1bddc997bef281db36600e3e58d6b16d6486b3540eb62c9e54c6584f137fd" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:0d8d2826bf622644fc374a9f53ac00918b489d03599783953fcbe79af19123f5" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:f063624a98a64bab387430c5eaea61ef3825a98399104a297b8da4741c15139f" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:53605636e3b1eaeca368b475f1471ad9774736c6502a4b58b8b6b8d74b531770" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:1e1d5570fd0ec75b1b2c2877c5545ed9f0738b5d23b000e2b6a8fc830dc8b310" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:9dc0fd6f09ef72d18d3f43ca3d1140295222d925c583114ab9b1e8843a109a6e" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "sha256:4f2e0b6d393dc0ea78cfd13a9a4321fc35fd6a2db802e5f64651317e859fc929" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:ddf8d946b795ebd7c75b331b6dcbab4808fdd2c9f16ca76012b4757512861133" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp314-cp314t-manylinux_2_34_x86_64.whl", hash = "sha256:1c1a387f8784a86a56a8912ca42e1ad67599f16406f497b5b655b461a1b89426" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:456a93868ff007cea65d916d96d192cda8b9992c6eee046cb0159040f9446ab5" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/caio/0.12.4/caio-0.12.4-py3-none-any.whl", hash = "sha256:7a5e231bbf81eaed269f99afa9ef46457f51f9407952a1795c0795b3a62c23c0" },
 ]
 
 [[package]]
@@ -440,6 +545,40 @@ wheels = [
 ]
 
 [[package]]
+name = "cuda-pathfinder"
+version = "1.8.2"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cuda-pathfinder/1.8.2/cuda_pathfinder-1.8.2-py3-none-any.whl", hash = "sha256:4e65059febdb4d19d5cbc4798677e19db2b582f2f702f457b609e571690d357e" },
+]
+
+[[package]]
+name = "cufile-python"
+version = "0.2.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cufile-python/0.2.0/cufile_python-0.2.0.tar.gz", hash = "sha256:13455ff4df789ce623ced2cffb3c84671a47c99fd9ee737399e524a3d0aeb3f3" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cufile-python/0.2.0/cufile_python-0.2.0-py3-none-any.whl", hash = "sha256:f19a67b32f11ffdde35d0a62f44ca196f51463a106dd54b30e1f4c5c4577cb19" },
+]
+
+[[package]]
+name = "cupy-cuda13x"
+version = "14.2.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "cuda-pathfinder" },
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cupy-cuda13x/14.2.0/cupy_cuda13x-14.2.0-cp310-cp310-manylinux2014_x86_64.whl", hash = "sha256:351e33aa4260dd89359b243cc8ce3ee76c08e4ed4d1bafaaaec2b882f42e59f8" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cupy-cuda13x/14.2.0/cupy_cuda13x-14.2.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:f94843e54500a9c8c169135f79572bfaba946efe4f7178e834c227280c1b0c12" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cupy-cuda13x/14.2.0/cupy_cuda13x-14.2.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:9aafadbe29db3d4285026044aafeb28f2a3de4bd0df70718ec6892b7d27a4ded" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cupy-cuda13x/14.2.0/cupy_cuda13x-14.2.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:5b79a606f6639d9bed74ef7072f36756a95a804c86d7adb367b39307ac771600" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cupy-cuda13x/14.2.0/cupy_cuda13x-14.2.0-cp314-cp314-manylinux2014_x86_64.whl", hash = "sha256:ff0bdebd1b43c0c6db53095784c787c4e4eae671356cf521c4b7482ed78a1a7e" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/cupy-cuda13x/14.2.0/cupy_cuda13x-14.2.0-cp314-cp314t-manylinux2014_x86_64.whl", hash = "sha256:313500c5d415f65d388e84a9d2eb7f07f97c23c85dc5785f986e75d46d9c9693" },
+]
+
+[[package]]
 name = "datasets"
 version = "5.0.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -450,12 +589,10 @@ dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "multiprocess" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "packaging" },
-    { name = "pandas", version = "2.3.3", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "pandas", version = "3.0.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11'" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11' or python_full_version >= '3.14'" },
+    { name = "pandas", version = "3.0.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.14'" },
     { name = "pyarrow" },
     { name = "pyyaml" },
     { name = "requests" },
@@ -507,9 +644,7 @@ dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "importlib-metadata" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "pillow" },
     { name = "regex" },
     { name = "requests" },
@@ -750,6 +885,106 @@ http = [
 ]
 
 [[package]]
+name = "google-api-core"
+version = "2.35.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "google-auth" },
+    { name = "googleapis-common-protos" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+    { name = "requests" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-api-core/2.35.0/google_api_core-2.35.0.tar.gz", hash = "sha256:80611ccbd0291919f6cea8827d57b472946fcd9ab519625becce0c002140a7b0" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-api-core/2.35.0/google_api_core-2.35.0-py3-none-any.whl", hash = "sha256:88ce7a11146e1ddd331f7d2fd379787eb7e9015c34c6ed681e4f5fb8af3615af" },
+]
+
+[package.optional-dependencies]
+grpc = [
+    { name = "grpcio" },
+    { name = "grpcio-status" },
+]
+
+[[package]]
+name = "google-auth"
+version = "2.58.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "pyasn1-modules" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-auth/2.58.0/google_auth-2.58.0.tar.gz", hash = "sha256:55e30cf15e737de92c5323d78cda8a83fcd57e7ffbaf900c4600039fd60a80fd" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-auth/2.58.0/google_auth-2.58.0-py3-none-any.whl", hash = "sha256:8a9c4645bb4c8e91668fb1934b95ae6a8687084232753639220ba9bf04a1610d" },
+]
+
+[[package]]
+name = "google-cloud-bigtable"
+version = "2.46.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "google-cloud-core" },
+    { name = "google-cloud-monitoring" },
+    { name = "google-crc32c" },
+    { name = "grpc-google-iam-v1" },
+    { name = "grpcio" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-sdk" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-cloud-bigtable/2.46.0/google_cloud_bigtable-2.46.0.tar.gz", hash = "sha256:9f331e6004e1395c8e903ed4f989554fe6bbd9fa36c8f44d2a34167cc60a552a" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-cloud-bigtable/2.46.0/google_cloud_bigtable-2.46.0-py3-none-any.whl", hash = "sha256:7448c9f45e543c5f16162ab9f90eb4d10d604195e1cb4ab4ce324329a05b1950" },
+]
+
+[[package]]
+name = "google-cloud-core"
+version = "2.7.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "google-api-core" },
+    { name = "google-auth" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-cloud-core/2.7.0/google_cloud_core-2.7.0.tar.gz", hash = "sha256:874aaf89765db87a9b911b7a2ca7c5068554868eed9e75c7766affe342a2913d" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-cloud-core/2.7.0/google_cloud_core-2.7.0-py3-none-any.whl", hash = "sha256:c18a250904cfdda021eb3ae8b8238c9f9ca272a4cbbfb5cba946b3fe3022eed1" },
+]
+
+[[package]]
+name = "google-cloud-monitoring"
+version = "2.31.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-cloud-monitoring/2.31.0/google_cloud_monitoring-2.31.0.tar.gz", hash = "sha256:b4c9d3528c8643d4eb4b9d688cbb3c5914bc5f69b314ff7c5e1b47bdc073a9ae" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-cloud-monitoring/2.31.0/google_cloud_monitoring-2.31.0-py3-none-any.whl", hash = "sha256:64f3d56ead48f0a0674f650cb2828c47b936582a02a27c55f2836681a86281c3" },
+]
+
+[[package]]
+name = "google-crc32c"
+version = "1.8.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-crc32c/1.8.0/google_crc32c-1.8.0.tar.gz", hash = "sha256:a428e25fb7691024de47fecfbff7ff957214da51eddded0da0ae0e0f03a2cf79" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-crc32c/1.8.0/google_crc32c-1.8.0-cp310-cp310-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:6f35aaffc8ccd81ba3162443fabb920e65b1f20ab1952a31b13173a67811467d" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-crc32c/1.8.0/google_crc32c-1.8.0-cp311-cp311-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:19b40d637a54cb71e0829179f6cb41835f0fbd9e8eb60552152a8b52c36cbe15" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-crc32c/1.8.0/google_crc32c-1.8.0-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:14f87e04d613dfa218d6135e81b78272c3b904e2a7053b841481b38a7d901411" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-crc32c/1.8.0/google_crc32c-1.8.0-cp313-cp313-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:3b9776774b24ba76831609ffbabce8cdf6fa2bd5e9df37b594221c7e333a81fa" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-crc32c/1.8.0/google_crc32c-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:b0d1a7afc6e8e4635564ba8aa5c0548e3173e41b6384d7711a9123165f582de2" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/google-crc32c/1.8.0/google_crc32c-1.8.0-pp311-pypy311_pp73-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:87fa445064e7db928226b2e6f0d5304ab4cd0339e664a4e9a25029f384d9bb93" },
+]
+
+[[package]]
 name = "googleapis-common-protos"
 version = "1.75.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -759,6 +994,25 @@ dependencies = [
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/googleapis-common-protos/1.75.0/googleapis_common_protos-1.75.0.tar.gz", hash = "sha256:53a062ff3c32552fbd62c11fe23768b78e4ddf0494d5e5fd97d3f4689c75fbbd" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/googleapis-common-protos/1.75.0/googleapis_common_protos-1.75.0-py3-none-any.whl", hash = "sha256:961ed60399c457ceb0ee8f285a84c870aabc9c6a832b9d37bb281b5bebde43ed" },
+]
+
+[package.optional-dependencies]
+grpc = [
+    { name = "grpcio" },
+]
+
+[[package]]
+name = "grpc-google-iam-v1"
+version = "0.14.5"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "googleapis-common-protos", extra = ["grpc"] },
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/grpc-google-iam-v1/0.14.5/grpc_google_iam_v1-0.14.5.tar.gz", hash = "sha256:07fd3a9fafb586588e771831fbfc8f6597050181d0c3b45e039d18b8fdc1aab5" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/grpc-google-iam-v1/0.14.5/grpc_google_iam_v1-0.14.5-py3-none-any.whl", hash = "sha256:0f5e680b20aa0a9441e68c769da04d94d70fca4e43751a82d8abb8aa6a7181ca" },
 ]
 
 [[package]]
@@ -780,6 +1034,20 @@ wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/grpcio/1.83.0/grpcio-1.83.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:a21cb4eeeba124443f399be2e8b624943cde864dcbe588cb42e5c483a52a906c" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/grpcio/1.83.0/grpcio-1.83.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:009667eaf3dcd5224c713589cdc98e7ca4ed0ff0b61132c6b276e930eb83a2df" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/grpcio/1.83.0/grpcio-1.83.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:61007cd08640abc5c54547ee32505474c482cd733a53cb87551ea81faa6350af" },
+]
+
+[[package]]
+name = "grpcio-status"
+version = "1.83.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/grpcio-status/1.83.0/grpcio_status-1.83.0.tar.gz", hash = "sha256:837219c6de9afdccb6f6f72b34bc71e151a2011ef04040e3faaca746a57e54ae" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/grpcio-status/1.83.0/grpcio_status-1.83.0-py3-none-any.whl", hash = "sha256:f6a838a7c5fb84ae98833ec0ef81ed438c26e11e54b2ddb8e92ad328c861de69" },
 ]
 
 [[package]]
@@ -912,14 +1180,14 @@ wheels = [
 
 [[package]]
 name = "importlib-metadata"
-version = "9.0.0"
+version = "8.7.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "zipp" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/importlib-metadata/9.0.0/importlib_metadata-9.0.0.tar.gz", hash = "sha256:a4f57ab599e6a2e3016d7595cfd72eb4661a5106e787a95bcc90c7105b831efc" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/importlib-metadata/8.7.1/importlib_metadata-8.7.1.tar.gz", hash = "sha256:49fef1ae6440c182052f407c8d34a68f72efc36db9ca90dc0113398f2fdde8bb" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/importlib-metadata/9.0.0/importlib_metadata-9.0.0-py3-none-any.whl", hash = "sha256:2d21d1cc5a017bd0559e36150c21c830ab1dc304dedd1b7ea85d20f45ef3edd7" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/importlib-metadata/8.7.1/importlib_metadata-8.7.1-py3-none-any.whl", hash = "sha256:5a1f80bf1daa489495071efbb095d75a634cf28a8bc299581244063b53176151" },
 ]
 
 [[package]]
@@ -1095,6 +1363,76 @@ wheels = [
 ]
 
 [[package]]
+name = "lmcache"
+version = "0.5.4"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "aiofile", version = "3.9.0", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
+    { name = "aiofile", version = "3.12.3", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11'" },
+    { name = "aiofiles" },
+    { name = "aiohttp" },
+    { name = "awscrt" },
+    { name = "blake3" },
+    { name = "cachetools" },
+    { name = "cryptography" },
+    { name = "cufile-python" },
+    { name = "cupy-cuda13x" },
+    { name = "fastapi" },
+    { name = "google-api-core" },
+    { name = "google-cloud-bigtable" },
+    { name = "httptools" },
+    { name = "httpx" },
+    { name = "huggingface-hub" },
+    { name = "msgspec" },
+    { name = "numba" },
+    { name = "numpy" },
+    { name = "nvtx" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp" },
+    { name = "opentelemetry-exporter-prometheus" },
+    { name = "opentelemetry-sdk" },
+    { name = "prometheus-client" },
+    { name = "psutil" },
+    { name = "py-cpuinfo" },
+    { name = "pytest" },
+    { name = "pyyaml" },
+    { name = "pyzmq" },
+    { name = "redis" },
+    { name = "safetensors" },
+    { name = "setuptools" },
+    { name = "setuptools-scm" },
+    { name = "sortedcontainers" },
+    { name = "torch" },
+    { name = "transformers" },
+    { name = "uvicorn" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4.tar.gz", hash = "sha256:4e25826c76af65d537d253f1e4653fcbc36c34133bd2562c0d11ca19d20a692e" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e97cb4ebcb09aa5a597e91f250b2ce5a7c33fc817424727add2842b6735efdae" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:9af3c63e85e6bd871c88b6db9e894730" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:39eb810fcbc096f10a288e551574e9be710662f5833efd9f42fa290500b9827b" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:1717ebe4bed413adabe58cce70b4367c" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d4fccafe6a0c90ffac96e3b67fd6dbe5a3a6ff8dbbe8139612a873c26971861b" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:4310c55f3e7d0feccdd0fd83ceefd6aa" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bc7f11e06e4a5a015198c2bf4645d5ab67472776297b2abeace5a5829811680c" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:f872bba4ea16c4c845730c59e88d78b2" },
+]
+
+[[package]]
+name = "lmcache-rbln"
+version = "0.12.0rc1.dev3+g77a7dce"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "lmcache" },
+    { name = "rebel-compiler" },
+    { name = "torch" },
+    { name = "torch-rbln" },
+]
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache-rbln/0.12.0rc1.dev3+g77a7dce/lmcache_rbln-0.12.0rc1.dev3+g77a7dce-py3-none-any.whl", hash = "md5:87f8c20ffac24a93af6a5018bd367bd3" },
+]
+
+[[package]]
 name = "loguru"
 version = "0.7.3"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -1176,9 +1514,7 @@ version = "1.11.7"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "jsonschema" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "pillow" },
     { name = "pydantic" },
     { name = "pydantic-extra-types", extra = ["pycountry"] },
@@ -1201,9 +1537,7 @@ name = "ml-dtypes"
 version = "0.5.4"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/ml-dtypes/0.5.4/ml_dtypes-0.5.4.tar.gz", hash = "sha256:8ab06a50fb9bf9666dd0fe5dfb4676fa2b0ac0f31ecff72a6c3af8e22c063453" }
 wheels = [
@@ -1346,14 +1680,69 @@ wheels = [
 ]
 
 [[package]]
+name = "nixl"
+version = "1.1.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "nixl-cu12" },
+    { name = "nixl-cu13" },
+]
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl/1.1.0/nixl-1.1.0-py3-none-any.whl", hash = "sha256:f46f65768770fa508eb52921c41b5dc52b754478b0ebb606fff6d80f41375d8b" },
+]
+
+[[package]]
+name = "nixl-cu12"
+version = "1.1.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu12/1.1.0/nixl_cu12-1.1.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:c6fef6445d2da46fa3476f1a4c134f224f38884bbfc1230c3a207d66cc4faa38" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu12/1.1.0/nixl_cu12-1.1.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:c2cfc58abc8baef6ebdf6a184516e5e114ec20c19dff191e898971ddedb081f7" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu12/1.1.0/nixl_cu12-1.1.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:cf270a5319f4feb80cedc7ae19029ef48eb4428f587bbcdcd3b787933430890b" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu12/1.1.0/nixl_cu12-1.1.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:7c7c90204b39dd936a3636bbaa85256a3818d4749bc700bc221f714e5ff5fdc7" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu12/1.1.0/nixl_cu12-1.1.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:95161ec1a0dbb3dccb191b768f116299e4bff7d2304aee741f474989b4097963" },
+]
+
+[[package]]
+name = "nixl-cu13"
+version = "1.1.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu13/1.1.0/nixl_cu13-1.1.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:3f623b77fd59199afd71edadebb79ab394ec5e035873efe8a9bc8b4716b34e73" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu13/1.1.0/nixl_cu13-1.1.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:6549dcb4f405f70903534a0770970ab95ed9185a8b16522db1ab4e2d0cc60b37" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu13/1.1.0/nixl_cu13-1.1.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:60cc00b12871d8c7d78c2385ad9380070424d5b07d3fe01680f222d6c4f1f428" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu13/1.1.0/nixl_cu13-1.1.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:1991d7899603907099f3e3ac3bf59f950de194bfe8d92c01ef9f06ce1639efa4" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-cu13/1.1.0/nixl_cu13-1.1.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:90c27cfdae0932f8ecb96ce29474249dd25d7f7712b9f43821cdb57699888fcb" },
+]
+
+[[package]]
+name = "nixl-rbln"
+version = "0.1.0.dev119+g7bbd9adca"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "nixl" },
+    { name = "rebel-compiler" },
+    { name = "torch-rbln" },
+]
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-rbln/0.1.0.dev119+g7bbd9adca/nixl_rbln-0.1.0.dev119+g7bbd9adca-py3-none-manylinux_2_34_x86_64.whl", hash = "md5:b1b17a64dff5cfd9a33245a42e027f1e" },
+]
+
+[[package]]
 name = "numba"
 version = "0.65.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "llvmlite" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numba/0.65.0/numba-0.65.0.tar.gz", hash = "sha256:edad0d9f6682e93624c00125a471ae4df186175d71fd604c983c377cdc03e68b" }
 wheels = [
@@ -1369,9 +1758,6 @@ wheels = [
 name = "numpy"
 version = "2.2.6"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-resolution-markers = [
-    "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.2.6/numpy-2.2.6.tar.gz", hash = "sha256:e29554e2bef54a90aa5cc07da6ce955accb83f21ab5de01a62c8478897b264fd" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.2.6/numpy-2.2.6-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:fc7b73d02efb0e18c000e9ad8b83480dfcd5dfd11065997ed4c6747470ae8915" },
@@ -1388,62 +1774,26 @@ wheels = [
 ]
 
 [[package]]
-name = "numpy"
-version = "2.3.5"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-resolution-markers = [
-    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5.tar.gz", hash = "sha256:784db1dcdab56bf0517743e746dfb0f885fc68d948aba86eeec2cba234bdf1c0" }
-wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8cba086a43d54ca804ce711b2a940b16e452807acebe7852ff327f1ecd49b0d4" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:396084a36abdb603546b119d96528c2f6263921c50df3c8fd7cb28873a237748" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "md5:de782dd125ea5f41fca0290526dcac03" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:b46b4ec24f7293f23adcd2d146960559aaf8020213de8ad1909dba6c013bf89c" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:11e06aa0af8c0f05104d56450d6093ee639e15f24ecf62d417329d06e522e017" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:51c55fe3451421f3a6ef9a9c1439e82101c57a2c9eab9feb196a62b1a10b58ce" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ce581db493ea1a96c0556360ede6607496e8bf9b3a8efa66e06477267bc831e9" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:9ee2197ef8c4f0dfe405d835f3b6a14f5fee7782b5de51ba06fb65fc9b36e9f1" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fffe29a1ef00883599d1dc2c51aa2e5d80afe49523c261a74933df395c15c520" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:2e2eb32ddb9ccb817d620ac1d8dae7c3f641c1e5f55f531a33e8ab97960a75b8" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:09a1bea522b25109bf8e6f3027bd810f7c1085c64a0c7ce050c1676ad0ba010b" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:d6889ec4ec662a1a37eb4b4fb26b6100841804dac55bd9df579e326cdc146227" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.3.5/numpy-2.3.5-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:63c0e9e7eea69588479ebf4a8a270d5ac22763cc5854e9a7eae952a3908103f7" },
-]
-
-[[package]]
-name = "numpy"
-version = "2.4.6"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6.tar.gz", hash = "sha256:f3a3570c4a2a16746ac2c31a7c7c7b0c186b95ce902e33db6f28094ed7387dda" }
-wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:89cd468399cfd2504718f0ba50e410dca55a170b61a02ad92bb18c8a65186e93" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:f407cb6b8e9d6d8c626bc73c945db1706035af8fd632295547bf1c9e46d092d6" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "md5:25ab1d60036b4432277d22f6d38873fe" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:e5805d5a22fd19c8ccff10a9561f9df94436b0545619ea579db2d3c35294bce2" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a7830bab239b79cda9c08c2da014761cafb48da6150e1da17ac06283f43b6089" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:dfa20cc6ca228e6b155b11da03825975ce66aea520985dbbddf0f2a5a495c605" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ede83e07a75dd06bc501566c1eca2afc0d61677c1472ac9ad93fdee6e638a48d" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:a0df0043bdb289bde1f62da130d20df23d58b45429f752bc7a8fc5325a225ecd" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a2c306dea656c12c68f51f4cea133cbe78ca7435eb28c735eac1d3ebe73be6e8" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:ae506e6902902557576a26ff33eda8695e7ecb3cb36c3b573a0765dee114ebdb" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7d92c3819208a60205a12a245c91ad70cb0a85336659b19b834205573ac8456e" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:29cb7f67d10b479ff07c17d33e39f78c07f71c40ef30d63c153d340e96cd3fb4" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/numpy/2.4.6/numpy-2.4.6-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8ad03c0965fb3c692200e74d458ca28c1dbb4ce96f9a479a8aa041ad5fabca02" },
-]
-
-[[package]]
 name = "nvidia-ml-py"
 version = "13.610.43"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvidia-ml-py/13.610.43/nvidia_ml_py-13.610.43.tar.gz", hash = "sha256:65437eb73d68d0c62c931ca4d45038472faff03bd0b8729abba4b899f70d60f2" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvidia-ml-py/13.610.43/nvidia_ml_py-13.610.43-py3-none-any.whl", hash = "sha256:f13c72698edef492f985cc225f14faafe68ae065a2e407f45bdf6f4b9b43fde8" },
+]
+
+[[package]]
+name = "nvtx"
+version = "0.2.16"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvtx/0.2.16/nvtx-0.2.16.tar.gz", hash = "sha256:252fdb870308be4a2beecb3ed174b1d59099eeb63c883f269944a765ce5f7720" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvtx/0.2.16/nvtx-0.2.16-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:23f30fcaf68f53d1895282315cb35aed5f605d59aeb33e75e276545ff95c4af6" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvtx/0.2.16/nvtx-0.2.16-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f6d2922f5637b5f4c646599a066a770e7f26e154697dc217ad0aa8b831ea1338" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvtx/0.2.16/nvtx-0.2.16-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b6230be4ee35edcfe00411c6f71d48de5d50147146c4efc06b710d2516086031" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvtx/0.2.16/nvtx-0.2.16-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:624bf44efe550528e210ccb9fae2f53512f1f22a2f2629eca08b1c1e020e13ea" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvtx/0.2.16/nvtx-0.2.16-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f1ce0c2509a6136ceaaebf73bb4b4d20fb741a2852c5c63ae4b6c1e5a5bb8fac" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nvtx/0.2.16/nvtx-0.2.16-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:154df7d6d5f47d2831275c6e2ad6fc9e917abe90bbc2513c501943fc4ec1dbff" },
 ]
 
 [[package]]
@@ -1483,9 +1833,7 @@ name = "opencv-python-headless"
 version = "5.0.0.93"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opencv-python-headless/5.0.0.93/opencv_python_headless-5.0.0.93.tar.gz", hash = "sha256:b82f9831daab90b725c7c1ee1b36cb5732c367096ac76d119e64e14eb70d5f3c" }
 wheels = [
@@ -1495,44 +1843,45 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-api"
-version = "1.44.0"
+version = "1.40.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
+    { name = "importlib-metadata" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-api/1.44.0/opentelemetry_api-1.44.0.tar.gz", hash = "sha256:67647e5e9566edcf421166fdf022b3537f818635daa852b289e34604dc6fb33a" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-api/1.40.0/opentelemetry_api-1.40.0.tar.gz", hash = "sha256:159be641c0b04d11e9ecd576906462773eb97ae1b657730f0ecf64d32071569f" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-api/1.44.0/opentelemetry_api-1.44.0-py3-none-any.whl", hash = "sha256:94b98c893a91b88657eaac1e3ba89618cdb85be6918196705354f34728b2cdef" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-api/1.40.0/opentelemetry_api-1.40.0-py3-none-any.whl", hash = "sha256:82dd69331ae74b06f6a874704be0cfaa49a1650e1537d4a813b86ecef7d0ecf9" },
 ]
 
 [[package]]
 name = "opentelemetry-exporter-otlp"
-version = "1.44.0"
+version = "1.40.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp/1.44.0/opentelemetry_exporter_otlp-1.44.0.tar.gz", hash = "sha256:af1cde7c33ea8ed624bf04ac49a885730fe44c1f1ad698656e592c38f70ce106" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp/1.40.0/opentelemetry_exporter_otlp-1.40.0.tar.gz", hash = "sha256:7caa0870b95e2fcb59d64e16e2b639ecffb07771b6cd0000b5d12e5e4fef765a" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp/1.44.0/opentelemetry_exporter_otlp-1.44.0-py3-none-any.whl", hash = "sha256:4a498fa8d8fd8be9e8e2d175fe5524a3fe581ccffadd8509db86526a5fb97051" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp/1.40.0/opentelemetry_exporter_otlp-1.40.0-py3-none-any.whl", hash = "sha256:48c87e539ec9afb30dc443775a1334cc5487de2f72a770a4c00b1610bf6c697d" },
 ]
 
 [[package]]
 name = "opentelemetry-exporter-otlp-proto-common"
-version = "1.44.0"
+version = "1.40.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "opentelemetry-proto" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-common/1.44.0/opentelemetry_exporter_otlp_proto_common-1.44.0.tar.gz", hash = "sha256:dc87a5a5bc58f149a56d1547e4691588fa12994cdc3bc039a694ccb3375862ac" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-common/1.40.0/opentelemetry_exporter_otlp_proto_common-1.40.0.tar.gz", hash = "sha256:1cbee86a4064790b362a86601ee7934f368b81cd4cc2f2e163902a6e7818a0fa" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-common/1.44.0/opentelemetry_exporter_otlp_proto_common-1.44.0-py3-none-any.whl", hash = "sha256:9a9fe61bba73d802904bc989f1d6b4a7b1ee40f06c40e98d6f85af65aaebb694" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-common/1.40.0/opentelemetry_exporter_otlp_proto_common-1.40.0-py3-none-any.whl", hash = "sha256:7081ff453835a82417bf38dccf122c827c3cbc94f2079b03bba02a3165f25149" },
 ]
 
 [[package]]
 name = "opentelemetry-exporter-otlp-proto-grpc"
-version = "1.44.0"
+version = "1.40.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "googleapis-common-protos" },
@@ -1543,14 +1892,14 @@ dependencies = [
     { name = "opentelemetry-sdk" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-grpc/1.44.0/opentelemetry_exporter_otlp_proto_grpc-1.44.0.tar.gz", hash = "sha256:40d1ae9e03fcc36de3cbac610cc99f35894938bff9cfd90fc4ec68bd85448463" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-grpc/1.40.0/opentelemetry_exporter_otlp_proto_grpc-1.40.0.tar.gz", hash = "sha256:bd4015183e40b635b3dab8da528b27161ba83bf4ef545776b196f0fb4ec47740" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-grpc/1.44.0/opentelemetry_exporter_otlp_proto_grpc-1.44.0-py3-none-any.whl", hash = "sha256:6a1a645ea182a2f59440c51fa8301d309f3324a8f9d65f8395584b064b67ee4e" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-grpc/1.40.0/opentelemetry_exporter_otlp_proto_grpc-1.40.0-py3-none-any.whl", hash = "sha256:2aa0ca53483fe0cf6405087a7491472b70335bc5c7944378a0a8e72e86995c52" },
 ]
 
 [[package]]
 name = "opentelemetry-exporter-otlp-proto-http"
-version = "1.44.0"
+version = "1.40.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "googleapis-common-protos" },
@@ -1561,48 +1910,62 @@ dependencies = [
     { name = "requests" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-http/1.44.0/opentelemetry_exporter_otlp_proto_http-1.44.0.tar.gz", hash = "sha256:c633d7270ad6b57cd4cfbe8b0007a9e2e7c0cb50bd6c50fe2a7b245f721a09d8" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-http/1.40.0/opentelemetry_exporter_otlp_proto_http-1.40.0.tar.gz", hash = "sha256:db48f5e0f33217588bbc00274a31517ba830da576e59503507c839b38fa0869c" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-http/1.44.0/opentelemetry_exporter_otlp_proto_http-1.44.0-py3-none-any.whl", hash = "sha256:838592fce774c1c8bb7b9a0a7facbfa82e17be5a8a4e94cef10cb84ae026bae3" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-otlp-proto-http/1.40.0/opentelemetry_exporter_otlp_proto_http-1.40.0-py3-none-any.whl", hash = "sha256:a8d1dab28f504c5d96577d6509f80a8150e44e8f45f82cdbe0e34c99ab040069" },
+]
+
+[[package]]
+name = "opentelemetry-exporter-prometheus"
+version = "0.61b0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-sdk" },
+    { name = "prometheus-client" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-prometheus/0.61b0/opentelemetry_exporter_prometheus-0.61b0.tar.gz", hash = "sha256:7c4919bd8e79abd62b610767e80f42c9c3a06c5183f4dd9141eedeb57aea284b" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-exporter-prometheus/0.61b0/opentelemetry_exporter_prometheus-0.61b0-py3-none-any.whl", hash = "sha256:3013b41f4370143d48d219a2351473761423e5882fa4c213811eaefacba39cb7" },
 ]
 
 [[package]]
 name = "opentelemetry-proto"
-version = "1.44.0"
+version = "1.40.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "protobuf" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-proto/1.44.0/opentelemetry_proto-1.44.0.tar.gz", hash = "sha256:c547a79c2f8c0c515d31509154682e5921c7cfd5ca67b70e1f9266e2c3e103f3" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-proto/1.40.0/opentelemetry_proto-1.40.0.tar.gz", hash = "sha256:03f639ca129ba513f5819810f5b1f42bcb371391405d99c168fe6937c62febcd" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-proto/1.44.0/opentelemetry_proto-1.44.0-py3-none-any.whl", hash = "sha256:898b155a0e1557afd867478fb6158e8122a46329ca0bb8dc53cc55e98f017f56" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-proto/1.40.0/opentelemetry_proto-1.40.0-py3-none-any.whl", hash = "sha256:266c4385d88923a23d63e353e9761af0f47a6ed0d486979777fe4de59dc9b25f" },
 ]
 
 [[package]]
 name = "opentelemetry-sdk"
-version = "1.44.0"
+version = "1.40.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-semantic-conventions" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-sdk/1.44.0/opentelemetry_sdk-1.44.0.tar.gz", hash = "sha256:cebe7f65dc12f26ead75c6064de12fd2a9052e5060c0272d402cfa203aae123b" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-sdk/1.40.0/opentelemetry_sdk-1.40.0.tar.gz", hash = "sha256:18e9f5ec20d859d268c7cb3c5198c8d105d073714db3de50b593b8c1345a48f2" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-sdk/1.44.0/opentelemetry_sdk-1.44.0-py3-none-any.whl", hash = "sha256:df081c4c6bcfdb1211e3e86140376792643128a25f8d72d1d27675936e7e96ad" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-sdk/1.40.0/opentelemetry_sdk-1.40.0-py3-none-any.whl", hash = "sha256:787d2154a71f4b3d81f20524a8ce061b7db667d24e46753f32a7bc48f1c1f3f1" },
 ]
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.65b0"
+version = "0.61b0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "opentelemetry-api" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-semantic-conventions/0.65b0/opentelemetry_semantic_conventions-0.65b0.tar.gz", hash = "sha256:f9b2b81e9d5b64f11bc952075e7e9c7fb0aab075c7fd1c46d597f1b919852d60" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-semantic-conventions/0.61b0/opentelemetry_semantic_conventions-0.61b0.tar.gz", hash = "sha256:072f65473c5d7c6dc0355b27d6c9d1a679d63b6d4b4b16a9773062cb7e31192a" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-semantic-conventions/0.65b0/opentelemetry_semantic_conventions-0.65b0-py3-none-any.whl", hash = "sha256:1cacde7b0ad306f84c5ef08c3dbe1bbaf20165bba6f8bff43b670e555a086bcb" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-semantic-conventions/0.61b0/opentelemetry_semantic_conventions-0.61b0-py3-none-any.whl", hash = "sha256:fa530a96be229795f8cef353739b618148b0fe2b4b3f005e60e262926c4d38e2" },
 ]
 
 [[package]]
@@ -1621,7 +1984,7 @@ wheels = [
 [[package]]
 name = "optimum-rbln"
 version = "0.11.3a8"
-source = { registry = "https://pypi.org/simple" }
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "accelerate" },
     { name = "diffusers" },
@@ -1634,9 +1997,9 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/44/01/4b594368256d1d5de81832be2869aedd9c80fc397886351de57b7152cd4f/optimum_rbln-0.11.3a8.tar.gz", hash = "sha256:840ceb4aaf7c60fc1ca19a0f737ec757f21fe0edd0c7ab29fafc871844ab403b", size = 668110, upload-time = "2026-09-16T11:29:04.56Z" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a8/optimum_rbln-0.11.3a8.tar.gz", hash = "sha256:840ceb4aaf7c60fc1ca19a0f737ec757f21fe0edd0c7ab29fafc871844ab403b" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4f/d7/c9cb0743d03bc74458d2269cf8d469f810d156aaca5124270b87e0906a57/optimum_rbln-0.11.3a8-py3-none-any.whl", hash = "sha256:bd2296e5996598ba46574c2c1b5b701bab5d8eee1d1f61cf0fb03545c8881108", size = 696798, upload-time = "2026-09-16T11:29:02.529Z" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a8/optimum_rbln-0.11.3a8-py3-none-any.whl", hash = "sha256:bd2296e5996598ba46574c2c1b5b701bab5d8eee1d1f61cf0fb03545c8881108" },
 ]
 
 [[package]]
@@ -1666,10 +2029,11 @@ name = "pandas"
 version = "2.3.3"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
     "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" } },
+    { name = "numpy" },
     { name = "python-dateutil" },
     { name = "pytz" },
     { name = "tzdata" },
@@ -1697,14 +2061,12 @@ name = "pandas"
 version = "3.0.5"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
     "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "python-dateutil" },
 ]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pandas/3.0.5/pandas-3.0.5.tar.gz", hash = "sha256:dca3734d6ab7c906e6730f0788b0a1dbb9f2467731f9711f77995c8e9d62d712" }
@@ -1777,11 +2139,11 @@ wheels = [
 
 [[package]]
 name = "prometheus-client"
-version = "0.25.0"
+version = "0.24.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/prometheus-client/0.25.0/prometheus_client-0.25.0.tar.gz", hash = "sha256:5e373b75c31afb3c86f1a52fa1ad470c9aace18082d39ec0d2f918d11cc9ba28" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/prometheus-client/0.24.1/prometheus_client-0.24.1.tar.gz", hash = "sha256:7e0ced7fbbd40f7b84962d5d2ab6f17ef88a72504dcf7c0b40737b43b2a461f9" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/prometheus-client/0.25.0/prometheus_client-0.25.0-py3-none-any.whl", hash = "sha256:d5aec89e349a6ec230805d0df882f3807f74fd6c1a2fa86864e3c2279059fed1" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/prometheus-client/0.24.1/prometheus_client-0.24.1-py3-none-any.whl", hash = "sha256:150db128af71a5c2482b36e588fc8a6b95e498750da4b17065947c16070f4055" },
 ]
 
 [[package]]
@@ -1821,13 +2183,25 @@ wheels = [
 ]
 
 [[package]]
-name = "protobuf"
-version = "7.35.1"
+name = "proto-plus"
+version = "1.28.4"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/protobuf/7.35.1/protobuf-7.35.1.tar.gz", hash = "sha256:ce115a26fe0c39a2c29973d914d327e516a6455464489fe3cd1e51a1b354f81a" }
+dependencies = [
+    { name = "protobuf" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/proto-plus/1.28.4/proto_plus-1.28.4.tar.gz", hash = "sha256:5ff7ecad828e032a491fcb86947801768e32237f99dd049b649965b892ae9a63" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/protobuf/7.35.1/protobuf-7.35.1-cp310-abi3-manylinux2014_x86_64.whl", hash = "md5:45bc7c52bf09d431b63527406baba98c" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/protobuf/7.35.1/protobuf-7.35.1-py3-none-any.whl", hash = "sha256:4bc97768d8fe4ad6743c8a19403e314511ed9f6d13205b687e52421c023ac1b9" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/proto-plus/1.28.4/proto_plus-1.28.4-py3-none-any.whl", hash = "sha256:4b01341272f8a348db3f003b6143109f83ab43091019d5181b3fcdf500ab32aa" },
+]
+
+[[package]]
+name = "protobuf"
+version = "6.33.6"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/protobuf/6.33.6/protobuf-6.33.6.tar.gz", hash = "sha256:a6768d25248312c297558af96a9f9c929e8c4cee0659cb07e780731095f38135" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/protobuf/6.33.6/protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/protobuf/6.33.6/protobuf-6.33.6-py3-none-any.whl", hash = "sha256:77179e006c476e69bf8e8ce866640091ec42e1beb80b213c3900006ecfba6901" },
 ]
 
 [[package]]
@@ -1869,6 +2243,27 @@ wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pyarrow/25.0.0/pyarrow-25.0.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:f0f100dacf2c0f400601664a79d1a907ced4740514bb2b00917341038e2ce76f" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pyarrow/25.0.0/pyarrow-25.0.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:c70a5fd9a82bd1a702fd482bdc62d38dcb672fb2b449b1d7c0d7d1f4be7b7bfe" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pyarrow/25.0.0/pyarrow-25.0.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:e83916bbcf380866b4e14255850b33323ff678dc9758411d0409cdd2523880b0" },
+]
+
+[[package]]
+name = "pyasn1"
+version = "0.6.4"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pyasn1/0.6.4/pyasn1-0.6.4.tar.gz", hash = "sha256:9c447d8431c947fe4c8febc4ed9e760bc29011a5b01e5c74b67025bd9fb8ce81" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pyasn1/0.6.4/pyasn1-0.6.4-py3-none-any.whl", hash = "sha256:deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b" },
+]
+
+[[package]]
+name = "pyasn1-modules"
+version = "0.4.2"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "pyasn1" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pyasn1-modules/0.4.2/pyasn1_modules-0.4.2.tar.gz", hash = "sha256:677091de870a80aae844b1ca6134f54652fa2c8c5a52aa396440ac3106e941e6" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/pyasn1-modules/0.4.2/pyasn1_modules-0.4.2-py3-none-any.whl", hash = "sha256:29253a9207ce32b64c3ac6600edc75368f98473906e8fd1043bd6b5b1de2c14a" },
 ]
 
 [[package]]
@@ -2242,9 +2637,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "decorator" },
     { name = "ml-dtypes" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "packaging" },
     { name = "prettytable" },
     { name = "psutil" },
@@ -2261,6 +2654,18 @@ wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev499+g59b3fe53.prod/rebel_compiler-0.11.3.dev499+g59b3fe53.prod-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:ea51fefd36b89129c780a3d33bf41367" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev499+g59b3fe53.prod/rebel_compiler-0.11.3.dev499+g59b3fe53.prod-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:85cba69e5a30a97a8cd5f05af37b200b" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev499+g59b3fe53.prod/rebel_compiler-0.11.3.dev499+g59b3fe53.prod-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:33ead71a7a19d3d846616d23f05474ee" },
+]
+
+[[package]]
+name = "redis"
+version = "8.1.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "async-timeout", marker = "python_full_version < '3.11.3'" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/redis/8.1.0/redis-8.1.0.tar.gz", hash = "sha256:6e1a19beef9225c83efd689c7e6b7da2d5215b1f42cd13b7fc3714d0a09c7b25" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/redis/8.1.0/redis-8.1.0-py3-none-any.whl", hash = "sha256:a4fe1aac3d3b3cc791d4b3d5931c5a956045dc951ee74d1c913ee3ac4d2ee9fb" },
 ]
 
 [[package]]
@@ -2436,7 +2841,7 @@ resolution-markers = [
     "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" } },
+    { name = "numpy" },
 ]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/scipy/1.15.3/scipy-1.15.3.tar.gz", hash = "sha256:eae3cf522bc7df64b42cad3925c876e1b0b6c35c1337c93e12c0f366f55b0eaf" }
 wheels = [
@@ -2460,7 +2865,7 @@ resolution-markers = [
     "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" } },
+    { name = "numpy" },
 ]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/scipy/1.17.1/scipy-1.17.1.tar.gz", hash = "sha256:95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0" }
 wheels = [
@@ -2488,8 +2893,7 @@ resolution-markers = [
     "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/scipy/1.18.0/scipy-1.18.0.tar.gz", hash = "sha256:67b2ad2ad54c72ca6d04975a9b2df8c3638c34ddd5b28738e94fc2b57929d378" }
 wheels = [
@@ -2614,6 +3018,15 @@ source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/sniffio/1.3.1/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/sniffio/1.3.1/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2" },
+]
+
+[[package]]
+name = "sortedcontainers"
+version = "2.4.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/sortedcontainers/2.4.0/sortedcontainers-2.4.0.tar.gz", hash = "sha256:25caa5a06cc30b6b83d11423433f65d1f9d76c4c6a0c90e3379eaa43b9bfdb88" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/sortedcontainers/2.4.0/sortedcontainers-2.4.0-py2.py3-none-any.whl", hash = "sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0" },
 ]
 
 [[package]]
@@ -2807,9 +3220,7 @@ name = "torchvision"
 version = "0.26.0+cpu"
 source = { registry = "https://download.pytorch.org/whl/cpu" }
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "pillow" },
     { name = "torch" },
 ]
@@ -2848,9 +3259,7 @@ version = "5.15.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "huggingface-hub" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "packaging" },
     { name = "pyyaml" },
     { name = "regex" },
@@ -3016,9 +3425,7 @@ dependencies = [
     { name = "msgspec" },
     { name = "ninja" },
     { name = "numba" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "openai" },
     { name = "openai-harmony" },
     { name = "opencv-python-headless" },
@@ -3097,6 +3504,10 @@ dev = [
 examples = [
     { name = "qwen-vl-utils" },
 ]
+kv-connectors = [
+    { name = "lmcache-rbln" },
+    { name = "nixl-rbln" },
+]
 runtime = [
     { name = "rebel-compiler" },
 ]
@@ -3117,6 +3528,8 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
+    { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0.dev0,<0.12.1" },
+    { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.1.0.dev0,<0.1.1" },
     { name = "openai", specifier = ">=2.25.0" },
     { name = "optimum-rbln", specifier = ">=0.11.3a8,<0.11.4" },
     { name = "packaging", marker = "extra == 'dev'" },
@@ -3140,7 +3553,7 @@ requires-dist = [
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
     { name = "vllm", specifier = "==0.26.0+cpu", index = "https://wheels.vllm.ai/0.26.0/cpu" },
 ]
-provides-extras = ["examples", "test", "build", "dev", "runtime"]
+provides-extras = ["examples", "test", "build", "dev", "runtime", "kv-connectors"]
 
 [[package]]
 name = "watchfiles"
@@ -3205,9 +3618,7 @@ version = "0.2.3"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "apache-tvm-ffi" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11' and python_full_version < '3.13'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.13'" },
+    { name = "numpy" },
     { name = "pydantic" },
     { name = "torch" },
     { name = "transformers" },
