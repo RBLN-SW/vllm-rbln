@@ -51,9 +51,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Imported only by the multimodal examples and the optimum correctness
-# scripts, never by `vllm_rbln/`. Keeping it out of the base set stops every
-# deployment from installing it.
 examples = [
     "qwen_vl_utils",
 ]
