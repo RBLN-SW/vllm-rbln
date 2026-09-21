@@ -3526,7 +3526,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
-    { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = "~=0.12.0rc1.dev0" },
+    { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = "~=0.12.0.dev0" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = "~=0.1.0.dev0" },
     { name = "openai", specifier = ">=2.25.0" },
     { name = "optimum-rbln", specifier = ">=0.11.3a8,<0.11.4" },
