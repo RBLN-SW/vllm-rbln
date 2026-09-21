@@ -3576,6 +3576,49 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
 
+    def run_model_graphs(self) -> None:
+        """Every model graph once, at the shapes serving will ask for."""
+        # 1. prefill
+        self._dummy_run(1, self.max_num_tokens, True)
+
+        # 2. decode
+        query_lens = [1]
+        if self.speculative_config:
+            spec_query_len = self.speculative_config.num_speculative_tokens + 1
+            query_lens = (
+                [spec_query_len]
+                if self.uses_fixed_decode_window
+                else [1, spec_query_len]
+            )
+        for num_req in self.bucketing_manager.decode_batch_buckets:
+            for query_len in query_lens:
+                self._dummy_run(num_req, query_len, False)
+
+        if self.specialized_moe_decode:
+            # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
+            # cover the DP-asymmetric case (this rank decoding while another
+            # rank prefills). Warm-up is symmetric, so it cannot reach those
+            # shapes on its own: it pins the token dimension the ANY_PREFILL
+            # and QLEN_ASYM routes would ask for, which the small-bucket decode
+            # graphs from 2. decode above cannot satisfy.
+            num_req = self.bucketing_manager.decode_batch_buckets[-1]
+            for query_len in query_lens:
+                self._dummy_run(
+                    num_req,
+                    query_len,
+                    False,
+                    num_tokens_padded_override=self.max_num_tokens,
+                )
+            if self.speculative_config and not self.uses_fixed_decode_window:
+                # Cover DP-asymmetric decode where a peer runs spec decode.
+                self._dummy_run(
+                    num_req,
+                    1,
+                    False,
+                    num_tokens_padded_override=num_req
+                    * (self.speculative_config.num_speculative_tokens + 1),
+                )
+
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
         # KV transfer group exists: the KV-connector mixin asserts
@@ -3587,46 +3630,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         sig = mega_cache.config_signature(self.vllm_config)
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
-            # 1. prefill
-            self._dummy_run(1, self.max_num_tokens, True)
-
-            # 2. decode
-            query_lens = [1]
-            if self.speculative_config:
-                spec_query_len = self.speculative_config.num_speculative_tokens + 1
-                query_lens = (
-                    [spec_query_len]
-                    if self.uses_fixed_decode_window
-                    else [1, spec_query_len]
-                )
-            for num_req in self.bucketing_manager.decode_batch_buckets:
-                for query_len in query_lens:
-                    self._dummy_run(num_req, query_len, False)
-
-            if self.specialized_moe_decode:
-                # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
-                # cover the DP-asymmetric case (this rank decoding while another
-                # rank prefills). Warm-up is symmetric, so it cannot reach those
-                # shapes on its own: it pins the token dimension the ANY_PREFILL
-                # and QLEN_ASYM routes would ask for, which the small-bucket decode
-                # graphs from 2. decode above cannot satisfy.
-                num_req = self.bucketing_manager.decode_batch_buckets[-1]
-                for query_len in query_lens:
-                    self._dummy_run(
-                        num_req,
-                        query_len,
-                        False,
-                        num_tokens_padded_override=self.max_num_tokens,
-                    )
-                if self.speculative_config and not self.uses_fixed_decode_window:
-                    # Cover DP-asymmetric decode where a peer runs spec decode.
-                    self._dummy_run(
-                        num_req,
-                        1,
-                        False,
-                        num_tokens_padded_override=num_req
-                        * (self.speculative_config.num_speculative_tokens + 1),
-                    )
+            self.run_model_graphs()
 
             # 3. compute_logits
             if not self.use_wrapped_compute_logits:
