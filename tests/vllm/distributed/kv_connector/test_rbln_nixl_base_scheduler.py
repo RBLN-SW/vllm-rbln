@@ -101,6 +101,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched.blocks_per_sw = [0]
     sched._kv_lease_duration = 30
     sched._reqs_need_recv = {}
+    sched._abort_notify_reqs = set()
     sched._reqs_need_save = {}
     sched._reqs_need_send = {}
     sched._reqs_in_batch = set()
@@ -448,3 +449,66 @@ class TestRejectedBeforeScheduling:
 
         assert "rejected" in meta.reqs_to_recv
         assert meta.reqs_to_recv["rejected"].remote.block_ids == ()
+
+
+class TestAbortNotificationsAreTagged:
+    # A request aborted before it was scheduled still has to tell the producer
+    # to free what it prefilled. Upstream queues that as a read with no blocks,
+    # which the worker cannot tell from a full prefix hit -- so the tagging has
+    # to happen here, where the request's status is still visible (ICR-47).
+
+    @staticmethod
+    def _scheduler():
+        s = RblnNixlPullConnectorScheduler.__new__(RblnNixlPullConnectorScheduler)
+        s._abort_notify_reqs = set()
+        s._reqs_need_recv = {}
+        s._block_ids_need_save = {}
+        return s
+
+    @staticmethod
+    def _request(req_id, params):
+        req = MagicMock()
+        req.request_id = req_id
+        req.kv_transfer_params = params
+        return req
+
+    def test_an_abort_only_read_is_tagged(self, monkeypatch):
+        s = self._scheduler()
+        req = self._request("r0", {"do_remote_prefill": True})
+
+        def _upstream(self_, request, block_ids):
+            # What upstream does on this branch: queue a read with no blocks.
+            self_._reqs_need_recv[request.request_id] = (request, [])
+            return False, None
+
+        monkeypatch.setattr(NixlPullConnectorScheduler, "request_finished", _upstream)
+        RblnNixlPullConnectorScheduler.request_finished(s, req, [[1]])
+
+        assert s._abort_notify_reqs == {"r0"}
+
+    def test_a_normal_finish_is_not_tagged(self, monkeypatch):
+        s = self._scheduler()
+        req = self._request("r1", {"do_remote_decode": True})
+        monkeypatch.setattr(
+            NixlPullConnectorScheduler,
+            "request_finished",
+            lambda self_, request, block_ids: (False, None),
+        )
+        RblnNixlPullConnectorScheduler.request_finished(s, req, [[1]])
+
+        assert s._abort_notify_reqs == set()
+
+    def test_the_tags_ride_the_metadata_and_do_not_repeat(self, monkeypatch):
+        s = self._scheduler()
+        s._abort_notify_reqs = {"r0"}
+        monkeypatch.setattr(
+            NixlPullConnectorScheduler,
+            "build_connector_meta",
+            lambda self_, scheduler_output: MagicMock(),
+            raising=False,
+        )
+
+        meta = RblnNixlPullConnectorScheduler.build_connector_meta(s, MagicMock())
+        assert getattr(meta, sm.ABORT_NOTIFY_ATTR) == {"r0"}
+        # The next step starts clean: a stale tag would silence a real report.
+        assert s._abort_notify_reqs == set()

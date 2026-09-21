@@ -92,6 +92,22 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         )
         return self.transfer_topo
 
+    def _report_failed_recv(self, req_id: str) -> None:
+        """Upstream's failure report, for a request that may hold no block.
+
+        `_handle_failed_transfer` indexes `local_block_ids[0]` to invalidate
+        what was being read. A notify-only read has no such entry -- a full
+        prefix hit pulls nothing -- so there is no block to invalidate, and
+        indexing would raise instead of reporting. The scheduler still has to
+        hear that the request failed, which is the half that always applies.
+        """
+        meta = self._recving_metadata.get(req_id)
+        if meta is not None and meta.local_block_ids:
+            self._handle_failed_transfer(req_id, None)
+            return
+        self._failed_recv_reqs.put(req_id)
+        self.xfer_stats.record_failed_transfer()
+
     def _layer_overlap(
         self, registered_layer_names: tuple[str, ...] | list[str]
     ) -> list[tuple[int, int]]:

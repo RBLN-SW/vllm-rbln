@@ -127,6 +127,22 @@ class TestShardReadPath:
         w._logical_to_kernel_block_ids = lambda ids, _n: ids
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.make_prepped_xfer.side_effect = lambda *a, **k: object()
+        # What get_finished reads on top of the above: the producer-side notif
+        # sweep, the expiry sweep, and the post-processing switches (all off
+        # here -- equal block sizes, no host buffer, one uniform KV group).
+        w.nixl_wrapper.get_new_notifs.return_value = {}
+        w.nixl_wrapper.check_xfer_state.return_value = "DONE"
+        w.tp_rank = 0
+        w.use_mla = False
+        w.use_host_buffer = False
+        w.enable_permute_local_kv = False
+        w.enable_heterogeneous_attn_post_process = False
+        w._reqs_to_send = {}
+        w._reqs_to_process = set()
+        w.consumer_notification_counts_by_req = defaultdict(int)
+        w._zero_read_reqs = set()
+        w._failed_zero_reads = set()
+        w._abort_notify_reqs = set()
         return w
 
     @staticmethod
@@ -138,6 +154,9 @@ class TestShardReadPath:
         meta = MagicMock()
         meta.remote = remote
         meta.local_physical_block_ids = local_ids
+        # The logical ids upstream invalidates on failure; equal to the physical
+        # ones wherever the two block sizes match, as they do here.
+        meta.local_block_ids = local_ids
         return meta
 
     def test_reads_every_stage(self):
@@ -185,6 +204,125 @@ class TestShardReadPath:
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 0
         assert w.nixl_wrapper.send_notif.call_count == 2
         assert len(w._recving_transfers["r0"]) == 0
+
+    def test_a_prefix_hit_is_reported_done(self):
+        # A prefix hit reads nothing, so only get_finished can end the
+        # scheduler's wait. Every peer answered and every block is already
+        # local, so it is complete, not failed.
+        w = self._read_worker(pp_size=2)
+        meta = self._meta([], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+        _done_sending, done_recving = w.get_finished()
+
+        assert done_recving == {"r0"}
+        assert w._invalid_block_ids.empty()
+        assert w._failed_recv_reqs.empty()
+
+    def test_a_prefix_hit_against_a_dead_conn_is_reported_failed(self):
+        # The notification is the whole read here, so a peer that cannot be
+        # reached leaves nothing to report the request with (ICR-47). It goes
+        # the way a failed transfer does, and the scheduler ends it with a
+        # reason instead of waiting without a bound.
+        w = self._read_worker(pp_size=2)
+        w.nixl_wrapper.send_notif.side_effect = RuntimeError("conn is gone")
+        meta = self._meta([], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+
+        assert list(w._failed_recv_reqs.queue) == ["r0"]
+        # A full prefix hit pulled nothing, so there is no block to invalidate.
+        assert w._invalid_block_ids.empty()
+        w.xfer_stats.record_failed_notification.assert_called()
+        assert "r0" not in w._zero_read_reqs
+
+    def test_one_dead_stage_fails_the_whole_prefix_hit(self):
+        # Stage 0 answers and stage 1 does not: the request is not complete
+        # just because part of the fan-out was reached.
+        w = self._read_worker(pp_size=2)
+        w.nixl_wrapper.send_notif.side_effect = [None, RuntimeError("conn is gone")]
+        meta = self._meta([], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+
+        # One report for the request, not one per unreachable stage.
+        assert list(w._failed_recv_reqs.queue) == ["r0"]
+        assert w._zero_read_reqs == set()
+        assert w.get_finished()[1] == {"r0"}
+
+    def test_a_prefix_hit_is_reported_once(self):
+        # The engine's aggregator counts one report per worker, so a second
+        # would settle some later request early.
+        w = self._read_worker(pp_size=2)
+        meta = self._meta([], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+
+        assert [len(w.get_finished()[1]) for _ in range(3)] == [1, 0, 0]
+
+    def test_an_aborted_requests_release_is_not_reported(self):
+        # Upstream queues a read with no blocks for a request aborted before it
+        # was scheduled, purely to free the producer's blocks. The scheduler has
+        # already dropped that request, so naming it in finished_recving trips
+        # its `assert req_id in self.requests` and kills the engine (ICR-47).
+        w = self._read_worker(pp_size=2)
+        w._abort_notify_reqs = {"r0"}
+        meta = self._meta([], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+
+        assert w.nixl_wrapper.send_notif.call_count == 2  # P still gets told
+        assert w._zero_read_reqs == set()
+        assert w.get_finished()[1] == set()
+
+    def test_an_aborted_requests_release_is_not_reported_when_it_fails(self):
+        # Nor when the producer is gone: there is nobody left to report to, and
+        # its blocks go when the lease expires.
+        w = self._read_worker(pp_size=2)
+        w._abort_notify_reqs = {"r0"}
+        w.nixl_wrapper.send_notif.side_effect = RuntimeError("conn is gone")
+        meta = self._meta([], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+
+        assert w._failed_recv_reqs.empty()
+        assert w._invalid_block_ids.empty()
+        assert w.get_finished()[1] == set()
+
+    def test_a_stage_that_posts_a_transfer_keeps_the_request(self):
+        # Upstream's read settles some peers without a transfer and posts one
+        # for others. The handle owns the request then: reporting it done here
+        # as well would drop the metadata the handle still needs.
+        w = self._read_worker(pp_size=2)
+        w._recving_metadata["r0"] = self._meta([[1, 2]], [[3, 4]])
+        w._settle_zero_read("r0")
+        w._recving_transfers["r0"].append(object())
+
+        _done_sending, done_recving = w.get_finished()
+
+        assert done_recving == {"r0"}
+        assert w._recving_metadata == {}
+
+    def test_a_failed_read_stays_a_failure(self):
+        # Upstream's read posts no transfer when it fails either, so the
+        # zero-read set picks the request up. Upstream still owns it -- taking
+        # it as done here would report success for KV that never arrived, and
+        # drop the metadata upstream is about to read.
+        w = self._read_worker(pp_size=2)
+        w._recving_metadata["r0"] = self._meta([[1, 2]], [[3, 4]])
+        w._settle_zero_read("r0")
+        w._handle_failed_transfer("r0", None)
+
+        _done_sending, done_recving = w.get_finished()
+
+        assert done_recving == {"r0"}
+        assert list(w._invalid_block_ids.queue) == [{1, 2}]
 
     def test_the_read_notification_counts_our_stages(self):
         # The parametrized case below pins this arithmetic; what this pins is
@@ -385,6 +523,66 @@ class TestUpstreamReachesTheOverride:
         # upstream's own formula can produce.
         ids = w.nixl_wrapper.make_prepped_xfer.call_args.args[2]
         assert min(ids) >= w.num_regions * w.dst_num_blocks["eng"]
+
+    @staticmethod
+    def _delegating_worker():
+        w = TestShardReadPath._read_worker(pp_size=1)
+        w._overlapping_ranks = {}  # nothing narrowed -> delegate to upstream
+        w.block_size = 16
+        w.src_xfer_handles_by_block_size = {16: 900}
+        w.src_xfer_handles_by_tp_ratio = {}
+        w.tp_mappings = {
+            "eng": TPMapping(
+                source_ranks_per_group=((0,),),
+                all_source_ranks=(0,),
+                rank_to_attention_slot={0: 0},
+                rank_offset_factor=0,
+            )
+        }
+        w._sw_ratio = None  # no sliding window: plain descriptor ids
+        w.num_regions = 2
+        return w
+
+    def test_upstream_prefix_hit_is_reported_done(self):
+        # Upstream's read returns right after the notif on a prefix hit, having
+        # posted no transfer, so the delegating path needs the same reporting as
+        # the per-shard one (ICR-47).
+        w = self._delegating_worker()
+        meta = TestShardReadPath._meta([], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+
+        assert w.nixl_wrapper.make_prepped_xfer.call_count == 0
+        assert w.nixl_wrapper.send_notif.call_count == 1
+        assert w.get_finished()[1] == {"r0"}
+        assert w._failed_recv_reqs.empty()
+
+    def test_upstream_prefix_hit_against_a_dead_conn_is_reported_failed(self):
+        # Upstream swallows this notification failure, so the notify-only read
+        # is taken over rather than delegated.
+        w = self._delegating_worker()
+        w.nixl_wrapper.send_notif.side_effect = RuntimeError("conn is gone")
+        meta = TestShardReadPath._meta([], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+
+        assert list(w._failed_recv_reqs.queue) == ["r0"]
+        assert w._zero_read_reqs == set()
+
+    def test_a_delegated_read_that_moves_blocks_stays_upstreams(self):
+        # Only the notify-only case is taken over; a real read still goes
+        # through upstream and is reported by its handle.
+        w = self._delegating_worker()
+        meta = TestShardReadPath._meta([[3, 4]], [[1, 2]])
+        w._recving_metadata["r0"] = meta
+
+        w._read_blocks_for_req("r0", meta)
+
+        assert w.nixl_wrapper.make_prepped_xfer.call_count == 1
+        assert w._zero_read_reqs == set()
+        assert len(w._recving_transfers["r0"]) == 1
 
 
 class TestReadMarksTheEngineActive:
