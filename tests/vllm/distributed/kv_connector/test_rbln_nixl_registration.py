@@ -1677,6 +1677,28 @@ class TestTailBlockTrim:
         with pytest.raises(RuntimeError, match="host staging"):
             build_worker(monkeypatch, kv_buffer_device="cpu", swa_window_mode=True)
 
+    def test_host_staging_refuses_streaming_on_the_side_that_would_do_it(
+        self, monkeypatch
+    ):
+        # A prefix offer is named in per-shard descriptors, which host staging
+        # has none of. It used to be dropped in silence, leaving an operator
+        # who asked for it with an engine that never streamed.
+        with pytest.raises(RuntimeError, match="host staging"):
+            build_worker(
+                monkeypatch,
+                kv_buffer_device="cpu",
+                push_stream=True,
+                cls=RblnNixlPushConnectorWorker,
+            )
+
+    def test_host_staging_leaves_the_reading_side_alone(self, monkeypatch):
+        # One `--kv-transfer-config` reaches both ends, and the knob names
+        # something only the writer does. Refusing it here would refuse the
+        # consumer of a pair whose producer legitimately asked.
+        worker = build_worker(monkeypatch, kv_buffer_device="cpu", push_stream=True)
+
+        assert worker._shape.streams_prefix is False
+
 
 class TestChunkModeWithASlidingWindow:
     """A hybrid engine is let into chunk mode because it owns the whole-engine

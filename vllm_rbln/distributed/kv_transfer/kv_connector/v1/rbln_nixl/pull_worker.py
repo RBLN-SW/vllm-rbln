@@ -96,7 +96,11 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
             # Chunk mode registers per-shard state against every peer unless
             # a sliding window kept it on this route, so reaching upstream's
             # whole-engine read without one means it did not.
-            assert not self._shape.chunk_mode or self._own_engine_layout
+            assert not self._shape.chunk_mode or self._own_engine_layout, (
+                f"RBLN NIXL: chunk mode reached upstream's whole-engine read "
+                f"for {engine_id}, whose notification cannot name the part of "
+                "a request a chunked read fills"
+            )
             # Counted before the call: upstream trims the front of both lists
             # against the local prefix cache, and the token count describes the
             # request's own blocks.
@@ -206,7 +210,11 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                 num_valid_tokens=valid_tokens,
                 num_prompt_blocks=n_prompt_blocks,
             )
-            assert len(local_descs) == len(remote_descs)
+            assert len(local_descs) == len(remote_descs), (
+                f"RBLN NIXL: {len(local_descs)} local vs {len(remote_descs)} "
+                f"remote descriptor(s) for {engine_id} rank {global_rank}; the "
+                "two lists pair by position, so a transfer would misread"
+            )
             local_handle = self.src_xfer_handles_by_remote[
                 (engine_id, global_rank, remote_block_size)
             ]

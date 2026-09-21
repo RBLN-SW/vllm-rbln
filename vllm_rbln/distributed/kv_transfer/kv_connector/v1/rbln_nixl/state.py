@@ -352,7 +352,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         chunks = span_tokens // chunk_tokens
         # What keeps the arithmetic downstream free of the axis: a block is a
         # whole number of chunks however its spans are cut.
-        assert chunk_tokens * chunks * spans == block_size
+        assert chunk_tokens * chunks * spans == block_size, (
+            f"RBLN NIXL: {spans} span(s) of {chunks} chunk(s) of "
+            f"{chunk_tokens} token(s) do not tile a {block_size}-token block"
+        )
         if chunks == 1:
             return None
         return runs, chunks

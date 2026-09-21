@@ -377,7 +377,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self.block_len_per_layer = list(xfer.block_lens)
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = xfer.base_addrs
         self._registered_descs.append(xfer.reg_handle)
-        assert len(self.block_len_per_layer) == len(xfer.base_addrs)
+        assert len(self.block_len_per_layer) == len(xfer.base_addrs), (
+            f"RBLN NIXL: the adapter returned {len(xfer.base_addrs)} region "
+            f"address(es) for {len(self.block_len_per_layer)} block length(s); "
+            "every descriptor here is (address, length) by position"
+        )
 
         # Upstream keys REPLICATE vs SPLIT off this list and indexes it 1:1 with
         # block_len_per_layer, which is chiplet-expanded here -- so the flags are
@@ -418,10 +422,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             f"the plugin reported {self._kv_slices} logical slice(s) per shard"
         )
 
-        # A head axis of extent one cannot be cut, so the compiler replicates
-        # instead and more than one slice there has no other explanation. Above
-        # one head both axes fit the same count, so an axis that is not derived
-        # stays HEAD rather than guessed.
+        # A rank's head axis of extent one cannot be cut, so the compiler
+        # replicates instead and more than one slice there has no other
+        # explanation. Above one head it is a head band: nothing here
+        # context-cuts a rank holding several, and the adapter's return could
+        # not say so anyway -- both cuts give the same length and slice count.
         region_cut = [
             (heads, self._logical_region_slices[r])
             for r, heads in enumerate(logical_kv_heads)

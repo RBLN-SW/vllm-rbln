@@ -32,6 +32,7 @@ from vllm.v1.request import RequestStatus
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
 from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
+    set_shape,
     shape,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
@@ -606,7 +607,7 @@ class TestEarlyOfferOnTheWritePath:
         # one block whatever the prompt length -- and that block is the live
         # window.
         sched = self._chunking_scheduler(8)
-        sched.blocks_per_sw = [2, 0]  # group 0 is the sliding window this time
+        set_shape(sched, counted_group=1)  # group 0 is the window this time
         req = _Request("prefill", num_prompt_tokens=512)
         sched._reqs_need_save["prefill"] = req
         req.num_computed_tokens = 40
@@ -900,6 +901,9 @@ class TestEarlyPushGate:
         worker.shutdown = lambda: None  # the base __init__ was stubbed out
 
         assert worker._shape.streams_prefix is sched._shape.streams_prefix
+        # The scheduler sizes an offer by this group and the worker reads the
+        # window, the coverage range and the chunk bound off it.
+        assert worker._shape.counted_group == sched._shape.counted_group
 
 
 class TestTailTokenCountOnTheReadPath:

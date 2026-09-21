@@ -220,36 +220,29 @@ class TestSwaWindowRatio:
         )
         assert worker._shape.window_ratio is None
 
-    def test_pure_full_attention_keeps_ratio_none(self, monkeypatch):
-        # A non-sliding-window group contributes no ratio.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",  # window mode is the direct path's
-            swa_window_mode=True,
-            specs=[MagicMock()],
-        )
-        assert worker._shape.window_ratio is None
+    def test_pure_full_attention_is_refused_the_window_knob(self, monkeypatch):
+        # A non-sliding-window group contributes no ratio, so the range the
+        # knob asks for has nothing to be cut by. Refused rather than left
+        # inert: an operator who named it is owed the reason.
+        with pytest.raises(RuntimeError, match="no window to cut by"):
+            build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",  # window mode is the direct path's
+                swa_window_mode=True,
+                specs=[MagicMock()],
+            )
 
-    def test_a_window_as_wide_as_its_block_says_the_knob_did_nothing(
-        self, monkeypatch, caplog
-    ):
-        # A granule would be the block, so registering no range is right --
-        # but the operator set the knob and nothing follows it. Silent, that
-        # reads as a knob that works.
-        with caplog.at_level("INFO"):
-            worker = build_worker(
+    def test_a_window_as_wide_as_its_block_is_refused(self, monkeypatch):
+        # A granule would be the block, so the range would repeat what the
+        # whole one names. The operator set the knob and nothing could follow
+        # it; silent, that reads as a knob that works.
+        with pytest.raises(RuntimeError, match="no window to cut by"):
+            build_worker(
                 monkeypatch,
                 kv_buffer_device="rbln",
                 swa_window_mode=True,
                 specs=[sliding_window_spec(block_size=64, sliding_window=64)],
             )
-
-        assert worker._shape.window_ratio is None
-        assert [
-            r.getMessage()
-            for r in caplog.records
-            if "registered no window range" in r.getMessage()
-        ]
 
     def test_sliding_window_derives_block_over_window_ratio(self, monkeypatch):
         worker = build_worker(
@@ -274,15 +267,16 @@ class TestSwaWindowRatio:
         assert worker._shape.window_ratio is None
         assert worker._own_engine_layout
 
-    def test_window_equal_to_block_collapses_to_none(self, monkeypatch):
-        # ratio 1 means the window equals the full block -> no trimming.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            swa_window_mode=True,
-            specs=[sliding_window_spec(block_size=64, sliding_window=64)],
-        )
-        assert worker._shape.window_ratio is None
+    def test_a_window_as_wide_as_the_block_is_refused_the_knob(self, monkeypatch):
+        # Ratio 1: the window IS the block, so the second range would repeat
+        # the first. Same refusal as having no window at all.
+        with pytest.raises(RuntimeError, match="no window to cut by"):
+            build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                swa_window_mode=True,
+                specs=[sliding_window_spec(block_size=64, sliding_window=64)],
+            )
 
     def test_full_attention_groups_are_skipped(self, monkeypatch):
         # The hybrid shape: a model interleaves full-attention and sliding-window
@@ -354,18 +348,6 @@ class TestSwaWindowRatio:
                 specs=[
                     sliding_window_spec(block_size=64, sliding_window=sliding_window)
                 ],
-            )
-
-    def test_mla_with_window_mode_is_rejected_at_startup(self, monkeypatch):
-        # The dual desc range and a key-only latent have not been combined,
-        # so fail at construction rather than at the first handshake.
-        with pytest.raises(RuntimeError, match="sliding-window MLA"):
-            build_worker(
-                monkeypatch,
-                kv_buffer_device="rbln",
-                swa_window_mode=True,
-                use_mla=True,
-                specs=[sliding_window_spec(block_size=64, sliding_window=16)],
             )
 
 

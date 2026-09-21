@@ -118,12 +118,18 @@ class RblnNixlWorkerBase(
         # buffer; restore it — NIXL cannot register RBLN device memory.
         self.use_host_buffer = self._shape.use_host_buffer
         if self.use_host_buffer:
-            # Either knob puts a second descriptor range on the lists. Refused
+            # Each knob needs the descriptor lists of the direct path. Refused
             # here rather than left inert, since an operator who named one is
-            # owed the reason it cannot be served.
+            # owed the reason it cannot be served. `push_stream` only on the
+            # side that would act on it: the other gets the same config and
+            # the shape has already made it inert there.
             for knob, asked in (
                 ("chunk_mode", self._shape.chunk_mode),
                 ("swa_window_mode", self._shape.wants_window),
+                (
+                    "push_stream",
+                    self._shape.wants_stream and self._shape.writes_into_peer,
+                ),
             ):
                 if asked:
                     raise RuntimeError(
@@ -133,8 +139,6 @@ class RblnNixlWorkerBase(
                         "upstream built, and a second range extends neither."
                     )
 
-        # 0 is "nobody named one": a stripe is a byte width, so no width is a
-        # width the adapter is never handed.
         # 0 is a width the adapter takes, so it cannot stand for "nobody named
         # one" -- this knob carries its absence instead.
         self._stripe_width = connector_option(
@@ -219,23 +223,20 @@ class RblnNixlWorkerBase(
             g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
         ]
         if self._shape.wants_window and not self._shape.has_window_range:
-            # Doing nothing is right here -- a granule would be the block,
-            # so the range would repeat what the whole one names. Saying so
-            # is what was missing: the knob is set and nothing follows.
-            logger.info(
-                "RBLN NIXL: swa_window_mode registered no window range. "
-                "Every sliding-window group here holds a window as wide as "
-                "its block, so a granule is the block."
+            raise RuntimeError(
+                "RBLN NIXL: swa_window_mode asks for a second descriptor range "
+                "of one sliding window, and this engine has no window to cut "
+                "by -- no sliding-window group, or one as wide as its block."
             )
         if self._shape.has_window_range:
-            # Fail at startup rather than at the first handshake: the two desc
-            # ranges `register_local_xfer_handler` builds and a key-only latent
-            # have not been combined.
-            if self.use_mla:
-                raise RuntimeError(
-                    "RBLN NIXL: SWA window mode is not supported with a "
-                    "sliding-window MLA cache."
-                )
+            # A backstop: `patches/attention.py` refuses a sliding-window MLA
+            # layer while the engine is being built, so no such group reaches
+            # here. The two desc ranges `register_local_xfer_handler` builds
+            # and a key-only latent have not been combined.
+            assert not self.use_mla, (
+                "RBLN NIXL: SWA window mode is not supported with a "
+                "sliding-window MLA cache."
+            )
             logger.info(
                 "SWA window mode on: %d sliding_window-sized desc(s) per "
                 "block alongside the Full descs at shared base addrs.",

@@ -388,6 +388,23 @@ class TestTransferShape:
 
         assert shape.streams_prefix is streams
 
+    def test_the_counted_group_is_the_one_that_does_not_slide(self):
+        # Not the first: a sliding-window group holds one block whatever the
+        # prompt length, so an offer sized from it would be one block for every
+        # request. Which position it sits in is the model's business.
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        groups = self._groups(
+            sliding_window_spec(block_size=64, sliding_window=16),
+            MagicMock(spec=FullAttentionSpec),
+        )
+
+        shape = transfer_shape(
+            mock_vllm_config(chunk_mode=True), groups, writes_into_peer=True
+        )
+
+        assert shape.counted_group == 1
+
     def test_the_knob_is_still_reported_as_asked_for(self):
         # `wants_stream` is what an operator typed; `streams_prefix` is what
         # this side does about it. A refusal reads the first.

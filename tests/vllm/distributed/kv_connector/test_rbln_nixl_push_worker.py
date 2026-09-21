@@ -1711,6 +1711,7 @@ class TestCoverageNotif:
             MagicMock(spec=SlidingWindowSpec),
             MagicMock(),  # full attention, and the second group at that
         ]
+        set_shape(worker, counted_group=1)
 
         worker._xfer_blocks_for_req(
             "r0", TestPerShardWrite._meta(([1], [2, 3]), ([7], [8, 9]))
@@ -2546,6 +2547,27 @@ class TestStreamWindow:
         worker._xfer_blocks_for_req("r0", second)
 
         # One transfer, the first batch's. The second names no descriptor.
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 1
+
+    def test_streaming_alone_stops_the_closing_batch_at_the_same_place(self):
+        # The same two batches with the knob off: streaming reaches the chunk
+        # range on its own, so the bound the last block is cut to cannot be
+        # chunk mode's. Without it the closing batch writes the rest of a block
+        # the forward pass had not filled.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        set_shape(worker, streams_prefix=True)
+        worker._shard_chunk_grids = {("eng", 0): (2, 2)}
+        worker._valid_tokens = {"r0": 3 * 16 + 8}
+
+        first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        first.local_block_ids = pw.OfferedBlocks(first.local_block_ids, 3 * 16 + 8)
+        worker._xfer_blocks_for_req("r0", first)
+
+        second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        second.local_block_ids = pw.OfferedBlocks(second.local_block_ids, 4 * 16)
+        worker._xfer_blocks_for_req("r0", second)
+
         assert worker.nixl_wrapper.make_prepped_xfer.call_count == 1
 
     def test_a_peer_with_a_grid_is_counted_in_chunks_even_unstreamed(self):

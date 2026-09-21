@@ -201,11 +201,18 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
-        super().__init__(vllm_config, engine_id, kv_cache_config)
+        # Both are what `shutdown` walks, and a refusal in the base leaves
+        # this body unrun while upstream's `__del__` still calls it.
         # Tokens a handed-over request holds, for `_tail_chunks`. Every
         # request has one, streamed or not, so it is not part of
         # `_StreamedSend`.
         self._valid_tokens: dict[str, int] = {}
+        # Per request, for as long as it is being pushed in pieces. Created
+        # when this rank first closes a chunk of it, dropped when the send is
+        # over -- see _StreamedSend.
+        self._streamed: dict[ReqId, _StreamedSend] = {}
+
+        super().__init__(vllm_config, engine_id, kv_cache_config)
 
         # Ranges of this request's blocks each writer has reported filling,
         # for a peer that does name them. Kept per writer because a request
@@ -224,10 +231,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # one and nothing can reach it unstripped.
         self._pending_completion_notifs = _CoverageNotifQueue(self)
 
-        # Per request, for as long as it is being pushed in pieces. Created
-        # when this rank first closes a chunk of it, dropped when the send is
-        # over -- see _StreamedSend.
-        self._streamed: dict[ReqId, _StreamedSend] = {}
         self._empty_receives: set[ReqId] = set()
 
     def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
@@ -671,7 +674,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             # Chunk mode asks for per-shard state, because those ids are what
             # can leave part of a block out -- unless a sliding window kept it
             # on this route, whose list carries the range instead.
-            assert not self._shape.chunk_mode or self._own_engine_layout
+            assert not self._shape.chunk_mode or self._own_engine_layout, (
+                f"RBLN NIXL push: chunk mode reached the whole-engine handle "
+                f"for {engine_id}, whose notification cannot name the part of "
+                "a request a chunked write fills"
+            )
             send = self._streamed.get(req_id)
             if send is not None and send.released:
                 # Streaming asks for the same state, and for the same reason
@@ -737,7 +744,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         n_prompt_blocks = sum(len(g) for g in local_block_ids)
         # Registration refuses a streamed engine with no full-attention group,
         # which is what would leave nothing to count in.
-        counted = self._counted_group(remote_block_ids)
+        counted = self._shape.counted_group
         assert counted is not None
         registered = len(remote_block_ids[counted])
 
@@ -891,7 +898,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         remote_block_ids = meta.remote.block_ids
         local_block_ids = meta.local_physical_block_ids
         n_prompt_blocks = self._prompt_blocks(local_block_ids)
-        counted = self._counted_group(remote_block_ids)
+        counted = self._shape.counted_group
         # Registration refuses a streamed engine with no full-attention group,
         # which is what would leave nothing to count in.
         assert n_prompt_blocks is not None and counted is not None
@@ -1068,7 +1075,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         if expand != self._remote_expand_for(req_id):
             return None
 
-        f = self._counted_group(remote_block_ids)
+        f = self._shape.counted_group
         assert f is not None
         registered = len(remote_block_ids[f])
         offset = total * expand - registered

@@ -144,8 +144,9 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
         # A sliding window's group holds one block whatever the prompt length,
         # and that block is the live window the kernel keeps overwriting -- final
         # only once the prefill is, so the handover carries it, clipped to the
-        # window by upstream.
-        counted = next(g for g, blocks in enumerate(self.blocks_per_sw) if not blocks)
+        # window by upstream. The worker reads the same field of the same shape.
+        counted = self._shape.counted_group
+        assert counted is not None
         for req_id, new_block_id_groups, resumed in yield_req_data(scheduler_output):
             req = self._reqs_need_save.get(req_id)
             if req is None:

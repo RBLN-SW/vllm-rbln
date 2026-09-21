@@ -97,30 +97,9 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         finally:
             self._request_tail = prev
 
-    def _counted_group(self, block_ids: BlockIds) -> int | None:
-        """The group a token count, a chunk and a coverage range are counted in.
-
-        A sliding-window group holds one block whatever the prompt length, so
-        summing the groups -- or taking the first -- describes no request.
-        Chunk mode and streaming both register against exactly one
-        full-attention group, which is the one those counts belong to. With a
-        single group there is nothing to select, and the specs need not be read
-        to know it; an engine without such a group has nothing to count in.
-        """
-        if len(block_ids) == 1:
-            return 0
-        return next(
-            (
-                g
-                for g, spec in enumerate(self._group_specs)
-                if not isinstance(spec, SlidingWindowSpec)
-            ),
-            None,
-        )
-
     def _prompt_blocks(self, block_ids: BlockIds) -> int | None:
         """How many blocks the request holds, read off the group a chunk cuts."""
-        counted = self._counted_group(block_ids)
+        counted = self._shape.counted_group
         return None if counted is None else len(block_ids[counted])
 
     def _window_granules(
@@ -198,7 +177,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             needed = None
         else:
             # A chunk range exists only where a full-attention group does, and
-            # that group is what `_counted_group` selects.
+            # that group is what the shape counts in.
             prompt_blocks = tail[1]
             assert prompt_blocks is not None
             needed = self._tail_chunks(
@@ -390,8 +369,16 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         -- the same bytes in more descriptors is a loss.
 
         Rounds up, because every token counted has to reach the peer.
+
+        Asked of whatever may name part of a block rather than of chunk mode
+        alone: a streamed batch closes a block the forward pass is still
+        filling, and the chunks above the count hold KV nobody has written.
         """
-        if not self._shape.chunk_mode or not num_valid_tokens or num_blocks <= 0:
+        if (
+            not self._shape.writes_part_of_a_block
+            or not num_valid_tokens
+            or num_blocks <= 0
+        ):
             return None
         rem = num_valid_tokens - (num_blocks - 1) * self.block_size
         if not 1 <= rem <= self.block_size:

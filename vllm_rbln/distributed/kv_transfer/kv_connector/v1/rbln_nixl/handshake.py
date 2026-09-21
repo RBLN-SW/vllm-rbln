@@ -157,7 +157,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             "same regions in the same order, but this peer narrows ours to "
             f"{region_ids} of {self.num_regions}"
         )
-        assert len(handles) == len(plan.all_source_ranks)
+        assert len(handles) == len(plan.all_source_ranks), (
+            f"RBLN NIXL: {len(handles)} handle(s) for "
+            f"{len(plan.all_source_ranks)} source rank(s); the plan pairs "
+            "them by position"
+        )
         # A pipeline-parallel peer cannot reach here (rejected during the
         # handshake), so the rank we hold is the peer's TP rank as planned.
         return handles[plan.all_source_ranks.index(global_rank)]
@@ -1364,7 +1368,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
 
         remote_engine_id = nixl_agent_meta.engine_id
         remote_info = self.topo.get_engine_info(remote_engine_id)
-        assert remote_info.remote_tp_size == remote_tp_size
+        assert remote_info.remote_tp_size == remote_tp_size, (
+            f"RBLN NIXL: {remote_engine_id} is registered at TP "
+            f"{remote_info.remote_tp_size} and handshaking at {remote_tp_size}"
+        )
         # A producer with FEWER TP ranks is matched per head band; the other
         # direction never reaches here, rejected during the handshake.
         pp_tp_ratio = self.topo.tp_ratio(remote_tp_size)
@@ -1381,7 +1388,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         assert self.topo.block_size_ratio(nixl_agent_meta.block_size) == 1, (
             "PP over NIXL P/D requires equal P/D block sizes."
         )
-        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
+        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks, (
+            f"RBLN NIXL: {remote_engine_id} advertised "
+            f"{nixl_agent_meta.num_blocks} block(s) after registering "
+            f"{self.dst_num_blocks[remote_engine_id]}; a descriptor id is "
+            "region * blocks + block"
+        )
         rpl = self._regions_per_layer()
         n_remote = len(nixl_agent_meta.kv_caches_base_addr)
         assert (
