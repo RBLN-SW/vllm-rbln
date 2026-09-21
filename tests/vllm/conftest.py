@@ -354,6 +354,10 @@ def pytest_runtest_protocol(item, nextitem):
             report = _config.hook.pytest_report_from_serializable(
                 config=_config, data=data
             )
+            # JSON turns the skip location tuple into a list; JUnit requires
+            # pytest's original tuple representation.
+            if report.skipped and isinstance(report.longrepr, list):
+                report.longrepr = tuple(report.longrepr)
             # The child addressed the test by its own nodeid; re-anchor to this
             # session's item so the terminal, cache and junitxml agree.
             report.nodeid = item.nodeid
