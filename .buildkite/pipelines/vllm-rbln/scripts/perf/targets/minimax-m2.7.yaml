@@ -5,7 +5,7 @@ env:
   VLLM_DISABLE_COMPILE_CACHE: "1"
 
 serve:
-  rbln_model_impl: vllm
+  model_impl: vllm
   rbln_use_batch_attn_opt: true
   max_model_len: 65536
   block_size: 8192
