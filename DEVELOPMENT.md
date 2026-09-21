@@ -22,6 +22,8 @@ uv sync --extra runtime
 
 > `rebel-compiler` is separated into the `runtime` extra — it is required for NPU execution but excluded from the base dependency set. `--extra runtime` installs it alongside the rest of the locked environment.
 
+> `qwen_vl_utils` is separated into the `examples` extra — only the multimodal examples and the optimum correctness scripts import it, so a deployment that just serves a model does not install it. Add `--extra examples` to run those.
+
 ## pyproject.toml vs uv.lock — what to edit when
 
 | File | Role | Edit by hand? |
