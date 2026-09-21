@@ -563,6 +563,7 @@ SYNTHETIC_ARGMAX = [6, 7]
 
 
 def run_synthetic(impl, rates: list[float]) -> torch.Tensor:
+    """One greedy request drafting `SYNTHETIC_DRAFTS`, with 1 as its bonus token."""
     return run_rejection_sample(
         impl,
         draft_token_ids=SYNTHETIC_DRAFTS,
@@ -575,26 +576,38 @@ def run_synthetic(impl, rates: list[float]) -> torch.Tensor:
     )
 
 
-def test_synthetic_rate_one_accepts_a_draft_the_target_rejects(impl):
-    # Every draft accepted, so the row runs to its bonus token.
-    assert run_synthetic(impl, [1.0, 1.0]).tolist() == [[3, 5, 1]]
+# The synthetic count decides how far the row runs; `recovered_token_ids` is
+# filled only where the op itself stopped, so the boundary token is always that
+# one and never a zeroed slot.
+@pytest.mark.parametrize(
+    "rates,expected,rule",
+    [
+        (
+            [1.0, 1.0],
+            [[3, 5, 1]],
+            "every position accepts, so the row runs on to its bonus token",
+        ),
+        (
+            [1.0, 0.0],
+            [[3, 6, PLACEHOLDER_TOKEN_ID]],
+            "stopping past the op's own stop still carries the op's token, 6, "
+            "rather than the zero sitting in position 1's slot",
+        ),
+        (
+            [0.0, 1.0],
+            [[6, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+            "a rejection ends the run, so position 1 cannot accept on its own",
+        ),
+    ],
+    ids=["accepts_every_position", "stops_after_the_op", "rejection_ends_the_run"],
+)
+def test_synthetic_rates_decide_the_row(impl, rates, expected, rule):
+    assert run_synthetic(impl, rates).tolist() == expected, rule
 
 
-def test_synthetic_rejection_reuses_the_token_the_op_itself_drew(impl):
-    """The op fills `recovered_token_ids` only where it rejected, so a synthetic
-    count landing elsewhere must carry that one token, never a zeroed slot."""
-    # The op rejects at position 0 and recovers its argmax, 6. A synthetic draw
-    # that rejects at position 1 has to reuse that 6 -- position 1's own slot
-    # holds a zero, which would leave token id 0 in the output.
-    assert run_synthetic(impl, [1.0, 0.0]).tolist() == [[3, 6, PLACEHOLDER_TOKEN_ID]]
-
-    # Rejecting where the op did keeps the same token in its own slot.
-    assert run_synthetic(impl, [0.0, 0.0]).tolist() == [
-        [6, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]
-    ]
-
-    # When the op accepted everything it recovered nothing, so its bonus token
-    # is the only one it drew; a synthetic rejection carries that instead.
+def test_synthetic_rejection_reuses_the_bonus_when_the_op_accepted_everything(impl):
+    """An op that accepted every draft recovered nothing, so the only token it
+    drew is its bonus; a synthetic rejection has to carry that one."""
     output = run_rejection_sample(
         impl,
         draft_token_ids=SYNTHETIC_ARGMAX,
@@ -609,9 +622,9 @@ def test_synthetic_rejection_reuses_the_token_the_op_itself_drew(impl):
 
 
 def test_synthetic_acceptance_is_capped_by_the_drafted_count(impl):
-    """Rates that accept every position, against a request that brought fewer
-    drafts than the padded length: the slot it never drafted must not be
-    accepted, so its bonus token still lands right after its own last draft."""
+    """Every position accepts, so a request that drafted fewer tokens than the
+    padded width must still stop at its own last draft and put its bonus there.
+    The second row drafted the full width and is the control."""
     output = run_rejection_sample(
         impl,
         draft_token_ids=[3, 2, 4],

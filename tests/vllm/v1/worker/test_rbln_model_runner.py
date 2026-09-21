@@ -341,12 +341,9 @@ class TestSamplePadding:
 
 
 def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
-    """Synthetic mode hands the graph one more input, which dynamo specializes on.
-
-    A warm-up that passed `synthetic_mode=False` would compile the variant the
-    real steps never ask for, and the first real step would recompile. So the
-    warm-up forwards the sampler's own setting.
-    """
+    """Synthetic mode feeds the graph one more input and dynamo specializes on
+    it, so a warm-up forced to `synthetic_mode=False` would compile a variant the
+    real steps never ask for -- and the first of them would recompile."""
     rejection_sample = MagicMock()
     rates = torch.tensor([0.9, 0.8])
     runner = _make_runner_stub(
