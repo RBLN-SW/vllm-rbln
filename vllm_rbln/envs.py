@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     # --- COMPILE / RUNTIME ---
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_NESTED_COMPILE_REGION: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = True
@@ -252,6 +253,12 @@ environment_variables = {
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
     ),
+    # Experimental decoder boundaries for MiniMax-M2 and GPT-OSS.
+    # Requires nested-region support in rebel-compiler; this does not emit loops.
+    "VLLM_RBLN_NESTED_COMPILE_REGION": (
+        lambda: os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
+        in ("true", "1")
+    ),
     # Build only the first N decoder layers and leave the rest as
     # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
     # truncation. The HF config is left untouched, so layer indices still line
@@ -395,6 +402,7 @@ RBLN_COMPILE_ENV = frozenset(
     {
         "VLLM_RBLN_USE_VLLM_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
+        "VLLM_RBLN_NESTED_COMPILE_REGION",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
     }
 )
