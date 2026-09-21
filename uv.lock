@@ -3072,7 +3072,6 @@ dependencies = [
     { name = "openai" },
     { name = "optimum-rbln" },
     { name = "pyyaml" },
-    { name = "qwen-vl-utils" },
     { name = "setuptools" },
     { name = "setuptools-scm" },
     { name = "torch" },
@@ -3094,6 +3093,9 @@ dev = [
     { name = "packaging" },
     { name = "pynvml" },
     { name = "simphile" },
+]
+examples = [
+    { name = "qwen-vl-utils" },
 ]
 runtime = [
     { name = "rebel-compiler" },
@@ -3125,7 +3127,7 @@ requires-dist = [
     { name = "pytest-timeout", marker = "extra == 'test'" },
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "pyyaml" },
-    { name = "qwen-vl-utils" },
+    { name = "qwen-vl-utils", marker = "extra == 'examples'" },
     { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "~=0.11.3.dev499" },
     { name = "setuptools", specifier = ">=64" },
     { name = "setuptools-scm", specifier = ">=8" },
@@ -3138,7 +3140,7 @@ requires-dist = [
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
     { name = "vllm", specifier = "==0.26.0+cpu", index = "https://wheels.vllm.ai/0.26.0/cpu" },
 ]
-provides-extras = ["test", "build", "dev", "runtime"]
+provides-extras = ["examples", "test", "build", "dev", "runtime"]
 
 [[package]]
 name = "watchfiles"
