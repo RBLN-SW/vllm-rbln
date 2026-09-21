@@ -27,6 +27,7 @@ from vllm_rbln.patches.registry import (
 from . import (
     attention,
     axk2,
+    deepseek_eagle3,
     deepseek_mtp,
     deepseek_v2,
     distributed_utils,
