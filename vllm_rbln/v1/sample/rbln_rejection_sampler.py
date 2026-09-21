@@ -49,8 +49,8 @@ PLACEHOLDER_TOKEN_ID = -1
 
 
 class RBLNRejectionSampler(RejectionSampler):
-    # Declared so the host-side move below is not a `has-type` cycle for mypy,
-    # which cannot see the base class under `--follow-imports skip`.
+    # mypy cannot pick the type up from the base class, and without it the
+    # read-then-reassign in `__init__` below is a `has-type` cycle.
     synthetic_conditional_rates: torch.Tensor | None
 
     def __init__(
@@ -73,11 +73,7 @@ class RBLNRejectionSampler(RejectionSampler):
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
 
-        # NOTE(RBLN): The synthetic count is drawn on the host every step, so
-        # settle the rates here instead: onto the host, because the base class
-        # builds them on the sampler's device (the NPU under device tensors), and
-        # padded to the op's fixed draft width, because they are only as long as
-        # the configured spec length. Positions past their end never accept.
+        # NOTE(RBLN): the host draws every step; settle the rates there, padded to K.
         if self.synthetic_conditional_rates is not None:
             rates = torch.zeros(num_spec_tokens, dtype=torch.float32)
             width = min(num_spec_tokens, self.synthetic_conditional_rates.shape[0])
@@ -536,12 +532,12 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_num_accepted = None
         if synthetic_mode:
             assert synthetic_conditional_rates is not None
+            # `cumprod` stops the count at the first rejection.
+            width = synthetic_conditional_rates.shape[0]
+            accepted = torch.rand(batch_size, width) < synthetic_conditional_rates
+            drawn = accepted.to(torch.int32).cumprod(dim=1).sum(dim=1)
             synthetic_num_accepted = bufs["synthetic_num_accepted"]
-            synthetic_num_accepted.copy_(
-                draw_synthetic_acceptance(
-                    batch_size, counts, synthetic_conditional_rates
-                )
-            )
+            synthetic_num_accepted.copy_(torch.minimum(drawn, counts))
 
         return self._compiled_rejection_sample(
             reshaped_draft_token_ids,
@@ -572,31 +568,6 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         assert logits.ndim == 2
         assert cu_num_draft_tokens.ndim == 1
         return logits
-
-
-def draw_synthetic_acceptance(
-    batch_size: int,
-    num_draft_tokens: torch.Tensor,
-    conditional_rates: torch.Tensor,
-) -> torch.Tensor:
-    """Draw a per-request accepted count for `rejection_sample_method="synthetic"`.
-
-    A position is accepted when a fresh uniform draw falls under its rate, and the
-    first rejection ends the request's run, so the count is the leading
-    all-accepted prefix -- capped by what was actually drafted.
-
-    Args:
-        batch_size: Number of requests.
-        num_draft_tokens: Per-request draft count, on the host. Shape is [B].
-        conditional_rates: Per-position acceptance probability, on the host,
-            already padded to the op's draft width. Shape is [K].
-
-    Returns:
-        The accepted counts, on the host. Shape is [B], int32.
-    """
-    accepted = torch.rand(batch_size, conditional_rates.shape[0]) < conditional_rates
-    num_accepted = accepted.to(torch.int32).cumprod(dim=1).sum(dim=1)
-    return torch.minimum(num_accepted, num_draft_tokens)
 
 
 def rbln_rejection_sample(
@@ -633,8 +604,11 @@ def rbln_rejection_sample(
             `bonus_temperature` is given. Shape is [B, vocab_size].
         bonus_temperature: Per-row divisor for a top-k/top-p draw of the bonus
             token under the same `top_k`/`top_p`. Shape is [B].
-        synthetic_num_accepted: Replaces the op's own accepted count under
-            `rejection_sample_method="synthetic"`. Shape is [B], int32.
+        synthetic_num_accepted: Simulates an acceptance rate:
+            `rbln::rejection_sample` runs unchanged -- that is the cost being
+            measured -- and only its count is replaced. The boundary token stays
+            the one it drew, so it is real but drawn for its own position.
+            Shape is [B], int32.
 
     Returns:
         The sampled token ids, `PLACEHOLDER_TOKEN_ID` in unfilled slots. Shape
@@ -669,7 +643,6 @@ def rbln_rejection_sample(
     num_accepted = num_accepted.reshape(batch_size)
 
     if bonus_logits is not None and bonus_temperature is not None:
-        # The bonus sampler's draw;
         bonus_probs = torch.softmax(
             bonus_logits / bonus_temperature.unsqueeze(1), dim=-1
         )
@@ -682,22 +655,14 @@ def rbln_rejection_sample(
         bonus = bonus_token_ids
 
     if synthetic_num_accepted is not None:
-        # Synthetic mode simulates a chosen acceptance rate: the op above still
-        # ran -- that is the cost being measured -- but its verdict is replaced
-        # by the host's draw, already capped by `num_draft_tokens`.
-        # `recovered_token_ids` is filled only at the position the op itself
-        # rejected, so a draw landing anywhere else would read a zero. Carry the
-        # op's own token instead -- its recovered one, or its bonus when it
-        # accepted everything -- and let it broadcast to whatever slot the draw
-        # picks. It is a real sampled token, but not the one that slot would
-        # have drawn: this mode is for measurement, not for output quality.
-        op_recovered = recovered_token_ids.gather(
+        # `recovered_token_ids` is a zero except at `num_accepted`, where it stopped.
+        drawn_token = recovered_token_ids.gather(
             1, num_accepted.clamp(max=max_spec_len - 1).to(torch.int64).unsqueeze(1)
         )
         recovered_token_ids = torch.where(
-            (num_accepted == num_draft_tokens).unsqueeze(1),
+            (num_accepted == num_draft_tokens).unsqueeze(1),  # nothing recovered
             bonus.to(dtype=recovered_token_ids.dtype),
-            op_recovered,
+            drawn_token,
         )
         num_accepted = synthetic_num_accepted.reshape(batch_size)
     # `all_accepted` is True for inactive rows too (0 == 0), which is what the
