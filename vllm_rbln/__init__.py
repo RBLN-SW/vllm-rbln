@@ -33,7 +33,7 @@ def register_model():
     early to know the model path, while the architecture is resolved in the
     process that parses them.
     """
-    # TODO(vllm-rbln>=0.12.0): delete, with the entry point in pyproject.toml.
+    # TODO(vllm-rbln>=0.14.0): delete, with the entry point in pyproject.toml.
 
 
 def register_ops():

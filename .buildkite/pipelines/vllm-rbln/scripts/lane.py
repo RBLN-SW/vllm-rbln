@@ -64,7 +64,7 @@ def devices_needed(serve: dict[str, Any], env: dict[str, str]) -> int:
     """Mirrors RBLNWorker._init_device_env: DP ranks do not share, and every rank
     of vLLM's world size takes --rbln-num-devices-per-local-rank devices.
 
-    Both spellings are read, because the variable still works until 0.12.0 and
+    Both spellings are read, because the variable still works until 0.14.0 and
     the worker reads both.
     """
     needed = int(serve.get(_RSD_SERVE, env.get(_RSD_ENV, 1)))

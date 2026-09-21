@@ -233,7 +233,7 @@ class OptimumRBLNConfig(RBLNConfigBase):
 # an unset flag leaves the run on that path.
 _CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (OptimumRBLNConfig, RBLNConfig)
 
-# TODO(vllm-rbln>=0.12.0): delete. Former additional_config keys, still accepted
+# TODO(vllm-rbln>=0.14.0): delete. Former additional_config keys, still accepted
 # with a warning.
 _RENAMED_KEYS: dict[type[RBLNConfigBase], dict[str, str]] = {
     OptimumRBLNConfig: {"rbln_config": "optimum_overrides"},
@@ -294,12 +294,12 @@ def _env_overrides(cls: type[RBLNConfigBase]) -> dict[str, Any]:
                 break
 
     if deprecated:
-        # TODO(vllm-rbln>=0.12.0): delete, with the variables themselves. Every
+        # TODO(vllm-rbln>=0.14.0): delete, with the variables themselves. Every
         # field here has a flag now, and the flag is what the config records; a
         # variable reaches it only through this function.
         logger.warning_once(
             "These environment variables are deprecated and will be removed in "
-            "0.12.0. Use the flag instead, or the additional_config key it "
+            "0.14.0. Use the flag instead, or the additional_config key it "
             "writes, which is the flag without the --rbln- prefix: %s.",
             ", ".join(sorted(deprecated)),
         )
@@ -365,7 +365,7 @@ def resolve_model_impl(
 
     from vllm_rbln import envs
 
-    # TODO(vllm-rbln>=0.12.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
+    # TODO(vllm-rbln>=0.14.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
     if "VLLM_RBLN_USE_VLLM_MODEL" in os.environ:
         legacy: ModelImpl = "vllm" if envs.VLLM_RBLN_USE_VLLM_MODEL else "optimum"
         if given is not None and given != legacy:
@@ -381,7 +381,7 @@ def resolve_model_impl(
             )
         logger.warning_once(
             "VLLM_RBLN_USE_VLLM_MODEL is deprecated and will be removed in "
-            "0.12.0. Use --model-impl, or hand additional_config the config "
+            "0.14.0. Use --model-impl, or hand additional_config the config "
             "class of the path you want, instead."
         )
 
@@ -431,7 +431,7 @@ def _resolve(cls: type[_C], additional_config: Any) -> _C:
         if old in given:
             logger.warning_once(
                 "additional_config[%r] is deprecated and will be removed in "
-                "0.12.0; use %r.",
+                "0.14.0; use %r.",
                 old,
                 new,
             )

@@ -182,7 +182,7 @@ def model_impl_from_env() -> str:
     """The model path this process was started on, for a reader with no config."""
     if INHERITED_MODEL_IMPL:
         return INHERITED_MODEL_IMPL
-    # TODO(vllm-rbln>=0.12.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
+    # TODO(vllm-rbln>=0.14.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
     # Silent here on purpose: `vllm_rbln.platform` calls this while `vllm` is
     # still importing itself, and a logger would pull `vllm` back in.
     # `resolve_model_impl` warns instead.

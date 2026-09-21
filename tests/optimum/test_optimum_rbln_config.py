@@ -125,7 +125,7 @@ def test_the_capture_writes_only_where_this_path_reads(monkeypatch):
 
 
 def test_the_former_overrides_key_is_accepted():
-    """TODO(vllm-rbln>=0.12.0): delete with the key."""
+    """TODO(vllm-rbln>=0.14.0): delete with the key."""
     config = _resolve(OptimumRBLNConfig, {"rbln_config": {"device": [0]}})
     assert config.optimum_overrides == {"device": [0]}
 

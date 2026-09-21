@@ -305,7 +305,7 @@ class TestResolveModelImpl:
         environment. This one cannot: the plugin entry points have acted on the
         variable before anything reads the flag.
         """
-        # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
+        # TODO(vllm-rbln>=0.14.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL"):
             resolve_model_impl(model_impl="optimum")
@@ -317,7 +317,7 @@ class TestResolveModelImpl:
             resolve_model_impl(model_impl="vllm")
 
     def test_an_agreeing_deprecated_variable_is_not_a_conflict(self, monkeypatch):
-        # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
+        # TODO(vllm-rbln>=0.14.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         assert resolve_model_impl(model_impl="vllm") == "vllm"
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
@@ -334,7 +334,7 @@ class TestResolveModelImpl:
         assert resolve_model_impl(None) == "optimum"
 
     def test_the_deprecated_variable_still_selects_the_path(self, monkeypatch):
-        # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
+        # TODO(vllm-rbln>=0.14.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         assert resolve_model_impl() == "vllm"
