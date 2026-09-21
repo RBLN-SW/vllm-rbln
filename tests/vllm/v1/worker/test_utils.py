@@ -1477,21 +1477,20 @@ class TestDynamicKvUnsupportedReason:
         # The worker drives the registration behind the resize, so the set is
         # a policy; the reason names the connector that was asked for.
         reason = dynamic_kv_unsupported_reason(
-            self._cfg(
-                kv_transfer_config=SimpleNamespace(
-                    kv_connector="RBLNLMCacheConnectorV1"
-                )
-            )
+            self._cfg(kv_transfer_config=SimpleNamespace(kv_connector="OtherConnector"))
         )
-        assert "RBLNLMCacheConnectorV1" in reason
+        assert "OtherConnector" in reason
 
     @pytest.mark.parametrize(
         "connector",
-        ["RblnNixlConnector", "RblnNixlPullConnector", "RblnNixlPushConnector"],
+        [
+            "RblnNixlConnector",
+            "RblnNixlPullConnector",
+            "RblnNixlPushConnector",
+            "RBLNLMCacheConnectorV1",
+        ],
     )
-    def test_the_rbln_nixl_connectors_are_supported(self, connector):
-        # One worker base and one registration mixin between them, so the
-        # count fix that opened the path covers all three.
+    def test_connectors_registered_after_the_resize_are_supported(self, connector):
         assert (
             dynamic_kv_unsupported_reason(
                 self._cfg(kv_transfer_config=SimpleNamespace(kv_connector=connector))

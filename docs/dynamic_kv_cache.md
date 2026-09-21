@@ -64,10 +64,12 @@ views right after warm-up. So in the one mode that reallocates
 (`DynamicKvSizer.defers_kv_registration`, i.e. ACTIVE) the worker skips the
 warm-up registration and runs the whole of it from `apply_dynamic_kv_num_blocks`,
 after the resize has allocated: `register_kv_caches_with_connector` rebuilds the
-mapping from the tensors the runner is holding, and the RBLN NIXL connector takes
-its block count from `cache_config.num_gpu_blocks` at that point instead of the
-pre-compile estimate it copied at construction. Nothing is registered early, so
-nothing has to be unregistered. Every other mode keeps the start-up order.
+mapping from the tensors the runner is holding. The RBLN NIXL connectors take
+their block count from `cache_config.num_gpu_blocks` at that point instead of the
+pre-compile estimate copied at construction; `RBLNLMCacheConnectorV1` binds the
+actual post-resize tensors and does not cache a block count. Nothing is registered
+early, so nothing has to be unregistered. Every other mode keeps the start-up
+order.
 
 > The dynamic path needs `VLLM_RBLN_USE_VLLM_MODEL=1` and
 > `VLLM_RBLN_USE_DEVICE_TENSOR=1`, and turns itself off without them. Only
@@ -135,7 +137,7 @@ feature is absent there rather than disabled.
 | `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
 | Flash causal attention disabled, or non-causal attention enabled | These dispatch to attention kernels that do not accept a dynamic KV input. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
-| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. |
+| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. |
 
 ## When Start-up Refuses
 

@@ -307,6 +307,7 @@ DYNAMIC_KV_SUPPORTED_CONNECTORS = (
     "RblnNixlConnector",
     "RblnNixlPullConnector",
     "RblnNixlPushConnector",
+    "RBLNLMCacheConnectorV1",
 )
 
 
