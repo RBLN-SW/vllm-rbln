@@ -7,12 +7,21 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
 
+from itertools import islice
+
 import torch
+from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context
+from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.patches.axk2.loader import load_frozen_module
 from vllm_rbln.patches.deepseek_v2 import patched_deepseek_v2_moe_forward
+from vllm_rbln.v1.spec_decode.eagle3_pp import (
+    AUX_COMBINED,
+    aux_slots_captured,
+    aux_slots_received,
+)
 
 CANONICAL_NAME = "vllm.model_executor.models.axk2"
 
@@ -166,6 +175,88 @@ def _rbln_gated_mla_forward(
     return self.o_proj(attn_out)[0]
 
 
+def _rbln_axk2_model_forward(
+    self,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None,
+    inputs_embeds: torch.Tensor | None = None,
+) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+    """Collect the EAGLE3 aux hidden states across a pipeline split.
+
+    The frozen forward indexes the capture with a global `idx` but still drops the
+    list on every non-last stage, while the drafter runs on the last one. Carry
+    them in the existing IntermediateTensors handoff as one tensor concatenated in
+    layer order; no new collective is introduced.
+
+    TODO(vllm-project/vllm#50514): delete once that lands and is released.
+    """
+    received: list[torch.Tensor] = []
+    if get_pp_group().is_first_rank:
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            if input_ids is None:
+                raise ValueError(
+                    "Either input_ids or inputs_embeds must be provided "
+                    "to AXK2Model.forward"
+                )
+            hidden_states = self.embed_input_ids(input_ids)
+        residual = None
+    else:
+        assert intermediate_tensors is not None
+        hidden_states = intermediate_tensors["hidden_states"]
+        residual = intermediate_tensors["residual"]
+        if aux_slots_received(self):
+            received = [intermediate_tensors[AUX_COMBINED]]
+
+    llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
+    llama_4_scaling: torch.Tensor | None = None
+    if llama_4_scaling_config is not None:
+        llama_4_scaling = _module._get_llama_4_scaling(
+            original_max_position_embeddings=llama_4_scaling_config[
+                "original_max_position_embeddings"
+            ],
+            scaling_beta=llama_4_scaling_config["beta"],
+            positions=positions,
+        )
+
+    # Index i means "input to layer i", so the frozen forward's pre-loop capture at
+    # i is this one's post-loop capture at i - 1. Capturing after the layer leaves
+    # the boundary index start_layer to the previous stage, which is the partition
+    # `aux_slots_received` and `aux_slots_captured` share with every other target.
+    captured: list[torch.Tensor] = []
+    if get_pp_group().is_first_rank and 0 in self.aux_hidden_state_layers:
+        captured.append(hidden_states)
+    for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+        hidden_states, residual = layer(
+            positions, hidden_states, residual, llama_4_scaling
+        )
+        if self.start_layer + idx + 1 in self.aux_hidden_state_layers:
+            captured.append(hidden_states + residual)
+
+    aux = received + captured
+    if not get_pp_group().is_last_rank:
+        tensors = {"hidden_states": hidden_states, "residual": residual}
+        if aux:
+            tensors[AUX_COMBINED] = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
+        return IntermediateTensors(tensors)
+
+    hidden_states, _ = self.norm(hidden_states, residual)
+
+    if not self.aux_hidden_state_layers:
+        return hidden_states
+
+    carried = sum(t.shape[-1] for t in aux) // self.config.hidden_size
+    assert carried == len(self.aux_hidden_state_layers), (
+        f"EAGLE3 expected {len(self.aux_hidden_state_layers)} aux hidden states for "
+        f"layers {sorted(self.aux_hidden_state_layers)}, but the handoff carried "
+        f"{carried}: {len(aux_slots_received(self))} arrived and "
+        f"{len(aux_slots_captured(self))} were captured"
+    )
+    return hidden_states, aux
+
+
 from vllm_rbln.patches.axk2 import config as _config  # noqa: E402, F401
 
 _module = load_frozen_module(CANONICAL_NAME, "_skt_model.py")
@@ -173,7 +264,9 @@ _module = load_frozen_module(CANONICAL_NAME, "_skt_model.py")
 _module.Indexer.forward = _rbln_indexer_forward
 _module.AXK2GatedMultiHeadLatentAttentionWrapper.forward = _rbln_gated_mla_forward
 _module.AXK2MoE.forward = patched_deepseek_v2_moe_forward
+_module.AXK2Model.forward = _rbln_axk2_model_forward
 
 AXK2ForCausalLM = _module.AXK2ForCausalLM
+AXK2Model = _module.AXK2Model
 
-__all__ = ["AXK2ForCausalLM", "CANONICAL_NAME"]
+__all__ = ["AXK2ForCausalLM", "AXK2Model", "CANONICAL_NAME"]
