@@ -379,6 +379,7 @@ def run_rejection_sample(
     metadata: SamplingMetadata,
     num_draft_tokens: list[int] | None = None,
     bonus_from_logits: bool = False,
+    synthetic_conditional_rates: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the impl on a batch of drafts packed in `draft_token_ids` order.
 
@@ -401,6 +402,8 @@ def run_rejection_sample(
         if bonus_from_logits
         else torch.tensor(bonus_token_ids, dtype=torch.int64).unsqueeze(-1),
         sampling_metadata=metadata,
+        synthetic_mode=synthetic_conditional_rates is not None,
+        synthetic_conditional_rates=synthetic_conditional_rates,
         bonus_logits=make_target_probs(bonus_token_ids) if bonus_from_logits else None,
     )
 
@@ -547,3 +550,93 @@ def test_random_step_draws_the_bonus_token_in_the_graph(impl):
         assert int(output[0, 2]) == 6
         drawn.add(int(output[1, 2]))
     assert drawn == {2, 5}
+
+
+# ---------------------------------------------------------------------------
+# Synthetic acceptance (rejection_sample_method="synthetic")
+# ---------------------------------------------------------------------------
+
+# The drafts miss the target argmax at both positions, so standard rejection
+# would stop at position 0. Only a synthetic rate can accept them.
+SYNTHETIC_DRAFTS = [3, 5]
+SYNTHETIC_ARGMAX = [6, 7]
+
+
+def run_synthetic(impl, rates: list[float]) -> torch.Tensor:
+    """One greedy request drafting `SYNTHETIC_DRAFTS`, with 1 as its bonus token."""
+    return run_rejection_sample(
+        impl,
+        draft_token_ids=SYNTHETIC_DRAFTS,
+        target_argmax_token_ids=SYNTHETIC_ARGMAX,
+        bonus_token_ids=[1],
+        metadata=make_sampling_metadata(
+            temperature=None, all_greedy=True, all_random=False
+        ),
+        synthetic_conditional_rates=torch.tensor(rates),
+    )
+
+
+# The synthetic count decides how far the row runs; `recovered_token_ids` is
+# filled only where the op itself stopped, so the boundary token is always that
+# one and never a zeroed slot.
+@pytest.mark.parametrize(
+    "rates,expected,rule",
+    [
+        (
+            [1.0, 1.0],
+            [[3, 5, 1]],
+            "every position accepts, so the row runs on to its bonus token",
+        ),
+        (
+            [1.0, 0.0],
+            [[3, 6, PLACEHOLDER_TOKEN_ID]],
+            "stopping past the op's own stop still carries the op's token, 6, "
+            "rather than the zero sitting in position 1's slot",
+        ),
+        (
+            [0.0, 1.0],
+            [[6, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+            "a rejection ends the run, so position 1 cannot accept on its own",
+        ),
+    ],
+    ids=["accepts_every_position", "stops_after_the_op", "rejection_ends_the_run"],
+)
+def test_synthetic_rates_decide_the_row(impl, rates, expected, rule):
+    assert run_synthetic(impl, rates).tolist() == expected, rule
+
+
+def test_synthetic_rejection_reuses_the_bonus_when_the_op_accepted_everything(impl):
+    """An op that accepted every draft recovered nothing, so the only token it
+    drew is its bonus; a synthetic rejection has to carry that one."""
+    output = run_rejection_sample(
+        impl,
+        draft_token_ids=SYNTHETIC_ARGMAX,
+        target_argmax_token_ids=SYNTHETIC_ARGMAX,
+        bonus_token_ids=[1],
+        metadata=make_sampling_metadata(
+            temperature=None, all_greedy=True, all_random=False
+        ),
+        synthetic_conditional_rates=torch.tensor([1.0, 0.0]),
+    )
+    assert output.tolist() == [[6, 1, PLACEHOLDER_TOKEN_ID]]
+
+
+def test_synthetic_acceptance_is_capped_by_the_drafted_count(impl):
+    """Every position accepts, so a request that drafted fewer tokens than the
+    padded width must still stop at its own last draft and put its bonus there.
+    The second row drafted the full width and is the control."""
+    output = run_rejection_sample(
+        impl,
+        draft_token_ids=[3, 2, 4],
+        target_argmax_token_ids=[6, 7, 7],
+        bonus_token_ids=[10, 11],
+        metadata=make_sampling_metadata(
+            temperature=None, all_greedy=True, all_random=False
+        ),
+        num_draft_tokens=[1, 2],
+        synthetic_conditional_rates=torch.ones(NUM_SPEC_TOKENS),
+    )
+    assert output.tolist() == [
+        [3, 10, PLACEHOLDER_TOKEN_ID],
+        [2, 4, 11],
+    ]

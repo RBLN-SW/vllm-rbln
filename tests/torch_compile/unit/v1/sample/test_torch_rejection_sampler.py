@@ -27,6 +27,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+from vllm_rbln.v1.sample import rbln_rejection_sampler as rejection_sampler_module
 from vllm_rbln.v1.sample.rbln_logits_processor import (
     RBLNMinTokensLogitsProcessor,
     build_rbln_logitsprocs,
@@ -54,8 +55,9 @@ def make_synthetic_rejection_sampler(
     """Build an RBLNRejectionSampler (Torch impl) in synthetic-acceptance mode.
 
     Built with `use_rbln_sampler=False`, so this exercises
-    TorchRejectionSamplerImpl — the only impl that supports synthetic mode (the
-    NPU impl asserts against it).
+    TorchRejectionSamplerImpl, which decides acceptance inside its kernels. The
+    NPU impl instead overrides the op's acceptance count inside the graph, so its
+    boundary token differs.
 
     `conditional_rates` are the per-position conditional rates the kernels
     compare uniform samples against (c_i in vllm's synthetic mode). A rate of
@@ -1002,22 +1004,32 @@ def test_placeholder_draft_random_non_synthetic(rejection_sampler):
     assert torch.equal(output.sampled_token_ids, expected)
 
 
-def test_npu_impl_refuses_synthetic_mode():
-    """The NPU impl must fail fast on synthetic mode.
+def test_npu_impl_keeps_the_synthetic_rates_on_the_host(monkeypatch):
+    """The NPU impl decides synthetic acceptance from host randomness.
 
-    The NPU `rbln::rejection_sample` primitive ignores synthetic rates, so
-    RBLNRejectionSampler asserts against it at construction (before the impl is
-    even compiled) rather than silently sampling normally.
+    The NPU `rbln::rejection_sample` primitive ignores synthetic rates, so the
+    sampler overrides the acceptance count after the op instead. That draw runs
+    on the host every step, so the rates are settled once at construction: moved
+    off the sampler's device and padded to the op's draft width.
     """
+    # The impl compiles a graph on construction, which this test does not need.
+    monkeypatch.setattr(rejection_sampler_module, "RBLNRejectionSamplerImpl", Mock())
     mock_sampler = Mock(spec=Sampler)
     mock_sampler.logprobs_mode = "raw_logprobs"
     spec_config = Mock()
     spec_config.rejection_sample_method = "synthetic"
-    spec_config.synthetic_acceptance_rates = [0.5, 0.5]
-    with pytest.raises(AssertionError):
-        RBLNRejectionSampler(
-            mock_sampler,
-            spec_config=spec_config,
-            device="cpu",
-            use_rbln_sampler=True,
-        )
+    spec_config.synthetic_acceptance_rates = [0.5, 0.25]
+    # Wider than the rates, so the padding the draw relies on is exercised.
+    spec_config.num_speculative_tokens = 3
+    sampler = RBLNRejectionSampler(
+        mock_sampler,
+        spec_config=spec_config,
+        device="cpu",
+        use_rbln_sampler=True,
+    )
+
+    assert sampler.synthetic_mode
+    rates = sampler.synthetic_conditional_rates
+    assert rates is not None and rates.device.type == "cpu"
+    # Conditional rates c_i = p_i / p_{i-1}, then a never-accepting third slot.
+    assert torch.allclose(rates, torch.tensor([0.5, 0.5, 0.0]))
