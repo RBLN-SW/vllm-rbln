@@ -3223,41 +3223,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        kv_caches = self.initialize_kv_cache_tensors(
-            kv_cache_config, kernel_block_sizes
-        )
-
-        if has_kv_transfer_group():
-            kv_transfer_group = get_kv_transfer_group()
-            if self.cross_layers_kv_cache is not None:
-                assert self.cross_layers_attn_backend is not None
-                kv_transfer_group.register_cross_layers_kv_cache(
-                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
-                )
-            else:
-                # Filter to one Full-preferred canonical layer per pool so
-                # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
-                # SWA-layer views alias the same storage, so no separate
-                # registration is needed.
-                canonical_layers = self._select_canonical_kv_layers_per_pool(
-                    kv_cache_config
-                )
-                missing = canonical_layers - kv_caches.keys()
-                assert not missing, (
-                    f"Canonical layers missing from kv_caches: {missing}"
-                )
-                # Iterate in layer-index order (self.kv_cache_names): NIXL
-                # assigns region indices in iteration order, and set iteration
-                # would vary with PYTHONHASHSEED, breaking the P/D region <->
-                # layer agreement.
-                filtered_kv_caches = {
-                    name: kv_caches[name]
-                    for name in self.kv_cache_names
-                    if name in canonical_layers
-                }
-                kv_transfer_group.register_kv_caches(filtered_kv_caches)
-
-            kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
+        self.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3270,6 +3236,45 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             len(kv_cache_config.kv_cache_tensors),
             total_gb,
         )
+
+    def register_kv_caches_with_connector(self) -> None:
+        """Hand the KV caches the runner holds to the KV transfer connector.
+
+        The worker drives this instead of `initialize_kv_cache`: a dynamic-KV
+        resize replaces every tensor after warm-up, so the caches worth
+        registering are the ones standing at that point.
+        """
+        if not has_kv_transfer_group():
+            return
+        kv_transfer_group = get_kv_transfer_group()
+        if self.cross_layers_kv_cache is not None:
+            assert self.cross_layers_attn_backend is not None
+            kv_transfer_group.register_cross_layers_kv_cache(
+                self.cross_layers_kv_cache, self.cross_layers_attn_backend
+            )
+        else:
+            kv_caches = dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
+            # Filter to one Full-preferred canonical layer per pool so
+            # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
+            # SWA-layer views alias the same storage, so no separate
+            # registration is needed.
+            canonical_layers = self._select_canonical_kv_layers_per_pool(
+                self.kv_cache_config
+            )
+            missing = canonical_layers - kv_caches.keys()
+            assert not missing, f"Canonical layers missing from kv_caches: {missing}"
+            # Iterate in layer-index order (self.kv_cache_names): NIXL
+            # assigns region indices in iteration order, and set iteration
+            # would vary with PYTHONHASHSEED, breaking the P/D region <->
+            # layer agreement.
+            filtered_kv_caches = {
+                name: kv_caches[name]
+                for name in self.kv_cache_names
+                if name in canonical_layers
+            }
+            kv_transfer_group.register_kv_caches(filtered_kv_caches)
+
+        kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -3576,6 +3581,49 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
 
+    def run_model_graphs(self) -> None:
+        """Every model graph once, at the shapes serving will ask for."""
+        # 1. prefill
+        self._dummy_run(1, self.max_num_tokens, True)
+
+        # 2. decode
+        query_lens = [1]
+        if self.speculative_config:
+            spec_query_len = self.speculative_config.num_speculative_tokens + 1
+            query_lens = (
+                [spec_query_len]
+                if self.uses_fixed_decode_window
+                else [1, spec_query_len]
+            )
+        for num_req in self.bucketing_manager.decode_batch_buckets:
+            for query_len in query_lens:
+                self._dummy_run(num_req, query_len, False)
+
+        if self.specialized_moe_decode:
+            # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
+            # cover the DP-asymmetric case (this rank decoding while another
+            # rank prefills). Warm-up is symmetric, so it cannot reach those
+            # shapes on its own: it pins the token dimension the ANY_PREFILL
+            # and QLEN_ASYM routes would ask for, which the small-bucket decode
+            # graphs from 2. decode above cannot satisfy.
+            num_req = self.bucketing_manager.decode_batch_buckets[-1]
+            for query_len in query_lens:
+                self._dummy_run(
+                    num_req,
+                    query_len,
+                    False,
+                    num_tokens_padded_override=self.max_num_tokens,
+                )
+            if self.speculative_config and not self.uses_fixed_decode_window:
+                # Cover DP-asymmetric decode where a peer runs spec decode.
+                self._dummy_run(
+                    num_req,
+                    1,
+                    False,
+                    num_tokens_padded_override=num_req
+                    * (self.speculative_config.num_speculative_tokens + 1),
+                )
+
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
         # KV transfer group exists: the KV-connector mixin asserts
@@ -3587,46 +3635,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         sig = mega_cache.config_signature(self.vllm_config)
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
-            # 1. prefill
-            self._dummy_run(1, self.max_num_tokens, True)
-
-            # 2. decode
-            query_lens = [1]
-            if self.speculative_config:
-                spec_query_len = self.speculative_config.num_speculative_tokens + 1
-                query_lens = (
-                    [spec_query_len]
-                    if self.uses_fixed_decode_window
-                    else [1, spec_query_len]
-                )
-            for num_req in self.bucketing_manager.decode_batch_buckets:
-                for query_len in query_lens:
-                    self._dummy_run(num_req, query_len, False)
-
-            if self.specialized_moe_decode:
-                # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
-                # cover the DP-asymmetric case (this rank decoding while another
-                # rank prefills). Warm-up is symmetric, so it cannot reach those
-                # shapes on its own: it pins the token dimension the ANY_PREFILL
-                # and QLEN_ASYM routes would ask for, which the small-bucket decode
-                # graphs from 2. decode above cannot satisfy.
-                num_req = self.bucketing_manager.decode_batch_buckets[-1]
-                for query_len in query_lens:
-                    self._dummy_run(
-                        num_req,
-                        query_len,
-                        False,
-                        num_tokens_padded_override=self.max_num_tokens,
-                    )
-                if self.speculative_config and not self.uses_fixed_decode_window:
-                    # Cover DP-asymmetric decode where a peer runs spec decode.
-                    self._dummy_run(
-                        num_req,
-                        1,
-                        False,
-                        num_tokens_padded_override=num_req
-                        * (self.speculative_config.num_speculative_tokens + 1),
-                    )
+            self.run_model_graphs()
 
             # 3. compute_logits
             if not self.use_wrapped_compute_logits:
