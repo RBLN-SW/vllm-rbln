@@ -19,7 +19,21 @@ from vllm.distributed import (
 )
 from vllm.model_executor.models.gpt_oss import MLPBlock
 
+from vllm_rbln import envs
 from vllm_rbln.patches import register_patch
+
+if envs.VLLM_RBLN_NESTED_COMPILE_REGION:
+    from vllm.model_executor.models.gpt_oss import TransformerBlock
+
+    register_patch(
+        target="vllm.model_executor.models.gpt_oss.TransformerBlock.forward",
+        owner_module=__name__,
+        reason=(
+            "Upstream GPT-OSS exposes no decoder compile-region hook. Preserve "
+            "decoder bodies for RBLN loop-compilation bring-up using "
+            "invoke_subgraph boundaries."
+        ),
+    )(torch.compiler.nested_compile_region(TransformerBlock.forward))
 
 
 @register_patch(

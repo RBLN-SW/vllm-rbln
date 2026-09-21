@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
     Mxfp4MoeBackend,
 )
 
+from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
@@ -133,14 +134,27 @@ class RBLNGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         hidden_states = x.reshape(num_tokens, -1)
         masked_routing_weights = router_logits
 
+        if envs.VLLM_RBLN_NESTED_COMPILE_REGION:
+            # Pass each shared base into the region once; form its views inside.
+            gate_blocks = layer.w13_weight[:, ::2]
+            up_blocks = layer.w13_weight[:, 1::2]
+            gate_scales = layer.w13_weight_scale[:, ::2]
+            up_scales = layer.w13_weight_scale[:, 1::2]
+            gate_bias = layer.w13_bias[:, ::2]
+            up_bias = layer.w13_bias[:, 1::2]
+        else:
+            gate_blocks, up_blocks = layer.gate_proj_blocks, layer.up_proj_blocks
+            gate_scales, up_scales = layer.gate_proj_scales, layer.up_proj_scales
+            gate_bias, up_bias = layer.gate_proj_bias, layer.up_proj_bias
+
         out = torch.ops.rbln_custom_ops.custom_moe_glu_mxfp4(
             hidden_states,
-            layer.gate_proj_blocks,
-            layer.gate_proj_scales,
-            layer.gate_proj_bias,
-            layer.up_proj_blocks,
-            layer.up_proj_scales,
-            layer.up_proj_bias,
+            gate_blocks,
+            gate_scales,
+            gate_bias,
+            up_blocks,
+            up_scales,
+            up_bias,
             layer.down_proj_blocks,
             layer.down_proj_scales,
             layer.down_proj_bias,
