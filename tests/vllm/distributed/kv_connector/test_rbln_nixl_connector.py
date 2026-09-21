@@ -21,7 +21,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    SlidingWindowSpec,
+)
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.connector as cm
 import vllm_rbln.envs as envs
@@ -119,6 +127,48 @@ class TestFinalizeDelegation:
         connector = object.__new__(RblnNixlPullConnector)
         connector.connector_worker = None
         connector.finalize_kv_cache_registration()  # must not raise
+
+
+@pytest.mark.parametrize(
+    "connector_cls", [RblnNixlPullConnector, RblnNixlPushConnector]
+)
+def test_registration_keeps_full_attention_view_per_pool(connector_cls):
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
+    swa = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=4,
+    )
+    pools = [torch.zeros(3, 2, 1, 1, 16, 64) for _ in range(2)]
+    caches = {
+        "layer.0": pools[0].view(12, 2, 1, 1, 4, 64),
+        "layer.1": pools[0],
+        "layer.2": pools[1].view(12, 2, 1, 1, 4, 64),
+        "layer.3": pools[1],
+    }
+    connector = object.__new__(connector_cls)
+    connector.kv_cache_config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[
+            KVCacheTensor(size=3 * full.page_size_bytes, shared_by=layers)
+            for layers in (["layer.2", "layer.3"], ["layer.0", "layer.1"])
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["layer.0", "layer.2"], kv_cache_spec=swa),
+            KVCacheGroupSpec(layer_names=["layer.1", "layer.3"], kv_cache_spec=full),
+        ],
+    )
+    registered: list[dict[str, torch.Tensor]] = []
+    connector.connector_worker = SimpleNamespace(register_kv_caches=registered.append)
+    connector.register_kv_caches(caches)
+
+    assert list(registered[0]) == ["layer.1", "layer.3"]
+    assert registered[0]["layer.1"] is pools[0]
+    assert registered[0]["layer.3"] is pools[1]
 
 
 class TestSetXferHandshakeMetadataPpAware:

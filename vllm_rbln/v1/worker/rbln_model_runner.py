@@ -64,7 +64,6 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -139,6 +138,7 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.kv_cache import select_canonical_kv_layers_per_pool
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -2897,43 +2897,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for attn_groups in self.attn_groups:
             yield from attn_groups
 
-    def _select_canonical_kv_layers_per_pool(
-        self, kv_cache_config: KVCacheConfig
-    ) -> set[str]:
-        """Pick one layer per HMA pool as the canonical handle.
-
-        Both `mark_static_address` (last-write-wins on storage->name) and the
-        KV connector's `register_kv_caches` (uses the chosen layer's view as
-        NIXL's descriptor stride) need a single layer per pool.
-
-        Prefer a Full-attention layer — its view's `cache.shape[-2]` equals the
-        logical `cache_config.block_size`, matching the scheduler / connector /
-        runtime copy block_id space. A SWA layer's view (`shape[-2] ==
-        sliding_window`, kernel granularity) would mis-address logical
-        block_ids. Falls back to the first layer in `shared_by` when no Full
-        layer is present.
-        """
-        layer_to_spec: dict[str, KVCacheSpec] = {
-            layer_name: attn_group.kv_cache_spec
-            for attn_group in self._kv_cache_spec_attn_group_iterator()
-            for layer_name in attn_group.layer_names
-        }
-        chosen: set[str] = set()
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            pool_layers = kv_cache_tensor.shared_by
-            if not pool_layers:
-                continue
-            full_layer = next(
-                (
-                    ln
-                    for ln in pool_layers
-                    if isinstance(layer_to_spec.get(ln), FullAttentionSpec)
-                ),
-                None,
-            )
-            chosen.add(full_layer or pool_layers[0])
-        return chosen
-
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
@@ -3151,9 +3114,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
             # same logical block_id space).
-            layers_to_register = self._select_canonical_kv_layers_per_pool(
-                kv_cache_config
-            )
+            layers_to_register = select_canonical_kv_layers_per_pool(kv_cache_config)
             for name, kv_cache in kv_caches.items():
                 if name not in layers_to_register:
                     continue
@@ -3250,25 +3211,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         else:
             kv_caches = dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
-            # Filter to one Full-preferred canonical layer per pool so
-            # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
-            # SWA-layer views alias the same storage, so no separate
-            # registration is needed.
-            canonical_layers = self._select_canonical_kv_layers_per_pool(
-                self.kv_cache_config
-            )
-            missing = canonical_layers - kv_caches.keys()
-            assert not missing, f"Canonical layers missing from kv_caches: {missing}"
-            # Iterate in layer-index order (self.kv_cache_names): NIXL
-            # assigns region indices in iteration order, and set iteration
-            # would vary with PYTHONHASHSEED, breaking the P/D region <->
-            # layer agreement.
-            filtered_kv_caches = {
-                name: kv_caches[name]
-                for name in self.kv_cache_names
-                if name in canonical_layers
-            }
-            kv_transfer_group.register_kv_caches(filtered_kv_caches)
+            kv_transfer_group.register_kv_caches(kv_caches)
 
         kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
 

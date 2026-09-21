@@ -49,6 +49,7 @@ from tests.vllm.v1.worker.utils import (
 )
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
+from vllm_rbln.v1.kv_cache import select_canonical_kv_layers_per_pool
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.utils import eagle_prepare_inputs_padded
 from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
@@ -470,15 +471,11 @@ class TestSelectCanonicalKvLayersPerPool:
     def _group(layer_names, spec):
         return SimpleNamespace(layer_names=layer_names, kv_cache_spec=spec)
 
-    def _runner(self, groups):
-        r = _make_runner_stub()
-        r._kv_cache_spec_attn_group_iterator = lambda: iter(groups)
-        return r
-
     @staticmethod
-    def _cfg(*pools):
+    def _cfg(groups, *pools):
         return SimpleNamespace(
-            kv_cache_tensors=[SimpleNamespace(shared_by=list(p)) for p in pools]
+            kv_cache_groups=groups,
+            kv_cache_tensors=[SimpleNamespace(shared_by=list(p)) for p in pools],
         )
 
     def test_prefers_full_attention_layer(self):
@@ -486,30 +483,28 @@ class TestSelectCanonicalKvLayersPerPool:
             self._group(["sw0"], SimpleNamespace()),
             self._group(["full0"], self._full()),
         ]
-        r = self._runner(groups)
-        assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0", "full0"])) == {
-            "full0"
-        }
+        assert select_canonical_kv_layers_per_pool(
+            self._cfg(groups, ["sw0", "full0"])
+        ) == {"full0"}
 
     def test_falls_back_to_first_layer(self):
         # No full-attention layer in the pool -> shared_by[0].
-        r = self._runner([self._group(["sw0", "sw1"], SimpleNamespace())])
-        assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0", "sw1"])) == {
-            "sw0"
-        }
+        groups = [self._group(["sw0", "sw1"], SimpleNamespace())]
+        assert select_canonical_kv_layers_per_pool(
+            self._cfg(groups, ["sw0", "sw1"])
+        ) == {"sw0"}
 
     def test_skips_empty_shared_by(self):
-        r = self._runner([self._group(["full0"], self._full())])
-        assert r._select_canonical_kv_layers_per_pool(self._cfg([])) == set()
+        groups = [self._group(["full0"], self._full())]
+        assert select_canonical_kv_layers_per_pool(self._cfg(groups, [])) == set()
 
     def test_one_canonical_layer_per_pool(self):
         groups = [
             self._group(["full0"], self._full()),
             self._group(["full1"], self._full()),
         ]
-        r = self._runner(groups)
-        assert r._select_canonical_kv_layers_per_pool(
-            self._cfg(["full0"], ["full1"])
+        assert select_canonical_kv_layers_per_pool(
+            self._cfg(groups, ["full0"], ["full1"])
         ) == {"full0", "full1"}
 
 

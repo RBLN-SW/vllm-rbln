@@ -52,8 +52,10 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     SupportsKVCacheRegistrationFinalize,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import select_canonical_kv_layers_per_pool
 
 if TYPE_CHECKING:
+    import torch
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
         NixlConnectorMetadata,
     )
@@ -108,6 +110,20 @@ class RblnNixlConnectorBase(NixlBaseConnector, SupportsKVCacheRegistrationFinali
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.connector_scheduler = None
         self.connector_worker = None
+
+    def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
+        canonical_layers = select_canonical_kv_layers_per_pool(self.kv_cache_config)
+        missing = canonical_layers - kv_caches.keys()
+        assert not missing, f"Canonical layers missing from kv_caches: {missing}"
+        # NIXL numbers regions in iteration order; preserve layer order so
+        # both peers agree even when their hash seeds differ.
+        super().register_kv_caches(
+            {
+                name: cache
+                for name, cache in kv_caches.items()
+                if name in canonical_layers
+            }
+        )
 
     def finalize_kv_cache_registration(self) -> None:
         """Run the worker's deferred NIXL registration after warm-up
