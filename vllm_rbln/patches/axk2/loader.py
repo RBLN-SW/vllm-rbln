@@ -16,7 +16,21 @@ from types import ModuleType
 _HERE = Path(__file__).resolve().parent
 
 
+def alias_frozen_module(canonical_name: str, module: ModuleType) -> None:
+    """Make ``module`` reachable under the upstream name the copies import it by."""
+    sys.modules.setdefault(canonical_name, module)
+    parent_name, _, attr = canonical_name.rpartition(".")
+    setattr(importlib.import_module(parent_name), attr, module)
+
+
 def load_frozen_module(canonical_name: str, filename: str) -> ModuleType:
+    """Execute a frozen copy under ``canonical_name``.
+
+    For a copy whose relative imports have to resolve against the upstream
+    package. The name a module is loaded under is also what pickle writes for
+    the classes it defines, so a copy that must survive a pickle round trip is
+    imported by its real path and only aliased instead; see ``config.py``.
+    """
     existing = sys.modules.get(canonical_name)
     if existing is not None:
         return existing
@@ -35,7 +49,6 @@ def load_frozen_module(canonical_name: str, filename: str) -> ModuleType:
         sys.modules.pop(canonical_name, None)
         raise
 
-    parent_name, _, attr = canonical_name.rpartition(".")
-    setattr(importlib.import_module(parent_name), attr, module)
+    alias_frozen_module(canonical_name, module)
 
     return module

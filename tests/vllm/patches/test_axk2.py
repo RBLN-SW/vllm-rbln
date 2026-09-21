@@ -22,6 +22,9 @@ that reach the last stage are the layer numbers actually harvested.
 
 from __future__ import annotations
 
+import pickle
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -216,3 +219,25 @@ def test_last_stage_returns_a_bare_tensor_when_eagle3_is_off(monkeypatch):
         carried = out
 
     assert isinstance(out, torch.Tensor)
+
+
+def test_config_unpickles_where_vllm_rbln_has_not_been_imported(tmp_path):
+    # An engine core started under VLLM_WORKER_MULTIPROC_METHOD=spawn unpickles
+    # VllmConfig, and with it this config, before the plugin is loaded there, so
+    # the class has to name a module a bare interpreter can import.
+    from vllm_rbln.patches.axk2.config import AXK2Config
+
+    blob = tmp_path / "axk2_config.pkl"
+    blob.write_bytes(pickle.dumps(AXK2Config(num_hidden_layers=2)))
+
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import pickle; pickle.loads(open({str(blob)!r}, 'rb').read())",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert child.returncode == 0, child.stderr
