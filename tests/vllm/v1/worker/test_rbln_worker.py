@@ -72,13 +72,17 @@ def _make_vllm_config(
             disable_custom_all_reduce=False,
         ),
         model_config=SimpleNamespace(
-            quantization=quantization, enforce_eager=enforce_eager
+            quantization=quantization,
+            enforce_eager=enforce_eager,
+            max_model_len=4096,
         ),
         cache_config=SimpleNamespace(
             gpu_memory_utilization=0.9,
             num_gpu_blocks=None,
             num_gpu_blocks_override=None,
+            block_size=16,
         ),
+        attention_config=SimpleNamespace(use_non_causal=False),
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
