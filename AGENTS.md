@@ -78,7 +78,7 @@ These are the cases that legitimately reach a patch:
 
 The registry rules:
 
-- Never `setattr` an upstream symbol directly. Every replacement goes through the registry, which verifies that it took.
+- Never `setattr` an upstream symbol from `patches/`. Every replacement here goes through the registry, which verifies that it took. `platform/` is the narrow exception, for the entry points that run before the model path is known and for the optimum path, neither of which the registry reaches; each site says why.
 - A new module under `patches/` must be added to the import list in `patches/__init__.py`. A decorator in a module nobody imports registers nothing.
 - Duplicate keys and duplicate targets raise. Two patches may share a target only when their `condition` predicates are mutually exclusive.
 - `priority` applies `0` first and `100` last, default `50`. Importing a `patches/` module only registers; nothing touches upstream until `apply_registered_patches()` runs.
