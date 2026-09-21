@@ -185,8 +185,6 @@ class TestRegisterKvCachesWithConnector:
         self, make_model_runner, monkeypatch
     ):
         registered = self._registrations(monkeypatch)
-        # One layer per group, so both survive the canonical-layer filter that
-        # keeps aliasing SWA views out of the registration.
         runner = make_model_runner(
             layers=("layer.0", "layer.1"),
             additional_config={"enable_sub_block_cache": False},
@@ -200,6 +198,21 @@ class TestRegisterKvCachesWithConnector:
         assert [id(t) for t in registered[0].values()] == [
             id(t) for t in runner.kv_caches
         ]
+
+    def test_shared_pool_preserves_every_layer_view(
+        self, make_model_runner, monkeypatch
+    ):
+        registered = self._registrations(monkeypatch)
+        runner = _one_group_two_layers(make_model_runner)
+        runner.register_kv_caches_with_connector()
+
+        assert list(registered[0]) == runner.kv_cache_names
+        assert all(
+            cache is bound
+            for cache, bound in zip(
+                registered[0].values(), runner.kv_caches, strict=True
+            )
+        )
 
     def test_a_rebuilt_cache_is_what_the_second_call_registers(
         self, make_model_runner, monkeypatch
