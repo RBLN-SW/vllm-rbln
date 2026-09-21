@@ -44,7 +44,7 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 ## Two model paths
 
-`RBLNConfigBase.model_impl` selects the model path: `optimum` (the default) or `vllm`. `--rbln-model-impl` sets it, and `resolve_model_impl()` reads it before the config exists. `VLLM_RBLN_USE_VLLM_MODEL=1` still means `vllm`, warns, and goes away in 0.12.0.
+Upstream's `--model-impl` selects the model path. `vllm` is the vllm model path, `transformers` and `optimum` are the optimum one, and `auto` (the default) leaves it to `resolve_model_impl()`, which takes the path this process was handed and then `optimum`. Anything else is refused. `resolve_model_impl()` reads it before the config exists, and `create_engine_config` hands the field back its default so upstream's own resolution is untouched. A built `additional_config` names the path by being one of the two classes, and disagreeing with the flag is refused. `VLLM_RBLN_USE_VLLM_MODEL=1` still means `vllm`, warns, and goes away in 0.12.0.
 
 | Path         | Owns                                                                        |
 | ------------ | --------------------------------------------------------------------------- |

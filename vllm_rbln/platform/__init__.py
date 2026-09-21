@@ -227,21 +227,21 @@ class RblnPlatform(Platform):
         orig_create_engine_config = EngineArgs.create_engine_config
 
         def create_engine_config(self, *args, **kwargs):
-            model_impl = resolve_model_impl(self.additional_config)
+            model_impl = resolve_model_impl(self.additional_config, self.model_impl)
+            # Upstream reads this field too, and there `transformers` means its
+            # own Transformers backend, which refuses several of the models
+            # optimum-rbln supports. Hand the default back so that resolution is
+            # the one it would have done without us.
+            self.model_impl = "auto"
             config = self.additional_config
-            if config is None or isinstance(config, dict):
-                # Write the path back so the config states it. That config is
-                # what reaches every worker in the pickle. A built one states it
-                # already, and upstream's bare string is left as it is, for
-                # `VllmConfig` to reject in its own words.
-                config = self.additional_config = (config or {}) | {
-                    "model_impl": model_impl
-                }
             if model_impl == "optimum":
                 # The prefill chunk size that path compiles is
                 # `--max-num-batched-tokens` as the user gave it, and the call
                 # below replaces an unset one with a default, leaving
-                # `sync_from_vllm` no way to tell the two apart.
+                # `sync_from_vllm` no way to tell the two apart. Nothing else
+                # writes additional_config now, so an unset one starts here.
+                if config is None:
+                    config = self.additional_config = {}
                 if isinstance(config, dict):
                     config["user_max_num_batched_tokens"] = self.max_num_batched_tokens
                 elif isinstance(config, OptimumRBLNConfig):
@@ -347,8 +347,6 @@ class RblnPlatform(Platform):
         stop a run that the flag off would have served. Reasons per shape:
         docs/dynamic_kv_cache.md, "Unsupported Configurations".
         """
-        from vllm_rbln.config import resolve_model_impl
-
         dry_run = envs.VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN
 
         def reject(message: str) -> None:
@@ -357,10 +355,10 @@ class RblnPlatform(Platform):
                 return
             raise ValueError(message)
 
-        if resolve_model_impl(vllm_config.additional_config) != "vllm":
+        if _MODEL_IMPL != "vllm":
             reject(
                 "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 requires "
-                "--rbln-model-impl vllm; see docs/dynamic_kv_cache.md."
+                "--model-impl vllm; see docs/dynamic_kv_cache.md."
             )
 
         if not USE_DEVICE_TENSOR:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnPlatform on the vllm model path only (--rbln-model-impl vllm). Written
+# RblnPlatform on the vllm model path only (--model-impl vllm). Written
 # against outcomes rather than call paths -- a real config is built so the engine's
 # own entry point (VllmConfig.__post_init__ -> check_and_update_config) does the
 # work, and the assertions read the resulting config, the raised error, or the
@@ -792,31 +792,28 @@ class TestDynamicKvConfig:
     model loads; the worker keeps only the checks that read runtime state."""
 
     @staticmethod
-    def _cfg(
-        use_mla=False,
-        speculative_config=None,
-        kv_transfer_config=None,
-        model_impl="vllm",
-    ):
+    def _cfg(use_mla=False, speculative_config=None, kv_transfer_config=None):
         return SimpleNamespace(
             model_config=SimpleNamespace(use_mla=use_mla),
             speculative_config=speculative_config,
             kv_transfer_config=kv_transfer_config,
-            additional_config={"model_impl": model_impl},
+            additional_config={},
         )
 
     @pytest.fixture(autouse=True)
     def _dynamic_kv(self, monkeypatch):
-        # The path comes from `_cfg`, which states it on every config; the
-        # deprecated variable saying it too would be a conflict to resolve.
+        # The guard reads the path this process adopted, which in production is
+        # `create_engine_config`'s answer and here is the suite's.
         monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
+        monkeypatch.setattr(platform, "_MODEL_IMPL", "vllm")
 
     def test_a_clean_config_passes(self):
         RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
-    def test_needs_the_vllm_model_path(self):
-        with pytest.raises(ValueError, match="--rbln-model-impl vllm"):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg(model_impl="optimum"))
+    def test_needs_the_vllm_model_path(self, monkeypatch):
+        monkeypatch.setattr(platform, "_MODEL_IMPL", "optimum")
+        with pytest.raises(ValueError, match="--model-impl vllm"):
+            RblnPlatform._validate_dynamic_kv_config(self._cfg())
 
     def test_mla_passes(self):
         RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
@@ -852,19 +849,19 @@ class TestDynamicKvConfig:
         """A dry run changes nothing, so refusing would stop a run the flag off
         would have served. Each shape is reported and the run continues."""
         monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "1")
+        monkeypatch.setattr(platform, "_MODEL_IMPL", "optimum")
         with (
             patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
             caplog.at_level("WARNING"),
         ):
             RblnPlatform._validate_dynamic_kv_config(
                 self._cfg(
-                    model_impl="optimum",
                     kv_transfer_config=SimpleNamespace(
                         kv_connector="RBLNLMCacheConnectorV1"
-                    ),
+                    )
                 )
             )
-        assert "--rbln-model-impl vllm" in caplog.text
+        assert "--model-impl vllm" in caplog.text
         assert "VLLM_RBLN_USE_DEVICE_TENSOR=1" in caplog.text
         assert "RBLNLMCacheConnectorV1" in caplog.text
         assert caplog.text.count("dynamic KV cache dry run:") == 3
@@ -923,7 +920,7 @@ class TestDflashTokenBudget:
 
 
 class TestModelImpl:
-    """`--rbln-model-impl` decides the path, and the path decides the device.
+    """`--model-impl` decides the path, and the path decides the device.
 
     The frontend only learns it after the arguments are parsed, later than the
     module scope where RblnPlatform's device identity is first computed, so the
@@ -979,9 +976,9 @@ class TestModelImpl:
         """
         assert RblnPlatform.device_type == "cpu"
 
-        config = _build(additional_config={"model_impl": "vllm"})
+        config = _build(model_impl="vllm")
 
-        assert config.additional_config.model_impl == "vllm"
+        assert isinstance(config.additional_config, RBLNConfig)
         assert RblnPlatform.device_type == "rbln"
         assert platform.USE_DEVICE_TENSOR is True
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
@@ -1004,14 +1001,14 @@ class TestModelImpl:
     def test_the_write_back_keeps_the_rest_of_additional_config(
         self, on_the_other_path
     ):
-        """The wrapper writes the resolved path in beside what the caller gave.
+        """The flag picks the path and additional_config keeps carrying options.
 
-        Replacing the dict instead of merging into it would drop every other
-        `--rbln-*` flag on the way to the engine, silently.
+        The two arrive separately now, so a run that sets both has to end up
+        with the path the flag named and every field the dict held.
         """
-        config = _build(additional_config={"model_impl": "vllm", "use_w8a8": True})
+        config = _build(model_impl="vllm", additional_config={"use_w8a8": True})
 
-        assert config.additional_config.model_impl == "vllm"
+        assert isinstance(config.additional_config, RBLNConfig)
         assert config.additional_config.use_w8a8 is True
 
     def test_a_second_engine_does_not_take_the_first_one_s_path(self, monkeypatch):
@@ -1033,14 +1030,29 @@ class TestModelImpl:
         RblnPlatform._capture_model_impl()
 
         first = SimpleNamespace(
-            max_num_batched_tokens=None, additional_config={"model_impl": "vllm"}
+            max_num_batched_tokens=None, additional_config=None, model_impl="vllm"
         )
         EngineArgs.create_engine_config(first)
-        second = SimpleNamespace(max_num_batched_tokens=None, additional_config=None)
-        EngineArgs.create_engine_config(second)
+        assert platform._MODEL_IMPL == "vllm"
 
-        assert first.additional_config["model_impl"] == "vllm"
-        assert second.additional_config["model_impl"] == "optimum"
+        second = SimpleNamespace(
+            max_num_batched_tokens=None, additional_config=None, model_impl="auto"
+        )
+        EngineArgs.create_engine_config(second)
+        assert platform._MODEL_IMPL == "optimum"
+
+    def test_the_upstream_flag_picks_the_path_and_is_handed_back(self):
+        """`--model-impl` says which path runs, and upstream never sees that.
+
+        Its own meaning for the value is a different question: `transformers`
+        there is vLLM's Transformers backend, which refuses several models
+        optimum-rbln supports, and it is asked at config time. Putting the
+        default back leaves that resolution exactly as it would have been.
+        """
+        config = _build(model_impl="vllm")
+
+        assert isinstance(config.additional_config, RBLNConfig)
+        assert config.model_config.model_impl == "auto"
 
     def test_a_bare_string_additional_config_is_left_to_upstream(self):
         """`_MergeAdditionalConfig` keeps the bare string the CLI action takes,
@@ -1070,7 +1082,7 @@ class TestModelImpl:
         RblnPlatform._capture_model_impl()
 
         EngineArgs.create_engine_config(
-            SimpleNamespace(additional_config={"model_impl": "vllm"})
+            SimpleNamespace(additional_config={"model_impl": "vllm"}, model_impl="auto")
         )
 
         assert seen == [{"model_impl": "vllm"}]

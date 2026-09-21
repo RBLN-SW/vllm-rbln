@@ -457,7 +457,7 @@ class TestApplySites:
         """The deprecated variable is not a resolved path.
 
         It answers in the process that parses the arguments too, where
-        `--rbln-model-impl optimum` can still overrule it. Applying here on its
+        `--model-impl optimum` can still overrule it. Applying here on its
         answer would put that run on patched upstream with nothing left to undo
         it, so this process waits for the platform hook.
         """

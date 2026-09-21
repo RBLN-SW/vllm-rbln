@@ -153,20 +153,18 @@ def test_unknown_key_is_rejected():
 def test_a_config_of_the_other_path_is_rejected():
     """Two ways to hand a resolution the wrong class, and one message for both.
 
-    `RBLNConfig(model_impl="optimum")` says two different things and the key is
-    what the path is read off; `build_rbln_config(OptimumRBLNConfig())` says one
-    thing to a caller that asked for the other class. A message that explains
-    either one as the cause reads backwards for the other, so it states what it
-    was handed and what is being resolved, in that order.
+    A caller can hand either builder the other path's class, and the message
+    has to read the same way round for both: what it was handed, then what is
+    being resolved.
     """
     with pytest.raises(ValueError, match="belongs to one model path") as said:
-        build_optimum_rbln_config(RBLNConfig(model_impl="optimum"))
-    assert "is an RBLNConfig (model_impl='optimum')" in str(said.value)
+        build_optimum_rbln_config(RBLNConfig())
+    assert "is an RBLNConfig" in str(said.value)
     assert "OptimumRBLNConfig path is the one being resolved" in str(said.value)
 
     with pytest.raises(ValueError, match="belongs to one model path") as said:
         build_rbln_config(OptimumRBLNConfig())
-    assert "is an OptimumRBLNConfig (model_impl='optimum')" in str(said.value)
+    assert "is an OptimumRBLNConfig" in str(said.value)
     assert "RBLNConfig path is the one being resolved" in str(said.value)
 
 
@@ -260,18 +258,11 @@ def test_no_field_is_read_from_the_environment():
 def test_the_model_path_keys_the_compile_cache():
     """A different model implementation is a different artifact.
 
-    Adding the field already cost everyone one cache invalidation; dropping it
-    from the key later would instead hand a run the other path's artifact. Once
-    VLLM_RBLN_USE_VLLM_MODEL leaves RBLN_COMPILE_ENV this is the only thing
-    putting the path in the mega-cache bundle key.
+    The path is not a field any more, so what keeps the two apart in the
+    mega-cache bundle key is that each path hashes a class of its own. Handing a
+    run the other path's artifact is what this prevents.
     """
-    assert (
-        RBLNConfig(model_impl="optimum").compute_hash() != RBLNConfig().compute_hash()
-    )
-    assert (
-        OptimumRBLNConfig(model_impl="vllm").compute_hash()
-        != OptimumRBLNConfig().compute_hash()
-    )
+    assert RBLNConfig().compute_hash() != OptimumRBLNConfig().compute_hash()
 
 
 def test_only_compile_fields_change_the_hash():
@@ -293,8 +284,8 @@ def test_only_compile_fields_change_the_hash():
 class TestResolveModelImpl:
     """The model path has to be readable before the config class is known.
 
-    Which path runs picks the class, so `resolve_model_impl` reads the one key
-    and the environment instead of building anything.
+    Which path runs picks the class, so `resolve_model_impl` reads upstream's
+    `--model-impl` and the environment instead of building anything.
     """
 
     def test_a_built_config_states_its_own_path(self):
@@ -312,25 +303,25 @@ class TestResolveModelImpl:
 
         Every other field takes the additional_config value over the
         environment. This one cannot: the plugin entry points have acted on the
-        variable before anything reads the key.
+        variable before anything reads the flag.
         """
         # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL"):
-            resolve_model_impl({"model_impl": "optimum"})
+            resolve_model_impl(model_impl="optimum")
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL"):
             resolve_model_impl(OptimumRBLNConfig())
 
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
         with pytest.raises(ValueError, match="VLLM_RBLN_USE_VLLM_MODEL"):
-            resolve_model_impl({"model_impl": "vllm"})
+            resolve_model_impl(model_impl="vllm")
 
     def test_an_agreeing_deprecated_variable_is_not_a_conflict(self, monkeypatch):
         # TODO(vllm-rbln>=0.12.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
-        assert resolve_model_impl({"model_impl": "vllm"}) == "vllm"
+        assert resolve_model_impl(model_impl="vllm") == "vllm"
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
-        assert resolve_model_impl({"model_impl": "optimum"}) == "optimum"
+        assert resolve_model_impl(model_impl="optimum") == "optimum"
 
     def test_nothing_given_is_the_default_path(self, monkeypatch):
         # Both names this suite sets are what the default is the absence of: the
@@ -355,25 +346,74 @@ class TestResolveModelImpl:
         monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", "optimum")
         assert resolve_model_impl() == "optimum"
 
-    def test_the_key_wins_over_the_inherited_path(self, monkeypatch):
-        """A worker is handed the path, but an explicit key still decides.
+    def test_the_flag_wins_over_the_inherited_path(self, monkeypatch):
+        """A worker is handed the path, but an explicit flag still decides.
 
         Nothing relies on this today; it keeps the ladder total, so a reader
         does not have to guess which of the two wins.
         """
         monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", "optimum")
-        assert resolve_model_impl({"model_impl": "vllm"}) == "vllm"
+        assert resolve_model_impl(model_impl="vllm") == "vllm"
 
-    @pytest.mark.parametrize("value", ["transformers", "auto", True, None])
-    def test_an_unknown_path_is_rejected(self, value):
-        # `--model-impl` upstream takes "transformers" and "auto"; this is a
-        # different option with its own values.
-        with pytest.raises(ValueError, match="model_impl must be one of"):
-            resolve_model_impl({"model_impl": value})
+    @pytest.mark.parametrize(
+        ("given", "resolved"),
+        [("vllm", "vllm"), ("optimum", "optimum"), ("transformers", "optimum")],
+    )
+    def test_upstream_spellings_name_a_path(self, given, resolved):
+        """`--model-impl` is the flag now, so its vocabulary is what arrives.
+
+        `transformers` is the optimum path's name there: the models it runs come
+        from optimum-rbln, which is a transformers implementation, and upstream's
+        own Transformers backend does not run on RBLN.
+        """
+        assert resolve_model_impl(model_impl=given) == resolved
+
+    def test_auto_leaves_the_path_to_the_ladder(self, monkeypatch):
+        """Every EngineArgs carries `auto`, typed or not.
+
+        Read as a path it would overrule what a parent handed down, so it is no
+        answer at all: the process that was handed one keeps it, and the one
+        that was handed nothing takes the default.
+        """
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", "vllm")
+        assert resolve_model_impl(model_impl="auto") == "vllm"
+
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
+        assert resolve_model_impl(model_impl="auto") == "optimum"
+
+    def test_a_flag_that_disagrees_with_the_config_class_is_rejected(self):
+        """The class holds one path's options and the flag names a path.
+
+        Letting either win silently drops the other: the class would ignore what
+        the caller typed, and the flag would hand the resolution a config it
+        cannot read.
+        """
+        with pytest.raises(ValueError, match="--model-impl names the optimum"):
+            resolve_model_impl(RBLNConfig(), model_impl="optimum")
+        with pytest.raises(ValueError, match="--model-impl names the vllm"):
+            resolve_model_impl(OptimumRBLNConfig(), model_impl="vllm")
+
+        # The same pair agreeing is how a built config is normally passed.
+        assert resolve_model_impl(RBLNConfig(), model_impl="vllm") == "vllm"
+        assert resolve_model_impl(OptimumRBLNConfig(), model_impl="auto") == "optimum"
+
+    @pytest.mark.parametrize("value", ["terratorch", "vLLM", "", True])
+    def test_an_unsupported_implementation_is_rejected(self, value):
+        # `terratorch` is upstream's fourth value and has no RBLN
+        # implementation. None is not here: it is the argument's own absence.
+        with pytest.raises(ValueError, match="unsupported model implementation"):
+            resolve_model_impl(model_impl=value)
 
 
-def test_the_flag_reaches_the_config(parser):
-    assert resolve(parser, ["--rbln-model-impl", "vllm"]).model_impl == "vllm"
+def test_the_path_has_no_rbln_flag_of_its_own(parser):
+    """Upstream's `--model-impl` is the flag, so this field does not add one.
+
+    Registering both would give the same field two spellings that can disagree.
+    """
+    group = next(g for g in parser._action_groups if g.title == _GROUP_TITLE)
+    assert "rbln_model_impl" not in {a.dest for a in group._group_actions}
+    assert "model_impl" in {a.dest for a in parser._actions}
 
 
 def test_model_impl_has_no_variable_of_its_own():

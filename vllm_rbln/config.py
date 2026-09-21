@@ -18,13 +18,13 @@ On this path the config *is* `VllmConfig.additional_config`, which
 `check_and_update_config` replaces with the resolved object. Being a
 `VllmConfig` field is what carries it to every worker in the config pickle,
 and what makes `VllmConfig.compute_hash()` call our `compute_hash`.
-`platform/__init__.py` gates all of it on `model_impl`.
+`platform/__init__.py` gates all of it on the model path.
 
 Resolution order, highest first:
 
   1. `additional_config`, one of the two config classes or a dict of field
-     names. The `--rbln-*` flags write into it. A built config names its own
-     model path, so `model_impl` is for the dict and the flag.
+     names. The `--rbln-*` flags write into it. Which class it resolves into is
+     upstream's `--model-impl` to say, and a built config says it by being one.
   2. `VLLM_RBLN_<FIELD>`, read through `envs.py` so the parsing there still
      applies. `_ENV_PROBE` lists the names that break the pattern.
   3. the field default
@@ -37,7 +37,7 @@ exists, and the rest are bring-up knobs -- are not fields here.
 import argparse
 import os
 from dataclasses import field, fields
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_args
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
@@ -72,12 +72,6 @@ DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
 class RBLNConfigBase:
     """RBLN NPU options that are not specific to one model path."""
 
-    model_impl: ModelImpl = "optimum"
-    """Which model implementation runs: optimum-rbln, or the vLLM model under
-    torch.compile. It picks the class this config is resolved into, so it is
-    read through `resolve_model_impl` before the class is known. Each subclass
-    defaults it to the path that class belongs to."""
-
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
 
@@ -88,8 +82,6 @@ class RBLNConfigBase:
 @vllm_config_dataclass
 class RBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the vllm model path."""
-
-    model_impl: ModelImpl = "vllm"
 
     compile_model: bool = True
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
@@ -181,8 +173,6 @@ class RBLNConfig(RBLNConfigBase):
 class OptimumRBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the optimum-rbln model path."""
 
-    model_impl: ModelImpl = "optimum"
-
     optimum_overrides: dict[str, Any] = field(default_factory=dict)
     """Entries for optimum-rbln's own model config, laid over what vllm-rbln
     derives from the vLLM settings when the model is compiled. With a
@@ -240,7 +230,7 @@ class OptimumRBLNConfig(RBLNConfigBase):
 
 # Every class a `--rbln-*` flag can belong to. The optimum path comes first: a
 # field both classes declare takes its flag default from the first of them, and
-# an unset --rbln-model-impl leaves the run on that path.
+# an unset flag leaves the run on that path.
 _CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (OptimumRBLNConfig, RBLNConfig)
 
 # TODO(vllm-rbln>=0.12.0): delete. Former additional_config keys, still accepted
@@ -316,27 +306,62 @@ def _env_overrides(cls: type[RBLNConfigBase]) -> dict[str, Any]:
     return overrides
 
 
-def _as_model_impl(value: Any) -> ModelImpl:
-    if value not in get_args(ModelImpl):
+# What upstream's `--model-impl` values mean here. `auto` maps to no answer at
+# all: every `EngineArgs` carries it whether or not the user typed it, so
+# reading it as a path would overrule the one a parent process handed down.
+# Left to the ladder below it still lands on optimum in a process that was
+# handed nothing, which is the default either way. `terratorch` is absent on
+# purpose: it has no RBLN implementation.
+_MODEL_IMPL_ALIASES: dict[str, ModelImpl | None] = {
+    "auto": None,
+    "transformers": "optimum",
+    "optimum": "optimum",
+    "vllm": "vllm",
+}
+
+
+def _as_model_impl(value: Any) -> ModelImpl | None:
+    """The path `value` names, or None where it names none."""
+    if not isinstance(value, str) or value not in _MODEL_IMPL_ALIASES:
         raise ValueError(
-            f"model_impl must be one of {list(get_args(ModelImpl))}, got {value!r}"
+            f"unsupported model implementation {value!r}; --model-impl takes "
+            f"{sorted(_MODEL_IMPL_ALIASES)} on RBLN"
         )
-    return value
+    return _MODEL_IMPL_ALIASES[value]
 
 
-def resolve_model_impl(additional_config: Any = None) -> ModelImpl:
-    """The model path, from an `additional_config` nobody has resolved yet.
+def resolve_model_impl(
+    additional_config: Any = None, model_impl: str | None = None
+) -> ModelImpl:
+    """The model path, before there is a config to read it off.
 
-    Which path runs decides which class the config becomes, so it cannot be read
-    off a built config. This looks at the one key instead, early enough for
-    `RblnPlatform` to point itself at the right device and for the plugin entry
-    points of the processes it spawns.
+    `model_impl` is upstream's `--model-impl` as the caller was given it, mapped
+    through `_MODEL_IMPL_ALIASES`; `auto` is the absence of an answer, since
+    every `EngineArgs` carries it whether or not the user typed it. An
+    `additional_config` that is already one of the two classes answers on its
+    own, and disagreeing with the flag is refused rather than resolved.
+
+    With neither, the path is the one this process was handed, and then the
+    default. It is read this early because `RblnPlatform` points itself at a
+    device before any config exists, and because the processes it spawns run
+    their plugin entry points before one reaches them.
     """
+    flagged = _as_model_impl(model_impl) if model_impl is not None else None
+
+    given: ModelImpl | None = None
     if isinstance(additional_config, RBLNConfigBase):
-        given: ModelImpl | None = additional_config.model_impl
-    else:
-        keys = additional_config if isinstance(additional_config, dict) else {}
-        given = _as_model_impl(keys["model_impl"]) if "model_impl" in keys else None
+        # A built config is the path: each class holds one path's options, and
+        # `check_and_update` resolves into the class the path picks.
+        given = "vllm" if isinstance(additional_config, RBLNConfig) else "optimum"
+        if flagged is not None and flagged != given:
+            raise ValueError(
+                f"--model-impl names the {flagged} model path and "
+                f"additional_config is an {type(additional_config).__name__}, "
+                f"which holds the {given} one's options. Pass the config class "
+                "for the path you want, or leave --model-impl at auto."
+            )
+    elif flagged is not None:
+        given = flagged
 
     from vllm_rbln import envs
 
@@ -352,17 +377,19 @@ def resolve_model_impl(additional_config: Any = None) -> ModelImpl:
             raise ValueError(
                 f"VLLM_RBLN_USE_VLLM_MODEL selects the {legacy!r} model path "
                 f"and model_impl selects {given!r}. VLLM_RBLN_USE_VLLM_MODEL "
-                "is deprecated: unset it and keep --rbln-model-impl."
+                "is deprecated: unset it and keep --model-impl."
             )
         logger.warning_once(
             "VLLM_RBLN_USE_VLLM_MODEL is deprecated and will be removed in "
-            "0.12.0. Use --rbln-model-impl, or the additional_config key it "
-            'writes, additional_config={"model_impl": "vllm"}, instead.'
+            "0.12.0. Use --model-impl, or hand additional_config the config "
+            "class of the path you want, instead."
         )
 
     if given is not None:
         return given
-    return _as_model_impl(envs.model_impl_from_env())
+    # A path, never `auto`: what a parent publishes is one, and so is what the
+    # deprecated variable and the default below resolve to.
+    return cast("ModelImpl", envs.model_impl_from_env())
 
 
 def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
@@ -388,9 +415,8 @@ def _resolve(cls: type[_C], additional_config: Any) -> _C:
         # the other class outright. Neither is inferred, since the message that
         # named the wrong one read backwards.
         raise ValueError(
-            f"additional_config is an {type(additional_config).__name__} "
-            f"(model_impl={additional_config.model_impl!r}), and the "
-            f"{cls.__name__} path is the one being resolved. A config class "
+            f"additional_config is an {type(additional_config).__name__}, and "
+            f"the {cls.__name__} path is the one being resolved. A config class "
             "belongs to one model path."
         )
 

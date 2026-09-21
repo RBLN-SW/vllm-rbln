@@ -7,7 +7,7 @@ supported bucket and padded before the model forward pass. Prefill always uses
 `batch_size = 1` and is unaffected by the settings below.
 
 > Bucketing is automatically enabled on the vllm model path
-> (`--rbln-model-impl vllm`).
+> (`--model-impl vllm`).
 
 Key components:
 

@@ -56,7 +56,7 @@ reallocates the KV tensors at that size and re-announces the count to the
 scheduler. No recompilation happens, because the affected dimension is already
 dynamic.
 
-> The dynamic path requires `--rbln-model-impl vllm` and
+> The dynamic path requires `--model-impl vllm` and
 > `VLLM_RBLN_USE_DEVICE_TENSOR=1`. Only `DynamoRuntime` applies adaptive buffer
 > sizes; the other runtimes ignore them silently.
 
@@ -129,7 +129,7 @@ carry the result:
 A dry run refuses nothing. It changes nothing either, so a refusal would stop a
 run the flag off would have served; every shape is reported instead and the run
 continues. That covers the two the dynamic compile needs
-(`--rbln-model-impl vllm`, `VLLM_RBLN_USE_DEVICE_TENSOR=1`) and a
+(`--model-impl vllm`, `VLLM_RBLN_USE_DEVICE_TENSOR=1`) and a
 `torch.rbln` without `capture_programs()` -- without them nothing is captured and
 the sizing step says so -- as well as a KV transfer connector (the reallocation
 is what invalidates its registrations), an attention layer that does not dispatch

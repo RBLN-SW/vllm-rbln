@@ -111,7 +111,9 @@ def test_the_capture_writes_only_where_this_path_reads(monkeypatch):
 
     def captured(additional_config):
         args = SimpleNamespace(
-            max_num_batched_tokens=512, additional_config=additional_config
+            max_num_batched_tokens=512,
+            additional_config=additional_config,
+            model_impl="auto",
         )
         EngineArgs.create_engine_config(args)
         return args.additional_config

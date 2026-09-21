@@ -61,7 +61,7 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         logger.warning(
             "Disabling asynchronous scheduling: the optimum model runner "
             "does not support it. Running synchronously. Set "
-            "--rbln-model-impl vllm to use the runner that does."
+            "--model-impl vllm to use the runner that does."
         )
     scheduler_config.async_scheduling = False
 
