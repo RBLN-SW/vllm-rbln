@@ -17,7 +17,7 @@ Everything here is architecture-independent: the slot naming, which indices a
 stage receives versus captures, and the handoff placeholder that has to advertise
 them. Only the capture itself is not, because it lives inside a model's `forward`
 and the tensors have to be graph outputs of that forward -- see
-`vllm_rbln/patches/minimax_m2.py` for the one architecture that has it.
+`vllm_rbln/patches/minimax_m2.py` and `vllm_rbln/patches/axk2/model.py`.
 
 TODO(vllm-project/vllm#50514): delete once that lands and is released.
 """
@@ -36,7 +36,7 @@ from vllm.sequence import IntermediateTensors
 # architecture absent from here harvests the wrong layers and comes up short at
 # the drafter. `RblnPlatform.check_and_update_config` rejects the combination
 # rather than letting it fail mid-compile.
-EAGLE3_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM"})
+EAGLE3_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM", "AXK2ForCausalLM"})
 
 # One handoff tensor carries every aux hidden state, concatenated on the feature
 # dim in ascending layer order, which is the layout the drafter's `fc` already expects.

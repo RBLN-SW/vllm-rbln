@@ -7,12 +7,17 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
 
-from vllm_rbln.patches.axk2.loader import load_frozen_module
+from vllm_rbln.patches.axk2 import _skt_config
+from vllm_rbln.patches.axk2.loader import alias_frozen_module
 
 CANONICAL_NAME = "vllm.transformers_utils.configs.axk2"
 
-_module = load_frozen_module(CANONICAL_NAME, "_skt_config.py")
+# Imported by its real path instead of being loaded under CANONICAL_NAME: pickle
+# names a class by the module it was loaded under, and an engine core started
+# with VLLM_WORKER_MULTIPROC_METHOD=spawn unpickles this config before anything
+# has imported vllm_rbln in that process, where only the real path resolves.
+alias_frozen_module(CANONICAL_NAME, _skt_config)
 
-AXK2Config = _module.AXK2Config
+AXK2Config = _skt_config.AXK2Config
 
 __all__ = ["AXK2Config", "CANONICAL_NAME"]
