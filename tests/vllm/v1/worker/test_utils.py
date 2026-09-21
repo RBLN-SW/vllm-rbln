@@ -23,6 +23,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -159,6 +160,9 @@ class TestWorkerFailFast:
         assert exit_codes == [70]
 
     def test_logging_failure_does_not_prevent_exit(self, monkeypatch, exit_codes):
+        errors: list[threading.ExceptHookArgs] = []
+        monkeypatch.setattr(threading, "excepthook", errors.append)
+
         def broken_log(*args, **kwargs):
             raise OSError("log unavailable")
 
@@ -168,22 +172,47 @@ class TestWorkerFailFast:
         assert excinfo.value.code == 70
         assert exit_codes == [70]
 
-    def test_a_blocked_record_does_not_hold_the_exit(self, monkeypatch, exit_codes):
+        assert len(errors) == 1
+        assert isinstance(errors[0].exc_value, OSError)
+
+    @pytest.mark.parametrize("blocked", ["event", "log", "both"])
+    def test_blocked_record_preserves_other_output_and_exit(
+        self, monkeypatch, exit_codes, blocked
+    ):
         release = threading.Event()
-        monkeypatch.setattr(worker_utils, "_write_event_line", lambda _: release.wait())
-        monkeypatch.setattr(worker_utils, "_FATAL_RECORD_TIMEOUT_S", 0.2)
+        recorded = {name: threading.Event() for name in ("event", "log")}
+        finished = {name: threading.Event() for name in recorded}
+
+        def record(name):
+            try:
+                if blocked in (name, "both"):
+                    release.wait()
+                recorded[name].set()
+            finally:
+                finished[name].set()
+
+        monkeypatch.setattr(
+            worker_utils, "_write_event_line", lambda line: record("event")
+        )
+        monkeypatch.setattr(worker_utils.logger, "error", lambda *a, **k: record("log"))
+        monkeypatch.setattr(worker_utils, "_FATAL_RECORD_TIMEOUT_S", 0.5)
         try:
+            started = time.monotonic()
             with pytest.raises(SystemExit) as excinfo:
                 worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+            assert time.monotonic() - started < 0.9
+            for name in recorded:
+                assert recorded[name].is_set() == (blocked not in (name, "both"))
         finally:
             release.set()
+            for done in finished.values():
+                assert done.wait(5)
         assert excinfo.value.code == 70
         assert exit_codes == [70]
 
     def test_exit_is_not_held_by_a_stalled_stderr_consumer(self):
-        # A container's stderr is a pipe. Fill one, make it fd 2 and abort: the
-        # event write and the log line both land on it, and the exit must not
-        # wait for a reader that never drains it.
+        # Fill stderr without a reader. The JSON write may stall, but the
+        # readable log on stdout and the process exit must still complete.
         result = subprocess.run(
             [
                 sys.executable,
@@ -212,12 +241,15 @@ class TestWorkerFailFast:
                 **os.environ,
                 "PYTHONPATH": os.pathsep.join(sys.path),
                 "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": "0",
+                "VLLM_LOGGING_STREAM": "ext://sys.stdout",
+                "VLLM_LOGGING_CONFIG_PATH": "",
             },
             capture_output=True,
             text=True,
             timeout=180,
         )
         assert "aborting on a full stderr pipe" in result.stdout, result.stderr
+        assert "stderr consumer stalled" in result.stdout, result.stderr
         assert result.returncode == 70, result.stdout + result.stderr
 
     @staticmethod
@@ -254,7 +286,6 @@ class TestWorkerFailFast:
         assert (event["rank"], event["dp_rank"]) == (3, 1)
         # The worker cannot tell a device or storage fault from any other error.
         assert event["cause"] == "unknown"
-        assert len(event["event_id"]) == 32
         assert event["ts"].endswith("Z")
 
     def test_fatal_event_leaves_unknown_ranks_null(self, exit_codes, capfd):

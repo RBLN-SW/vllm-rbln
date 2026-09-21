@@ -241,12 +241,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
-        rank: int | None = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.fail_fast = issubclass(Executor.get_class(vllm_config), MultiprocExecutor)
-        # The owning worker's rank, for the fatal event of a deferred output.
-        self.rank = rank
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         # self.offload_config = vllm_config.offload_config
@@ -2023,7 +2020,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             placeholder_pos=dict(self._placeholder_pos),
             logprobs_tensors=self._async_logprobs_tensors,
             fail_fast=self.fail_fast,
-            rank=self.rank,
+            rank=self.parallel_config.rank,
             dp_rank=self.parallel_config.data_parallel_rank,
         )
         return async_output

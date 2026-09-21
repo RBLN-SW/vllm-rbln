@@ -19,7 +19,7 @@ import math
 import os
 import platform
 import threading
-import uuid
+import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -66,13 +66,13 @@ _FAIL_FAST_EXIT_CODE = 70
 _FATAL_EVENT = "rbln.worker.fatal"
 _EVENT_SCHEMA_VERSION = 1
 _EVENT_MESSAGE_LIMIT = 500
-# How long the exit waits for the fatal record. stderr is a pipe whose reader
-# may have stalled; past this the record is dropped, not the exit.
+# Both recording threads share this deadline. A stalled pipe or logging handler
+# may lose a record but must not hold the worker alive.
 _FATAL_RECORD_TIMEOUT_S = 1.0
 
 
 def _write_event_line(line: str) -> None:
-    """Write straight to fd 2: no handler lock or buffer before the log."""
+    """Write raw JSON to fd 2, bypassing logging locks and formatters."""
     data = line.encode("utf-8", "replace")
     while data:
         written = os.write(2, data)
@@ -89,7 +89,6 @@ def _fatal_event(
         "ts": now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
         "source": "vllm-rbln",
         "pid": os.getpid(),
-        "event_id": uuid.uuid4().hex,
         "where": where,
         "exception_type": type(exc).__name__,
         "exception_message": str(exc)[:_EVENT_MESSAGE_LIMIT],
@@ -104,20 +103,6 @@ def _fatal_event(
     return json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
-def _worker_rank(worker: Any) -> int | None:
-    rank = getattr(worker, "rank", None)
-    return rank if isinstance(rank, int) else None
-
-
-def _worker_dp_rank(worker: Any) -> int | None:
-    config = getattr(worker, "parallel_config", None)
-    rank = getattr(config, "data_parallel_rank", None)
-    if rank is None:
-        # An async output carries the ranks it was built with, not a config.
-        rank = getattr(worker, "dp_rank", None)
-    return rank if isinstance(rank, int) else None
-
-
 def abort_worker(
     exc: Exception,
     *,
@@ -128,36 +113,43 @@ def abort_worker(
     """Exit without device cleanup once the failure is recorded or the record
     has had its chance.
 
-    The structured event and the readable log line are written from a helper
-    thread; the exit waits for them at most _FATAL_RECORD_TIMEOUT_S. A blocked
-    stderr pipe or handler lock therefore costs the record, not the exit.
+    The event bypasses logging on stderr; the readable log uses the configured
+    handler. Separate threads let either proceed if the other stalls, without
+    guaranteeing output order. Their combined wait is _FATAL_RECORD_TIMEOUT_S.
     """
 
-    def record() -> None:
-        with contextlib.suppress(Exception):
+    def record_event() -> None:
+        with contextlib.suppress(OSError):
             _write_event_line(
                 _fatal_event(exc, where=where, rank=rank, dp_rank=dp_rank)
             )
-        with contextlib.suppress(Exception):
-            logger.error(
-                "RBLN worker %d: %s raised %s: %s. Ending this worker process "
-                "with exit code %d so the executor detects the failure.",
-                os.getpid(),
-                where,
-                type(exc).__name__,
-                exc,
-                _FAIL_FAST_EXIT_CODE,
-                exc_info=exc,
-            )
 
     try:
-        recorder = threading.Thread(
-            target=record, name="rbln-fatal-record", daemon=True
+        deadline = time.monotonic() + _FATAL_RECORD_TIMEOUT_S
+        recorders = (
+            threading.Thread(target=record_event, name="rbln-fatal-event", daemon=True),
+            threading.Thread(
+                target=logger.error,
+                args=(
+                    "RBLN worker %d: %s raised %s: %s. Ending this worker process "
+                    "with exit code %d so the executor detects the failure.",
+                    os.getpid(),
+                    where,
+                    type(exc).__name__,
+                    exc,
+                    _FAIL_FAST_EXIT_CODE,
+                ),
+                kwargs={"exc_info": exc},
+                name="rbln-fatal-log",
+                daemon=True,
+            ),
         )
-        recorder.start()
-        recorder.join(_FATAL_RECORD_TIMEOUT_S)
+        for recorder in recorders:
+            recorder.start()
+        for recorder in recorders:
+            recorder.join(max(0.0, deadline - time.monotonic()))
     finally:
-        # os._exit ends the process even while the recorder is still blocked.
+        # os._exit ends the process even while a recorder is still blocked.
         os._exit(_FAIL_FAST_EXIT_CODE)
 
 
@@ -175,11 +167,16 @@ def worker_fail_fast(function: _F) -> _F:
             return function(self, *args, **kwargs)
         except Exception as exc:
             if fail_fast:
+                config = getattr(self, "parallel_config", None)
                 abort_worker(
                     exc,
                     where=function.__qualname__,
-                    rank=_worker_rank(self),
-                    dp_rank=_worker_dp_rank(self),
+                    rank=getattr(self, "rank", None),
+                    dp_rank=(
+                        config.data_parallel_rank
+                        if config is not None
+                        else getattr(self, "dp_rank", None)
+                    ),
                 )
             raise
 

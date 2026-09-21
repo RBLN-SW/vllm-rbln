@@ -563,11 +563,11 @@ def test_async_output_inherits_runner_fail_fast_policy(
 ):
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     config = make_runner_config(distributed_executor_backend=backend)
+    config.parallel_config.rank = 2
     # The CPU lane disables async scheduling at platform setup. Exercise the
     # deferred output path with CPU tensors after that setup has completed.
     config.scheduler_config.async_scheduling = True
     runner = make_model_runner(vllm_config=config)
-    runner.rank = 2  # what RBLNWorker passes at construction
     scheduler_output = schedule_new("a")
     runner._update_states(scheduler_output)
     hidden_states = torch.zeros(1, 1)

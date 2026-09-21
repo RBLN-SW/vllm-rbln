@@ -171,8 +171,8 @@ class RBLNWorker(WorkerBase):
         if num_devices > 1:
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(num_devices)
 
-    @instrument(span_name="Init device")
     @worker_fail_fast
+    @instrument(span_name="Init device")
     def init_device(self) -> None:
         self.device = self.device_config.device
 
@@ -199,7 +199,7 @@ class RBLNWorker(WorkerBase):
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
-            self.vllm_config, self.device, rank=self.rank
+            self.vllm_config, self.device
         )
         self.dynamic_kv = DynamicKvSizer(
             self.vllm_config, self.model_runner, foreign_dram_used_bytes
@@ -450,8 +450,8 @@ class RBLNWorker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
-    @instrument(span_name="Allocate KV cache")
     @worker_fail_fast
+    @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate RBLN KV cache with the specified kv_cache_config."""
 
@@ -489,8 +489,8 @@ class RBLNWorker(WorkerBase):
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             return self.dynamic_kv.apply_num_blocks(n)
 
-    @instrument(span_name="Warmup (NPU)")
     @worker_fail_fast
+    @instrument(span_name="Warmup (NPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # NOTE(RBLN): Manual timing since RBLN does not support @support_torch_compile.
         st = time.perf_counter()
