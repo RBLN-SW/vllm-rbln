@@ -62,11 +62,15 @@ _WEIGHT_TYPE_IDS = ["int8", "int4"]
 
 # Grouped WNA16 does not compile on REBEL today; channelwise does. Not a group
 # size constraint -- a directly built 128 group is rejected the same way.
+# The CPU-tensor compiler aborts on these unsupported shapes, killing later
+# cases in the module. The device-tensor lane still executes the xfail cases.
+_RUN_GROUPED = host_chip() not in REBEL or current_platform.device_type != "cpu"
 _REBEL_GROUPED_XFAIL = pytest.mark.xfail(
     host_chip() in REBEL,
     reason="TODO(rbln-wna16-grouped-rebel): grouped WNA16 does not compile on "
     "REBEL; drop when it does.",
     strict=True,
+    run=_RUN_GROUPED,
 )
 
 _GROUP_SIZES = [
@@ -86,6 +90,7 @@ _SCALE_GROUP = 64
 _GROUPED_BIAS_XFAIL = pytest.mark.xfail(
     reason="TODO(rbln-wna16-grouped-bias): grouped WNA16 with a bias does not "
     "compile for more than one token.",
+    run=_RUN_GROUPED,
 )
 
 
