@@ -341,12 +341,19 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # (base addrs + block lens), already shard-expanded so upstream's
         # connector's descriptor math is correct without this connector
         # knowing the shard count.
+
+        # 0 is a width the adapter accepts and a missing one means "keep the
+        # plugin default", so the test is on absence, not on truthiness.
+        extra = (
+            {} if self._stripe_width is None else {"stripe_width": self._stripe_width}
+        )
         xfer = nixl_rbln.register_kv_regions(
             self.nixl_wrapper,
             regions,
             device_id,
             mem=self.nixl_memory_type,
             rbln_ctx_ptr=rbln_ctx_ptr,
+            **extra,
         )
         self.device_id = device_id
         self.block_len_per_layer = list(xfer.block_lens)

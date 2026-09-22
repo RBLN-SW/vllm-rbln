@@ -1282,6 +1282,19 @@ class TestD2dRegistrationReachesTheAdapterAndThePeer:
             entry_bytes = entry.numel() * entry.element_size()
             assert w.num_blocks * full_block_len == entry_bytes
 
+    @pytest.mark.parametrize(
+        "stripe_width, passed",
+        [(None, {}), (0, {"stripe_width": 0}), (4096, {"stripe_width": 4096})],
+    )
+    def test_a_stripe_width_reaches_the_adapter_only_when_named(
+        self, make_worker, stripe_width, passed
+    ):
+        # A backend-lifecycle override, and this path creates the backend from
+        # inside the registration call -- so this is where it has to ride. The
+        # 0 case is what separates "nobody named it" from a width of zero.
+        make_worker(stripe_width=stripe_width)
+        assert sys.modules["nixl_rbln"].register_kwargs_seen == [passed]
+
     def test_registration_republishes_what_a_peer_pairs_on(self, make_worker):
         # Upstream's publish carries no layer names and no chiplet geometry, so
         # without this a D2D peer has nothing to match on. The geometry has to

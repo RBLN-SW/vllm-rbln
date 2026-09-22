@@ -56,6 +56,7 @@ def engine_config(
     speculative_model: str | None = None,
     block_size: int = BLOCK_SIZE,
     kv_role: str = "kv_both",
+    stripe_width: int | None = None,
 ) -> Any:
     """A real VllmConfig with a kv_transfer_config, through EngineArgs.
 
@@ -80,6 +81,9 @@ def engine_config(
             kv_connector="RblnNixlConnector",
             kv_role=kv_role,
             kv_buffer_device=kv_buffer_device,
+            kv_connector_extra_config=(
+                {} if stripe_width is None else {"stripe_width": stripe_width}
+            ),
         ),
         **extra,
     )
@@ -409,9 +413,16 @@ def fake_nixl_rbln(geometry: KvGeometry, kv_caches: dict[str, Any]) -> Any:
     # from the geometry, so nothing else here would ever read `regions` -- and
     # the byte offset in it is the only thing telling a layer's K from its V.
     module.regions_seen = []
+    # Backend-lifecycle overrides ride this call on the D2D path, and the
+    # adapter treats a missing one as "keep the plugin default", so what is
+    # absent is as much the contract as what is present.
+    module.register_kwargs_seen = []
 
     def _register_kv_regions(wrapper: Any, regions: Any, *a: Any, **k: Any) -> Any:
         module.regions_seen.append(list(regions))
+        module.register_kwargs_seen.append(
+            {n: v for n, v in k.items() if n not in ("mem", "rbln_ctx_ptr")}
+        )
         return geometry.xfer_tables(kv_caches)
 
     module.register_kv_regions = _register_kv_regions
