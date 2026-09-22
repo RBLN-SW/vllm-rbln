@@ -829,6 +829,23 @@ class TestDummyRunPadding:
 
         assert captured["layout"].num_reqs_padded == 1
 
+    def test_a_dummy_prefill_pads_to_the_width_warm_up_compiled(self, monkeypatch):
+        # Serving pads every prefill to max_num_tokens, so that is the one width
+        # warm-up builds. A dummy prefill has to land on it whatever length it is
+        # handed -- an idle rank reports the minimal entry, not the staged width.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, runner.max_num_tokens, is_prefill=True)
+        warmed = captured["layout"].shape
+
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, 1, is_prefill=True, warmup=False)
+        assert captured["layout"].shape == warmed
+
+        # A decode dummy still runs at the length it is given; only prefill pads.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+        assert captured["layout"].shape != warmed
+
     def test_warmup_pin_is_the_token_dimension(self, monkeypatch):
         # Warm-up dictates the dimension it wants compiled -- the group agreement
         # would give a smaller one -- and nothing downstream recomputes it, so the
@@ -1798,6 +1815,16 @@ class TestDummyRunPPIntermediateTensors:
         assert captured["layout"].num_reqs == 1
         assert captured["layout"].num_reqs_padded == 8
 
+    def test_prefill_intermediate_tensors_match_the_staged_width(self, monkeypatch):
+        # The stager pads a prefill's rows to max_num_tokens but passes
+        # intermediate tensors through, so the sender built them at that width.
+        # Sizing them from the unpadded length instead splits the two apart.
+        runner, captured = self._runner(monkeypatch, num_reqs_padded=1, query_len=1)
+        runner._dummy_run(1, 1, is_prefill=True, warmup=False)
+        _, width = captured["layout"].shape
+        assert width == runner.max_num_tokens
+        assert captured["intermediate_tensors"]["h"].shape == (1, width, self.HIDDEN)
+
 
 class TestExecuteModelRecoversADeferredLoad:
     """A read the dummy step never issued goes out on the next execute_model.
@@ -1969,6 +1996,7 @@ class TestDecodeGraphShapes:
             bucketing_manager=SimpleNamespace(decode_batch_buckets=buckets),
             specialized_moe_decode=specialized,
             max_num_tokens=512,
+            is_strict_kv_producer=False,
         )
 
     def _dummies(self, runner):
@@ -2014,3 +2042,13 @@ class TestDecodeGraphShapes:
         shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
         # Top bucket, one token, padded to what a drafting peer would stage.
         assert shapes[-1] == (4, 1, 4 * 4)
+
+    def test_a_strict_producer_compiles_no_decode_graph(self):
+        # Every step a producer runs is a prefill step, so warm-up issues the
+        # prefill dummy and nothing else.
+        runner = self._runner(buckets=[1, 2, 4], specialized=True, num_spec=3)
+        runner.is_strict_kv_producer = True
+        assert mr.RBLNModelRunner.decode_graph_shapes(runner) == []
+        calls = self._dummies(runner)
+        assert len(calls) == 1
+        assert calls[0][0] == (1, runner.max_num_tokens, True)

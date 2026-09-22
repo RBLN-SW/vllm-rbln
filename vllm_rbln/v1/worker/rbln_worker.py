@@ -358,6 +358,8 @@ class RBLNWorker(WorkerBase):
         )
 
         if draft_model is not None and draft_model_config is not None:
+            # draft_model is read off the drafter, so it cannot be absent here.
+            assert drafter is not None
             if draft_parallel_config is None:
                 draft_parallel_config = self.parallel_config
 
@@ -381,7 +383,7 @@ class RBLNWorker(WorkerBase):
                 n_model_bytes=n_model_bytes,
             )
 
-            # Draft runtimes: one per bucket, plus the specialized-MoE fallback.
+            # Draft runtimes: one, plus the decode set the drafter warms.
             # TODO(RBLN): an undercount since the draft started compiling both decode
             # query lengths. Reserving for what it actually compiles needs the count
             # split by speculative method, which the medusa path would want too.
@@ -390,6 +392,11 @@ class RBLNWorker(WorkerBase):
                 num_draft_runtimes += decode_batch_buckets_count
                 if has_specialized_moe_decode:
                     num_draft_runtimes += 1
+            elif drafter.warms_up_decode_graphs_on_a_producer:
+                # run_model_graphs issues one drafter dummy on a producer, so
+                # the decode buckets collapse to the one query length it warms.
+                # The shapes a drafter compiles per dummy are the TODO's share.
+                num_draft_runtimes += 1
             draft_n_model_bytes = 0
 
             for value in draft_model.parameters():
@@ -692,13 +699,11 @@ class RBLNWorker(WorkerBase):
 
     @worker_fail_fast
     def execute_dummy_batch(self) -> None:
-        # Serving-time DP-idle step: this rank has no real work. Run a non-warmup
-        # dummy (warmup=False) so it contributes a minimal (num_reqs=1, qlen=1)
-        # entry to the cross-DP collective, is EXCLUDED from the shape decision,
-        # then adopts the busy-decided shape and runs the same compiled decode
-        # graph the busy ranks run -- so an idle rank never drags the collective
-        # into a fall-back route nor lands on an uncompiled shape.
-        self.model_runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+        # A strict producer has no decode graph to adopt, so its idle step asks
+        # for the prefill one; _dummy_run pads that to the width warm-up built.
+        self.model_runner._dummy_run(
+            1, 1, is_prefill=self.model_runner.is_strict_kv_producer, warmup=False
+        )
 
     # def add_lora(self, lora_request: LoRARequest) -> bool:
     #     return self.model_runner.add_lora(lora_request)

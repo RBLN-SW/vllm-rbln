@@ -706,6 +706,20 @@ class TestDetermineDraftBatch:
             None,
         )
 
+    def test_a_prefilling_moe_draft_pins_the_token_dimension(self):
+        # A guard, not a test of a change: an idle rank reports the minimal entry
+        # while staging the width warm-up compiled, and what keeps that difference
+        # off the graph key is this dimension being a config constant. A drafter
+        # whose MoE forbids the idle skip is the only one that reaches it.
+        for reported in ([1, 1], [1, MAX_NUM_TOKENS], [MAX_NUM_TOKENS, 1]):
+            desc, _ = self._determine(
+                _status(num_tokens=reported, num_reqs=[1, 1], is_prefill=[1, 1]),
+                num_reqs=1,
+                num_tokens=reported[0],
+                is_prefill=True,
+            )
+            assert desc.num_tokens_padded == MAX_NUM_TOKENS, reported
+
     def test_token_dimension_follows_the_busiest_rank(self):
         # bucket(max(4, 2)) = 4, and max(16 // 4, 16 // 2) = 8 tokens per request.
         desc, across = self._determine(
