@@ -668,10 +668,11 @@ class TestShapeConfigWiring:
         # both need data parallelism to specialize at all -- so this runner is built
         # with a peer and a ladder of buckets, or the top and the first would be the
         # same entry and the answers indistinguishable.
-        monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", "4")
-        runner = make_model_runner(data_parallel_size=2, max_num_seqs=8)
-        monkeypatch.undo()
+        runner = make_model_runner(
+            data_parallel_size=2,
+            max_num_seqs=8,
+            additional_config={"decode_batch_bucket_limit": 4},
+        )
         buckets = runner.bucketing_manager.decode_batch_buckets
         assert len(buckets) > 1, buckets
 
@@ -1190,21 +1191,23 @@ class TestCalcSpecDecodeMetadata:
 
 class TestSortBatchByLength:
     # __init__ enables the sort on REBEL CR13 and wherever
-    # VLLM_RBLN_BATCH_ATTN_OPT is set; other parts keep the scheduler's order.
+    # --rbln-use-batch-attn-opt is set; other parts keep the scheduler's order.
     @pytest.mark.parametrize(
         ("is_cr13", "use_batch_attn_opt", "expected"),
         [
-            (True, "0", True),
-            (False, "0", False),
-            (False, "1", True),
+            (True, False, True),
+            (False, False, False),
+            (False, True, True),
         ],
     )
     def test_resolved_from_device_and_flag(
         self, monkeypatch, make_model_runner, is_cr13, use_batch_attn_opt, expected
     ):
         monkeypatch.setattr(current_platform, "is_cr13", lambda: is_cr13)
-        monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", use_batch_attn_opt)
-        runner = make_model_runner(init_kv_cache=False)
+        runner = make_model_runner(
+            init_kv_cache=False,
+            additional_config={"use_batch_attn_opt": use_batch_attn_opt},
+        )
         assert runner.sort_batch_by_length is expected
 
 

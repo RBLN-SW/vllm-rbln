@@ -44,25 +44,27 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 ## Two model paths
 
-`VLLM_RBLN_USE_VLLM_MODEL` selects the model path at startup: unset or `0` is the optimum model path, `1` is the vllm model path.
+Upstream's `--model-impl` selects the model path. `vllm` is the vllm model path, `transformers` and `optimum` are the optimum one, and `auto` (the default) leaves it to `resolve_model_impl()`, which takes the path this process was handed and then `optimum`. Anything else is refused. `resolve_model_impl()` reads it before the config exists, and `create_engine_config` hands the field back its default so upstream's own resolution is untouched. A built `additional_config` names the path by being one of the two classes, and disagreeing with the flag is refused. `VLLM_RBLN_USE_VLLM_MODEL=1` still means `vllm`, warns, and goes away in 0.14.0.
 
 | Path         | Owns                                                                        |
 | ------------ | --------------------------------------------------------------------------- |
 | optimum      | `model_executor/models/optimum/`, `utils/optimum/`, `v1/worker/optimum_*.py`, `platform/optimum_impl.py` |
 | vllm         | `patches/`, `compilation/`, `v1/worker/rbln_*.py`, `platform/vllm_impl.py` |
-| shared       | everything else |
+| shared       | everything else, including `config.py`, which holds both paths' config classes |
 
-**`envs.py` defines the flag; only `__init__.py` and `platform/__init__.py` branch on it.** Do not branch on `VLLM_RBLN_USE_VLLM_MODEL` anywhere else. Path-specific code belongs in the module that path owns.
+**`config.py` defines the selector; only `__init__.py` and `platform/__init__.py` branch on it.** Do not branch on the model path anywhere else. Path-specific code belongs in the module that path owns.
 
 - Say which path or paths you changed in the PR description.
 - A change to one path must not alter the other. If it appears to need both, stop and ask before writing code.
 - A new env var goes in three places in `envs.py`: the `TYPE_CHECKING` block, the `environment_variables` dict, and either `RBLN_COMPILE_ENV` or `RBLN_NON_COMPILE_ENV`. The two sets partition the mega-cache bundle key, and `test_mega_cache.py` asserts they cover every variable.
-- Suites carry the path: `tests/vllm/` sets it to `1` in its conftest and scrubs `VLLM_RBLN_*`; `tests/optimum/` has no suite-level conftest and takes the default. An exported `VLLM_RBLN_USE_VLLM_MODEL` therefore changes what `tests/optimum/` exercises without failing.
-- Do not set `VLLM_RBLN_USE_VLLM_MODEL` inside a test to escape its suite.
+- Suites carry the path: `tests/vllm/` adopts `vllm` in its conftest and scrubs `VLLM_RBLN_*`; `tests/optimum/` has no suite-level conftest and takes the default. An exported `VLLM_RBLN_USE_VLLM_MODEL` therefore changes what `tests/optimum/` exercises without failing.
+- Do not select the model path inside a test to escape its suite.
 
 ## Patching upstream vLLM
 
-`vllm_rbln/patches/` adapts upstream vLLM for RBLN. Both mechanisms live in `patches/registry.py`, both take a required `reason`, and `register_ops()` applies registrations before patches — on the vllm model path only.
+`vllm_rbln/patches/` adapts upstream vLLM for RBLN. Both mechanisms live in `patches/registry.py`, both take a required `reason`, and only the vllm model path applies them. Registrations go first, then patches.
+
+Two places apply them, and each applies all of them. `register_ops()` covers every process that inherits a resolved model path. It runs before the arguments are parsed, so it cannot cover the process that resolves the path itself; `platform/vllm_impl.patch_upstream()` does, from the post-parse window of `pre_register_and_update()`.
 
 **Use upstream's own extension points first.** `@add_registration` wraps a callback that registers through a vLLM API: `base_cls.register_oot(...)`, a `PlatformEnum.OOT` entry in a kernel registry, and so on. `patches/oot.py` is the worked example. A registration survives an upstream refactor; a replaced symbol does not.
 
@@ -76,10 +78,11 @@ These are the cases that legitimately reach a patch:
 
 The registry rules:
 
-- Never `setattr` an upstream symbol directly. Every replacement goes through the registry, which verifies that it took.
+- Never `setattr` an upstream symbol from `patches/`. Every replacement here goes through the registry, which verifies that it took. `platform/` is the narrow exception, for the entry points that run before the model path is known and for the optimum path, neither of which the registry reaches; each site says why.
 - A new module under `patches/` must be added to the import list in `patches/__init__.py`. A decorator in a module nobody imports registers nothing.
 - Duplicate keys and duplicate targets raise. Two patches may share a target only when their `condition` predicates are mutually exclusive.
-- `priority` applies `0` first and `100` last, default `50`. `apply_immediately` patches at import time, for targets that import-time code snapshots before `apply_registered_patches()` runs; it cannot be combined with an explicit `priority`.
+- `priority` applies `0` first and `100` last, default `50`. Importing a `patches/` module only registers; nothing touches upstream until `apply_registered_patches()` runs.
+- `build=True` makes the decorated object a zero-argument factory that the registry calls at apply time. Use it when building the replacement reads a target another patch replaces: give it the later `priority`, and the factory sees the patched value.
 - Pass `verify` when "the attribute is now our object" does not prove the patch took effect.
 
 ## Language

@@ -18,12 +18,13 @@ On this path the config *is* `VllmConfig.additional_config`, which
 `check_and_update_config` replaces with the resolved object. Being a
 `VllmConfig` field is what carries it to every worker in the config pickle,
 and what makes `VllmConfig.compute_hash()` call our `compute_hash`.
-`platform/__init__.py` gates all of it on `VLLM_RBLN_USE_VLLM_MODEL=1`.
+`platform/__init__.py` gates all of it on the model path.
 
 Resolution order, highest first:
 
-  1. `additional_config`, an `RBLNConfig` or a dict of field names. The
-     `--rbln-*` flags write into it.
+  1. `additional_config`, one of the two config classes or a dict of field
+     names. The `--rbln-*` flags write into it. Which class it resolves into is
+     upstream's `--model-impl` to say, and a built config says it by being one.
   2. `VLLM_RBLN_<FIELD>`, read through `envs.py` so the parsing there still
      applies. `_ENV_PROBE` lists the names that break the pattern.
   3. the field default
@@ -36,7 +37,7 @@ exists, and the rest are bring-up knobs -- are not fields here.
 import argparse
 import os
 from dataclasses import field, fields
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from pydantic import Field
 from vllm.config.utils import config as vllm_config_dataclass
@@ -44,24 +45,43 @@ from vllm.config.utils import config as vllm_config_dataclass
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
+    # `Field` here is pydantic's, which a field definition below calls.
+    from dataclasses import Field as DataclassField
+
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
 _GROUP_TITLE = "RBLNConfig"
 
+# No `--rbln-*` flag; the field's own docstring says why. Still accepted through
+# `additional_config`, which is how one of them arrives before the config exists.
+_NO_FLAG = {"no_flag": True}
+
+# Written by the config sync, from the compiled artifact or from other fields. A
+# value given here is overwritten, and hashing it would key the compile cache on
+# something derived from the artifact the key is looking for.
+_DERIVED = {"no_flag": True, "derived": True}
+
+ModelImpl = Literal["vllm", "optimum"]
+
 DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
 
 
 @vllm_config_dataclass
-class RBLNConfig:
-    """RBLN NPU options for the vllm model path."""
+class RBLNConfigBase:
+    """RBLN NPU options that are not specific to one model path."""
 
     num_devices_per_local_rank: int = 1
     """Number of NPU devices assigned to each local rank."""
 
     use_custom_sampler: bool = True
     """Use the customized RBLN sampler."""
+
+
+@vllm_config_dataclass
+class RBLNConfig(RBLNConfigBase):
+    """RBLN NPU options for the vllm model path."""
 
     compile_model: bool = True
     """Compile models with torch.compile. Otherwise run CPU eager mode, if
@@ -149,9 +169,83 @@ class RBLNConfig:
             )
 
 
-# `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
-# without vllm installed, so it cannot see that this makes a dataclass.
-_FIELDS = fields(RBLNConfig)  # type: ignore[arg-type]
+@vllm_config_dataclass
+class OptimumRBLNConfig(RBLNConfigBase):
+    """RBLN NPU options for the optimum-rbln model path."""
+
+    optimum_overrides: dict[str, Any] = field(default_factory=dict)
+    """Entries for optimum-rbln's own model config, laid over what vllm-rbln
+    derives from the vLLM settings when the model is compiled. With a
+    pre-compiled model only the `device` entries apply."""
+
+    prefix_block_size: int | None = None
+    """Block size of the prefix cache. Defaults to the prefill chunk size."""
+
+    # Snapshots of a vLLM field taken before it is overwritten. vLLM already has
+    # the flag, so there is no `--rbln-*` one, but they stay settable: the
+    # platform hook writes the first into the dict before this class exists.
+    user_max_num_batched_tokens: int | None = field(default=None, metadata=_NO_FLAG)
+    """`--max-num-batched-tokens` as the user gave it, before vLLM fills in its
+    default. On this path it is the prefill chunk size to compile."""
+
+    num_blocks_override: int | None = field(default=None, metadata=_NO_FLAG)
+    """`--num-gpu-blocks-override` as given, before the prefix-cache block ratio
+    is applied to it."""
+
+    # Written by the sync, and carried to the processes that cannot build
+    # `RBLNParams` of their own.
+    attn_block_size: int | None = field(default=None, metadata=_DERIVED)
+    """`RBLNParams.kvcache_block_size`, when prefix caching splits the KV-cache
+    block size from `cache_config.block_size`."""
+
+    image_prefill_chunk_size: list[int] | None = field(default=None, metadata=_DERIVED)
+    """`RBLNParams.image_prefill_chunk_size`, the image-prefill buckets
+    (gemma3/gemma4) the scheduler pads against."""
+
+    cached_model_path: str | None = field(default=None, metadata=_DERIVED)
+    """Where the compile cache holds, or will put, this model's artifact. Built
+    from the fields above, so it cannot key the cache it names."""
+
+    num_blocks_synced: bool = field(default=False, metadata=_DERIVED)
+    """Set once num_gpu_blocks is derived from the compiled model, so the second
+    run of the sync in EngineCore does not derive it again."""
+
+    def compute_hash(self) -> str:
+        """Hash of the fields that change the compiled artifact.
+
+        `VllmConfig.compute_hash()` requires this of an `additional_config` that
+        is not a dict, and `mega_cache` keys its bundle on the result.
+        """
+        from vllm.config.utils import get_hash_factors, hash_factors
+
+        ignored_factors = {
+            f.name for f in _fields_of(type(self)) if f.metadata.get("derived")
+        } | {
+            # Sampler graphs compile with use_cache=False, so they never enter
+            # the bundle.
+            "use_custom_sampler",
+        }
+        return hash_factors(get_hash_factors(self, ignored_factors))
+
+
+# Every class a `--rbln-*` flag can belong to. The optimum path comes first: a
+# field both classes declare takes its flag default from the first of them, and
+# an unset flag leaves the run on that path.
+_CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (OptimumRBLNConfig, RBLNConfig)
+
+# TODO(vllm-rbln>=0.14.0): delete. Former additional_config keys, still accepted
+# with a warning.
+_RENAMED_KEYS: dict[type[RBLNConfigBase], dict[str, str]] = {
+    OptimumRBLNConfig: {"rbln_config": "optimum_overrides"},
+}
+
+_C = TypeVar("_C", bound=RBLNConfigBase)
+
+
+def _fields_of(cls: type[RBLNConfigBase]) -> tuple["DataclassField[Any]", ...]:
+    # `vllm_config_dataclass` is a `dataclass_transform`, but the mypy hook runs
+    # without vllm installed, so it cannot see that this makes a dataclass.
+    return fields(cls)  # type: ignore[arg-type]
 
 
 # Which env name means "the user set this field". It is VLLM_RBLN_<FIELD>
@@ -183,67 +277,198 @@ def _env_source(field_name: str) -> tuple[str, tuple[str, ...]]:
     return attr, _ENV_PROBE.get(field_name, (attr,))
 
 
-def _env_overrides() -> dict[str, Any]:
+def _env_overrides(cls: type[RBLNConfigBase]) -> dict[str, Any]:
     from vllm_rbln import envs
 
     overrides: dict[str, Any] = {}
-    for f in _FIELDS:
+    deprecated: list[str] = []
+    for f in _fields_of(cls):
         attr, probes = _env_source(f.name)
+        if attr not in envs.environment_variables:
+            # No variable of its own; the CLI or the default is the only source.
+            continue
         for probe in probes:
             if probe in os.environ:
                 overrides[f.name] = getattr(envs, attr)
+                deprecated.append(f"{probe} -> --rbln-{f.name.replace('_', '-')}")
                 break
+
+    if deprecated:
+        # TODO(vllm-rbln>=0.14.0): delete, with the variables themselves. Every
+        # field here has a flag now, and the flag is what the config records; a
+        # variable reaches it only through this function.
+        logger.warning_once(
+            "These environment variables are deprecated and will be removed in "
+            "0.14.0. Use the flag instead, or the additional_config key it "
+            "writes, which is the flag without the --rbln- prefix: %s.",
+            ", ".join(sorted(deprecated)),
+        )
     return overrides
 
 
-def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
-    """Resolve the RBLN config from `additional_config` and the environment.
+# What upstream's `--model-impl` values mean here. `auto` maps to no answer at
+# all: every `EngineArgs` carries it whether or not the user typed it, so
+# reading it as a path would overrule the one a parent process handed down.
+# Left to the ladder below it still lands on optimum in a process that was
+# handed nothing, which is the default either way. `terratorch` is absent on
+# purpose: it has no RBLN implementation.
+_MODEL_IMPL_ALIASES: dict[str, ModelImpl | None] = {
+    "auto": None,
+    "transformers": "optimum",
+    "optimum": "optimum",
+    "vllm": "vllm",
+}
 
-    An `RBLNConfig` is returned unchanged, so a process that receives one
+
+def _as_model_impl(value: Any) -> ModelImpl | None:
+    """The path `value` names, or None where it names none."""
+    if not isinstance(value, str) or value not in _MODEL_IMPL_ALIASES:
+        raise ValueError(
+            f"unsupported model implementation {value!r}; --model-impl takes "
+            f"{sorted(_MODEL_IMPL_ALIASES)} on RBLN"
+        )
+    return _MODEL_IMPL_ALIASES[value]
+
+
+def resolve_model_impl(
+    additional_config: Any = None, model_impl: str | None = None
+) -> ModelImpl:
+    """The model path, before there is a config to read it off.
+
+    `model_impl` is upstream's `--model-impl` as the caller was given it, mapped
+    through `_MODEL_IMPL_ALIASES`; `auto` is the absence of an answer, since
+    every `EngineArgs` carries it whether or not the user typed it. An
+    `additional_config` that is already one of the two classes answers on its
+    own, and disagreeing with the flag is refused rather than resolved.
+
+    With neither, the path is the one this process was handed, and then the
+    default. It is read this early because `RblnPlatform` points itself at a
+    device before any config exists, and because the processes it spawns run
+    their plugin entry points before one reaches them.
+    """
+    flagged = _as_model_impl(model_impl) if model_impl is not None else None
+
+    given: ModelImpl | None = None
+    if isinstance(additional_config, RBLNConfigBase):
+        # A built config is the path: each class holds one path's options, and
+        # `check_and_update` resolves into the class the path picks.
+        given = "vllm" if isinstance(additional_config, RBLNConfig) else "optimum"
+        if flagged is not None and flagged != given:
+            raise ValueError(
+                f"--model-impl names the {flagged} model path and "
+                f"additional_config is an {type(additional_config).__name__}, "
+                f"which holds the {given} one's options. Pass the config class "
+                "for the path you want, or leave --model-impl at auto."
+            )
+    elif flagged is not None:
+        given = flagged
+
+    from vllm_rbln import envs
+
+    # TODO(vllm-rbln>=0.14.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
+    if "VLLM_RBLN_USE_VLLM_MODEL" in os.environ:
+        legacy: ModelImpl = "vllm" if envs.VLLM_RBLN_USE_VLLM_MODEL else "optimum"
+        if given is not None and given != legacy:
+            # Not the shadow warning `_resolve` gives an ordinary field, which
+            # the additional_config value simply wins. This one picks the config
+            # class, the device identity and the patch set, and the module
+            # import has already adopted the environment's answer by the time
+            # the key is read here.
+            raise ValueError(
+                f"VLLM_RBLN_USE_VLLM_MODEL selects the {legacy!r} model path "
+                f"and model_impl selects {given!r}. VLLM_RBLN_USE_VLLM_MODEL "
+                "is deprecated: unset it and keep --model-impl."
+            )
+        logger.warning_once(
+            "VLLM_RBLN_USE_VLLM_MODEL is deprecated and will be removed in "
+            "0.14.0. Use --model-impl, or hand additional_config the config "
+            "class of the path you want, instead."
+        )
+
+    if given is not None:
+        return given
+    # A path, never `auto`: what a parent publishes is one, and so is what the
+    # deprecated variable and the default below resolve to.
+    return cast("ModelImpl", envs.model_impl_from_env())
+
+
+def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
+    return _resolve(RBLNConfig, additional_config)
+
+
+def build_optimum_rbln_config(additional_config: Any = None) -> OptimumRBLNConfig:
+    return _resolve(OptimumRBLNConfig, additional_config)
+
+
+def _resolve(cls: type[_C], additional_config: Any) -> _C:
+    """Resolve `cls` from `additional_config` and the environment.
+
+    A resolved config is returned unchanged, so a process that receives one
     cannot resolve it into something different.
     """
-    if isinstance(additional_config, RBLNConfig):
+    if isinstance(additional_config, cls):
         return additional_config
+
+    if isinstance(additional_config, RBLNConfigBase):
+        # Two ways here: an object whose model_impl disagrees with the class it
+        # is, which is the value the path was read off, or a caller asking for
+        # the other class outright. Neither is inferred, since the message that
+        # named the wrong one read backwards.
+        raise ValueError(
+            f"additional_config is an {type(additional_config).__name__}, and "
+            f"the {cls.__name__} path is the one being resolved. A config class "
+            "belongs to one model path."
+        )
 
     given: dict[str, Any] = additional_config or {}
     if not isinstance(given, dict):
         raise ValueError(
-            "additional_config must be an RBLNConfig or a mapping of its field "
-            f"names on the vllm model path, got {type(given).__name__}"
+            f"additional_config must be a {cls.__name__} or a mapping of its "
+            f"field names, got {type(given).__name__}"
         )
 
-    known = {f.name for f in _FIELDS}
+    for old, new in _RENAMED_KEYS.get(cls, {}).items():
+        if old in given:
+            logger.warning_once(
+                "additional_config[%r] is deprecated and will be removed in "
+                "0.14.0; use %r.",
+                old,
+                new,
+            )
+            given = {k: v for k, v in given.items() if k != old} | {new: given[old]}
+
+    known = {f.name for f in _fields_of(cls)}
     if unknown := sorted(set(given) - known):
         # `extra="forbid"` would catch these too, but its message talks about
         # keyword arguments. Upstream's --gdn-prefill-backend arrives this way:
         # arg_utils writes it into additional_config.
         raise ValueError(
-            f"additional_config takes only RBLNConfig fields on the "
-            f"vllm model path, and {unknown} are not fields. The fields are "
-            f"{sorted(known)}."
+            f"additional_config takes only {cls.__name__} fields, and "
+            f"{unknown} are not fields. The fields are {sorted(known)}."
         )
 
-    overrides = _env_overrides()
+    overrides = _env_overrides(cls)
     shadowed = sorted(set(given) & set(overrides))
     overrides.update(given)
 
     if shadowed:
         logger.warning_once(
-            "Both the environment and additional_config set %s; RBLNConfig "
-            "takes the additional_config value.",
+            "Both the environment and additional_config set %s; %s takes the "
+            "additional_config value.",
             ", ".join(shadowed),
+            cls.__name__,
         )
 
-    resolved = RBLNConfig(**overrides)
+    resolved = cls(**overrides)
 
     # Upstream's `non-default args` covers what the CLI was given, but not what
     # the environment resolved to, and `VllmConfig.__str__` leaves
     # additional_config out entirely. This is the only record of the values a
     # run actually used.
-    defaults = RBLNConfig()
+    defaults = cls()
     changed = {
         f.name: getattr(resolved, f.name)
-        for f in _FIELDS
+        for f in _fields_of(cls)
         if getattr(resolved, f.name) != getattr(defaults, f.name)
     }
     logger.info("RBLN config: %s", changed or "all defaults")
@@ -265,9 +490,9 @@ def get_rbln_config() -> RBLNConfig:
     rbln_config = get_current_vllm_config().additional_config
     if not isinstance(rbln_config, RBLNConfig):
         raise RuntimeError(
-            "additional_config is not an RBLNConfig; "
-            "check_and_update_config resolves it on the vllm model path, so "
-            f"this is the optimum-rbln path or an unbuilt config: {rbln_config!r}"
+            "additional_config is not an RBLNConfig; each path resolves it into "
+            "its own class, so this is the optimum-rbln path's "
+            f"OptimumRBLNConfig or an unbuilt config: {rbln_config!r}"
         )
     return rbln_config
 
@@ -325,11 +550,13 @@ class _MergeAdditionalConfig(argparse.Action):
 
 
 def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
-    """Add the `RBLNConfig` group to `parser`. Safe to call twice.
+    """Add every `--rbln-*` flag to `parser`. Safe to call twice.
 
     `RblnPlatform.pre_register_and_update(parser)` calls this from inside
     `AsyncEngineArgs.add_cli_args()`, before `parse_args()`. That is early
-    enough for `--help`, `--help=all` and `--help=rblnconfig`.
+    enough for `--help`, `--help=all` and `--help=rblnconfig`, and too early to
+    know the model path, so both paths' fields are registered. `_resolve`
+    rejects a field the selected class does not have.
     """
     if any(group.title == _GROUP_TITLE for group in parser._action_groups):
         return
@@ -338,18 +565,29 @@ def add_rbln_cli_args(parser: "FlexibleArgumentParser") -> None:
 
     group = parser.add_argument_group(
         title=_GROUP_TITLE,
-        description=RBLNConfig.__doc__,
+        description=(
+            "RBLN NPU options for both model paths. Each flag is also an "
+            "additional_config key, spelled without the --rbln- prefix: "
+            '--rbln-use-w8a8 is additional_config={"use_w8a8": true}.'
+        ),
     )
-    kwargs = get_kwargs(RBLNConfig)
-    for f in _FIELDS:
-        field_kwargs = kwargs[f.name]
-        is_bool = field_kwargs.pop("action", None) is argparse.BooleanOptionalAction
-        group.add_argument(
-            f"--rbln-{f.name.replace('_', '-')}",
-            dest=f"rbln_{f.name}",
-            action=_StoreRblnBool if is_bool else _StoreRbln,
-            **field_kwargs,
-        )
+    seen: set[str] = set()
+    for cls in _CONFIG_CLASSES:
+        kwargs = get_kwargs(cls)
+        for f in _fields_of(cls):
+            if f.name in seen:
+                continue
+            seen.add(f.name)
+            if f.metadata.get("no_flag"):
+                continue
+            field_kwargs = kwargs[f.name]
+            is_bool = field_kwargs.pop("action", None) is argparse.BooleanOptionalAction
+            group.add_argument(
+                f"--rbln-{f.name.replace('_', '-')}",
+                dest=f"rbln_{f.name}",
+                action=_StoreRblnBool if is_bool else _StoreRbln,
+                **field_kwargs,
+            )
 
     for action in parser._actions:
         if action.dest == "additional_config":

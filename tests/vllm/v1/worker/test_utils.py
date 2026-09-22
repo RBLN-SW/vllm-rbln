@@ -37,7 +37,6 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
 import vllm_rbln.envs as envs
 import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.config import RBLNConfig
@@ -1511,6 +1510,7 @@ class TestDynamicKvUnsupportedReason:
         )
 
     def test_every_supported_connector_is_registered(self):
+        # The suite conftest applies the registry, as production does.
         for name in worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS:
             assert name in KVConnectorFactory._registry
 

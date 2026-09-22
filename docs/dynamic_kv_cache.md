@@ -71,10 +71,9 @@ actual post-resize tensors and does not cache a block count. Nothing is register
 early, so nothing has to be unregistered. Every other mode keeps the start-up
 order.
 
-> The dynamic path needs `VLLM_RBLN_USE_VLLM_MODEL=1` and
-> `VLLM_RBLN_USE_DEVICE_TENSOR=1`, and turns itself off without them. Only
-> `DynamoRuntime` applies adaptive buffer sizes; the other runtimes ignore them
-> silently.
+> The dynamic path needs `--model-impl vllm` and `VLLM_RBLN_USE_DEVICE_TENSOR=1`,
+> and turns itself off without them. Only `DynamoRuntime` applies adaptive buffer
+> sizes; the other runtimes ignore them silently.
 
 Key components:
 
@@ -96,7 +95,6 @@ Key components:
 | `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `1` | Size the KV cache from the compiled placement and the device. `0` goes back to the pre-compile estimate. Unset, a configuration the path cannot size turns it off on its own; an explicit `1` refuses such a configuration at start-up. |
 
 ```bash
-export VLLM_RBLN_USE_VLLM_MODEL=1
 export VLLM_RBLN_USE_DEVICE_TENSOR=1
 export VLLM_CACHE_ROOT=<a fresh directory>
 ```
@@ -170,7 +168,7 @@ would serve from the pre-compile estimate this feature exists to replace.
 Three more cases warn and continue on the pre-compile estimate, because each is
 an explicit request from the caller:
 
-- Compile and warm-up are skipped (`--enforce-eager`, `VLLM_RBLN_COMPILE_MODEL=0`,
+- Compile and warm-up are skipped (`--enforce-eager`, `--no-rbln-compile-model`,
   `VLLM_RBLN_ENABLE_WARM_UP=0`). Nothing compiles, so no program carries a placement.
 - `--num-gpu-blocks-override` is set. The override pins the count and wins.
 - `RBLN_DUMMY_DEVICE` is set (a compile-only run). There is no device to
