@@ -340,6 +340,12 @@ class TestTheWindowsOwnGranules:
         # which is the case a single block-wide descriptor cannot express.
         assert self._ids(65, [2, 3]) == [9, 10]
 
+    def test_a_list_that_cannot_reach_the_earlier_granule_names_one(self):
+        # Guard: the one list shape the cases above never build. The straddle
+        # wants the block before and a one-block list lacks it -- and upstream
+        # clips both ends alike, so a peer is short there too and names one.
+        assert self._ids(65, [3]) == [10]
+
     def test_a_straddle_is_what_makes_it_two_granules(self):
         # The straddle is what the count decides; the list decides only
         # whether the earlier granule is reachable, and every path equalises

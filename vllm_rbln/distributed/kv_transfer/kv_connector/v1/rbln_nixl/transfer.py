@@ -110,10 +110,14 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         holds the newest one and the token count says where inside. It spans one
         granule, or two when it straddles a boundary -- and the second of those
         sits in the block before, so a list too short to reach it names one and
-        says nothing. What keeps the two ends agreeing is that every path here
-        equalises their lists from the tail and clips the group to
-        `cdiv(sliding_window, block_size) + 1` blocks, which is what a straddle
-        reaches back over.
+        says nothing.
+
+        What keeps the two ends agreeing is upstream's `get_sw_clipped_blocks`,
+        which cuts an SWA group to `blocks_per_sw` = `cdiv(sliding_window,
+        block_size) + 1` from the tail. Both ends of a read run it -- the
+        producer in `request_finished` before it publishes the ids, the consumer
+        in `update_state_after_alloc` on its own -- so neither is clipped here
+        and a short list means the peer was short too.
         """
         sw = self.block_size // sw_ratio
         newest = (valid_tokens - 1) // sw
