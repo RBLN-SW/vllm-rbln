@@ -49,6 +49,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 from vllm_rbln import envs
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
