@@ -140,6 +140,15 @@ def test_unprefixed_custom_kernel_env_is_honored(parser, monkeypatch):
     assert resolve(parser, []).use_custom_kernel is True
 
 
+def test_dynamic_kv_cache_is_tri_state(parser):
+    assert resolve(parser, []).use_dynamic_kv_cache is None
+    assert resolve(parser, ["--rbln-use-dynamic-kv-cache"]).use_dynamic_kv_cache is True
+    assert (
+        resolve(parser, ["--no-rbln-use-dynamic-kv-cache"]).use_dynamic_kv_cache
+        is False
+    )
+
+
 def test_cli_wins_over_env(parser, monkeypatch):
     monkeypatch.setenv("VLLM_RBLN_USE_W8A8", "1")
     assert resolve(parser, ["--no-rbln-use-w8a8"]).use_w8a8 is False
@@ -279,6 +288,9 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
     assert buckets.compute_hash() != base
+    # Unset and True resolve to the same graph; False compiles a static one.
+    assert RBLNConfig(use_dynamic_kv_cache=True).compute_hash() == base
+    assert RBLNConfig(use_dynamic_kv_cache=False).compute_hash() != base
 
 
 class TestResolveModelImpl:

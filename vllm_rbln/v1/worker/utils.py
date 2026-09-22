@@ -387,6 +387,89 @@ def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
     return None
 
 
+DYNAMIC_KV_SUPPORTED_CONNECTORS = (
+    "RblnNixlConnector",
+    "RblnNixlPullConnector",
+    "RblnNixlPushConnector",
+    "RBLNLMCacheConnectorV1",
+)
+
+
+def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
+    """Why this configuration cannot size its KV cache from the compiled
+    placement, or None when it can.
+
+    Every reason here is decidable before the compile, from the deployment or
+    the kernel the model dispatches to. With `use_dynamic_kv_cache` unset the
+    feature turns itself off on one and serves the pre-compile estimate; set,
+    start-up refuses with the same reason. What fails only after the compile
+    is a hard failure in `DynamicKvSizer`. The optimum path is not among them --
+    it installs neither the engine patch nor a worker that carries a sizer.
+    """
+    if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+        return (
+            "VLLM_RBLN_USE_DEVICE_TENSOR is off, so the artifact carries no "
+            "dynamic KV dimension"
+        )
+    rbln_config: RBLNConfig = vllm_config.additional_config
+    if rbln_config.use_custom_kernel:
+        # rbln_triton_ops goes through the compiler's triton converter, so the
+        # KV input never reaches a whitelisted paged_* custom op.
+        return (
+            "RBLN_USE_CUSTOM_KERNEL is on, and the rbln_triton_ops kernels take "
+            "no dynamic KV input"
+        )
+    if not rbln_config.use_flash_causal_attn:
+        return (
+            "flash causal attention is off, so the model dispatches to an "
+            "attention kernel that does not accept a dynamic KV input"
+        )
+    speculative = vllm_config.speculative_config
+    if speculative is not None and speculative.method == "dflash":
+        # `use_non_causal` lives on the draft config only; the RBLN drafter is
+        # non-causal by requirement.
+        return (
+            "the DFlash drafter is non-causal, and its attention kernel does "
+            "not accept a dynamic KV input"
+        )
+    if vllm_config.cache_config.block_size == vllm_config.model_config.max_model_len:
+        # This selects the normal-attention kernels unless the model supplies
+        # attention sinks. The decision runs before the layers exist, so keep
+        # that uncommon shape on the safe static path too.
+        return (
+            "block_size == max_model_len selects normal attention, whose kernel "
+            "does not accept a dynamic KV input"
+        )
+    kv_transfer = vllm_config.kv_transfer_config
+    if (
+        kv_transfer is not None
+        and kv_transfer.kv_connector not in DYNAMIC_KV_SUPPORTED_CONNECTORS
+    ):
+        # The worker registers with the connector only once the resize has
+        # allocated. That is connector-agnostic, so one outside this set is
+        # untried rather than known broken.
+        return (
+            f"kv_connector={kv_transfer.kv_connector!r} is not among the "
+            "connectors the dynamic-KV resize is open for "
+            f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
+        )
+    return None
+
+
+def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether this run sizes its KV cache from the compiled placement.
+
+    The field alone is not the answer: a configuration the path cannot size
+    turns it off, and `mark_dynamic` must follow that decision or the artifact
+    carries a dynamic dim nothing will ever resize.
+    """
+    rbln_config: RBLNConfig = vllm_config.additional_config
+    return (
+        rbln_config.use_dynamic_kv_cache is not False
+        and dynamic_kv_unsupported_reason(vllm_config) is None
+    )
+
+
 @dataclass(frozen=True)
 class KvMinimum:
     """The fewest blocks a KV cache pool can serve with."""
@@ -610,8 +693,8 @@ def estimate_available_memory(
         rsd_size = REBEL_CHIPLET_SIZE
         available_dram_bytes = REBEL_DRAM_NBYTES
         if exact_dram:
-            # Caller-gated: the default path's estimate must not depend on the
-            # driver, and neither may a dry run, which only observes it.
+            # Caller-gated: only the mode that replaces the estimate may let
+            # the driver's capacity move it.
             device_dram_total = rbln_device_dram_total_bytes()
             if device_dram_total is None:
                 logger.debug(

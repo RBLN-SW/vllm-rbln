@@ -30,6 +30,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.cpu_resource_utils import LogicalCPUInfo
@@ -44,6 +45,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 import vllm_rbln.envs as envs
 import vllm_rbln.v1.worker.utils as worker_utils
+from vllm_rbln.config import RBLNConfig
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory
 from vllm_rbln.v1.worker.utils import (
@@ -52,6 +54,7 @@ from vllm_rbln.v1.worker.utils import (
     compute_rbln_local_omp_cpuid,
     copy_host_device_kv_blocks,
     divide_by_chiplet_replication,
+    dynamic_kv_unsupported_reason,
     estimate_available_memory,
     estimate_model_kernel_size,
     get_autobind_cpu_ids,
@@ -1556,3 +1559,116 @@ class TestRblnDeviceDramTotal:
             "torch.rbln.get_device_properties", create=True, return_value=self._props(0)
         ):
             assert rbln_device_dram_total_bytes() is None
+
+
+class TestDynamicKvUnsupportedReason:
+    """Each reason is a property of the path, the deployment or the kernel, so
+    the feature turns itself off rather than refusing a run the flag off would
+    have served."""
+
+    @staticmethod
+    def _cfg(
+        use_custom_kernel=False,
+        use_flash_causal_attn=True,
+        use_dynamic_kv_cache=None,
+        speculative_method=None,
+        block_size=16,
+        max_model_len=32,
+        kv_transfer_config=None,
+    ):
+        return SimpleNamespace(
+            additional_config=RBLNConfig(
+                use_custom_kernel=use_custom_kernel,
+                use_flash_causal_attn=use_flash_causal_attn,
+                use_dynamic_kv_cache=use_dynamic_kv_cache,
+            ),
+            speculative_config=(
+                None
+                if speculative_method is None
+                else SimpleNamespace(method=speculative_method)
+            ),
+            cache_config=SimpleNamespace(block_size=block_size),
+            model_config=SimpleNamespace(max_model_len=max_model_len),
+            kv_transfer_config=kv_transfer_config,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _device_tensor_on(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
+    def test_a_clean_config_is_supported(self):
+        assert dynamic_kv_unsupported_reason(self._cfg()) is None
+
+    def test_device_tensor_off_is_unsupported(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "0")
+        assert "VLLM_RBLN_USE_DEVICE_TENSOR" in dynamic_kv_unsupported_reason(
+            self._cfg()
+        )
+
+    def test_the_triton_kernels_are_unsupported(self):
+        reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))
+        assert "RBLN_USE_CUSTOM_KERNEL" in reason
+
+    @pytest.mark.parametrize(
+        ("config_overrides", "expected"),
+        [
+            ({"block_size": 32}, "block_size == max_model_len"),
+            ({"use_flash_causal_attn": False}, "flash causal attention is off"),
+            ({"speculative_method": "dflash"}, "DFlash drafter is non-causal"),
+        ],
+        ids=["normal-attention", "flash-causal-off", "dflash-drafter"],
+    )
+    def test_non_paged_attention_is_unsupported(self, config_overrides, expected):
+        reason = dynamic_kv_unsupported_reason(self._cfg(**config_overrides))
+        assert reason is not None
+        assert expected in reason
+
+    def test_a_causal_drafter_is_supported(self):
+        assert (
+            dynamic_kv_unsupported_reason(self._cfg(speculative_method="eagle3"))
+            is None
+        )
+
+    def test_an_unlisted_kv_transfer_connector_is_unsupported(self):
+        # The worker drives the registration behind the resize, so the set is
+        # a policy; the reason names the connector that was asked for.
+        reason = dynamic_kv_unsupported_reason(
+            self._cfg(kv_transfer_config=SimpleNamespace(kv_connector="OtherConnector"))
+        )
+        assert "OtherConnector" in reason
+
+    @pytest.mark.parametrize(
+        "connector",
+        [
+            "RblnNixlConnector",
+            "RblnNixlPullConnector",
+            "RblnNixlPushConnector",
+            "RBLNLMCacheConnectorV1",
+        ],
+    )
+    def test_connectors_registered_after_the_resize_are_supported(self, connector):
+        assert (
+            dynamic_kv_unsupported_reason(
+                self._cfg(kv_transfer_config=SimpleNamespace(kv_connector=connector))
+            )
+            is None
+        )
+
+    def test_every_supported_connector_is_registered(self):
+        # The suite conftest applies the registry, as production does.
+        for name in worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS:
+            assert name in KVConnectorFactory._registry
+
+    def test_the_flag_alone_does_not_enable_it(self):
+        # `mark_dynamic` follows this, not the flag: marking a dim nothing will
+        # resize leaves the compile with a symbolic extent it cannot lower.
+        assert worker_utils.dynamic_kv_enabled(self._cfg(use_custom_kernel=True)) is (
+            False
+        )
+        assert worker_utils.dynamic_kv_enabled(self._cfg()) is True
+
+    def test_off_disables_it(self):
+        assert (
+            worker_utils.dynamic_kv_enabled(self._cfg(use_dynamic_kv_cache=False))
+            is False
+        )

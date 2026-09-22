@@ -166,6 +166,7 @@ from vllm_rbln.v1.worker.dp_utils import (
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
     copy_host_device_kv_blocks,
+    dynamic_kv_enabled,
     get_kv_cache_names,
     prepare_kernel_block_sizes,
     reorder_input_batch,
@@ -3023,7 +3024,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                     view_block_axis = inv_order.index(base_block_axis)
                     kv_cache_block_axes[layer_name] = view_block_axis
-                    if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
+                    if dynamic_kv_enabled(self.vllm_config):
                         base_dynamic_axis = base_block_axis
                         view_dynamic_axis = view_block_axis
                     else:
@@ -3124,7 +3125,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_cache_view_infos,
             num_attn_module,
         )
-        if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE and self.kv_cache_bases:
+        if dynamic_kv_enabled(self.vllm_config) and self.kv_cache_bases:
             # With shared bases these are the graph inputs and the per-layer
             # views are built inside the graph.
             base_axes = {

@@ -27,6 +27,7 @@ import re
 import vllm.envs as envs
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.utils import dynamic_kv_enabled
 
 logger = init_logger(__name__)
 
@@ -96,6 +97,7 @@ def _warmup_graph_set_factors(vllm_config) -> str:
         "gpu_memory_utilization": normalize_value(
             getattr(cache, "gpu_memory_utilization", None)
         ),
+        "dynamic_kv_enabled": normalize_value(dynamic_kv_enabled(vllm_config)),
         "num_speculative_tokens": normalize_value(
             getattr(spec, "num_speculative_tokens", None)
         ),
