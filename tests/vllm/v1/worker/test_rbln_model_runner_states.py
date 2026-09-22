@@ -265,3 +265,71 @@ class TestSampleTokensOnDrafterOverflow:
         # What the scheduler actually receives. .tolist() is also the only read of
         # the expanded (non-contiguous) view the runner builds.
         assert runner.take_draft_token_ids().draft_token_ids == [[0, 0, 0]]
+
+    @pytest.mark.parametrize("strict_kv_producer", [False, True])
+    def test_a_producer_does_not_ask_a_proposer_that_holds_no_kv(
+        self, make_model_runner, monkeypatch, strict_kv_producer
+    ):
+        # ngram writes no KV, so on a producer its drafts would be built and then
+        # dropped by take_draft_token_ids. A decoding role still asks for them.
+        _last_rank(monkeypatch)
+        runner = make_model_runner(
+            speculative_config={
+                "method": "ngram",
+                "num_speculative_tokens": 3,
+                "prompt_lookup_max": 4,
+            }
+        )
+        scheduler_output = schedule_new("a")
+        runner._update_states(scheduler_output)
+        runner.is_strict_kv_producer = strict_kv_producer
+        # 10 + 3 <= 64, so the input fits and the role is the only thing left.
+        monkeypatch.setattr(runner, "effective_drafter_max_model_len", 64)
+        runner.execute_model_state = mr.ExecuteModelState(
+            scheduler_output=scheduler_output,
+            logits=torch.zeros((1, 8)),
+            spec_decode_metadata=None,
+            spec_decode_common_attn_metadata=SimpleNamespace(max_seq_len=10),
+            hidden_states=torch.zeros((1, 4)),
+            sample_hidden_states=torch.zeros((1, 4)),
+            combined_hidden_states=None,
+        )
+        asked: list[str] = []
+        monkeypatch.setattr(
+            runner, "propose_draft_token_ids", lambda *a, **kw: asked.append("draft")
+        )
+        monkeypatch.setattr(
+            runner,
+            "_sample",
+            lambda logits, spec_decode_metadata: SimpleNamespace(
+                sampled_token_ids=torch.tensor([[101]], dtype=torch.int32)
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_bookkeeping_sync",
+            lambda *args: ({}, None, [[101]], {}, ["a"], {"a": 0}, []),
+        )
+
+        runner.sample_tokens(grammar_output=None)
+
+        assert bool(asked) is not strict_kv_producer
+
+    def test_a_strict_producer_publishes_no_drafts(
+        self, make_model_runner, monkeypatch
+    ):
+        # A producer verifies nothing, so the placeholder above must not reach
+        # the scheduler: it drops drafts only for a request still chunking, and
+        # the last chunk is not one. Accepted, the next step would schedule
+        # 1 + num_spec tokens and look for a graph a producer does not compile.
+        _last_rank(monkeypatch)
+        runner = make_model_runner(
+            speculative_config={
+                "method": "ngram",
+                "num_speculative_tokens": 3,
+                "prompt_lookup_max": 4,
+            }
+        )
+        runner._update_states(schedule_new("a"))
+        runner.is_strict_kv_producer = True
+        assert runner.take_draft_token_ids() is None
