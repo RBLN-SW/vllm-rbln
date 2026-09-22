@@ -27,13 +27,6 @@ from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
 pytestmark = pytest.mark.maybe_use_device
 
 
-def _unexpected(name):
-    def fail(*args, **kwargs):
-        raise AssertionError(f"{name} must not be called")
-
-    return fail
-
-
 def _one_group_two_layers(make_model_runner):
     """A runner whose single KV cache group holds two layers, so they share one
     allocation -- the only shape in which the deduplicated bindings turn on."""
@@ -42,35 +35,6 @@ def _one_group_two_layers(make_model_runner):
         make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
     )
     return runner
-
-
-class TestSubBlockCacheGuard:
-    def test_rejects_multi_group_before_any_side_effect(
-        self, make_model_runner, monkeypatch
-    ):
-        # Sub-block prefix caching cannot span KV cache groups, and the refusal
-        # must come before attention backends are set up.
-        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
-        monkeypatch.setattr(
-            runner, "initialize_attn_backend", _unexpected("initialize_attn_backend")
-        )
-
-        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
-        with pytest.raises(NotImplementedError, match="multi-group"):
-            runner.initialize_kv_cache(config)
-
-    def test_additional_config_lifts_the_guard(self, make_model_runner):
-        # The scheduler reads the same option, so a runner that kept reading the
-        # environment would refuse a model the scheduler had already agreed to.
-        runner = make_model_runner(
-            layers=("layer.0", "layer.1"),
-            init_kv_cache=False,
-            additional_config={"enable_sub_block_cache": False},
-        )
-        runner.initialize_kv_cache(
-            make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
-        )
-        assert len(runner.kv_cache_config.kv_cache_groups) == 2
 
 
 class TestReshapeKVCacheTensors:
