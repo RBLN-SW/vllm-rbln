@@ -845,6 +845,9 @@ class TestDflashTokenBudget:
         assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8
 
 
+# Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,
+# so the chip is named here rather than inherited from whatever card ran this.
+@pytest.mark.usefixtures("cr13")
 class TestModelImpl:
     """`--model-impl` decides the path, and the path decides the device.
 
