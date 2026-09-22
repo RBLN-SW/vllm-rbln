@@ -350,7 +350,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 .reshape(hs_shape)
             )
             hs_scale = scale.reshape(hs_shape[0], hs_shape[1] // in_block_size).to(
-                dtype=compute_dtype)
+                dtype=compute_dtype
+            )
             final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu_w8a8(
                 hs_q,
                 hs_scale,
