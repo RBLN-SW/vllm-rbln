@@ -889,15 +889,12 @@ class TestCompileOrWarmUpModel:
         monkeypatch,
         *,
         enforce_eager=False,
-        compile_model=True,
         warm_up=True,
         warmup_side_effect=None,
         data_parallel_size=1,
     ):
         vcfg = _make_vllm_config(
-            enforce_eager=enforce_eager,
-            data_parallel_size=data_parallel_size,
-            additional_config=RBLNConfig(compile_model=compile_model),
+            enforce_eager=enforce_eager, data_parallel_size=data_parallel_size
         )
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
@@ -971,11 +968,6 @@ class TestCompileOrWarmUpModel:
 
     def test_skips_when_enforce_eager(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch, enforce_eager=True)
-        worker.compile_or_warm_up_model()
-        assert calls == []
-
-    def test_skips_when_compile_disabled(self, make_worker, monkeypatch):
-        worker, calls = self._worker(make_worker, monkeypatch, compile_model=False)
         worker.compile_or_warm_up_model()
         assert calls == []
 

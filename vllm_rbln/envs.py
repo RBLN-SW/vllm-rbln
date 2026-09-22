@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=True
     # ====================================================================
     # --- COMPILE / RUNTIME ---
-    VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
@@ -237,13 +236,6 @@ environment_variables = {
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=True
     # ====================================================================
     # --- COMPILE / RUNTIME ---
-    # If true, will compile models using torch.compile.
-    # Otherwise, run the CPU eager mode, if possible.
-    "VLLM_RBLN_COMPILE_MODEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_COMPILE_MODEL", "True").lower() in ("true", "1")
-        )
-    ),
     # If true, will compile models using strict mode.
     "VLLM_RBLN_COMPILE_STRICT_MODE": (
         lambda: (
@@ -440,7 +432,6 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
-        "VLLM_RBLN_COMPILE_MODEL",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",

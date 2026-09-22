@@ -83,10 +83,6 @@ class RBLNConfigBase:
 class RBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the vllm model path."""
 
-    compile_model: bool = True
-    """Compile models with torch.compile. Otherwise run CPU eager mode, if
-    possible."""
-
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
 
