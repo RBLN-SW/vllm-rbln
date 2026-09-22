@@ -187,7 +187,11 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
             reconfigure(lambda config: None)
 
-    def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
+    def test_an_explicit_dynamic_kv_on_an_unsizable_config(
+        self, reconfigure, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
         def custom_kernel(dynamic):
             def mutate(config):
                 config.additional_config.use_custom_kernel = True
