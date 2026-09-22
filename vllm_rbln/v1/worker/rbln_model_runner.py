@@ -2026,6 +2026,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             placeholder_pos=dict(self._placeholder_pos),
             logprobs_tensors=self._async_logprobs_tensors,
             fail_fast=self.fail_fast,
+            rank=self.parallel_config.rank,
+            dp_rank=self.parallel_config.data_parallel_rank,
         )
         return async_output
 

@@ -19,6 +19,7 @@
 # only repeat itself -- it builds a real runner and carries its own device marker.
 
 import contextlib
+import json
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -582,10 +583,11 @@ class TestResolveBatchDescriptor:
 @pytest.mark.maybe_use_device
 @pytest.mark.parametrize(("backend", "should_exit"), [("mp", True), ("uni", False)])
 def test_async_output_inherits_runner_fail_fast_policy(
-    make_model_runner, monkeypatch, backend, should_exit
+    make_model_runner, monkeypatch, capfd, backend, should_exit
 ):
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     config = make_runner_config(distributed_executor_backend=backend)
+    config.parallel_config.rank = 2
     # The CPU lane disables async scheduling at platform setup. Exercise the
     # deferred output path with CPU tensors after that setup has completed.
     config.scheduler_config.async_scheduling = True
@@ -625,6 +627,14 @@ def test_async_output_inherits_runner_fail_fast_policy(
         exit_process.assert_called_once_with(70)
         assert isinstance(excinfo.value, SystemExit)
         assert excinfo.value.code == 70
+        (event,) = [
+            json.loads(line)
+            for line in capfd.readouterr().err.splitlines()
+            if line.startswith('{"event":"rbln.worker.fatal"')
+        ]
+        assert event["where"] == "AsyncRBLNModelRunnerOutput.get_output"
+        assert event["rank"] == 2
+        assert event["dp_rank"] == config.parallel_config.data_parallel_rank
     else:
         exit_process.assert_not_called()
         assert excinfo.value is error

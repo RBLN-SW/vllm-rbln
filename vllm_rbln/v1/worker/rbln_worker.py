@@ -172,6 +172,7 @@ class RBLNWorker(WorkerBase):
         if num_devices > 1:
             os.environ["RBLN_NPUS_PER_DEVICE"] = str(num_devices)
 
+    @worker_fail_fast
     @instrument(span_name="Init device")
     def init_device(self) -> None:
         self.device = self.device_config.device
@@ -209,11 +210,13 @@ class RBLNWorker(WorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
+    @worker_fail_fast
     def load_model(self):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
     @torch.inference_mode()
+    @worker_fail_fast
     def determine_available_memory(self) -> int:
         """Estimate KV-cache DRAM, discounting the fixed command-stream buffers
         that warm-up's compiled decode runtimes reserve.
@@ -444,9 +447,11 @@ class RBLNWorker(WorkerBase):
         tp_rank = get_tp_group().rank_in_group
         return {(pp_rank, tp_rank): metadata}
 
+    @worker_fail_fast
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    @worker_fail_fast
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate RBLN KV cache with the specified kv_cache_config."""
@@ -492,6 +497,7 @@ class RBLNWorker(WorkerBase):
                 finalize_kv_cache_registrations(get_kv_transfer_group())
             return applied
 
+    @worker_fail_fast
     @instrument(span_name="Warmup (NPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # NOTE(RBLN): Manual timing since RBLN does not support @support_torch_compile.
