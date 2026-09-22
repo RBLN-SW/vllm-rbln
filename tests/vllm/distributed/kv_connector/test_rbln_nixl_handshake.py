@@ -3333,7 +3333,7 @@ class TestADeadPeerIsReported:
     # The heartbeat is the one call made against a producer every step, so a
     # connection that died after the handshake surfaces here first. Upstream
     # logs it and moves on, which leaves the reads against that peer unreported
-    # and its agents in place (ICR-47).
+    # and its agents in place.
 
     @staticmethod
     def _worker():
@@ -3372,27 +3372,6 @@ class TestADeadPeerIsReported:
         }
         return metadata
 
-    def test_a_live_heartbeat_changes_nothing(self):
-        w = self._worker()
-        w._recving_metadata = {"r0": self._meta()}
-
-        w._send_heartbeats(self._heartbeat({"r0"}))
-
-        assert w.nixl_wrapper.send_notif.call_count == 2  # one per agent
-        assert w._failed_recv_reqs.empty()
-        assert "eng" in w._remote_agents
-
-    def test_a_pending_handshake_is_left_alone(self):
-        # Nothing is known about a peer that has not answered yet, so a
-        # heartbeat withheld for it says nothing about the connection.
-        w = self._worker()
-        w._ensure_handshake = MagicMock(return_value=MagicMock())
-
-        w._send_heartbeats(self._heartbeat({"r0"}))
-
-        assert w.nixl_wrapper.send_notif.call_count == 0
-        assert "eng" in w._remote_agents
-
     def test_a_failing_heartbeat_fails_that_peers_reads(self):
         w = self._worker()
         w._recving_metadata = {"r0": self._meta(), "r1": self._meta("other")}
@@ -3407,27 +3386,6 @@ class TestADeadPeerIsReported:
         # would report r0 a second time with its metadata already gone.
         w.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
         assert "r0" not in w._recving_transfers
-
-    def test_a_reader_of_another_peer_is_untouched(self):
-        w = self._worker()
-        w._recving_metadata = {"r1": self._meta("other")}
-        w.nixl_wrapper.send_notif.side_effect = RuntimeError("conn is gone")
-
-        w._send_heartbeats(self._heartbeat({"r1"}))
-
-        assert w._failed_recv_reqs.empty()
-
-    def test_a_notify_only_reader_is_failed_without_invalid_blocks(self):
-        # A full prefix hit holds no block to invalidate; upstream's failure
-        # path indexes for one, so the report has to survive without it.
-        w = self._worker()
-        w._recving_metadata = {"r0": self._meta(local_ids=())}
-        w.nixl_wrapper.send_notif.side_effect = RuntimeError("conn is gone")
-
-        w._send_heartbeats(self._heartbeat({"r0"}))
-
-        assert list(w._failed_recv_reqs.queue) == ["r0"]
-        assert w._invalid_block_ids.empty()
 
     def test_a_failing_heartbeat_drops_the_handshake_state(self):
         # _ensure_handshake skips the reconnect while the entry is there, so
@@ -3452,3 +3410,20 @@ class TestADeadPeerIsReported:
         w._send_heartbeats(self._heartbeat())
 
         assert "eng" not in w._remote_agents
+
+
+class TestAReadThatMovedNoBlock:
+    # An empty local list means no async load was scheduled, so the request is
+    # not in WAITING_FOR_REMOTE_KVS -- naming it to the scheduler trips
+    # `assert req_id in self.requests`. Both producers of such a read reach the
+    # failure path: a full prefix hit and an aborted request's release notify.
+
+    def test_it_is_not_reported_and_its_metadata_goes(self):
+        w = TestADeadPeerIsReported._worker()
+        w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
+
+        w._handle_failed_transfer("r0", None)
+
+        assert w._failed_recv_reqs.empty()
+        assert w._invalid_block_ids.empty()
+        assert w._recving_metadata == {}

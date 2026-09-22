@@ -415,7 +415,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         Both halves are needed once a connection is gone: the reads against it
         will never complete and are the only thing that can end the scheduler's
         wait, and the `_remote_agents` entry left behind makes `_ensure_handshake`
-        skip the reconnect for the life of the process (ICR-47).
+        skip the reconnect for the life of the process.
 
         In-flight handles are released and dropped rather than left to
         `_pop_done_transfers`, which would report the request a second time with
@@ -434,15 +434,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 dst_engine_id=engine_id,
             )
             for handle in self._recving_transfers.pop(req_id, []):
-                try:
-                    self.nixl_wrapper.release_xfer_handle(handle)
-                except Exception:
-                    logger.debug(
-                        "Releasing a transfer handle of %s failed",
-                        req_id,
-                        exc_info=True,
-                    )
-            self._report_failed_recv(req_id)
+                self.nixl_wrapper.release_xfer_handle(handle)
+            self._handle_failed_transfer(req_id, None)
 
         if engine_id not in self._remote_agents:
             return
@@ -464,7 +457,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
 
         Upstream swallows it with a `logger.debug`, so a connection that died
         after the handshake is never noticed here -- which is the one place a
-        producer that has stopped answering is touched every step (ICR-47).
+        producer that has stopped answering is touched every step.
+
+        Mirrors `NixlBaseConnectorWorker._send_heartbeats` as of vllm 0.26.0,
+        differing only in the `except` body.
         """
         for engine_id, hb_info in metadata.heartbeat_by_engine.items():
             # Proactive handshake (this request may still be in waiting queue) so
@@ -483,7 +479,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 continue  # handshake is still pending
 
             hb_msg = ("HB:" + ",".join(hb_info.req_ids)).encode()
-            for agent_name in list(self._remote_agents[engine_id].values()):
+            for agent_name in self._remote_agents[engine_id].values():
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
                 except Exception as e:

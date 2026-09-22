@@ -92,21 +92,21 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         )
         return self.transfer_topo
 
-    def _report_failed_recv(self, req_id: str) -> None:
-        """Upstream's failure report, for a request that may hold no block.
+    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
+        """Upstream's failure report, minus the reads nothing is waiting on.
 
-        `_handle_failed_transfer` indexes `local_block_ids[0]` to invalidate
-        what was being read. A notify-only read has no such entry -- a full
-        prefix hit pulls nothing -- so there is no block to invalidate, and
-        indexing would raise instead of reporting. The scheduler still has to
-        hear that the request failed, which is the half that always applies.
+        A read with no local block moved nothing: `load_kv_async` is returned
+        only with a positive external token count, so such a request was never
+        put in WAITING_FOR_REMOTE_KVS, and reporting it trips the scheduler's
+        `assert req_id in self.requests`. Upstream would also index
+        `local_block_ids[0]` to invalidate what was read.
         """
         meta = self._recving_metadata.get(req_id)
-        if meta is not None and meta.local_block_ids:
-            self._handle_failed_transfer(req_id, None)
+        if meta is not None and not meta.local_block_ids:
+            assert handle is None
+            del self._recving_metadata[req_id]
             return
-        self._failed_recv_reqs.put(req_id)
-        self.xfer_stats.record_failed_transfer()
+        super()._handle_failed_transfer(req_id, handle)
 
     def _layer_overlap(
         self, registered_layer_names: tuple[str, ...] | list[str]
