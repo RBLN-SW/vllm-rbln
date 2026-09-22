@@ -3418,7 +3418,7 @@ class TestAReadThatMovedNoBlock:
     # `assert req_id in self.requests`. Both producers of such a read reach the
     # failure path: a full prefix hit and an aborted request's release notify.
 
-    def test_it_is_not_reported_and_its_metadata_goes(self):
+    def test_it_is_not_reported(self):
         w = TestADeadPeerIsReported._worker()
         w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
 
@@ -3426,4 +3426,47 @@ class TestAReadThatMovedNoBlock:
 
         assert w._failed_recv_reqs.empty()
         assert w._invalid_block_ids.empty()
-        assert w._recving_metadata == {}
+
+    def test_a_second_report_says_the_same(self):
+        # The handshake done-callback runs on the executor thread, so it and
+        # the heartbeat can reach one request. Consuming the entry would leave
+        # the second one with no block list to judge by.
+        w = TestADeadPeerIsReported._worker()
+        w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
+
+        w._handle_failed_transfer("r0", None)
+        w._handle_failed_transfer("r0", None)
+
+        assert w._failed_recv_reqs.empty()
+
+
+class TestMetadataTakenMidSweep:
+    # `_handle_dead_engine` sweeps `_recving_metadata` while that same
+    # executor thread may be dropping entries from it.
+
+    class _PopsWhenRead:
+        """A read whose peer cannot be named without losing another entry."""
+
+        def __init__(self, store, victim):
+            self._store = store
+            self._victim = victim
+            self.local_block_ids = [[1, 2]]
+
+        @property
+        def remote(self):
+            self._store.pop(self._victim, None)
+            return MagicMock(engine_id="eng")
+
+    def test_the_sweep_survives_it(self):
+        w = TestADeadPeerIsReported._worker()
+        store: dict = {}
+        store["r0"] = self._PopsWhenRead(store, "r1")
+        store["r1"] = TestADeadPeerIsReported._meta()
+        store["r2"] = TestADeadPeerIsReported._meta()
+        w._recving_metadata = store
+
+        w._handle_dead_engine("eng")
+
+        # Reading the live view would raise here; the sweep still covers every
+        # read it set out to, including the one taken from under it.
+        assert list(w._failed_recv_reqs.queue) == ["r0", "r1", "r2"]

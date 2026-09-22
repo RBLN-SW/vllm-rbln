@@ -100,11 +100,15 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         put in WAITING_FOR_REMOTE_KVS, and reporting it trips the scheduler's
         `assert req_id in self.requests`. Upstream would also index
         `local_block_ids[0]` to invalidate what was read.
+
+        The entry stays: the handshake done-callback runs on the executor
+        thread, so it and the heartbeat can reach one request, and dropping it
+        here would leave whichever came second without the list to judge by --
+        reporting the request after all.
         """
         meta = self._recving_metadata.get(req_id)
         if meta is not None and not meta.local_block_ids:
             assert handle is None
-            del self._recving_metadata[req_id]
             return
         super()._handle_failed_transfer(req_id, handle)
 

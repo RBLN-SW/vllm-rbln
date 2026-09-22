@@ -421,15 +421,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         `_pop_done_transfers`, which would report the request a second time with
         its metadata already gone.
         """
-        for req_id in [
-            r
-            for r, meta in self._recving_metadata.items()
-            if meta.remote is not None and meta.remote.engine_id == engine_id
-        ]:
+        # Snapshotted: the handshake done-callback drops entries from the
+        # executor thread, and reading the live view would raise here.
+        for req_id, meta in list(self._recving_metadata.items()):
+            if meta.remote is None or meta.remote.engine_id != engine_id:
+                continue
             self._log_failure(
                 failure_type="peer_unreachable",
                 req_id=req_id,
-                msg="Marking blocks as invalid",
                 error=error,
                 dst_engine_id=engine_id,
             )
@@ -437,8 +436,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 self.nixl_wrapper.release_xfer_handle(handle)
             self._handle_failed_transfer(req_id, None)
 
-        if engine_id not in self._remote_agents:
-            return
         try:
             self._cleanup_remote_engine(engine_id, log_eviction=False)
         except Exception:
