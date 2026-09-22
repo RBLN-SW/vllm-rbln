@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
 import vllm_rbln.envs as envs
 import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.config import RBLNConfig
@@ -1497,6 +1498,23 @@ class TestDynamicKvUnsupportedReason:
             )
             is None
         )
+
+    def test_a_supported_connector_the_factory_never_registered_fails_loudly(
+        self, monkeypatch
+    ):
+        # A typo in the allowlist would otherwise send every deployment of that
+        # connector down the static path with only a warning to show for it.
+        monkeypatch.setattr(
+            worker_utils,
+            "DYNAMIC_KV_SUPPORTED_CONNECTORS",
+            worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS + ("RblnNixlConnectr",),
+        )
+        with pytest.raises(AssertionError, match="RblnNixlConnectr"):
+            dynamic_kv_unsupported_reason(
+                self._cfg(
+                    kv_transfer_config=SimpleNamespace(kv_connector="RblnNixlConnector")
+                )
+            )
 
     def test_the_flag_alone_does_not_enable_it(self):
         # `mark_dynamic` follows this, not the flag: marking a dim nothing will
