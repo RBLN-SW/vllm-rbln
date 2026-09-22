@@ -410,6 +410,43 @@ class TestResolveModelImpl:
         assert resolve_model_impl(RBLNConfig(), model_impl="vllm") == "vllm"
         assert resolve_model_impl(OptimumRBLNConfig(), model_impl="auto") == "optimum"
 
+    @pytest.mark.parametrize(
+        ("device_name", "model_impl", "refused"),
+        [
+            ("RBLN-CA25", "vllm", True),
+            (" rbln-ca02 ", "vllm", True),
+            ("RBLN-CA25", "optimum", False),
+            ("RBLN-CR03", "vllm", False),
+        ],
+    )
+    def test_a_disabled_path_is_rejected(
+        self, monkeypatch, device_name, model_impl, refused
+    ):
+        """The vllm path is disabled on RBLN-CA*, and this is where paths are named.
+
+        Refusing at resolution puts the failure on the flag the caller typed,
+        before anything is built from it.
+        """
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: device_name
+        )
+        if refused:
+            with pytest.raises(ValueError, match=device_name.strip()):
+                resolve_model_impl(model_impl=model_impl)
+        else:
+            assert resolve_model_impl(model_impl=model_impl) == model_impl
+
+    def test_a_host_that_cannot_name_its_npu_keeps_every_path(self, monkeypatch):
+        """A compile-only worker names its target later, so nothing is refused."""
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: None)
+        monkeypatch.delenv("RBLN_FORCE_NPU_NAME", raising=False)
+        monkeypatch.delenv("RBLN_TARGET_SOC", raising=False)
+        assert resolve_model_impl(model_impl="vllm") == "vllm"
+
     @pytest.mark.parametrize("value", ["terratorch", "vLLM", "", True])
     def test_an_unsupported_implementation_is_rejected(self, value):
         # `terratorch` is upstream's fourth value and has no RBLN

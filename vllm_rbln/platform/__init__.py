@@ -51,6 +51,7 @@ RBLN_DEFAULT_MAX_NUM_SEQS = 1
 RBLN_DEFAULT_GPU_MEMORY_UTILIZATION = 0.93
 # Superseded by RblnPlatform.device_control_env_var.
 DEPRECATED_DEVICE_CONTROL_ENV_VAR = "RBLN_DEVICES"
+CA_NAME_PREFIX = "RBLN-CA"
 
 
 def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
@@ -154,6 +155,10 @@ class RblnPlatform(Platform):
     @classmethod
     def is_cr13(cls) -> bool:
         return cls.get_device_name().strip().upper() == "RBLN-CR13"
+
+    @classmethod
+    def is_ca(cls) -> bool:
+        return cls.get_device_name().strip().upper().startswith(CA_NAME_PREFIX)
 
     @staticmethod
     def inference_mode():

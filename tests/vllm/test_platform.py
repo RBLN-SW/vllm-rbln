@@ -614,6 +614,21 @@ class TestDeviceName:
         monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
         assert RblnPlatform.is_cr13() is expected
 
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("RBLN-CA25", True),
+            ("RBLN-CA22", True),
+            (" rbln-ca02 ", True),
+            ("RBLN-CR03", False),
+            ("RBLN-CR13", False),
+        ],
+    )
+    def test_is_ca_matches_the_soc_name_prefix(self, monkeypatch, name, expected):
+        """A family, not one part: a new RBLN-CA* needs no code change here."""
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
+        assert RblnPlatform.is_ca() is expected
+
 
 class TestAdditionalForwardContext:
     def test_kv_cache_bases_passes_through(self):
@@ -1015,6 +1030,30 @@ class TestModelImpl:
         assert seen == [{"model_impl": "vllm"}]
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
         assert RblnPlatform.device_type == "rbln"
+
+    def test_a_disabled_path_stops_the_config(self, monkeypatch):
+        """The wrapper resolves the path, so a disabled one fails here."""
+        from vllm.engine.arg_utils import EngineArgs
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+        monkeypatch.setattr(
+            EngineArgs, "create_engine_config", lambda self, *a, **k: None
+        )
+        monkeypatch.delattr(EngineArgs, "_rbln_model_impl_patched", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        RblnPlatform._capture_model_impl()
+
+        with pytest.raises(ValueError, match="RBLN-CA25"):
+            EngineArgs.create_engine_config(
+                SimpleNamespace(
+                    max_num_batched_tokens=None,
+                    additional_config=None,
+                    model_impl="vllm",
+                )
+            )
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == _UNTOUCHED
 
     def test_the_modules_that_copy_the_device_flag_import_late(self):
         """They bind USE_DEVICE_TENSOR at their own import.

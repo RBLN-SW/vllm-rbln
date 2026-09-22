@@ -325,6 +325,28 @@ _MODEL_IMPL_ALIASES: dict[str, ModelImpl | None] = {
 }
 
 
+def _reject_disabled_model_impl(model_impl: ModelImpl) -> None:
+    """Refuse a model path that is disabled on this host's device.
+
+    A host that cannot name its NPU is left alone: a compile-only worker names
+    its target later, and refusing here would take the optimum path down too.
+    """
+    if model_impl != "vllm":
+        return
+
+    from vllm_rbln.platform import RblnPlatform
+
+    try:
+        if not RblnPlatform.is_ca():
+            return
+    except RuntimeError:
+        return
+    raise ValueError(
+        f"--model-impl vllm is not supported on {RblnPlatform.get_device_name()}. "
+        "Use --model-impl optimum."
+    )
+
+
 def _as_model_impl(value: Any) -> ModelImpl | None:
     """The path `value` names, or None where it names none."""
     if not isinstance(value, str) or value not in _MODEL_IMPL_ALIASES:
@@ -390,11 +412,13 @@ def resolve_model_impl(
             "class of the path you want, instead."
         )
 
-    if given is not None:
-        return given
     # A path, never `auto`: what a parent publishes is one, and so is what the
     # deprecated variable and the default below resolve to.
-    return cast("ModelImpl", envs.model_impl_from_env())
+    resolved = given
+    if resolved is None:
+        resolved = cast("ModelImpl", envs.model_impl_from_env())
+    _reject_disabled_model_impl(resolved)
+    return resolved
 
 
 def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
