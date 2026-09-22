@@ -540,6 +540,6 @@ def _isolate_rbln_ctx_standalone():
     any TP/DP/PP/EP config and never clears it. The rebel runtime reads it on
     every context creation, so one test building such a config leaves every later
     test -- and every spawned child, which inherits the env -- unable to register
-    a device at all. Mirrors tests/torch_compile/conftest.py."""
+    a device at all."""
     os.environ.pop("RBLN_CTX_STANDALONE", None)
     yield
