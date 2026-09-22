@@ -14,8 +14,6 @@
 
 import os
 
-os.environ["VLLM_RBLN_USE_VLLM_MODEL"] = "1"
-
 import pytest
 from vllm.config import (
     CacheConfig,
@@ -45,6 +43,22 @@ def pytest_configure(config):
     # don't silently reintroduce the hang.
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     load_general_plugins()
+
+    # This tree is the vllm model path's, and nothing has said so yet: production
+    # adopts the path in create_engine_config, and no engine is built here. The
+    # second call is what the platform hook makes right after, and register_ops
+    # above could not, having run before any of this was known.
+    from vllm_rbln import envs
+    from vllm_rbln.platform import _apply_model_impl
+
+    # Said the way a parent says it, so a config built here with no path of
+    # its own resolves to this one rather than to the default.
+    envs.INHERITED_MODEL_IMPL = "vllm"
+    _apply_model_impl("vllm")
+
+    from vllm_rbln.platform import vllm_impl
+
+    vllm_impl.patch_upstream()
 
 
 @pytest.fixture(autouse=True)

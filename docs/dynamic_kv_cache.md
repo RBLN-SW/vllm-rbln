@@ -56,7 +56,7 @@ reallocates the KV tensors at that size and re-announces the count to the
 scheduler. No recompilation happens, because the affected dimension is already
 dynamic.
 
-> The dynamic path requires `VLLM_RBLN_USE_VLLM_MODEL=1` and
+> The dynamic path requires `--model-impl vllm` and
 > `VLLM_RBLN_USE_DEVICE_TENSOR=1`. Only `DynamoRuntime` applies adaptive buffer
 > sizes; the other runtimes ignore them silently.
 
@@ -81,7 +81,6 @@ Key components:
 | `VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN` | `0` | Compute the count and log how the count vllm sized fits each chiplet, but resize nothing. Implies the flag above, so it is the only variable a trial run needs. |
 
 ```bash
-export VLLM_RBLN_USE_VLLM_MODEL=1
 export VLLM_RBLN_USE_DEVICE_TENSOR=1
 export VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1
 export VLLM_CACHE_ROOT=<a fresh directory>
@@ -130,7 +129,7 @@ carry the result:
 A dry run refuses nothing. It changes nothing either, so a refusal would stop a
 run the flag off would have served; every shape is reported instead and the run
 continues. That covers the two the dynamic compile needs
-(`VLLM_RBLN_USE_VLLM_MODEL=1`, `VLLM_RBLN_USE_DEVICE_TENSOR=1`) and a
+(`--model-impl vllm`, `VLLM_RBLN_USE_DEVICE_TENSOR=1`) and a
 `torch.rbln` without `capture_programs()` -- without them nothing is captured and
 the sizing step says so -- as well as a KV transfer connector (the reallocation
 is what invalidates its registrations), an attention layer that does not dispatch
@@ -183,7 +182,7 @@ would serve from the pre-compile estimate this feature exists to replace.
 Two cases warn and continue on the pre-compile estimate instead, because both are
 an explicit request from the caller:
 
-- Compile and warm-up are skipped (`--enforce-eager`, `VLLM_RBLN_COMPILE_MODEL=0`,
+- Compile and warm-up are skipped (`--enforce-eager`, `--no-rbln-compile-model`,
   `VLLM_RBLN_ENABLE_WARM_UP=0`). Nothing compiles, so no program carries a placement.
 - `--num-gpu-blocks-override` is set. The override pins the count and wins.
 - `RBLN_DUMMY_DEVICE` is set (a compile-only run). There is no device to

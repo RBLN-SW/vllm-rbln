@@ -44,7 +44,7 @@ Look for each of these:
 
 Repository-specific checks:
 
-- No new branch on `VLLM_RBLN_USE_VLLM_MODEL` outside `__init__.py` and `platform/__init__.py`.
+- No new branch on the model path outside `__init__.py` and `platform/__init__.py`.
 - A new env var must appear in **three** places in `envs.py`: the `TYPE_CHECKING` block, the `environment_variables` dict, and either `RBLN_COMPILE_ENV` or `RBLN_NON_COMPILE_ENV`.
 - No `model_compile`, `use_device`, or `maybe_use_device` mark under `tests/optimum/` — nothing gates them there.
 - No `test_*.py` under `tests/optimum/optimum_correctness/` — those are `fire` scripts.
