@@ -187,18 +187,17 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
             reconfigure(lambda config: None)
 
-    def test_an_explicit_dynamic_kv_on_an_unsizable_config(
-        self, monkeypatch, reconfigure
-    ):
-        def custom_kernel(config):
-            config.additional_config.use_custom_kernel = True
+    def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
+        def custom_kernel(dynamic):
+            def mutate(config):
+                config.additional_config.use_custom_kernel = True
+                config.additional_config.use_dynamic_kv_cache = dynamic
 
-        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
+            return mutate
+
         with pytest.raises(ValueError, match="RBLN_USE_CUSTOM_KERNEL"):
-            reconfigure(custom_kernel)
-
-        monkeypatch.delenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE")
-        reconfigure(custom_kernel)
+            reconfigure(custom_kernel(True))
+        reconfigure(custom_kernel(None))
 
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):

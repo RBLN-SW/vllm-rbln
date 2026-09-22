@@ -114,17 +114,14 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 "It is on by default; drop --no-rbln-use-moe-tokens-mask."
             )
 
-    if (
-        os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE") is not None
-        and envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
-    ):
+    if rbln_config.use_dynamic_kv_cache is True:
         from vllm_rbln.v1.worker.utils import dynamic_kv_unsupported_reason
 
         if (reason := dynamic_kv_unsupported_reason(vllm_config)) is not None:
             raise ValueError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 is set, but this configuration "
+                "--rbln-use-dynamic-kv-cache is set, but this configuration "
                 f"cannot size its KV cache from the compiled placement: {reason}. "
-                "Unset it to serve the pre-compile estimate."
+                "Leave it unset to serve the pre-compile estimate."
             )
 
     if (

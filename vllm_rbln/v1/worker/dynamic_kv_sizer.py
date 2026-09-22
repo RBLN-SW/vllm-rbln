@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Placement-based sizing of the KV cache (`VLLM_RBLN_USE_DYNAMIC_KV_CACHE`):
+"""Placement-based sizing of the KV cache (`--rbln-use-dynamic-kv-cache`):
 the state machine; `kv_placement` holds the arithmetic."""
 
 import copy
@@ -30,7 +30,6 @@ from vllm.config import VllmConfig
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-import vllm_rbln.envs as envs
 from vllm_rbln.compilation.backends import set_compile_stage
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.utils import sub_block_size_in_use
@@ -77,7 +76,7 @@ def resolve_mode(
     """The mode and its reason. Every input is static config or env, so the
     decision is final at init time."""
     if not use_dynamic_kv:
-        return DynamicKvMode.DISABLED, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE is off"
+        return DynamicKvMode.DISABLED, "use_dynamic_kv_cache is off"
     if unsupported_reason is not None:
         return DynamicKvMode.DISABLED, unsupported_reason
     if compile_skip_reason is not None:
@@ -166,7 +165,8 @@ class DynamicKvSizer:
         self.device: torch.device = vllm_config.device_config.device
         self.rank: int = vllm_config.parallel_config.rank
         self.mode, self.mode_reason = resolve_mode(
-            use_dynamic_kv=envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE,
+            use_dynamic_kv=vllm_config.additional_config.use_dynamic_kv_cache
+            is not False,
             unsupported_reason=dynamic_kv_unsupported_reason(vllm_config),
             num_gpu_blocks_override=self.cache_config.num_gpu_blocks_override,
             compile_skip_reason=compile_and_warmup_skip_reason(vllm_config),
@@ -299,8 +299,8 @@ class DynamicKvSizer:
         capture = getattr(torch.rbln, "capture_programs", None)
         if capture is None:
             raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs torch_rbln's "
-                "capture_programs(); this torch_rbln does not carry it."
+                "The dynamic KV cache needs torch_rbln's capture_programs(); "
+                "this torch_rbln does not carry it."
             )
         return capture()
 
@@ -343,8 +343,8 @@ class DynamicKvSizer:
         properties = getattr(torch.rbln, "get_device_properties", None)
         if properties is None:
             raise RuntimeError(
-                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE needs torch_rbln's "
-                "get_device_properties() to size from this process's allocator "
+                "The dynamic KV cache needs torch_rbln's get_device_properties() "
+                "to size from this process's allocator "
                 "when mem_get_info_per_chiplet() is missing."
             )
         # Cached-but-free blocks would otherwise count as used.

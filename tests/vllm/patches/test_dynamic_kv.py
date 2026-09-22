@@ -40,9 +40,10 @@ class TestOverrideBranch:
         )
 
     @staticmethod
-    def _config():
+    def _config(dynamic=None):
         return SimpleNamespace(
-            cache_config=SimpleNamespace(num_gpu_blocks_override=26, num_gpu_blocks=26)
+            cache_config=SimpleNamespace(num_gpu_blocks_override=26, num_gpu_blocks=26),
+            additional_config=SimpleNamespace(use_dynamic_kv_cache=dynamic),
         )
 
     def test_the_override_skips_the_workers(self, monkeypatch):
@@ -73,12 +74,30 @@ class TestOverrideBranch:
         config = SimpleNamespace(
             cache_config=SimpleNamespace(
                 num_gpu_blocks_override=None, num_gpu_blocks=26
-            )
+            ),
+            additional_config=SimpleNamespace(use_dynamic_kv_cache=None),
         )
         assert dk.patched_initialize_kv_caches(self._engine(calls), config) is (
             kv_cache_config
         )
         assert calls == []
+
+    def test_off_skips_the_workers_without_a_reason(self, monkeypatch, caplog):
+        calls: list = []
+        kv_cache_config = SimpleNamespace(num_blocks=26)
+        monkeypatch.setattr(
+            dk,
+            "engine_core_original_initialize_kv_caches",
+            lambda self, cfg: kv_cache_config,
+        )
+        monkeypatch.setattr(dk, "dynamic_kv_unsupported_reason", lambda cfg: None)
+        with caplog.at_level("WARNING"):
+            out = dk.patched_initialize_kv_caches(
+                self._engine(calls), self._config(dynamic=False)
+            )
+        assert out is kv_cache_config
+        assert calls == []
+        assert caplog.records == []
 
 
 class TestResolveRankNumBlocks:

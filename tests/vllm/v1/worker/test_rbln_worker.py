@@ -518,8 +518,8 @@ class TestDetermineAvailableMemory:
         speculative_config=None,
         dynamic=False,
     ):
-        monkeypatch.setattr(dks.envs, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE", dynamic)
         vcfg = _make_vllm_config(quantization=quantization)
+        vcfg.additional_config.use_dynamic_kv_cache = None if dynamic else False
         vcfg.model_config.hf_config = hf_config
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
         worker.device = torch.device("cpu")
@@ -755,8 +755,11 @@ class TestDetermineAvailableMemory:
 
 class TestInitializeFromConfig:
     @staticmethod
-    def _init(make_worker, monkeypatch, kv_cfg):
+    def _init(make_worker, monkeypatch, kv_cfg, *, dynamic=True):
         worker = make_worker()
+        worker.vllm_config.additional_config.use_dynamic_kv_cache = (
+            None if dynamic else False
+        )
         monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", lambda *a: None)
         init_calls = []
         worker.model_runner = SimpleNamespace(
@@ -768,9 +771,8 @@ class TestInitializeFromConfig:
         return worker, init_calls
 
     def test_sets_num_gpu_blocks(self, make_worker, monkeypatch):
-        monkeypatch.setattr(dks.envs, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE", False)
         kv_cfg = SimpleNamespace(num_blocks=123)
-        worker, init_calls = self._init(make_worker, monkeypatch, kv_cfg)
+        worker, init_calls = self._init(make_worker, monkeypatch, kv_cfg, dynamic=False)
         assert worker.cache_config.num_gpu_blocks == 123
         assert worker.cache_config.num_cpu_blocks == 123
         assert init_calls == [kv_cfg]

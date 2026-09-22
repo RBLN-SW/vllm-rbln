@@ -1,7 +1,7 @@
 ## Dynamic KV Cache Sizing Overview
 
 The KV cache is sized from the compiled artifact's placement and a per-chiplet
-memory snapshot. The alternative, which `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` goes
+memory snapshot. The alternative, which `--no-rbln-use-dynamic-kv-cache` goes
 back to, is a pre-compile estimate of free device memory: a whole-card figure
 with no notion of chiplets, so on a quad-chiplet card it can exceed the
 per-chiplet budget and the engine allocates a cache that does not fit.
@@ -90,9 +90,9 @@ Key components:
 
 ## Enabling and Configuring
 
-| Variable | Default | Description |
+| Option | Default | Description |
 | --- | --- | --- |
-| `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `1` | Size the KV cache from the compiled placement and the device. `0` goes back to the pre-compile estimate. Unset, a configuration the path cannot size turns it off on its own; an explicit `1` refuses such a configuration at start-up. |
+| `--rbln-use-dynamic-kv-cache` (`additional_config={"use_dynamic_kv_cache": ...}`) | unset | Size the KV cache from the compiled placement and the device. `--no-rbln-use-dynamic-kv-cache` goes back to the pre-compile estimate. Unset, a configuration the path cannot size turns it off on its own; set, such a configuration is refused at start-up. `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` still sets it, with a deprecation warning, until 0.14.0. |
 
 ```bash
 export VLLM_RBLN_USE_DEVICE_TENSOR=1
@@ -120,11 +120,11 @@ the pool rather than report on it.
 
 ## Where It Turns Itself Off
 
-A configuration the mechanism cannot size is not a refusal while the variable is
-unset: refusing would stop a run that `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` would
+A configuration the mechanism cannot size is not a refusal while the option is
+unset: refusing would stop a run that `--no-rbln-use-dynamic-kv-cache` would
 have served. The feature logs one warning and the run continues on the
 pre-compile estimate, with no KV dimension marked dynamic: `mark_dynamic` follows
-this decision, not the flag. An explicit `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1` is a
+this decision, not the option. An explicit `--rbln-use-dynamic-kv-cache` is a
 request, and start-up refuses it with the same reason.
 `dynamic_kv_unsupported_reason` in `v1/worker/utils.py` holds the whole list, and
 both the engine patch and the worker read it. The optimum-rbln path is not on it:

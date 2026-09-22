@@ -379,7 +379,6 @@ class TestModeResolution:
     the sizer branches on the mode instead of re-reading them."""
 
     def test_explicit_off_is_silent_in_the_worker(self, monkeypatch, caplog):
-        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0")
         monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
         config = SimpleNamespace(
             cache_config=SimpleNamespace(
@@ -394,6 +393,7 @@ class TestModeResolution:
                 compile_model=True,
                 use_custom_kernel=False,
                 use_flash_causal_attn=True,
+                use_dynamic_kv_cache=False,
             ),
             speculative_config=None,
             kv_transfer_config=None,
@@ -418,7 +418,7 @@ class TestModeResolution:
     def test_the_flag_off_disables_everything(self):
         assert self._mode(use_dynamic_kv=False) == (
             dks.DynamicKvMode.DISABLED,
-            "VLLM_RBLN_USE_DYNAMIC_KV_CACHE is off",
+            "use_dynamic_kv_cache is off",
         )
 
     def test_an_unsupported_config_disables_the_feature(self):

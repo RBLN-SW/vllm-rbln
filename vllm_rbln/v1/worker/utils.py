@@ -375,12 +375,13 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
 def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
     """Whether this run sizes its KV cache from the compiled placement.
 
-    The flag alone is not the answer: a configuration the path cannot size
+    The field alone is not the answer: a configuration the path cannot size
     turns it off, and `mark_dynamic` must follow that decision or the artifact
     carries a dynamic dim nothing will ever resize.
     """
+    rbln_config: RBLNConfig = vllm_config.additional_config
     return (
-        envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
+        rbln_config.use_dynamic_kv_cache is not False
         and dynamic_kv_unsupported_reason(vllm_config) is None
     )
 

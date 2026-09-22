@@ -1425,6 +1425,7 @@ class TestDynamicKvUnsupportedReason:
     def _cfg(
         use_custom_kernel=False,
         use_flash_causal_attn=True,
+        use_dynamic_kv_cache=None,
         speculative_method=None,
         block_size=16,
         max_model_len=32,
@@ -1434,6 +1435,7 @@ class TestDynamicKvUnsupportedReason:
             additional_config=RBLNConfig(
                 use_custom_kernel=use_custom_kernel,
                 use_flash_causal_attn=use_flash_causal_attn,
+                use_dynamic_kv_cache=use_dynamic_kv_cache,
             ),
             speculative_config=(
                 None
@@ -1522,6 +1524,8 @@ class TestDynamicKvUnsupportedReason:
         )
         assert worker_utils.dynamic_kv_enabled(self._cfg()) is True
 
-    def test_the_flag_off_disables_it(self, monkeypatch):
-        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0")
-        assert worker_utils.dynamic_kv_enabled(self._cfg()) is False
+    def test_off_disables_it(self):
+        assert (
+            worker_utils.dynamic_kv_enabled(self._cfg(use_dynamic_kv_cache=False))
+            is False
+        )

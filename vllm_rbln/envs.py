@@ -306,10 +306,8 @@ environment_variables = {
         )
     ),
     # --- DYNAMIC KV CACHE ---
-    # Size the KV cache from the compiled artifact instead of the estimate.
-    # Unset, configurations the path cannot size turn it off on their own
-    # (`dynamic_kv_unsupported_reason`); an explicit 1 refuses them at start-up
-    # and 0 turns it off everywhere.
+    # TODO(vllm-rbln>=0.14.0): delete. Resolved into
+    # `RBLNConfig.use_dynamic_kv_cache`; `--rbln-use-dynamic-kv-cache` is the flag.
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "True").lower()
@@ -420,7 +418,6 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_USE_VLLM_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
-        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
     }
 )
 
@@ -448,6 +445,7 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
         "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
         "VLLM_RBLN_USE_MOE_TOKENS_MASK",
         "VLLM_RBLN_DISPATCH_ALL2ALL",

@@ -99,6 +99,12 @@ class RBLNConfig(RBLNConfigBase):
     use_custom_kernel: bool = False
     """Use the custom RBLN kernels."""
 
+    use_dynamic_kv_cache: bool | None = None
+    """Size the KV cache from the compiled placement and the device instead of
+    the pre-compile estimate. Unset, a configuration the path cannot size turns
+    it off on its own; True refuses such a configuration at start-up; False
+    keeps the estimate."""
+
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
