@@ -325,6 +325,34 @@ _MODEL_IMPL_ALIASES: dict[str, ModelImpl | None] = {
 }
 
 
+def _reject_disabled_model_impl(
+    model_impl: ModelImpl, selected_by: str, remedy: str
+) -> None:
+    """Refuse a model path that is disabled on this host's device.
+
+    A host that cannot name its NPU is left alone: a compile-only worker names
+    its target later.
+
+    Each input that can name the path is undone somewhere else, so the caller is
+    told which one named it and what to do about that one. Naming a flag they
+    never typed sends them to a refusal above this one instead.
+    """
+    if model_impl != "vllm":
+        return
+
+    from vllm_rbln.platform import RblnPlatform
+
+    try:
+        if not RblnPlatform.is_ca():
+            return
+    except RuntimeError:
+        return
+    raise ValueError(
+        "The vllm model path is not supported on "
+        f"{RblnPlatform.get_device_name()}; {selected_by} selected it. {remedy}"
+    )
+
+
 def _as_model_impl(value: Any) -> ModelImpl | None:
     """The path `value` names, or None where it names none."""
     if not isinstance(value, str) or value not in _MODEL_IMPL_ALIASES:
@@ -354,10 +382,13 @@ def resolve_model_impl(
     flagged = _as_model_impl(model_impl) if model_impl is not None else None
 
     given: ModelImpl | None = None
+    selected_by = remedy = ""
     if isinstance(additional_config, RBLNConfigBase):
         # A built config is the path: each class holds one path's options, and
         # `check_and_update` resolves into the class the path picks.
         given = "vllm" if isinstance(additional_config, RBLNConfig) else "optimum"
+        selected_by = f"an {type(additional_config).__name__} additional_config"
+        remedy = "Pass an OptimumRBLNConfig instead."
         if flagged is not None and flagged != given:
             raise ValueError(
                 f"--model-impl names the {flagged} model path and "
@@ -367,6 +398,8 @@ def resolve_model_impl(
             )
     elif flagged is not None:
         given = flagged
+        selected_by = f"--model-impl {model_impl}"
+        remedy = "Use --model-impl optimum."
 
     from vllm_rbln import envs
 
@@ -390,11 +423,21 @@ def resolve_model_impl(
             "class of the path you want, instead."
         )
 
-    if given is not None:
-        return given
     # A path, never `auto`: what a parent publishes is one, and so is what the
     # deprecated variable and the default below resolve to.
-    return cast("ModelImpl", envs.model_impl_from_env())
+    resolved = given
+    if resolved is None:
+        resolved = cast("ModelImpl", envs.model_impl_from_env())
+        if envs.INHERITED_MODEL_IMPL:
+            selected_by = envs.RESOLVED_MODEL_IMPL_ENV
+            remedy = "Start the process that published it on the optimum path."
+        else:
+            selected_by = "VLLM_RBLN_USE_VLLM_MODEL"
+            # Not `--model-impl optimum`: with the variable still set that is
+            # the disagreement the refusal above this one is for.
+            remedy = "Unset VLLM_RBLN_USE_VLLM_MODEL."
+    _reject_disabled_model_impl(resolved, selected_by, remedy)
+    return resolved
 
 
 def build_rbln_config(additional_config: Any = None) -> RBLNConfig:

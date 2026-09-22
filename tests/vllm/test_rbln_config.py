@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import pathlib
+import re
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -293,6 +294,9 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(use_dynamic_kv_cache=False).compute_hash() != base
 
 
+# Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,
+# so the chip is named here rather than inherited from whatever card ran this.
+@pytest.mark.usefixtures("cr13")
 class TestResolveModelImpl:
     """The model path has to be readable before the config class is known.
 
@@ -409,6 +413,89 @@ class TestResolveModelImpl:
         # The same pair agreeing is how a built config is normally passed.
         assert resolve_model_impl(RBLNConfig(), model_impl="vllm") == "vllm"
         assert resolve_model_impl(OptimumRBLNConfig(), model_impl="auto") == "optimum"
+
+    @pytest.mark.parametrize(
+        ("device_name", "model_impl", "refused"),
+        [
+            ("RBLN-CA25", "vllm", True),
+            (" rbln-ca02 ", "vllm", True),
+            ("RBLN-CA25", "optimum", False),
+            ("RBLN-CR03", "vllm", False),
+        ],
+    )
+    def test_a_disabled_path_is_rejected(
+        self, monkeypatch, device_name, model_impl, refused
+    ):
+        """The vllm path is disabled on RBLN-CA*, and this is where paths are named.
+
+        Refusing at resolution puts the failure on the flag the caller typed,
+        before anything is built from it.
+        """
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: device_name
+        )
+        if refused:
+            with pytest.raises(ValueError, match=device_name.strip()):
+                resolve_model_impl(model_impl=model_impl)
+        else:
+            assert resolve_model_impl(model_impl=model_impl) == model_impl
+
+    @pytest.mark.parametrize(
+        ("kwargs", "remedy"),
+        [
+            (
+                {"model_impl": "vllm"},
+                "--model-impl vllm selected it. Use --model-impl optimum.",
+            ),
+            (
+                {"additional_config": RBLNConfig()},
+                "an RBLNConfig additional_config selected it. Pass an "
+                "OptimumRBLNConfig instead.",
+            ),
+        ],
+    )
+    def test_the_refusal_names_what_selected_the_path(
+        self, monkeypatch, kwargs, remedy
+    ):
+        """Three inputs can name this path and each is undone somewhere else.
+
+        A caller sent to --model-impl optimum by name lands on the refusal above
+        this one whenever a config class chose the path.
+        """
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+        with pytest.raises(ValueError, match=re.escape(remedy)):
+            resolve_model_impl(**kwargs)
+
+    def test_the_refusal_names_the_deprecated_variable(self, monkeypatch):
+        # TODO(vllm-rbln>=0.14.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
+        with pytest.raises(
+            ValueError,
+            match="VLLM_RBLN_USE_VLLM_MODEL selected it. Unset "
+            "VLLM_RBLN_USE_VLLM_MODEL.",
+        ):
+            resolve_model_impl()
+
+    def test_a_host_that_cannot_name_its_npu_keeps_every_path(self, monkeypatch):
+        """A compile-only worker names its target later, so nothing is refused."""
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: None)
+        monkeypatch.delenv("RBLN_FORCE_NPU_NAME", raising=False)
+        monkeypatch.delenv("RBLN_TARGET_SOC", raising=False)
+        assert resolve_model_impl(model_impl="vllm") == "vllm"
 
     @pytest.mark.parametrize("value", ["terratorch", "vLLM", "", True])
     def test_an_unsupported_implementation_is_rejected(self, value):
