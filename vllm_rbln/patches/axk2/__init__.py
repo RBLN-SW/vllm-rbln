@@ -14,11 +14,18 @@ MODEL_TYPE = "axk2"
 MODEL_CLASS_PATH = "vllm_rbln.patches.axk2.model:AXK2ForCausalLM"
 
 
-def _upstream_has_axk2() -> bool:
-    """True once the installed vLLM ships axk2 itself."""
+def _read_upstream_has_axk2() -> bool:
     from vllm.model_executor.models import ModelRegistry
 
     return ARCH in ModelRegistry.get_supported_archs()
+
+
+_UPSTREAM_HAS_AXK2 = _read_upstream_has_axk2()
+
+
+def _upstream_has_axk2() -> bool:
+    """True once the installed vLLM ships axk2 itself."""
+    return _UPSTREAM_HAS_AXK2
 
 
 def _patch_condition() -> bool:
