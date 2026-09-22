@@ -140,7 +140,7 @@ from vllm_rbln.v1.core.utils import (
 )
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
-from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
+from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
 from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -498,7 +498,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and self.rbln_config.specialize_moe_decode
         )
         # The batched dynamic decode kernel (REBEL CR13, or any device with
-        # VLLM_RBLN_BATCH_ATTN_OPT) processes the first valid_batch[p] rows of
+        # --rbln-use-batch-attn-opt) processes the first valid_batch[p] rows of
         # partition p and early-exits on the rest, which is only correct when
         # rows are sorted by descending sequence length.
         self.sort_batch_by_length = (
@@ -1859,7 +1859,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if not self.is_prefill and (
                 spec_decode_metadata is not None or self.uses_fixed_decode_window
             ):
-                logits = logits[logits_indices]
+                num_rows = logits_indices.shape[0]
+                if int(logits_indices[-1]) == num_rows - 1:
+                    # Ascending indices ending at num_rows - 1 are exactly 0..num_rows-1
+                    logits = logits[:num_rows]
+                else:
+                    logits = torch.index_select(logits, 0, logits_indices)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -2635,30 +2640,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dtype=self.dtype,
         )
 
-        def dummy_tensor_view(
-            buffer: torch.Tensor, value: int | float | None
-        ) -> torch.Tensor | None:
-            """Warm-up stand-in for what a real step feeds: a view of the buffer.
-
-            Dynamo guards distinguish a view from a fresh allocation, so this follows
-            how the runtime builds its sampling metadata tensors -- `_pad_rows` hands
-            through a slice of the persistent buffer.
-            """
-            if value is None:
-                return None
-            view = buffer[:num_reqs]
-            view.fill_(value)
-            return view
-
         for config in WARM_UP_CONFIGS:
             dummy_metadata = SamplingMetadata(
-                temperature=dummy_tensor_view(
-                    self.input_batch.temperature, config.get("temperature")
+                temperature=_dummy_tensor_view(
+                    self.input_batch.temperature, num_reqs, config.get("temperature")
                 ),
                 all_greedy=config.get("all_greedy", True),
                 all_random=config.get("all_random", False),
-                top_p=dummy_tensor_view(self.input_batch.top_p, config.get("top_p")),
-                top_k=dummy_tensor_view(self.input_batch.top_k, config.get("top_k")),
+                top_p=_dummy_tensor_view(
+                    self.input_batch.top_p, num_reqs, config.get("top_p")
+                ),
+                top_k=_dummy_tensor_view(
+                    self.input_batch.top_k, num_reqs, config.get("top_k")
+                ),
                 generators={},
                 max_num_logprobs=None,
                 no_penalties=config.get("no_penalties", True),
@@ -2667,16 +2661,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
                 if not config.get("no_penalties", True)
                 else None,
-                frequency_penalties=dummy_tensor_view(
+                frequency_penalties=_dummy_tensor_view(
                     self.input_batch.frequency_penalties,
+                    num_reqs,
                     config.get("frequency_penalties", 0.1),
                 ),
-                presence_penalties=dummy_tensor_view(
+                presence_penalties=_dummy_tensor_view(
                     self.input_batch.presence_penalties,
+                    num_reqs,
                     config.get("presence_penalties", 0.1),
                 ),
-                repetition_penalties=dummy_tensor_view(
+                repetition_penalties=_dummy_tensor_view(
                     self.input_batch.repetition_penalties,
+                    num_reqs,
                     config.get("repetition_penalties", 0.1),
                 ),
                 output_token_ids=[],
@@ -3206,7 +3203,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             raise NotImplementedError(
                 "Sub-block prefix caching does not support "
                 "multi-group KV caches yet.  "
-                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
+                "Pass --no-rbln-enable-sub-block-cache to disable."
             )
 
         kv_cache_config = deepcopy(kv_cache_config)
@@ -3228,41 +3225,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        kv_caches = self.initialize_kv_cache_tensors(
-            kv_cache_config, kernel_block_sizes
-        )
-
-        if has_kv_transfer_group():
-            kv_transfer_group = get_kv_transfer_group()
-            if self.cross_layers_kv_cache is not None:
-                assert self.cross_layers_attn_backend is not None
-                kv_transfer_group.register_cross_layers_kv_cache(
-                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
-                )
-            else:
-                # Filter to one Full-preferred canonical layer per pool so
-                # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
-                # SWA-layer views alias the same storage, so no separate
-                # registration is needed.
-                canonical_layers = self._select_canonical_kv_layers_per_pool(
-                    kv_cache_config
-                )
-                missing = canonical_layers - kv_caches.keys()
-                assert not missing, (
-                    f"Canonical layers missing from kv_caches: {missing}"
-                )
-                # Iterate in layer-index order (self.kv_cache_names): NIXL
-                # assigns region indices in iteration order, and set iteration
-                # would vary with PYTHONHASHSEED, breaking the P/D region <->
-                # layer agreement.
-                filtered_kv_caches = {
-                    name: kv_caches[name]
-                    for name in self.kv_cache_names
-                    if name in canonical_layers
-                }
-                kv_transfer_group.register_kv_caches(filtered_kv_caches)
-
-            kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
+        self.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
 
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
@@ -3275,6 +3238,45 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             len(kv_cache_config.kv_cache_tensors),
             total_gb,
         )
+
+    def register_kv_caches_with_connector(self) -> None:
+        """Hand the KV caches the runner holds to the KV transfer connector.
+
+        The worker drives this instead of `initialize_kv_cache`: a dynamic-KV
+        resize replaces every tensor after warm-up, so the caches worth
+        registering are the ones standing at that point.
+        """
+        if not has_kv_transfer_group():
+            return
+        kv_transfer_group = get_kv_transfer_group()
+        if self.cross_layers_kv_cache is not None:
+            assert self.cross_layers_attn_backend is not None
+            kv_transfer_group.register_cross_layers_kv_cache(
+                self.cross_layers_kv_cache, self.cross_layers_attn_backend
+            )
+        else:
+            kv_caches = dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
+            # Filter to one Full-preferred canonical layer per pool so
+            # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
+            # SWA-layer views alias the same storage, so no separate
+            # registration is needed.
+            canonical_layers = self._select_canonical_kv_layers_per_pool(
+                self.kv_cache_config
+            )
+            missing = canonical_layers - kv_caches.keys()
+            assert not missing, f"Canonical layers missing from kv_caches: {missing}"
+            # Iterate in layer-index order (self.kv_cache_names): NIXL
+            # assigns region indices in iteration order, and set iteration
+            # would vary with PYTHONHASHSEED, breaking the P/D region <->
+            # layer agreement.
+            filtered_kv_caches = {
+                name: kv_caches[name]
+                for name in self.kv_cache_names
+                if name in canonical_layers
+            }
+            kv_transfer_group.register_kv_caches(filtered_kv_caches)
+
+        kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -3524,15 +3526,51 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs=LogitsProcessors(),
             spec_token_ids=[[] for _ in range(batch_size)],
         )
+
+        variants: list[tuple[dict, SamplingMetadata]] = []
         # int32, as the bonus sampler's ops return it.
         bonus_token_ids = torch.zeros(
             batch_size, 1, dtype=torch.int32, device=self.device
         )
+
         logger.info("Warm-up: rejection sampler (decode_batch=%d)", batch_size)
-        for bonus_token_ids_in, bonus_logits_in in (
-            (None, bonus_logits),
-            (bonus_token_ids, None),
-        ):
+        # One graph per top_k/top_p None-pattern (the sampler's WARM_UP_CONFIGS)
+        # plus the one fed bonus token ids (logprobs).
+        variants.append(({"bonus_token_ids": bonus_token_ids}, dummy_sampling_metadata))
+        for config in WARM_UP_CONFIGS:
+            metadata = dataclasses.replace(
+                dummy_sampling_metadata,
+                all_greedy=config["all_greedy"],
+                all_random=config["all_random"],
+                temperature=None
+                if config["all_greedy"]
+                else torch.ones(batch_size, dtype=self.dtype, device=self.device),
+                top_p=_dummy_tensor_view(
+                    self.input_batch.top_p, batch_size, config.get("top_p")
+                ),
+                top_k=_dummy_tensor_view(
+                    self.input_batch.top_k, batch_size, config.get("top_k")
+                ),
+            )
+            variants.append(({"bonus_logits": bonus_logits}, metadata))
+
+            if batch_size > 1 and (metadata.top_p, metadata.top_k) != (None, None):
+                # A batch below the bound arrives through `_pad_rows`'s torch.cat,
+                # not a buffer view.
+                variants.append(
+                    (
+                        {"bonus_logits": bonus_logits},
+                        _pad_sampling_metadata(
+                            dataclasses.replace(
+                                metadata,
+                                top_p=_pad_rows(metadata.top_p, batch_size - 1),
+                                top_k=_pad_rows(metadata.top_k, batch_size - 1),
+                            ),
+                            batch_size,
+                        ),
+                    )
+                )
+        for bonus_kwargs, sampling_metadata in variants:
             self.rejection_sampler.impl.rejection_sample(
                 draft_token_ids,
                 num_draft_tokens,
@@ -3540,10 +3578,53 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 cu_num_draft_tokens,
                 None,
                 target_logits,
-                bonus_token_ids_in,
-                dummy_sampling_metadata,
-                bonus_logits=bonus_logits_in,
+                bonus_kwargs.get("bonus_token_ids"),
+                sampling_metadata,
+                bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
+
+    def run_model_graphs(self) -> None:
+        """Every model graph once, at the shapes serving will ask for."""
+        # 1. prefill
+        self._dummy_run(1, self.max_num_tokens, True)
+
+        # 2. decode
+        query_lens = [1]
+        if self.speculative_config:
+            spec_query_len = self.speculative_config.num_speculative_tokens + 1
+            query_lens = (
+                [spec_query_len]
+                if self.uses_fixed_decode_window
+                else [1, spec_query_len]
+            )
+        for num_req in self.bucketing_manager.decode_batch_buckets:
+            for query_len in query_lens:
+                self._dummy_run(num_req, query_len, False)
+
+        if self.specialized_moe_decode:
+            # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
+            # cover the DP-asymmetric case (this rank decoding while another
+            # rank prefills). Warm-up is symmetric, so it cannot reach those
+            # shapes on its own: it pins the token dimension the ANY_PREFILL
+            # and QLEN_ASYM routes would ask for, which the small-bucket decode
+            # graphs from 2. decode above cannot satisfy.
+            num_req = self.bucketing_manager.decode_batch_buckets[-1]
+            for query_len in query_lens:
+                self._dummy_run(
+                    num_req,
+                    query_len,
+                    False,
+                    num_tokens_padded_override=self.max_num_tokens,
+                )
+            if self.speculative_config and not self.uses_fixed_decode_window:
+                # Cover DP-asymmetric decode where a peer runs spec decode.
+                self._dummy_run(
+                    num_req,
+                    1,
+                    False,
+                    num_tokens_padded_override=num_req
+                    * (self.speculative_config.num_speculative_tokens + 1),
+                )
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
@@ -3556,46 +3637,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         sig = mega_cache.config_signature(self.vllm_config)
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
-            # 1. prefill
-            self._dummy_run(1, self.max_num_tokens, True)
-
-            # 2. decode
-            query_lens = [1]
-            if self.speculative_config:
-                spec_query_len = self.speculative_config.num_speculative_tokens + 1
-                query_lens = (
-                    [spec_query_len]
-                    if self.uses_fixed_decode_window
-                    else [1, spec_query_len]
-                )
-            for num_req in self.bucketing_manager.decode_batch_buckets:
-                for query_len in query_lens:
-                    self._dummy_run(num_req, query_len, False)
-
-            if self.specialized_moe_decode:
-                # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
-                # cover the DP-asymmetric case (this rank decoding while another
-                # rank prefills). Warm-up is symmetric, so it cannot reach those
-                # shapes on its own: it pins the token dimension the ANY_PREFILL
-                # and QLEN_ASYM routes would ask for, which the small-bucket decode
-                # graphs from 2. decode above cannot satisfy.
-                num_req = self.bucketing_manager.decode_batch_buckets[-1]
-                for query_len in query_lens:
-                    self._dummy_run(
-                        num_req,
-                        query_len,
-                        False,
-                        num_tokens_padded_override=self.max_num_tokens,
-                    )
-                if self.speculative_config and not self.uses_fixed_decode_window:
-                    # Cover DP-asymmetric decode where a peer runs spec decode.
-                    self._dummy_run(
-                        num_req,
-                        1,
-                        False,
-                        num_tokens_padded_override=num_req
-                        * (self.speculative_config.num_speculative_tokens + 1),
-                    )
+            self.run_model_graphs()
 
             # 3. compute_logits
             if not self.use_wrapped_compute_logits:
@@ -3654,7 +3696,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and self.rbln_config.compile_model
         ):
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
-            # in this path (VLLM_RBLN_USE_VLLM_MODEL).
+            # in this path (--model-impl vllm).
             for op in copy_ops:
                 runtime = self.runtime_holder[0]
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
@@ -3679,6 +3721,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     dsts.append(kv_cache.select(axis, dst)[..., :nt, :])
                     srcs.append(kv_cache.select(axis, src)[..., :nt, :])
         torch._foreach_copy_(dsts, srcs)
+
+
+def _dummy_tensor_view(
+    buffer: torch.Tensor, num_reqs: int, value: int | float | None
+) -> torch.Tensor | None:
+    """A view of the persistent buffer, as a real step feeds"""
+    if value is None:
+        return None
+    view = buffer[:num_reqs]
+    view.fill_(value)
+    return view
 
 
 def _pad_rows(t: torch.Tensor | None, bucket: int) -> torch.Tensor | None:

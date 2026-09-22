@@ -32,7 +32,7 @@ import optimum.rbln
 from optimum.rbln.transformers.models.decoderonly import (
     decoderonly_runtime_utils as runtime_utils,
 )
-from vllm_rbln import envs
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import get_attn_block_size
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
@@ -87,16 +87,10 @@ class KVCacheBlockAdapter:
 
     def _estimated_num_blocks(self) -> int:
         """Override estimated blocks if num_gpu_blocks_override is set."""
-        if (
-            self.vllm_config.additional_config
-            and "num_blocks_override" in self.vllm_config.additional_config
-        ):
-            num_gpu_blocks_override = self.vllm_config.additional_config[
-                "num_blocks_override"
-            ]
-            return num_gpu_blocks_override
-        else:
-            return int(self.estimated_kvcache_num_blocks)
+        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        if rbln_config.num_blocks_override is not None:
+            return rbln_config.num_blocks_override
+        return int(self.estimated_kvcache_num_blocks)
 
     def is_full_block_available(self) -> bool:
         """True if we can allocate a full batch worth of blocks."""
@@ -112,7 +106,7 @@ class KVCacheBlockAdapter:
 
     def get_available_num_blocks(self) -> int:
         if self.vllm_config.cache_config.enable_prefix_caching:
-            ob_size = self.vllm_config.additional_config["attn_block_size"]
+            ob_size = get_attn_block_size(self.vllm_config)
             ib_size = self.vllm_config.cache_config.block_size
             blk_ratio = ob_size // ib_size
         else:
@@ -188,8 +182,9 @@ class RBLNOptimumModelBase(nn.Module):
 
     def init_model(self) -> None:
         hf_config = self.model_config.hf_config
-        cached_model_path = self.vllm_config.additional_config.get("cached_model_path")
-        rbln_overrides = self.vllm_config.additional_config.get("rbln_config", {})
+        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        cached_model_path = rbln_config.cached_model_path
+        rbln_overrides = rbln_config.optimum_overrides
         _, model_cls_name = get_rbln_model_info(hf_config)
         model_path = self.vllm_config.model_config.model
         if is_compiled_dir(model_path):
@@ -236,7 +231,7 @@ class RBLNOptimumModelBase(nn.Module):
                 batch_size=self.scheduler_config.max_num_seqs,
                 block_size=get_attn_block_size(self.vllm_config),
                 max_model_len=self.model_config.max_model_len,
-                num_devices=envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK,
+                num_devices=rbln_config.num_devices_per_local_rank,
                 # Resolved during sync (from_optimum/from_vllm) into
                 # max_num_batched_tokens; pin it at compile time so the compiled
                 # model matches the value used for KV-cache block padding.
@@ -250,17 +245,30 @@ class RBLNOptimumModelBase(nn.Module):
                 spec.model_cls.__name__,
                 json.dumps(spec.rbln_config, indent=2, default=str),
             )
-            text_config = hf_config.get_text_config()
-            layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
-            if hasattr(text_config, "layer_types"):
-                layer_override["layer_types"] = text_config.layer_types
-            if text_config is not hf_config:
-                layer_override = {"text_config": layer_override}
+            # Pass transformers config objects directly to preserve all settings.
+            # Config classes defined outside transformers (e.g. vLLM's qwen3_asr)
+            # may be incompatible with the transformers model implementation.
+            # For these configs, pass num_hidden_layers and, when available,
+            # layer_types as config kwargs instead.
+            # FIXME(optimum-rbln): Ensure RBLNGptOssForCausalLM.get_pytorch_model
+            # applies these config kwargs; it currently discards them.
+            if type(hf_config).__module__.startswith("transformers."):
+                config_override = {"config": hf_config}
+            else:
+                text_config = hf_config.get_text_config()
+                layer_override = {"num_hidden_layers": text_config.num_hidden_layers}
+                if hasattr(text_config, "layer_types"):
+                    layer_override["layer_types"] = text_config.layer_types
+                config_override = (
+                    layer_override
+                    if text_config is hf_config
+                    else {"text_config": layer_override}
+                )
             model = spec.model_cls.from_pretrained(
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
                 dtype=self.model_config.dtype,
-                **layer_override,
+                **config_override,
             )
             model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
             self.vllm_config.model_config.model = cached_model_path

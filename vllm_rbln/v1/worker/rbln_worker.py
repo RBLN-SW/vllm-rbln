@@ -472,6 +472,8 @@ class RBLNWorker(WorkerBase):
         self.model_runner.initialize_kv_cache(
             self.dynamic_kv.shrink_for_compile(kv_cache_config)
         )
+        if not self.dynamic_kv.defers_kv_registration:
+            self.model_runner.register_kv_caches_with_connector()
 
         self.dynamic_kv.assert_cache_layout()
 
@@ -483,11 +485,20 @@ class RBLNWorker(WorkerBase):
 
     def apply_dynamic_kv_num_blocks(self, n: int | None) -> int | None:
         """RPC target of the engine's dynamic-KV patch; see
-        `DynamicKvSizer.apply_num_blocks`."""
+        `DynamicKvSizer.apply_num_blocks`.
+
+        This is also where a KV connector registers when the resize owns the
+        cache: the tensors it must describe exist only once the resize has
+        allocated them.
+        """
         # The KV cache shape reads the RBLN config off the global vllm config,
         # which these RPCs arrive outside of -- warm-up has already returned.
         with set_current_vllm_config(self.vllm_config, check_compile=False):
-            return self.dynamic_kv.apply_num_blocks(n)
+            applied = self.dynamic_kv.apply_num_blocks(n)
+            if self.dynamic_kv.defers_kv_registration and has_kv_transfer_group():
+                self.model_runner.register_kv_caches_with_connector()
+                finalize_kv_cache_registrations(get_kv_transfer_group())
+            return applied
 
     @worker_fail_fast
     @instrument(span_name="Warmup (NPU)")
@@ -514,7 +525,9 @@ class RBLNWorker(WorkerBase):
                 # connector tree (incl. MultiConnector children) so the hook
                 # still runs when combined with other connectors. Only on a
                 # successful warm-up — not on the skipped or failed path.
-                if has_kv_transfer_group():
+                if has_kv_transfer_group() and not (
+                    self.dynamic_kv.defers_kv_registration
+                ):
                     # Registration probes the backend for the block axis,
                     # which reads the config the way
                     # `apply_dynamic_kv_num_blocks` describes; warm-up is

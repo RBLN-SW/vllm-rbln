@@ -374,9 +374,8 @@ def pytest_runtest_protocol(item, nextitem):
 
 
 def pytest_configure(config):
-    # Must run before collection: register_ops() gates on
-    # VLLM_RBLN_USE_VLLM_MODEL, and test modules capture upstream symbols at
-    # import time -- so the patches have to be in place before any of them
+    # Must run before collection: test modules capture upstream symbols at
+    # import time, so the patches have to be in place before any of them
     # execute `from vllm.xxx import yyy`.
     global _scrubbed, _config
     _config = config
@@ -402,12 +401,31 @@ def pytest_configure(config):
             os.environ.pop(LAYERS_PINNABLE_ENV, None)
 
     # Platform plugins activate on their own when current_platform is first
-    # touched, but the patches live in the general_plugins group and nothing
-    # loads those implicitly. Without this the suite runs half-applied:
-    # RblnPlatform is current, yet every patched symbol is still upstream's.
+    # touched, but the registrations live in the general_plugins group and
+    # nothing loads those implicitly. This also imports the platform, which no
+    # module may do directly: vllm.platforms has to be the one resolving it.
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
+
+    # This suite is the vllm model path's, and nothing has said so yet: production
+    # adopts the path in create_engine_config, and no engine is built here. The
+    # second call is what the platform hook makes right after; without it the
+    # suite runs half-applied, RblnPlatform current yet every patched symbol
+    # still upstream's.
+    from vllm_rbln import envs
+    from vllm_rbln.platform import _apply_model_impl
+
+    # Said the way a parent says it, so a config built here with no path of
+    # its own resolves to this one rather than to the default.
+    envs.INHERITED_MODEL_IMPL = "vllm"
+    _apply_model_impl("vllm")
+
+    # Imported only now: it copies USE_DEVICE_TENSOR into its own namespace, as
+    # seven other modules do, and the call above is what settles that value.
+    from vllm_rbln.platform import vllm_impl
+
+    vllm_impl.patch_upstream()
 
 
 def pytest_sessionfinish(session):

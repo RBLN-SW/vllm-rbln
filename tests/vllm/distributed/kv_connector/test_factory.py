@@ -16,12 +16,10 @@
 # resolved all the way to its class; LMCache only by presence, since its module
 # imports `lmcache_rbln` at load time.
 
-# Importing the factory module fires the register_connector side effects, exactly
-# as register_ops() does under VLLM_RBLN_USE_VLLM_MODEL in production.
+# The registrations run at session start, as both apply sites run them in
+# production, so the registry is populated by the time this file is collected.
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-
-import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
 
 
 def test_vllm_path_registers_every_connector():

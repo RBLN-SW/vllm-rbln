@@ -17,7 +17,7 @@ Everything here is architecture-independent: the slot naming, which indices a
 stage receives versus captures, and the handoff placeholder that has to advertise
 them. Only the capture itself is not, because it lives inside a model's `forward`
 and the tensors have to be graph outputs of that forward -- see
-`vllm_rbln/patches/minimax_m2.py` for the one architecture that has it.
+`vllm_rbln/patches/minimax_m2.py` and `vllm_rbln/patches/axk2/model.py`.
 
 TODO(vllm-project/vllm#50514): delete once that lands and is released.
 """
@@ -36,9 +36,11 @@ from vllm.sequence import IntermediateTensors
 # architecture absent from here harvests the wrong layers and comes up short at
 # the drafter. `RblnPlatform.check_and_update_config` rejects the combination
 # rather than letting it fail mid-compile.
-EAGLE3_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM"})
+EAGLE3_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM", "AXK2ForCausalLM"})
 
-AUX_SLOT = "aux_hidden_states_"
+# One handoff tensor carries every aux hidden state, concatenated on the feature
+# dim in ascending layer order, which is the layout the drafter's `fc` already expects.
+AUX_COMBINED = "aux_hidden_states"
 
 
 def eagle3_aux_hidden_states_enabled(
@@ -135,12 +137,13 @@ def install_aux_handoff_slots(model: nn.Module) -> None:
     def make_empty_intermediate_tensors(
         batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
-        keys = ["hidden_states", "residual"]
-        keys += [f"{AUX_SLOT}{i}" for i in aux_slots_received(inner)]
+        widths = {"hidden_states": hidden_size, "residual": hidden_size}
+        if received := aux_slots_received(inner):
+            widths[AUX_COMBINED] = len(received) * hidden_size
         return IntermediateTensors(
             {
-                key: torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
-                for key in keys
+                key: torch.zeros((batch_size, width), dtype=dtype, device=device)
+                for key, width in widths.items()
             }
         )
 

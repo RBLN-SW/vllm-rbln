@@ -22,26 +22,25 @@ from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
 
 def patch_upstream() -> None:
-    # Only sync_from_vllm reads the key the first one writes, and on the vllm
-    # path it would be an unknown field of RBLNConfig.
-    _capture_user_max_num_batched_tokens()
     _allow_gemma4_global_per_layer_attribute_access()
 
 
-def add_cli_args(parser: "FlexibleArgumentParser") -> None:
-    """The optimum path takes no RBLN command-line arguments."""
-
-
 def check_and_update(vllm_config: "VllmConfig") -> None:
+    from vllm_rbln.config import build_optimum_rbln_config
     from vllm_rbln.utils.optimum.converter import sync_vllm_and_optimum
     from vllm_rbln.utils.optimum.predicates import forces_fp32_dtype
     from vllm_rbln.utils.optimum.registry import is_pooling_arch
+
+    # Everything below, and the sync at the end, reads additional_config as an
+    # OptimumRBLNConfig. The sync also writes its derived fields back.
+    vllm_config.additional_config = build_optimum_rbln_config(
+        vllm_config.additional_config
+    )
 
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
@@ -62,15 +61,14 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         logger.warning(
             "Disabling asynchronous scheduling: the optimum model runner "
             "does not support it. Running synchronously. Set "
-            "VLLM_RBLN_USE_VLLM_MODEL=1 to use the runner that does."
+            "--model-impl vllm to use the runner that does."
         )
     scheduler_config.async_scheduling = False
 
     assert parallel_config.tensor_parallel_size == 1, (
         "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
         "If you want to compile with tensor parallelism in vllm-rbln, "
-        "please use the `VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK` "
-        "environment variable instead."
+        "please use --rbln-num-devices-per-local-rank instead."
     )
     assert parallel_config.pipeline_parallel_size == 1, (
         "Pipeline parallelism is not supported in optimum-rbln."
@@ -92,54 +90,6 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
 
     disable_unsupported_prefix_caching(vllm_config)
     sync_vllm_and_optimum(vllm_config)
-
-
-def _capture_user_max_num_batched_tokens() -> None:
-    """Stash the user's raw max_num_batched_tokens so the converter can read it.
-
-    In the RBLN optimum path an explicit max_num_batched_tokens IS the
-    prefill chunk size, so ``sync_from_vllm`` needs to know whether the user
-    set it. By the time that runs it can no longer tell, because vLLM has
-    already overwritten the value:
-
-      1. The user passes ``max_num_batched_tokens`` (an int) or leaves it
-         ``None``.
-      2. ``_set_default_max_num_seqs_and_batched_tokens_args`` replaces a
-         ``None`` with a throughput default and, since chunked prefill is
-         off on RBLN, floors it up to ``max_model_len``.
-      3. ``VllmConfig.__post_init__`` calls ``check_and_update_config`` ->
-         ``sync_from_vllm``, which now sees a concrete number with no trace
-         of whether it came from the user or from step 2.
-
-    This wrapper runs at the start of step 2, before the overwrite, and
-    records the raw value (``None`` if unset) into ``additional_config``,
-    which flows unchanged into ``VllmConfig``. ``sync_from_vllm`` then reads
-    it via ``get_user_max_num_batched_tokens``.
-    """
-    from vllm.engine.arg_utils import EngineArgs
-
-    from vllm_rbln.utils.optimum.converter.common import (
-        USER_MAX_NUM_BATCHED_TOKENS_KEY,
-    )
-
-    if getattr(EngineArgs, "_rbln_user_mnbt_patched", False):
-        return
-
-    orig_set_defaults = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
-
-    def _set_default_max_num_seqs_and_batched_tokens_args(self, *args, **kwargs):
-        # Runs before the value is resolved from None to its default.
-        if self.additional_config is None:
-            self.additional_config = {}
-        self.additional_config[USER_MAX_NUM_BATCHED_TOKENS_KEY] = (
-            self.max_num_batched_tokens
-        )
-        return orig_set_defaults(self, *args, **kwargs)
-
-    EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = (
-        _set_default_max_num_seqs_and_batched_tokens_args
-    )
-    EngineArgs._rbln_user_mnbt_patched = True
 
 
 def _allow_gemma4_global_per_layer_attribute_access() -> None:

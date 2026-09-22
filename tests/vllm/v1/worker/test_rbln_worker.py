@@ -864,7 +864,8 @@ class TestInitializeFromConfig:
         monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", lambda *a: None)
         init_calls = []
         worker.model_runner = SimpleNamespace(
-            initialize_kv_cache=lambda cfg: init_calls.append(cfg)
+            initialize_kv_cache=lambda cfg: init_calls.append(cfg),
+            register_kv_caches_with_connector=lambda: None,
         )
         _attach_sizer(worker)
         kv_cfg = SimpleNamespace(num_blocks=123)
@@ -942,6 +943,21 @@ class TestCompileOrWarmUpModel:
         # Identity, not just "something was set": an outer scope holding a
         # different config would satisfy a bare call.
         assert seen == [worker.vllm_config]
+
+    def test_a_pending_resize_holds_the_finalize(self, make_worker, monkeypatch):
+        # The dynamic-KV resize frees this cache and allocates again right
+        # after warm-up returns; `apply_dynamic_kv_num_blocks` registers what
+        # it allocated instead.
+        worker, _ = self._worker(make_worker, monkeypatch)
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "group")
+        monkeypatch.setattr(dks.DynamicKvSizer, "defers_kv_registration", True)
+        seen: list = []
+        monkeypatch.setattr(wm, "finalize_kv_cache_registrations", seen.append)
+
+        worker.compile_or_warm_up_model()
+
+        assert seen == []
 
     def test_skips_when_enforce_eager(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch, enforce_eager=True)
@@ -1196,12 +1212,14 @@ class TestDynamicKvLayoutGuards:
             cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
             vllm_config=object(),
             model_runner=SimpleNamespace(
-                initialize_kv_cache=lambda cfg: record("initialize_kv_cache")
+                initialize_kv_cache=lambda cfg: record("initialize_kv_cache"),
+                register_kv_caches_with_connector=lambda: record("register"),
             ),
             dynamic_kv=SimpleNamespace(
                 assert_attention_layout=lambda: record("attention"),
                 assert_cache_layout=lambda: record("bindings"),
                 shrink_for_compile=lambda cfg: record("shrink", cfg),
+                defers_kv_registration=False,
             ),
         )
         with (
@@ -1231,6 +1249,7 @@ class TestDynamicKvBlockCountRpcs:
             dynamic_kv=SimpleNamespace(
                 compute_num_blocks=lambda: seen.append(get_current_vllm_config()),
                 apply_num_blocks=lambda n: seen.append(get_current_vllm_config()),
+                defers_kv_registration=False,
             ),
         )
 
@@ -1240,6 +1259,90 @@ class TestDynamicKvBlockCountRpcs:
         # Identity, not just "something was set": an outer scope holding a
         # different config would satisfy a bare call.
         assert seen == [vllm_config, vllm_config]
+
+    def test_the_registration_it_drives_is_inside_that_scope(self, monkeypatch):
+        # Registration probes the attention backend for the KV block axis,
+        # which resolves the RBLN config through `get_current_vllm_config()`
+        # the same way. Running it after the scope closes kills the rank.
+        vllm_config = _make_vllm_config()
+        seen: list = []
+        worker = SimpleNamespace(
+            vllm_config=vllm_config,
+            model_runner=SimpleNamespace(
+                register_kv_caches_with_connector=(
+                    lambda: seen.append(get_current_vllm_config())
+                )
+            ),
+            dynamic_kv=SimpleNamespace(
+                apply_num_blocks=lambda n: n,
+                defers_kv_registration=True,
+            ),
+        )
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "group")
+        monkeypatch.setattr(
+            wm,
+            "finalize_kv_cache_registrations",
+            lambda g: seen.append(get_current_vllm_config()),
+        )
+
+        RBLNWorker.apply_dynamic_kv_num_blocks(worker, 4)
+
+        assert seen == [vllm_config, vllm_config]
+
+
+class TestKvRegistrationOrder:
+    """When the KV caches reach the connector.
+
+    A connector holds the addresses it was handed. The dynamic-KV resize frees
+    them after warm-up and allocates again, so that mode registers once the
+    resize is done; every other mode keeps the startup order.
+    """
+
+    @staticmethod
+    def _worker(calls, *, defers):
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
+            vllm_config=_make_vllm_config(),
+            model_runner=SimpleNamespace(
+                initialize_kv_cache=lambda cfg: calls.append("initialize_kv_cache"),
+                register_kv_caches_with_connector=lambda: calls.append("register"),
+            ),
+            dynamic_kv=SimpleNamespace(
+                assert_attention_layout=lambda: None,
+                assert_cache_layout=lambda: None,
+                shrink_for_compile=lambda cfg: cfg,
+                apply_num_blocks=lambda n: calls.append("resize"),
+                defers_kv_registration=defers,
+            ),
+        )
+
+    @pytest.fixture
+    def _connector(self, monkeypatch):
+        monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", lambda *a: None)
+        monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "group")
+        monkeypatch.setattr(wm, "finalize_kv_cache_registrations", lambda g: None)
+
+    def test_the_resize_registers_what_it_allocated(self, _connector):
+        calls: list[str] = []
+        worker = self._worker(calls, defers=True)
+
+        RBLNWorker.initialize_from_config(worker, SimpleNamespace(num_blocks=123))
+        RBLNWorker.apply_dynamic_kv_num_blocks(worker, 64)
+
+        # Startup allocates a placeholder the resize throws away, so the
+        # connector must not see it -- and the resize must come first.
+        assert calls == ["initialize_kv_cache", "resize", "register"]
+
+    def test_a_cache_nothing_replaces_registers_at_startup(self, _connector):
+        calls: list[str] = []
+        worker = self._worker(calls, defers=False)
+
+        RBLNWorker.initialize_from_config(worker, SimpleNamespace(num_blocks=123))
+        RBLNWorker.apply_dynamic_kv_num_blocks(worker, 64)
+
+        assert calls == ["initialize_kv_cache", "register", "resize"]
 
 
 class TestProfile:

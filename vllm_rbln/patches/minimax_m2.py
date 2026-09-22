@@ -24,7 +24,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches import register_patch
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
-    AUX_SLOT,
+    AUX_COMBINED,
     aux_slots_captured,
     aux_slots_received,
 )
@@ -90,7 +90,7 @@ def _forward_qk(
         "([B*L, H]) around forward_qkv and reshaping back, although a numerical no-op "
         "in eager, corrupts attention on RBLN: the flatten/unflatten roundtrip "
         "perturbs the [B, L, H] layout that the compiled rotary + flash-attention path "
-        "(and VLLM_RBLN_BATCH_ATTN_OPT) is built around. "
+        "(and --rbln-use-batch-attn-opt) is built around. "
         "Instead we split qkv on the last dim (no reshape) and apply a locally "
         "reimplemented forward_qk -- plain RMSNorm over dim=-1, which is "
         "layout-invariant -- so q/k/v reach rotary/attn in the exact layout 0.22 used. "
@@ -124,7 +124,7 @@ def patched_minimax_m2_attention_forward(
         "layer index against a stage-local one and harvests the wrong layer. It "
         "then drops `aux_hidden_states` entirely on non-last stages, while the "
         "drafter runs on the last one. Carry them in the existing IntermediateTensors "
-        "handoff under global-index slots and reassemble in layer order; no new "
+        "handoff as one tensor concatenated in layer order; no new "
         "collective is introduced. "
         "TODO(vllm-project/vllm#50514): delete once that lands and is released."
     ),
@@ -147,9 +147,8 @@ def forward(
         assert intermediate_tensors is not None
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
-        received = [
-            intermediate_tensors[f"{AUX_SLOT}{i}"] for i in aux_slots_received(self)
-        ]
+        if aux_slots_received(self):
+            received = [intermediate_tensors[AUX_COMBINED]]
 
     # Index i means "input to layer i". The pre-loop capture is first-rank only:
     # for a later stage that index is the previous stage's final capture, and
@@ -171,9 +170,9 @@ def forward(
 
     if not get_pp_group().is_last_rank:
         tensors = {"hidden_states": hidden_states, "residual": residual}
-        slots = aux_slots_received(self) + aux_slots_captured(self)
-        for index, value in zip(slots, received + captured):
-            tensors[f"{AUX_SLOT}{index}"] = value
+        aux = received + captured
+        if aux:
+            tensors[AUX_COMBINED] = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
         return IntermediateTensors(tensors)
 
     hidden_states, _ = self.norm(hidden_states, residual)
@@ -182,10 +181,11 @@ def forward(
         return hidden_states
 
     aux = received + captured
-    assert len(aux) == len(self.aux_hidden_state_layers), (
+    carried = sum(t.shape[-1] for t in aux) // self.config.hidden_size
+    assert carried == len(self.aux_hidden_state_layers), (
         f"EAGLE3 expected {len(self.aux_hidden_state_layers)} aux hidden states for "
-        f"layers {sorted(self.aux_hidden_state_layers)}, but "
-        f"{len(aux_slots_received(self))} arrived and "
+        f"layers {sorted(self.aux_hidden_state_layers)}, but the handoff carried "
+        f"{carried}: {len(aux_slots_received(self))} arrived and "
         f"{len(aux_slots_captured(self))} were captured"
     )
     return hidden_states, aux

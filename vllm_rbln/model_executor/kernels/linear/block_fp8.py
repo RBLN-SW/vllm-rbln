@@ -123,7 +123,7 @@ class RBLNW8A8BlockFp8LinearKernel(RBLNW8A16BlockFp8LinearKernel):
         from vllm_rbln.config import get_rbln_config
 
         if not get_rbln_config().use_w8a8:
-            return False, "RBLN W8A8 block fp8 kernel requires VLLM_RBLN_USE_W8A8."
+            return False, "RBLN W8A8 block fp8 kernel requires --rbln-use-w8a8."
         return True, None
 
     def apply_weights(

@@ -20,7 +20,9 @@ Then install the locked, team-identical environment with a single command:
 uv sync --extra runtime
 ```
 
-> `rebel-compiler` is separated into the `runtime` extra — it is required for NPU execution but excluded from the base dependency set. `--extra runtime` installs it alongside the rest of the locked environment.
+> `rebel-compiler` is separated into the `runtime` extra — it is required for NPU execution but excluded from the base dependency set. `--extra runtime` installs it alongside the rest of the locked environment. `nixl-rbln` and `lmcache-rbln` live in the `kv_connectors` extra; add `--extra kv_connectors` when working on the NIXL or LMCache KV connectors.
+
+> `qwen_vl_utils` is in the `examples` extra, not the base set — nothing under `vllm_rbln/` imports it. Add `--extra examples` to run the optimum multimodal examples.
 
 ## pyproject.toml vs uv.lock — what to edit when
 

@@ -11,19 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for what optimum-rbln receives on a cache-miss compile.
+"""Test config forwarding to optimum-rbln during compilation on a cache miss.
 
-vLLM's ``hf_config`` may be a vLLM-private config class (e.g. qwen3_asr) that
-transformers' model classes cannot read, so ``init_model`` does not forward it.
-It passes only the layer count (and the per-layer attention types that HF
-validates against it) as HF config kwargs, nested under ``text_config`` for
-composite models. Everything that needs an NPU is faked.
+Configs defined in transformers are passed directly as objects. Other configs
+are passed as kwargs containing ``num_hidden_layers`` and, when available,
+``layer_types``, nested under ``text_config`` for composite models.
+NPU-dependent operations are replaced with test doubles.
 """
 
 import types
 
 import torch
+from transformers import Gemma4Config
 
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
 
@@ -62,7 +63,9 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
         max_num_seqs=1, max_num_batched_tokens=128
     )
     obj.vllm_config = types.SimpleNamespace(
-        additional_config={"cached_model_path": str(tmp_path)},
+        # What `check_and_update` leaves on the config, which is what
+        # `init_model` reads its options off.
+        additional_config=OptimumRBLNConfig(cached_model_path=str(tmp_path)),
         model_config=obj.model_config,
         scheduler_config=obj.scheduler_config,
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
@@ -73,8 +76,8 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
 
 
 def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_path):
-    # hf_overrides={"num_hidden_layers": 2} on a text-only model: the override
-    # lands on the top-level config, and vLLM's config object stays out.
+    # For a flat non-transformers config, pass layer settings as top-level
+    # kwargs rather than passing the config object.
     hf_config = types.SimpleNamespace(
         architectures=["Qwen3ForCausalLM"],
         num_hidden_layers=2,
@@ -91,8 +94,8 @@ def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_pat
 
 
 def test_composite_config_nests_layer_count_under_text_config(monkeypatch, tmp_path):
-    # A vLLM-private composite config (qwen3_asr keeps the text config under
-    # thinker_config): the override must reach HF's text_config sub-config.
+    # For a composite non-transformers config, nest the layer override under
+    # text_config rather than passing it as a top-level kwarg.
     text_config = types.SimpleNamespace(num_hidden_layers=2)
     hf_config = types.SimpleNamespace(
         architectures=["Qwen3ASRForConditionalGeneration"],
@@ -103,4 +106,17 @@ def test_composite_config_nests_layer_count_under_text_config(monkeypatch, tmp_p
 
     assert "config" not in passed
     assert passed["text_config"] == {"num_hidden_layers": 2}
+    assert "num_hidden_layers" not in passed
+
+
+def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_path):
+    # gemma4's config carries per-layer state that the kwargs cannot reproduce,
+    # and transformers defines the class, so the object itself goes through.
+    hf_config = Gemma4Config()
+    hf_config.architectures = ["Gemma4ForConditionalGeneration"]
+
+    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+
+    assert passed["config"] is hf_config
+    assert "text_config" not in passed
     assert "num_hidden_layers" not in passed

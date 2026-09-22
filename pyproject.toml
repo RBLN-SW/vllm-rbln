@@ -38,7 +38,6 @@ dependencies = [
     "setuptools-scm>=8",
     "pyyaml",
     "datasets>=4.0.0",
-    "qwen_vl_utils",
     "vllm==0.26.0+cpu",
     # vllm 0.26.0 imports openai.types.responses.NamespaceTool (openai>=2.25.0) but declares openai>=2.0.0
     "openai>=2.25.0",
@@ -52,6 +51,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+examples = [
+    "qwen_vl_utils",
+]
 test = [
     "pytest",
     "pytest-asyncio",
@@ -74,6 +76,10 @@ dev = [
 
 runtime = [
     "rebel-compiler~=0.11.3.dev499",
+]
+kv_connectors = [
+    "nixl-rbln>=0.1.0.dev0,<0.1.1",
+    "lmcache-rbln>=0.12.0.dev0,<0.12.1",
 ]
 
 

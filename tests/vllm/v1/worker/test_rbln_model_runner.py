@@ -355,6 +355,9 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
             decode_batch_buckets=[2, 4], max_batch_size=4
         ),
         max_num_reqs=8,
+        input_batch=SimpleNamespace(
+            top_p=torch.ones(8), top_k=torch.ones(8, dtype=torch.int32)
+        ),
         rejection_sampler=SimpleNamespace(
             impl=SimpleNamespace(rejection_sample=rejection_sample)
         ),
@@ -362,17 +365,38 @@ def test_rejection_sampler_warmup_uses_per_stage_batch_bound():
 
     runner._warmup_sampler_decode_batches()
 
-    # One call per bonus-token graph: the argmax-in-graph one an all-greedy
-    # step without logprobs takes, and the pre-sampled-ids one every other
-    # step takes. Both are warmed at the same batch bound.
-    assert rejection_sample.call_count == 2
+    # One call per graph, all at the batch bound; a filtered random pattern
+    # twice, once with buffer views and once with torch.cat metadata.
+    buffers = {runner.input_batch.top_k.data_ptr(), runner.input_batch.top_p.data_ptr()}
+    variants = []
     for call in rejection_sample.call_args_list:
         assert len(call.args[1]) == 4
-    variants = [
-        (call.args[6] is None, call.kwargs["bonus_logits"] is None)
-        for call in rejection_sample.call_args_list
-    ]
-    assert sorted(variants) == [(False, True), (True, False)]
+        metadata = call.args[7]
+        filters = [t for t in (metadata.top_k, metadata.top_p) if t is not None]
+        variants.append(
+            (
+                call.args[6] is None,
+                call.kwargs["bonus_logits"] is None,
+                metadata.all_greedy,
+                metadata.top_k is None,
+                metadata.top_p is None,
+                bool(filters) and filters[0].data_ptr() in buffers,
+            )
+        )
+    # (no bonus ids, no bonus logits, all_greedy, no top_k, no top_p, buffer view)
+    assert sorted(variants) == sorted(
+        [
+            (False, True, True, True, True, False),  # bonus ids (logprobs)
+            (True, False, True, True, True, False),  # all-greedy argmax in the graph
+            (True, False, False, True, True, False),  # random, no filter
+            (True, False, False, True, False, True),  # random, top_p, buffer view
+            (True, False, False, True, False, False),  # random, top_p, torch.cat
+            (True, False, False, False, True, True),  # random, top_k, buffer view
+            (True, False, False, False, True, False),  # random, top_k, torch.cat
+            (True, False, False, False, False, True),  # random, top_k+top_p, view
+            (True, False, False, False, False, False),  # random, top_k+top_p, cat
+        ]
+    )
 
 
 class TestPredicates:
@@ -654,10 +678,11 @@ class TestShapeConfigWiring:
         # both need data parallelism to specialize at all -- so this runner is built
         # with a peer and a ladder of buckets, or the top and the first would be the
         # same entry and the answers indistinguishable.
-        monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", "4")
-        runner = make_model_runner(data_parallel_size=2, max_num_seqs=8)
-        monkeypatch.undo()
+        runner = make_model_runner(
+            data_parallel_size=2,
+            max_num_seqs=8,
+            additional_config={"decode_batch_bucket_limit": 4},
+        )
         buckets = runner.bucketing_manager.decode_batch_buckets
         assert len(buckets) > 1, buckets
 
@@ -1176,21 +1201,23 @@ class TestCalcSpecDecodeMetadata:
 
 class TestSortBatchByLength:
     # __init__ enables the sort on REBEL CR13 and wherever
-    # VLLM_RBLN_BATCH_ATTN_OPT is set; other parts keep the scheduler's order.
+    # --rbln-use-batch-attn-opt is set; other parts keep the scheduler's order.
     @pytest.mark.parametrize(
         ("is_cr13", "use_batch_attn_opt", "expected"),
         [
-            (True, "0", True),
-            (False, "0", False),
-            (False, "1", True),
+            (True, False, True),
+            (False, False, False),
+            (False, True, True),
         ],
     )
     def test_resolved_from_device_and_flag(
         self, monkeypatch, make_model_runner, is_cr13, use_batch_attn_opt, expected
     ):
         monkeypatch.setattr(current_platform, "is_cr13", lambda: is_cr13)
-        monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", use_batch_attn_opt)
-        runner = make_model_runner(init_kv_cache=False)
+        runner = make_model_runner(
+            init_kv_cache=False,
+            additional_config={"use_batch_attn_opt": use_batch_attn_opt},
+        )
         assert runner.sort_batch_by_length is expected
 
 
