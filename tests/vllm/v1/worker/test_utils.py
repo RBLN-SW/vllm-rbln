@@ -1461,8 +1461,6 @@ class TestDynamicKvUnsupportedReason:
         )
 
     def test_the_triton_kernels_are_unsupported(self):
-        # rbln_triton_ops goes through the compiler's triton converter, so the
-        # KV input never reaches a whitelisted paged_* custom op.
         reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))
         assert "RBLN_USE_CUSTOM_KERNEL" in reason
 

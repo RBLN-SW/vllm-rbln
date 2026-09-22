@@ -500,6 +500,10 @@ def _params():
 
 
 class TestDetermineAvailableMemory:
+    @pytest.fixture(autouse=True)
+    def _device_tensor_on(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
     # Isolates the worker's own arithmetic by capturing the kwargs it hands to
     # the already-tested estimate_available_memory. Golden values are _params().
     @staticmethod
@@ -754,6 +758,10 @@ class TestDetermineAvailableMemory:
 
 
 class TestInitializeFromConfig:
+    @pytest.fixture(autouse=True)
+    def _device_tensor_on(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
     @staticmethod
     def _init(make_worker, monkeypatch, kv_cfg, *, dynamic=True):
         worker = make_worker()

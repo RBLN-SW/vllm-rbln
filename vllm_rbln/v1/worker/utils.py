@@ -315,12 +315,12 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
     """Why this configuration cannot size its KV cache from the compiled
     placement, or None when it can.
 
-    Every reason here is a property of the deployment or of the kernel the model
-    dispatches to, not a request from the caller, so the feature turns itself off
-    and the run serves the pre-compile estimate. A caller who asked for something
-    the mechanism then fails at still gets a hard failure: those live in
-    `DynamicKvSizer`. The optimum path is not among them -- it installs neither
-    the engine patch nor a worker that carries a sizer.
+    Every reason here is decidable before the compile, from the deployment or
+    the kernel the model dispatches to. With `use_dynamic_kv_cache` unset the
+    feature turns itself off on one and serves the pre-compile estimate; set,
+    start-up refuses with the same reason. What fails only after the compile
+    is a hard failure in `DynamicKvSizer`. The optimum path is not among them --
+    it installs neither the engine patch nor a worker that carries a sizer.
     """
     if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
         return (

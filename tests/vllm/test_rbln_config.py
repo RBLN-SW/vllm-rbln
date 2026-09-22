@@ -288,6 +288,9 @@ def test_only_compile_fields_change_the_hash():
     assert RBLNConfig(decode_batch_bucket_strategy="linear").compute_hash() != base
     buckets = RBLNConfig(decode_batch_bucket_manual_buckets=[1, 2, 4])
     assert buckets.compute_hash() != base
+    # Unset and True resolve to the same graph; False compiles a static one.
+    assert RBLNConfig(use_dynamic_kv_cache=True).compute_hash() == base
+    assert RBLNConfig(use_dynamic_kv_cache=False).compute_hash() != base
 
 
 class TestResolveModelImpl:

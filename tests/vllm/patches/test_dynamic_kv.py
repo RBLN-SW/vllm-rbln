@@ -28,8 +28,8 @@ from vllm_rbln.v1.worker.utils import minimum_kv_blocks
 
 
 class TestOverrideBranch:
-    """`--num-gpu-blocks-override` keeps the pool, but a dry run still asks the
-    workers for their report."""
+    """`--num-gpu-blocks-override`, an unsupported configuration and an explicit
+    off all keep the pool without asking the workers."""
 
     @staticmethod
     def _engine(calls):

@@ -292,10 +292,10 @@ environment_variables = {
         )
     ),
     # Disable only for debugging worker failures without terminating the worker.
-    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: (
-        os.environ.get("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False").lower()
-        in ("true", "1")
-    ),
+    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: os.environ.get(
+        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False"
+    ).lower()
+    in ("true", "1"),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
