@@ -124,6 +124,13 @@ class RBLNScheduler(Scheduler):
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
         self._kv_load_failure_req_ids: set[str] = set()
+        groups = self.kv_cache_config.kv_cache_groups
+        self._hybrid_kv_cache = len(groups) > 1 or (
+            bool(groups) and isinstance(groups[0].kv_cache_spec, SlidingWindowSpec)
+        )
+        self._preempted_hybrid_blocks: dict[
+            str, tuple[tuple[tuple[int, ...], ...], int]
+        ] = {}
 
         # NOTE(RBLN): PP degree for the per-step decode-admission budget
         # (DecodeBatchBudget.for_step): hard cap = max_num_seqs // pp, soft cap =
@@ -479,6 +486,13 @@ class RBLNScheduler(Scheduler):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
+                if (
+                    request_id in self._preempted_hybrid_blocks
+                    and request.num_in_flight_tokens
+                ):
+                    # Keep ordinary preemptions in waiting: a valid in-flight
+                    # output may finish them before they resume.
+                    break
                 if request_id in self._kv_load_failure_req_ids:
                     if request.num_in_flight_tokens:
                         request_queue.pop_request()
@@ -1037,9 +1051,7 @@ class RBLNScheduler(Scheduler):
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
     ) -> set[str]:
         groups = self.kv_cache_config.kv_cache_groups
-        if len(groups) == 1 and not isinstance(
-            groups[0].kv_cache_spec, SlidingWindowSpec
-        ):
+        if not self._hybrid_kv_cache:
             return super()._handle_invalid_blocks(
                 invalid_block_ids, num_scheduled_tokens
             )
@@ -1055,22 +1067,38 @@ class RBLNScheduler(Scheduler):
                 RequestStatus.WAITING_FOR_REMOTE_KVS,
             )
         ]
+        pending.extend(
+            self.requests[request_id]
+            for request_id in self._preempted_hybrid_blocks
+            if self.requests[request_id].status == RequestStatus.PREEMPTED
+        )
         # A consumer may have reclaimed the failed SWA block while retaining
         # full-attention blocks produced from it. Follow shared dependencies.
         while pending:
             previous_count = len(pending)
             for request in list(pending):
-                blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks
-                computed = request.num_computed_tokens - num_scheduled_tokens.get(
-                    request.request_id, 0
-                )
+                if request.status == RequestStatus.PREEMPTED:
+                    block_ids, computed = self._preempted_hybrid_blocks[
+                        request.request_id
+                    ]
+                else:
+                    block_ids = tuple(
+                        tuple(
+                            block.block_id if not block.is_null else -1 for block in b
+                        )
+                        for b in self.kv_cache_manager.get_blocks(
+                            request.request_id
+                        ).blocks
+                    )
+                    computed = request.num_computed_tokens
+                computed -= num_scheduled_tokens.get(request.request_id, 0)
                 first_invalid_token = min(
                     (
                         index * group.kv_cache_spec.block_size
-                        for group, group_blocks in zip(groups, blocks, strict=True)
-                        for index, block in enumerate(group_blocks)
-                        if not block.is_null
-                        and block.block_id in blocks_to_evict
+                        for group, group_blocks in zip(groups, block_ids, strict=True)
+                        for index, block_id in enumerate(group_blocks)
+                        if block_id >= 0
+                        and block_id in blocks_to_evict
                         and index * group.kv_cache_spec.block_size < computed
                     ),
                     default=None,
@@ -1079,10 +1107,10 @@ class RBLNScheduler(Scheduler):
                     affected.append(request)
                     pending.remove(request)
                     blocks_to_evict.update(
-                        block.block_id
-                        for group, group_blocks in zip(groups, blocks, strict=True)
-                        for index, block in enumerate(group_blocks)
-                        if not block.is_null
+                        block_id
+                        for group, group_blocks in zip(groups, block_ids, strict=True)
+                        for index, block_id in enumerate(group_blocks)
+                        if block_id >= 0
                         and (index + 1) * group.kv_cache_spec.block_size
                         > first_invalid_token
                     )
@@ -1095,9 +1123,10 @@ class RBLNScheduler(Scheduler):
         if self.recompute_kv_load_failures and affected:
             for request in reversed(affected):
                 request.skip_reading_prefix_cache = True
-                if request.status == RequestStatus.RUNNING:
-                    self.running.remove(request)
-                    self._preempt_request(request, time.monotonic())
+                if request.status in (RequestStatus.RUNNING, RequestStatus.PREEMPTED):
+                    if request.status == RequestStatus.RUNNING:
+                        self.running.remove(request)
+                        self._preempt_request(request, time.monotonic())
                     self._kv_load_failure_req_ids.add(request.request_id)
                     request.num_output_placeholders = 0
                     # Keep stale speculative outputs suppressed until all
@@ -1121,6 +1150,21 @@ class RBLNScheduler(Scheduler):
     def _preempt_request(
         self, request: Request, timestamp: float
     ) -> dict[str, Any] | None:
+        if (
+            self.connector is not None
+            and self._hybrid_kv_cache
+            and request.num_in_flight_tokens
+        ):
+            blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks
+            self._preempted_hybrid_blocks[request.request_id] = (
+                tuple(
+                    tuple(
+                        block.block_id if not block.is_null else -1 for block in group
+                    )
+                    for group in blocks
+                ),
+                request.num_computed_tokens,
+            )
         # Preempted requests resume with full block tables, so pending deltas
         # from the previous running state are stale.
         self._pending_runner_block_deltas.pop(request.request_id, None)
@@ -1171,6 +1215,7 @@ class RBLNScheduler(Scheduler):
         # never be scheduled again.
         self._pending_runner_block_deltas.pop(request.request_id, None)
         self._kv_load_failure_req_ids.discard(request.request_id)
+        self._preempted_hybrid_blocks.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(
@@ -1180,6 +1225,10 @@ class RBLNScheduler(Scheduler):
     ) -> dict[int, EngineCoreOutputs]:
         assert isinstance(scheduler_output, RBLNSchedulerOutput)
         result = super().update_from_output(scheduler_output, model_runner_output)
+        for request_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(request_id)
+            if request is None or not request.num_in_flight_tokens:
+                self._preempted_hybrid_blocks.pop(request_id, None)
 
         if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
             # Now that execute_model has written KV data and
@@ -1233,7 +1282,7 @@ class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
     all_reduce only run after step N's output. AsyncScheduler fixes this by
     bumping num_output_placeholders at schedule time.
 
-    Empty by design: RBLNScheduler defines neither _update_after_schedule nor
-    _update_request_with_output, so both resolve to AsyncScheduler via the MRO
-    RBLNAsyncScheduler -> RBLNScheduler -> AsyncScheduler -> Scheduler.
+    AsyncScheduler supplies _update_after_schedule through the MRO.
+    RBLNScheduler._update_request_with_output drops stale recovery frames,
+    then delegates normal outputs to AsyncScheduler via super().
     """

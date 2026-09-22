@@ -294,6 +294,53 @@ class TestHybridLoadFailure:
         _drain(sched)
         assert request.is_finished()
 
+    @pytest.mark.parametrize("recompute", [False, True])
+    def test_load_failure_after_preemption_discards_invalid_output(self, recompute):
+        sched = self._scheduler(async_scheduling=True)
+        sched.recompute_kv_load_failures = recompute
+        request = self._request(num_tokens=64)
+        sched.add_request(request)
+        output = sched.schedule()
+        groups = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        failed_block = groups[1][2].block_id
+        sched.running.remove(request)
+        sched._preempt_request(request, 0.0)
+        waiting = sched.schedule()
+        assert request.request_id not in waiting.num_scheduled_tokens
+        result = make_model_runner_output(output, 100)
+        result.kv_connector_output = KVConnectorOutput(invalid_block_ids={failed_block})
+
+        sched.update_from_output(output, result)
+
+        assert not request.output_token_ids
+        if recompute:
+            assert request.skip_reading_prefix_cache
+            _drain(sched)
+            assert list(request.output_token_ids) == [0, 0]
+        else:
+            assert request.status == RequestStatus.FINISHED_ERROR
+            assert request.request_id not in sched.requests
+        assert not sched._preempted_hybrid_blocks
+
+    def test_preempted_request_can_finish_while_waiting_for_inflight_output(self):
+        sched = self._scheduler(async_scheduling=True)
+        request = self._request(num_tokens=64)
+        request.max_tokens = 1
+        sched.add_request(request)
+        output = sched.schedule()
+        sched.running.remove(request)
+        sched._preempt_request(request, 0.0)
+        waiting = sched.schedule()
+        assert request.request_id not in waiting.num_scheduled_tokens
+
+        sched.update_from_output(output, make_model_runner_output(output, 100))
+
+        assert list(request.output_token_ids) == [100]
+        assert request.is_finished()
+        assert not sched.waiting and not sched.skipped_waiting
+        assert not sched._preempted_hybrid_blocks
+        assert not sched.schedule().num_scheduled_tokens
+
     def test_failure_does_not_propagate_through_valid_shared_prefix(self):
         sched = self._scheduler()
         manager = sched.kv_cache_manager
