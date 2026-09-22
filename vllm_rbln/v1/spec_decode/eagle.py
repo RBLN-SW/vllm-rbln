@@ -488,9 +488,9 @@ class RBLNEagleProposer(EagleProposer):
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens_per_req,
             max_seq_len=seq_lens.max().item(),
-            block_table_tensor=self.runner.input_batch.block_table[0].get_cpu_tensor()[
-                :num_reqs
-            ],
+            block_table_tensor=self.runner.input_batch.block_table[
+                self.kv_cache_gid
+            ].get_cpu_tensor()[:num_reqs],
             slot_mapping=torch.tensor(0),  # dummy
             causal=True,
         )

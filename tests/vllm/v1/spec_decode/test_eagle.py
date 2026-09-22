@@ -929,3 +929,29 @@ class TestBuildDummyAttnMetadata:
         assert cad.seq_lens.cpu().tolist() == [2, 2, 2]
         assert cad.num_actual_tokens == 6
         assert cad.max_query_len == 2
+
+    def test_takes_the_block_table_of_the_drafters_own_group(self):
+        # A hybrid target's groups have block tables of different widths, so a
+        # draft graph compiled at warm-up against one group rejects the tensor
+        # `propose` hands it from the group `kv_cache_gid` names.
+        proposer = make_eagle_proposer(num_speculative_tokens=1)
+        proposer.kv_cache_gid = 1
+        proposer.runner = SimpleNamespace(
+            is_prefill=False,
+            input_batch=SimpleNamespace(
+                block_table=[
+                    SimpleNamespace(
+                        get_cpu_tensor=lambda: torch.zeros((8, 1024), dtype=torch.int32)
+                    ),
+                    SimpleNamespace(
+                        get_cpu_tensor=lambda: torch.zeros((8, 128), dtype=torch.int32)
+                    ),
+                ]
+            ),
+            _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
+                np.cumsum(nt, dtype=cumsum_dtype),
+                None,
+            ),
+        )
+        cad = proposer._build_dummy_attn_metadata(num_reqs=3, num_tokens_per_req=2)
+        assert cad.block_table_tensor.shape == (3, 128)
