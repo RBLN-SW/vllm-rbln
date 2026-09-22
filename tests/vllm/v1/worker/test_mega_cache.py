@@ -44,7 +44,22 @@ def _raiser(exc):
 
 
 def _stub_config(digest: str = "cfghash"):
-    return SimpleNamespace(compute_hash=lambda: digest)
+    return SimpleNamespace(
+        compute_hash=lambda: digest,
+        additional_config=SimpleNamespace(
+            use_custom_kernel=False,
+            use_flash_causal_attn=True,
+            use_dynamic_kv_cache=None,
+        ),
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            block_size=16,
+            num_gpu_blocks_override=None,
+            gpu_memory_utilization=0.9,
+        ),
+        model_config=SimpleNamespace(max_model_len=32),
+        kv_transfer_config=None,
+    )
 
 
 class TestRebelVersion:
@@ -87,13 +102,24 @@ class TestSignatureComposition:
         monkeypatch.setattr(mega_cache, "_rebel_major_minor", lambda: "0.12")
         assert mega_cache.config_signature(_stub_config()) != before
 
+    def test_resolved_dynamic_kv_decision_invalidates(self, monkeypatch):
+        enabled = True
+        monkeypatch.setattr(
+            mega_cache,
+            "dynamic_kv_enabled",
+            lambda config: enabled,
+        )
+        dynamic = mega_cache.config_signature(_stub_config())
+        enabled = False
+        static = mega_cache.config_signature(_stub_config())
+        assert dynamic != static
+
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this
-# is the only route into the key. One per type still on this route, since what
-# has to survive is the round trip through normalize_value()/hash_factors().
+# is the only route into the key. What has to survive is the round trip through
+# normalize_value()/hash_factors().
 GRAPH_ENV = [
     ("VLLM_RBLN_NUM_HIDDEN_LAYERS", "0", "4"),  # int
-    ("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0", "1"),  # bool
 ]
 
 # Variables that must not move it. Each value differs from that variable's
@@ -102,6 +128,8 @@ RUNTIME_ENV = [
     ("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "1"),
     # Sampler graphs compile with use_cache=False, so they never enter a bundle.
     ("VLLM_RBLN_SAMPLER", "0"),
+    # Resolved into `RBLNConfig.use_dynamic_kv_cache`, which the config hashes.
+    ("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0"),
     # Must stay out, or a bundle compiled on a CPU host misses on the NPU host.
     ("VLLM_RBLN_COMPILE_ONLY", "1"),
     ("VLLM_RBLN_ENABLE_WARM_UP", "0"),

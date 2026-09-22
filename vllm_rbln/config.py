@@ -99,6 +99,12 @@ class RBLNConfig(RBLNConfigBase):
     use_custom_kernel: bool = False
     """Use the custom RBLN kernels."""
 
+    use_dynamic_kv_cache: bool | None = None
+    """Size the KV cache from the compiled placement and the device instead of
+    the pre-compile estimate. Unset, a configuration the path cannot size turns
+    it off on its own; True refuses such a configuration at start-up; False
+    keeps the estimate."""
+
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
 
@@ -154,7 +160,10 @@ class RBLNConfig(RBLNConfigBase):
             "enable_sub_block_cache",
             "sub_block_size",
         }
-        return hash_factors(get_hash_factors(self, ignored_factors))
+        factors = get_hash_factors(self, ignored_factors)
+        # Unset and True build the same graph; only False changes the artifact.
+        factors["use_dynamic_kv_cache"] = self.use_dynamic_kv_cache is not False
+        return hash_factors(factors)
 
     def __post_init__(self) -> None:
         buckets = self.decode_batch_bucket_manual_buckets

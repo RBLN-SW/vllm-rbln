@@ -71,6 +71,7 @@ from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
     compile_and_warmup_skip_reason,
+    dynamic_kv_enabled,
     estimate_model_kernel_size,
     get_rbln_planned_affinity_cpu_count,
     read_rbln_card_dram_used_bytes,
@@ -180,7 +181,7 @@ class RBLNWorker(WorkerBase):
         # nothing.
         foreign_dram_used_bytes = (
             read_rbln_card_dram_used_bytes()
-            if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
+            if dynamic_kv_enabled(self.vllm_config)
             else 0
         )
 
@@ -462,15 +463,11 @@ class RBLNWorker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        self.dynamic_kv.assert_attention_layout()
-
         self.model_runner.initialize_kv_cache(
             self.dynamic_kv.shrink_for_compile(kv_cache_config)
         )
         if not self.dynamic_kv.defers_kv_registration:
             self.model_runner.register_kv_caches_with_connector()
-
-        self.dynamic_kv.assert_cache_layout()
 
     def compute_dynamic_kv_num_blocks(self) -> int | None:
         """RPC target of the engine's dynamic-KV patch; see

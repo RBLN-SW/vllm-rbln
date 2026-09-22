@@ -187,6 +187,18 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
             reconfigure(lambda config: None)
 
+    def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
+        def custom_kernel(dynamic):
+            def mutate(config):
+                config.additional_config.use_custom_kernel = True
+                config.additional_config.use_dynamic_kv_cache = dynamic
+
+            return mutate
+
+        with pytest.raises(ValueError, match="RBLN_USE_CUSTOM_KERNEL"):
+            reconfigure(custom_kernel(True))
+        reconfigure(custom_kernel(None))
+
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
@@ -785,107 +797,6 @@ class TestKnownGaps:
         )
         assert config.model_config.hf_config.sliding_window == 512
         assert config.cache_config.enable_prefix_caching is True
-
-
-class TestDynamicKvConfig:
-    """VLLM_RBLN_USE_DYNAMIC_KV_CACHE is validated at config time, before the
-    model loads; the worker keeps only the checks that read runtime state."""
-
-    @staticmethod
-    def _cfg(use_mla=False, speculative_config=None, kv_transfer_config=None):
-        return SimpleNamespace(
-            model_config=SimpleNamespace(use_mla=use_mla),
-            speculative_config=speculative_config,
-            kv_transfer_config=kv_transfer_config,
-            additional_config={},
-        )
-
-    @pytest.fixture(autouse=True)
-    def _dynamic_kv(self, monkeypatch):
-        # The guard reads the path this process adopted, which in production is
-        # `create_engine_config`'s answer and here is the suite's.
-        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
-        monkeypatch.setattr(platform, "_MODEL_IMPL", "vllm")
-
-    def test_a_clean_config_passes(self):
-        RblnPlatform._validate_dynamic_kv_config(self._cfg())
-
-    def test_needs_the_vllm_model_path(self, monkeypatch):
-        monkeypatch.setattr(platform, "_MODEL_IMPL", "optimum")
-        with pytest.raises(ValueError, match="--model-impl vllm"):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg())
-
-    def test_mla_passes(self):
-        RblnPlatform._validate_dynamic_kv_config(self._cfg(use_mla=True))
-
-    def test_speculative_decoding_passes(self):
-        RblnPlatform._validate_dynamic_kv_config(
-            self._cfg(speculative_config=SimpleNamespace())
-        )
-
-    def test_an_unlisted_kv_transfer_connector_is_rejected(self):
-        # The resize reallocates the cache after warm-up and the worker drives
-        # the registration behind it. That is connector-agnostic, so the set is
-        # a policy and the message names the connector that was asked for.
-        with pytest.raises(ValueError, match="RBLNLMCacheConnectorV1"):
-            RblnPlatform._validate_dynamic_kv_config(
-                self._cfg(
-                    kv_transfer_config=SimpleNamespace(
-                        kv_connector="RBLNLMCacheConnectorV1"
-                    )
-                )
-            )
-
-    def test_the_rbln_nixl_read_path_passes(self):
-        RblnPlatform._validate_dynamic_kv_config(
-            self._cfg(
-                kv_transfer_config=SimpleNamespace(kv_connector="RblnNixlPullConnector")
-            )
-        )
-
-    def test_a_dry_run_reports_every_refusal_instead_of_raising(
-        self, monkeypatch, caplog
-    ):
-        """A dry run changes nothing, so refusing would stop a run the flag off
-        would have served. Each shape is reported and the run continues."""
-        monkeypatch.setenv("VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", "1")
-        monkeypatch.setattr(platform, "_MODEL_IMPL", "optimum")
-        with (
-            patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
-            caplog.at_level("WARNING"),
-        ):
-            RblnPlatform._validate_dynamic_kv_config(
-                self._cfg(
-                    kv_transfer_config=SimpleNamespace(
-                        kv_connector="RBLNLMCacheConnectorV1"
-                    )
-                )
-            )
-        assert "--model-impl vllm" in caplog.text
-        assert "VLLM_RBLN_USE_DEVICE_TENSOR=1" in caplog.text
-        assert "RBLNLMCacheConnectorV1" in caplog.text
-        assert caplog.text.count("dynamic KV cache dry run:") == 3
-
-    def test_device_tensor_off_is_refused(self):
-        with (
-            patch("vllm_rbln.platform.USE_DEVICE_TENSOR", False),
-            pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR=1"),
-        ):
-            RblnPlatform._validate_dynamic_kv_config(self._cfg())
-
-    def test_the_hook_validates_only_under_the_flag(self, monkeypatch, reconfigure):
-        seen: list = []
-        with patch.object(
-            RblnPlatform,
-            "_validate_dynamic_kv_config",
-            side_effect=lambda cfg: seen.append(cfg),
-        ):
-            monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0")
-            reconfigure(lambda config: None)
-            assert seen == []
-            monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "1")
-            reconfigure(lambda config: None)
-            assert len(seen) == 1
 
 
 class TestDflashTokenBudget:

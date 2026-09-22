@@ -114,6 +114,16 @@ def _validate(vllm_config: "VllmConfig") -> None:
                 "It is on by default; drop --no-rbln-use-moe-tokens-mask."
             )
 
+    if rbln_config.use_dynamic_kv_cache is True:
+        from vllm_rbln.v1.worker.utils import dynamic_kv_unsupported_reason
+
+        if (reason := dynamic_kv_unsupported_reason(vllm_config)) is not None:
+            raise ValueError(
+                "--rbln-use-dynamic-kv-cache is set, but this configuration "
+                f"cannot size its KV cache from the compiled placement: {reason}. "
+                "Leave it unset to serve the pre-compile estimate."
+            )
+
     if (
         vllm_config.speculative_config is not None
         and vllm_config.speculative_config.method == "dflash"

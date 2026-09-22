@@ -1,11 +1,12 @@
 ## Dynamic KV Cache Sizing Overview
 
-By default the KV cache is sized from a pre-compile estimate of free device
-memory. That estimate is a whole-card figure and has no notion of chiplets, so on
-a quad-chiplet card it can exceed the per-chiplet budget and the engine allocates
-a cache that does not fit.
+The KV cache is sized from the compiled artifact's placement and a per-chiplet
+memory snapshot. The alternative, which `--no-rbln-use-dynamic-kv-cache` goes
+back to, is a pre-compile estimate of free device memory: a whole-card figure
+with no notion of chiplets, so on a quad-chiplet card it can exceed the
+per-chiplet budget and the engine allocates a cache that does not fit.
 
-With the flag on and a device present, the pre-compile estimate itself is taken
+With the feature on and a device present, the pre-compile estimate itself is taken
 per chiplet: before the compile, the worker snapshots every chiplet's
 `(total, used)` (the same snapshot the final sizing uses, below) and replaces the
 whole-card capacity with `chiplets * min_c(total_c * gpu_memory_utilization -
@@ -14,7 +15,7 @@ weights reach the device only when the compiled programs load. This estimate is
 still only the starting point: the count that serves comes from the placement
 after warm-up.
 
-With `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1` the worker marks the KV cache's
+The worker marks the KV cache's
 `num_blocks` dimension dynamic at compile time, compiles against a small
 compile-time cache, and after warm-up sizes the real cache from two measurements:
 
@@ -56,8 +57,22 @@ reallocates the KV tensors at that size and re-announces the count to the
 scheduler. No recompilation happens, because the affected dimension is already
 dynamic.
 
-> The dynamic path requires `--model-impl vllm` and
-> `VLLM_RBLN_USE_DEVICE_TENSOR=1`. Only `DynamoRuntime` applies adaptive buffer
+### KV transfer connectors
+
+A connector registers the KV cache's physical views, and a resize replaces those
+views right after warm-up. So in the one mode that reallocates
+(`DynamicKvSizer.defers_kv_registration`, i.e. ACTIVE) the worker skips the
+warm-up registration and runs the whole of it from `apply_dynamic_kv_num_blocks`,
+after the resize has allocated: `register_kv_caches_with_connector` rebuilds the
+mapping from the tensors the runner is holding. The RBLN NIXL connectors take
+their block count from `cache_config.num_gpu_blocks` at that point instead of the
+pre-compile estimate copied at construction; `RBLNLMCacheConnectorV1` binds the
+actual post-resize tensors and does not cache a block count. Nothing is registered
+early, so nothing has to be unregistered. Every other mode keeps the start-up
+order.
+
+> The dynamic path needs `--model-impl vllm` and `VLLM_RBLN_USE_DEVICE_TENSOR=1`,
+> and turns itself off without them. Only `DynamoRuntime` applies adaptive buffer
 > sizes; the other runtimes ignore them silently.
 
 Key components:
@@ -75,14 +90,12 @@ Key components:
 
 ## Enabling and Configuring
 
-| Variable | Default | Description |
+| Option | Default | Description |
 | --- | --- | --- |
-| `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `0` | Size the KV cache from the compiled placement and the device instead of the pre-compile estimate. Off means the estimate, exactly as before. |
-| `VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN` | `0` | Compute the count and log how the count vllm sized fits each chiplet, but resize nothing. Implies the flag above, so it is the only variable a trial run needs. |
+| `--rbln-use-dynamic-kv-cache` (`additional_config={"use_dynamic_kv_cache": ...}`) | unset | Size the KV cache from the compiled placement and the device. `--no-rbln-use-dynamic-kv-cache` goes back to the pre-compile estimate. Unset, a configuration the path cannot size turns it off on its own; set, such a configuration is refused at start-up. `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` still sets it, with a deprecation warning, until 0.14.0. |
 
 ```bash
 export VLLM_RBLN_USE_DEVICE_TENSOR=1
-export VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1
 export VLLM_CACHE_ROOT=<a fresh directory>
 ```
 
@@ -93,65 +106,39 @@ from the environment. It is a trace hint for the dynamic dimension, not a
 capacity: the count that ends up in service comes from the placement and the
 snapshot.
 
-Use a separate `VLLM_CACHE_ROOT` per configuration. The compile cache hash does
-not include dynamism, so a static and a dynamic build of the same model share one
-signature and can replay each other's codegen.
+The mega-cache bundle key includes the resolved dynamic-KV decision, not only
+the environment flag. A configuration that turns the feature off therefore
+cannot replay a dynamic artifact, or vice versa.
 
 When the pre-compile estimate falls short of one max-length request, it is
 raised to exactly that with a warning instead of letting vllm refuse the compile:
 under the shrink the estimate is only the placeholder the model is compiled with,
 and the count the device can hold is sized after warm-up, where a pool below one
-request is refused with the same message. Only under the shrink -- a dry run, an
-override and a skipped compile all serve this estimate, so raising it there would
-change the pool rather than report on it.
+request is refused with the same message. Only under the shrink -- an override
+and a skipped compile both serve this estimate, so raising it there would change
+the pool rather than report on it.
 
-### Dry run
+## Where It Turns Itself Off
 
-`VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN=1` (on its own; it implies the flag) keeps every count
-as it is today -- the pre-compile estimate or `--num-gpu-blocks-override`, whichever
-vllm would have used -- and only reports. The KV dim is still marked dynamic,
-since that is what makes the compiled programs carry a placement, but the cache is
-not shrunk for the compile and nothing is reallocated after warm-up. Two lines
-carry the result:
-
-- at the pre-compile estimate, what the per-chiplet snapshot would have put the
-  estimate at, next to the whole-card formula that is kept;
-- after warm-up, `dry run: vllm sized N blocks, this feature would set n (+/-d)`
-  with, per `(node, chiplet)`, the bytes the current `N` blocks take, the non-KV
-  base, the budget, the headroom left in bytes and blocks, how full the chiplet
-  is today as a percentage of the budget, and what `n` would do: the predicted
-  `used` at `n`, `budget_left` against `total * gpu_memory_utilization`,
-  `total_left` against the chiplet's physical DRAM, and the fill at `n` as a
-  percentage of both. A negative headroom means the current count already
-  exceeds the budget on that chiplet. Nothing is allocated at `n`; the real mode's fit
-  check line is what validates the prediction.
-
-A dry run refuses nothing. It changes nothing either, so a refusal would stop a
-run the flag off would have served; every shape is reported instead and the run
-continues. That covers the two the dynamic compile needs
-(`--model-impl vllm`, `VLLM_RBLN_USE_DEVICE_TENSOR=1`) and a
-`torch.rbln` without `capture_programs()` -- without them nothing is captured and
-the sizing step says so -- as well as a KV transfer connector (the reallocation
-is what invalidates its registrations), an attention layer that does not dispatch
-to a paged naive kernel, cross-layer KV sharing, and a sizing failure after
-warm-up (no placement, no fit). The pre-compile estimate is
-likewise left alone: the one-request floor above applies only when the cache is
-shrunk, and so do the exact chiplet-replication factor and the driver-read DRAM
-capacity, since every other mode serves that estimate rather than replacing it.
-A dry run therefore compiles at the count the flag off would have picked. What it
-still does differently is mark the KV dim dynamic -- without that the programs
-carry no placement and there is nothing to measure -- so the artifact is a
-dynamic build either way.
-
-## Unsupported Configurations
-
-The following are rejected at start-up when the flag is on, and are unaffected
-when it is off. Run with `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` to use them.
+A configuration the mechanism cannot size is not a refusal while the option is
+unset: refusing would stop a run that `--no-rbln-use-dynamic-kv-cache` would
+have served. The feature logs one warning and the run continues on the
+pre-compile estimate, with no KV dimension marked dynamic: `mark_dynamic` follows
+this decision, not the option. An explicit `--rbln-use-dynamic-kv-cache` is a
+request, and start-up refuses it with the same reason.
+`dynamic_kv_unsupported_reason` in `v1/worker/utils.py` holds the whole list, and
+both the engine patch and the worker read it. The optimum-rbln path is not on it:
+it installs neither the engine patch nor a worker that carries a sizer, so the
+feature is absent there rather than disabled.
 
 | Configuration | Why |
 | --- | --- |
-| KV transfer connectors | The connector registers the KV cache's physical views during warm-up, and the reallocation invalidates them. A dry run does not reallocate and is allowed. |
-| Cross-layer KV sharing | The compiler admits a dynamic KV input through view ops into several paged naive attention calls (`paged_flash_causal_attention_naive_*`, `paged_sliding_window_attention_naive_*`), which is how a deduped base shared by a full-attention and a sliding-window layer compiles; the same view feeding two layers' attention calls is not admitted. A dry run reports it instead. |
+| `VLLM_RBLN_USE_DEVICE_TENSOR=0` | The artifact carries no dynamic KV dimension. |
+| `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
+| Flash causal attention disabled | This dispatches to an attention kernel that does not accept a dynamic KV input. |
+| A DFlash drafter (`--speculative-config '{"method": "dflash", ...}'`) | The drafter is non-causal on RBLN, and its attention kernel does not accept a dynamic KV input. `use_non_causal` lives on the draft config only, so the method is the signal. |
+| `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
+| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. |
 
 ## When Start-up Refuses
 
@@ -178,8 +165,7 @@ would serve from the pre-compile estimate this feature exists to replace.
 - **No KV block fits.** On some chiplet the non-KV base already exceeds
   `total * gpu_memory_utilization`. Raise `--gpu-memory-utilization`, or give the
   model more devices.
-
-Two cases warn and continue on the pre-compile estimate instead, because both are
+Three more cases warn and continue on the pre-compile estimate, because each is
 an explicit request from the caller:
 
 - Compile and warm-up are skipped (`--enforce-eager`, `--no-rbln-compile-model`,
@@ -190,7 +176,7 @@ an explicit request from the caller:
   cache itself stays at the compile hint rather than being restored: the dummy
   UMD still enforces its memory limit, and nothing runs after warm-up.
 
-In both cases `mark_dynamic` is still applied and still logged, so that log line
+In each case `mark_dynamic` is still applied and still logged, so that log line
 is not evidence that the block count came from the device.
 
 ## Known Limitations
@@ -198,8 +184,7 @@ is not evidence that the block count came from the device.
 - **Whatever the runtime keeps of the compile-time cache costs blocks.** The
   cache is released before the snapshot, so a runtime that does not hand it
   back (observed on a DP + EP run, where the count dropped by exactly the
-  cache's size) is measured, not guessed. A dry run cannot release, so it
-  reports the count under both readings.
+  cache's size) is measured, not guessed.
 - **The allocator snapshot is an approximation.** It sees only this process and
   only the caching allocator; the runtime's direct allocations are covered by a
   fixed reserve and other tenants by a start-up sample spread evenly over the

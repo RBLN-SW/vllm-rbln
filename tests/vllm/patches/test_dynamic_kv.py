@@ -28,8 +28,8 @@ from vllm_rbln.v1.worker.utils import minimum_kv_blocks
 
 
 class TestOverrideBranch:
-    """`--num-gpu-blocks-override` keeps the pool, but a dry run still asks the
-    workers for their report."""
+    """`--num-gpu-blocks-override`, an unsupported configuration and an explicit
+    off all keep the pool without asking the workers."""
 
     @staticmethod
     def _engine(calls):
@@ -40,12 +40,13 @@ class TestOverrideBranch:
         )
 
     @staticmethod
-    def _config():
+    def _config(dynamic=None):
         return SimpleNamespace(
-            cache_config=SimpleNamespace(num_gpu_blocks_override=26, num_gpu_blocks=26)
+            cache_config=SimpleNamespace(num_gpu_blocks_override=26, num_gpu_blocks=26),
+            additional_config=SimpleNamespace(use_dynamic_kv_cache=dynamic),
         )
 
-    def _run(self, monkeypatch, *, dry_run):
+    def test_the_override_skips_the_workers(self, monkeypatch):
         calls: list = []
         kv_cache_config = SimpleNamespace(num_blocks=26)
         monkeypatch.setattr(
@@ -53,17 +54,50 @@ class TestOverrideBranch:
             "engine_core_original_initialize_kv_caches",
             lambda self, cfg: kv_cache_config,
         )
-        monkeypatch.setattr(dk.envs, "VLLM_RBLN_DYNAMIC_KV_CACHE_DRY_RUN", dry_run)
+        monkeypatch.setattr(dk, "dynamic_kv_unsupported_reason", lambda cfg: None)
         out = dk.patched_initialize_kv_caches(self._engine(calls), self._config())
         assert out is kv_cache_config
         assert out.num_blocks == 26
-        return calls
+        assert calls == []
 
-    def test_the_override_alone_skips_the_workers(self, monkeypatch):
-        assert self._run(monkeypatch, dry_run=False) == []
+    def test_an_unsupported_config_skips_the_workers(self, monkeypatch):
+        calls: list = []
+        kv_cache_config = SimpleNamespace(num_blocks=26)
+        monkeypatch.setattr(
+            dk,
+            "engine_core_original_initialize_kv_caches",
+            lambda self, cfg: kv_cache_config,
+        )
+        monkeypatch.setattr(
+            dk, "dynamic_kv_unsupported_reason", lambda cfg: "the optimum path"
+        )
+        config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                num_gpu_blocks_override=None, num_gpu_blocks=26
+            ),
+            additional_config=SimpleNamespace(use_dynamic_kv_cache=None),
+        )
+        assert dk.patched_initialize_kv_caches(self._engine(calls), config) is (
+            kv_cache_config
+        )
+        assert calls == []
 
-    def test_a_dry_run_still_collects_the_report(self, monkeypatch):
-        assert self._run(monkeypatch, dry_run=True) == ["compute_dynamic_kv_num_blocks"]
+    def test_off_skips_the_workers_without_a_reason(self, monkeypatch, caplog):
+        calls: list = []
+        kv_cache_config = SimpleNamespace(num_blocks=26)
+        monkeypatch.setattr(
+            dk,
+            "engine_core_original_initialize_kv_caches",
+            lambda self, cfg: kv_cache_config,
+        )
+        monkeypatch.setattr(dk, "dynamic_kv_unsupported_reason", lambda cfg: None)
+        with caplog.at_level("WARNING"):
+            out = dk.patched_initialize_kv_caches(
+                self._engine(calls), self._config(dynamic=False)
+            )
+        assert out is kv_cache_config
+        assert calls == []
+        assert caplog.records == []
 
 
 class TestResolveRankNumBlocks:
