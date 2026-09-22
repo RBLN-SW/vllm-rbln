@@ -48,6 +48,7 @@ from . import (
     oot,
     profiler,
     qwen2_moe,
+    qwen3_dflash,
     qwen3_moe,
     rotary_embedding,
     speculative_config,
