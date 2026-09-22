@@ -1441,6 +1441,14 @@ class TestDynamicKvUnsupportedReason:
             kv_transfer_config=kv_transfer_config,
         )
 
+    @staticmethod
+    def _ktc(kv_connector, *children):
+        """A KVTransferConfig stand-in; `children` fills MultiConnector's list."""
+        extra = {"connectors": [dict(c) for c in children]} if children else {}
+        return SimpleNamespace(
+            kv_connector=kv_connector, kv_connector_extra_config=extra
+        )
+
     @pytest.fixture(autouse=True)
     def _device_tensor_on(self, monkeypatch):
         monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
@@ -1478,7 +1486,7 @@ class TestDynamicKvUnsupportedReason:
         # The worker drives the registration behind the resize, so the set is
         # a policy; the reason names the connector that was asked for.
         reason = dynamic_kv_unsupported_reason(
-            self._cfg(kv_transfer_config=SimpleNamespace(kv_connector="OtherConnector"))
+            self._cfg(kv_transfer_config=self._ktc("OtherConnector"))
         )
         assert "OtherConnector" in reason
 
@@ -1494,10 +1502,62 @@ class TestDynamicKvUnsupportedReason:
     def test_connectors_registered_after_the_resize_are_supported(self, connector):
         assert (
             dynamic_kv_unsupported_reason(
-                self._cfg(kv_transfer_config=SimpleNamespace(kv_connector=connector))
+                self._cfg(kv_transfer_config=self._ktc(connector))
             )
             is None
         )
+
+    def test_multi_connector_is_supported_when_every_child_is(self):
+        # NIXL for P/D plus lmcache-rbln for offload is the shape in use. The
+        # wrapper registers nothing of its own, so what it wraps is the question.
+        assert (
+            dynamic_kv_unsupported_reason(
+                self._cfg(
+                    kv_transfer_config=self._ktc(
+                        "MultiConnector",
+                        {"kv_connector": "RblnNixlConnector"},
+                        {"kv_connector": "RBLNLMCacheConnectorV1"},
+                    )
+                )
+            )
+            is None
+        )
+
+    def test_multi_connector_names_only_the_child_that_is_not_open(self):
+        reason = dynamic_kv_unsupported_reason(
+            self._cfg(
+                kv_transfer_config=self._ktc(
+                    "MultiConnector",
+                    {"kv_connector": "RBLNLMCacheConnectorV1"},
+                    {"kv_connector": "OtherConnector"},
+                )
+            )
+        )
+        assert "OtherConnector" in reason
+        # The wrapper is not blamed for a child it merely carries.
+        assert "'MultiConnector'" not in reason
+
+    def test_multi_connector_wrapping_nothing_is_unsupported(self):
+        # An empty child list means nothing was checked, not that everything
+        # passed, so the wrapper's own name is what gets reported.
+        reason = dynamic_kv_unsupported_reason(
+            self._cfg(kv_transfer_config=self._ktc("MultiConnector"))
+        )
+        assert "MultiConnector" in reason
+
+    def test_a_multi_connector_child_reads_as_untried(self):
+        # Nesting is not walked: the child's name is checked against the set
+        # like every other, and that shape has not been tried.
+        reason = dynamic_kv_unsupported_reason(
+            self._cfg(
+                kv_transfer_config=self._ktc(
+                    "MultiConnector",
+                    {"kv_connector": "RblnNixlConnector"},
+                    {"kv_connector": "MultiConnector"},
+                )
+            )
+        )
+        assert "MultiConnector" in reason
 
     def test_a_supported_connector_the_factory_never_registered_fails_loudly(
         self, monkeypatch

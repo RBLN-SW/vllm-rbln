@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
-from vllm.config import ModelConfig, ParallelConfig, VllmConfig
+from vllm.config import KVTransferConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
@@ -310,6 +310,28 @@ DYNAMIC_KV_SUPPORTED_CONNECTORS = (
     "RblnNixlPushConnector",
     "RBLNLMCacheConnectorV1",
 )
+# vLLM's wrapper for running several connectors at once. It is not itself in the
+# set above because it registers nothing of its own: `register_kv_caches` and the
+# post-resize finalize both fan out to its children, so the resize is open for it
+# exactly when it is open for every child.
+MULTI_CONNECTOR = "MultiConnector"
+
+
+def configured_kv_connectors(kv_transfer: KVTransferConfig) -> list[str]:
+    """The connector names this config actually runs, in config order.
+
+    A `MultiConnector` is replaced by what it wraps. With nothing to wrap its own
+    name stays and is reported, because an empty child list means nothing was
+    checked rather than everything passing. A child that is itself a
+    `MultiConnector` is likewise left as that name, so the nested shape reads as
+    untried like any other name outside the set.
+    """
+    if kv_transfer.kv_connector != MULTI_CONNECTOR:
+        return [kv_transfer.kv_connector]
+    children = kv_transfer.kv_connector_extra_config.get("connectors")
+    if not children:
+        return [MULTI_CONNECTOR]
+    return [child.get("kv_connector", "<unnamed>") for child in children]
 
 
 def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
@@ -365,18 +387,21 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "DYNAMIC_KV_SUPPORTED_CONNECTORS names connectors the factory never "
             f"registered: {unregistered}"
         )
-    if (
-        kv_transfer is not None
-        and kv_transfer.kv_connector not in DYNAMIC_KV_SUPPORTED_CONNECTORS
-    ):
-        # The worker registers with the connector only once the resize has
-        # allocated. That is connector-agnostic, so one outside this set is
-        # untried rather than known broken.
-        return (
-            f"kv_connector={kv_transfer.kv_connector!r} is not among the "
-            "connectors the dynamic-KV resize is open for "
-            f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
-        )
+    if kv_transfer is not None:
+        unsupported = [
+            name
+            for name in configured_kv_connectors(kv_transfer)
+            if name not in DYNAMIC_KV_SUPPORTED_CONNECTORS
+        ]
+        if unsupported:
+            # The worker registers with the connector only once the resize has
+            # allocated. That is connector-agnostic, so one outside this set is
+            # untried rather than known broken.
+            return (
+                f"kv_connector={', '.join(repr(n) for n in unsupported)} is not "
+                "among the connectors the dynamic-KV resize is open for "
+                f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
+            )
     return None
 
 

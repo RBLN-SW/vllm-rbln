@@ -137,7 +137,7 @@ feature is absent there rather than disabled.
 | `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
 | Flash causal attention disabled, or non-causal attention enabled | These dispatch to attention kernels that do not accept a dynamic KV input. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
-| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. |
+| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. A `MultiConnector` is read through to its children and is open exactly when all of them are; one that wraps nothing, or that wraps another `MultiConnector`, is not. |
 
 ## When Start-up Refuses
 
