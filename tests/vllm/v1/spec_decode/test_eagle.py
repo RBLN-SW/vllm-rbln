@@ -61,11 +61,14 @@ def _neutralize(monkeypatch):
     )
 
 
-def _wire_runner(proposer, *, num_reqs, intermediate_chunk=False):
+def _wire_runner(
+    proposer, *, num_reqs, intermediate_chunk=False, strict_kv_producer=False
+):
     proposer.runner = SimpleNamespace(
         # propose runs in the decode phase, which is the step phase it reads.
         is_prefill=intermediate_chunk,
         is_intermediate_chunked_prefill=intermediate_chunk,
+        is_strict_kv_producer=strict_kv_producer,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
         kv_caches=[],
         kv_cache_bases=[],
@@ -427,6 +430,45 @@ class TestPropose:
         assert out.shape == (2, 3)
         assert out.cpu().tolist() == [[0, 0, 0], [0, 0, 0]]
 
+    @pytest.mark.parametrize("draft_has_moe", [False, True])
+    def test_a_strict_producer_runs_one_pass_and_drafts_nothing(
+        self, draft_has_moe, monkeypatch
+    ):
+        # A producer hands its KV off and never verifies a draft, so the first
+        # pass (which writes the KV the consumer's drafter reads) is the only
+        # one worth running. Unlike the chunk case there is no MoE carve-out:
+        # every rank of a producer prefills, so no peer is inside a collective.
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2, strict_kv_producer=True)
+        proposer.draft_has_moe = draft_has_moe
+        monkeypatch.setattr(
+            proposer.vllm_config.parallel_config, "data_parallel_size", 2
+        )
+        # Every rank of a producer prefills -- the split the MoE carve-out
+        # exists for cannot arise here.
+        proposer.runner.dp_status = DPStatus(
+            num_tokens=(4, 4),
+            num_reqs=(2, 2),
+            is_prefill=(True, True),
+            is_idle=(False, False),
+            num_tokens_across_dp=torch.tensor([4, 4], dtype=torch.int32),
+        )
+        echo = _echo_model_exec(proposer.hidden_size)
+        passes = []
+
+        def counting(**kwargs):
+            passes.append(1)
+            return echo(**kwargs)
+
+        proposer.model_executable = counting
+
+        out = _call_propose(proposer)
+
+        assert len(passes) == 1
+        assert out.shape == (2, 3)
+        assert out.cpu().tolist() == [[0, 0, 0], [0, 0, 0]]
+
     @pytest.mark.parametrize("dp_size, expected_passes", [(1, 1), (2, 3)])
     def test_a_draft_with_moe_keeps_drafting_only_under_dp(
         self, dp_size, expected_passes, monkeypatch
@@ -755,7 +797,13 @@ class TestLoadModel:
 class TestDummyRun:
     @staticmethod
     def _proposer(
-        monkeypatch, *, num_spec, dp_status=None, draft_has_moe=True, specialized=False
+        monkeypatch,
+        *,
+        num_spec,
+        dp_status=None,
+        draft_has_moe=True,
+        specialized=False,
+        strict_kv_producer=False,
     ):
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(num_speculative_tokens=num_spec)
@@ -767,6 +815,7 @@ class TestDummyRun:
             )
         proposer.runner = SimpleNamespace(
             is_prefill=False,
+            is_strict_kv_producer=strict_kv_producer,
             input_batch=SimpleNamespace(
                 num_reqs=2,
                 block_table=[
@@ -842,6 +891,18 @@ class TestDummyRun:
         # first pass (1) + one extra draft step (num_speculative_tokens - 1 = 1).
         assert len(calls) == 2
 
+    def test_a_strict_producer_warms_no_loop_graph(self, monkeypatch):
+        # The loop is decode-shaped, so warming it on a producer would compile
+        # the graph the role exists to leave out. Only the first pass runs.
+        proposer, calls = self._proposer(
+            monkeypatch, num_spec=2, strict_kv_producer=True
+        )
+        proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
+        assert len(calls) == 1
+        # The worker reserves draft runtimes off the declaration, so it has to
+        # agree with the pass count warm-up just produced.
+        assert proposer.warms_up_decode_graphs_on_a_producer is (len(calls) > 1)
+
     @pytest.mark.parametrize("idle,passes", [(True, 0), (False, 2)])
     def test_a_dense_draft_runs_unless_this_rank_is_idle(
         self, monkeypatch, idle, passes
@@ -912,6 +973,7 @@ class TestBuildDummyAttnMetadata:
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         proposer.runner = SimpleNamespace(
             is_prefill=False,
+            is_strict_kv_producer=False,
             input_batch=SimpleNamespace(
                 block_table=[
                     SimpleNamespace(
