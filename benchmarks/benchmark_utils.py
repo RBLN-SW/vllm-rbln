@@ -27,7 +27,10 @@ from vllm_rbln.config import resolve_model_impl
 
 
 def get_llm_instance(engine_args: EngineArgs) -> LLM:
-    if resolve_model_impl(engine_args.additional_config) != "vllm":
+    model_impl = resolve_model_impl(
+        engine_args.additional_config, engine_args.model_impl, engine_args=engine_args
+    )
+    if model_impl != "vllm":
         compiled_model_path = engine_args.model
         if not os.path.exists(compiled_model_path):
             raise ValueError(

@@ -21,6 +21,8 @@ MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 MAX_TOKENS = 1
 
 SERVER_ARGS = [
+    "--model-impl",
+    "optimum",
     "--hf-overrides",
     '{"num_hidden_layers": 1, "layer_types": ["full_attention"]}',
     "--max-model-len",

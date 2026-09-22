@@ -44,7 +44,7 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 
 ## Two model paths
 
-Upstream's `--model-impl` selects the model path. `vllm` is the vllm model path, `transformers` and `optimum` are the optimum one, and `auto` (the default) leaves it to `resolve_model_impl()`, which takes the path this process was handed and then `optimum`. Anything else is refused. `resolve_model_impl()` reads it before the config exists, and `create_engine_config` hands the field back its default so upstream's own resolution is untouched. A built `additional_config` names the path by being one of the two classes, and disagreeing with the flag is refused. `VLLM_RBLN_USE_VLLM_MODEL=1` still means `vllm`, warns, and goes away in 0.14.0.
+Upstream's `--model-impl` selects the model path. `vllm` is the vllm model path, `transformers` and `optimum` are the optimum one, and `auto` (the default) leaves it to `resolve_model_impl()`, which takes the path this process was handed, and otherwise the one the model asks for: optimum where optimum-rbln implements the architecture, and vllm where it does not. Anything else is refused. `resolve_model_impl()` reads it before the config exists, and `create_engine_config` hands the field back its default so upstream's own resolution is untouched. A built `additional_config` names the path by being one of the two classes, and disagreeing with the flag is refused. `VLLM_RBLN_USE_VLLM_MODEL=1` still means `vllm`, warns, and goes away in 0.14.0.
 
 | Path         | Owns                                                                        |
 | ------------ | --------------------------------------------------------------------------- |
@@ -57,7 +57,7 @@ Upstream's `--model-impl` selects the model path. `vllm` is the vllm model path,
 - Say which path or paths you changed in the PR description.
 - A change to one path must not alter the other. If it appears to need both, stop and ask before writing code.
 - A new env var goes in three places in `envs.py`: the `TYPE_CHECKING` block, the `environment_variables` dict, and either `RBLN_COMPILE_ENV` or `RBLN_NON_COMPILE_ENV`. The two sets partition the mega-cache bundle key, and `test_mega_cache.py` asserts they cover every variable.
-- Suites carry the path: `tests/vllm/` adopts `vllm` in its conftest and scrubs `VLLM_RBLN_*`; `tests/optimum/` has no suite-level conftest and takes the default. An exported `VLLM_RBLN_USE_VLLM_MODEL` therefore changes what `tests/optimum/` exercises without failing.
+- Suites carry the path: `tests/vllm/` adopts `vllm` in its conftest and scrubs `VLLM_RBLN_*`; `tests/optimum/` has no suite-level conftest, so the tests there that build an engine name `optimum` themselves. An exported `VLLM_RBLN_USE_VLLM_MODEL` therefore changes what the rest of `tests/optimum/` exercises without failing.
 - Do not select the model path inside a test to escape its suite.
 
 ## Patching upstream vLLM

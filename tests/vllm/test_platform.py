@@ -36,7 +36,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
 from tests.vllm.vllm_config import local_model_path
-from vllm_rbln.config import RBLNConfig
+from vllm_rbln.config import OptimumRBLNConfig, RBLNConfig
 from vllm_rbln.platform import (
     RBLN_DEFAULT_GPU_MEMORY_UTILIZATION,
     RBLN_DEFAULT_MAX_NUM_SEQS,
@@ -937,6 +937,23 @@ class TestModelImpl:
         assert platform.USE_DEVICE_TENSOR is True
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
 
+    def test_auto_reads_the_model_off_the_engine_args(self, monkeypatch):
+        """The wrapper is the only place `auto` can be handed a model to read.
+
+        Resolution takes the flag and the additional_config as arguments, and
+        the model sits on the EngineArgs the wrapper is called on. This one is
+        an architecture optimum-rbln runs, and the suite runs on the vllm path.
+        """
+        monkeypatch.setattr(platform.envs, "INHERITED_MODEL_IMPL", None)
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        platform._apply_model_impl("vllm")
+
+        config = _build()
+
+        assert isinstance(config.additional_config, OptimumRBLNConfig)
+        assert RblnPlatform.device_type == "cpu"
+
     def test_a_built_config_passed_in_keeps_its_path(self, on_the_other_path):
         """`LLM(additional_config=RBLNConfig(...))` hands in a resolved object.
 
@@ -983,15 +1000,13 @@ class TestModelImpl:
         monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
         RblnPlatform._capture_model_impl()
 
-        first = SimpleNamespace(
-            max_num_batched_tokens=None, additional_config=None, model_impl="vllm"
-        )
+        first = EngineArgs(model=local_model_path(_MODEL), model_impl="vllm")
         EngineArgs.create_engine_config(first)
         assert platform._MODEL_IMPL == "vllm"
 
-        second = SimpleNamespace(
-            max_num_batched_tokens=None, additional_config=None, model_impl="auto"
-        )
+        # Left at `auto`, so the path is the model's own: optimum-rbln runs this
+        # architecture, and the first engine's answer is not consulted.
+        second = EngineArgs(model=local_model_path(_MODEL))
         EngineArgs.create_engine_config(second)
         assert platform._MODEL_IMPL == "optimum"
 

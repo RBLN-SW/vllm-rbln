@@ -110,10 +110,12 @@ def test_the_capture_writes_only_where_this_path_reads(monkeypatch):
     RblnPlatform._capture_model_impl()
 
     def captured(additional_config):
+        # Named rather than left at `auto`, which reads the model to pick a
+        # path and there is no model on this stub.
         args = SimpleNamespace(
             max_num_batched_tokens=512,
             additional_config=additional_config,
-            model_impl="auto",
+            model_impl="optimum",
         )
         EngineArgs.create_engine_config(args)
         return args.additional_config
