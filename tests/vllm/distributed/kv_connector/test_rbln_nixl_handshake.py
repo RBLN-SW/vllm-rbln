@@ -3527,14 +3527,29 @@ class TestSplitAxisConstraints:
 
     @staticmethod
     def _worker(
-        *, axis, tp_ratio=1, host_buffer=False, trim=False, block_size=16, sw_ratio=None
+        *,
+        axis,
+        tp_ratio=1,
+        host_buffer=False,
+        trim=False,
+        block_size=16,
+        sw_ratio=None,
+        cls=RblnNixlPullConnectorWorker,
+        stream=False,
     ):
-        w = object.__new__(RblnNixlPullConnectorWorker)
+        w = object.__new__(cls)
         w._kv_per_block = 1
         w.use_host_buffer = host_buffer
         w._kv_split_axis = axis
         w.block_size = block_size
-        window_mode(w, sw_ratio, chunk_mode=trim)
+        window_mode(
+            w,
+            sw_ratio,
+            chunk_mode=trim,
+            streams_prefix=stream,
+            wants_stream=stream,
+            writes_into_peer=stream,
+        )
         topo = MagicMock()
         topo.tp_size = 2
         topo.tp_ratio.return_value = tp_ratio
@@ -3581,6 +3596,22 @@ class TestSplitAxisConstraints:
         meta = _agent_meta(block_size=32)
         with pytest.raises(RuntimeError, match="cut one the same way"):
             w._check_split_axis_constraints(meta, 1)
+
+    def test_a_streaming_peer_must_size_its_block_the_same(self):
+        # Streaming names part of the block a prefill is filling, by the same
+        # grid the knob cuts a last block with -- so it needs the peer to hold
+        # the same count, whether or not that knob is on.
+        w = self._worker(
+            axis=KVSplitAxis.NON_HEAD,
+            stream=True,
+            block_size=16,
+            cls=RblnNixlPushConnectorWorker,
+        )
+        meta = _agent_meta(
+            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
+        )
+        with pytest.raises(RuntimeError, match="cut one the same way"):
+            w._check_split_axis_constraints(meta, 2)
 
     def test_a_matching_block_size_passes_while_trimming(self):
         w = self._worker(axis=KVSplitAxis.NON_HEAD, trim=True, block_size=16)

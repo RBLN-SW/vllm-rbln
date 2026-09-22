@@ -445,7 +445,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # `window_ratio` -- and both lists are cut by that one number. A peer whose
         # block holds a different count is then cut into pieces that are not its
         # own, while every byte count still fits.
-        if (self._shape.chunk_mode or self._own_engine_layout) and (
+        if (self._shape.writes_part_of_a_block or self._own_engine_layout) and (
             nixl_agent_meta.block_size != self.block_size
         ):
             raise RuntimeError(
