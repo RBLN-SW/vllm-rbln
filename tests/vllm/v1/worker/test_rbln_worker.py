@@ -1302,6 +1302,7 @@ class TestKvRegistrationOrder:
     @staticmethod
     def _worker(calls, *, defers):
         return SimpleNamespace(
+            fail_fast=False,
             cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
             vllm_config=_make_vllm_config(),
             model_runner=SimpleNamespace(
