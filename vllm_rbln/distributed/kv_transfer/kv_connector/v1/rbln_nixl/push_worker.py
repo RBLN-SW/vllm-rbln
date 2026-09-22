@@ -147,6 +147,9 @@ class _StreamedSend:
     # None until then: an unsealed request is never finished, however many of
     # its batches have landed.
     expected: int | None = None
+    # Whether a peer's write was lost. The counts above cannot carry it: a
+    # batch that never left still has to raise them.
+    failed: bool = False
     # How many of the consumer's blocks the writer has already filled.
     issued_hwm: int = 0
     # And how many chunks of the one after those, for a block written in
@@ -665,7 +668,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             for req_id, send in list(self._streamed.items()):
                 if send.expected is None or send.done < send.expected:
                     continue
-                finished.add(req_id)
+                # A send that lost a write keeps its lease instead -- see
+                # `_handle_failed_transfer`.
+                if not send.failed:
+                    finished.add(req_id)
                 self._forget_send(req_id)
 
         for req_id in finished:
@@ -1056,12 +1062,15 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         with self._sending_transfers_lock:
             send = self._streamed.get(req_id)
             if send is not None and send.released:
+                # A peer that never submitted leaves a hole no later batch
+                # fills.
+                send.failed = send.failed or len(handles) < len(writes)
                 if handles:
                     send.transfers.append(handles)
                 else:
-                    # Every peer's submission failed, or the batch covered
-                    # nothing. Either way it is over, and a request whose
-                    # count never reaches its seal never finishes.
+                    # A batch that issued nothing is over where it stands, and
+                    # a request whose count never reaches its seal never
+                    # finishes.
                     send.done += 1
             elif writes:
                 self._sending_transfers[req_id].extend(handles)

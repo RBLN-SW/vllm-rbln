@@ -2185,6 +2185,45 @@ class TestSealedCompletion:
         assert worker.nixl_wrapper.check_xfer_state.call_count == 0
 
 
+class TestAStreamedSendThatLostAWrite:
+    """A batch raises the seal count whether or not its writes went out, so the
+    count alone reports a request whose KV never moved as sent -- freeing the
+    producer's blocks while the consumer is still waiting for them. The lease
+    owns such a request instead."""
+
+    def test_a_peer_that_did_not_submit_marks_the_send(self):
+        worker = TestABatchThatSendsNothing._worker()
+        worker.nixl_wrapper.make_prepped_xfer.side_effect = [RuntimeError("boom"), 7]
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1, 2],), ([3, 4],)))
+
+        assert worker._streamed["r0"].transfers == [[7]]
+        assert worker._streamed["r0"].failed
+
+    def test_a_later_batch_does_not_clear_an_earlier_failure(self):
+        # The flag is the request's, not the batch's: the hole a dropped batch
+        # left is still there when the next one lands whole.
+        worker = TestABatchThatSendsNothing._worker()
+        _send(worker, failed=True)
+        worker.nixl_wrapper.make_prepped_xfer.side_effect = [7, 8]
+
+        worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1, 2],), ([3, 4],)))
+
+        assert worker._streamed["r0"].failed
+
+    def test_a_failed_send_is_left_to_its_lease(self, monkeypatch):
+        TestSealedCompletion._upstream_reports_nothing(monkeypatch)
+        worker = TestSealedCompletion._worker(["DONE"])
+        _send(worker, transfers=[[7]], queued=1, expected=1, failed=True)
+        worker._reqs_to_send = {"r0": 1.0}
+
+        done_sending, _ = worker.get_finished()
+
+        assert done_sending == set()
+        assert worker._reqs_to_send == {"r0": 1.0}
+        assert worker._streamed == {}
+
+
 class TestEmptyReceive:
     """A request turned away before it was scheduled is registered as a receive
     of no blocks, so the producer stops holding what it pinned. Nothing is ever
