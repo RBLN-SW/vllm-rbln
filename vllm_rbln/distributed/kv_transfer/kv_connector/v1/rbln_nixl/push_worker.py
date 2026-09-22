@@ -384,16 +384,43 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         """
         drained = False
         for req_id in req_ids:
-            with self._sending_transfers_lock:
-                send = self._streamed.get(req_id)
-                handles = [h for batch in send.transfers for h in batch] if send else []
-                self._forget_send(req_id)
+            handles = self._take_early_handles(req_id)
             for handle in handles:
                 self._drain_early_handle(req_id, handle)
             self._evict_finished_inbox.put(req_id)
             drained = True
         if drained:
             self._push_writer_wake.set()
+
+    def _take_early_handles(self, req_id: ReqId) -> list[int]:
+        """This request's handles, once the writer has recorded every batch.
+
+        A batch is issued before it is recorded, so a send read between the two
+        looks like it has nothing in flight and the blocks go back while that
+        write is still reading them. `queued` counts what the engine handed
+        over and the writer moves each batch into `transfers` or `done`, so
+        waiting for those to meet closes the window.
+        """
+        deadline = time.perf_counter() + _EARLY_FLUSH_DRAIN_TIMEOUT_S
+        while True:
+            with self._sending_transfers_lock:
+                send = self._streamed.get(req_id)
+                settled = send is None or len(send.transfers) + send.done >= send.queued
+                if settled or time.perf_counter() >= deadline:
+                    handles = (
+                        [h for batch in send.transfers for h in batch] if send else []
+                    )
+                    self._forget_send(req_id)
+                    if not settled:
+                        logger.warning(
+                            "RBLN NIXL push: the writer has issued a batch of "
+                            "request %s without recording it after %.1fs; its "
+                            "blocks are about to be reused.",
+                            req_id,
+                            _EARLY_FLUSH_DRAIN_TIMEOUT_S,
+                        )
+                    return handles
+            time.sleep(_EARLY_FLUSH_POLL_INTERVAL_S)
 
     def _drain_early_handle(self, req_id: ReqId, handle: int) -> None:
         deadline = time.perf_counter() + _EARLY_FLUSH_DRAIN_TIMEOUT_S

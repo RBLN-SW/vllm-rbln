@@ -19,6 +19,7 @@
 
 import queue
 import threading
+import time
 from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
@@ -1592,6 +1593,37 @@ class TestFlushEarlySends:
         assert worker._streamed == {}
         # The writer holds state for a request it may never see finish.
         assert worker._evict_finished_inbox.get_nowait() == "r0"
+
+    def test_a_batch_issued_but_not_yet_recorded_is_waited_for(self):
+        # The writer issues a batch before it records it, so a send read
+        # between the two looks idle. `queued` is what says otherwise.
+        worker = self._worker(["DONE", "DONE"])
+        send = _send(worker, queued=2)
+
+        def record_late():
+            time.sleep(pw._EARLY_FLUSH_POLL_INTERVAL_S * 2)
+            with worker._sending_transfers_lock:
+                send.transfers.append([9])
+
+        writer = threading.Thread(target=record_late)
+        writer.start()
+        worker.flush_early_sends({"r0"})
+        writer.join()
+
+        # Both handles drained: the one already recorded and the late one.
+        assert worker.nixl_wrapper.release_xfer_handle.call_count == 2
+        assert worker._streamed == {}
+
+    def test_a_writer_that_never_records_does_not_hold_the_engine(self, monkeypatch):
+        # Same bound as a wedged write, and it says the blocks are going back
+        # with a write still reading them.
+        setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=0.0)
+        worker = self._worker(["DONE"])
+        _send(worker, queued=2)
+
+        worker.flush_early_sends({"r0"})
+
+        assert worker._streamed == {}
 
     def test_a_wedged_write_does_not_take_the_engine_with_it(self, monkeypatch):
         # This runs on the engine main thread, ahead of the forward.
