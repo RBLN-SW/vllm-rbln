@@ -75,7 +75,7 @@ def _push_worker():
     # the shape the pairing predicates read before an engine is registered.
     w.use_host_buffer = False
     w._sw_ratio = None
-    # Off, as the environment variable is; the trim tests turn it on.
+    # Off, as the connector option is; the trim tests turn it on.
     w._chunk_mode = False
     w._valid_tokens = {}
     # __init__ never ran, so the writer state shutdown() reaches through

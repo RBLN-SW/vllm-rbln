@@ -237,7 +237,7 @@ def _make_worker(
     w.enforce_compat_hash = True
     w._sw_ratio = sw_ratio
     w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
-    # Off, as the environment variable is; the trim tests turn it on.
+    # Off, as the connector option is; the trim tests turn it on.
     w._chunk_mode = False
     w._remote_shard_layer_names = defaultdict(dict)
     w._remote_pp_size = {}
