@@ -64,6 +64,11 @@ class RBLNDFlashProposer(DFlashProposer):
     # is what keeps it false.
     draft_has_moe = False
 
+    # A producer's warm-up still runs the decode-shaped query pass: it is the
+    # only warm-up pass that binds the draft's KV, and the connector cannot
+    # register what has no device memory behind it.
+    warms_up_decode_graphs_on_a_producer = True
+
     @staticmethod
     def _require_dense_drafter(draft_model) -> None:
         """Fused MoE would require DP-idle ranks to join the draft collectives."""
@@ -167,6 +172,16 @@ class RBLNDFlashProposer(DFlashProposer):
             num_context,
             valid_ctx_lens,
         )
+
+        if self.runner.is_strict_kv_producer:
+            # The context write above is what the consumer's drafter reads; the
+            # drafts this pass would build are verified by nobody here.
+            return torch.zeros(
+                num_reqs,
+                self.num_speculative_tokens,
+                device=self.device,
+                dtype=torch.int64,
+            )
 
         draft_ids = self._run_query_pass(
             common_attn_metadata,
