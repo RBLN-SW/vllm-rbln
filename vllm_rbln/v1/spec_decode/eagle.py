@@ -466,6 +466,7 @@ class RBLNEagleProposer(EagleProposer):
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                 use_static_output=True,
                 use_direct_dispatch=True,
+                dtype=rbln_config.compile_dtype,
             )
 
     def _build_dummy_attn_metadata(

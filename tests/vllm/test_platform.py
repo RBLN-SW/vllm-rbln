@@ -306,6 +306,20 @@ class TestDtype:
         assert config.model_config.dtype == torch.float32
 
 
+class TestCompileDtype:
+    def test_default_is_empty(self, configured):
+        assert configured.additional_config.compile_dtype == ""
+
+    def test_the_hook_leaves_a_given_value_alone(self, reconfigure):
+        def mutate(config):
+            config.additional_config = replace(
+                config.additional_config, compile_dtype="float16"
+            )
+
+        config = reconfigure(mutate)
+        assert config.additional_config.compile_dtype == "float16"
+
+
 class TestWorkerAndScheduler:
     def test_auto_worker_becomes_the_rbln_worker(self, configured):
         assert (

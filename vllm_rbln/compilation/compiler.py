@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
+import rebel
 import torch
 from rebel import CompileContext
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
@@ -23,6 +25,9 @@ from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 from vllm_rbln import envs
 from vllm_rbln.compilation.backends import rbln_backend
 from vllm_rbln.compilation.dispatch import Dispatcher
+from vllm_rbln.logger import init_logger
+
+logger = init_logger(__name__)
 
 CompiledTarget = TypeVar("CompiledTarget")
 
@@ -41,6 +46,10 @@ def _ensure_torch_dynamo_configured() -> None:
     torch._dynamo.config.cache_size_limit = 64
 
     _DYNAMO_CONFIGURED = True
+
+
+def _dtype_option_supported() -> bool:
+    return "dtype" in inspect.signature(rebel.compile).parameters
 
 
 def create_compile_context(
@@ -86,6 +95,7 @@ def compile(
     cache_dir: str = "",
     use_static_output: bool = False,
     use_direct_dispatch: bool = False,
+    dtype: str = "",
 ) -> CompiledTarget:
     if use_direct_dispatch and not fullgraph:
         # A dispatched call runs one code object, so whatever Dynamo leaves
@@ -118,6 +128,17 @@ def compile(
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
     set_option("use_static_output", use_static_output)
+    if dtype:
+        if _dtype_option_supported():
+            set_option("dtype", dtype)
+        else:
+            logger.warning_once(
+                "compile_dtype=%s is ignored: installed rebel-compiler %s does not "
+                "take `dtype` as a compile option, so the graphs compile in the "
+                "target default dtype.",
+                dtype,
+                rebel.__version__,
+            )
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
         set_option("mega_cache_only", True)
