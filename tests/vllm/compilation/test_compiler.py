@@ -102,7 +102,7 @@ class TestCompileOptions:
         assert "runtime_holder" not in captured_compile["options"]
 
     def test_dtype_is_forwarded(self, captured_compile, monkeypatch):
-        monkeypatch.setattr(compiler, "_dtype_option_supported", lambda: True)
+        monkeypatch.setattr(compiler, "_check_dtype_option_supported", lambda: None)
         compile(object(), dtype="float16")
         assert captured_compile["options"]["dtype"] == "float16"
 
@@ -110,19 +110,16 @@ class TestCompileOptions:
         compile(object(), dtype="")
         assert "dtype" not in captured_compile["options"]
 
-    def test_dtype_is_dropped_with_a_warning_on_an_older_rebel(
-        self, captured_compile, monkeypatch, caplog
-    ):
+    def test_dtype_is_refused_on_an_older_rebel(self, captured_compile, monkeypatch):
         # An older rebel ignores unknown option keys, so the graph would silently
-        # compile in the target default; say so instead of forwarding the key.
+        # compile in the target default instead of the requested dtype.
         def legacy_compile(model, *, npu=None):
             pass
 
         monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
-        with caplog.at_level("WARNING"):
+        with pytest.raises(ValueError, match="dtype"):
             compile(object(), dtype="float16")
-        assert "dtype" not in captured_compile["options"]
-        assert "compile_dtype=float16 is ignored" in caplog.text
+        assert "options" not in captured_compile
 
     def test_mode_str_becomes_list(self, captured_compile):
         # A str mode is wrapped into a single-element list.
