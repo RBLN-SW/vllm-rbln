@@ -2138,7 +2138,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if spec_config.use_eagle():
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-            else:
+            elif not self.is_strict_kv_producer:
+                # A draft-model proposer still runs its first pass on a producer,
+                # to write the KV the consumer's drafter reads. The others hold
+                # no KV, so on a producer they would only build drafts nobody
+                # verifies.
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
             if not input_fits_in_drafter:
@@ -2237,6 +2241,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         req_ids = self.input_batch.req_ids.copy()
         if not self.num_spec_tokens or not req_ids:
+            return None
+        if self.is_strict_kv_producer:
+            # A producer proposes nothing to verify. Publishing the placeholder
+            # would have the scheduler carry it as real drafts: it only drops
+            # them for a request still chunking, and the last chunk is not.
             return None
         draft_token_ids = (
             self._draft_token_ids.tolist()
@@ -2727,6 +2736,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 f"{batch_desc.num_tokens_padded} tokens the ranks settled on"
             )
 
+        # Serving pads a prefill's query to max_num_tokens whatever its length, so
+        # warm-up compiles that one width and a dummy has to land on it too.
+        query_len_padded = self.max_num_tokens if is_prefill else target_query_len
+
         num_scheduled_tokens = np.array([target_query_len] * num_reqs, dtype=np.int32)
         num_tokens = int(num_scheduled_tokens.sum())
         # The decided length, not the requested one, is what the buffers below are
@@ -2784,14 +2797,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             intermediate_tensors = None
         else:
             intermediate_tensors = self._create_or_get_intermediate_tensors(
-                batch_desc.num_reqs_padded, target_query_len
+                batch_desc.num_reqs_padded, query_len_padded
             )
 
         layout = InputLayout(
             num_reqs=num_reqs,
             num_reqs_padded=batch_desc.num_reqs_padded,
             query_len=target_query_len,
-            query_len_padded=target_query_len,
+            query_len_padded=query_len_padded,
         )
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
@@ -2832,9 +2845,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # step decided -- what it stages then fits the dimension the group
                 # settled on, whichever route decided it.
                 draft_query_len = query_len
-                if self.uses_fixed_decode_window and self.num_spec_tokens == 1:
+                if (
+                    not is_prefill
+                    and self.uses_fixed_decode_window
+                    and self.num_spec_tokens == 1
+                ):
                     draft_query_len = target_query_len
-                self.drafter.dummy_run(num_reqs, draft_query_len, False)
+                self.drafter.dummy_run(num_reqs, draft_query_len, is_prefill)
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
@@ -3795,7 +3812,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         Warm-up runs one dummy per entry and the KV-cache estimate reserves one
         command-stream buffer per entry.
+
+        Empty on a strict KV producer: every step it runs is a prefill step, so
+        a decode runtime would only hold a buffer the KV cache can have instead.
         """
+        if self.is_strict_kv_producer:
+            return []
+
         query_lens = [1]
         if self.speculative_config:
             spec_query_len = self.speculative_config.num_speculative_tokens + 1
@@ -3848,16 +3871,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         with set_compile_stage("warmup"), self.offload_context():
             self.run_model_graphs()
 
+            # A strict producer admits one request per step, since every step it
+            # runs is a prefill, so that is the only width it samples at.
+            batch_buckets = (
+                [1]
+                if self.is_strict_kv_producer
+                else self.bucketing_manager.batch_buckets
+            )
+
             # NOTE(RBLN): the sampler and the rejection sampler are built on the
             # last PP rank only, so no other rank has anything to warm up here.
             if get_pp_group().is_last_rank:
                 # 4-1. sampler
                 if not self.is_pooling_model:
-                    for size in self.bucketing_manager.batch_buckets:
+                    for size in batch_buckets:
                         self._dummy_sampler_run(size)
 
-                # 4-2. rejection sampler
-                self._warmup_sampler_decode_batches()
+                # 4-2. rejection sampler -- a producer verifies no drafts.
+                if not self.is_strict_kv_producer:
+                    self._warmup_sampler_decode_batches()
 
             # 5. specdec (medusa)
             if isinstance(self.drafter, RBLNMedusaProposer):
