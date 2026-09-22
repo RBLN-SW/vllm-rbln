@@ -596,8 +596,8 @@ class TestDetermineAvailableMemory:
         hf_config=None,
         params=None,
         specialized_moe_decode=False,
-        uses_fixed_decode_window=False,
         decode_buckets=3,
+        decode_graph_shapes=(),
         drafter=None,
         speculative_config=None,
         dynamic=False,
@@ -630,7 +630,7 @@ class TestDetermineAvailableMemory:
             ),
             drafter=drafter,
             get_kv_cache_spec=lambda: {},
-            uses_fixed_decode_window=uses_fixed_decode_window,
+            decode_graph_shapes=lambda: list(decode_graph_shapes),
         )
         _attach_sizer(worker)
         worker.determine_available_memory()
@@ -676,6 +676,7 @@ class TestDetermineAvailableMemory:
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
             bucketing_manager=SimpleNamespace(decode_batch_buckets_count=3),
+            decode_graph_shapes=lambda: [(b, 1, None) for b in (1, 2, 4)],
             drafter=None,
             get_kv_cache_spec=lambda: {"a": spec, "b": spec},
         )
@@ -703,11 +704,15 @@ class TestDetermineAvailableMemory:
         assert "chiplet_memory" not in cap
 
     def test_num_runtimes_from_buckets_and_moe(self, make_worker, monkeypatch):
+        # Non-spec with specialized-MoE decode: 3 buckets at one query length
+        # plus the MoE fallback = 4 decode graphs, and the prefill makes 5.
         cap = self._capture(
-            make_worker, monkeypatch, specialized_moe_decode=True, decode_buckets=3
+            make_worker,
+            monkeypatch,
+            specialized_moe_decode=True,
+            decode_buckets=3,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
-        # Non-spec: num_decode_query_lens == 1, so 1 + buckets(3)*1 = 4, plus
-        # the specialized-MoE-decode fallback (+1 query length) = 5.
         assert cap["num_runtimes"] == 5
 
     def test_no_quant_counts_int_at_16bit(self, make_worker, monkeypatch):
@@ -781,7 +786,7 @@ class TestDetermineAvailableMemory:
             monkeypatch,
             drafter=drafter,
             speculative_config=spec,
-            uses_fixed_decode_window=True,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)],
         )
         assert "kernel_size" in cap
         assert "n_model_bytes" not in cap
@@ -812,7 +817,7 @@ class TestDetermineAvailableMemory:
             drafter=drafter,
             speculative_config=spec,
             specialized_moe_decode=True,
-            uses_fixed_decode_window=True,
+            decode_graph_shapes=[(b, 1, None) for b in (1, 2, 4)] + [(4, 1, 512)],
         )
         assert cap["num_runtimes"] == 10
 
@@ -833,7 +838,6 @@ class TestDetermineAvailableMemory:
                 monkeypatch,
                 drafter=drafter,
                 speculative_config=spec,
-                uses_fixed_decode_window=True,
             )
 
 

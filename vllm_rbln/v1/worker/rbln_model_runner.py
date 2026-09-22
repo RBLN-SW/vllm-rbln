@@ -3582,12 +3582,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
 
-    def run_model_graphs(self) -> None:
-        """Every model graph once, at the shapes serving will ask for."""
-        # 1. prefill
-        self._dummy_run(1, self.max_num_tokens, True)
+    def decode_graph_shapes(self) -> list[tuple[int, int, int | None]]:
+        """(num_reqs, query_len, num_tokens_padded_override) per decode graph.
 
-        # 2. decode
+        Warm-up runs one dummy per entry and the KV-cache estimate reserves one
+        command-stream buffer per entry.
+        """
         query_lens = [1]
         if self.speculative_config:
             spec_query_len = self.speculative_config.num_speculative_tokens + 1
@@ -3596,9 +3596,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if self.uses_fixed_decode_window
                 else [1, spec_query_len]
             )
-        for num_req in self.bucketing_manager.decode_batch_buckets:
-            for query_len in query_lens:
-                self._dummy_run(num_req, query_len, False)
+        shapes: list[tuple[int, int, int | None]] = [
+            (num_req, query_len, None)
+            for num_req in self.bucketing_manager.decode_batch_buckets
+            for query_len in query_lens
+        ]
 
         if self.specialized_moe_decode:
             # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
@@ -3606,24 +3608,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # rank prefills). Warm-up is symmetric, so it cannot reach those
             # shapes on its own: it pins the token dimension the ANY_PREFILL
             # and QLEN_ASYM routes would ask for, which the small-bucket decode
-            # graphs from 2. decode above cannot satisfy.
+            # graphs above cannot satisfy.
             num_req = self.bucketing_manager.decode_batch_buckets[-1]
-            for query_len in query_lens:
-                self._dummy_run(
-                    num_req,
-                    query_len,
-                    False,
-                    num_tokens_padded_override=self.max_num_tokens,
-                )
+            shapes += [
+                (num_req, query_len, self.max_num_tokens) for query_len in query_lens
+            ]
             if self.speculative_config and not self.uses_fixed_decode_window:
                 # Cover DP-asymmetric decode where a peer runs spec decode.
-                self._dummy_run(
-                    num_req,
-                    1,
-                    False,
-                    num_tokens_padded_override=num_req
-                    * (self.speculative_config.num_speculative_tokens + 1),
-                )
+                spec_query_len = self.speculative_config.num_speculative_tokens + 1
+                shapes.append((num_req, 1, num_req * spec_query_len))
+        return shapes
+
+    def run_model_graphs(self) -> None:
+        """Every model graph once, at the shapes serving will ask for."""
+        self._dummy_run(1, self.max_num_tokens, True)
+        for num_reqs, query_len, override in self.decode_graph_shapes():
+            self._dummy_run(
+                num_reqs, query_len, False, num_tokens_padded_override=override
+            )
 
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a

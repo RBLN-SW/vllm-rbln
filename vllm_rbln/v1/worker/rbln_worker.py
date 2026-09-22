@@ -219,14 +219,12 @@ class RBLNWorker(WorkerBase):
     @worker_fail_fast
     def determine_available_memory(self) -> int:
         """Estimate KV-cache DRAM, discounting the fixed command-stream buffers
-        that warm-up's compiled decode runtimes reserve.
+        that warm-up's compiled runtimes reserve.
 
-        One runtime per (decode bucket, query length): non-spec has a single
-        query length (1); spec adds a second (num_spec + 1) per bucket;
-        specialized-MoE decode repeats those plus one DP-asymmetric spec dummy.
-        A draft model, when present, adds its own -- one per bucket, plus the
-        specialized-MoE fallback. Counting all of them keeps the KV-block estimate
-        from over-reserving and OOMing at runtime.
+        One per decode graph the runner will compile, plus the prefill. A draft
+        model, when present, adds one, and a bucket's worth more wherever the
+        runner compiles decode graphs. Counting all of them keeps the KV-block
+        estimate from over-reserving and OOMing at runtime.
         """
         params_dict = dict(self.model_runner.model.named_parameters())
         device_name = current_platform.get_device_name().lower()
@@ -237,16 +235,10 @@ class RBLNWorker(WorkerBase):
             self.model_runner.bucketing_manager.decode_batch_buckets_count
         )
 
-        spec_enabled = self.speculative_config is not None
-        variable_decode_query_lens = (
-            spec_enabled and not self.model_runner.uses_fixed_decode_window
-        )
-        num_decode_query_lens = 2 if variable_decode_query_lens else 1
-        num_runtimes = 1 + decode_batch_buckets_count * num_decode_query_lens
-        if has_specialized_moe_decode:
-            num_runtimes += num_decode_query_lens
-            if variable_decode_query_lens:
-                num_runtimes += 1
+        # Read off the runner that compiles them, so this count and
+        # run_model_graphs cannot drift apart.
+        decode_graph_shapes = self.model_runner.decode_graph_shapes()
+        num_runtimes = 1 + len(decode_graph_shapes)
 
         ratio: float = 1.0
         if self.model_config.quantization is not None:
@@ -393,9 +385,11 @@ class RBLNWorker(WorkerBase):
             # TODO(RBLN): an undercount since the draft started compiling both decode
             # query lengths. Reserving for what it actually compiles needs the count
             # split by speculative method, which the medusa path would want too.
-            num_draft_runtimes = 1 + decode_batch_buckets_count
-            if has_specialized_moe_decode:
-                num_draft_runtimes += 1
+            num_draft_runtimes = 1
+            if decode_graph_shapes:
+                num_draft_runtimes += decode_batch_buckets_count
+                if has_specialized_moe_decode:
+                    num_draft_runtimes += 1
             draft_n_model_bytes = 0
 
             for value in draft_model.parameters():

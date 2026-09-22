@@ -1953,3 +1953,64 @@ class TestExecuteModelFlushesAfterTheSubmission:
         # The entry flush recovers a stale hold, then this step's read goes out
         # only after its own submission.
         assert order == ["flush", "submit", "flush"]
+
+
+class TestDecodeGraphShapes:
+    # The list warm-up iterates and the KV-cache estimate counts, so what it
+    # must hold is that it matches the dummies run_model_graphs issues.
+    @staticmethod
+    def _runner(*, buckets, specialized, num_spec=None, fixed_window=False):
+        spec = None
+        if num_spec is not None:
+            spec = SimpleNamespace(num_speculative_tokens=num_spec)
+        return SimpleNamespace(
+            speculative_config=spec,
+            uses_fixed_decode_window=fixed_window,
+            bucketing_manager=SimpleNamespace(decode_batch_buckets=buckets),
+            specialized_moe_decode=specialized,
+            max_num_tokens=512,
+        )
+
+    def _dummies(self, runner):
+        calls = []
+        runner._dummy_run = lambda *a, **kw: calls.append((a, kw))
+        runner.decode_graph_shapes = lambda: mr.RBLNModelRunner.decode_graph_shapes(
+            runner
+        )
+        mr.RBLNModelRunner.run_model_graphs(runner)
+        return calls
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"buckets": [1, 2, 4], "specialized": False},
+            {"buckets": [1, 2, 4], "specialized": True},
+            {"buckets": [1, 2, 4], "specialized": True, "num_spec": 3},
+            {
+                "buckets": [1, 2, 4],
+                "specialized": True,
+                "num_spec": 3,
+                "fixed_window": True,
+            },
+        ],
+    )
+    def test_one_dummy_per_shape_plus_the_prefill(self, kwargs):
+        runner = self._runner(**kwargs)
+        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
+        calls = self._dummies(runner)
+        assert len(calls) == len(shapes) + 1
+        assert calls[0][0] == (1, runner.max_num_tokens, True)
+        for (num_reqs, query_len, override), (args, kw) in zip(shapes, calls[1:]):
+            assert args == (num_reqs, query_len, False)
+            assert kw == {"num_tokens_padded_override": override}
+
+    def test_specialized_pins_the_prefill_token_dimension(self):
+        runner = self._runner(buckets=[1, 2, 4], specialized=True)
+        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
+        assert shapes[-1] == (4, 1, runner.max_num_tokens)
+
+    def test_a_variable_query_length_adds_the_asymmetric_spec_pin(self):
+        runner = self._runner(buckets=[1, 2, 4], specialized=True, num_spec=3)
+        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
+        # Top bucket, one token, padded to what a drafting peer would stage.
+        assert shapes[-1] == (4, 1, 4 * 4)
