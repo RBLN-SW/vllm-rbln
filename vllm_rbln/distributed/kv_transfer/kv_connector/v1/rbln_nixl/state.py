@@ -29,55 +29,39 @@ from vllm_rbln.logger import init_logger
 logger = init_logger(__name__)
 
 
-# What the byte target is when nobody names one: large enough that the fixed
-# cost of a descriptor is small beside what it carries.
-DEFAULT_CHUNK_BYTES = 256 * 1024
-
-
 def kv_chunk_tokens(
     *,
     span_tokens: int,
-    bytes_per_token: int,
     prefill_step_tokens: int,
-    chunk_bytes: int = 0,
     chunk_tokens: int = 0,
 ) -> int:
     """Tokens one chunk of a span holds, ``span_tokens`` for the whole span.
 
-    The byte knob is a floor, not a size: under the transfer size a fabric
-    moves efficiently a descriptor pays more fixed cost than it carries, so a
-    target landing between two sizes that tile the span takes the larger.
+    One prefill step is the floor, and the size when nobody names one. A step
+    closes at most one chunk, which is what lets a chunk be the unit a coverage
+    range counts in; a smaller chunk asks for something the write path cannot
+    count in.
 
-    One prefill step is a second floor. A step closes at most one chunk, which
-    is what lets a chunk be the unit a coverage range counts in, and the token
-    knob has to obey it as well -- given a smaller one, an operator has asked
-    for something the write path cannot count in.
+    In tokens rather than bytes because a byte target has to be divided by
+    what a token costs, and a rank reads that off the regions it registered --
+    which a pipeline stage holding a layer its siblings do not makes local to
+    the rank. What is left is the request's span and the scheduler's step.
 
     Args:
         span_tokens: tokens one whole descriptor covers -- a block, or one
             chiplet area's token range where a context cut gives it one.
-        bytes_per_token: what one token of one span costs.
         prefill_step_tokens: ``max_num_batched_tokens``. Named for the step
             rather than the chunk it is, because the chunk this returns is the
             other one and the two are compared here.
-        chunk_bytes: the byte target; 0 where nobody named one.
-        chunk_tokens: the size itself, named instead of the target; 0 unset.
+        chunk_tokens: the size itself; 0 takes the floor.
     """
     if chunk_tokens and chunk_tokens < prefill_step_tokens:
         raise RuntimeError(
             f"RBLN NIXL: chunk_tokens={chunk_tokens} is under the "
             f"{prefill_step_tokens}-token prefill step, so a step would close "
-            "several chunks; raise it or leave it unset for the byte target."
+            "several chunks; raise it or leave it unset for the step itself."
         )
-    if chunk_tokens and chunk_bytes:
-        raise RuntimeError(
-            f"RBLN NIXL: chunk_tokens={chunk_tokens} and chunk_bytes="
-            f"{chunk_bytes} both name a chunk size; set one."
-        )
-    want = max(
-        chunk_tokens or (chunk_bytes or DEFAULT_CHUNK_BYTES) // bytes_per_token,
-        prefill_step_tokens,
-    )
+    want = max(chunk_tokens, prefill_step_tokens)
     # A chunk that does not tile the span leaves a descriptor reaching into the
     # next one, so the answer is the smallest size at or above the floor that
     # does. The span itself always qualifies, which is where "no chunk" comes
@@ -332,27 +316,11 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             return None
         parts = self._kv_per_block // kv_runs
         span_tokens = block_size // spans
-        # The widest region rather than the first: one layer may register
-        # several of very different sizes -- a latent, its indexer, its scale
-        # -- and the byte target belongs on the one carrying the bytes. Off
-        # the first, registration order picks the grid, and a narrow region
-        # there sizes a chunk past the span and drops the range entirely.
-        widest = max(self.block_len_per_layer)
-        bytes_per_token = widest // (span_tokens * heads_per_span * parts)
-        assert bytes_per_token > 0, (
-            f"RBLN NIXL: the widest region holds {widest}B per block, which is "
-            f"under one byte per token for {span_tokens} token(s) of "
-            f"{heads_per_span} head(s) in {parts} K/V part(s)"
-        )
         chunk_tokens = kv_chunk_tokens(
             span_tokens=span_tokens,
-            # A region holds one band of one span in one part, so this divides
-            # out all three.
-            bytes_per_token=bytes_per_token,
             prefill_step_tokens=(
                 self.vllm_config.scheduler_config.max_num_batched_tokens
             ),
-            chunk_bytes=connector_option(self.vllm_config, "chunk_bytes", 0),
             chunk_tokens=connector_option(self.vllm_config, "chunk_tokens", 0),
         )
         chunks = span_tokens // chunk_tokens

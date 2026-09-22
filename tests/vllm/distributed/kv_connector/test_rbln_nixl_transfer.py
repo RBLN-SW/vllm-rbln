@@ -341,9 +341,10 @@ class TestTheWindowsOwnGranules:
         assert self._ids(65, [2, 3]) == [9, 10]
 
     def test_a_list_that_cannot_reach_the_earlier_granule_names_one(self):
-        # Guard: the one list shape the cases above never build. The straddle
-        # wants the block before and a one-block list lacks it -- and upstream
-        # clips both ends alike, so a peer is short there too and names one.
+        # Guard: a list shape the other cases do not build. The straddle wants
+        # the block before and a one-block list lacks it -- and upstream clips
+        # the producer's list and the consumer's alike, so a peer is short
+        # there too and names one.
         assert self._ids(65, [3]) == [10]
 
     def test_a_straddle_is_what_makes_it_two_granules(self):

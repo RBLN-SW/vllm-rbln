@@ -878,7 +878,7 @@ class TestTheThreeListsAgree:
     )
     def test_both_sides_describe_the_same_number_of_pieces(self, cls, monkeypatch):
         worker = self._worker(cls)
-        set_mock_connector_options(worker.vllm_config, chunk_bytes=128)
+        set_mock_connector_options(worker.vllm_config, chunk_tokens=8)
         peer = self._peer()
         fanout = worker._peer_replica_fanout(peer, 4)
         split = worker._peer_head_split(peer, 4)

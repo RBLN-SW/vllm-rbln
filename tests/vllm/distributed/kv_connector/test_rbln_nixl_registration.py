@@ -171,7 +171,7 @@ def _prep_impl_worker(
     block_size=64,
     specs=None,
     chunk_mode=False,
-    chunk_bytes=0,
+    chunk_tokens=0,
 ):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = build_worker(
@@ -182,7 +182,7 @@ def _prep_impl_worker(
         nixl_available=True,
         specs=specs,
         chunk_mode=chunk_mode,
-        chunk_bytes=chunk_bytes,
+        chunk_tokens=chunk_tokens,
     )
     worker.tp_rank = 0
     worker.world_size = 1
@@ -1565,15 +1565,15 @@ class TestTailBlockTrim:
         # A transfer picks its range by this, and nothing else sets it: left
         # unset, the third range is registered and never selected -- every
         # request goes whole while the longer dlist is still paid for. The span
-        # has to be wider than one prefill step, or the floor collapses the
-        # grid to None and the assertion holds for the wrong reason.
+        # has to be wider than the chunk, or the size collapses the grid to
+        # None and the assertion holds for the wrong reason.
         worker = self._register(
             monkeypatch,
             areas=4,
             slices=4,
             chunk_mode=True,
             block_size=1024,
-            chunk_bytes=512,
+            chunk_tokens=128,
         )
 
         assert worker._chunk_grid == worker._shard_chunk_grid(

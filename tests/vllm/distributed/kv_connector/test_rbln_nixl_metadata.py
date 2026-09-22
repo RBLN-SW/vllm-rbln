@@ -79,13 +79,13 @@ class TestConnectorOptions:
 
     def test_a_knob_nobody_set_is_its_default(self):
         assert connector_option(self._config({}), "chunk_mode", False) is False
-        assert connector_option(self._config({}), "chunk_bytes", 0) == 0
+        assert connector_option(self._config({}), "chunk_tokens", 0) == 0
 
     def test_a_knob_that_was_set_is_what_it_says(self):
-        config = self._config({"chunk_mode": True, "chunk_bytes": 128})
+        config = self._config({"chunk_mode": True, "chunk_tokens": 512})
 
         assert connector_option(config, "chunk_mode", False) is True
-        assert connector_option(config, "chunk_bytes", 0) == 128
+        assert connector_option(config, "chunk_tokens", 0) == 512
 
     @pytest.mark.parametrize(
         "extra, key, default, takes",
@@ -95,7 +95,7 @@ class TestConnectorOptions:
             ({"chunk_mode": "false"}, "chunk_mode", False, "bool"),
             # The axis the bool case cannot reach: `bool` is a subclass of
             # `int`, so an int knob given `true` would count as 1.
-            ({"chunk_bytes": True}, "chunk_bytes", 0, "int"),
+            ({"chunk_tokens": True}, "chunk_tokens", 0, "int"),
         ],
     )
     def test_a_value_of_the_wrong_type_is_refused(self, extra, key, default, takes):

@@ -1577,7 +1577,7 @@ class TestShardLocalRegions:
         w.block_len_per_layer = [512] * 8
         w.tp_rank = 0
         w.transfer_topo.tp_size = 1
-        w.vllm_config = mock_vllm_config(chunk_bytes=128)
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = 8
         w._kv_per_block = kv_per_block
 
@@ -1646,79 +1646,51 @@ class TestShardLocalRegions:
 class TestChunkSizing:
     """What a chunk descriptor covers, and the grid a shard's lists take.
 
-    Sized in bytes because that is what the fabric charges for, floored by the
-    prefill chunk because that is the unit a write covers, and rounded to a
-    size that tiles the span because a descriptor may not reach past it.
+    Sized in tokens rather than bytes, so the answer does not depend on which
+    regions a rank registered; floored by the prefill chunk because that is
+    the unit a write covers; and rounded to a size that tiles the span because
+    a descriptor may not reach past it.
     """
 
     @staticmethod
-    def _sized(monkeypatch, *, span_tokens, bytes_per_token, prefill=512, **knobs):
+    def _sized(*, span_tokens, prefill=512, tokens=0):
         return kv_chunk_tokens(
             span_tokens=span_tokens,
-            bytes_per_token=bytes_per_token,
             prefill_step_tokens=prefill,
-            chunk_bytes=knobs.get("BYTES", 0),
-            chunk_tokens=knobs.get("TOKENS", 0),
+            chunk_tokens=tokens,
         )
 
     @pytest.mark.parametrize(
-        "knobs, span_tokens, bytes_per_token, prefill, expected",
+        "tokens, span_tokens, prefill, expected",
         [
-            # 256 KiB of a 256-byte token is 1024, which tiles an 8k block cut
-            # into four areas.
-            ({}, 2048, 256, 512, 1024),
-            # A target between two tiling sizes takes the larger: below the
-            # size the fabric moves efficiently, the smaller pays fixed cost
-            # for bytes it does not carry.
-            ({"BYTES": 153600}, 2048, 256, 512, 1024),
-            # An MLA token is wide enough that the target names fewer tokens
-            # than a prefill step covers, and the floor is what catches that.
-            ({}, 2048, 1152, 512, 512),
-            # The token knob is taken over the byte target, which says 1024.
-            ({"TOKENS": 512}, 2048, 256, 512, 512),
+            # Unset takes the prefill step, which tiles an 8k block cut into
+            # four areas.
+            (0, 2048, 512, 512),
+            # The knob is taken over the floor where it is above it.
+            (1024, 2048, 512, 1024),
             # And it tiles the span as well -- 700 would leave a descriptor
             # reaching into the next span.
-            ({"TOKENS": 700}, 2048, 256, 512, 1024),
-            # A span the target names the whole of, and one a prefill step
-            # fills: both leave the span uncut.
-            ({}, 512, 256, 512, 512),
-            ({}, 2048, 256, 2048, 2048),
-            ({}, 2048, 256, 4096, 2048),
+            (700, 2048, 512, 1024),
+            # A span one prefill step fills leaves the span uncut, and so does
+            # a step wider than the span.
+            (0, 512, 512, 512),
+            (0, 2048, 2048, 2048),
+            (0, 2048, 4096, 2048),
         ],
     )
     def test_the_chunk_is_the_smallest_tiling_size_the_floors_allow(
-        self, monkeypatch, knobs, span_tokens, bytes_per_token, prefill, expected
+        self, tokens, span_tokens, prefill, expected
     ):
-        assert (
-            self._sized(
-                monkeypatch,
-                span_tokens=span_tokens,
-                bytes_per_token=bytes_per_token,
-                prefill=prefill,
-                **knobs,
-            )
-            == expected
+        assert self._sized(span_tokens=span_tokens, prefill=prefill, tokens=tokens) == (
+            expected
         )
 
-    def test_both_size_knobs_at_once_are_refused(self, monkeypatch):
-        # Picking one and logging the other says nothing about which the
-        # operator meant, and this runs once per peer list, so the log would
-        # repeat while the transfer used a size nobody confirmed.
-        with pytest.raises(RuntimeError, match="both name a chunk size"):
-            self._sized(
-                monkeypatch,
-                span_tokens=2048,
-                bytes_per_token=256,
-                TOKENS=512,
-                BYTES=153600,
-            )
-
-    def test_a_token_knob_under_one_prefill_step_is_refused(self, monkeypatch):
+    def test_a_token_knob_under_one_prefill_step_is_refused(self):
         # Rounding it up instead would ignore the size an operator asked for,
         # and a step closing several chunks is not something the write path
         # can count in.
         with pytest.raises(RuntimeError, match="prefill step"):
-            self._sized(monkeypatch, span_tokens=2048, bytes_per_token=256, TOKENS=256)
+            self._sized(span_tokens=2048, tokens=256)
 
     @staticmethod
     def _grid_worker(*, block_len, areas=4, prefill=512):
@@ -1733,12 +1705,12 @@ class TestChunkSizing:
         return w
 
     def test_a_context_cut_spreads_a_chunk_over_one_run(self, monkeypatch):
-        # An 8k block over four areas: each area holds 2048 tokens of 256
-        # bytes, and 256 KiB of that is half an area. A run per head would be
+        # An 8k block over four areas: each area holds 2048 tokens, and a
+        # 512-token prefill step cuts that into four. A run per head would be
         # the head axis; here the area already is a token range.
         w = self._grid_worker(block_len=2048 * 256)
 
-        assert w._shard_chunk_grid(block_size=8192, split=1) == (1, 2)
+        assert w._shard_chunk_grid(block_size=8192, split=1) == (1, 4)
 
     @pytest.mark.parametrize(
         "kwargs, block_size",
@@ -2289,7 +2261,7 @@ class TestHeadBandMatching:
         w._kv_per_block = 2
         w._chunk_mode = True
         w._kv_split_axis = KVSplitAxis.HEAD
-        w.vllm_config = mock_vllm_config(chunk_bytes=128)
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = 8
         meta = self._meta(areas=4, slices=4, n_logical=1, block_len=512)
 
@@ -2299,7 +2271,7 @@ class TestHeadBandMatching:
         # 2-chunk grid over it.
         assert len(out) == 4 * 2 * 2 * (1 + 1 * 2)
 
-    def _grid_worker(self, *, monkeypatch, kv_heads=8, chunk_bytes=128, prefill=8):
+    def _grid_worker(self, *, monkeypatch, kv_heads=8, prefill=8):
         w = self._worker(
             tp_rank=0,
             tp_size=1,
@@ -2313,20 +2285,9 @@ class TestHeadBandMatching:
         # descriptor target is 8 tokens: two chunks of a block.
         w._chunk_mode = True
         w._kv_split_axis = KVSplitAxis.HEAD
-        w.vllm_config = mock_vllm_config(chunk_bytes=chunk_bytes)
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
         return w
-
-    def test_a_head_band_is_what_a_token_costs(self, monkeypatch):
-        # A region holds one token range of SEVERAL heads, so a token costs the
-        # band, not the range. The default case above cannot see this: its byte
-        # target and its prefill floor answer 8 either way. Here the target
-        # decides, and dropping the band from the cost halves the chunk.
-        w = self._grid_worker(monkeypatch=monkeypatch, chunk_bytes=64, prefill=2)
-
-        # 512B over 16 tokens of 2 heads is 16B a token, so 64B is 4 tokens --
-        # four chunks of the block, one run per head.
-        assert w._shard_chunk_grid(block_size=16, split=1) == (2, 4)
 
     @pytest.mark.parametrize(
         "split, expected",
@@ -2350,18 +2311,17 @@ class TestHeadBandMatching:
         "kv_per_block, kv_runs, expected",
         [
             # A piece that is K or V alone: one run per head, as before.
-            (1, 1, (2, 4)),
-            (2, 2, (2, 4)),
+            (1, 1, (2, 8)),
+            (2, 2, (2, 8)),
             # A piece holding both: the same token range sits once in each, so
-            # it takes twice the runs over half the tokens -- and the
-            # descriptor stays the size the byte target asked for.
-            (2, 1, (4, 2)),
+            # it takes twice the runs over the same chunks.
+            (2, 1, (4, 8)),
         ],
     )
     def test_a_piece_holding_both_halves_takes_a_run_in_each(
         self, monkeypatch, kv_per_block, kv_runs, expected
     ):
-        w = self._grid_worker(monkeypatch=monkeypatch, chunk_bytes=64, prefill=2)
+        w = self._grid_worker(monkeypatch=monkeypatch, prefill=2)
         w._kv_per_block = kv_per_block
 
         assert w._shard_chunk_grid(block_size=16, split=1, kv_runs=kv_runs) == expected

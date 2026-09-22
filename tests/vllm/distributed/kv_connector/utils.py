@@ -698,7 +698,7 @@ def build_worker(
     hma_disabled=False,
     stripe_width=None,
     chunk_mode=False,
-    chunk_bytes=0,
+    chunk_tokens=0,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -752,8 +752,8 @@ def build_worker(
 
     vllm_config = mock_vllm_config(
         chunk_mode=chunk_mode,
+        chunk_tokens=chunk_tokens,
         swa_window_mode=swa_window_mode,
-        chunk_bytes=chunk_bytes,
         stripe_width=stripe_width,
     )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
