@@ -24,6 +24,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.cpu_resource_utils import LogicalCPUInfo
@@ -1425,7 +1426,7 @@ class TestDynamicKvUnsupportedReason:
     def _cfg(
         use_custom_kernel=False,
         use_flash_causal_attn=True,
-        use_non_causal=False,
+        speculative_method=None,
         block_size=16,
         max_model_len=32,
         kv_transfer_config=None,
@@ -1435,7 +1436,11 @@ class TestDynamicKvUnsupportedReason:
                 use_custom_kernel=use_custom_kernel,
                 use_flash_causal_attn=use_flash_causal_attn,
             ),
-            attention_config=SimpleNamespace(use_non_causal=use_non_causal),
+            speculative_config=(
+                None
+                if speculative_method is None
+                else SimpleNamespace(method=speculative_method)
+            ),
             cache_config=SimpleNamespace(block_size=block_size),
             model_config=SimpleNamespace(max_model_len=max_model_len),
             kv_transfer_config=kv_transfer_config,
@@ -1465,14 +1470,20 @@ class TestDynamicKvUnsupportedReason:
         [
             ({"block_size": 32}, "block_size == max_model_len"),
             ({"use_flash_causal_attn": False}, "flash causal attention is off"),
-            ({"use_non_causal": True}, "non-causal attention"),
+            ({"speculative_method": "dflash"}, "DFlash drafter is non-causal"),
         ],
-        ids=["normal-attention", "flash-causal-off", "non-causal"],
+        ids=["normal-attention", "flash-causal-off", "dflash-drafter"],
     )
     def test_non_paged_attention_is_unsupported(self, config_overrides, expected):
         reason = dynamic_kv_unsupported_reason(self._cfg(**config_overrides))
         assert reason is not None
         assert expected in reason
+
+    def test_a_causal_drafter_is_supported(self):
+        assert (
+            dynamic_kv_unsupported_reason(self._cfg(speculative_method="eagle3"))
+            is None
+        )
 
     def test_an_unlisted_kv_transfer_connector_is_unsupported(self):
         # The worker drives the registration behind the resize, so the set is
@@ -1499,22 +1510,9 @@ class TestDynamicKvUnsupportedReason:
             is None
         )
 
-    def test_a_supported_connector_the_factory_never_registered_fails_loudly(
-        self, monkeypatch
-    ):
-        # A typo in the allowlist would otherwise send every deployment of that
-        # connector down the static path with only a warning to show for it.
-        monkeypatch.setattr(
-            worker_utils,
-            "DYNAMIC_KV_SUPPORTED_CONNECTORS",
-            worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS + ("RblnNixlConnectr",),
-        )
-        with pytest.raises(AssertionError, match="RblnNixlConnectr"):
-            dynamic_kv_unsupported_reason(
-                self._cfg(
-                    kv_transfer_config=SimpleNamespace(kv_connector="RblnNixlConnector")
-                )
-            )
+    def test_every_supported_connector_is_registered(self):
+        for name in worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS:
+            assert name in KVConnectorFactory._registry
 
     def test_the_flag_alone_does_not_enable_it(self):
         # `mark_dynamic` follows this, not the flag: marking a dim nothing will

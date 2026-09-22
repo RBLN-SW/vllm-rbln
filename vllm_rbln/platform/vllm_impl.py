@@ -112,6 +112,19 @@ def _validate(vllm_config: "VllmConfig") -> None:
             )
 
     if (
+        os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE") is not None
+        and envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
+    ):
+        from vllm_rbln.v1.worker.utils import dynamic_kv_unsupported_reason
+
+        if (reason := dynamic_kv_unsupported_reason(vllm_config)) is not None:
+            raise ValueError(
+                "VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1 is set, but this configuration "
+                f"cannot size its KV cache from the compiled placement: {reason}. "
+                "Unset it to serve the pre-compile estimate."
+            )
+
+    if (
         vllm_config.speculative_config is not None
         and vllm_config.speculative_config.method == "dflash"
         and scheduler_config.max_num_scheduled_tokens

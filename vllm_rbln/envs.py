@@ -286,8 +286,9 @@ environment_variables = {
     ),
     # --- DYNAMIC KV CACHE ---
     # Size the KV cache from the compiled artifact instead of the estimate.
-    # Configurations the path cannot size turn it off on their own
-    # (`dynamic_kv_unsupported_reason`); 0 turns it off everywhere.
+    # Unset, configurations the path cannot size turn it off on their own
+    # (`dynamic_kv_unsupported_reason`); an explicit 1 refuses them at start-up
+    # and 0 turns it off everywhere.
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "True").lower()

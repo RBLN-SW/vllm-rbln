@@ -50,7 +50,7 @@ def _stub_config(digest: str = "cfghash"):
             use_custom_kernel=False,
             use_flash_causal_attn=True,
         ),
-        attention_config=SimpleNamespace(use_non_causal=False),
+        speculative_config=None,
         cache_config=SimpleNamespace(
             block_size=16,
             num_gpu_blocks_override=None,
@@ -107,7 +107,6 @@ class TestSignatureComposition:
             mega_cache,
             "dynamic_kv_enabled",
             lambda config: enabled,
-            raising=False,
         )
         dynamic = mega_cache.config_signature(_stub_config())
         enabled = False

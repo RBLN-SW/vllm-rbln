@@ -82,7 +82,7 @@ def _make_vllm_config(
             num_gpu_blocks_override=None,
             block_size=16,
         ),
-        attention_config=SimpleNamespace(use_non_causal=False),
+        speculative_config=None,
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
@@ -1189,8 +1189,6 @@ class TestKvRegistrationOrder:
                 register_kv_caches_with_connector=lambda: calls.append("register"),
             ),
             dynamic_kv=SimpleNamespace(
-                assert_attention_layout=lambda: None,
-                assert_cache_layout=lambda: None,
                 shrink_for_compile=lambda cfg: cfg,
                 apply_num_blocks=lambda n: calls.append("resize"),
                 defers_kv_registration=defers,

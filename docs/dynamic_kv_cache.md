@@ -93,7 +93,7 @@ Key components:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `1` | Size the KV cache from the compiled placement and the device. `0` goes back to the pre-compile estimate. |
+| `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `1` | Size the KV cache from the compiled placement and the device. `0` goes back to the pre-compile estimate. Unset, a configuration the path cannot size turns it off on its own; an explicit `1` refuses such a configuration at start-up. |
 
 ```bash
 export VLLM_RBLN_USE_VLLM_MODEL=1
@@ -122,10 +122,12 @@ the pool rather than report on it.
 
 ## Where It Turns Itself Off
 
-A configuration the mechanism cannot size is not a refusal: refusing would stop a
-run that `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` would have served. The feature logs
-one warning and the run continues on the pre-compile estimate, with no KV
-dimension marked dynamic: `mark_dynamic` follows this decision, not the flag.
+A configuration the mechanism cannot size is not a refusal while the variable is
+unset: refusing would stop a run that `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` would
+have served. The feature logs one warning and the run continues on the
+pre-compile estimate, with no KV dimension marked dynamic: `mark_dynamic` follows
+this decision, not the flag. An explicit `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=1` is a
+request, and start-up refuses it with the same reason.
 `dynamic_kv_unsupported_reason` in `v1/worker/utils.py` holds the whole list, and
 both the engine patch and the worker read it. The optimum-rbln path is not on it:
 it installs neither the engine patch nor a worker that carries a sizer, so the
@@ -135,7 +137,8 @@ feature is absent there rather than disabled.
 | --- | --- |
 | `VLLM_RBLN_USE_DEVICE_TENSOR=0` | The artifact carries no dynamic KV dimension. |
 | `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
-| Flash causal attention disabled, or non-causal attention enabled | These dispatch to attention kernels that do not accept a dynamic KV input. |
+| Flash causal attention disabled | This dispatches to an attention kernel that does not accept a dynamic KV input. |
+| A DFlash drafter (`--speculative-config '{"method": "dflash", ...}'`) | The drafter is non-causal on RBLN, and its attention kernel does not accept a dynamic KV input. `use_non_causal` lives on the draft config only, so the method is the signal. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
 | A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. |
 
@@ -164,7 +167,6 @@ would serve from the pre-compile estimate this feature exists to replace.
 - **No KV block fits.** On some chiplet the non-KV base already exceeds
   `total * gpu_memory_utilization`. Raise `--gpu-memory-utilization`, or give the
   model more devices.
-
 Three more cases warn and continue on the pre-compile estimate, because each is
 an explicit request from the caller:
 

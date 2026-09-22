@@ -395,7 +395,7 @@ class TestModeResolution:
                 use_custom_kernel=False,
                 use_flash_causal_attn=True,
             ),
-            attention_config=SimpleNamespace(use_non_causal=False),
+            speculative_config=None,
             kv_transfer_config=None,
         )
 
@@ -403,7 +403,7 @@ class TestModeResolution:
             sizer = DynamicKvSizer(config, object(), foreign_dram_used_bytes=0)
 
         assert sizer.mode is dks.DynamicKvMode.DISABLED
-        assert "[Dynamic KV] off for this run" not in caplog.text
+        assert caplog.records == []
 
     @staticmethod
     def _mode(**kwargs):
@@ -933,12 +933,17 @@ class TestReleaseKvCacheTensors:
         # The rebind reassigns these together from one ordered name list, so a
         # piece left behind describes a cache that no longer exists.
         layer = SimpleNamespace(kv_cache=torch.zeros(1))
+        # l1 aliases l0's view and owns no tensor, so it is in no `shared_by`.
+        aliasing = SimpleNamespace(kv_cache=layer.kv_cache)
         model_runner = SimpleNamespace(
             kv_caches=[torch.zeros(1)],
             kv_cache_bases=[torch.zeros(1)],
             kv_cache_names=["l0"],
             kv_cache_block_axes={"l0": 1},
-            compilation_config=SimpleNamespace(static_forward_context={"l0": layer}),
+            shared_kv_cache_layers={"l1": "l0"},
+            compilation_config=SimpleNamespace(
+                static_forward_context={"l0": layer, "l1": aliasing}
+            ),
         )
         sizer = SimpleNamespace(
             model_runner=model_runner,
@@ -957,3 +962,4 @@ class TestReleaseKvCacheTensors:
         assert model_runner.kv_cache_names == []
         assert model_runner.kv_cache_block_axes == {}
         assert layer.kv_cache is None
+        assert aliasing.kv_cache is None

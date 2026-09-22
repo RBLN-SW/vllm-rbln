@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
@@ -341,10 +340,13 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "flash causal attention is off, so the model dispatches to an "
             "attention kernel that does not accept a dynamic KV input"
         )
-    if vllm_config.attention_config.use_non_causal:
+    speculative = vllm_config.speculative_config
+    if speculative is not None and speculative.method == "dflash":
+        # `use_non_causal` lives on the draft config only; the RBLN drafter is
+        # non-causal by requirement.
         return (
-            "non-causal attention dispatches to a kernel that does not accept "
-            "a dynamic KV input"
+            "the DFlash drafter is non-causal, and its attention kernel does "
+            "not accept a dynamic KV input"
         )
     if vllm_config.cache_config.block_size == vllm_config.model_config.max_model_len:
         # This selects the normal-attention kernels unless the model supplies
@@ -355,16 +357,6 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "does not accept a dynamic KV input"
         )
     kv_transfer = vllm_config.kv_transfer_config
-    if kv_transfer is not None:
-        unregistered = [
-            name
-            for name in DYNAMIC_KV_SUPPORTED_CONNECTORS
-            if name not in KVConnectorFactory._registry
-        ]
-        assert not unregistered, (
-            "DYNAMIC_KV_SUPPORTED_CONNECTORS names connectors the factory never "
-            f"registered: {unregistered}"
-        )
     if (
         kv_transfer is not None
         and kv_transfer.kv_connector not in DYNAMIC_KV_SUPPORTED_CONNECTORS

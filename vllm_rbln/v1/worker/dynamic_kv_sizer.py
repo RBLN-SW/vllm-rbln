@@ -674,8 +674,10 @@ class DynamicKvSizer:
         # overwrites it only after the new tensors exist.
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
+        # An aliasing layer owns no tensor, so it is not in any `shared_by`.
         for layer_name in dict.fromkeys(
-            name for t in old_cfg.kv_cache_tensors for name in t.shared_by
+            [name for t in old_cfg.kv_cache_tensors for name in t.shared_by]
+            + list(mr.shared_kv_cache_layers)
         ):
             layer = forward_context.get(layer_name)
             if layer is None:
