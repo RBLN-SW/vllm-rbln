@@ -21,10 +21,6 @@ def _upstream_has_axk2() -> bool:
     return ARCH in ModelRegistry.get_supported_archs()
 
 
-def _patch_condition() -> bool:
-    return not _upstream_has_axk2()
-
-
 @add_registration(
     reason=(
         "A.X K2 is vendored here until upstream vLLM ships it. Registering "
@@ -68,7 +64,6 @@ def _register_is_deepseek_mla_patch() -> None:
             "axk2 is an MLA model but upstream decides MLA-ness from a hardcoded "
             "model_type tuple that does not list it"
         ),
-        condition=_patch_condition,
     )
     def is_deepseek_mla(self) -> bool:
         hf_text_config = self.hf_text_config
