@@ -27,6 +27,7 @@ import re
 import vllm.envs as envs
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.core.utils import is_strict_kv_producer
 from vllm_rbln.v1.worker.utils import dynamic_kv_enabled
 
 logger = init_logger(__name__)
@@ -106,6 +107,8 @@ def _warmup_graph_set_factors(vllm_config) -> str:
         "draft_tensor_parallel_size": normalize_value(
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
+        # Not kv_role itself: only the strict producer builds a different set.
+        "prefill_only": is_strict_kv_producer(vllm_config),
     }
     return hash_factors(factors)
 

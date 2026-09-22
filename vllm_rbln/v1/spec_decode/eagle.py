@@ -55,6 +55,9 @@ logger = init_logger(__name__)
 
 
 class RBLNEagleProposer(EagleProposer):
+    # A producer's warm-up stops after the first pass, which is prefill-shaped.
+    warms_up_decode_graphs_on_a_producer = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -179,9 +182,13 @@ class RBLNEagleProposer(EagleProposer):
         # since the draft tokens are discarded anyway.
         # Under DP with MoE drafters, we still need to run the full
         # drafter steps for possible decoding peers.
-        if self.runner.is_intermediate_chunked_prefill and not (
-            self.vllm_config.parallel_config.data_parallel_size > 1
-            and self.draft_has_moe
+        # A strict producer discards them too, with no decoding peer to wait for.
+        if self.runner.is_strict_kv_producer or (
+            self.runner.is_intermediate_chunked_prefill
+            and not (
+                self.vllm_config.parallel_config.data_parallel_size > 1
+                and self.draft_has_moe
+            )
         ):
             return draft_ids.new_zeros((num_reqs, self.num_speculative_tokens))
 
@@ -581,7 +588,7 @@ class RBLNEagleProposer(EagleProposer):
                 token_indices_to_sample=token_indices_to_sample_padded,
             )
 
-        if self.num_speculative_tokens == 1:
+        if self.num_speculative_tokens == 1 or self.runner.is_strict_kv_producer:
             return
 
         common_attn_metadata.num_actual_tokens = num_reqs
