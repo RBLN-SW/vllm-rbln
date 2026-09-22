@@ -46,6 +46,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
@@ -918,7 +919,9 @@ def set_omp_num_threads(
 
 
 def prepare_kernel_block_sizes(
-    kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
+    sub_block_size: int | None = None,
 ) -> list[int]:
     """
     Generate kernel_block_sizes that matches each block_size.
@@ -930,6 +933,7 @@ def prepare_kernel_block_sizes(
     Args:
         kv_cache_config: The KV cache configuration.
         attn_groups: Attention groups indexed by KV cache group id.
+        sub_block_size: Sub-block prefix caching granularity, None when off.
 
     Returns:
         List of kernel block sizes for each cache group.
@@ -944,10 +948,18 @@ def prepare_kernel_block_sizes(
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
         if isinstance(kv_cache_spec, SlidingWindowSpec):
-            # Both sliding-window kernels address the cache in windows, not
-            # in the manager's blocks; upstream BlockTable rejects a block the
-            # window does not divide.
-            kernel_block_sizes.append(kv_cache_spec.sliding_window)
+            if sub_block_size is None or isinstance(
+                kv_cache_spec, RBLNSlidingWindowSpec
+            ):
+                # The shift kernel holds one window per block; the append kernel
+                # gathers whole blocks around the window, whatever their size.
+                kernel_block_sizes.append(kv_cache_spec.sliding_window)
+            else:
+                # A sub-block copy slices the buffer the compiled graph reads,
+                # and this layer shares it with a full-attention layer on the
+                # manager block: the append kernel takes the same block, so the
+                # slice is one geometry for both.
+                kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
