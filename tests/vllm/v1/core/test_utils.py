@@ -178,7 +178,7 @@ class TestSubBlockSizeInUse:
         from vllm_rbln import platform
 
         monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR03"
         )
 
     def _call(self, **kw):

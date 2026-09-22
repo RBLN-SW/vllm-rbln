@@ -271,10 +271,10 @@ class TestSignatureVllmConfig:
         import rebel
 
         monkeypatch.setattr(rebel, "get_npu_name", lambda device_id=0: None)
-        monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CA25")
-        atom = mega_cache.config_signature(make_vllm_config())
+        monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CR03")
+        cr03 = mega_cache.config_signature(make_vllm_config())
         monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CR13")
-        assert mega_cache.config_signature(make_vllm_config()) != atom
+        assert mega_cache.config_signature(make_vllm_config()) != cr03
 
     def test_every_factor_is_a_real_field(self):
         # A getattr default would drop an axis from the key on an upstream rename.
