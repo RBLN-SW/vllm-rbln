@@ -45,6 +45,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
+    RblnNixlPushConnectorWorker,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     _as_descs,
 )
@@ -243,6 +246,32 @@ class TestSwaWindowRatio:
                 swa_window_mode=True,
                 specs=[sliding_window_spec(block_size=64, sliding_window=64)],
             )
+
+    def test_two_full_groups_are_refused_the_streaming_knob(self, monkeypatch):
+        # Two full-attention groups: no window to view them through and no
+        # per-shard list that names two, so nothing on the wire can say which
+        # group a batch filled. Refused rather than turned off behind the
+        # operator's back.
+        with pytest.raises(RuntimeError, match="which of its KV cache groups"):
+            build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                push_stream=True,
+                specs=[MagicMock(), MagicMock()],
+                cls=RblnNixlPushConnectorWorker,
+            )
+
+    def test_the_reading_side_of_that_hybrid_is_untouched(self, monkeypatch):
+        # One `--kv-transfer-config` reaches both ends and only the writer
+        # streams, so the refusal must not take the consumer with it.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            push_stream=True,
+            specs=[MagicMock(), MagicMock()],
+        )
+
+        assert worker._shape.streams_prefix is False
 
     def test_sliding_window_derives_block_over_window_ratio(self, monkeypatch):
         worker = build_worker(
