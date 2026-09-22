@@ -14,15 +14,6 @@ _secrets: &secrets
   HF_TOKEN: FSW_HF_TOKEN
   HF_HOME: FSW_HF_HOME
 
-_secrets_k8s: &secrets_k8s
-  UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
-  UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
-  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
-  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
-  HF_TOKEN: HF_TOKEN
-  HF_HOME: HF_HOME
-
-
 _sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
 
 _perf: &perf
@@ -34,38 +25,6 @@ _lm_eval: &lm_eval
   - "bash .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run-lm-eval.sh"
 
 steps:
-  - label: ":pytest: [CA25] pytest (T0)"
-    key: "nightly-t0-ca25"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 4
-        product: "RBLN-CA25"
-    secrets: *secrets_k8s
-    env:
-      UV_CACHE_DIR: "/mnt/uv_cache"
-    timeout_in_minutes: 60
-    command:
-      - *sync
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
-
-  - label: ":pytest: [CA25] pytest (T2)"
-    key: "nightly-t2-ca25"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    resources:
-      npu:
-        count: 32
-        product: "RBLN-CA25"
-    secrets: *secrets_k8s
-    env:
-      UV_CACHE_DIR: "/mnt/uv_cache"
-      VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
-      VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
-    timeout_in_minutes: 120
-    command:
-      - *sync
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
-
   - label: ":pytest: [CR13] pytest (T0)"
     key: "nightly-t0-cr13"
     agents:
@@ -134,15 +93,13 @@ steps:
       - "lm-eval-results/**/*"
     command: *lm_eval
 
-  # The four gating lanes above; perf and lm-eval are measured, not gated, so
+  # The two gating lanes above; perf and lm-eval are measured, not gated, so
   # they stay out of depends_on. No NPU needed -- the wheel is a pure CPU build,
   # so this runs on the default queue.
   - label: ":package: nightly publish"
     key: "nightly-publish"
     if: 'build.env("NIGHTLY_DEPLOY") == "1"'
     depends_on:
-      - "nightly-t0-ca25"
-      - "nightly-t2-ca25"
       - "nightly-t0-cr13"
       - "nightly-t2-cr13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"

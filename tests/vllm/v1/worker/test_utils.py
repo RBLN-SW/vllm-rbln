@@ -1146,8 +1146,9 @@ class TestReplicationFactorIsGated:
     ):
         """Measure with the card DRAM capacity pinned, not read off the host.
 
-        The CI fleet is ATOM (~15.7 GiB), so letting the RBLN-CR branch read the
-        real card makes every figure in this class ~9x too small.
+        The RBLN-CR branch reads the driver's capacity when it is allowed to, so
+        a host that reports anything other than REBEL_DRAM_NBYTES would move
+        every figure in this class.
         """
         mock_platform.get_device_name.return_value = "RBLN-CR03"
         mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
