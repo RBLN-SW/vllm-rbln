@@ -88,10 +88,12 @@ def _resolved_batch(
 
 def _make_runner_stub(**attrs):
     # A bare RBLNModelRunner (no __init__); set only the attributes the method
-    # under test reads. dp_status is the exception: __init__ always sets it, and
-    # the dummy step reads it before anything publishes one.
+    # under test reads. dp_status and is_strict_kv_producer are the exceptions:
+    # __init__ always sets them, and the step phase and the dummy step read them
+    # before anything publishes one.
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
+    runner.is_strict_kv_producer = False
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -1811,7 +1813,7 @@ class TestExecuteModelRecoversADeferredLoad:
     @staticmethod
     def _runner(monkeypatch):
         order: list[str] = []
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: False)
         connector = SimpleNamespace(
             handle_preemptions=lambda meta: order.append(f"preemptions:{meta}")
         )
@@ -1885,7 +1887,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
     def _runner(monkeypatch):
         order: list[str] = []
         connector = SimpleNamespace(handle_preemptions=lambda meta: None)
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: False)
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
         monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
         monkeypatch.setattr(mr, "flush_deferred_loads", lambda c: order.append("flush"))

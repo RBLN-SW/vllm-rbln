@@ -134,6 +134,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
+    is_strict_kv_producer,
     num_base_tokens,
     resolve_propagated_token_write,
     step_is_prefill,
@@ -494,6 +495,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             type(self.bucketing_manager).__name__,
             self.bucketing_manager.decode_batch_buckets,
         )
+
+        self.is_strict_kv_producer = is_strict_kv_producer(vllm_config)
 
         self.specialized_moe_decode = (
             parallel_config.data_parallel_size > 1
@@ -1717,7 +1720,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
         # Stamp the step's phase before any step logic reads it.
-        self.is_prefill = step_is_prefill(scheduler_output)
+        self.is_prefill = step_is_prefill(
+            scheduler_output, strict_kv_producer=self.is_strict_kv_producer
+        )
 
         # Before anything reads token_ids_cpu this step.
         if self.use_async_scheduling:

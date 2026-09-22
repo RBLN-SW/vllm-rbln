@@ -260,9 +260,18 @@ class TestIsPrefill:
         # num_computed < num_tokens - 1 is prefill; the last-token point is not.
         req = create_requests(1, num_tokens=10)[0]
         req.num_computed_tokens = 5
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         req.num_computed_tokens = req.num_tokens - 1
-        assert not is_prefill(req)
+        assert not is_prefill(req, strict_kv_producer=False)
+
+    def test_is_prefill_boundary_on_a_strict_producer(self):
+        # A producer has no decode graph, so the last-token point is a prefill
+        # too; only a fully computed request is left on the decode side.
+        req = create_requests(1, num_tokens=10)[0]
+        req.num_computed_tokens = req.num_tokens - 1
+        assert is_prefill(req, strict_kv_producer=True)
+        req.num_computed_tokens = req.num_tokens
+        assert not is_prefill(req, strict_kv_producer=True)
 
 
 class TestScheduleBasic:
@@ -815,7 +824,7 @@ class TestPortDriftConformance:
 # check the invariants hold at every step.
 
 
-def _check_phase_agrees(sched, out) -> bool:
+def _check_phase_agrees(sched, out, *, strict_kv_producer: bool = False) -> bool:
     """The scheduler's phase for a step against the phase the runner derives from
     it, and that the step carries only one of the two. Returns the phase.
 
@@ -830,11 +839,14 @@ def _check_phase_agrees(sched, out) -> bool:
                 SimpleNamespace(
                     num_computed_tokens=req.num_computed_tokens - chunk,
                     num_tokens=req.num_tokens,
-                )
+                ),
+                strict_kv_producer=strict_kv_producer,
             )
         )
     assert len(phases) <= 1, "a step mixed prefill and decode"
-    assert step_is_prefill(out) is (phases == {True}), (
+    assert step_is_prefill(out, strict_kv_producer=strict_kv_producer) is (
+        phases == {True}
+    ), (
         f"phase {phases} but chunks {out.num_scheduled_tokens} "
         f"(spec {out.scheduled_spec_decode_tokens})"
     )
@@ -859,6 +871,26 @@ class TestFullRunInvariants:
         _drain(sched, per_step=check)
         assert all(r.is_finished() for r in reqs)
         assert sched.running == []
+
+    def test_a_producer_reads_prefill_at_every_step_of_a_full_drain(self):
+        # v1/core/utils.py names this sweep as what pins the two phase views
+        # together; until now it only ever ran for the roles that decode.
+        sched = create_rbln_scheduler(
+            max_num_seqs=4,
+            block_size=16,
+            num_blocks=10000,
+            use_kv_connector=MockKVConfig(matched_tokens=0, kv_role="kv_producer"),
+        )
+        reqs = create_requests(6, num_tokens=10, max_tokens=4)
+        for r in reqs:
+            sched.add_request(r)
+
+        def check(out):
+            assert _check_phase_agrees(sched, out, strict_kv_producer=True)
+            assert len(list(out.num_scheduled_tokens)) == 1
+
+        _drain(sched, per_step=check)
+        assert all(r.is_finished() for r in reqs)
 
     @pytest.mark.parametrize(
         ("num_tokens", "max_num_batched_tokens"),
@@ -1165,12 +1197,12 @@ class TestNoSpecDuringPrefill:
         )[0]
         sched.add_request(req)
         out = sched.schedule()  # first prefill chunk
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         sched.update_from_output(out, make_model_runner_output(out, 0))
 
         req.spec_token_ids = [1] * 4  # spec present, but still prefilling
         out2 = sched.schedule()
-        assert is_prefill(req)
+        assert is_prefill(req, strict_kv_producer=False)
         assert out2.num_scheduled_tokens[req.request_id] == 32  # a full prefill chunk
         assert req.request_id not in out2.scheduled_spec_decode_tokens
 
@@ -1266,7 +1298,9 @@ class TestDecodeCapMachinery:
         )
         for r in reqs:
             advance_to_decode(sched, r)
-        running_decodes = sum(1 for r in sched.running if not is_prefill(r))
+        running_decodes = sum(
+            1 for r in sched.running if not is_prefill(r, strict_kv_producer=False)
+        )
         out = sched.schedule()
         # At most ceil(active / pp) decodes admitted this step, and at least one.
         assert 1 <= len(out.num_scheduled_tokens) <= math.ceil(running_decodes / 2)

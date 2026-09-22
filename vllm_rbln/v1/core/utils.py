@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -56,20 +57,43 @@ if TYPE_CHECKING:
 # is_intermediate_chunked_prefill falls with it since it ANDs the phase: the step
 # gets sampled and drafts get proposed with no anchor token, landing drafts on a
 # request that is still prefilling.
+#
+# A strict KV producer compiles no decode graph, so both widen by one token and
+# every step it runs is a prefill step. It reaches three of the four cases above
+# -- it is never asked to fetch remote KV -- and the prefill graph takes them,
+# since a prefill's query is padded to max_num_tokens either way. The graph
+# follows step_is_prefill, which reads prefill whenever a base token is there.
 
 
-def is_prefill(request: Request) -> bool:
+def is_strict_kv_producer(vllm_config: VllmConfig) -> bool:
+    """Whether this engine only ever prefills, handing its KV to a peer.
+
+    Not ``KVTransferConfig.is_kv_producer``: upstream counts ``kv_both`` as a
+    producer, and that role decodes.
+    """
+    kv = vllm_config.kv_transfer_config
+    return (
+        kv is not None and kv.kv_connector is not None and kv.kv_role == "kv_producer"
+    )
+
+
+def is_prefill(request: Request, *, strict_kv_producer: bool) -> bool:
+    if strict_kv_producer:
+        return request.num_computed_tokens < request.num_tokens
     return request.num_computed_tokens < request.num_tokens - 1
 
 
-def step_is_prefill(scheduler_output: SchedulerOutput) -> bool:
+def step_is_prefill(
+    scheduler_output: SchedulerOutput, *, strict_kv_producer: bool
+) -> bool:
+    min_base_tokens = 1 if strict_kv_producer else 2
     return any(
         num_base_tokens(
             scheduler_output.num_scheduled_tokens,
             scheduler_output.scheduled_spec_decode_tokens,
             req_id,
         )
-        > 1
+        >= min_base_tokens
         for req_id in scheduler_output.num_scheduled_tokens
     )
 

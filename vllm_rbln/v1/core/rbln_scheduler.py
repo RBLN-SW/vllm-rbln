@@ -46,6 +46,7 @@ from vllm_rbln.v1.core.rbln_kv_cache_manager import (
 from vllm_rbln.v1.core.utils import (
     DecodeBatchBudget,
     is_prefill,
+    is_strict_kv_producer,
     num_base_tokens,
     should_defer_spec_step,
     sub_block_size_in_use,
@@ -128,6 +129,7 @@ class RBLNScheduler(Scheduler):
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        self._strict_kv_producer = is_strict_kv_producer(self.vllm_config)
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -140,7 +142,11 @@ class RBLNScheduler(Scheduler):
         running), so this snapshot is exact even as the running/ready split
         shifts during the waiting loop.
         """
-        num_running_decodes = sum(1 for r in self.running if not is_prefill(r))
+        num_running_decodes = sum(
+            1
+            for r in self.running
+            if not is_prefill(r, strict_kv_producer=self._strict_kv_producer)
+        )
         num_ready_remote_kv = len(self.finished_recving_kv_req_ids)
         return num_running_decodes + num_ready_remote_kv
 
@@ -242,7 +248,10 @@ class RBLNScheduler(Scheduler):
         # section in v1/core/utils.py.
         req_index = (
             len(self.running) - 1
-            if self.running and is_prefill(self.running[-1])
+            if self.running
+            and is_prefill(
+                self.running[-1], strict_kv_producer=self._strict_kv_producer
+            )
             else 0
         )
         while req_index < len(self.running) and token_budget > 0:
@@ -458,7 +467,13 @@ class RBLNScheduler(Scheduler):
         if (
             not preempted_reqs
             and self._pause_state == PauseState.UNPAUSED
-            and not (scheduled_running_reqs and is_prefill(scheduled_running_reqs[0]))
+            and not (
+                scheduled_running_reqs
+                and is_prefill(
+                    scheduled_running_reqs[0],
+                    strict_kv_producer=self._strict_kv_producer,
+                )
+            )
         ):
             # NOTE(RBLN): refresh the token budget to determine whether we can schedule
             # new prefill requests into the running batch.
@@ -647,7 +662,9 @@ class RBLNScheduler(Scheduler):
                     num_new_tokens = min(num_new_tokens, prefill_token_budget)
                     assert num_new_tokens > 0
 
-                    if is_prefill(request) and (
+                    if is_prefill(
+                        request, strict_kv_producer=self._strict_kv_producer
+                    ) and (
                         len(scheduled_new_reqs) > 0 or len(scheduled_resumed_reqs) > 0
                     ):
                         # NOTE(RBLN): Only a request that will run as a LOCAL prefill
@@ -831,7 +848,7 @@ class RBLNScheduler(Scheduler):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
-                if not is_prefill(request):
+                if not is_prefill(request, strict_kv_producer=self._strict_kv_producer):
                     # NOTE(RBLN): A decode-ready request joins the decode batch
                     # here, regardless of how it became decode-ready -- a FULL
                     # remote-KV match promoted from WAITING_FOR_REMOTE_KVS, a full
@@ -840,10 +857,10 @@ class RBLNScheduler(Scheduler):
                     # the no-mixed-batching eviction block below and runs as a lone
                     # prefill, reaching decode via the running loop on a later step.)
                     #
-                    # is_prefill is False here, so num_computed == num_tokens - 1
-                    # and (given the earlier `assert num_new_tokens > 0`)
-                    # num_new_tokens == 1 -- the single-token decode precondition.
-                    # Kept as a sanity check.
+                    # On a decoding role is_prefill is False only at
+                    # num_computed == num_tokens - 1, so num_new_tokens == 1 given
+                    # the earlier `assert num_new_tokens > 0`. A producer widens
+                    # is_prefill past this branch and never arrives. Sanity check.
                     assert num_new_tokens == 1, (
                         f"decode-ready request {request_id} has "
                         f"num_new_tokens={num_new_tokens} (expected 1)."
