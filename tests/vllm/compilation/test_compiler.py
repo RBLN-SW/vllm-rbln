@@ -101,25 +101,13 @@ class TestCompileOptions:
         assert captured_compile["options"]["_runtime_holder"] is holder
         assert "runtime_holder" not in captured_compile["options"]
 
-    def test_dtype_is_forwarded(self, captured_compile, monkeypatch):
-        monkeypatch.setattr(compiler, "_check_dtype_option_supported", lambda: None)
+    def test_dtype_is_forwarded(self, captured_compile):
         compile(object(), dtype="float16")
         assert captured_compile["options"]["dtype"] == "float16"
 
     def test_empty_dtype_is_not_forwarded(self, captured_compile):
         compile(object(), dtype="")
         assert "dtype" not in captured_compile["options"]
-
-    def test_dtype_is_refused_on_an_older_rebel(self, captured_compile, monkeypatch):
-        # An older rebel ignores unknown option keys, so the graph would silently
-        # compile in the target default instead of the requested dtype.
-        def legacy_compile(model, *, npu=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
-        with pytest.raises(ValueError, match="dtype"):
-            compile(object(), dtype="float16")
-        assert "options" not in captured_compile
 
     def test_mode_str_becomes_list(self, captured_compile):
         # A str mode is wrapped into a single-element list.
@@ -286,3 +274,24 @@ class TestCompilerConformance:
         params = inspect.signature(CompileContext).parameters
         assert "use_weight_sharing" in params
         assert "use_global_ctx" not in params  # deprecated kwargs
+
+    def test_rebel_compile_signature(self):
+        params = inspect.signature(compiler.rebel.compile).parameters
+        assert "dtype" not in params, (
+            "rebel.compile takes dtype now; remove check_dtype_option_supported"
+        )
+
+    def test_dtype_check_refuses_an_older_rebel(self, monkeypatch):
+        def legacy_compile(model, *, npu=None):
+            pass
+
+        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
+        with pytest.raises(ValueError, match="dtype"):
+            compiler.check_dtype_option_supported()
+
+    def test_dtype_check_passes_when_rebel_takes_it(self, monkeypatch):
+        def new_compile(model, *, npu=None, dtype=None):
+            pass
+
+        monkeypatch.setattr(compiler.rebel, "compile", new_compile)
+        compiler.check_dtype_option_supported()

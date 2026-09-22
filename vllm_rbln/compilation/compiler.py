@@ -45,9 +45,8 @@ def _ensure_torch_dynamo_configured() -> None:
     _DYNAMO_CONFIGURED = True
 
 
-def _check_dtype_option_supported() -> None:
-    # rebel.compile gained `dtype` in the same change as the torch.compile option.
-    # Drop this probe with the rebel-compiler pin bump that guarantees both.
+def check_dtype_option_supported() -> None:
+    # Remove once the rebel-compiler pin guarantees the `dtype` option.
     if "dtype" not in inspect.signature(rebel.compile).parameters:
         raise ValueError(
             "compile_dtype needs a rebel-compiler that takes `dtype` as a compile "
@@ -131,9 +130,7 @@ def compile(
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
     set_option("use_static_output", use_static_output)
-    if dtype:
-        _check_dtype_option_supported()
-        set_option("dtype", dtype)
+    set_option("dtype", dtype)
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
         set_option("mega_cache_only", True)
