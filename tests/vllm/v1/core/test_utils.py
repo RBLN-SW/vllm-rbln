@@ -23,6 +23,7 @@ import pytest
 
 from vllm_rbln.v1.core.utils import (
     decode_batch_size,
+    is_strict_kv_producer,
     num_base_tokens,
     resolve_propagated_token_write,
     should_defer_spec_step,
@@ -38,34 +39,86 @@ def _sched_out(num_scheduled_tokens, spec=None):
     )
 
 
+def _phase(num_scheduled_tokens, spec=None, *, producer=False):
+    return step_is_prefill(
+        _sched_out(num_scheduled_tokens, spec), strict_kv_producer=producer
+    )
+
+
 class TestStepIsPrefill:
     # The phase the runner selects its compiled graph with: more than one
     # non-draft token for some request.
 
     def test_decode_step(self):
-        assert step_is_prefill(_sched_out({"a": 1, "b": 1})) is False
+        assert _phase({"a": 1, "b": 1}) is False
 
     def test_prefill_chunk(self):
-        assert step_is_prefill(_sched_out({"a": 512})) is True
+        assert _phase({"a": 512}) is True
 
     def test_single_token_step_is_decode(self):
         # Where a 1-token prompt, a chunked prefill's last token and a full
         # remote-KV or prefix-cache match all land -- is_prefill() reports decode
         # for each, so this has to as well.
-        assert step_is_prefill(_sched_out({"a": 1})) is False
+        assert _phase({"a": 1}) is False
 
     def test_drafts_do_not_inflate_the_phase(self):
         # 1 base + 4 drafts is a decode step; only the base counts.
-        assert step_is_prefill(_sched_out({"a": 5}, spec={"a": [1, 2, 3, 4]})) is False
+        assert _phase({"a": 5}, spec={"a": [1, 2, 3, 4]}) is False
 
     def test_empty_step(self):
-        assert step_is_prefill(_sched_out({})) is False
+        assert _phase({}) is False
 
     def test_a_mixed_step_reads_prefill(self):
         # Unreachable (the scheduler never mixes) and asserted against there.
         # Pinned because any() picks the safe side: a prefill graph can still
         # take a single-token query, a decode graph cannot take a chunk.
-        assert step_is_prefill(_sched_out({"a": 1, "b": 512})) is True
+        assert _phase({"a": 1, "b": 512}) is True
+
+
+class TestStepIsPrefillOnAStrictProducer:
+    # A producer compiles no decode graph, so the 1-token cases have to read
+    # prefill instead.
+
+    def test_single_token_step_is_prefill(self):
+        assert _phase({"a": 1}, producer=True) is True
+
+    @pytest.mark.parametrize("producer", [False, True])
+    def test_a_chunk_is_prefill_either_way(self, producer):
+        assert _phase({"a": 512}, producer=producer) is True
+
+    def test_drafts_alone_do_not_make_it_prefill(self):
+        # The widened threshold counts base tokens, not scheduled ones: a
+        # draft-only step stays out of the phase on both sides.
+        assert _phase({"a": 4}, spec={"a": [1, 2, 3, 4]}, producer=True) is False
+
+    def test_empty_step(self):
+        assert _phase({}, producer=True) is False
+
+
+class TestIsStrictKvProducer:
+    # kv_both is a producer to upstream and decodes here, so the two must not
+    # be read through KVTransferConfig.is_kv_producer.
+
+    @pytest.mark.parametrize(
+        "kv_role, expected",
+        [("kv_producer", True), ("kv_both", False), ("kv_consumer", False)],
+    )
+    def test_only_the_strict_role_qualifies(self, kv_role, expected):
+        config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="RblnNixlConnector", kv_role=kv_role
+            )
+        )
+        assert is_strict_kv_producer(config) is expected
+
+    def test_a_role_without_a_connector_is_not_one(self):
+        config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector=None, kv_role="kv_producer")
+        )
+        assert is_strict_kv_producer(config) is False
+
+    def test_no_transfer_config(self):
+        assert is_strict_kv_producer(SimpleNamespace(kv_transfer_config=None)) is False
 
 
 @pytest.mark.parametrize(
