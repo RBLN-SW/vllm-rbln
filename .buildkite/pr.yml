@@ -1,6 +1,7 @@
 env:
   UV_CACHE_DIR: "/mnt/uv_cache"
   UV_LINK_MODE: "symlink"
+  UV_LOCK_TIMEOUT: "1200"
   UV_INDEX_STRATEGY: "unsafe-best-match"
 
 # uv index creds for the pre-commit env (LHS = job env var, RHS = OB vault name).
