@@ -187,7 +187,11 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
             reconfigure(lambda config: None)
 
-    def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
+    def test_an_explicit_dynamic_kv_on_an_unsizable_config(
+        self, reconfigure, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
         def custom_kernel(dynamic):
             def mutate(config):
                 config.additional_config.use_custom_kernel = True
@@ -892,6 +896,8 @@ class TestModelImpl:
         [("vllm", ("rbln", "rbln", "rbln-ccl")), ("optimum", ("cpu", "cpu", ""))],
     )
     def test_the_path_moves_the_device_identity(self, model_impl, expected):
+        if not platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR:
+            expected = ("cpu", "cpu", "")
         platform._apply_model_impl(model_impl)
         assert (
             RblnPlatform.device_name,
@@ -933,8 +939,10 @@ class TestModelImpl:
         config = _build(model_impl="vllm")
 
         assert isinstance(config.additional_config, RBLNConfig)
-        assert RblnPlatform.device_type == "rbln"
-        assert platform.USE_DEVICE_TENSOR is True
+        assert RblnPlatform.device_type == (
+            "rbln" if platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR else "cpu"
+        )
+        assert platform.USE_DEVICE_TENSOR is platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
 
     def test_a_built_config_passed_in_keeps_its_path(self, on_the_other_path):
@@ -950,7 +958,9 @@ class TestModelImpl:
 
         assert config.additional_config is given
         assert config.additional_config.use_w8a8 is True
-        assert RblnPlatform.device_type == "rbln"
+        assert RblnPlatform.device_type == (
+            "rbln" if platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR else "cpu"
+        )
 
     def test_the_write_back_keeps_the_rest_of_additional_config(
         self, on_the_other_path
@@ -1057,7 +1067,9 @@ class TestModelImpl:
 
         assert seen == [{"model_impl": "vllm"}]
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
-        assert RblnPlatform.device_type == "rbln"
+        assert RblnPlatform.device_type == (
+            "rbln" if platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR else "cpu"
+        )
 
     def test_a_disabled_path_stops_the_config(self, monkeypatch):
         """The wrapper resolves the path, so a disabled one fails here."""

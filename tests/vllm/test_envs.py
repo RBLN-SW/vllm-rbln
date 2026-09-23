@@ -326,7 +326,7 @@ def test_rbln_variables_are_registered_with_vllm():
     )
     # Registered *and* resolvable: ray_env only needs the name, but collect_env
     # and any direct reader go through vllm.envs' own attribute lookup.
-    assert getattr(upstream_envs, "VLLM_RBLN_USE_DEVICE_TENSOR") is True  # noqa: B009
+    assert upstream_envs.VLLM_RBLN_USE_DEVICE_TENSOR is envs.VLLM_RBLN_USE_DEVICE_TENSOR
 
 
 def test_compile_env_partition_covers_every_variable():

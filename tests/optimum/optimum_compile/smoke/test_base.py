@@ -24,8 +24,9 @@ import gc
 import os
 import time
 import unittest
-from collections.abc import Callable
+from functools import partial
 from typing import Any
+from unittest.mock import patch
 
 import torch
 from PIL import Image
@@ -46,28 +47,26 @@ _ASSET_IMAGE = os.path.join(
 )
 
 
-def _make_hf_overrides(dotted: dict[str, Any]) -> Callable:
-    """Wrap a flat/dotted config-override dict in a vLLM ``hf_overrides``
-    callable. Missing sub-configs are skipped so the callable survives vLLM's
-    dummy-config probe (``transformers_utils/config.py``)."""
+def _apply_hf_overrides(config, *, dotted: dict[str, Any]):
+    """Apply flat/dotted overrides, including vLLM's dummy-config probe.
 
-    def apply(config):
-        for key, value in dotted.items():
-            obj = config
-            *heads, last = key.split(".")
-            for head in heads:
-                obj = getattr(obj, head, None)
-                if obj is None:
-                    break
-            if obj is not None and hasattr(obj, last):
-                setattr(obj, last, value)
-                if last == "num_hidden_layers":
-                    lt = getattr(obj, "layer_types", None)
-                    if isinstance(lt, (list, tuple)) and len(lt) > value:
-                        obj.layer_types = list(lt[:value])
-        return config
+    A module-level callable can be pickled when the engine uses spawn.
+    """
 
-    return apply
+    for key, value in dotted.items():
+        obj = config
+        *heads, last = key.split(".")
+        for head in heads:
+            obj = getattr(obj, head, None)
+            if obj is None:
+                break
+        if obj is not None and hasattr(obj, last):
+            setattr(obj, last, value)
+            if last == "num_hidden_layers":
+                lt = getattr(obj, "layer_types", None)
+                if isinstance(lt, (list, tuple)) and len(lt) > value:
+                    obj.layer_types = list(lt[:value])
+    return config
 
 
 class SmokeBase:
@@ -92,9 +91,14 @@ class SmokeBase:
             os.environ["VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"] = str(cls.NUM_DEVICES)
             kwargs = dict(cls.LLM_KWARGS)
             if cls.HF_OVERRIDES:
-                kwargs["hf_overrides"] = _make_hf_overrides(cls.HF_OVERRIDES)
+                kwargs["hf_overrides"] = partial(
+                    _apply_hf_overrides, dotted=cls.HF_OVERRIDES
+                )
             cls.model_path = cls.MODEL_ID
-            cls.llm = LLM(model=cls.MODEL_ID, **kwargs)
+            # Pooling assertions initialize parent-side torch thread pools;
+            # later engines must not inherit their locks through fork.
+            with patch.dict(os.environ, {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}):
+                cls.llm = LLM(model=cls.MODEL_ID, **kwargs)
 
         @classmethod
         def tearDownClass(cls) -> None:

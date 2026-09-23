@@ -18,8 +18,46 @@ from dataclasses import dataclass
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.request import Request
+
+
+def select_canonical_kv_layers_per_pool(kv_cache_config: KVCacheConfig) -> set[str]:
+    """Choose one Full-preferred view per pool for storage-level consumers.
+
+    Full-attention views retain the logical block size required by NIXL's
+    descriptor strides. Static-address binding also needs one name per storage.
+    Token-level connectors must retain every layer's own view instead.
+    """
+    layer_to_spec = {
+        name: (
+            group.kv_cache_spec.kv_cache_specs[name]
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else group.kv_cache_spec
+        )
+        for group in kv_cache_config.kv_cache_groups
+        for name in group.layer_names
+    }
+    chosen = set()
+    for tensor in kv_cache_config.kv_cache_tensors:
+        if not tensor.shared_by:
+            continue
+        chosen.add(
+            next(
+                (
+                    name
+                    for name in tensor.shared_by
+                    if isinstance(layer_to_spec.get(name), FullAttentionSpec)
+                ),
+                tensor.shared_by[0],
+            )
+        )
+    return chosen
 
 
 @dataclass(frozen=True)
