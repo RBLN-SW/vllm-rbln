@@ -513,9 +513,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             # count is refused at the handshake.
             logger.info(
                 "RBLN NIXL (D2D): chunk_mode registered no chunk range. A span "
-                "holds %d token(s) and one prefill step computes %d; a chunk is "
-                "never narrower than a step, so a block is cut only where a "
-                "step is under a span.",
+                "holds %d token(s) against a %d-token prefill step, and a chunk "
+                "is never narrower than a step; a grid is also refused where "
+                "the regions disagree on the head band.",
                 self.block_size // self._spans_per_block,
                 self.vllm_config.scheduler_config.max_num_batched_tokens,
             )
