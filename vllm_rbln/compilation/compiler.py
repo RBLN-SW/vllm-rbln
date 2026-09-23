@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
+import rebel
 import torch
 from rebel import CompileContext
 from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
@@ -41,6 +43,15 @@ def _ensure_torch_dynamo_configured() -> None:
     torch._dynamo.config.cache_size_limit = 64
 
     _DYNAMO_CONFIGURED = True
+
+
+def check_dtype_option_supported() -> None:
+    # Remove once the rebel-compiler pin guarantees the `dtype` option.
+    if "dtype" not in inspect.signature(rebel.compile).parameters:
+        raise ValueError(
+            "compile_dtype needs a rebel-compiler that takes `dtype` as a compile "
+            f"option; installed {rebel.__version__} does not."
+        )
 
 
 def create_compile_context(
@@ -86,6 +97,7 @@ def compile(
     cache_dir: str = "",
     use_static_output: bool = False,
     use_direct_dispatch: bool = False,
+    dtype: str = "",
 ) -> CompiledTarget:
     if use_direct_dispatch and not fullgraph:
         # A dispatched call runs one code object, so whatever Dynamo leaves
@@ -118,6 +130,7 @@ def compile(
     set_option("use_global_ctx", use_global_ctx)
     set_option("global_device_id", global_device_id)
     set_option("use_static_output", use_static_output)
+    set_option("dtype", dtype)
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
         set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
         set_option("mega_cache_only", True)

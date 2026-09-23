@@ -2292,6 +2292,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # output buffer can be reused across steps even under async scheduling.
                 use_static_output=True,
                 use_direct_dispatch=True,
+                dtype=self.rbln_config.compile_dtype,
             )
             # NOTE(RBLN): We compile compute_logits separately to cover cases when
             # `self.use_wrapped_compute_logits` is `False`
@@ -2307,6 +2308,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                 use_static_output=True,
+                dtype=self.rbln_config.compile_dtype,
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:

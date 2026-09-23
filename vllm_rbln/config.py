@@ -66,6 +66,7 @@ _DERIVED = {"no_flag": True, "derived": True}
 ModelImpl = Literal["vllm", "optimum"]
 
 DecodeBatchBucketStrategy = Literal["exponential", "linear", "manual"]
+CompileDtype = Literal["", "float16", "bfloat16"]
 
 
 @vllm_config_dataclass
@@ -139,6 +140,10 @@ class RBLNConfig(RBLNConfigBase):
     use_w8a8: bool = False
     """Opt in to W8A8. W8A16 runs on every RBLN NPU, W8A8 only on the ones
     whose kernels take an fp8 activation."""
+
+    compile_dtype: CompileDtype = ""
+    """dtype the compiled graphs run in on the device. Empty keeps the
+    compiler's per-target default."""
 
     def compute_hash(self) -> str:
         """Hash of the fields that change the compiled artifact.

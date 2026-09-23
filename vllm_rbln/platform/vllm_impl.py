@@ -76,6 +76,11 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
+    if rbln_config.compile_dtype:
+        from vllm_rbln.compilation import check_dtype_option_supported
+
+        check_dtype_option_supported()
+
     if not scheduler_config.enable_chunked_prefill:
         raise ValueError(
             "Disabling chunked prefill is not supported on RBLN. "

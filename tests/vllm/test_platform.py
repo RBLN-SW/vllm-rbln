@@ -335,6 +335,31 @@ class TestDtype:
         assert config.model_config.dtype == torch.float32
 
 
+class TestCompileDtype:
+    @staticmethod
+    def _with_dtype(config):
+        config.additional_config = replace(
+            config.additional_config, compile_dtype="float16"
+        )
+
+    @pytest.fixture
+    def older_rebel(self, monkeypatch):
+        import vllm_rbln.compilation.compiler as compiler
+
+        def legacy_compile(model, *, npu=None):
+            pass
+
+        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
+
+    def test_empty_dtype_skips_the_probe(self, reconfigure, older_rebel):
+        config = reconfigure(lambda config: None)
+        assert config.additional_config.compile_dtype == ""
+
+    def test_refused_at_startup_on_an_older_rebel(self, reconfigure, older_rebel):
+        with pytest.raises(ValueError, match="dtype"):
+            reconfigure(self._with_dtype)
+
+
 class TestWorkerAndScheduler:
     def test_auto_worker_becomes_the_rbln_worker(self, configured):
         assert (
