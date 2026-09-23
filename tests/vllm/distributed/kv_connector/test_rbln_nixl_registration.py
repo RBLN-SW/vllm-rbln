@@ -1581,6 +1581,20 @@ class TestTailBlockTrim:
         )
         assert worker._chunk_grid is not None
 
+    def test_a_grid_that_collapses_says_so(self, monkeypatch, caplog):
+        # A chunk is never narrower than one prefill step, so a step at or
+        # above a span leaves every block whole and the knob registers
+        # nothing. Silent, that reads as a knob that works.
+        with caplog.at_level("INFO"):
+            worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=True)
+
+        assert worker._chunk_grid is None
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if "registered no chunk range" in r.getMessage()
+        ]
+
     def test_the_flag_off_leaves_the_same_geometry_alone(self, monkeypatch):
         # Same cut, opposite answer: nothing about the geometry turns this on.
         worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=False)

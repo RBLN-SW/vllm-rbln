@@ -507,6 +507,18 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # the block size it was built with; this is the one a transfer reads
         # back, and it has to answer for the list it selects in.
         self._chunk_grid = self._shard_chunk_grid(block_size=self.block_size, split=1)
+        if self._chunk_mode and self._chunk_grid is None:
+            # Said once here rather than per peer: every list is cut by the
+            # same two numbers, and a peer whose block holds a different
+            # count is refused at the handshake.
+            logger.info(
+                "RBLN NIXL (D2D): chunk_mode registered no chunk range. A span "
+                "holds %d token(s) and one prefill step computes %d; a chunk is "
+                "never narrower than a step, so a block is cut only where a "
+                "step is under a span.",
+                self.block_size // self._spans_per_block,
+                self.vllm_config.scheduler_config.max_num_batched_tokens,
+            )
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
