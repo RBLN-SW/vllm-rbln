@@ -66,15 +66,16 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     scheduler_config.async_scheduling = False
 
     assert parallel_config.tensor_parallel_size == 1, (
-        "Cannot set tensor_parallel_size for pre-compiled optimum-rbln models. "
-        "If you want to compile with tensor parallelism in vllm-rbln, "
-        "please use --rbln-num-devices-per-local-rank instead."
+        "Tensor parallelism is not supported on the optimum model path. "
+        "Set --model-impl vllm to use it."
     )
     assert parallel_config.pipeline_parallel_size == 1, (
-        "Pipeline parallelism is not supported in optimum-rbln."
+        "Pipeline parallelism is not supported on the optimum model path. "
+        "Set --model-impl vllm to use it."
     )
     assert vllm_config.speculative_config is None, (
-        "Speculative decoding is not supported in optimum-rbln."
+        "Speculative decoding is not supported on the optimum model path. "
+        "Set --model-impl vllm to use it."
     )
     # T5EncoderModel is encoder-only but inherits T5Config which has
     # is_encoder_decoder=True. This causes vllm to route inputs
