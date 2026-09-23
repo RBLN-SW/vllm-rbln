@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any, Literal
@@ -42,7 +43,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RblnNixlAgentMetadata,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    LINK_POLL_S,
     RblnNixlWorkerState,
+    every_local_link_down,
 )
 from vllm_rbln.logger import init_logger
 
@@ -401,6 +404,52 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._overlapping_ranks.pop(engine_id, None)
         self._remote_pp_size.pop(engine_id, None)
         super()._cleanup_remote_engine(engine_id, log_eviction=log_eviction)
+
+    def _ensure_handshake(self, *args: Any, **kwargs: Any) -> Future | None:
+        # A dial from a dead local link leaves nixl a half-loaded remote that
+        # fails every later handshake, so nothing is dialled until it is back.
+        if self._link_down_since is None:
+            return super()._ensure_handshake(*args, **kwargs)
+        failed: Future = Future()
+        failed.set_exception(RuntimeError("every local RDMA link is down"))
+        return failed
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        now = time.perf_counter()
+        if now - self._link_checked_at >= LINK_POLL_S:
+            self._link_checked_at = now
+            if not every_local_link_down():
+                self._link_down_since = None
+            elif self._link_down_since is None:
+                self._link_down_since = now
+                logger.warning("Every local RDMA link is down; KV transfers fail.")
+            elif 0 < self._link_down_exit_s <= now - self._link_down_since:
+                raise RuntimeError(
+                    f"Every local RDMA link has been down for "
+                    f"{self._link_down_exit_s}s; exiting so this KV producer is "
+                    "recycled."
+                )
+        done = super().get_finished()
+        # A dead peer stays known -- every read refreshes its TTL on the way to
+        # failing -- so upstream never re-dials it. Drop it once no handle of
+        # its is in flight; a handle whose request is gone has no known owner.
+        if self._engines_to_rehandshake:
+            busy = {
+                self._recving_metadata[req_id].remote.engine_id
+                if req_id in self._recving_metadata
+                else None
+                for req_id, handles in self._recving_transfers.items()
+                if handles
+            }
+            if None not in busy:
+                for engine_id in self._engines_to_rehandshake - busy:
+                    if engine_id in self._remote_agents:
+                        self._cleanup_remote_engine(engine_id, log_eviction=False)
+                        logger.warning(
+                            "Re-handshaking unreachable engine %s.", engine_id
+                        )
+                self._engines_to_rehandshake &= busy
+        return done
 
     def _fan_in_peer_areas(
         self, remote_tp_rank: int, remote_tp_size: int
@@ -914,6 +963,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         )
         payload_bytes, perf_bytes = sock.recv_multipart()
         recv_time = time.perf_counter()
+        if not payload_bytes:
+            raise RuntimeError(
+                f"engine {expected_engine_id} reports every RDMA link down"
+            )
         try:
             handshake_payload = msgspec.msgpack.Decoder(NixlHandshakePayload).decode(
                 payload_bytes

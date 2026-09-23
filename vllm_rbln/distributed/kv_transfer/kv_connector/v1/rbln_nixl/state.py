@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, ClassVar
 
 import numpy as np
@@ -25,6 +26,19 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+_SYS_CLASS_NET = Path("/sys/class/net")
+LINK_POLL_S = 1.0
+
+
+def every_local_link_down() -> bool:
+    """Every physical link in this namespace is down; a veth has no `device`."""
+    states = [
+        (dev / "operstate").read_text().strip()
+        for dev in _SYS_CLASS_NET.iterdir()
+        if (dev / "device").exists()
+    ]
+    return bool(states) and all(s == "down" for s in states)
 
 
 def _as_descs(blocks_data: list[tuple[int, int, int]]) -> np.ndarray:
@@ -79,6 +93,12 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _borrowed_src_handles: set[tuple[str, int, int]]
     _shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
     _shard_descs_per_block: dict[tuple[str, int], int]
+
+    # Peers whose transfer failed, dropped once their handles drain.
+    _engines_to_rehandshake: set[str]
+    _link_down_since: float | None
+    _link_checked_at: float
+    _link_down_exit_s: float
 
     @property
     def topo(self) -> TransferTopology:

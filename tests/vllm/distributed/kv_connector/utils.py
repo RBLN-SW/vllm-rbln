@@ -638,6 +638,8 @@ def build_worker(
     use_mla=False,
     pp_size=1,
     hma_disabled=False,
+    kv_role="kv_both",
+    link_down_exit_s=0,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -708,9 +710,24 @@ def build_worker(
         is_encoder_decoder=False, max_model_len=128
     )
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
+    vllm_config.kv_transfer_config.kv_role = kv_role
+    vllm_config.kv_transfer_config.kv_connector_extra_config = {
+        "link_down_exit_s": link_down_exit_s
+    }
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     kv_cache_config.kv_cache_groups = [
         MagicMock(kv_cache_spec=spec) for spec in (specs or [])
     ]
     return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+
+
+def fake_sysfs_net(tmp_path, **operstate: str):
+    """A `/sys/class/net` with a veth and the given physical links."""
+    (tmp_path / "eth0").mkdir()
+    (tmp_path / "eth0" / "operstate").write_text("up\n")
+    for name, state in operstate.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "device").touch()
+        (tmp_path / name / "operstate").write_text(f"{state}\n")
+    return tmp_path
