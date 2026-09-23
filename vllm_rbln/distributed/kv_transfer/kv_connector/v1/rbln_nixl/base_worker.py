@@ -230,11 +230,13 @@ class RblnNixlWorkerBase(
         if self._has_swa and (
             swa_window_mode or connector_option(self.vllm_config, "chunk_mode", False)
         ):
+            ratios: set[int] = set()
             for spec in self._group_specs:
                 if not isinstance(spec, SlidingWindowSpec):
                     continue
                 assert spec.block_size % spec.sliding_window == 0
                 ratio = spec.block_size // spec.sliding_window
+                ratios.add(ratio)
                 if ratio == 1:
                     continue
                 # Which granule the range names is read off the request's token
@@ -248,13 +250,18 @@ class RblnNixlWorkerBase(
                         "the block's first kernel block. Turn off whichever of "
                         "swa_window_mode and chunk_mode asked for one."
                     )
-                if self._sw_ratio is None:
-                    self._sw_ratio = ratio
-                else:
-                    assert self._sw_ratio == ratio, (
-                        "RBLN NIXL connector assumes a single SWA ratio "
-                        f"across groups, got {self._sw_ratio} vs {ratio}"
-                    )
+            if len(ratios) > 1:
+                # The builder reads a group as windowed from its spec and then
+                # cuts it by the one ratio this engine carries, so a group that
+                # tiles its block differently would be named in another group's
+                # granules -- part of its block, with the descriptor count
+                # unchanged.
+                raise RuntimeError(
+                    "RBLN NIXL: every sliding-window group has to cut its "
+                    "block into the same number of kernel blocks, and this "
+                    f"engine's groups cut it {sorted(ratios)} ways."
+                )
+            self._sw_ratio = next((r for r in ratios if r != 1), None)
             if self._sw_ratio is not None:
                 # Fail at startup rather than at the first handshake: the
                 # two desc ranges `register_local_xfer_handler` builds and a

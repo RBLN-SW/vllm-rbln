@@ -224,7 +224,7 @@ class TestSwaWindowRatio:
         assert worker._sw_ratio == 4
 
     def test_mismatched_ratios_are_rejected(self, monkeypatch):
-        with pytest.raises(AssertionError, match="single SWA ratio"):
+        with pytest.raises(RuntimeError, match="same number of kernel blocks"):
             build_worker(
                 monkeypatch,
                 kv_buffer_device="rbln",
@@ -232,6 +232,23 @@ class TestSwaWindowRatio:
                 specs=[
                     sliding_window_spec(block_size=64, sliding_window=16),
                     sliding_window_spec(block_size=64, sliding_window=32),
+                ],
+            )
+
+    def test_a_window_as_wide_as_its_block_beside_a_narrower_one_is_rejected(
+        self, monkeypatch
+    ):
+        # The builder reads a group as windowed from its spec, not from its
+        # ratio, so the wide one would be cut into the narrow one's granules
+        # -- part of its block, with the descriptor count unchanged.
+        with pytest.raises(RuntimeError, match="same number of kernel blocks"):
+            build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                swa_window_mode=True,
+                specs=[
+                    sliding_window_spec(block_size=64, sliding_window=64),
+                    sliding_window_spec(block_size=64, sliding_window=16),
                 ],
             )
 
