@@ -188,8 +188,8 @@ class OptimumRBLNConfig(RBLNConfigBase):
     derives from the vLLM settings when the model is compiled. With a
     pre-compiled model only the `device` entries apply."""
 
-    prefix_block_size: int | None = None
-    """Block size of the prefix cache. Defaults to the prefill chunk size."""
+    sub_block_size: int | None = None
+    """Sub-block size in tokens. Unset takes the prefill chunk."""
 
     # Snapshots of a vLLM field taken before it is overwritten. vLLM already has
     # the flag, so there is no `--rbln-*` one, but they stay settable: the
@@ -246,7 +246,10 @@ _CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (OptimumRBLNConfig, RBLNConf
 # TODO(vllm-rbln>=0.14.0): delete. Former additional_config keys, still accepted
 # with a warning.
 _RENAMED_KEYS: dict[type[RBLNConfigBase], dict[str, str]] = {
-    OptimumRBLNConfig: {"rbln_config": "optimum_overrides"},
+    OptimumRBLNConfig: {
+        "rbln_config": "optimum_overrides",
+        "prefix_block_size": "sub_block_size",
+    },
 }
 
 _C = TypeVar("_C", bound=RBLNConfigBase)
