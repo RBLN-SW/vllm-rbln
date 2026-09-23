@@ -275,18 +275,15 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     ) -> tuple[int, int] | None:
         """`(byte runs a chunk is spread over, chunks each run is cut into)`.
 
-        None where a chunk comes out the whole span, so neither list grows and
-        a transfer keeps naming whole spans -- which is what a block too small
-        for the byte target, or a prefill chunk as wide as a span, asks for.
+        None where a chunk comes out the whole span -- what a prefill step at
+        or above a span asks for -- so neither list grows.
 
         The axis says where a chunk sits. A context cut gives an area the
-        in-block token range [a * span, (a + 1) * span), so a chunk of it is
-        one run of bytes. A head cut gives every area every token of some
-        heads, so the span is the block and a chunk is one run per head -- and
-        that band has to be one number, since the two lists carry one grid:
-        regions that disagree, a draft's named past the target's, get no grid
-        rather than one region's band standing for the rest. A piece narrower
-        than a head gets none for the same reason.
+        in-block range [a * span, (a + 1) * span), so a chunk of it is one
+        run of bytes; a head cut gives every area every token of some heads,
+        so the span is the block and a chunk is one run per head. That band
+        has to be one number -- the two lists carry one grid -- so regions
+        that disagree, and a piece narrower than a head, get none.
 
         A packed block holds a token's K beside its V, so a token range is one
         run in each -- unless the peer pairing already read the two apart,
