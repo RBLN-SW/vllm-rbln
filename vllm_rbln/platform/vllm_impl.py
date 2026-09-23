@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
-from vllm.version import __version_tuple__ as VLLM_VERSION
 
 from vllm_rbln import envs
 from vllm_rbln.platform import USE_DEVICE_TENSOR
@@ -234,7 +233,6 @@ def _override(vllm_config: "VllmConfig") -> None:
     from vllm.config import CompilationMode
 
     model_config = vllm_config.model_config
-    spec_config = vllm_config.speculative_config
 
     if rbln_config.enforce_model_fp32:
         if model_config.dtype != torch.float32:
@@ -262,19 +260,6 @@ def _override(vllm_config: "VllmConfig") -> None:
             model_config.dtype = torch.float32
 
     logger.info("Using model_config.dtype for RBLN: %s", model_config.dtype)
-
-    if (
-        spec_config is not None
-        and model_config.hf_text_config.model_type == "deepseek_v32"
-    ):
-        # TODO(vllm>=0.29.0): delete this block; vllm#52861 stops upstream
-        # forcing v32 MTP eager, which leaves the reset below dead.
-        assert VLLM_VERSION < (0, 29), (
-            f"vLLM {VLLM_VERSION} ships vllm#52861; delete the deepseek_v32 "
-            "MTP enforce_eager reset."
-        )
-        if not model_config.enforce_eager and spec_config.enforce_eager:
-            spec_config.enforce_eager = False
 
     if model_config.enforce_eager:
         # RBLN(NOTE): force dtype into fp16 for eager mode

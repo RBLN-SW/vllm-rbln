@@ -539,18 +539,6 @@ class TestEnforceEager:
             with pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
                 reconfigure(mutate)
 
-    def test_v32_mtp_eager_force_is_undone(self, reconfigure):
-        # Upstream forces the drafter eager for deepseek_v32 MTP; RBLN compiles it
-        # instead, so the reset has to win back over that force.
-        def mutate(config):
-            config.model_config.hf_text_config.model_type = "deepseek_v32"
-            config.model_config.enforce_eager = False
-            config.speculative_config = SimpleNamespace(
-                method="mtp", enforce_eager=True
-            )
-
-        assert reconfigure(mutate).speculative_config.enforce_eager is False
-
 
 def _selector(*, use_mla: bool = False, use_sparse: bool = False) -> SimpleNamespace:
     return SimpleNamespace(use_mla=use_mla, use_sparse=use_sparse)
