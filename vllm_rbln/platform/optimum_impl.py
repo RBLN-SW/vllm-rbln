@@ -67,8 +67,8 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
 
     assert parallel_config.tensor_parallel_size == 1, (
         "Cannot set tensor_parallel_size on the optimum model path. "
-        "Use --rbln-num-devices-per-local-rank to compile the model with "
-        "tensor parallelism, or set --model-impl vllm."
+        "Use --rbln-num-devices-per-local-rank to compile the model with RSD, "
+        "or set --model-impl vllm."
     )
     assert parallel_config.pipeline_parallel_size == 1, (
         "Pipeline parallelism is not supported on the optimum model path. "
