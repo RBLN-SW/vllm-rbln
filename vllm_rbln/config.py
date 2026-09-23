@@ -476,7 +476,7 @@ def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
     # Owned by the optimum path, and imported here so that a run which named
     # its path, and never reaches this, does not import it at all.
     from vllm_rbln.utils.optimum.paths import is_compiled_dir
-    from vllm_rbln.utils.optimum.registry import is_supported_arch
+    from vllm_rbln.utils.optimum.registry import is_arch_supported
 
     model = maybe_model_redirect(engine_args.hf_config_path or engine_args.model)
     if is_compiled_dir(model):
@@ -521,7 +521,7 @@ def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
         )
 
     architectures = getattr(hf_config, "architectures", None) or []
-    if is_supported_arch(hf_config):
+    if is_arch_supported(hf_config):
         logger.info(
             "--model-impl auto takes the optimum model path: optimum-rbln runs %s.",
             architectures,

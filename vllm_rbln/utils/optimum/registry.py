@@ -133,18 +133,13 @@ def is_enc_dec_arch(config: PretrainedConfig) -> bool:
     return is_arch_supported(config, _RBLN_ENCODER_DECODER_MODELS)
 
 
-def is_supported_arch(config: PretrainedConfig) -> bool:
-    """Whether optimum-rbln has an implementation for this model."""
-    return is_arch_supported(config, _RBLN_SUPPORTED_MODELS)
-
-
 def is_arch_supported(
-    config: PretrainedConfig, model_set: dict[str, tuple[str, str]]
+    config: PretrainedConfig, model_set: dict[str, tuple[str, str]] | None = None
 ) -> bool:
     architectures = getattr(config, "architectures", None) or []
-    return any(
-        arch in _RBLN_SUPPORTED_MODELS and arch in model_set for arch in architectures
-    )
+    if model_set is None:
+        model_set = _RBLN_SUPPORTED_MODELS
+    return any(arch in model_set for arch in architectures)
 
 
 def get_rbln_model_info(config: PretrainedConfig) -> tuple[str, str]:
