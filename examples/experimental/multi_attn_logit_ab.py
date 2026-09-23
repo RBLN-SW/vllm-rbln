@@ -23,21 +23,21 @@
 
 Cases 1 and 2 are the kernel team's A and B.
 
-Case 0 is the reference every other case is compared against.  Prefix
-caching is off throughout, so the cases differ only in the SWA kernel and its
-cache view.  Each case runs in its own process with its own VLLM_CACHE_ROOT:
-the env vars are read when the KV cache is built, and they are not part of the
-mega-cache key, so a shared cache could hand one case another's compiled
-graphs.
+The first case in CASE_ENV is the reference every other case is compared
+against.  Prefix caching is off throughout, so the cases differ only in the SWA
+kernel and its cache view.  Each case runs in its own process with its own
+VLLM_CACHE_ROOT: the env vars are read when the KV cache is built, and they are
+not part of the mega-cache key, so a shared cache could hand one case another's
+compiled graphs.
 
 Each prompt is the passage, cycled to length, and then one question about it,
 so the cases decode real sentences instead of repeating filler.
 
 Per request:
 
-  pos0    max|d| against case 0 at the first generated position, the prefill
-  decode  max|d| against case 0 over later positions, up to the first divergence
-  div     index of the first generated token that differs from case 0, '-' if none
+  pos0    max|d| against the reference at the first generated position
+  decode  max|d| against the reference over later positions, up to divergence
+  div     index of the first generated token that differs, '-' if none
   noise   max|d| between two runs of the same case, over all positions
 
 Usage:
@@ -63,12 +63,12 @@ TOPK = 10
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CASE_ENV = {
-    0: {"RBLN_USE_MULTI_ATTN": "0", "RBLN_SWA_KERNEL_BLOCK": "window"},
+    # 0: {"RBLN_USE_MULTI_ATTN": "0", "RBLN_SWA_KERNEL_BLOCK": "window"},
     1: {"RBLN_USE_MULTI_ATTN": "1", "RBLN_SWA_KERNEL_BLOCK": "window"},
     2: {"RBLN_USE_MULTI_ATTN": "1", "RBLN_SWA_KERNEL_BLOCK": "manager"},
 }
 CASES = tuple(CASE_ENV)
-OTHERS = CASES[1:]
+REF, *OTHERS = CASES
 
 SYSTEM = (
     "You are a meticulous research assistant. Read the passage that follows and "
@@ -241,21 +241,21 @@ def step_deltas(r1: dict, r2: dict) -> list[float]:
 
 
 def dump(i: int, step: int, runs: dict, deltas: dict) -> None:
-    """Top-TOPK logprobs at one position for every case, case 0's ranking.
+    """Top-TOPK logprobs at one position for every case, the reference's ranking.
 
-    An case already past its divergence from case 0 prints blank.
+    A case already past its divergence from the reference prints blank.
     """
-    ref = runs[0]["logprobs"][step]
+    ref = runs[REF]["logprobs"][step]
     live = [case for case in OTHERS if step < len(deltas[case])]
     picked = []
     for case in CASES:
-        if case == 0 or case in live:
+        if case == REF or case in live:
             tid = str(runs[case]["token_ids"][step])
             picked.append(f"{case}:{runs[case]['logprobs'][step][tid][1]!r}")
     moved = "  ".join(f"max|d|{case}={deltas[case][step]:.3e}" for case in live)
     print(f"\n--- request #{i}  step {step}  token {' '.join(picked)}  {moved} ---")
     print(
-        "  rank  token                 case 0"
+        f"  rank  token                 case {REF}"
         + "".join(f"     case {case}    delta {case}" for case in OTHERS)
     )
     for rank, t in enumerate(sorted(ref, key=lambda t: -ref[t][0]), 1):
@@ -276,9 +276,9 @@ def compare() -> None:
     for case in CASES:
         with open(result_path(case)) as f:
             res[case] = json.load(f)
-    n = len(res[0]["first"])
+    n = len(res[REF]["first"])
     runs = [{case: res[case]["first"][i] for case in CASES} for i in range(n)]
-    deltas = [{case: step_deltas(r[0], r[case]) for case in OTHERS} for r in runs]
+    deltas = [{case: step_deltas(r[REF], r[case]) for case in OTHERS} for r in runs]
 
     print(
         f"\nblock={BLOCK_SIZE}  chunk={MAX_BATCHED}  tp={TP}  "
@@ -286,15 +286,15 @@ def compare() -> None:
     )
     print(
         "\n   # case  top1       pos0     decode   div      noise"
-        "   (against case 0; case 0's noise on its own row)"
+        f"   (against case {REF}; case {REF}'s noise on its own row)"
     )
     for i, r in enumerate(runs):
-        noise0 = max(step_deltas(r[0], res[0]["second"][i]))
-        print(f"  {i:2d}   0  {'':>5}  {'':>9}  {'':>9}  {'':>4}  {noise0:9.3e}")
+        noise = max(step_deltas(r[REF], res[REF]["second"][i]))
+        print(f"  {i:2d}   {REF}  {'':>5}  {'':>9}  {'':>9}  {'':>4}  {noise:9.3e}")
         for case in OTHERS:
             d = deltas[i][case]
-            div = first_divergence(r[0]["token_ids"], r[case]["token_ids"])
-            same = r[0]["token_ids"][0] == r[case]["token_ids"][0]
+            div = first_divergence(r[REF]["token_ids"], r[case]["token_ids"])
+            same = r[REF]["token_ids"][0] == r[case]["token_ids"][0]
             decode = f"{max(d[1:]):9.3e}" if len(d) > 1 else f"{'--':>9}"
             noise = max(step_deltas(r[case], res[case]["second"][i]))
             print(
@@ -303,8 +303,8 @@ def compare() -> None:
             )
 
     # Step 0 is the prefill; each later step is one decode.  A row stops at the
-    # first divergence from case 0.
-    print("\nmax|d| against case 0 per step")
+    # first divergence from the reference.
+    print(f"\nmax|d| against case {REF} per step")
     row = 25
     for start in range(0, MAX_TOKENS, row):
         steps = range(start, min(start + row, MAX_TOKENS))
