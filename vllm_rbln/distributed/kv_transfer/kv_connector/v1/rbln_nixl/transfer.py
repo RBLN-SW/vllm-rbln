@@ -138,3 +138,21 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
             peers *= max(1, local_pp // remote_pp)
         return f"{remote_request_id}:{peers * remote_tp_size}".encode()
+
+    # TODO(vllm-project/vllm#54518): delete once a pinned vLLM carries eb74fbb3.
+    def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
+        # A request reported failed in an earlier poll has no metadata left;
+        # the poll that drains its remaining handles must not report it again.
+        done = super()._pop_done_transfers(transfers)
+        return {req_id for req_id in done if req_id in self._recving_metadata}
+
+    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
+        if (meta := self._recving_metadata.get(req_id)) is not None:
+            # A full local prefix hit leaves nothing to invalidate.
+            if not self._is_hma_required and meta.local_block_ids:
+                self._invalid_block_ids.put(set(meta.local_block_ids[0]))
+            self._failed_recv_reqs.put(req_id)
+            self._engines_to_rehandshake.add(meta.remote.engine_id)
+        if handle is not None:
+            self.nixl_wrapper.release_xfer_handle(handle)
+        self.xfer_stats.record_failed_transfer()

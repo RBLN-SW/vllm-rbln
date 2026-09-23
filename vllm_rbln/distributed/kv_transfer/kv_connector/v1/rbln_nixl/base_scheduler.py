@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
+import msgspec
+import zmq
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
@@ -26,8 +30,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    every_local_link_down,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -56,6 +65,44 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
 
         # Blocks collected so far for a prefill that is still being chunked.
         self._block_ids_need_save: dict[ReqId, BlockIds] = {}
+
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._exit_on_link_down = extra.get("link_down_exit_s", 0) > 0
+
+    def has_pending_push_work(self) -> bool:
+        # The worker exits from get_finished, which only a step calls, and an
+        # idle engine does not step: pending work keeps it stepping.
+        if self._exit_on_link_down and every_local_link_down():
+            return True
+        return super().has_pending_push_work()
+
+    @staticmethod
+    def _nixl_handshake_listener(
+        encoded_data: dict[tuple[int, int], Any],
+        ready_event: threading.Event,
+        stop_event: threading.Event,
+        host: str,
+        port: int,
+    ) -> None:
+        # Upstream's listener, answering an empty payload while every local link
+        # is down: the side channel rides the pod network, so a peer would
+        # otherwise handshake fine and then wait out the CM timeout.
+        with zmq_ctx(zmq.ROUTER, make_zmq_path("tcp", host, port)) as sock:
+            sock.setsockopt(zmq.RCVTIMEO, 1000)
+            ready_event.set()
+            while True:
+                try:
+                    identity, _, msg = sock.recv_multipart()
+                except zmq.Again:
+                    if stop_event.is_set():
+                        break
+                    continue
+                _, pp_rank, tp_rank = msgspec.msgpack.decode(msg)
+                payload = (
+                    b"" if every_local_link_down() else encoded_data[(pp_rank, tp_rank)]
+                )
+                ts = msgspec.msgpack.encode(time.perf_counter())
+                sock.send_multipart((identity, b"", payload, ts))
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
