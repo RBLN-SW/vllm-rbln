@@ -17,8 +17,11 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import logging
 import pathlib
 import re
+from types import SimpleNamespace
 
 import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -35,6 +38,7 @@ from vllm_rbln.config import (
     resolve_model_impl,
 )
 from vllm_rbln.envs import RESOLVED_MODEL_IMPL_ENV
+from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
 
 
 @pytest.fixture(autouse=True)
@@ -209,8 +213,6 @@ def test_get_rbln_config_needs_the_current_config_context():
 @pytest.mark.parametrize("other", [{}, OptimumRBLNConfig()], ids=["unbuilt", "optimum"])
 def test_get_rbln_config_rejects_a_config_that_is_not_ours(other):
     """The two classes share a base, so `isinstance` has to reject the sibling."""
-    from types import SimpleNamespace
-
     from vllm.config import set_current_vllm_config
 
     from vllm_rbln.config import get_rbln_config
@@ -340,16 +342,6 @@ class TestResolveModelImpl:
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
         assert resolve_model_impl(model_impl="optimum") == "optimum"
 
-    def test_nothing_given_is_the_default_path(self, monkeypatch):
-        # Both names this suite sets are what the default is the absence of: the
-        # deprecated variable, and the path a parent hands down, which the
-        # conftest states for the whole session.
-        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
-        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
-        assert resolve_model_impl() == "optimum"
-        assert resolve_model_impl({}) == "optimum"
-        assert resolve_model_impl(None) == "optimum"
-
     def test_the_deprecated_variable_still_selects_the_path(self, monkeypatch):
         # TODO(vllm-rbln>=0.14.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
@@ -389,15 +381,11 @@ class TestResolveModelImpl:
         """Every EngineArgs carries `auto`, typed or not.
 
         Read as a path it would overrule what a parent handed down, so it is no
-        answer at all: the process that was handed one keeps it, and the one
-        that was handed nothing takes the default.
+        answer at all and the process that was handed one keeps it.
         """
         monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
         monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", "vllm")
         assert resolve_model_impl(model_impl="auto") == "vllm"
-
-        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
-        assert resolve_model_impl(model_impl="auto") == "optimum"
 
     def test_a_flag_that_disagrees_with_the_config_class_is_rejected(self):
         """The class holds one path's options and the flag names a path.
@@ -504,6 +492,196 @@ class TestResolveModelImpl:
         # implementation. None is not here: it is the argument's own absence.
         with pytest.raises(ValueError, match="unsupported model implementation"):
             resolve_model_impl(model_impl=value)
+
+
+def _model_dir(tmp_path: pathlib.Path, **config) -> str:
+    """A model directory a config read resolves without touching the hub."""
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    return str(tmp_path)
+
+
+def _engine_args(model: str, **fields) -> SimpleNamespace:
+    """The `EngineArgs` fields the resolution reads, and nothing else."""
+    return SimpleNamespace(
+        **{
+            "model": model,
+            "hf_config_path": None,
+            "hf_overrides": {},
+            "trust_remote_code": False,
+            "revision": None,
+            "code_revision": None,
+            "config_format": "auto",
+            "hf_token": None,
+            **fields,
+        }
+    )
+
+
+# Names the chip for the same reason `TestResolveModelImpl` does: half of these
+# resolve the vllm path, which RBLN-CA* refuses.
+@pytest.mark.usefixtures("cr13")
+class TestAutoReadsTheModel:
+    """The bottom rung: `auto`, with nothing handed down, reads the model.
+
+    optimum-rbln implements a fixed set of architectures, and a model outside it
+    has no optimum path to take, so the vllm one runs it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def unanswered(self, monkeypatch):
+        """Neither a parent nor the deprecated variable answers above it."""
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
+
+    @pytest.mark.parametrize(
+        ("model_type", "architecture", "resolved"),
+        [
+            ("llama", "LlamaForCausalLM", "optimum"),
+            ("mixtral", "MixtralForCausalLM", "vllm"),
+        ],
+    )
+    def test_the_architecture_names_the_path(
+        self, tmp_path, model_type, architecture, resolved
+    ):
+        model = _model_dir(
+            tmp_path, model_type=model_type, architectures=[architecture]
+        )
+        assert resolve_model_impl(engine_args=_engine_args(model)) == resolved
+
+    @pytest.mark.parametrize("additional_config", [None, {}])
+    def test_an_additional_config_that_names_no_path_reads_the_model(
+        self, tmp_path, additional_config
+    ):
+        """Only the two classes name a path; a dict carries options."""
+        model = _model_dir(
+            tmp_path, model_type="mixtral", architectures=["MixtralForCausalLM"]
+        )
+        args = _engine_args(model)
+
+        assert resolve_model_impl(additional_config, engine_args=args) == "vllm"
+
+    def test_hf_overrides_are_read_with_the_model(self, tmp_path):
+        """`architectures` is one of the fields an override can rewrite.
+
+        Reading the config without them would name a path for the model on disk
+        while `ModelConfig` builds the overridden one a moment later.
+        """
+        model = _model_dir(
+            tmp_path, model_type="llama", architectures=["LlamaForCausalLM"]
+        )
+        args = _engine_args(
+            model, hf_overrides={"architectures": ["MixtralForCausalLM"]}
+        )
+        assert resolve_model_impl(engine_args=args) == "vllm"
+
+    def test_a_compiled_artifact_is_recognised_without_a_config_read(self, tmp_path):
+        """Only the optimum path runs one, and the directory says so on its own.
+
+        No `config.json` here, so a resolution that read the model instead of
+        the artifact would fall back to the vllm path.
+        """
+        (tmp_path / RBLN_CONFIG_FILE).write_text("{}")
+        assert resolve_model_impl(engine_args=_engine_args(str(tmp_path))) == "optimum"
+
+    def test_a_model_that_cannot_be_read_takes_the_vllm_path(self, tmp_path, caplog):
+        """A config that fails to parse says nothing about which path runs it.
+
+        `ModelConfig` reads the same file next and raises there, so this one
+        warns and picks rather than pre-empting an error it cannot phrase.
+        """
+        (tmp_path / "config.json").write_text("not json")
+        with caplog.at_level(logging.WARNING, logger="vllm_rbln.config"):
+            assert resolve_model_impl(engine_args=_engine_args(str(tmp_path))) == "vllm"
+        assert "could not be read" in caplog.text
+
+    def test_a_refusal_says_why_the_model_was_read_as_vllm(self, tmp_path, monkeypatch):
+        """An unreadable config and an unsupported architecture are undone by
+        different things, so the two outcomes cannot share one remedy.
+        """
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+        (tmp_path / "config.json").write_text("not json")
+
+        with pytest.raises(ValueError, match="Make the config readable"):
+            resolve_model_impl(engine_args=_engine_args(str(tmp_path)))
+
+    def test_a_config_without_architectures_takes_the_vllm_path(
+        self, tmp_path, monkeypatch
+    ):
+        """A remote-code config can leave the field unset rather than empty.
+
+        optimum-rbln is keyed on the architecture, so one it cannot read is one
+        it does not implement.
+        """
+        monkeypatch.setattr(
+            "vllm.transformers_utils.config.get_config",
+            lambda *a, **kw: SimpleNamespace(architectures=None),
+        )
+        model = _model_dir(tmp_path, model_type="llama")
+
+        assert resolve_model_impl(engine_args=_engine_args(model)) == "vllm"
+
+    def test_a_named_path_is_taken_without_reading_the_model(self, tmp_path):
+        # The model is one optimum-rbln runs, so a resolution that read it would
+        # answer differently from what the caller typed.
+        model = _model_dir(
+            tmp_path, model_type="llama", architectures=["LlamaForCausalLM"]
+        )
+        args = _engine_args(model)
+        assert resolve_model_impl(model_impl="vllm", engine_args=args) == "vllm"
+        assert resolve_model_impl(RBLNConfig(), engine_args=args) == "vllm"
+
+    def test_the_deprecated_variable_answers_before_the_model(
+        self, tmp_path, monkeypatch
+    ):
+        """A stated path is never re-read, and this variable states one.
+
+        It says optimum while the model says vllm, so the answer names the rung
+        that gave it.
+        """
+        # TODO(vllm-rbln>=0.14.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
+        monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
+        model = _model_dir(
+            tmp_path, model_type="mixtral", architectures=["MixtralForCausalLM"]
+        )
+
+        assert resolve_model_impl(engine_args=_engine_args(model)) == "optimum"
+
+    def test_a_model_that_needs_the_disabled_path_is_refused(
+        self, monkeypatch, tmp_path
+    ):
+        """RBLN-CA* has no vllm model path, and reading the model cannot route
+        around that. The refusal names the architecture, since nothing the
+        caller typed chose this path for them.
+        """
+        from vllm_rbln import platform
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+        model = _model_dir(
+            tmp_path, model_type="mixtral", architectures=["MixtralForCausalLM"]
+        )
+
+        with pytest.raises(ValueError, match="the model's architecture selected it"):
+            resolve_model_impl(engine_args=_engine_args(model))
+
+    def test_an_inherited_path_is_kept_without_reading_the_model(
+        self, tmp_path, monkeypatch
+    ):
+        """Every worker would otherwise read the model its parent already read.
+
+        The unit lane builds well over a hundred configs, and the suites state
+        their path for exactly this reason.
+        """
+        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", "vllm")
+        model = _model_dir(
+            tmp_path, model_type="llama", architectures=["LlamaForCausalLM"]
+        )
+        assert resolve_model_impl(engine_args=_engine_args(model)) == "vllm"
 
 
 def test_the_path_has_no_rbln_flag_of_its_own(parser):

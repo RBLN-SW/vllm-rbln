@@ -198,6 +198,7 @@ def validate_vars():
 async def add_lora():
     engine_args = AsyncEngineArgs(
         model=MODEL_PATH,
+        model_impl="optimum",
         enable_lora=True,
         max_loras=NUM_LORAS,
         max_lora_rank=MAX_LORA_RANK,
@@ -214,6 +215,7 @@ async def add_lora():
 async def list_loras():
     engine_args = AsyncEngineArgs(
         model=MODEL_PATH,
+        model_impl="optimum",
         enable_lora=True,
         max_loras=NUM_LORAS,
         max_lora_rank=MAX_LORA_RANK,

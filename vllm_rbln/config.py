@@ -369,7 +369,9 @@ def _as_model_impl(value: Any) -> ModelImpl | None:
 
 
 def resolve_model_impl(
-    additional_config: Any = None, model_impl: str | None = None
+    additional_config: Any = None,
+    model_impl: str | None = None,
+    engine_args: Any = None,
 ) -> ModelImpl:
     """The model path, before there is a config to read it off.
 
@@ -379,8 +381,9 @@ def resolve_model_impl(
     `additional_config` that is already one of the two classes answers on its
     own, and disagreeing with the flag is refused rather than resolved.
 
-    With neither, the path is the one this process was handed, and then the
-    default. It is read this early because `RblnPlatform` points itself at a
+    With neither, the path is the one this process was handed, and then the one
+    the model asks for: `engine_args` is the `EngineArgs` whose model `auto`
+    reads. It is read this early because `RblnPlatform` points itself at a
     device before any config exists, and because the processes it spawns run
     their plugin entry points before one reaches them.
     """
@@ -428,21 +431,100 @@ def resolve_model_impl(
             "class of the path you want, instead."
         )
 
-    # A path, never `auto`: what a parent publishes is one, and so is what the
-    # deprecated variable and the default below resolve to.
     resolved = given
     if resolved is None:
-        resolved = cast("ModelImpl", envs.model_impl_from_env())
         if envs.INHERITED_MODEL_IMPL:
+            # A parent resolved this already, `auto` included. Reading the model
+            # again here could answer differently and split a run across paths.
+            resolved = cast("ModelImpl", envs.INHERITED_MODEL_IMPL)
             selected_by = envs.RESOLVED_MODEL_IMPL_ENV
             remedy = "Start the process that published it on the optimum path."
-        else:
+        elif "VLLM_RBLN_USE_VLLM_MODEL" in os.environ:
+            resolved = "vllm" if envs.VLLM_RBLN_USE_VLLM_MODEL else "optimum"
             selected_by = "VLLM_RBLN_USE_VLLM_MODEL"
             # Not `--model-impl optimum`: with the variable still set that is
             # the disagreement the refusal above this one is for.
             remedy = "Unset VLLM_RBLN_USE_VLLM_MODEL."
+        else:
+            # `create_engine_config` is the only caller that reaches this, and
+            # it always has its own engine args.
+            assert engine_args is not None
+            resolved, selected_by, remedy = _model_impl_for(engine_args)
     _reject_disabled_model_impl(resolved, selected_by, remedy)
     return resolved
+
+
+def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
+    """The path `auto` takes for this model, with the wording a refusal needs.
+
+    The two strings name what selected the path and how to undo it, and are
+    empty for the optimum path, which no host refuses. The arguments mirror the
+    ones `ModelConfig` reads the same config with a moment later, `hf_overrides`
+    included, since an override can rewrite the `architectures` this reads.
+    """
+    from vllm.transformers_utils.config import get_config
+    from vllm.transformers_utils.utils import maybe_model_redirect
+
+    # Owned by the optimum path, and imported here so that a run which named
+    # its path, and never reaches this, does not import it at all.
+    from vllm_rbln.utils.optimum.paths import is_compiled_dir
+    from vllm_rbln.utils.optimum.registry import is_arch_supported
+
+    model = maybe_model_redirect(engine_args.hf_config_path or engine_args.model)
+    if is_compiled_dir(model):
+        logger.info(
+            "--model-impl auto takes the optimum model path: %s holds a "
+            "compiled optimum-rbln artifact.",
+            model,
+        )
+        return "optimum", "", ""
+
+    overrides = engine_args.hf_overrides
+    overrides_fn = overrides if callable(overrides) else None
+    overrides_kw = (
+        {}
+        if overrides_fn
+        else {k: v for k, v in (overrides or {}).items() if not isinstance(v, dict)}
+    )
+    try:
+        hf_config = get_config(
+            model,
+            engine_args.trust_remote_code,
+            engine_args.revision,
+            engine_args.code_revision,
+            engine_args.config_format,
+            hf_overrides_kw=overrides_kw,
+            hf_overrides_fn=overrides_fn,
+            token=engine_args.hf_token,
+        )
+    except (ValueError, OSError) as exc:
+        # Not a path this cannot run, just one this cannot read. `ModelConfig`
+        # fetches the same config next and says what is wrong with it.
+        logger.warning(
+            "--model-impl auto takes the vllm model path: %s's config could "
+            "not be read (%s). Name the path to be sure of it.",
+            model,
+            exc,
+        )
+        return (
+            "vllm",
+            "a model whose config could not be read",
+            "Make the config readable, or use --model-impl optimum.",
+        )
+
+    architectures = getattr(hf_config, "architectures", None) or []
+    if is_arch_supported(hf_config):
+        logger.info(
+            "--model-impl auto takes the optimum model path: optimum-rbln runs %s.",
+            architectures,
+        )
+        return "optimum", "", ""
+    logger.info(
+        "--model-impl auto takes the vllm model path: optimum-rbln has no "
+        "implementation for %s.",
+        architectures,
+    )
+    return "vllm", "the model's architecture", "Use a model optimum-rbln implements."
 
 
 def build_rbln_config(additional_config: Any = None) -> RBLNConfig:
