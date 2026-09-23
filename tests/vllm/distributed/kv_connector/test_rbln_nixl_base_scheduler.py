@@ -17,18 +17,27 @@
 # through the inherited entry points of whichever direction sits underneath.
 # Built bare with only the state those paths read.
 
+import socket
+import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
+import zmq
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPullConnectorScheduler,
     NixlPushConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import GET_META_MSG
 from vllm.v1.request import RequestStatus
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
+from tests.vllm.distributed.kv_connector.utils import (
+    fake_sysfs_net,
+    setattr_in_package,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
     RblnNixlPullConnectorScheduler,
 )
@@ -106,6 +115,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._block_ids_need_save = {}
+    sched._exit_on_link_down = False
     # Upstream state the inherited entry points read.
     sched._heartbeat_by_engine = {}
     sched._heartbeat_req_engine = {}
@@ -138,7 +148,9 @@ class TestInit:
             sm.NixlPullConnectorScheduler, "__init__", lambda self, *a, **k: None
         )
         vllm_config = SimpleNamespace(
-            kv_transfer_config=SimpleNamespace(kv_buffer_device=kv_buffer_device)
+            kv_transfer_config=SimpleNamespace(
+                kv_buffer_device=kv_buffer_device, kv_connector_extra_config={}
+            )
         )
         sched = object.__new__(RblnNixlPullConnectorScheduler)
         RblnNixlPullConnectorScheduler.__init__(sched, vllm_config, "eng", {"kv": 1})
@@ -448,3 +460,85 @@ class TestRejectedBeforeScheduling:
 
         assert "rejected" in meta.reqs_to_recv
         assert meta.reqs_to_recv["rejected"].remote.block_ids == ()
+
+
+class TestLinkDownKeepsTheEngineStepping:
+    # The worker exits from get_finished, which only an engine step calls, so an
+    # idle producer with every link down must report pending work.
+
+    def test_all_links_down_is_pending_work(self, monkeypatch, tmp_path):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="down")
+        )
+        sched = _scheduler()
+        sched._exit_on_link_down = True
+        assert sched.has_pending_push_work()
+
+    def test_a_live_spare_link_is_not_pending_work(self, monkeypatch, tmp_path):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="down", ens2="up")
+        )
+        sched = _scheduler()
+        sched._exit_on_link_down = True
+        assert not sched.has_pending_push_work()
+
+    def test_without_the_exit_setting_the_links_are_not_read(
+        self, monkeypatch, tmp_path
+    ):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="down")
+        )
+        assert not _scheduler().has_pending_push_work()
+
+    def test_push_work_still_counts(self, monkeypatch, tmp_path):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="up")
+        )
+        sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
+        sched._exit_on_link_down = True
+        sched._finished_request_blocks = {"r0": object()}
+        assert sched.has_pending_push_work()
+
+
+class TestLinkDownRefusesTheHandshake:
+    # The side channel stays up when the RDMA links die, so a peer would
+    # handshake fine and then wait out the CM timeout; an empty frame fails
+    # its handshake at once instead.
+
+    @staticmethod
+    def _ask(sched, encoded):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        ready, stop = threading.Event(), threading.Event()
+        t = threading.Thread(
+            target=sched._nixl_handshake_listener,
+            args=(encoded, ready, stop, "127.0.0.1", port),
+            daemon=True,
+        )
+        t.start()
+        assert ready.wait(5)
+        ctx = zmq.Context()
+        try:
+            req = ctx.socket(zmq.REQ)
+            req.setsockopt(zmq.RCVTIMEO, 5000)
+            req.connect(f"tcp://127.0.0.1:{port}")
+            req.send(msgspec.msgpack.encode((GET_META_MSG, 0, 0)))
+            payload, _clock = req.recv_multipart()
+            return payload
+        finally:
+            stop.set()
+            t.join(5)
+            ctx.destroy(linger=0)
+
+    def test_all_links_down_answers_an_empty_frame(self, monkeypatch, tmp_path):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="down")
+        )
+        assert self._ask(_scheduler(), {(0, 0): b"meta"}) == b""
+
+    def test_a_live_link_answers_the_metadata(self, monkeypatch, tmp_path):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="down", ens2="up")
+        )
+        assert self._ask(_scheduler(), {(0, 0): b"meta"}) == b"meta"
