@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
 from collections import defaultdict
 from typing import Any, ClassVar, Literal
 
@@ -432,7 +431,6 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         block_size_ratio = self.block_size // block_size
         local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
         num_blocks = self.num_blocks * block_size_ratio
-        t0 = time.perf_counter()
         blocks_data: list[tuple[int, int, int]] = []
 
         # A whole block is one range whatever it packs, since K and V are
@@ -472,8 +470,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
 
         logger.info(
             "RBLN NIXL: %d local descriptor(s) for this engine over %d region(s) "
-            "x %d block(s): whole, %d sliding-window granule(s) each, and %s. "
-            "Built in %.1fms.",
+            "x %d block(s): whole, %d sliding-window granule(s) each, and %s.",
             len(blocks_data),
             len(local_base_addresses),
             num_blocks,
@@ -481,7 +478,6 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             f"a chunk range of {grid[0]} run(s) x {grid[1]} chunk(s)"
             if grid is not None
             else "no chunk range",
-            (time.perf_counter() - t0) * 1000.0,
         )
 
         descs_data = _as_descs(blocks_data)
@@ -524,7 +520,6 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 registered_layer_names, peer_areas=peer_areas
             )
 
-        t0 = time.perf_counter()
         blocks_data: list[tuple[int, int, int]] = []
         # The whole piece first, then its chunks. `(1, 1)` names the piece
         # itself, so the first pass is what this built before `chunk_grid`.
@@ -577,14 +572,13 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             logger.info(
                 "RBLN NIXL: %d local descriptor(s) for this shard, %d of them a "
                 "chunk range of %d run(s) x %d chunk(s) carrying %dB each; a "
-                "whole piece carries %dB. Built in %.1fms.",
+                "whole piece carries %dB.",
                 len(blocks_data),
                 len(blocks_data) // per_grid * (per_grid - 1),
                 runs,
                 chunks,
                 blocks_data[-1][1],
                 blocks_data[0][1],
-                (time.perf_counter() - t0) * 1000.0,
             )
         descs_data = _as_descs(blocks_data)
         descs = self.nixl_wrapper.get_xfer_descs(descs_data, self.nixl_memory_type)
