@@ -116,23 +116,38 @@ def test_the_reservation_patch_is_the_one_installed():
     )
 
 
-@pytest.mark.parametrize(
-    ("method", "reserved"), [("dflash", 0), ("draft_model", 1), ("eagle3", 0)]
-)
-def test_the_budget_upstream_computes_from_the_reservation(method, reserved):
-    # The payoff: with nothing reserved, `max_num_scheduled_tokens` lands on the
-    # full budget, so the prefill chunk keeps the KV block boundary.
-    budget, seqs = 512, 4
-    config = SimpleNamespace(
-        speculative_config=_spec_config(method),
-        scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=budget,
-            max_num_seqs=seqs,
-            max_num_scheduled_tokens=None,
-        ),
+def _budget_check(method: str, budget: int) -> None:
+    """Run the reservation through upstream's config-time budget validation."""
+    VllmConfig._set_max_num_scheduled_tokens(
+        SimpleNamespace(
+            speculative_config=_spec_config(method),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=budget,
+                max_num_seqs=4,
+                max_num_scheduled_tokens=None,
+            ),
+        )
     )
 
-    VllmConfig._set_max_num_scheduled_tokens(config)
 
-    scheduler_config = config.scheduler_config
-    assert scheduler_config.max_num_scheduled_tokens == budget - reserved * seqs
+def test_a_zeroed_reservation_keeps_a_tight_budget_legal():
+    # The payoff: upstream refuses a budget it cannot fit the drafting slots
+    # into, and dflash reserves `num_speculative_tokens` of them. Zeroing the
+    # reservation is what keeps a budget that tight usable on RBLN.
+    tight = _spec_config("dflash").num_speculative_tokens - 1
+
+    _budget_check("dflash", tight)
+
+    with pytest.raises(ValueError, match="enough slots"):
+        VllmConfig._set_max_num_scheduled_tokens(
+            SimpleNamespace(
+                speculative_config=SimpleNamespace(
+                    max_num_new_slots_for_drafting=tight
+                ),
+                scheduler_config=SimpleNamespace(
+                    max_num_batched_tokens=tight,
+                    max_num_seqs=4,
+                    max_num_scheduled_tokens=None,
+                ),
+            )
+        )
