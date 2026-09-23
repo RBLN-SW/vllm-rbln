@@ -23,14 +23,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlBaseConnectorWorker,
     NixlPullConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from tests.vllm.distributed.kv_connector.utils import (
+    fake_sysfs_net,
     mock_vllm_config,
     set_shape,
+    setattr_in_package,
     window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
@@ -324,6 +327,13 @@ class TestShardReadPath:
         w.pcp_rank = 0
         w._recving_transfers = defaultdict(list)
         w._engine_last_active = {}
+        w._engines_to_rehandshake = set()
+        w._link_down_since = None
+        # What get_transfer_results reads.
+        w._replicated_pcp_done_sending = set()
+        w._failed_recv_reqs = queue.Queue()
+        w._pending_recv_notifs = {}
+        w.use_host_buffer = False
         # What upstream's failure path reads: it logs with the engine id, looks the
         # request's metadata up, records the failure in the set its caller hands
         # it, and queues the invalidated blocks.
@@ -350,6 +360,11 @@ class TestShardReadPath:
         w._remote_agents = {
             "eng": {divmod(r, peer_tp_size): f"agent{r}" for r in range(pp_size)}
         }
+        # What dropping an unreachable engine releases.
+        w._borrowed_src_handles = set()
+        w._remote_shard_layer_names = {}
+        w.kv_caches_base_addr = {"eng": [0]}
+        w.tp_mappings = {"eng": MagicMock()}
         topo = MagicMock()
         topo.get_engine_info.return_value = MagicMock(
             remote_tp_size=peer_tp_size,
@@ -408,8 +423,11 @@ class TestShardReadPath:
         first = object()
         w.nixl_wrapper.make_prepped_xfer.side_effect = [first, RuntimeError("boom")]
         w._log_failure = MagicMock()
+        # start_load_kv registers it; a request without one is not reported.
+        meta = self._meta([[1, 2]], [[3, 4]])
+        w._recving_metadata["r0"] = meta
 
-        w._read_blocks_for_req("r0", self._meta([[1, 2]], [[3, 4]]))
+        w._read_blocks_for_req("r0", meta)
 
         assert w._recving_transfers["r0"] == []
         # The mock is installed to keep the log quiet; assert on it too, or a
@@ -769,6 +787,96 @@ class TestUpstreamReachesTheOverride:
         # upstream's own formula can produce.
         ids = w.nixl_wrapper.make_prepped_xfer.call_args.args[2]
         assert min(ids) >= w.num_regions * w.dst_num_blocks["eng"]
+
+
+class TestFailedRead:
+    # A dead link fails a request's per-stage handles in separate polls, and
+    # leaves the peer known, so upstream never re-dials it.
+
+    @staticmethod
+    def _polling_worker():
+        w = TestShardReadPath._read_worker(pp_size=2)
+        w.tp_rank = 0
+        w._reqs_to_send = {}
+        w.nixl_wrapper.get_new_notifs.return_value = {}
+        w.nixl_wrapper.make_prepped_xfer.side_effect = [1, 2]
+        meta = TestShardReadPath._meta([[1, 2]], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+        w._read_blocks_for_req("r0", meta)
+        return w
+
+    def test_a_peer_is_dropped_only_once_its_handles_drain(self):
+        # Releasing a descriptor list under a live handle would fault the agent.
+        w = self._polling_worker()
+        w.nixl_wrapper.check_xfer_state.side_effect = (
+            lambda h: "ERR" if h == 1 else "PROC"
+        )
+        w.get_transfer_results()
+        assert "eng" in w._remote_agents
+
+        w.nixl_wrapper.check_xfer_state.side_effect = None
+        w.nixl_wrapper.check_xfer_state.return_value = "ERR"
+        assert w.get_transfer_results().finished_recving == {"r0"}
+        assert "eng" not in w._remote_agents
+
+    def test_a_dead_peer_is_dropped_so_the_next_request_re_handshakes(self):
+        w = self._polling_worker()
+        w.nixl_wrapper.check_xfer_state.return_value = "ERR"
+        w.get_transfer_results()
+        assert "eng" not in w._remote_agents
+        assert w._engines_to_rehandshake == set()
+
+
+class TestLocalLinkDown:
+    @staticmethod
+    def _worker(monkeypatch, sysfs):
+        w = TestShardReadPath._read_worker(pp_size=2)
+        w.tp_rank = 0
+        w._reqs_to_send = {}
+        w.nixl_wrapper.get_new_notifs.return_value = {}
+        setattr_in_package(monkeypatch, _SYS_CLASS_NET=sysfs)
+        return w
+
+    def test_all_links_down_fails_requests_without_a_dial(self, monkeypatch, tmp_path):
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="down"))
+        w.get_transfer_results()
+        w._remote_agents = {}
+        dial = MagicMock(return_value=None)
+        monkeypatch.setattr(NixlBaseConnectorWorker, "_ensure_handshake", dial)
+        with pytest.raises(RuntimeError, match="local RDMA link"):
+            w._ensure_handshake("eng", "host", 1234, 1, 2, False).result()
+        dial.assert_not_called()
+
+    def test_a_live_spare_link_is_not_down(self, monkeypatch, tmp_path):
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="down", ens2="up"))
+        w.get_transfer_results()
+        assert w._link_down_since is None
+
+    def test_a_device_gone_mid_read_counts_as_absent(self, monkeypatch, tmp_path):
+        sysfs = fake_sysfs_net(tmp_path, ens1="down", ens2="up")
+        (sysfs / "ens2" / "operstate").unlink()
+        w = self._worker(monkeypatch, sysfs)
+        w.get_transfer_results()
+        assert w._link_down_since is not None
+
+    def test_a_host_without_a_physical_link_is_never_down(self, monkeypatch, tmp_path):
+        # Otherwise a host without RDMA would refuse every handshake.
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path))
+        w.get_transfer_results()
+        assert w._link_down_since is None
+
+    def test_a_producer_exits_once_the_links_stay_down(self, monkeypatch, tmp_path):
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="down"))
+        w._link_down_exit_s = 30.0
+        w.get_transfer_results()
+        assert w._link_down_since is not None
+
+        w._link_down_since -= 29
+        w.get_transfer_results()
+
+        w._link_down_since -= 2
+        with pytest.raises(RuntimeError, match="recycled"):
+            w.get_transfer_results()
 
 
 class TestReadMarksTheEngineActive:
