@@ -168,6 +168,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             kv_slices=self._kv_slices,
             kv_split_axis=self._kv_split_axis,
             kv_per_block=self._kv_per_block,
+            # Zero where this shard holds no sliding-window group, and where
+            # its groups disagree -- neither can cut a window range, so there
+            # is nothing for a peer to pair on.
+            swa_kernel_block=(
+                next(iter(self._swa_kernel_blocks))
+                if len(self._swa_kernel_blocks) == 1
+                else 0
+            ),
         )
         base_hash = self.compat_hash
         assert base_hash is not None
@@ -444,6 +452,16 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # sit beside the one full-attention group whose blocks a chunk cuts.
         # Exactly one, because every group's blocks are cut the same way.
         self._chunk_mode = connector_option(self.vllm_config, "chunk_mode", False)
+        # Read here rather than in `__init__`: the runner binds the views this
+        # asks about while initializing the KV cache, which is after the
+        # connector exists.
+        self._swa_kernel_blocks = self._observe_swa_kernel_block()
+        if self._has_swa:
+            logger.info(
+                "RBLN NIXL: the sliding-window kernel addresses this cache in "
+                "blocks of %s token(s).",
+                sorted(self._swa_kernel_blocks),
+            )
         full_groups = sum(
             not isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )

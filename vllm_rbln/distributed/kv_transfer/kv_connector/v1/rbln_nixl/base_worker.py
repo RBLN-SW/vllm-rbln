@@ -193,6 +193,8 @@ class RblnNixlWorkerBase(
         # This engine's own grid, set once registration knows the geometry.
         # None wherever a chunk is the whole span (see `_shard_chunk_grid`).
         self._chunk_grid: tuple[int, int] | None = None
+        # What the sliding-window kernel's own view says, read at registration.
+        self._swa_kernel_blocks: set[int] = set()
         # How far the request being transferred fills its last block, parked
         # for the length of one upstream call (`_tail_viewed_as`).
         self._request_tail: tuple[int | None, int | None] | None = None

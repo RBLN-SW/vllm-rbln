@@ -39,17 +39,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
 if TYPE_CHECKING:
     from vllm.config import SpeculativeConfig, VllmConfig
 
-# Bump on any incompatible change to the RBLN metadata schema or semantics.
-# Folded into the NIXL compatibility hash so an RBLN peer speaking a different
-# schema fails the handshake cleanly (both ends are RBLN). Upstream keeps its
-# own counterpart the same way (``NIXL_CONNECTOR_VERSION``).
-#   1: pp_rank / pp_size / registered_layer_names (the layer axis)
-#   2: + kv_areas / kv_slices (chiplet geometry)
-#   3: + the transfer direction in the hash
-#   4: + kv_split_axis (which axis the geometry above came from)
-#   5: + kv_per_block (whether a region's block holds K and V together)
-#   6: a window range names the kernel blocks the window is in, not a prefix
-RBLN_NIXL_CONNECTOR_VERSION: int = 6
+# Bump on any incompatible change to the RBLN metadata schema or semantics, as
+# upstream does with ``NIXL_CONNECTOR_VERSION``. Folded into the NIXL compat
+# hash so an RBLN peer on another schema fails the handshake cleanly -- both
+# ends are RBLN; earlier bumps are `git log -L` on this line.
+#   7: swa_kernel_block, and a window range cut by it rather than by the spec
+RBLN_NIXL_CONNECTOR_VERSION: int = 7
 
 
 class KVSplitAxis(Enum):
@@ -88,6 +83,11 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # build, so two peers off one build can differ and the version cannot tell
     # them apart. The default is the layout every version through 4 had.
     kv_per_block: int = 1
+    # Tokens a block holds in the view the sliding-window kernel reads
+    # (`_observe_swa_kernel_block`). 0 where the shard cuts no window range by
+    # it, so a PP stage without such a group pairs with any peer. Two engines
+    # whose runners chose differently cut a window range differently.
+    swa_kernel_block: int = 0
 
 
 class RblnNixlConnectorMetadata(NixlConnectorMetadata):

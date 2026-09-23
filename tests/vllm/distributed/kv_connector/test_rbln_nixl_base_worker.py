@@ -18,6 +18,7 @@
 # `build_worker`, which stubs it down to what the RBLN overrides read.
 
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -113,6 +114,69 @@ class TestLogicalBlockPinning:
         assert worker._physical_blocks_per_logical_kv_block == 1
         assert worker._logical_num_blocks == 128
         assert worker._pending_kv_caches is None
+
+
+class TestObservingTheKernelBlock:
+    """Which of `block_size` and `sliding_window` the sliding-window kernel
+    addresses the cache in is the runner's answer, and the spec does not carry
+    it -- a pool hands the connector its full-attention layer, whose view is
+    the same shape either way. So it is read off what the runner bound."""
+
+    def test_the_window_geometry_is_read_from_the_bound_view(self, monkeypatch):
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            block_size=64,
+            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+            swa_kernel_block=16,
+        )
+        assert worker._observe_swa_kernel_block() == {16}
+
+    def test_the_block_wide_geometry_reads_the_block(self, monkeypatch):
+        # The same spec, and the number that tells the two apart.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            block_size=64,
+            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+            swa_kernel_block=64,
+        )
+        assert worker._observe_swa_kernel_block() == {64}
+
+    def test_an_engine_with_no_window_observes_nothing(self, monkeypatch):
+        worker = build_worker(monkeypatch, kv_buffer_device="rbln", specs=[MagicMock()])
+        assert worker._observe_swa_kernel_block() == set()
+
+    def test_groups_addressed_differently_are_both_reported(self, monkeypatch):
+        # A speculative draft brings its own groups and they need not agree.
+        # Only a window range needs one number, so the disagreement is carried
+        # rather than refused here.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            block_size=64,
+            specs=[
+                sliding_window_spec(block_size=64, sliding_window=16),
+                sliding_window_spec(block_size=64, sliding_window=16),
+            ],
+        )
+        ctx = worker.vllm_config.compilation_config.static_forward_context
+        ctx["g1.l0"] = SimpleNamespace(kv_cache=torch.zeros(1, 1, 64, 1))
+        assert worker._observe_swa_kernel_block() == {16, 64}
+
+    def test_an_unbound_layer_says_so(self, monkeypatch):
+        # The placeholder a layer carries until the runner binds it has no
+        # token axis; reading `shape[-2]` off it would be a bare IndexError.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            block_size=64,
+            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+        )
+        ctx = worker.vllm_config.compilation_config.static_forward_context
+        ctx["g0.l0"] = SimpleNamespace(kv_cache=torch.tensor([]))
+        with pytest.raises(AssertionError):
+            worker._observe_swa_kernel_block()
 
 
 class TestSwaWindowRatio:

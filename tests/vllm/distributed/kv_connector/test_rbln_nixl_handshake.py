@@ -3915,6 +3915,8 @@ class TestTwoLayoutsNeverPair:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.use_host_buffer = False
         w._has_swa = False
+        w._sw_ratio = None
+        w._swa_kernel_blocks = set()
         w._kv_per_block = kv_per_block
         w.block_len_per_layer = [64]
         w.num_regions = 1
@@ -3928,6 +3930,9 @@ class TestTwoLayoutsNeverPair:
     def _meta(kv_per_block):
         meta = MagicMock()
         meta.kv_per_block = kv_per_block
+        # Explicit, because a mock answers this truthy and the pairing reads it
+        # as a peer that holds a sliding-window group.
+        meta.swa_kernel_block = 0
         meta.kv_caches_base_addr = [1000]
         meta.registered_layer_names = ["layer.0"]
         return meta
@@ -3949,6 +3954,60 @@ class TestTwoLayoutsNeverPair:
     def test_a_peer_on_our_layout_pairs(self, kv_per_block):
         self._worker(kv_per_block)._check_d2d_region_pairing(
             self._meta(kv_per_block), remote_tp_size=1
+        )
+
+
+class TestTwoKernelGeometriesNeverPair:
+    """Which of `block_size` and `sliding_window` the kernel addresses the
+    cache in is the runner's choice, so two engines off one build can differ.
+    A window range is cut by that number, so the lists would name different
+    pieces of the same block while every byte count still matched."""
+
+    @staticmethod
+    def _worker(swa_kernel_block, *, windowed=True):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.use_host_buffer = False
+        w._has_swa = True
+        w._swa_kernel_blocks = {swa_kernel_block} if swa_kernel_block else set()
+        w._sw_ratio = 8 if windowed else None
+        w._kv_per_block = 1
+        w.block_len_per_layer = [64]
+        w.num_regions = 1
+        w.local_seen_layer_names = ["layer.0"]
+        topo = MagicMock()
+        topo.tp_ratio.return_value = 1
+        w.transfer_topo = topo
+        return w
+
+    @staticmethod
+    def _meta(swa_kernel_block):
+        meta = MagicMock()
+        meta.kv_per_block = 1
+        meta.swa_kernel_block = swa_kernel_block
+        meta.kv_caches_base_addr = [1000]
+        meta.registered_layer_names = ["layer.0"]
+        return meta
+
+    def test_a_peer_on_the_other_geometry_is_refused(self):
+        with pytest.raises(RuntimeError, match="sub-block prefix caching"):
+            self._worker(128)._check_d2d_region_pairing(
+                self._meta(1024), remote_tp_size=1
+            )
+
+    def test_a_peer_on_our_geometry_pairs(self):
+        self._worker(128)._check_d2d_region_pairing(self._meta(128), remote_tp_size=1)
+
+    def test_a_peer_holding_no_window_pairs(self):
+        # Zero is what a shard cutting no window range advertises, which a PP
+        # stage without such a group is; refusing it would refuse the stage.
+        self._worker(128)._check_d2d_region_pairing(self._meta(0), remote_tp_size=1)
+
+    def test_without_a_window_range_the_geometry_does_not_pair(self):
+        # Two hybrids whose runners chose differently, neither cutting a window
+        # range. Their lists are whole blocks of the full-attention view, which
+        # is the same shape either way, so the pair stays allowed.
+        self._worker(128, windowed=False)._check_d2d_region_pairing(
+            self._meta(1024), remote_tp_size=1
         )
 
 

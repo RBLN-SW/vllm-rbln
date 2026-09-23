@@ -129,6 +129,14 @@ def make_worker(monkeypatch, tmp_path_factory):
         # would build a state production cannot reach.
         config.cache_config.num_gpu_blocks = geometry.num_blocks
 
+        # What the runner binds before it registers: every layer, unfiltered
+        # (`rbln_model_runner.initialize_kv_cache_tensors`). The connector
+        # reads a sliding-window layer's view from here, and nothing else does.
+        for name, view in geometry.forward_context_caches().items():
+            config.compilation_config.static_forward_context[name] = SimpleNamespace(
+                kv_cache=view
+            )
+
         worker = cls(config, "local-engine", geometry.kv_cache_config())
 
         # The topology's layout answers all come from get_kv_cache_shape, and

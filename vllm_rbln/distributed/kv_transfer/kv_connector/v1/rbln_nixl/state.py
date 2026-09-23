@@ -16,8 +16,10 @@ from collections import defaultdict
 from typing import Any, ClassVar, Literal
 
 import numpy as np
+import torch
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -104,6 +106,11 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _group_specs: list[Any]
     _has_swa: bool
     _sw_ratio: int | None
+    #: Tokens one block holds in the view the sliding-window kernel reads, per
+    #: sliding-window group, which is not `block_size` where that kernel takes
+    #: a window a block. Observed at registration, not derived. Empty where
+    #: this rank holds no such group.
+    _swa_kernel_blocks: set[int]
 
     _kv_areas: int
     _kv_slices: int
@@ -128,6 +135,34 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None]
     _chunk_grid: tuple[int, int] | None
     _request_tail: tuple[int | None, int | None] | None
+
+    def _observe_swa_kernel_block(self) -> set[int]:
+        """Tokens a block holds in the view the sliding-window kernel reads.
+
+        The spec carries `block_size` and `sliding_window`; which of the two the
+        kernel addresses the cache in is the runner's answer, and nothing the
+        connector is handed repeats it -- a pool hands over its full-attention
+        layer, and that view is the same shape either way. So read the runner's
+        own binding, which keeps every layer unfiltered.
+
+        One entry a sliding-window group, because a speculative draft brings
+        its own and they need not agree. Only a window range needs them to.
+        """
+        ctx = self.vllm_config.compilation_config.static_forward_context
+        blocks: set[int] = set()
+        for group, spec in zip(
+            self.kv_cache_config.kv_cache_groups, self._group_specs, strict=True
+        ):
+            if not isinstance(spec, SlidingWindowSpec):
+                continue
+            cache = ctx[group.layer_names[0]].kv_cache
+            # An unbound layer is `torch.tensor([])`, which has no token axis;
+            # say so here rather than let `shape[-2]` raise an IndexError.
+            assert isinstance(cache, torch.Tensor) and cache.ndim > 1, cache
+            # `get_kv_cache_shape` puts the token axis second to last whichever
+            # axis `num_blocks` went on.
+            blocks.add(int(cache.shape[-2]))
+        return blocks
 
     @property
     def _own_engine_layout(self) -> bool:

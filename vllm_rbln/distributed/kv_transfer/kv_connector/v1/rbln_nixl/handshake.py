@@ -343,6 +343,23 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 "split for rbln_triton_ops, so both ends of a transfer must "
                 "run under the same use_custom_kernel setting."
             )
+        peer_swa_block = nixl_agent_meta.swa_kernel_block
+        # Only a window range is cut by this number. Without one the lists are
+        # whole blocks of the full-attention view, which is the same shape
+        # under either geometry, so the pair is describable and stays allowed.
+        if (
+            self._own_engine_layout
+            and peer_swa_block
+            and peer_swa_block not in self._swa_kernel_blocks
+        ):
+            raise RuntimeError(
+                f"RBLN NIXL D2D: the peer's sliding-window kernel addresses "
+                f"its cache in {peer_swa_block}-token blocks and this "
+                f"worker's in {sorted(self._swa_kernel_blocks)}, so the two "
+                "window ranges name different pieces of the same block. Both "
+                "ends have to run under the same sub-block prefix caching "
+                "setting."
+            )
         n_remote = len(nixl_agent_meta.kv_caches_base_addr)
         peer_layers = len(nixl_agent_meta.registered_layer_names)
         local_rpl = self._regions_per_layer()

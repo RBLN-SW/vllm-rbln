@@ -1179,6 +1179,7 @@ class TestPublishHandshakeMetadata:
         w._has_mamba = has_mamba
         w._sw_ratio = None
         w._has_swa = False
+        w._swa_kernel_blocks = set()
         w.use_mla = False
         # Chiplet geometry travels with the metadata so a consumer with a
         # different TP degree can match head bands. Defaults are host-bounce's
