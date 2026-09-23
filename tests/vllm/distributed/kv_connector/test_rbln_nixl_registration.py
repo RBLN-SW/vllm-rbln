@@ -211,10 +211,22 @@ class TestRegisterKvCaches:
         assert worker.num_blocks == 128
         assert worker._logical_num_blocks == 128
 
-    def test_host_bounce_creates_backend_and_delegates(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "stripe_width, passed",
+        [(None, {}), (0, {"stripe_width": 0}), (4096, {"stripe_width": 4096})],
+    )
+    def test_host_bounce_creates_backend_and_delegates(
+        self, monkeypatch, stripe_width, passed
+    ):
         # Host-bounce with the adapter creates the RBLN backend on the agent,
-        # then delegates registration to upstream.
-        worker = build_worker(monkeypatch, kv_buffer_device="cpu", nixl_available=True)
+        # then delegates registration to upstream. The width rides on that
+        # call, which is the only place this path can pass one.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            nixl_available=True,
+            stripe_width=stripe_width,
+        )
         worker.nixl_wrapper = "wrapper"
         worker._layer_specs = {"layer0": _impl_layer_spec()}
         worker.block_len_per_layer = [2048, 2048]
@@ -222,7 +234,7 @@ class TestRegisterKvCaches:
         monkeypatch.setattr(
             sys.modules["nixl_rbln"],
             "ensure_rbln_backend",
-            lambda wrapper, device_id=0, **kw: ensured.append((wrapper, device_id)),
+            lambda wrapper, device_id=0, **kw: ensured.append((wrapper, device_id, kw)),
             raising=False,
         )
         delegated = []
@@ -232,7 +244,7 @@ class TestRegisterKvCaches:
             lambda self, kv: delegated.append(kv),
         )
         worker.register_kv_caches({"layer0": "tensor"})
-        assert ensured == [("wrapper", 0)]
+        assert ensured == [("wrapper", 0, passed)]
         assert delegated == [{"layer0": "tensor"}]
         assert worker._pending_kv_caches is None
         # Host staging needs the per-region counts too: a pipelined peer reaches
@@ -1264,7 +1276,7 @@ class TestFinalize:
 
 
 class TestD2dRegistrationReachesTheAdapterAndThePeer:
-    # Two things the D2D path does whose absence is silent: neither shows up as
+    # Three things the D2D path does whose absence is silent: none shows up as
     # a failure anywhere else, so each has one test here and nowhere.
 
     def test_a_layers_region_spans_its_whole_entry(self, make_worker):

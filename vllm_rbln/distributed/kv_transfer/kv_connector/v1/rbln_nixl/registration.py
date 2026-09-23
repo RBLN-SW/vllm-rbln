@@ -67,6 +67,18 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
     _use_rbln_nixl_backend: bool
     _pending_kv_caches: dict[str, torch.Tensor] | None
 
+    @property
+    def _backend_extra(self) -> dict[str, int]:
+        """What the adapter takes beyond the arguments every call passes.
+
+        0 is a width the adapter accepts and a missing one means "keep the
+        plugin default", so the test is on absence, not on truthiness. Both
+        calls that reach the adapter read it from here.
+        """
+        if self._stripe_width is None:
+            return {}
+        return {"stripe_width": self._stripe_width}
+
     def _check_pp_constraints(self) -> None:
         if self.vllm_config.parallel_config.pipeline_parallel_size <= 1:
             return
@@ -342,18 +354,13 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # connector's descriptor math is correct without this connector
         # knowing the shard count.
 
-        # 0 is a width the adapter accepts and a missing one means "keep the
-        # plugin default", so the test is on absence, not on truthiness.
-        extra = (
-            {} if self._stripe_width is None else {"stripe_width": self._stripe_width}
-        )
         xfer = nixl_rbln.register_kv_regions(
             self.nixl_wrapper,
             regions,
             device_id,
             mem=self.nixl_memory_type,
             rbln_ctx_ptr=rbln_ctx_ptr,
-            **extra,
+            **self._backend_extra,
         )
         self.device_id = device_id
         self.block_len_per_layer = list(xfer.block_lens)
@@ -558,12 +565,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         if self._use_rbln_nixl_backend:
             import nixl_rbln
 
-            extra = (
-                {}
-                if self._stripe_width is None
-                else {"stripe_width": self._stripe_width}
+            nixl_rbln.ensure_rbln_backend(
+                self.nixl_wrapper, device_id=0, **self._backend_extra
             )
-            nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0, **extra)
         page_sizes = self._layer_page_sizes(kv_caches)
         if len(page_sizes) > 1:
             # TODO(RBLN): delete once the pinned vLLM drops that assert --

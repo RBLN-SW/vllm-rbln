@@ -649,6 +649,7 @@ def build_worker(
     use_mla=False,
     pp_size=1,
     hma_disabled=False,
+    stripe_width=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -703,6 +704,11 @@ def build_worker(
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
     vllm_config = MagicMock()
+    # A real dict: read through a mock, every knob answers with a mock of its
+    # own, and a connector that tests one for absence never sees it missing.
+    vllm_config.kv_transfer_config.kv_connector_extra_config = (
+        {} if stripe_width is None else {"stripe_width": stripe_width}
+    )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # What the worker sets before it builds the connector; `register_kv_caches`
     # takes the count from here.
