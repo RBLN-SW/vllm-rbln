@@ -259,9 +259,19 @@ class RblnNixlWorkerBase(
                 raise RuntimeError(
                     "RBLN NIXL: every sliding-window group has to cut its "
                     "block into the same number of kernel blocks, and this "
-                    f"engine's groups cut it {sorted(ratios)} ways."
+                    f"engine's groups cut it into {sorted(ratios)} kernel "
+                    "block(s)."
                 )
             self._sw_ratio = next((r for r in ratios if r != 1), None)
+            if self._sw_ratio is None and swa_window_mode:
+                # Doing nothing is right here -- a granule would be the block,
+                # so the range would repeat what the whole one names. Saying so
+                # is what was missing: the knob is set and nothing follows.
+                logger.info(
+                    "RBLN NIXL: swa_window_mode registered no window range. "
+                    "Every sliding-window group here holds a window as wide as "
+                    "its block, so a granule is the block."
+                )
             if self._sw_ratio is not None:
                 # Fail at startup rather than at the first handshake: the
                 # two desc ranges `register_local_xfer_handler` builds and a

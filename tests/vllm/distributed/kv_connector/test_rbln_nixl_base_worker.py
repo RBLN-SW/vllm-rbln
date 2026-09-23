@@ -162,6 +162,27 @@ class TestSwaWindowRatio:
         )
         assert worker._sw_ratio is None
 
+    def test_a_window_as_wide_as_its_block_says_the_knob_did_nothing(
+        self, monkeypatch, caplog
+    ):
+        # A granule would be the block, so registering no range is right --
+        # but the operator set the knob and nothing follows it. Silent, that
+        # reads as a knob that works.
+        with caplog.at_level("INFO"):
+            worker = build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                swa_window_mode=True,
+                specs=[sliding_window_spec(block_size=64, sliding_window=64)],
+            )
+
+        assert worker._sw_ratio is None
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if "registered no window range" in r.getMessage()
+        ]
+
     def test_sliding_window_derives_block_over_window_ratio(self, monkeypatch):
         worker = build_worker(
             monkeypatch,
