@@ -58,7 +58,7 @@ MAX_BATCHED = 512
 MAX_NUM_SEQS = 1
 TP = 1
 PROMPT_TOKENS = 7000
-MAX_TOKENS = 32
+MAX_TOKENS = 200
 TOPK = 10
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -182,7 +182,9 @@ def run_case(case: int) -> None:
     prompts = [
         TokensPrompt(prompt_token_ids=ids) for ids in build_prompts(llm.get_tokenizer())
     ]
-    sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS, logprobs=TOPK)
+    sp = SamplingParams(
+        temperature=0.0, max_tokens=MAX_TOKENS, logprobs=TOPK, ignore_eos=True
+    )
     outs = llm.generate(prompts + prompts, sp)
 
     runs = []
@@ -303,11 +305,15 @@ def compare() -> None:
     # Step 0 is the prefill; each later step is one decode.  A row stops at the
     # first divergence from case 0.
     print("\nmax|d| against case 0 per step")
-    print("   # case " + " ".join(f"{k:5d}" for k in range(MAX_TOKENS)))
-    for i, d in enumerate(deltas):
-        for case in OTHERS:
-            label = f"{i:2d}" if case == OTHERS[0] else "  "
-            print(f"  {label}   {case}  " + " ".join(f"{x:5.2f}" for x in d[case]))
+    row = 25
+    for start in range(0, MAX_TOKENS, row):
+        steps = range(start, min(start + row, MAX_TOKENS))
+        print("\n   # case " + " ".join(f"{k:5d}" for k in steps))
+        for i, d in enumerate(deltas):
+            for case in OTHERS:
+                label = f"{i:2d}" if case == OTHERS[0] else "  "
+                cells = " ".join(f"{x:5.2f}" for x in d[case][steps.start : steps.stop])
+                print(f"  {label}   {case}  " + cells)
 
     for i, r in enumerate(runs):
         print(f"\n=== request #{i}  {QUESTIONS[i]}")
