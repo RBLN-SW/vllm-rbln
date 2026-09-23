@@ -46,19 +46,27 @@ AUX_COMBINED = "aux_hidden_states"
 def eagle3_aux_hidden_states_enabled(
     speculative_config: SpeculativeConfig | None,
 ) -> bool:
-    """Whether an EAGLE3 draft consumes the target's aux hidden states.
+    """Whether the draft consumes the target's aux hidden states.
 
-    A draft can turn them off in its `eagle_config`, and then nothing is captured
-    anywhere: `aux_hidden_state_layers` stays empty, so upstream's unpatched
-    forward is harmless under a pipeline split. The model runner and the startup
-    guard both have to agree on this, hence a single reader.
+    An EAGLE3 draft can turn them off in its `eagle_config`, and then nothing is
+    captured anywhere, so upstream's unpatched forward is harmless under a
+    pipeline split. The runner and the startup guard must agree, hence one reader.
 
     Read from the config rather than from the drafter, which exists only on the
     last rank. Every stage has to know: the aux tensors are captured across the
     stages and consumed only on the last one, so a non-last stage that thinks
-    EAGLE3 is off captures nothing and the last stage comes up short.
+    they are off captures nothing and the last stage comes up short.
+
+    DFlash reduces them the same way, and upstream's runner captures them for it
+    whatever the draft config says. A DFlash head can still switch its own
+    projection off, which this does not read -- it answers what the runner
+    captures, which is what both callers ask about.
     """
-    if speculative_config is None or speculative_config.method != "eagle3":
+    if speculative_config is None:
+        return False
+    if speculative_config.method == "dflash":
+        return True
+    if speculative_config.method != "eagle3":
         return False
     eagle_config = getattr(
         speculative_config.draft_model_config.hf_config, "eagle_config", None

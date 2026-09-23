@@ -88,8 +88,16 @@ def test_an_unsupported_target_passes_when_aux_is_off():
 
 
 @pytest.mark.parametrize("method", [None, "eagle", "ngram", "medusa"])
-def test_only_eagle3_is_gated(method):
+def test_a_method_that_reduces_nothing_is_not_gated(method):
     _validate_eagle3_pp_config(_config(UNSUPPORTED, 4, method=method))
+
+
+def test_dflash_is_gated_like_eagle3():
+    # It reduces the same aux states, so the same unsupported target refuses it.
+    # The sweep above cannot say this: `dflash` is the member the reader's answer
+    # changed for.
+    with pytest.raises(ValueError, match="pipeline_parallel_size"):
+        _validate_eagle3_pp_config(_config(UNSUPPORTED, 4, method="dflash"))
 
 
 @pytest.mark.parametrize(
@@ -117,4 +125,16 @@ def test_a_non_eagle3_method_needs_no_aux():
             _config(SUPPORTED, 4, method="eagle").speculative_config
         )
         is False
+    )
+
+
+def test_dflash_needs_the_aux_states_too():
+    # It reduces them through its own projection as EAGLE3 does. Reading this
+    # off the drafter would light it on the last rank alone, and the stages
+    # holding the rest of the layers it reduces would capture nothing.
+    assert (
+        eagle3_aux_hidden_states_enabled(
+            _config(SUPPORTED, 4, method="dflash").speculative_config
+        )
+        is True
     )
