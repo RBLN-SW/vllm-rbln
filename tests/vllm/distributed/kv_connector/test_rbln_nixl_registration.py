@@ -39,8 +39,10 @@ from vllm.v1.kv_cache_interface import (
 from tests.vllm.distributed.kv_connector.utils import (
     KvGeometry,
     build_worker,
+    mock_vllm_config,
     patch_in_package,
     patched_in_package,
+    sliding_window_spec,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -162,7 +164,15 @@ def _fake_nixl_rbln(xfer_result):
     return module
 
 
-def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
+def _prep_impl_worker(
+    monkeypatch,
+    *,
+    num_blocks=128,
+    block_size=64,
+    specs=None,
+    chunk_mode=False,
+    chunk_tokens=0,
+):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = build_worker(
         monkeypatch,
@@ -170,6 +180,9 @@ def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
         num_blocks=num_blocks,
         block_size=block_size,
         nixl_available=True,
+        specs=specs,
+        chunk_mode=chunk_mode,
+        chunk_tokens=chunk_tokens,
     )
     worker.tp_rank = 0
     worker.world_size = 1
@@ -250,6 +263,44 @@ class TestRegisterKvCaches:
         # Host staging needs the per-region counts too: a pipelined peer reaches
         # the per-head handshake check through it.
         assert worker._logical_region_kv_heads == [8, 8]
+
+    @pytest.mark.parametrize(
+        "stripe_width, passed",
+        [(None, {}), (0, {"stripe_width": 0}), (4096, {"stripe_width": 4096})],
+    )
+    def test_a_stripe_width_reaches_the_adapter_only_when_named(
+        self, monkeypatch, stripe_width, passed
+    ):
+        # 0 is a width the adapter takes, so it cannot stand for the knob
+        # nobody set; absence is what keeps the plugin's own default.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            nixl_available=True,
+            stripe_width=stripe_width,
+        )
+        worker.nixl_wrapper = "wrapper"
+        worker._layer_specs = {"layer0": _impl_layer_spec()}
+        worker.block_len_per_layer = [2048, 2048]
+        seen = []
+        monkeypatch.setattr(
+            sys.modules["nixl_rbln"],
+            "ensure_rbln_backend",
+            lambda wrapper, device_id=0, **kw: seen.append(kw),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker, "register_kv_caches", lambda self, kv: None
+        )
+        worker.register_kv_caches({"layer0": "tensor"})
+
+        assert seen == [passed]
+
+    def test_a_stripe_width_given_a_bool_is_refused(self, monkeypatch):
+        # It goes through the same typed knob path as the rest: read straight
+        # off the extra config, `true` would arrive as a one-byte stripe.
+        with pytest.raises(RuntimeError, match="stripe_width"):
+            build_worker(monkeypatch, stripe_width=True)
 
     def test_host_bounce_rejects_differing_per_layer_sizes(self, monkeypatch):
         # Pins the refusal at this path's own point rather than upstream's assert.
@@ -1031,7 +1082,7 @@ class TestPpConstraints:
     ):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
         w.vllm_config.speculative_config = None
         w.transfer_topo = MagicMock()
@@ -1067,7 +1118,7 @@ class TestPpConstraints:
 
     @pytest.mark.parametrize("sw_ratio", [2, None])
     def test_swa_pp_raises(self, sw_ratio):
-        # `sw_ratio=None` is the model with the view-opt off: a sliding window
+        # `sw_ratio=None` is the model with window mode off: a sliding window
         # bars pipelining on its own, which is what `_has_swa` exists for.
         with pytest.raises(RuntimeError, match="sliding-window attention"):
             self._worker(
@@ -1120,7 +1171,7 @@ class TestPublishHandshakeMetadata:
         w.shutdown = lambda: None
         w.compat_hash = "BASE"
         # _check_pp_constraints reads these; a plain PP producer passes.
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
         w.vllm_config.speculative_config = None
         w.transfer_topo = MagicMock()
@@ -1228,7 +1279,7 @@ class TestPublishHandshakeMetadata:
         # the target's, or a speculative draft's where there is one.
         w.model_config = MagicMock()
         w.model_config.get_total_num_kv_heads.return_value = 8
-        w.vllm_config = MagicMock()
+        w.vllm_config = mock_vllm_config()
         w.vllm_config.speculative_config = None
 
         with patch.object(NixlBaseConnectorWorker, "register_kv_caches"):
@@ -1374,6 +1425,14 @@ class TestWhatRegistrationSettles:
         assert plain.compat_hash and drafted.compat_hash
         assert plain.compat_hash != drafted.compat_hash
 
+    def test_a_context_cut_over_a_packed_block_is_refused(self, make_worker):
+        # MLA is the cut's only model shape today and registers K alone, so
+        # nothing has run this pairing; a one-head attention model reaches the
+        # same axis with both halves in the block.
+        geo = KvGeometry(layers=("l0",), heads=1, areas=4, slices=4)
+        with pytest.raises(RuntimeError, match="packs K and V"):
+            make_worker(kv_cache=geo)
+
     def test_an_undeclared_head_count_has_no_band(self, make_worker):
         # Neither the target's count nor any declared draft's: replicated heads
         # report a product no model in this engine has, and _layer_kv_heads
@@ -1399,6 +1458,9 @@ class TestTheLayoutReachesTheDescriptors:
         w._kv_areas = 1
         w._kv_slices = kv_slices
         w._kv_per_block = kv_per_block
+        # The chunk grid asks for the head bands before it asks anything else.
+        w._chunk_mode = False
+        w._logical_region_kv_heads = [8]
         topo = MagicMock()
         topo.tp_size = tp_size
         topo.tp_ratio.return_value = 2
@@ -1446,3 +1508,228 @@ class TestTheLayoutReachesTheDescriptors:
         meta = MagicMock()
         meta.kv_slices = 2
         assert w._peer_kv_runs(meta, remote_tp_size=1) == 1
+
+
+class TestTailBlockTrim:
+    # Whether a context-cut engine may leave a last block's empty areas out,
+    # and the geometries whose areas do not name a token range at all.
+
+    @staticmethod
+    def _register(monkeypatch, *, areas, slices, num_kv_heads=1, **kw):
+        worker = _prep_impl_worker(
+            monkeypatch,
+            specs=[MagicMock(spec=FullAttentionSpec)],
+            **kw,
+        )
+        worker.use_mla = True
+        spec = MagicMock(spec=MLAAttentionSpec)
+        spec.page_size_bytes = 4096
+        spec.num_kv_heads = num_kv_heads
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _mla_kv_caches(num_blocks=worker.num_blocks)
+
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000 + 0x1000 * i for i in range(2 * areas)]
+        xfer_result.block_lens = [1024] * (2 * areas)
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = areas
+        xfer_result.slices = slices
+        # Replicas sit innermost, so each slice repeats areas // slices times.
+        xfer_result.slice_ids = [i // (areas // slices) for i in range(areas)] * 2
+        fake = _fake_nixl_rbln(xfer_result)
+
+        topo = MagicMock(
+            is_kv_layout_blocks_first=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+            tp_size=1,  # the chunk grid asks the topology for a real head band
+        )
+        topo.get_transfer_cache_regions.side_effect = lambda cache, _spec: [cache]
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patched_in_package("rebel") as mock_rebel,
+            patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+        return worker
+
+    def test_a_context_cut_into_whole_areas_enables_the_trim(self, monkeypatch):
+        worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=True)
+        assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
+        assert worker._chunk_mode is True
+
+    def test_registration_leaves_the_grid_a_transfer_reads_back(self, monkeypatch):
+        # A transfer picks its range by this, and nothing else sets it: left
+        # unset, the third range is registered and never selected -- every
+        # request goes whole while the longer dlist is still paid for. The span
+        # has to be wider than the chunk, or the size collapses the grid to
+        # None and the assertion holds for the wrong reason.
+        worker = self._register(
+            monkeypatch,
+            areas=4,
+            slices=4,
+            chunk_mode=True,
+            block_size=1024,
+            chunk_tokens=128,
+        )
+
+        assert worker._chunk_grid == worker._shard_chunk_grid(
+            block_size=worker.block_size, split=1
+        )
+        assert worker._chunk_grid is not None
+
+    def test_a_grid_that_collapses_says_so(self, monkeypatch, caplog):
+        # A chunk is never narrower than one prefill step, so a step at or
+        # above a span leaves every block whole and the knob registers
+        # nothing. Silent, that reads as a knob that works.
+        with caplog.at_level("INFO"):
+            worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=True)
+
+        assert worker._chunk_grid is None
+        assert [
+            r.getMessage()
+            for r in caplog.records
+            if "registered no chunk range" in r.getMessage()
+        ]
+
+    def test_the_flag_off_leaves_the_same_geometry_alone(self, monkeypatch):
+        # Same cut, opposite answer: nothing about the geometry turns this on.
+        worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=False)
+        assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
+        assert worker._chunk_mode is False
+
+    def test_a_head_cut_is_taken_as_well(self, monkeypatch):
+        # 8 heads over 4 slices is head tiling: an area holds every token of
+        # some heads, so a chunk is a token range of the block rather than of
+        # an area -- which the chunk range names either way.
+        worker = self._register(
+            monkeypatch, areas=4, slices=4, num_kv_heads=8, chunk_mode=True
+        )
+        assert worker._kv_split_axis is KVSplitAxis.HEAD
+        assert worker._chunk_mode is True
+
+    def test_replicated_areas_are_refused_on_a_context_cut(self, monkeypatch):
+        # Two areas per slice: the position no longer names one token range.
+        with pytest.raises(RuntimeError, match="context-cut"):
+            self._register(monkeypatch, areas=4, slices=2, chunk_mode=True)
+
+    def test_areas_that_do_not_divide_the_block_are_refused(self, monkeypatch):
+        # 64 tokens over 5 areas: no area is a whole number of them.
+        with pytest.raises(RuntimeError, match="context-cut"):
+            self._register(monkeypatch, areas=5, slices=5, chunk_mode=True)
+
+    def test_host_staging_is_refused_before_anything_registers(self, monkeypatch):
+        # Host staging keeps one full-shape buffer per layer, so the flag would
+        # otherwise be silently inert: `_register_kv_caches_impl` is D2D-only.
+        with pytest.raises(RuntimeError, match="host staging"):
+            build_worker(monkeypatch, kv_buffer_device="cpu", chunk_mode=True)
+
+    def test_host_staging_refuses_the_window_knob_too(self, monkeypatch):
+        # The window range sits in the same lists a chunk range would, so host
+        # staging has no more room for one than for the other.
+        with pytest.raises(RuntimeError, match="host staging"):
+            build_worker(monkeypatch, kv_buffer_device="cpu", swa_window_mode=True)
+
+
+class TestChunkModeWithASlidingWindow:
+    """A hybrid engine is let into chunk mode because window mode already
+    gave its list a second descriptor range, which a third can follow. The
+    per-shard lists it would otherwise be sent to cannot name two KV groups:
+    their region-to-group map holds one group per region, and under HMA both
+    groups share every region."""
+
+    @staticmethod
+    def _register(monkeypatch, *, specs, chunk_mode=True, axis=None):
+        worker = _prep_impl_worker(monkeypatch, specs=specs, chunk_mode=chunk_mode)
+        # A context cut is one head per region over more than one slice; a head
+        # cut is the default 8 heads over one. The axis is derived from that
+        # pair, so asking for it here means building the geometry that makes it.
+        context_cut = axis is KVSplitAxis.NON_HEAD
+        spec = _impl_layer_spec(num_kv_heads=1 if context_cut else 8)
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        xfer_result = MagicMock()
+        # Four logical regions (two layers, K and V), each expanded into the
+        # areas a context cut gives it -- region-major, area-minor, as the
+        # adapter returns them.
+        areas = 2 if context_cut else 1
+        xfer_result.base_addrs = [
+            0x20000 + 0x1000 * r + 0x100 * a for r in range(4) for a in range(areas)
+        ]
+        xfer_result.block_lens = [256 // areas] * len(xfer_result.base_addrs)
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = areas
+        xfer_result.slices = areas
+        xfer_result.slice_ids = list(range(areas)) * 4
+        fake = _fake_nixl_rbln(xfer_result)
+
+        # 8 heads of a 256B region: the block has to be small enough that a
+        # token of one head is at least a byte, or the geometry is a fiction.
+        worker.block_size = 8
+        topo = MagicMock(
+            is_kv_layout_blocks_first=False,
+            cross_layers_blocks=False,
+            tp_size=1,  # the chunk grid asks the topology for a real head band
+        )
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patched_in_package("rebel") as mock_rebel,
+            patch.object(
+                worker,
+                "register_local_xfer_handler",
+                return_value=("local-handle", [(0x0, 0, 0)]),
+            ),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+        return worker
+
+    @staticmethod
+    def _hybrid_specs():
+        # What a gpt-oss-shaped model hands the worker: one full-attention
+        # group and one sliding-window group, both over the same regions.
+        return [
+            MagicMock(spec=FullAttentionSpec),
+            sliding_window_spec(block_size=64, sliding_window=16),
+        ]
+
+    def test_a_windowed_engine_enters_chunk_mode(self, monkeypatch):
+        worker = self._register(monkeypatch, specs=self._hybrid_specs())
+
+        assert worker._sw_ratio == 4
+        assert worker._chunk_mode is True
+
+    def test_two_groups_without_a_window_are_still_refused(self, monkeypatch):
+        # Nothing gave this engine a second range, so a third has nowhere to go.
+        with pytest.raises(RuntimeError, match="sliding window whose view"):
+            self._register(
+                monkeypatch,
+                specs=[MagicMock(spec=FullAttentionSpec)] * 2,
+            )
+
+    def test_a_context_cut_with_a_window_is_refused(self, monkeypatch):
+        # The whole-engine lists a window keeps name a block's chunks without
+        # naming which span holds the last token, so a block cut into several
+        # spans would send chunks addressed past the request's own blocks.
+        with pytest.raises(RuntimeError, match="needs a head cut"):
+            self._register(
+                monkeypatch,
+                specs=self._hybrid_specs(),
+                axis=KVSplitAxis.NON_HEAD,
+            )
+
+    def test_a_window_with_no_full_group_to_trim_is_refused(self, monkeypatch):
+        # The view alone is not the point: a chunk cuts full-attention blocks,
+        # and an engine with none of them would register a range it never uses.
+        with pytest.raises(RuntimeError, match="one full-attention"):
+            self._register(
+                monkeypatch,
+                specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+            )
