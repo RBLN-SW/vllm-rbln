@@ -28,6 +28,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    every_local_link_down,
+    link_down_exit_s,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -56,6 +60,29 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
 
         # Blocks collected so far for a prefill that is still being chunked.
         self._block_ids_need_save: dict[ReqId, BlockIds] = {}
+
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._exit_on_link_down = link_down_exit_s(extra) > 0
+
+    def has_pending_push_work(self) -> bool:
+        # The worker's exit runs on a step, and an idle engine does not step.
+        if self._exit_on_link_down and every_local_link_down():
+            return True
+        return super().has_pending_push_work()
+
+    @staticmethod
+    def _nixl_handshake_listener(
+        encoded_data: dict[tuple[int, int], Any], *args: Any
+    ) -> None:
+        # Refuse with an empty payload while every link is down: the side channel
+        # rides the pod network, so a peer would otherwise wait out the CM timeout.
+        class _RefusingWhileLinksDown(dict[tuple[int, int], Any]):
+            def __getitem__(self, key: tuple[int, int]) -> Any:
+                return b"" if every_local_link_down() else super().__getitem__(key)
+
+        NixlBaseConnectorScheduler._nixl_handshake_listener(
+            _RefusingWhileLinksDown(encoded_data), *args
+        )
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
