@@ -1024,12 +1024,12 @@ class RBLNScheduler(Scheduler):
         return scheduler_output
 
     def _preempt_request(
-        self, request: Request, timestamp: float
-    ) -> dict[str, Any] | None:
+        self, request: Request, timestamp: float, drop_stale_output: bool = False
+    ) -> None:
         # Preempted requests resume with full block tables, so pending deltas
         # from the previous running state are stale.
         self._pending_runner_block_deltas.pop(request.request_id, None)
-        return super()._preempt_request(request, timestamp)
+        super()._preempt_request(request, timestamp, drop_stale_output)
 
     def _make_cached_request_data(
         self,
