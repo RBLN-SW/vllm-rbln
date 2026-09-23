@@ -243,6 +243,7 @@ class TestShardReadPath:
         # wrote. Liveness is stamped first so TTL eviction sees it as active.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._engine_last_active = {}
+        w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
         w._remote_pp_size = {}  # unknown engine defaults to a single stage
         w._overlapping_ranks = {}  # nothing narrowed -> upstream's handle covers it
         w.transfer_topo = MagicMock()
@@ -402,3 +403,20 @@ class TestReadMarksTheEngineActive:
         w = TestShardReadPath._read_worker(pp_size=2)
         w._read_blocks_for_req("r0", TestShardReadPath._meta([], [[3, 4]]))
         assert "eng" in w._engine_last_active
+
+
+class TestAReadDeferredPastTheTeardown:
+    # `_ready_requests` hands a read here a step after the handshake published
+    # the agent, so a heartbeat can declare that engine gone in between and take
+    # the descriptors with it.
+
+    def test_it_is_failed_rather_than_read(self):
+        w = TestShardReadPath._read_worker(pp_size=1)
+        meta = TestShardReadPath._meta([[1, 2]], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+        w._remote_agents.pop("eng")
+
+        w._read_blocks_for_req("r0", meta)
+
+        assert list(w._failed_recv_reqs.queue) == ["r0"]
+        assert w.nixl_wrapper.make_prepped_xfer.call_count == 0

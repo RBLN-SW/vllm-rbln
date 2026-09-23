@@ -92,6 +92,26 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         )
         return self.transfer_topo
 
+    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
+        """Upstream's failure report, minus the reads nothing is waiting on.
+
+        A read with no local block moved nothing: `load_kv_async` is returned
+        only with a positive external token count, so such a request was never
+        put in WAITING_FOR_REMOTE_KVS, and reporting it trips the scheduler's
+        `assert req_id in self.requests`. Upstream would also index
+        `local_block_ids[0]` to invalidate what was read.
+
+        The entry stays: the handshake done-callback runs on the executor
+        thread, so it and the heartbeat can reach one request, and dropping it
+        here would leave whichever came second without the list to judge by --
+        reporting the request after all.
+        """
+        meta = self._recving_metadata.get(req_id)
+        if meta is not None and not meta.local_block_ids:
+            assert handle is None
+            return
+        super()._handle_failed_transfer(req_id, handle)
+
     def _layer_overlap(
         self, registered_layer_names: tuple[str, ...] | list[str]
     ) -> list[tuple[int, int]]:

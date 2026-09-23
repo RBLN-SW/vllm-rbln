@@ -15,7 +15,7 @@
 import time
 from contextlib import contextmanager
 from dataclasses import replace
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 import zmq
@@ -45,6 +45,11 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     RblnNixlWorkerState,
 )
 from vllm_rbln.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorMetadata,
+    )
 
 logger = init_logger(__name__)
 
@@ -401,6 +406,89 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         self._overlapping_ranks.pop(engine_id, None)
         self._remote_pp_size.pop(engine_id, None)
         super()._cleanup_remote_engine(engine_id, log_eviction=log_eviction)
+
+    def _handle_dead_engine(
+        self, engine_id: str, *, error: Exception | None = None
+    ) -> None:
+        """Fail this peer's in-flight reads and drop its handshake state.
+
+        Both halves are needed once a connection is gone: the reads against it
+        will never complete and are the only thing that can end the scheduler's
+        wait, and the `_remote_agents` entry left behind makes `_ensure_handshake`
+        skip the reconnect for the life of the process.
+
+        In-flight handles are released and dropped rather than left to
+        `_pop_done_transfers`, which would report the request a second time with
+        its metadata already gone.
+        """
+        # Snapshotted: the handshake done-callback drops entries from the
+        # executor thread, and reading the live view would raise here.
+        for req_id, meta in list(self._recving_metadata.items()):
+            if meta.remote is None or meta.remote.engine_id != engine_id:
+                continue
+            self._log_failure(
+                failure_type="peer_unreachable",
+                req_id=req_id,
+                error=error,
+                dst_engine_id=engine_id,
+            )
+            for handle in self._recving_transfers.pop(req_id, []):
+                self.nixl_wrapper.release_xfer_handle(handle)
+            self._handle_failed_transfer(req_id, None)
+
+        try:
+            self._cleanup_remote_engine(engine_id, log_eviction=False)
+        except Exception:
+            # The teardown talks to the agent it is dropping, so a dead
+            # connection can fail it halfway. The entry has to go regardless:
+            # keeping it is what blocks the re-handshake.
+            logger.warning(
+                "Dropping the state of unreachable engine %s failed",
+                engine_id,
+                exc_info=True,
+            )
+            self._remote_agents.pop(engine_id, None)
+
+    def _send_heartbeats(self, metadata: "NixlConnectorMetadata") -> None:
+        """Upstream's heartbeat, treating a send failure as the peer being gone.
+
+        Upstream swallows it with a `logger.debug`, so a connection that died
+        after the handshake is never noticed here -- which is the one place a
+        producer that has stopped answering is touched every step.
+
+        Mirrors `NixlBaseConnectorWorker._send_heartbeats` as of vllm 0.26.0,
+        differing only in the `except` body.
+        """
+        for engine_id, hb_info in metadata.heartbeat_by_engine.items():
+            # Proactive handshake (this request may still be in waiting queue) so
+            # the **next** heartbeat for this remote can go through.
+            if (
+                self._ensure_handshake(
+                    engine_id,
+                    hb_info.host,
+                    hb_info.port,
+                    hb_info.tp_size,
+                    hb_info.pp_size,
+                    self._hb_handshake_notif_only and hb_info.pp_size > 1,
+                )
+                is not None
+            ):
+                continue  # handshake is still pending
+
+            hb_msg = ("HB:" + ",".join(hb_info.req_ids)).encode()
+            for agent_name in self._remote_agents[engine_id].values():
+                try:
+                    self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
+                except Exception as e:
+                    logger.warning(
+                        "Heartbeat to engine %s failed; treating it as gone",
+                        engine_id,
+                        exc_info=True,
+                    )
+                    # The remaining agents of a dead engine are gone with it,
+                    # and the teardown drops them all.
+                    self._handle_dead_engine(engine_id, error=e)
+                    break
 
     def _fan_in_peer_areas(
         self, remote_tp_rank: int, remote_tp_size: int

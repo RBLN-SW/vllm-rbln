@@ -40,6 +40,20 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
     def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
+        if engine_id not in self._remote_agents:
+            # A handshake publishes the agent before `_ready_requests` carries
+            # its read here a step later, and a heartbeat can declare the engine
+            # gone in between. Upstream's only teardown cannot open that window
+            # -- an engine this fresh is never stale -- and the descriptors this
+            # read needs went with it.
+            self._log_failure(
+                failure_type="peer_unreachable",
+                req_id=req_id,
+                error=None,
+                dst_engine_id=engine_id,
+            )
+            self._handle_failed_transfer(req_id, None)
+            return
         # Keep the engine off the staleness sweep: upstream does this on the
         # read path this one replaces, and a swept producer loses the state
         # mid-transfer.

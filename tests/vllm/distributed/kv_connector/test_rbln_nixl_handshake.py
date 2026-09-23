@@ -21,6 +21,7 @@
 # nixl-rbln is the only stand-in.
 
 import collections
+import queue
 import threading
 import time
 from collections import Counter, defaultdict
@@ -3326,3 +3327,146 @@ class TestKvRuns:
         # A region is K or V alone, so a head band is contiguous however the two
         # sides cut heads. This is the arithmetic the connector shipped with.
         assert RblnNixlWorkerBase._kv_runs(SPLIT, cuts_l, cuts_r) == 1
+
+
+class TestADeadPeerIsReported:
+    # The heartbeat is the one call made against a producer every step, so a
+    # connection that died after the handshake surfaces here first. Upstream
+    # logs it and moves on, which leaves the reads against that peer unreported
+    # and its agents in place.
+
+    @staticmethod
+    def _worker():
+        w = RblnNixlPullConnectorWorker.__new__(RblnNixlPullConnectorWorker)
+        w.engine_id = "local"
+        w.nixl_wrapper = MagicMock()
+        w._recving_metadata = {}
+        w._recving_transfers = collections.defaultdict(list)
+        w._invalid_block_ids = queue.Queue()
+        w._failed_recv_reqs = queue.Queue()
+        w._is_hma_required = False
+        w.xfer_stats = MagicMock()
+        w._remote_agents = {"eng": {(0, 0): "agent0", (0, 1): "agent1"}}
+        w._hb_handshake_notif_only = False
+        # Handshake already done for every engine a heartbeat names.
+        w._ensure_handshake = MagicMock(return_value=None)
+        w._cleanup_remote_engine = MagicMock(
+            side_effect=lambda eid, **_: w._remote_agents.pop(eid)
+        )
+        return w
+
+    @staticmethod
+    def _meta(engine_id="eng", local_ids=((1, 2),)):
+        meta = MagicMock()
+        meta.remote = MagicMock(engine_id=engine_id)
+        meta.local_block_ids = [list(g) for g in local_ids]
+        return meta
+
+    @staticmethod
+    def _heartbeat(req_ids=frozenset()):
+        metadata = MagicMock()
+        metadata.heartbeat_by_engine = {
+            "eng": MagicMock(
+                req_ids=set(req_ids), host="h", port=1, tp_size=1, pp_size=1
+            )
+        }
+        return metadata
+
+    def test_a_failing_heartbeat_fails_that_peers_reads(self):
+        w = self._worker()
+        w._recving_metadata = {"r0": self._meta(), "r1": self._meta("other")}
+        w._recving_transfers["r0"].append(7)
+        w.nixl_wrapper.send_notif.side_effect = RuntimeError("conn is gone")
+
+        w._send_heartbeats(self._heartbeat({"r0"}))
+
+        assert list(w._failed_recv_reqs.queue) == ["r0"]
+        assert list(w._invalid_block_ids.queue) == [{1, 2}]
+        # The in-flight handle goes with it: left in place, _pop_done_transfers
+        # would report r0 a second time with its metadata already gone.
+        w.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
+        assert "r0" not in w._recving_transfers
+
+    def test_a_failing_heartbeat_drops_the_handshake_state(self):
+        # _ensure_handshake skips the reconnect while the entry is there, so
+        # the pair never recovers until the process dies.
+        w = self._worker()
+        w.nixl_wrapper.send_notif.side_effect = RuntimeError("conn is gone")
+
+        w._send_heartbeats(self._heartbeat())
+
+        w._cleanup_remote_engine.assert_called_once_with("eng", log_eviction=False)
+        assert "eng" not in w._remote_agents
+        # One attempt, not one per agent of an engine already declared gone.
+        assert w.nixl_wrapper.send_notif.call_count == 1
+
+    def test_a_teardown_that_itself_fails_still_frees_the_reconnect(self):
+        # The teardown talks to the agent it is dropping, so the dead
+        # connection can fail it halfway; the entry still has to go.
+        w = self._worker()
+        w.nixl_wrapper.send_notif.side_effect = RuntimeError("conn is gone")
+        w._cleanup_remote_engine = MagicMock(side_effect=RuntimeError("agent is gone"))
+
+        w._send_heartbeats(self._heartbeat())
+
+        assert "eng" not in w._remote_agents
+
+
+class TestAReadThatMovedNoBlock:
+    # An empty local list means no async load was scheduled, so the request is
+    # not in WAITING_FOR_REMOTE_KVS -- naming it to the scheduler trips
+    # `assert req_id in self.requests`. Both producers of such a read reach the
+    # failure path: a full prefix hit and an aborted request's release notify.
+
+    def test_it_is_not_reported(self):
+        w = TestADeadPeerIsReported._worker()
+        w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
+
+        w._handle_failed_transfer("r0", None)
+
+        assert w._failed_recv_reqs.empty()
+        assert w._invalid_block_ids.empty()
+
+    def test_a_second_report_says_the_same(self):
+        # The handshake done-callback runs on the executor thread, so it and
+        # the heartbeat can reach one request. Consuming the entry would leave
+        # the second one with no block list to judge by.
+        w = TestADeadPeerIsReported._worker()
+        w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
+
+        w._handle_failed_transfer("r0", None)
+        w._handle_failed_transfer("r0", None)
+
+        assert w._failed_recv_reqs.empty()
+
+
+class TestMetadataTakenMidSweep:
+    # `_handle_dead_engine` sweeps `_recving_metadata` while that same
+    # executor thread may be dropping entries from it.
+
+    class _PopsWhenRead:
+        """A read whose peer cannot be named without losing another entry."""
+
+        def __init__(self, store, victim):
+            self._store = store
+            self._victim = victim
+            self.local_block_ids = [[1, 2]]
+
+        @property
+        def remote(self):
+            self._store.pop(self._victim, None)
+            return MagicMock(engine_id="eng")
+
+    def test_the_sweep_survives_it(self):
+        w = TestADeadPeerIsReported._worker()
+        store: dict = {}
+        store["r0"] = self._PopsWhenRead(store, "r1")
+        store["r1"] = TestADeadPeerIsReported._meta()
+        store["r2"] = TestADeadPeerIsReported._meta()
+        w._recving_metadata = store
+
+        w._handle_dead_engine("eng")
+
+        # Reading the live view would raise here; the sweep still covers every
+        # read it set out to, including the one taken from under it.
+        assert list(w._failed_recv_reqs.queue) == ["r0", "r1", "r2"]
