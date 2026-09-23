@@ -77,6 +77,7 @@ class MockKVConfig:
 
     matched_tokens: int = 0
     is_async: bool = False
+    kv_role: str = "kv_both"
 
 
 class _MockKVConnectorMetadata(KVConnectorMetadata):
@@ -183,7 +184,7 @@ def create_rbln_scheduler(
     if use_kv_connector is not None:
         kv_transfer_config = KVTransferConfig(
             kv_connector="MockKVConnector",
-            kv_role="kv_both",
+            kv_role=use_kv_connector.kv_role,
             kv_connector_extra_config={
                 "matched_tokens": use_kv_connector.matched_tokens,
                 "is_async": use_kv_connector.is_async,

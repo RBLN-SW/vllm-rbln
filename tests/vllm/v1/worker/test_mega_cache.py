@@ -28,6 +28,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from vllm.config import KVTransferConfig
 
 from tests.vllm.vllm_config import make_vllm_config
 from vllm_rbln.v1.worker import mega_cache, rbln_model_runner
@@ -276,6 +277,30 @@ class TestSignatureVllmConfig:
         monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-CR13")
         assert mega_cache.config_signature(make_vllm_config()) != cr03
 
+    @staticmethod
+    def _role_config(role):
+        return make_vllm_config(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="RblnNixlConnector", kv_role=role
+            )
+        )
+
+    @pytest.mark.parametrize("kv_role", ["kv_both", "kv_consumer"])
+    def test_the_producer_role_invalidates(self, kv_role):
+        # A producer compiles no decode graph, so its bundle is a strict subset
+        # of the others'. KVTransferConfig.compute_hash() has no factors, so
+        # without this the two share a signature and the decoding side reads a
+        # bundle with its decode graphs missing as warm.
+        producer = mega_cache.config_signature(self._role_config("kv_producer"))
+        assert mega_cache.config_signature(self._role_config(kv_role)) != producer
+
+    def test_the_roles_that_decode_share_one_bundle(self):
+        # kv_both and kv_consumer compile the same graphs, so splitting them
+        # would only buy a cold compile.
+        assert mega_cache.config_signature(
+            self._role_config("kv_both")
+        ) == mega_cache.config_signature(self._role_config("kv_consumer"))
+
     def test_every_factor_is_a_real_field(self):
         # A getattr default would drop an axis from the key on an upstream rename.
         config = make_vllm_config()
@@ -293,6 +318,11 @@ class TestSignatureVllmConfig:
         ).speculative_config
         for name in ("num_speculative_tokens", "method", "draft_tensor_parallel_size"):
             assert hasattr(spec, name), name
+
+        assert hasattr(
+            KVTransferConfig(kv_connector="RblnNixlConnector", kv_role="kv_both"),
+            "kv_role",
+        )
 
     def test_every_port_field_is_swept(self):
         # Ports are auto-queried per launch; one reaching the hash moves the

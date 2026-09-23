@@ -88,10 +88,12 @@ def _resolved_batch(
 
 def _make_runner_stub(**attrs):
     # A bare RBLNModelRunner (no __init__); set only the attributes the method
-    # under test reads. dp_status is the exception: __init__ always sets it, and
-    # the dummy step reads it before anything publishes one.
+    # under test reads. dp_status and is_strict_kv_producer are the exceptions:
+    # __init__ always sets them, and the step phase and the dummy step read them
+    # before anything publishes one.
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
+    runner.is_strict_kv_producer = False
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -826,6 +828,23 @@ class TestDummyRunPadding:
         runner._dummy_run(1, 4, is_prefill=True)
 
         assert captured["layout"].num_reqs_padded == 1
+
+    def test_a_dummy_prefill_pads_to_the_width_warm_up_compiled(self, monkeypatch):
+        # Serving pads every prefill to max_num_tokens, so that is the one width
+        # warm-up builds. A dummy prefill has to land on it whatever length it is
+        # handed -- an idle rank reports the minimal entry, not the staged width.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, runner.max_num_tokens, is_prefill=True)
+        warmed = captured["layout"].shape
+
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, 1, is_prefill=True, warmup=False)
+        assert captured["layout"].shape == warmed
+
+        # A decode dummy still runs at the length it is given; only prefill pads.
+        runner, captured = self._runner(monkeypatch, reqs_across_dp=[1, 1, 1, 1])
+        runner._dummy_run(1, 1, is_prefill=False, warmup=False)
+        assert captured["layout"].shape != warmed
 
     def test_warmup_pin_is_the_token_dimension(self, monkeypatch):
         # Warm-up dictates the dimension it wants compiled -- the group agreement
@@ -1796,6 +1815,16 @@ class TestDummyRunPPIntermediateTensors:
         assert captured["layout"].num_reqs == 1
         assert captured["layout"].num_reqs_padded == 8
 
+    def test_prefill_intermediate_tensors_match_the_staged_width(self, monkeypatch):
+        # The stager pads a prefill's rows to max_num_tokens but passes
+        # intermediate tensors through, so the sender built them at that width.
+        # Sizing them from the unpadded length instead splits the two apart.
+        runner, captured = self._runner(monkeypatch, num_reqs_padded=1, query_len=1)
+        runner._dummy_run(1, 1, is_prefill=True, warmup=False)
+        _, width = captured["layout"].shape
+        assert width == runner.max_num_tokens
+        assert captured["intermediate_tensors"]["h"].shape == (1, width, self.HIDDEN)
+
 
 class TestExecuteModelRecoversADeferredLoad:
     """A read the dummy step never issued goes out on the next execute_model.
@@ -1811,7 +1840,7 @@ class TestExecuteModelRecoversADeferredLoad:
     @staticmethod
     def _runner(monkeypatch):
         order: list[str] = []
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: False)
         connector = SimpleNamespace(
             handle_preemptions=lambda meta: order.append(f"preemptions:{meta}")
         )
@@ -1885,7 +1914,7 @@ class TestExecuteModelFlushesAfterTheSubmission:
     def _runner(monkeypatch):
         order: list[str] = []
         connector = SimpleNamespace(handle_preemptions=lambda meta: None)
-        monkeypatch.setattr(mr, "step_is_prefill", lambda so: False)
+        monkeypatch.setattr(mr, "step_is_prefill", lambda so, **kw: False)
         monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
         monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
         monkeypatch.setattr(mr, "flush_deferred_loads", lambda c: order.append("flush"))
@@ -1951,3 +1980,75 @@ class TestExecuteModelFlushesAfterTheSubmission:
         # The entry flush recovers a stale hold, then this step's read goes out
         # only after its own submission.
         assert order == ["flush", "submit", "flush"]
+
+
+class TestDecodeGraphShapes:
+    # The list warm-up iterates and the KV-cache estimate counts, so what it
+    # must hold is that it matches the dummies run_model_graphs issues.
+    @staticmethod
+    def _runner(*, buckets, specialized, num_spec=None, fixed_window=False):
+        spec = None
+        if num_spec is not None:
+            spec = SimpleNamespace(num_speculative_tokens=num_spec)
+        return SimpleNamespace(
+            speculative_config=spec,
+            uses_fixed_decode_window=fixed_window,
+            bucketing_manager=SimpleNamespace(decode_batch_buckets=buckets),
+            specialized_moe_decode=specialized,
+            max_num_tokens=512,
+            is_strict_kv_producer=False,
+        )
+
+    def _dummies(self, runner):
+        calls = []
+        runner._dummy_run = lambda *a, **kw: calls.append((a, kw))
+        runner.decode_graph_shapes = lambda: mr.RBLNModelRunner.decode_graph_shapes(
+            runner
+        )
+        mr.RBLNModelRunner.run_model_graphs(runner)
+        return calls
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"buckets": [1, 2, 4], "specialized": False},
+            {"buckets": [1, 2, 4], "specialized": True},
+            {"buckets": [1, 2, 4], "specialized": True, "num_spec": 3},
+            {
+                "buckets": [1, 2, 4],
+                "specialized": True,
+                "num_spec": 3,
+                "fixed_window": True,
+            },
+        ],
+    )
+    def test_one_dummy_per_shape_plus_the_prefill(self, kwargs):
+        runner = self._runner(**kwargs)
+        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
+        calls = self._dummies(runner)
+        assert len(calls) == len(shapes) + 1
+        assert calls[0][0] == (1, runner.max_num_tokens, True)
+        for (num_reqs, query_len, override), (args, kw) in zip(shapes, calls[1:]):
+            assert args == (num_reqs, query_len, False)
+            assert kw == {"num_tokens_padded_override": override}
+
+    def test_specialized_pins_the_prefill_token_dimension(self):
+        runner = self._runner(buckets=[1, 2, 4], specialized=True)
+        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
+        assert shapes[-1] == (4, 1, runner.max_num_tokens)
+
+    def test_a_variable_query_length_adds_the_asymmetric_spec_pin(self):
+        runner = self._runner(buckets=[1, 2, 4], specialized=True, num_spec=3)
+        shapes = mr.RBLNModelRunner.decode_graph_shapes(runner)
+        # Top bucket, one token, padded to what a drafting peer would stage.
+        assert shapes[-1] == (4, 1, 4 * 4)
+
+    def test_a_strict_producer_compiles_no_decode_graph(self):
+        # Every step a producer runs is a prefill step, so warm-up issues the
+        # prefill dummy and nothing else.
+        runner = self._runner(buckets=[1, 2, 4], specialized=True, num_spec=3)
+        runner.is_strict_kv_producer = True
+        assert mr.RBLNModelRunner.decode_graph_shapes(runner) == []
+        calls = self._dummies(runner)
+        assert len(calls) == 1
+        assert calls[0][0] == (1, runner.max_num_tokens, True)

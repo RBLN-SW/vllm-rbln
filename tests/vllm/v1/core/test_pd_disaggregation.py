@@ -152,7 +152,7 @@ class TestCoexistenceWithDecodes:
         assert out2.num_scheduled_tokens["R"] == 1
         # The promoted request brought its whole prompt with it, so the step the
         # runner sees is a plain decode step.
-        assert step_is_prefill(out2) is False
+        assert step_is_prefill(out2, strict_kv_producer=False) is False
 
     def test_local_prefill_is_deferred_behind_a_promoted_request(self):
         # A promotion was admitted this step, so a local prefill must wait:
@@ -169,3 +169,24 @@ class TestCoexistenceWithDecodes:
         assert out2.num_scheduled_tokens["0"] == 1
         assert "L" not in out2.num_scheduled_tokens
         assert local.status == RequestStatus.WAITING
+
+
+class TestStrictProducerPhase:
+    """A producer reads a 1-token step as a prefill so it can run the prefill
+    graph."""
+
+    def test_a_one_token_prompt_is_a_prefill_step(self):
+        # The case the widening exists for: without it this schedules as a
+        # decode and asks for a graph a producer does not compile.
+        sched = create_rbln_scheduler(
+            block_size=BLOCK_SIZE,
+            num_blocks=100,
+            max_num_batched_tokens=MAX_LEN,
+            max_model_len=MAX_LEN,
+            use_kv_connector=MockKVConfig(matched_tokens=0, kv_role="kv_producer"),
+        )
+        sched.add_request(_local_request("a", num_tokens=1))
+        out = sched.schedule()
+        assert out.num_scheduled_tokens == {"a": 1}
+        assert step_is_prefill(out, strict_kv_producer=True) is True
+        assert step_is_prefill(out, strict_kv_producer=False) is False
