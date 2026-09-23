@@ -324,13 +324,6 @@ class TestManagerInit:
         assert manager.enable_kv_cache_events is True
         assert manager.block_pool.enable_kv_cache_events is False
 
-    def test_multi_group_with_events_raises(self):
-        # Multi-group + KV events -> ValueError (hybrid does not support events).
-        with pytest.raises(ValueError):
-            make_hybrid_manager(
-                8, 4, 10, sliding_window=16, enable_kv_cache_events=True
-            )
-
 
 class TestGetComputedBlocksSubBlock:
     def test_no_partial_match_on_first_request(self):
@@ -1001,6 +994,30 @@ class TestKVEvents:
         assert stored[0].parent_block_hash == maybe_convert_block_hash(
             expected_hashes[0]
         )
+
+    def test_events_carry_group_and_spec(self):
+        # One BlockStored per group with its index and spec, as upstream emits
+        # them; a BlockRemoved names the group that dropped the hashes.
+        manager = make_hybrid_manager(
+            8, 4, 10, sliding_window=16, enable_kv_cache_events=True
+        )
+        prefill_request(manager, make_request("0", list(range(8)), 8))
+        stored = self._stored(manager)
+        by_group = {e.group_idx: e for e in stored}
+        assert set(by_group) == {0, 1}
+        assert by_group[0].kv_cache_spec_kind == "full_attention"
+        assert by_group[0].kv_cache_spec_sliding_window is None
+        assert by_group[1].kv_cache_spec_kind == "sliding_window"
+        assert by_group[1].kv_cache_spec_sliding_window == 16
+        assert by_group[0].block_hashes == by_group[1].block_hashes
+
+        hashes, _, _ = SubBlockHasher(sha256, SUB_BLOCK_SIZE).hash_tokens(
+            list(range(1000, 1008))
+        )
+        manager._group_infos[1].sub_block_index.update(7, hashes)
+        manager._on_block_evicted(7)
+        removed = [e for e in manager.take_events() if isinstance(e, BlockRemoved)]
+        assert [e.group_idx for e in removed] == [1]
 
     def test_remove_fires_only_on_last_holder(self):
         # Two blocks hold the same prefix hashes: evicting the first fires no
