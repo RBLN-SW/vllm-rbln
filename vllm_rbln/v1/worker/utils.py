@@ -51,6 +51,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
@@ -1111,7 +1112,13 @@ def prepare_kernel_block_sizes(
             # Both sliding-window kernels address the cache in windows, not
             # in the manager's blocks; upstream BlockTable rejects a block the
             # window does not divide.
-            kernel_block_sizes.append(kv_cache_spec.sliding_window)
+            if os.environ.get("RBLN_SWA_FULL_BLOCK", "0") == "1" and not isinstance(
+                kv_cache_spec, RBLNSlidingWindowSpec
+            ):
+                # Experiment: hand the append kernel the manager block.
+                kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
+            else:
+                kernel_block_sizes.append(kv_cache_spec.sliding_window)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size

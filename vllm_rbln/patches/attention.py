@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import TYPE_CHECKING, Any
-
+import os
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
@@ -261,9 +261,13 @@ def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
             raise NotImplementedError(
                 "MLA is not supported with sliding window attention."
             )
-        spec_cls = (
-            SlidingWindowSpec if current_platform.is_cr13() else RBLNSlidingWindowSpec
-        )
+        if os.environ.get("RBLN_USE_MULTI_ATTN", "0") == "1":
+            spec_cls = SlidingWindowSpec
+        else:
+            spec_cls = RBLNSlidingWindowSpec
+        # spec_cls = (
+        #     SlidingWindowSpec if current_platform.is_cr13() else RBLNSlidingWindowSpec
+        # )
         return spec_cls(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,
