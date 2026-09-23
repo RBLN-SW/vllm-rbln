@@ -196,4 +196,10 @@ class RBLNParallelLMHead(ParallelLMHead):
             # selects the rank-local vocab shard.
             if self.tp_size < 2:
                 self.weight = embed_tokens.weight
+            else:
+                # Only reached when the model asked to tie, so this records
+                # "tying was wanted and declined". The loader has no other way
+                # to tell: upstream infers tying from parameter identity, which
+                # is exactly what the split layout removes.
+                self.replays_tied_embedding = True
             return self
