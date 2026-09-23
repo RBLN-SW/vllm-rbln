@@ -228,15 +228,18 @@ class RblnNixlWorkerBase(
                 "of one sliding window, and this engine has no window to cut "
                 "by -- no sliding-window group, or one as wide as its block."
             )
-        if self._shape.wants_stream and self._shape.writes_into_peer:
-            if not self._shape.streams_prefix:
-                raise RuntimeError(
-                    "RBLN NIXL: push_stream hands over a prefill's closed "
-                    "prefix ahead of the request, and this engine cannot say "
-                    "which of its KV cache groups a batch filled -- that "
-                    "takes lists of its own, and neither a single group nor a "
-                    "sliding window gives it any."
-                )
+        if (
+            self._shape.wants_stream
+            and self._shape.writes_into_peer
+            and not self._shape.streams_prefix
+        ):
+            raise RuntimeError(
+                "RBLN NIXL: push_stream hands over a prefill's closed "
+                "prefix ahead of the request, and this engine cannot say "
+                "which of its KV cache groups a batch filled -- that "
+                "takes lists of its own, and neither a single group nor a "
+                "sliding window gives it any."
+            )
         if self._shape.has_window_range:
             # A backstop: `patches/attention.py` refuses a sliding-window MLA
             # layer while the engine is being built, so no such group reaches

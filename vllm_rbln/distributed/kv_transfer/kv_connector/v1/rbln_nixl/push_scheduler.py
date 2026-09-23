@@ -58,10 +58,6 @@ class RblnNixlPushConnectorScheduler(RblnNixlSchedulerBase, NixlPushConnectorSch
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
-        # What a prefill closes can leave before the request ends, whether the
-        # rest of it is still running on later pipeline stages or in this
-        # rank's own later chunks. Which peers can be written a prefix is not
-        # known until the handshake, so that part is settled per write.
         # How much of each request's prefix has already been offered, so a
         # step that closes no new block offers nothing.
         self._streamed_chunks: dict[str, int] = {}

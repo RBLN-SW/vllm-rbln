@@ -16,19 +16,17 @@
 
 ``transfer_shape`` is a pure reduction both sides run over the same two config
 objects, so neither carries a term of its own. It reads no chiplet geometry,
-which is why it can run before upstream's ``__init__`` and why the scheduler,
-which never sees that geometry, can run it at all. The rest is what a producer
-advertises beyond upstream's ``NixlAgentMetadata``.
+which is why it can run before upstream's ``__init__`` and in the scheduler,
+which never sees that geometry. The rest is what a producer advertises beyond
+upstream's ``NixlAgentMetadata``.
 
 Peers pair by what each holds rather than by position, on two axes, and each
 axis needs one thing upstream's struct does not carry: the layer names a shard
-registered, and the chiplet geometry its regions expanded into. Both describe
-the sender; the receiver derives its own side and matches.
+registered, and the chiplet geometry its regions expanded into.
 
-Kept in a subclass so upstream's struct and its compatibility hash stay
-untouched. Both ends are RBLN, so folding a private version tag into that hash
-(``rbln_compat_hash``) is enough to keep peers speaking different schemas from
-completing a handshake.
+Kept in a subclass so upstream's struct and its hash stay untouched: both ends
+are RBLN, so folding a private version tag into that hash
+(``rbln_compat_hash``) keeps peers on different schemas from pairing.
 """
 
 from dataclasses import dataclass, field
