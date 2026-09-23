@@ -48,7 +48,8 @@ if TYPE_CHECKING:
 #   3: + the transfer direction in the hash
 #   4: + kv_split_axis (which axis the geometry above came from)
 #   5: + kv_per_block (whether a region's block holds K and V together)
-RBLN_NIXL_CONNECTOR_VERSION: int = 5
+#   6: a window range names the kernel blocks the window is in, not a prefix
+RBLN_NIXL_CONNECTOR_VERSION: int = 6
 
 
 class KVSplitAxis(Enum):
