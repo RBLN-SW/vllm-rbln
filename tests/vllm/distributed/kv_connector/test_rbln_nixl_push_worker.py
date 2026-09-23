@@ -103,6 +103,7 @@ def _push_worker():
     w.use_host_buffer = False
     window_mode(w, None, streams_prefix=False)
     w._streamed = {}
+    w._send_failures = set()
     w._empty_receives = set()
     w._recving_transfers = {}
     # Off, as the connector option is; the trim tests turn it on.
@@ -1682,6 +1683,25 @@ class TestOutboundFailure:
         worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
         worker.xfer_stats.record_failed_transfer.assert_called_once()
 
+    def test_a_write_this_side_does_not_seal_leaves_nothing_behind(self, monkeypatch):
+        # Upstream reports such a request itself, on its own completion check
+        # or when the lease expires, and the failure recorded here has to go
+        # with it or it outlives every request it was about.
+        worker = self._worker(receiving=False)
+        worker._streamed = {}
+        worker._empty_receives = set()
+        worker._coverage_by_req, worker._coverage_units_by_req = {}, {}
+        worker._evict_finished_inbox = queue.Queue()
+        worker._push_writer_wake = threading.Event()
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "get_finished", lambda self: ({"r0"}, set())
+        )
+        worker._handle_failed_transfer("r0", 7)
+
+        worker.get_finished()
+
+        assert worker._send_failures == set()
+
     def test_a_failed_read_still_reaches_upstream(self):
         # Guard: this engine receives as well, and that direction is the one
         # upstream's handler was written for.
@@ -2210,6 +2230,23 @@ class TestAStreamedSendThatLostAWrite:
         worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([1, 2],), ([3, 4],)))
 
         assert worker._streamed["r0"].failed
+
+    def test_a_transfer_that_came_back_failed_is_one_too(self, monkeypatch):
+        # The submission went out and the transfer itself failed. Nothing is
+        # left in flight, so the batch counts as done and the request would
+        # read as sent.
+        TestSealedCompletion._upstream_reports_nothing(monkeypatch)
+        worker = TestSealedCompletion._worker(["ERR"])
+        # The failure path names this rank's own engine in its log line.
+        worker.engine_id = "local"
+        _send(worker, transfers=[[7]], queued=1, expected=1)
+        worker._reqs_to_send = {"r0": 1.0}
+
+        done_sending, _ = worker.get_finished()
+
+        assert done_sending == set()
+        assert worker._reqs_to_send == {"r0": 1.0}
+        assert worker._send_failures == set()
 
     def test_a_failed_send_is_left_to_its_lease(self, monkeypatch):
         TestSealedCompletion._upstream_reports_nothing(monkeypatch)

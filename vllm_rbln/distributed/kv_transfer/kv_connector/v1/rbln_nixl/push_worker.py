@@ -214,6 +214,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # when this rank first closes a chunk of it, dropped when the send is
         # over -- see _StreamedSend.
         self._streamed: dict[ReqId, _StreamedSend] = {}
+        # Requests a failed WRITE was seen for, drained under the sending
+        # lock. A set rather than a `_StreamedSend` field because the paths
+        # that see one do not all hold that lock -- a registration or
+        # handshake failure is reported from the thread that ran it.
+        self._send_failures: set[ReqId] = set()
 
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
@@ -610,6 +615,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         push that never completes is unwound.
         """
         if req_id not in self._recving_metadata:
+            # A batch with no handle left in flight is counted done whatever
+            # state it came back in, so a failed one reads as sent. Only a
+            # send this side seals is covered; upstream reports the rest.
+            # TODO(vllm-project/vllm#56104): delete once that lands and is
+            # released.
+            self._send_failures.add(req_id)
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
             self.xfer_stats.record_failed_transfer()
@@ -639,6 +650,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # in a single transfer is reported here and nowhere else.
         for req_id in done_sending:
             self._valid_tokens.pop(req_id, None)
+            self._send_failures.discard(req_id)
         return done_sending, done_recving
 
     def _finish_sealed_requests(self) -> set[ReqId]:
@@ -670,7 +682,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     continue
                 # A send that lost a write keeps its lease instead -- see
                 # `_handle_failed_transfer`.
-                if not send.failed:
+                if not send.failed and req_id not in self._send_failures:
                     finished.add(req_id)
                 self._forget_send(req_id)
 
@@ -684,6 +696,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         """Drop what this side tracked for a request it is done pushing."""
         self._streamed.pop(req_id, None)
         self._valid_tokens.pop(req_id, None)
+        self._send_failures.discard(req_id)
 
     def _xfer_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         """Write this request's blocks, one transfer per paired peer rank.
