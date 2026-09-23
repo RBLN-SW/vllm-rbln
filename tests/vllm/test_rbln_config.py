@@ -610,6 +610,22 @@ class TestAutoReadsTheModel:
         with pytest.raises(ValueError, match="Make the config readable"):
             resolve_model_impl(engine_args=_engine_args(str(tmp_path)))
 
+    def test_a_config_without_architectures_takes_the_vllm_path(
+        self, tmp_path, monkeypatch
+    ):
+        """A remote-code config can leave the field unset rather than empty.
+
+        optimum-rbln is keyed on the architecture, so one it cannot read is one
+        it does not implement.
+        """
+        monkeypatch.setattr(
+            "vllm.transformers_utils.config.get_config",
+            lambda *a, **kw: SimpleNamespace(architectures=None),
+        )
+        model = _model_dir(tmp_path, model_type="llama")
+
+        assert resolve_model_impl(engine_args=_engine_args(model)) == "vllm"
+
     def test_a_named_path_is_taken_without_reading_the_model(self, tmp_path):
         # The model is one optimum-rbln runs, so a resolution that read it would
         # answer differently from what the caller typed.
