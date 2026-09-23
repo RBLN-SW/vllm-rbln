@@ -342,9 +342,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             hs_shape = hidden_states.shape
             s_g = hidden_states.reshape(-1, in_block_size).to(torch.float32)
             amax = s_g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
-            scale = amax / finfo.max
+            # The compiled kernel binds its __DTYPE__ (and so its output dtype)
+            # from this scale, so it must be compute_dtype, not fp32. Round it
+            # first and quantize with the rounded value.
+            scale = (amax / finfo.max).to(compute_dtype)
             hs_q = (
-                (s_g / scale)
+                (s_g / scale.float())
                 .clamp(finfo.min, finfo.max)
                 .to(fp8_dtype)
                 .reshape(hs_shape)
