@@ -148,7 +148,6 @@ class _Apply(torch.nn.Module):
                 act_type=act_dtype,
                 group_size=group_size,
                 zero_points=False,
-                has_g_idx=False,
             ),
             w_q_param_name="weight_packed",
             w_s_param_name="weight_scale",
