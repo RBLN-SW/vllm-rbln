@@ -445,30 +445,22 @@ def resolve_model_impl(
             # Not `--model-impl optimum`: with the variable still set that is
             # the disagreement the refusal above this one is for.
             remedy = "Unset VLLM_RBLN_USE_VLLM_MODEL."
-        elif engine_args is None:
-            # Nothing to read the model off. `create_engine_config` always has
-            # one; a caller resolving without an engine takes the documented
-            # default.
-            resolved = "optimum"
         else:
+            # `create_engine_config` is the only caller that reaches this, and
+            # it always has its own engine args.
+            assert engine_args is not None
             resolved, selected_by, remedy = _model_impl_for(engine_args)
     _reject_disabled_model_impl(resolved, selected_by, remedy)
     return resolved
 
 
 def _model_impl_for(engine_args: Any) -> tuple[ModelImpl, str, str]:
-    """The path `auto` takes for this model, and what a refusal should say.
+    """The path `auto` takes for this model, with the wording a refusal needs.
 
-    The two strings are what `_reject_disabled_model_impl` names when the path
-    is disabled on this host, and they are empty for the optimum path, which no
-    host refuses. They differ per outcome because the two that reach the vllm
-    path are undone by different things.
-
-    Reading the model costs a config fetch that `ModelConfig` pays again a
-    moment later, so only `auto` reaches here. The arguments mirror the ones it
-    uses, `hf_overrides` included: those can rewrite `architectures`, which is
-    what this reads, and a fetch without them can name a path the built config
-    then contradicts.
+    The two strings name what selected the path and how to undo it, and are
+    empty for the optimum path, which no host refuses. The arguments mirror the
+    ones `ModelConfig` reads the same config with a moment later, `hf_overrides`
+    included, since an override can rewrite the `architectures` this reads.
     """
     from vllm.transformers_utils.config import get_config
     from vllm.transformers_utils.utils import maybe_model_redirect

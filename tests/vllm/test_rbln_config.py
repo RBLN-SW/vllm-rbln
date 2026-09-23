@@ -342,16 +342,6 @@ class TestResolveModelImpl:
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "0")
         assert resolve_model_impl(model_impl="optimum") == "optimum"
 
-    def test_nothing_given_is_the_default_path(self, monkeypatch):
-        # Both names this suite sets are what the default is the absence of: the
-        # deprecated variable, and the path a parent hands down, which the
-        # conftest states for the whole session.
-        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
-        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
-        assert resolve_model_impl() == "optimum"
-        assert resolve_model_impl({}) == "optimum"
-        assert resolve_model_impl(None) == "optimum"
-
     def test_the_deprecated_variable_still_selects_the_path(self, monkeypatch):
         # TODO(vllm-rbln>=0.14.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
@@ -391,15 +381,11 @@ class TestResolveModelImpl:
         """Every EngineArgs carries `auto`, typed or not.
 
         Read as a path it would overrule what a parent handed down, so it is no
-        answer at all: the process that was handed one keeps it, and the one
-        that was handed nothing takes the default.
+        answer at all and the process that was handed one keeps it.
         """
         monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
         monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", "vllm")
         assert resolve_model_impl(model_impl="auto") == "vllm"
-
-        monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
-        assert resolve_model_impl(model_impl="auto") == "optimum"
 
     def test_a_flag_that_disagrees_with_the_config_class_is_rejected(self):
         """The class holds one path's options and the flag names a path.
@@ -561,6 +547,18 @@ class TestAutoReadsTheModel:
             tmp_path, model_type=model_type, architectures=[architecture]
         )
         assert resolve_model_impl(engine_args=_engine_args(model)) == resolved
+
+    @pytest.mark.parametrize("additional_config", [None, {}])
+    def test_an_additional_config_that_names_no_path_reads_the_model(
+        self, tmp_path, additional_config
+    ):
+        """Only the two classes name a path; a dict carries options."""
+        model = _model_dir(
+            tmp_path, model_type="mixtral", architectures=["MixtralForCausalLM"]
+        )
+        args = _engine_args(model)
+
+        assert resolve_model_impl(additional_config, engine_args=args) == "vllm"
 
     def test_hf_overrides_are_read_with_the_model(self, tmp_path):
         """`architectures` is one of the fields an override can rewrite.
