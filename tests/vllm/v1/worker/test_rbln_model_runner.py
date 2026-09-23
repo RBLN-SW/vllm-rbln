@@ -962,6 +962,19 @@ class TestDummyRunFlushesTheDeferredLoad:
         assert order == []
 
 
+def _copy_groups(*groups):
+    # One KV cache group per entry of layer names; the eager copy path reads
+    # only a group's block_size and layer_names.
+    return SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(block_size=8), layer_names=list(names)
+            )
+            for names in groups
+        ]
+    )
+
+
 class TestProcessKvCacheCopyOps:
     # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager.
     # Forced deterministically.
@@ -979,6 +992,8 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[kv],
             kv_cache_names=["l0"],
             kv_cache_block_axes={"l0": block_axis},
+            kv_cache_config=_copy_groups(["l0"]),
+            _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -998,6 +1013,8 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[kv],
             kv_cache_names=["l0"],
             kv_cache_block_axes={"l0": 0},
+            kv_cache_config=_copy_groups(["l0"]),
+            _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -1017,6 +1034,8 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[latent, scale],
             kv_cache_names=["latent", "scale"],
             kv_cache_block_axes={"latent": 0, "scale": 0},
+            kv_cache_config=_copy_groups(["latent", "scale"]),
+            _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -1025,6 +1044,26 @@ class TestProcessKvCacheCopyOps:
         assert (latent[2, 3:, :] == 0.0).all()
         assert (scale[2, :3] == 9.0).all()
         assert (scale[2, 3:] == 0.0).all()
+
+    def test_only_the_op_group_is_copied(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
+        # Two groups sharing a buffer keep their blocks apart by block id, so a
+        # copy for one group must not touch the other group's layer.
+        kv = torch.zeros(2, 4, 2, 1, 1, 8, 2)
+        kv[0, 1] = 5.0
+        kv[1, 1] = 6.0
+        r = _make_runner_stub(
+            kv_caches=[kv[0], kv[1]],
+            kv_cache_names=["a", "b"],
+            kv_cache_block_axes={"a": 0, "b": 0},
+            kv_cache_config=_copy_groups(["a"], ["b"]),
+            _kernel_block_sizes=[8, 8],
+            model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
+            runtime_holder=[None],
+        )
+        r._process_kv_cache_copy_ops([KVCacheCopyOp(1, 1, 2, 8)])
+        assert (kv[0, 2] == 0.0).all()
+        assert (kv[1, 2] == 6.0).all()
 
     def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
