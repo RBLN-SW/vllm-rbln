@@ -18,27 +18,30 @@
   0  RBLN_USE_MULTI_ATTN=0: RBLNSlidingWindowSpec, the shift kernel
   1  RBLN_USE_MULTI_ATTN=1: sliding_window_attention_v1 on window-sized blocks,
      KV (..., sliding_window, D)
-  2  1 plus RBLN_SWA_FULL_BLOCK=1: the same kernel on the manager block,
+  2  1 plus RBLN_SWA_KERNEL_BLOCK=manager: the same kernel on the manager block,
      KV (..., BLOCK_SIZE, D)
 
-Arm 0 is the reference every other arm is compared against.  Prefix caching is
-off throughout, so the arms differ only in the SWA kernel and its cache view.
-Each arm runs in its own process with its own VLLM_CACHE_ROOT: the env vars
-are read when the KV cache is built, and they are not part of the mega-cache
-key, so a shared cache could hand one arm another's compiled graphs.
+Cases 1 and 2 are the kernel team's A and B.
+
+Case 0 is the reference every other case is compared against.  Prefix
+caching is off throughout, so the cases differ only in the SWA kernel and its
+cache view.  Each case runs in its own process with its own VLLM_CACHE_ROOT:
+the env vars are read when the KV cache is built, and they are not part of the
+mega-cache key, so a shared cache could hand one case another's compiled
+graphs.
 
 Each prompt is the passage, cycled to length, and then one question about it,
-so the arms decode real sentences instead of repeating filler.
+so the cases decode real sentences instead of repeating filler.
 
 Per request:
 
-  pos0    max|d| against arm 0 at the first generated position, the prefill
-  decode  max|d| against arm 0 over later positions, up to the first divergence
-  div     index of the first generated token that differs from arm 0, '-' if none
-  noise   max|d| between two runs of the same arm, over all positions
+  pos0    max|d| against case 0 at the first generated position, the prefill
+  decode  max|d| against case 0 over later positions, up to the first divergence
+  div     index of the first generated token that differs from case 0, '-' if none
+  noise   max|d| between two runs of the same case, over all positions
 
 Usage:
-  python multi_attn_logit_ab.py              # run both arms, then compare
+  python multi_attn_logit_ab.py              # run every case, then compare
   python multi_attn_logit_ab.py --skip-run   # compare the saved results
 """
 
@@ -59,13 +62,13 @@ MAX_TOKENS = 32
 TOPK = 10
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ARM_ENV = {
-    0: {"RBLN_USE_MULTI_ATTN": "0", "RBLN_SWA_FULL_BLOCK": "0"},
-    1: {"RBLN_USE_MULTI_ATTN": "1", "RBLN_SWA_FULL_BLOCK": "0"},
-    2: {"RBLN_USE_MULTI_ATTN": "1", "RBLN_SWA_FULL_BLOCK": "1"},
+CASE_ENV = {
+    0: {"RBLN_USE_MULTI_ATTN": "0", "RBLN_SWA_KERNEL_BLOCK": "window"},
+    1: {"RBLN_USE_MULTI_ATTN": "1", "RBLN_SWA_KERNEL_BLOCK": "window"},
+    2: {"RBLN_USE_MULTI_ATTN": "1", "RBLN_SWA_KERNEL_BLOCK": "manager"},
 }
-ARMS = tuple(ARM_ENV)
-OTHERS = ARMS[1:]
+CASES = tuple(CASE_ENV)
+OTHERS = CASES[1:]
 
 SYSTEM = (
     "You are a meticulous research assistant. Read the passage that follows and "
@@ -129,8 +132,8 @@ QUESTIONS = (
 )
 
 
-def result_path(arm: int) -> str:
-    return os.path.join(HERE, f"multi_attn_{arm}.json")
+def result_path(case: int) -> str:
+    return os.path.join(HERE, f"multi_attn_{case}.json")
 
 
 def build_prompts(tok) -> list[list[int]]:
@@ -157,9 +160,9 @@ def build_prompts(tok) -> list[list[int]]:
     return prompts
 
 
-def run_arm(arm: int) -> None:
+def run_case(case: int) -> None:
     """Child process: generate every request twice and save the logprobs."""
-    for name, value in ARM_ENV[arm].items():
+    for name, value in CASE_ENV[case].items():
         assert os.environ.get(name) == value, (name, os.environ.get(name))
 
     from vllm import LLM, SamplingParams
@@ -196,20 +199,20 @@ def run_arm(arm: int) -> None:
             }
         )
     n = len(prompts)
-    with open(result_path(arm), "w") as f:
+    with open(result_path(case), "w") as f:
         json.dump({"first": runs[:n], "second": runs[n:]}, f)
 
 
-def spawn(arm: int) -> None:
+def spawn(case: int) -> None:
     env = dict(os.environ)
-    env.update(ARM_ENV[arm])
+    env.update(CASE_ENV[case])
     # A size with prefix caching off is refused by sub_block_size_in_use(), and
     # before #1158 the flag alone refuses a multi-group KV cache.
     env.pop("VLLM_RBLN_SUB_BLOCK_SIZE", None)
     env["VLLM_RBLN_SUB_BLOCK_CACHE"] = "0"
     root = env.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
-    env["VLLM_CACHE_ROOT"] = os.path.join(root, f"multi_attn_{arm}")
-    subprocess.run([sys.executable, __file__, "--arm", str(arm)], env=env, check=True)
+    env["VLLM_CACHE_ROOT"] = os.path.join(root, f"multi_attn_{case}")
+    subprocess.run([sys.executable, __file__, "--case", str(case)], env=env, check=True)
 
 
 def max_delta(a: dict, b: dict) -> float:
@@ -236,28 +239,28 @@ def step_deltas(r1: dict, r2: dict) -> list[float]:
 
 
 def dump(i: int, step: int, runs: dict, deltas: dict) -> None:
-    """Top-TOPK logprobs at one position for every arm, arm 0's ranking.
+    """Top-TOPK logprobs at one position for every case, case 0's ranking.
 
-    An arm already past its divergence from arm 0 prints blank.
+    An case already past its divergence from case 0 prints blank.
     """
     ref = runs[0]["logprobs"][step]
-    live = [arm for arm in OTHERS if step < len(deltas[arm])]
+    live = [case for case in OTHERS if step < len(deltas[case])]
     picked = []
-    for arm in ARMS:
-        if arm == 0 or arm in live:
-            tid = str(runs[arm]["token_ids"][step])
-            picked.append(f"{arm}:{runs[arm]['logprobs'][step][tid][1]!r}")
-    moved = "  ".join(f"max|d|{arm}={deltas[arm][step]:.3e}" for arm in live)
+    for case in CASES:
+        if case == 0 or case in live:
+            tid = str(runs[case]["token_ids"][step])
+            picked.append(f"{case}:{runs[case]['logprobs'][step][tid][1]!r}")
+    moved = "  ".join(f"max|d|{case}={deltas[case][step]:.3e}" for case in live)
     print(f"\n--- request #{i}  step {step}  token {' '.join(picked)}  {moved} ---")
     print(
-        "  rank  token                  arm 0"
-        + "".join(f"      arm {arm}    delta {arm}" for arm in OTHERS)
+        "  rank  token                 case 0"
+        + "".join(f"     case {case}    delta {case}" for case in OTHERS)
     )
     for rank, t in enumerate(sorted(ref, key=lambda t: -ref[t][0]), 1):
         a, text = ref[t]
         row = f"  {rank:4d}  {f'{t} {text!r}'[:20]:<20} {a:9.4f}"
-        for arm in OTHERS:
-            other = runs[arm]["logprobs"][step] if arm in live else {}
+        for case in OTHERS:
+            other = runs[case]["logprobs"][step] if case in live else {}
             if t in other:
                 b = other[t][0]
                 row += f"  {b:9.4f}  {a - b:10.3e}"
@@ -268,48 +271,48 @@ def dump(i: int, step: int, runs: dict, deltas: dict) -> None:
 
 def compare() -> None:
     res = {}
-    for arm in ARMS:
-        with open(result_path(arm)) as f:
-            res[arm] = json.load(f)
+    for case in CASES:
+        with open(result_path(case)) as f:
+            res[case] = json.load(f)
     n = len(res[0]["first"])
-    runs = [{arm: res[arm]["first"][i] for arm in ARMS} for i in range(n)]
-    deltas = [{arm: step_deltas(r[0], r[arm]) for arm in OTHERS} for r in runs]
+    runs = [{case: res[case]["first"][i] for case in CASES} for i in range(n)]
+    deltas = [{case: step_deltas(r[0], r[case]) for case in OTHERS} for r in runs]
 
     print(
         f"\nblock={BLOCK_SIZE}  chunk={MAX_BATCHED}  tp={TP}  "
         f"prompt={PROMPT_TOKENS} tok  max_tokens={MAX_TOKENS}"
     )
     print(
-        "\n   # arm   top1       pos0     decode   div      noise"
-        "   (against arm 0; arm 0's noise on its own row)"
+        "\n   # case  top1       pos0     decode   div      noise"
+        "   (against case 0; case 0's noise on its own row)"
     )
     for i, r in enumerate(runs):
         noise0 = max(step_deltas(r[0], res[0]["second"][i]))
         print(f"  {i:2d}   0  {'':>5}  {'':>9}  {'':>9}  {'':>4}  {noise0:9.3e}")
-        for arm in OTHERS:
-            d = deltas[i][arm]
-            div = first_divergence(r[0]["token_ids"], r[arm]["token_ids"])
-            same = r[0]["token_ids"][0] == r[arm]["token_ids"][0]
+        for case in OTHERS:
+            d = deltas[i][case]
+            div = first_divergence(r[0]["token_ids"], r[case]["token_ids"])
+            same = r[0]["token_ids"][0] == r[case]["token_ids"][0]
             decode = f"{max(d[1:]):9.3e}" if len(d) > 1 else f"{'--':>9}"
-            noise = max(step_deltas(r[arm], res[arm]["second"][i]))
+            noise = max(step_deltas(r[case], res[case]["second"][i]))
             print(
-                f"  {'':2}   {arm}  {'same' if same else 'DIFF':>5}  {d[0]:9.3e}  "
+                f"  {'':2}   {case}  {'same' if same else 'DIFF':>5}  {d[0]:9.3e}  "
                 f"{decode}  {'-' if div is None else div:>4}  {noise:9.3e}"
             )
 
     # Step 0 is the prefill; each later step is one decode.  A row stops at the
-    # first divergence from arm 0.
-    print("\nmax|d| against arm 0 per step")
-    print("   # arm  " + " ".join(f"{k:5d}" for k in range(MAX_TOKENS)))
+    # first divergence from case 0.
+    print("\nmax|d| against case 0 per step")
+    print("   # case " + " ".join(f"{k:5d}" for k in range(MAX_TOKENS)))
     for i, d in enumerate(deltas):
-        for arm in OTHERS:
-            label = f"{i:2d}" if arm == OTHERS[0] else "  "
-            print(f"  {label}   {arm}  " + " ".join(f"{x:5.2f}" for x in d[arm]))
+        for case in OTHERS:
+            label = f"{i:2d}" if case == OTHERS[0] else "  "
+            print(f"  {label}   {case}  " + " ".join(f"{x:5.2f}" for x in d[case]))
 
     for i, r in enumerate(runs):
         print(f"\n=== request #{i}  {QUESTIONS[i]}")
-        for arm in ARMS:
-            print(f"  arm {arm}: {r[arm]['text']!r}")
+        for case in CASES:
+            print(f"  case {case}: {r[case]['text']!r}")
         for step in range(max(len(d) for d in deltas[i].values())):
             dump(i, step, r, deltas[i])
 
@@ -317,16 +320,16 @@ def compare() -> None:
 def main():
     os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "60")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arm", type=int, choices=ARMS)
+    parser.add_argument("--case", type=int, choices=CASES)
     parser.add_argument("--skip-run", action="store_true")
     args = parser.parse_args()
 
-    if args.arm is not None:
-        run_arm(args.arm)
+    if args.case is not None:
+        run_case(args.case)
         return
     if not args.skip_run:
-        for arm in ARMS:
-            spawn(arm)
+        for case in CASES:
+            spawn(case)
     compare()
 
 

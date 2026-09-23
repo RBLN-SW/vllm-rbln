@@ -1112,10 +1112,12 @@ def prepare_kernel_block_sizes(
             # Both sliding-window kernels address the cache in windows, not
             # in the manager's blocks; upstream BlockTable rejects a block the
             # window does not divide.
-            if os.environ.get("RBLN_SWA_FULL_BLOCK", "0") == "1" and not isinstance(
+            # Experiment: which block the append kernel is handed.
+            swa_kernel_block = os.environ.get("RBLN_SWA_KERNEL_BLOCK", "window")
+            assert swa_kernel_block in ("window", "manager"), swa_kernel_block
+            if swa_kernel_block == "manager" and not isinstance(
                 kv_cache_spec, RBLNSlidingWindowSpec
             ):
-                # Experiment: hand the append kernel the manager block.
                 kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
             else:
                 kernel_block_sizes.append(kv_cache_spec.sliding_window)
