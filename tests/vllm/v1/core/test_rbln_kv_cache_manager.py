@@ -19,6 +19,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.distributed.kv_events import AllBlocksCleared, BlockRemoved, BlockStored
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -33,6 +34,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     maybe_convert_block_hash,
 )
+from vllm.v1.request import Request
 
 from tests.vllm.v1.core.utils import (
     full_attention_spec,
@@ -64,10 +66,17 @@ def _hasher(sub_block_size: int = SUB_BLOCK_SIZE) -> SubBlockHasher:
     return SubBlockHasher(sha256, sub_block_size)
 
 
+def _plain_request() -> Request:
+    """A request with no extra-key source, so hashing depends on the token
+    IDs alone. Its own tokens are irrelevant: the tokens to hash are passed
+    separately."""
+    return make_request("plain", [], block_size=8)
+
+
 def _hashes(num_sub_blocks: int, sub_block_size: int = SUB_BLOCK_SIZE) -> list:
     """A chain of ``num_sub_blocks`` distinct sub-block hashes."""
     hashes, _, _ = _hasher(sub_block_size).hash_tokens(
-        list(range(num_sub_blocks * sub_block_size))
+        list(range(num_sub_blocks * sub_block_size)), request=_plain_request()
     )
     return hashes
 
@@ -75,76 +84,98 @@ def _hashes(num_sub_blocks: int, sub_block_size: int = SUB_BLOCK_SIZE) -> list:
 class TestSubBlockHasher:
     def test_empty_tokens_yields_no_hashes(self):
         # No tokens -> empty hash/extra-keys lists, mm_idx unchanged.
-        hashes, extras, mm_idx = _hasher().hash_tokens([])
+        hashes, extras, mm_idx = _hasher().hash_tokens([], request=_plain_request())
         assert hashes == []
         assert extras == []
         assert mm_idx == 0
 
     def test_fewer_than_sub_block_yields_no_hashes(self):
         # Fewer than sub_block_size tokens -> no complete sub-block -> no hashes.
-        hashes, _, _ = _hasher().hash_tokens([1, 2, 3])
+        hashes, _, _ = _hasher().hash_tokens([1, 2, 3], request=_plain_request())
         assert hashes == []
 
     def test_exact_sub_block_yields_one_hash(self):
         # Exactly sub_block_size tokens -> a single hash (boundary).
-        hashes, _, _ = _hasher().hash_tokens(list(range(SUB_BLOCK_SIZE)))
+        hashes, _, _ = _hasher().hash_tokens(
+            list(range(SUB_BLOCK_SIZE)), request=_plain_request()
+        )
         assert len(hashes) == 1
 
     def test_hashes_only_full_sub_blocks(self):
         # Several sub-blocks plus a trailing partial (< sub_block_size) that is
         # ignored: 10 tokens at sbs=4 -> 2 hashes.
-        hashes, _, _ = _hasher().hash_tokens(list(range(10)))
+        hashes, _, _ = _hasher().hash_tokens(list(range(10)), request=_plain_request())
         assert len(hashes) == 2
 
     def test_chains_via_parent_hash(self):
         # Each hash chains off its parent, so the second sub-block's hash depends
         # on the first and differs from hashing it alone.
         tokens = list(range(2 * SUB_BLOCK_SIZE))
-        full, _, _ = _hasher().hash_tokens(tokens)
-        first, _, _ = _hasher().hash_tokens(tokens[:SUB_BLOCK_SIZE])
+        full, _, _ = _hasher().hash_tokens(tokens, request=_plain_request())
+        first, _, _ = _hasher().hash_tokens(
+            tokens[:SUB_BLOCK_SIZE], request=_plain_request()
+        )
         chained, _, _ = _hasher().hash_tokens(
-            tokens, parent_hash=first[0], num_hashed_tokens=SUB_BLOCK_SIZE
+            tokens,
+            parent_hash=first[0],
+            num_hashed_tokens=SUB_BLOCK_SIZE,
+            request=_plain_request(),
         )
         assert chained[0] == full[1]
-        lone, _, _ = _hasher().hash_tokens(tokens[SUB_BLOCK_SIZE:])
+        lone, _, _ = _hasher().hash_tokens(
+            tokens[SUB_BLOCK_SIZE:], request=_plain_request()
+        )
         assert chained[0] != lone[0]
 
     def test_num_hashed_tokens_offsets_start(self):
         # Hashing starts num_hashed_tokens into the sequence: with an offset of
         # one sub-block only the second sub-block is hashed.
         tokens = list(range(2 * SUB_BLOCK_SIZE))
-        hashes, _, _ = _hasher().hash_tokens(tokens, num_hashed_tokens=SUB_BLOCK_SIZE)
+        hashes, _, _ = _hasher().hash_tokens(
+            tokens, num_hashed_tokens=SUB_BLOCK_SIZE, request=_plain_request()
+        )
         assert len(hashes) == 1
 
     def test_incremental_hashing_continues_from_previous(self):
         # Re-hashing a grown sequence from where it left off (offset + parent)
         # reproduces the one-shot chain exactly.
         tokens = list(range(3 * SUB_BLOCK_SIZE))
-        one_shot, _, _ = _hasher().hash_tokens(tokens)
-        part1, _, _ = _hasher().hash_tokens(tokens[: 2 * SUB_BLOCK_SIZE])
+        one_shot, _, _ = _hasher().hash_tokens(tokens, request=_plain_request())
+        part1, _, _ = _hasher().hash_tokens(
+            tokens[: 2 * SUB_BLOCK_SIZE], request=_plain_request()
+        )
         part2, _, _ = _hasher().hash_tokens(
-            tokens, parent_hash=part1[-1], num_hashed_tokens=2 * SUB_BLOCK_SIZE
+            tokens,
+            parent_hash=part1[-1],
+            num_hashed_tokens=2 * SUB_BLOCK_SIZE,
+            request=_plain_request(),
         )
         assert part1 + part2 == one_shot
 
     def test_parent_hash_changes_result(self):
         # A different parent_hash changes the result for identical tokens.
-        other, _, _ = _hasher().hash_tokens(list(range(100, 100 + SUB_BLOCK_SIZE)))
-        without_parent, _, _ = _hasher().hash_tokens(list(range(SUB_BLOCK_SIZE)))
+        other, _, _ = _hasher().hash_tokens(
+            list(range(100, 100 + SUB_BLOCK_SIZE)), request=_plain_request()
+        )
+        without_parent, _, _ = _hasher().hash_tokens(
+            list(range(SUB_BLOCK_SIZE)), request=_plain_request()
+        )
         with_parent, _, _ = _hasher().hash_tokens(
-            list(range(SUB_BLOCK_SIZE)), parent_hash=other[0]
+            list(range(SUB_BLOCK_SIZE)), parent_hash=other[0], request=_plain_request()
         )
         assert without_parent[0] != with_parent[0]
 
     def test_different_tokens_different_hashes(self):
         # Different token content -> different hash.
-        a, _, _ = _hasher().hash_tokens([0, 1, 2, 3])
-        b, _, _ = _hasher().hash_tokens([0, 1, 2, 9])
+        a, _, _ = _hasher().hash_tokens([0, 1, 2, 3], request=_plain_request())
+        b, _, _ = _hasher().hash_tokens([0, 1, 2, 9], request=_plain_request())
         assert a[0] != b[0]
 
-    def test_no_request_yields_no_extra_keys(self):
-        # Without a request the extra-keys list is all None.
-        _, extras, _ = _hasher().hash_tokens(list(range(2 * SUB_BLOCK_SIZE)))
+    def test_request_without_extra_keys_yields_none(self):
+        # A request carrying no extra-key source leaves the list all None.
+        _, extras, _ = _hasher().hash_tokens(
+            list(range(2 * SUB_BLOCK_SIZE)), request=_plain_request()
+        )
         assert extras == [None, None]
 
     def test_request_extra_keys_mixed_and_recorded(self):
@@ -154,7 +185,9 @@ class TestSubBlockHasher:
             "r", list(range(2 * SUB_BLOCK_SIZE)), block_size=8, cache_salt="salt"
         )
         with_req, extras, _ = _hasher().hash_tokens(req.all_token_ids, request=req)
-        without, _, _ = _hasher().hash_tokens(req.all_token_ids)
+        without, _, _ = _hasher().hash_tokens(
+            req.all_token_ids, request=_plain_request()
+        )
         assert with_req[0] != without[0]
         assert extras[0] is not None
 
@@ -888,6 +921,25 @@ class TestIsolation:
         assert num_computed == 0
         assert manager.get_computed_blocks_sub_block(req1, num_computed) is None
 
+    def test_prompt_embeds_isolation(self):
+        # Different prompt embeddings behind the same leading tokens yield
+        # different hashes -> no cross-hit on the shared sub-block.
+        manager = make_manager(8, 4, 10)
+        embeds_a = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+        req0 = make_request("0", list(range(8)), 8, prompt_embeds=embeds_a)
+        prefill_request(manager, req0)
+        manager.free(req0)
+        embeds_b = torch.arange(24, dtype=torch.float32).reshape(12, 2) + 1
+        req1 = make_request(
+            "1",
+            list(range(4)) + [100 + i for i in range(8)],
+            8,
+            prompt_embeds=embeds_b,
+        )
+        _, num_computed, _ = manager.get_computed_blocks(req1)
+        assert num_computed == 0
+        assert manager.get_computed_blocks_sub_block(req1, num_computed) is None
+
 
 class TestEvictionHook:
     def test_evicted_block_removed_from_index(self):
@@ -944,7 +996,7 @@ class TestKVEvents:
         prefill_request(manager, make_request("0", tokens, 8))
         stored = self._stored(manager)
         expected_hashes, _, _ = SubBlockHasher(sha256, SUB_BLOCK_SIZE).hash_tokens(
-            tokens
+            tokens, request=_plain_request()
         )
         expected = [maybe_convert_block_hash(h) for h in expected_hashes]
         flat_chain: list = []
@@ -996,7 +1048,7 @@ class TestKVEvents:
         stored = self._stored(manager)
         assert sum(len(e.block_hashes) for e in stored) == self.R - 1
         expected_hashes, _, _ = SubBlockHasher(sha256, SUB_BLOCK_SIZE).hash_tokens(
-            full_tokens
+            full_tokens, request=_plain_request()
         )
         assert stored[0].parent_block_hash == maybe_convert_block_hash(
             expected_hashes[0]
@@ -1007,7 +1059,9 @@ class TestKVEvents:
         # BlockRemoved (refcount 1); evicting the second fires it with R hashes.
         manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
         tokens = list(range(8))
-        hashes, _, _ = SubBlockHasher(sha256, SUB_BLOCK_SIZE).hash_tokens(tokens)
+        hashes, _, _ = SubBlockHasher(sha256, SUB_BLOCK_SIZE).hash_tokens(
+            tokens, request=_plain_request()
+        )
         index = sub_block_index(manager)
         index.update(5, hashes)
         index.update(6, hashes)
@@ -1042,7 +1096,7 @@ class TestKVEvents:
             ]
         assert removed_events
         expected_hashes, _, _ = SubBlockHasher(sha256, SUB_BLOCK_SIZE).hash_tokens(
-            list(range(8))
+            list(range(8)), request=_plain_request()
         )
         expected = {maybe_convert_block_hash(h) for h in expected_hashes}
         seen: set = set()
