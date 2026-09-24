@@ -231,7 +231,17 @@ class RblnNixlWorkerBase(
             for spec in self._group_specs:
                 if not isinstance(spec, SlidingWindowSpec):
                     continue
-                assert spec.block_size % spec.sliding_window == 0
+                if spec.block_size % spec.sliding_window != 0:
+                    # Upstream's block table refuses this where the kernel
+                    # addresses the cache in windows; where it addresses whole
+                    # blocks the engine starts, and this is then the only place
+                    # that sees a window no granule can tile.
+                    raise RuntimeError(
+                        "RBLN NIXL: a window range cuts a block into windows, "
+                        f"so a {spec.sliding_window}-token window has to "
+                        f"divide the {spec.block_size}-token block this "
+                        "engine's manager leases. Turn swa_window_mode off."
+                    )
                 ratio = spec.block_size // spec.sliding_window
                 ratios.add(ratio)
                 if ratio == 1:

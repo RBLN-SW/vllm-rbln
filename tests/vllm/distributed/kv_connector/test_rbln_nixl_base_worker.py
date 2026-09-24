@@ -352,13 +352,24 @@ class TestSwaWindowRatio:
                 ],
             )
 
-    def test_window_not_dividing_block_is_rejected(self, monkeypatch):
-        with pytest.raises(AssertionError):
+    @pytest.mark.parametrize("sliding_window", [15, 4096])
+    def test_a_window_that_does_not_tile_its_block_is_refused(
+        self, monkeypatch, sliding_window
+    ):
+        # Indivisible, and wider than the block: no granule tiles either.
+        # Upstream's block table catches the same pairing only where the kernel
+        # addresses the cache in windows; with sub-block caching on it
+        # addresses whole blocks and the engine starts, leaving this the one
+        # refusal -- so it has to say why.
+        with pytest.raises(RuntimeError, match="has to divide"):
             build_worker(
                 monkeypatch,
                 kv_buffer_device="rbln",
+                block_size=64,
                 swa_window_mode=True,
-                specs=[sliding_window_spec(block_size=64, sliding_window=15)],
+                specs=[
+                    sliding_window_spec(block_size=64, sliding_window=sliding_window)
+                ],
             )
 
     def test_mla_with_window_mode_is_rejected_at_startup(self, monkeypatch):
