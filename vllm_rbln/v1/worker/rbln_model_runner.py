@@ -2873,12 +2873,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        # One KVCacheTensor covers a whole cache group since vllm 0.30.0, with
+        # layer `l` at `offset + l * layer_stride`. Allocate each layer on its
+        # own anyway: the RBLN runtime binds every KV cache as its own graph
+        # input and rejects sixteen slices of one buffer (RUN_INTERNAL out of
+        # `prepare_inputs`). `layer_stride` is one layer's bytes, so the sizes
+        # still come from the layout upstream describes.
+        device = self.device if USE_DEVICE_TENSOR else "meta"
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = self.device if USE_DEVICE_TENSOR else "meta"
-            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = tensor
+            for layer_name in kv_cache_tensor.layers:
+                kv_cache_raw_tensors[layer_name] = torch.zeros(
+                    kv_cache_tensor.layer_stride, dtype=torch.int8, device=device
+                )
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -2910,7 +2917,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         logical `cache_config.block_size`, matching the scheduler / connector /
         runtime copy block_id space. A SWA layer's view (`shape[-2] ==
         sliding_window`, kernel granularity) would mis-address logical
-        block_ids. Falls back to the first layer in `shared_by` when no Full
+        block_ids. Falls back to the first layer in `layers` when no Full
         layer is present.
         """
         layer_to_spec: dict[str, KVCacheSpec] = {
@@ -2920,7 +2927,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         }
         chosen: set[str] = set()
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            pool_layers = kv_cache_tensor.shared_by
+            pool_layers = kv_cache_tensor.layers
             if not pool_layers:
                 continue
             full_layer = next(

@@ -478,7 +478,7 @@ class TestSelectCanonicalKvLayersPerPool:
     @staticmethod
     def _cfg(*pools):
         return SimpleNamespace(
-            kv_cache_tensors=[SimpleNamespace(shared_by=list(p)) for p in pools]
+            kv_cache_tensors=[SimpleNamespace(layers=list(p)) for p in pools]
         )
 
     def test_prefers_full_attention_layer(self):
@@ -492,13 +492,13 @@ class TestSelectCanonicalKvLayersPerPool:
         }
 
     def test_falls_back_to_first_layer(self):
-        # No full-attention layer in the pool -> shared_by[0].
+        # No full-attention layer in the pool -> layers[0].
         r = self._runner([self._group(["sw0", "sw1"], SimpleNamespace())])
         assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0", "sw1"])) == {
             "sw0"
         }
 
-    def test_skips_empty_shared_by(self):
+    def test_skips_a_pool_with_no_layers(self):
         r = self._runner([self._group(["full0"], self._full())])
         assert r._select_canonical_kv_layers_per_pool(self._cfg([])) == set()
 
@@ -1366,12 +1366,29 @@ class TestUsesFixedDecodeWindow:
 class TestAllocateKvCacheTensors:
     # Device selection: self.device if device-tensor, else "meta". The
     # mapping/validation logic is exercised on CPU.
-    @staticmethod
-    def _cfg():
+    LAYER_STRIDE = 32
+
+    @classmethod
+    def _cfg(cls):
+        # Every tensor reports the whole pool, layer `l` sits at
+        # `offset + l * layer_stride`, and cache groups overlay from byte 0.
+        stride = cls.LAYER_STRIDE
         return SimpleNamespace(
             kv_cache_tensors=[
-                SimpleNamespace(size=64, shared_by=["l0", "l1"]),
-                SimpleNamespace(size=32, shared_by=["l2"]),
+                SimpleNamespace(
+                    size=2 * stride,
+                    layers=["l0", "l1"],
+                    layer_stride=stride,
+                    block_stride=8,
+                    offset=0,
+                ),
+                SimpleNamespace(
+                    size=2 * stride,
+                    layers=["l2"],
+                    layer_stride=stride,
+                    block_stride=8,
+                    offset=0,
+                ),
             ],
             kv_cache_groups=[
                 SimpleNamespace(layer_names=["l0", "l1"]),
@@ -1389,9 +1406,17 @@ class TestAllocateKvCacheTensors:
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert set(raw) == {"l0", "l1", "l2"}
         assert raw["l0"].device.type == "meta"
-        # Layers sharing a pool share the same buffer object.
-        assert raw["l0"] is raw["l1"]
-        assert raw["l0"] is not raw["l2"]
+
+    def test_each_layer_gets_its_own_allocation(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+        # One layer's worth of bytes each, from `layer_stride`.
+        assert all(t.numel() == self.LAYER_STRIDE for t in raw.values())
+        # Separate allocations: the RBLN runtime takes each layer's cache as
+        # its own graph input and cannot bind slices of one buffer.
+        # meta tensors all report data_ptr()==0, so compare identity.
+        storages = {id(t.untyped_storage()) for t in raw.values()}
+        assert len(storages) == len(raw)
 
     def test_self_device_with_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)

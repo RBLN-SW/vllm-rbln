@@ -194,8 +194,19 @@ class TestCoordinatorExternalTokens:
         config = KVCacheConfig(
             num_blocks=num_blocks,
             kv_cache_tensors=[
-                KVCacheTensor(size=swa.page_size_bytes * num_blocks, shared_by=["l0"]),
-                KVCacheTensor(size=full.page_size_bytes * num_blocks, shared_by=["l1"]),
+                # Groups overlay from byte 0, so the pool is sized by the widest.
+                KVCacheTensor(
+                    size=max(swa.page_size_bytes, full.page_size_bytes) * num_blocks,
+                    layers=["l0"],
+                    layer_stride=swa.page_size_bytes * num_blocks,
+                    block_stride=swa.page_size_bytes,
+                ),
+                KVCacheTensor(
+                    size=max(swa.page_size_bytes, full.page_size_bytes) * num_blocks,
+                    layers=["l1"],
+                    layer_stride=full.page_size_bytes * num_blocks,
+                    block_stride=full.page_size_bytes,
+                ),
             ],
             kv_cache_groups=[
                 KVCacheGroupSpec(["l0"], swa),
@@ -267,7 +278,12 @@ class TestCoordinatorCallsTheOverrides:
         config = KVCacheConfig(
             num_blocks=num_blocks,
             kv_cache_tensors=[
-                KVCacheTensor(size=swa.page_size_bytes * num_blocks, shared_by=["l0"])
+                KVCacheTensor(
+                    size=swa.page_size_bytes * num_blocks,
+                    layers=["l0"],
+                    layer_stride=swa.page_size_bytes * num_blocks,
+                    block_stride=swa.page_size_bytes,
+                )
             ],
             kv_cache_groups=[KVCacheGroupSpec(["l0"], swa)],
         )

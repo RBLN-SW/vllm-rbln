@@ -216,9 +216,20 @@ class KvGeometry:
         return KVCacheConfig(
             num_blocks=self.num_blocks,
             kv_cache_tensors=[
+                # One group: its layers sit a page apart inside each block, and
+                # the pool spans the whole group.
                 KVCacheTensor(
-                    size=specs[name].page_size_bytes * self.num_blocks,
-                    shared_by=[name],
+                    size=sum(s.page_size_bytes for s in specs.values())
+                    * self.num_blocks,
+                    layers=[name],
+                    layer_stride=specs[name].page_size_bytes * self.num_blocks,
+                    block_stride=specs[name].page_size_bytes,
+                    offset=sum(
+                        specs[earlier].page_size_bytes * self.num_blocks
+                        for earlier in list(self.layers)[
+                            : list(self.layers).index(name)
+                        ]
+                    ),
                 )
                 for name in self.layers
             ],

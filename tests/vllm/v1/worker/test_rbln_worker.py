@@ -872,7 +872,15 @@ class TestInitializeFromConfig:
         tensors the compile runs against shrink, and the resize restores them."""
         kv_cfg = SimpleNamespace(
             num_blocks=123,
-            kv_cache_tensors=[SimpleNamespace(size=123 * 4096, shared_by=["layer.0"])],
+            kv_cache_tensors=[
+                SimpleNamespace(
+                    size=123 * 4096,
+                    layers=["layer.0"],
+                    layer_stride=123 * 4096,
+                    block_stride=4096,
+                    offset=0,
+                )
+            ],
         )
         worker, init_calls = self._init(make_worker, monkeypatch, kv_cfg)
         assert worker.cache_config.num_gpu_blocks == 123

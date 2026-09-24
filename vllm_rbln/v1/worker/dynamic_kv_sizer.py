@@ -429,14 +429,17 @@ class DynamicKvSizer:
                 format_placements(group_specs),
             )
         tensors = self.model_runner.kv_cache_config.kv_cache_tensors
-        specs = self._specs_covering_tensors(groups, len(tensors))
+        # A KV input is a layer's cache. Since vllm 0.30.0 one KVCacheTensor
+        # describes a whole cache group, so its count no longer tracks them.
+        num_layers = sum(len(t.layers) for t in tensors)
+        specs = self._specs_covering_tensors(groups, num_layers)
         logger.info(
             "[Dynamic KV] the slope is summed over %d KV input(s) from %d set(s); "
             "vllm allocated %d KV cache tensor(s) for %d layer(s).",
             len(specs),
             len(groups),
             len(tensors),
-            sum(len(t.shared_by) for t in tensors),
+            num_layers,
         )
         growth = kv_growth(specs, hint_blocks)
         program = groups[0][1]
@@ -445,30 +448,30 @@ class DynamicKvSizer:
 
     @staticmethod
     def _specs_covering_tensors(
-        groups: list[tuple[list[Any], Any]], num_tensors: int
+        groups: list[tuple[list[Any], Any]], num_layers: int
     ) -> list[Any]:
-        """The KV inputs the slope is summed over: every KV tensor once.
+        """The KV inputs the slope is summed over: every layer's cache once.
 
         A group is one program's KV input set. Two programs binding the same
-        tensors (prefill and decode) form two groups, because dynamo names the
+        caches (prefill and decode) form two groups, because dynamo names the
         symbols and the arg positions differently; summing both would charge
-        every tensor twice. `InputSpec` carries no tensor identity, so the count
-        vllm allocated is what says which case this is.
+        every cache twice. `InputSpec` carries no identity, so the number of
+        layers vllm allocated for is what says which case this is.
         """
         flat = [spec for group_specs, _ in groups for spec in group_specs]
-        if len(flat) == num_tensors:
+        if len(flat) == num_layers:
             # Disjoint sets (a target's and a drafter's): the sum is the answer.
             return flat
         sizes = {len(group_specs) for group_specs, _ in groups}
-        if sizes == {num_tensors}:
-            # Every group already covers every tensor, so one of them is it.
+        if sizes == {num_layers}:
+            # Every group already covers every layer, so one of them is it.
             return list(groups[0][0])
         raise RuntimeError(
             f"the compiled programs carry {len(flat)} KV input(s) across "
             f"{len(groups)} set(s) of {sorted(sizes)}, which neither sum to nor "
-            f"individually match the {num_tensors} KV cache tensor(s) vllm "
-            "allocated. The placement cannot be attributed to tensors, so the "
-            "block count would be wrong."
+            f"individually match the {num_layers} layer(s) vllm allocated a "
+            "KV cache for. The placement cannot be attributed to layers, so "
+            "the block count would be wrong."
         )
 
     def _size_kv_from_snapshot(
@@ -675,7 +678,7 @@ class DynamicKvSizer:
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
         for layer_name in dict.fromkeys(
-            name for t in old_cfg.kv_cache_tensors for name in t.shared_by
+            name for t in old_cfg.kv_cache_tensors for name in t.layers
         ):
             layer = forward_context.get(layer_name)
             if layer is None:

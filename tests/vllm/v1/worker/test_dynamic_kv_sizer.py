@@ -76,7 +76,7 @@ def _kv_cache_tensors_for(programs):
     except RuntimeError:
         return []
     return [
-        SimpleNamespace(shared_by=[f"layer.{i}"])
+        SimpleNamespace(layers=[f"layer.{i}"])
         for i, _ in enumerate(s for g, _ in groups for s in g)
     ]
 
@@ -247,8 +247,8 @@ class TestComputeDynamicKvNumBlocks:
         )
         # Two programs, two groups, but vllm allocated two tensors, not four.
         sizer.model_runner.kv_cache_config.kv_cache_tensors = [
-            SimpleNamespace(shared_by=["layer.0"]),
-            SimpleNamespace(shared_by=["layer.1"]),
+            SimpleNamespace(layers=["layer.0"]),
+            SimpleNamespace(layers=["layer.1"]),
         ]
         with caplog.at_level("INFO"):
             n = DynamicKvSizer.compute_num_blocks(sizer)
@@ -277,9 +277,9 @@ class TestComputeDynamicKvNumBlocks:
             programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
         )
         sizer.model_runner.kv_cache_config.kv_cache_tensors = [
-            SimpleNamespace(shared_by=["layer.0"]),
-            SimpleNamespace(shared_by=["layer.1"]),
-            SimpleNamespace(shared_by=["layer.2"]),
+            SimpleNamespace(layers=["layer.0"]),
+            SimpleNamespace(layers=["layer.1"]),
+            SimpleNamespace(layers=["layer.2"]),
         ]
         with pytest.raises(RuntimeError, match="neither sum to nor"):
             DynamicKvSizer.compute_num_blocks(sizer)
@@ -518,8 +518,22 @@ class TestMaybeShrinkKvCacheForCompile:
         return SimpleNamespace(
             num_blocks=blocks,
             kv_cache_tensors=[
-                SimpleNamespace(size=blocks * cls.PAGE_SIZE, shared_by=["layer.0"]),
-                SimpleNamespace(size=blocks * cls.PAGE_SIZE, shared_by=["layer.1"]),
+                # Layer-compact placement: two single-layer groups overlaying
+                # the pool from byte 0. Rescaling moves everything but the page.
+                SimpleNamespace(
+                    size=blocks * cls.PAGE_SIZE,
+                    layers=["layer.0"],
+                    layer_stride=blocks * cls.PAGE_SIZE,
+                    block_stride=cls.PAGE_SIZE,
+                    offset=0,
+                ),
+                SimpleNamespace(
+                    size=blocks * cls.PAGE_SIZE,
+                    layers=["layer.1"],
+                    layer_stride=blocks * cls.PAGE_SIZE,
+                    block_stride=cls.PAGE_SIZE,
+                    offset=0,
+                ),
             ],
         )
 
@@ -946,7 +960,7 @@ class TestReleaseKvCacheTensors:
         )
         old_cfg = SimpleNamespace(
             num_blocks=4,
-            kv_cache_tensors=[SimpleNamespace(shared_by=["l0"], size=8)],
+            kv_cache_tensors=[SimpleNamespace(layers=["l0"], size=8)],
         )
         monkeypatch.setattr(dks, "empty_rbln_device_caches", lambda: False)
 

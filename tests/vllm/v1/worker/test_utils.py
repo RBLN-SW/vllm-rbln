@@ -66,6 +66,7 @@ from vllm_rbln.v1.worker.utils import (
     rbln_device_dram_total_bytes,
     read_rbln_card_dram_used_bytes,
     reorder_input_batch,
+    rescale_kv_cache_config,
     set_cpu_affinity,
     set_omp_num_threads,
     worker_fail_fast,
@@ -1699,3 +1700,49 @@ class TestDynamicKvUnsupportedReason:
             worker_utils.dynamic_kv_enabled(self._cfg(use_dynamic_kv_cache=False))
             is False
         )
+
+
+class TestRescaleKvCacheConfig:
+    @staticmethod
+    def _cfg(num_blocks: int) -> SimpleNamespace:
+        # Layer-compact placement of two layers, one page of 8 bytes each.
+        return SimpleNamespace(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                SimpleNamespace(
+                    size=16 * num_blocks,
+                    layers=["l0", "l1"],
+                    layer_stride=8 * num_blocks,
+                    block_stride=8,
+                    offset=8 * num_blocks,
+                )
+            ],
+        )
+
+    def test_every_field_that_counts_blocks_moves(self):
+        cfg = self._cfg(10)
+        rescale_kv_cache_config(cfg, 5)
+        (tensor,) = cfg.kv_cache_tensors
+        assert cfg.num_blocks == 5
+        assert tensor.size == 80
+        assert tensor.layer_stride == 40
+        assert tensor.offset == 40
+
+    def test_the_page_stride_is_left_alone(self):
+        cfg = self._cfg(10)
+        rescale_kv_cache_config(cfg, 5)
+        assert cfg.kv_cache_tensors[0].block_stride == 8
+
+    def test_the_placement_still_fits_the_allocation(self):
+        # The last layer's region has to end inside `size`, or the runner's
+        # slice would run off the backing allocation.
+        cfg = self._cfg(10)
+        rescale_kv_cache_config(cfg, 3)
+        (tensor,) = cfg.kv_cache_tensors
+        end = tensor.offset + len(tensor.layers) * tensor.layer_stride
+        assert end <= tensor.size + tensor.offset
+        assert tensor.layer_stride == tensor.block_stride * cfg.num_blocks
+
+    def test_a_zero_block_config_is_refused(self):
+        with pytest.raises(ValueError, match="cannot rescale"):
+            rescale_kv_cache_config(self._cfg(0), 5)
