@@ -17,10 +17,14 @@
 # an NPU and lives in the model-compile tests.
 
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import tomllib
 import torch
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 import vllm_rbln.compilation.compiler as compiler
 from vllm_rbln.compilation import (
@@ -253,6 +257,26 @@ class TestBuildProcessGroupDict:
         }
 
 
+# The first rebel-compiler that ships rebel.compile(dtype=...)
+# (rebellions-sw/rebel_compiler#13921).
+_DTYPE_IN_REBEL_SINCE = Version("0.11.3.dev570")
+
+
+def _rebel_compiler_floor() -> Version:
+    pyproject = Path(__file__).resolve().parents[3] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    for group in data["project"].get("optional-dependencies", {}).values():
+        for dep in group:
+            req = Requirement(dep)
+            if req.name == "rebel-compiler":
+                return max(
+                    Version(spec.version.rstrip(".*"))
+                    for spec in req.specifier
+                    if spec.operator in {">=", "==", "~="}
+                )
+    raise AssertionError("no rebel-compiler requirement in pyproject.toml")
+
+
 class TestCompilerConformance:
     def test_create_compile_context_forwards_args(self, monkeypatch):
         # create_compile_context forwards its two flags to rebel's CompileContext.
@@ -275,10 +299,14 @@ class TestCompilerConformance:
         assert "use_weight_sharing" in params
         assert "use_global_ctx" not in params  # deprecated kwargs
 
-    def test_rebel_compile_signature(self):
-        params = inspect.signature(compiler.rebel.compile).parameters
-        assert "dtype" not in params, (
-            "rebel.compile takes dtype now; remove check_dtype_option_supported"
+    def test_dtype_shim_is_removed_with_the_pin(self):
+        # Keyed to the pyproject pin, not the installed rebel: compiler CI
+        # lanes override the installed compiler with dev builds without
+        # moving the pin, and must not fire this.
+        assert _rebel_compiler_floor() < _DTYPE_IN_REBEL_SINCE, (
+            "the rebel-compiler pin now guarantees rebel.compile(dtype=...); "
+            "remove check_dtype_option_supported, its call in vllm_impl, "
+            "and this test"
         )
 
     def test_dtype_check_refuses_an_older_rebel(self, monkeypatch):
