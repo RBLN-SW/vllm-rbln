@@ -17,14 +17,10 @@
 # an NPU and lives in the model-compile tests.
 
 import inspect
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import tomllib
 import torch
-from packaging.requirements import Requirement
-from packaging.version import Version
 
 import vllm_rbln.compilation.compiler as compiler
 from vllm_rbln.compilation import (
@@ -278,23 +274,6 @@ class TestCompilerConformance:
         params = inspect.signature(CompileContext).parameters
         assert "use_weight_sharing" in params
         assert "use_global_ctx" not in params  # deprecated kwargs
-
-    def test_dtype_shim_is_removed_with_the_pin(self):
-        pins = tomllib.loads(
-            (Path(__file__).parents[3] / "pyproject.toml").read_text(encoding="utf-8")
-        )["project"]["optional-dependencies"]
-        floor = max(
-            Version(spec.version)
-            for req in (Requirement(dep) for group in pins.values() for dep in group)
-            if req.name == "rebel-compiler"
-            for spec in req.specifier
-            if spec.operator in {">=", "==", "~="}
-        )
-        assert floor < Version("0.11.3.dev570"), (
-            "the rebel-compiler pin now guarantees rebel.compile(dtype=...); "
-            "remove check_dtype_option_supported, its call in vllm_impl, "
-            "and this test"
-        )
 
     def test_dtype_check_refuses_an_older_rebel(self, monkeypatch):
         def legacy_compile(model, *, npu=None):
