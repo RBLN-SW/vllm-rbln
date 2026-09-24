@@ -132,6 +132,15 @@ def test_the_former_overrides_key_is_accepted():
     assert config.optimum_overrides == {"device": [0]}
 
 
+@pytest.mark.parametrize("size", [0, -1])
+def test_a_sub_block_size_of_zero_or_less_is_rejected(size):
+    """The converter divides by the size, so 0 is refused before it gets there.
+    Unset is None, not 0."""
+    with pytest.raises(ValueError, match="greater_than"):
+        _resolve(OptimumRBLNConfig, {"sub_block_size": size})
+    assert OptimumRBLNConfig().sub_block_size is None
+
+
 def test_the_former_prefix_block_size_key_is_accepted():
     """TODO(vllm-rbln>=0.14.0): delete with the key."""
     config = _resolve(OptimumRBLNConfig, {"prefix_block_size": 256})

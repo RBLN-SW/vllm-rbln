@@ -79,6 +79,11 @@ class RBLNConfigBase:
     use_custom_sampler: bool = True
     """Use the customized RBLN sampler."""
 
+    sub_block_size: int | None = Field(default=None, gt=0)
+    """Token granularity for prefix cache hit calculation.
+    If None, uses prefill_chunk_size.
+    """
+
 
 @vllm_config_dataclass
 class RBLNConfig(RBLNConfigBase):
@@ -104,11 +109,6 @@ class RBLNConfig(RBLNConfigBase):
 
     enable_sub_block_cache: bool = True
     """Enable sub-block prefix caching, at `sub_block_size` granularity."""
-
-    sub_block_size: int | None = Field(default=None, gt=0)
-    """Sub-block size in tokens; unset takes the prefill chunk
-    (`max_num_batched_tokens`). `sub_block_size_in_use()` holds the rules a
-    given size has to meet."""
 
     specialize_moe_decode: bool = True
     """Specialize the case where every instance is at the decode stage."""
@@ -188,9 +188,6 @@ class OptimumRBLNConfig(RBLNConfigBase):
     derives from the vLLM settings when the model is compiled. With a
     pre-compiled model only the `device` entries apply."""
 
-    sub_block_size: int | None = None
-    """Sub-block size in tokens. Unset takes the prefill chunk."""
-
     # Snapshots of a vLLM field taken before it is overwritten. vLLM already has
     # the flag, so there is no `--rbln-*` one, but they stay settable: the
     # platform hook writes the first into the dict before this class exists.
@@ -238,9 +235,7 @@ class OptimumRBLNConfig(RBLNConfigBase):
         return hash_factors(get_hash_factors(self, ignored_factors))
 
 
-# Every class a `--rbln-*` flag can belong to. The optimum path comes first: a
-# field both classes declare takes its flag default from the first of them, and
-# an unset flag leaves the run on that path.
+# Every class a `--rbln-*` flag can belong to.
 _CONFIG_CLASSES: tuple[type[RBLNConfigBase], ...] = (OptimumRBLNConfig, RBLNConfig)
 
 # TODO(vllm-rbln>=0.14.0): delete. Former additional_config keys, still accepted
