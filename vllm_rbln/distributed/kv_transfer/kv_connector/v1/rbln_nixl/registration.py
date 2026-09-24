@@ -446,11 +446,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "RBLN NIXL (D2D): a context-cut KV cache whose block packs K "
                 "and V is not supported."
             )
-        # A chunk is a token range of a block, and a second attention shape
-        # needs a descriptor of its own to be left out of one. A sliding
-        # window has that already -- window mode's second range -- so it may
-        # sit beside the one full-attention group whose blocks a chunk cuts.
-        # Exactly one, because every group's blocks are cut the same way.
+        # A chunk cuts the blocks of one full-attention group. Exactly one,
+        # because every group's blocks are cut the same way, and any other
+        # group has to be a sliding window -- which draws its block ids from a
+        # pool of its own and so is never the group a chunk is sized against.
         self._chunk_mode = connector_option(self.vllm_config, "chunk_mode", False)
         # Read here rather than in `__init__`: the runner binds the views this
         # asks about while initializing the KV cache, which is after the
@@ -476,10 +475,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 f"groups={len(self._group_specs)}, full={full_groups}, "
                 f"swa={self._has_swa}, sw_ratio={self._sw_ratio}."
             )
-        # A windowed engine keeps the whole-engine lists, and those name a
-        # block's chunks without naming which span holds the request's last
-        # token -- so a block cut into several spans would send chunks past
-        # the request's own blocks. A head cut leaves one span a block.
+        # An engine that owns the whole-engine lists names a block's chunks
+        # there without naming which span holds the request's last token -- so
+        # a block cut into several spans would send chunks past the request's
+        # own blocks. A head cut leaves one span a block.
         if (
             self._chunk_mode
             and self._own_engine_layout
@@ -521,10 +520,13 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             else "",
         )
 
-        # One grid for this engine. Each descriptor list derives its own from
-        # the block size it was built with; this is the one a transfer reads
-        # back, and it has to answer for the list it selects in.
+        # One grid per range for this engine. Each descriptor list derives its
+        # chunk grid from the block size it was built with; these are the ones
+        # a transfer reads back, and they have to answer for the list it
+        # selects in. The window range has no such parameter, so the builders
+        # read the value parked here rather than ask twice.
         self._chunk_grid = self._shard_chunk_grid(block_size=self.block_size, split=1)
+        self._window_grid_cut = self._window_grid()
         if self._chunk_mode and self._chunk_grid is None:
             # Said once here rather than per peer: every list is cut by the
             # same two numbers, and a peer whose block holds a different

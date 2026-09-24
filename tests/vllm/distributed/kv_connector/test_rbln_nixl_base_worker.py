@@ -37,6 +37,10 @@ from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
     decode,
     sliding_window_spec,
+    window_mode,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    KVSplitAxis,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
@@ -191,10 +195,10 @@ class TestSwaWindowRatio:
         # whether or not window mode is on.
         assert worker._has_swa
 
-    def test_chunk_mode_turns_the_view_on_over_the_flag(self, monkeypatch):
-        # The chunk range extends this layout and has nowhere else to sit:
-        # `_compute_desc_ids` hands the whole list to upstream where the ratio
-        # is None, and upstream's list carries no second range.
+    def test_chunk_mode_leaves_the_window_knob_alone(self, monkeypatch):
+        # The two knobs name different ranges. Chunk mode used to turn this one
+        # on because that was the only way a hybrid owned its descriptor lists;
+        # `_own_engine_layout` answers that itself now.
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="rbln",  # chunk mode is the direct path's
@@ -202,7 +206,7 @@ class TestSwaWindowRatio:
             chunk_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio == 4
+        assert worker._sw_ratio is None
 
     def test_chunk_mode_invents_no_ratio_without_a_window(self, monkeypatch):
         # The override rides on the window, not on the knob: an engine with no
@@ -256,24 +260,35 @@ class TestSwaWindowRatio:
         )
         assert worker._sw_ratio == 4
 
-    def test_chunk_mode_turning_window_mode_on_says_so(self, monkeypatch, caplog):
-        # The operator asked for no view and got one. This log is the only place
-        # that says so, and a chunk range has nowhere else to sit.
-        with caplog.at_level("WARNING"):
-            worker = build_worker(
-                monkeypatch,
-                kv_buffer_device="rbln",
-                swa_window_mode=False,
-                chunk_mode=True,
-                specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-            )
+    def test_a_hybrid_in_chunk_mode_owns_its_lists_without_a_window(self, monkeypatch):
+        # What the coupling above used to buy. A shard list names one KV group,
+        # so a hybrid's chunk range has nowhere but the whole-engine lists --
+        # and it reaches them without a window range beside it.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            swa_window_mode=False,
+            chunk_mode=True,
+            specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
+        )
+        worker._chunk_mode = True  # registration reads the knob, not __init__
+        assert worker._sw_ratio is None
+        assert worker._own_engine_layout
 
-        assert worker._sw_ratio == 4
-        assert [
-            r.getMessage()
-            for r in caplog.records
-            if "turned SWA window mode on" in r.getMessage()
-        ]
+    def test_chunk_mode_on_one_group_stays_off_the_whole_engine_lists(
+        self, monkeypatch
+    ):
+        # The other half of the split: a single-group engine's chunk range
+        # rides the per-shard lists, which is where it rode before any of this.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            swa_window_mode=False,
+            chunk_mode=True,
+            specs=[MagicMock()],
+        )
+        worker._chunk_mode = True
+        assert not worker._own_engine_layout
 
     def test_window_equal_to_block_collapses_to_none(self, monkeypatch):
         # ratio 1 means the window equals the full block -> no trimming.
@@ -437,17 +452,33 @@ class TestRegisterLocalXferHandlerSwa:
     # With a sliding-window group and window mode on, register_local_xfer_handler
     # emits a dual desc range: Full, then the `_sw_ratio` granules that tile a
     # block, over the same addresses.
-    def test_swa_builds_dual_desc_ranges(self, make_worker):
-        geo = KvGeometry(spec="swa", sliding_window=512, block_size=1024, num_blocks=4)
+    @pytest.mark.parametrize(
+        "kernel_block, runs", [(512, 1), (None, 16)], ids=["window-wide", "block-wide"]
+    )
+    def test_the_window_range_cuts_a_block_by_the_kernel_geometry(
+        self, make_worker, kernel_block, runs
+    ):
+        # The runner picks how the kernel addresses the cache and the window
+        # range follows: a window-wide kernel block IS one run of bytes, while
+        # a block-wide one spreads a window over every head the region holds.
+        geo = KvGeometry(
+            spec="swa",
+            sliding_window=512,
+            block_size=1024,
+            num_blocks=4,
+            swa_kernel_block=kernel_block,
+        )
         w = make_worker(kv_cache=geo, swa_window_mode=True)
         assert (w._has_swa, w._sw_ratio) == (True, 2)
+        assert w._window_grid_cut == (runs, 2)
 
         blocks_data = w.src_blocks_data
         full_len = w.block_len_per_layer[0]
         # A whole block is one descriptor whatever it packs; the window range
-        # cuts that same block into the granules that tile it.
+        # cuts that same block into the pieces that tile it.
         whole_descs = w.num_regions * w.num_blocks
-        assert len(blocks_data) == whole_descs * (1 + w._sw_ratio)
+        pieces = runs * w._sw_ratio
+        assert len(blocks_data) == whole_descs * (1 + pieces)
         full, swa = blocks_data[:whole_descs], blocks_data[whole_descs:]
         # The order is a contract, not a detail: a transfer turns (region, block)
         # into a desc id as region * num_blocks + block, so entry i of the list
@@ -463,13 +494,13 @@ class TestRegisterLocalXferHandlerSwa:
             for block in range(w.num_blocks)
         ]
         assert decode(swa, **decoded) == [
-            (region, block, unit)
+            (region, block, piece)
             for region in range(w.num_regions)
             for block in range(w.num_blocks)
-            for unit in range(w._sw_ratio)
+            for piece in range(pieces)
         ]
         assert {desc_len for _, desc_len, _ in full} == {full_len}
-        assert {desc_len for _, desc_len, _ in swa} == {full_len // w._sw_ratio}
+        assert {desc_len for _, desc_len, _ in swa} == {full_len // pieces}
 
     def test_a_chunk_grid_appends_a_third_range(self, monkeypatch):
         # A grid of (2 runs, 2 chunks) turns each region-block's one Full
@@ -477,7 +508,7 @@ class TestRegisterLocalXferHandlerSwa:
         # existing ranges -- the window range keeps its index space and the
         # transfer picks a range by offset.
         worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker._has_mamba = False
         worker.tp_rank = 0
         worker.device_id = 0
@@ -516,7 +547,7 @@ class TestRegisterLocalXferHandlerSwa:
         # block. Derived for K alone it would tile half of it and leave V
         # unwritten, and the count the two sides compare would still match.
         worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker._has_mamba = False
         worker._kv_per_block = 2
         worker.tp_rank = 0
@@ -544,7 +575,7 @@ class TestRegisterLocalXferHandlerSwa:
         # Off the knob the list must not grow: a longer dlist is memory every
         # peer pays for.
         worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker._has_mamba = False
         worker.tp_rank = 0
         worker.device_id = 0
@@ -663,20 +694,26 @@ class TestTheWindowRangeTilesABlock:
     BLOCK_LEN = 256
     NUM_BLOCKS = 2
     SW_RATIO = 2
+    #: Byte runs one granule is, which is the kernel geometry.
+    RUNS = 1
     BASES = [0x1000, 0x2000]
     #: Which side's addresses the descriptors are read against.
     DECODE_BASES = BASES
 
+    @property
+    def pieces(self) -> int:
+        return self.RUNS * self.SW_RATIO
+
     def _worker(self, kv_per_block):
         w = object.__new__(RblnNixlPullConnectorWorker)
-        w._sw_ratio = self.SW_RATIO
+        w.block_size = 64
+        window_mode(w, self.SW_RATIO, runs=self.RUNS)
         w._has_mamba = False
         w._chunk_mode = False
         w._kv_per_block = kv_per_block
         w.engine_id = "local"
         w.tp_rank = 0
         w.device_id = 0
-        w.block_size = 64
         w.num_blocks = self.NUM_BLOCKS
         w.kv_caches_base_addr = {"local": {0: self.BASES}}
         w.block_len_per_layer = [self.BLOCK_LEN] * len(self.BASES)
@@ -706,9 +743,9 @@ class TestTheWindowRangeTilesABlock:
         # A prefix of K and a prefix of V covers a fraction of the block and
         # leaves the window's own bytes behind, at a count the two sides still
         # agree on.
-        unit = self.BLOCK_LEN // self.SW_RATIO
+        unit = self.BLOCK_LEN // self.pieces
         assert self._window_pieces(PACKED) == [
-            (unit * i, unit) for i in range(self.SW_RATIO)
+            (unit * i, unit) for i in range(self.pieces)
         ]
 
     def test_a_whole_packed_block_stays_one_descriptor(self):
@@ -717,7 +754,7 @@ class TestTheWindowRangeTilesABlock:
         descs = self._descs(PACKED)
         whole = [d for d in descs if d[1] == self.BLOCK_LEN]
         assert len(whole) == len(self.DECODE_BASES) * self.NUM_BLOCKS
-        assert len(descs) == len(whole) * (1 + self.SW_RATIO)
+        assert len(descs) == len(whole) * (1 + self.pieces)
 
 
 class TestASlidingWindowOnThePeerSide(TestTheWindowRangeTilesABlock):
@@ -761,6 +798,64 @@ class TestASlidingWindowOnThePeerSide(TestTheWindowRangeTilesABlock):
         ):
             w.add_remote_agent(meta)
         return w.nixl_wrapper.get_xfer_descs.call_args[0][0]
+
+
+class TestABlockWideWindowRangeTilesABlock(TestTheWindowRangeTilesABlock):
+    """The other geometry, at the same numbers. A granule is a token range of a
+    block rather than a block the kernel addresses, so the head cut spreads it
+    -- and the two builders still have to break identically."""
+
+    RUNS = 2
+
+
+class TestABlockWideWindowOnThePeerSide(TestASlidingWindowOnThePeerSide):
+    RUNS = 2
+
+
+class TestAWindowRangeNeedsAGeometryItCanCut:
+    """`_window_grid` reads an observation, not an enumeration: a value that is
+    neither a granule nor a whole block cuts the range into pieces that are
+    neither, and every descriptor count still matches."""
+
+    @staticmethod
+    def _worker(blocks, *, axis=KVSplitAxis.HEAD, areas=1):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.block_size = 64
+        w._sw_ratio = 4
+        w._swa_kernel_blocks = blocks
+        w._kv_split_axis = axis
+        w._kv_areas, w._kv_slices = areas, areas
+        w._kv_per_block = 1
+        w.tp_rank = 0
+        w.transfer_topo = MagicMock(tp_size=1)
+        w._logical_region_kv_heads = [8, 8]
+        return w
+
+    def test_a_granule_wide_view_is_one_run(self):
+        assert self._worker({16})._window_grid() == (1, 4)
+
+    def test_a_block_wide_view_is_a_run_per_head(self):
+        assert self._worker({64})._window_grid() == (8, 4)
+
+    def test_a_third_value_is_refused(self):
+        with pytest.raises(RuntimeError, match="addressed in blocks of"):
+            self._worker({32})._window_grid()
+
+    def test_groups_that_disagree_are_refused_here(self):
+        # Carried by the observation, refused at the one place one number is
+        # needed.
+        with pytest.raises(RuntimeError, match="addressed in blocks of"):
+            self._worker({16, 64})._window_grid()
+
+    def test_a_block_wide_view_on_a_context_cut_is_refused(self):
+        with pytest.raises(RuntimeError, match="needs a head cut"):
+            self._worker({64}, axis=KVSplitAxis.NON_HEAD, areas=2)._window_grid()
+
+    def test_regions_disagreeing_on_the_head_band_are_refused(self):
+        w = self._worker({64})
+        w._logical_region_kv_heads = [8, 4]
+        with pytest.raises(RuntimeError, match="disagree on it"):
+            w._window_grid()
 
 
 class TestWindowModeNeedsAWindowThatMoves:

@@ -95,11 +95,13 @@ def _collisions(base: type, mixins: list[type]) -> list[str]:
 def _sw_ratio_asked_as_a_question() -> list[str]:
     """Where the package reads `_sw_ratio` for yes/no rather than for its value.
 
-    `_own_engine_layout` is that question. Asking it off the ratio again ties
-    the descriptor layout to one feature's knob, which is what the connector
-    spent a round untangling -- and the two stop agreeing the moment the layout
-    stops meaning "a window is present". Two reads are not the question and are
-    left out: deriving the ratio, and the property that answers it.
+    Two questions ride on the ratio and neither may be asked off it again.
+    `_own_engine_layout` is "do the whole-engine lists carry a range upstream
+    has no room for", which chunk mode also answers yes; `_window_grid` is "is
+    there a window range, and how is it cut". Asking either off the ratio ties
+    it back to one knob, which is what the connector spent a round untangling.
+    Three reads are not the question and are left out: deriving the ratio, and
+    the two that answer.
     """
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import rbln_nixl
 
@@ -112,7 +114,8 @@ def _sw_ratio_asked_as_a_question() -> list[str]:
         answers = {
             node
             for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "_own_engine_layout"
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("_own_engine_layout", "_window_grid")
         }
         skip = {id(sub) for node in answers for sub in ast.walk(node)}
         for node in ast.walk(tree):

@@ -46,6 +46,7 @@ from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
     mock_vllm_config,
     patched_in_package,
+    window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
@@ -235,7 +236,7 @@ def _make_worker(
     w.vllm_config.speculative_config = None
     w.compat_hash = compat
     w.enforce_compat_hash = True
-    w._sw_ratio = sw_ratio
+    window_mode(w, sw_ratio)
     w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
     # Off, as the connector option is; the trim tests turn it on.
     w._chunk_mode = False
@@ -1240,7 +1241,8 @@ class TestShardLocalRegions:
         w.get_backend_aware_kv_block_len = MagicMock(return_value=64)
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.prep_xfer_dlist.return_value = 42
-        w._sw_ratio = None  # shard registration goes through the SWA dispatch
+        # shard registration goes through the SWA dispatch
+        window_mode(w, None)
         w.use_host_buffer = False  # D2D: narrowing comes from chiplet areas
         w._shard_descs_per_block = {}
         w._shard_chunk_grids = {}
@@ -1385,7 +1387,7 @@ class TestShardLocalRegions:
         # pair that can name two KV groups -- so the chunk range has to follow
         # the window's range there. The per-shard builder never sees it.
         w = self._wired_worker()
-        w._sw_ratio = 2
+        window_mode(w, 2)
         w._has_swa = True
         w._chunk_mode = True
         runs, chunks = 1, 2
@@ -1413,7 +1415,7 @@ class TestShardLocalRegions:
         # it and a stage registers the whole model's regions, so the descriptor
         # math addresses layers it does not own.
         w = self._wired_worker()
-        w._sw_ratio = None
+        window_mode(w, None)
         w._has_swa = False
 
         with patch.object(
@@ -1505,7 +1507,7 @@ class TestShardLocalRegions:
     ):
         w = self._wired_worker()
         w._chunk_mode = True
-        w._sw_ratio = sw_ratio
+        window_mode(w, sw_ratio)
 
         assert (
             w._needs_own_descriptors(
@@ -1839,7 +1841,7 @@ class TestValidateRemoteAgentHandshake:
         w._kv_slices = 1
         w._kv_split_axis = KVSplitAxis.HEAD
         w._chunk_mode = False
-        w._sw_ratio = None
+        window_mode(w, None)
         w._has_swa = False
         topo = MagicMock()
         topo.get_engine_info.return_value = MagicMock(remote_tp_size=1)
@@ -2601,7 +2603,7 @@ class TestHeadBandMatching:
             block_len=256,
         )
         w.use_host_buffer = False
-        w._sw_ratio = None
+        window_mode(w, None)
         w._has_swa = False
         w.transfer_topo.tp_ratio.return_value = tp_ratio
         meta = self._meta(areas=peer[0], slices=peer[1], n_logical=1, block_len=256)
@@ -3029,7 +3031,7 @@ class TestD2DRegionPairing:
         # The check compares regions PER LAYER, so it needs both figures.
         w.num_regions = n_local
         w.local_seen_layer_names = [f"layer.{i}" for i in range(n_layers)]
-        w._sw_ratio = sw_ratio
+        window_mode(w, sw_ratio)
         w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
         topo = MagicMock()
         topo.tp_ratio.return_value = tp_ratio
@@ -3455,8 +3457,9 @@ class TestHeadMatchedAgentRegistration:
         # is the wrong key, so upstream's add_remote_agent must not be reached.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
-        w._sw_ratio = None
+        window_mode(w, None)
         w._has_swa = False
+        w._chunk_mode = False
         w.use_host_buffer = False
         w.transfer_topo = MagicMock()
         w.transfer_topo.tp_ratio.return_value = 2
@@ -3491,7 +3494,7 @@ class TestSplitAxisConstraints:
         w._kv_split_axis = axis
         w._chunk_mode = trim
         w.block_size = block_size
-        w._sw_ratio = sw_ratio
+        window_mode(w, sw_ratio)
         topo = MagicMock()
         topo.tp_size = 2
         topo.tp_ratio.return_value = tp_ratio
@@ -3581,7 +3584,7 @@ class TestAddRemoteAgentSwa:
     # topology lookup, or get_engine_info() KeyErrors.
     def test_registers_remote_engine_before_topology_lookups(self, monkeypatch):
         worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker._has_mamba = False
         worker.use_mla = False
         worker.tp_rank = 0
@@ -3650,7 +3653,7 @@ class TestAddRemoteAgentSwa:
     @staticmethod
     def _swa_remote_worker(monkeypatch):
         worker = build_worker(monkeypatch, num_blocks=8, block_size=64)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker._has_mamba = False
         worker.use_mla = False
         worker.tp_rank = 0
@@ -3745,7 +3748,7 @@ class TestAddRemoteAgentSwa:
         # can only span the peer's block length -- on both sides, which is why a
         # second local handler keyed by the peer's block size is registered.
         worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker._has_mamba = False
         worker.use_mla = False
         worker.tp_rank = 0
@@ -3915,7 +3918,8 @@ class TestTwoLayoutsNeverPair:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.use_host_buffer = False
         w._has_swa = False
-        w._sw_ratio = None
+        w._chunk_mode = False
+        w._window_grid_cut = None
         w._swa_kernel_blocks = set()
         w._kv_per_block = kv_per_block
         w.block_len_per_layer = [64]
@@ -3968,8 +3972,9 @@ class TestTwoKernelGeometriesNeverPair:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.use_host_buffer = False
         w._has_swa = True
+        w._chunk_mode = False
         w._swa_kernel_blocks = {swa_kernel_block} if swa_kernel_block else set()
-        w._sw_ratio = 8 if windowed else None
+        w._window_grid_cut = (1, 8) if windowed else None
         w._kv_per_block = 1
         w.block_len_per_layer = [64]
         w.num_regions = 1
@@ -4003,9 +4008,10 @@ class TestTwoKernelGeometriesNeverPair:
         self._worker(128)._check_d2d_region_pairing(self._meta(0), remote_tp_size=1)
 
     def test_without_a_window_range_the_geometry_does_not_pair(self):
-        # Two hybrids whose runners chose differently, neither cutting a window
-        # range. Their lists are whole blocks of the full-attention view, which
-        # is the same shape either way, so the pair stays allowed.
+        # The regression this guards: two hybrids whose runners chose
+        # differently, neither cutting a window range. Their lists are whole
+        # blocks of the full-attention view, which is the same shape either
+        # way, so the pair is describable and has to stay allowed.
         self._worker(128, windowed=False)._check_d2d_region_pairing(
             self._meta(1024), remote_tp_size=1
         )

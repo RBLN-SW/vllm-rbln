@@ -160,10 +160,11 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             num_blocks = int(num_blocks * block_size_ratio)
 
         # Both lists run region-major then block. A whole block is one
-        # descriptor, and the window range that follows holds the `sw_ratio`
-        # kernel blocks that tile it (`register_local_xfer_handler`).
-        sw_ratio = self._sw_ratio
-        assert sw_ratio is not None
+        # descriptor, and the window range that follows cuts that same block
+        # into `runs x granules` (`_window_grid`). Without window mode that
+        # range is absent, so the chunk range starts one range earlier.
+        window = self._window_grid_cut
+        window_units = window[0] * window[1] if window is not None else 0
         region_ids = np.arange(self.num_regions)[:, None]
         num_whole_descs = self.num_regions * num_blocks
         # One number for the whole request, whichever list this call is for.
@@ -189,21 +190,41 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 return (region_ids * num_blocks + blocks_arr).flatten()
 
             if is_sw:
+                if window is None:
+                    # Window mode registered no range: this group's blocks go
+                    # whole, and the chunk range cuts the full-attention
+                    # group's last block only.
+                    all_descs.append(whole(group_arr))
+                    continue
+                runs, granules_per_block = window
                 # Nothing having said how many tokens the request holds leaves
                 # nothing to say where its window is, so every granule goes --
                 # which is the block itself.
                 picked = (
-                    [(block, gran) for block in group for gran in range(sw_ratio)]
+                    [
+                        (block, gran)
+                        for block in group
+                        for gran in range(granules_per_block)
+                    ]
                     if tail is None or tail[0] is None
-                    else self._window_granules(group, tail[0], sw_ratio)
+                    else self._window_granules(group, tail[0], granules_per_block)
                 )
                 ids = (
                     region_ids * num_blocks
                     + np.asarray([block for block, _ in picked])[None, :]
                 )
                 granules = np.asarray([gran for _, gran in picked], dtype=np.int64)
+                # A granule is one run of bytes only where the kernel addresses
+                # the cache in window-wide blocks; otherwise the head cut
+                # spreads it, and every run of it goes.
                 all_descs.append(
-                    (ids * sw_ratio + granules[None, :] + num_whole_descs).ravel()
+                    (
+                        ids[:, :, None] * window_units
+                        + granules[None, :, None]
+                        + np.arange(runs, dtype=np.int64)[None, None, :]
+                        * granules_per_block
+                        + num_whole_descs
+                    ).ravel()
                 )
                 continue
             if needed is None:
@@ -215,7 +236,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             all_descs.append(whole(group_arr[:, :-1]))
             all_descs.append(
                 _chunk_desc_ids(
-                    start=num_whole_descs * (1 + sw_ratio),
+                    start=num_whole_descs * (1 + window_units),
                     positions=np.arange(self.num_regions, dtype=np.int64),
                     num_blocks=num_blocks,
                     block_id=group[-1],

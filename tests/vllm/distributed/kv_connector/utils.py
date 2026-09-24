@@ -721,6 +721,37 @@ def sliding_window_spec(*, block_size, sliding_window):
     return spec
 
 
+def window_mode(worker: Any, ratio: int | None, *, runs: int = 1) -> None:
+    """Put a worker in window mode the way registration would.
+
+    Three values, not one. The ratio says how many granules tile a block; the
+    grid says how one granule's bytes are laid out, defaulting to the geometry
+    where a granule IS a kernel block and so one run; the observation is the
+    geometry that grid belongs to, which a peer is refused against.
+
+    `_has_swa` follows a ratio, which cannot exist without a window. Turning
+    the mode off says nothing about whether the engine has one, so a stub that
+    means a hybrid sets that itself.
+    """
+    worker._sw_ratio = ratio
+    if ratio is None:
+        worker._swa_kernel_blocks = set()
+        worker._window_grid_cut = None
+        if not hasattr(worker, "_has_swa"):
+            worker._has_swa = False
+        return
+    worker._has_swa = True
+    block_size = getattr(worker, "block_size", None)
+    # The observation the grid was chosen from, so a stub pairs with a peer the
+    # way the engine it stands for would.
+    worker._swa_kernel_blocks = (
+        set()
+        if block_size is None
+        else {block_size // ratio if runs == 1 else block_size}
+    )
+    worker._window_grid_cut = (runs, ratio)
+
+
 def build_worker(
     monkeypatch,
     *,

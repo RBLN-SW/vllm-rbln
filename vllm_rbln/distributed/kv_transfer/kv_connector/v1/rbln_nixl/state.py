@@ -134,6 +134,9 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _shard_descs_per_block: dict[tuple[str, int], int]
     _shard_chunk_grids: dict[tuple[str, int], tuple[int, int] | None]
     _chunk_grid: tuple[int, int] | None
+    #: `_window_grid()` for this engine, parked so a transfer does
+    #: not recompute the head band per request.
+    _window_grid_cut: tuple[int, int] | None
     _request_tail: tuple[int | None, int | None] | None
 
     def _observe_swa_kernel_block(self) -> set[int]:
@@ -168,13 +171,13 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     def _own_engine_layout(self) -> bool:
         """Whether the whole-engine lists carry a range upstream has no room for.
 
-        Upstream names a region's block once. A sliding window gets a second
-        range over the same addresses, and a chunk range can only follow where
-        that one already sits -- so this, not the ratio itself, is what every
-        builder, peer mirror and index arithmetic here dispatches on. A window
-        as wide as the block adds no range and does not count.
+        Upstream names a region's block once. A window range cuts that block
+        again; a chunk range needs a list that can name both KV groups, which
+        a per-shard list cannot since each names one. So a hybrid in chunk mode
+        belongs here too, while a single-group engine's chunk range rides the
+        shard lists. A window as wide as the block adds no range at all.
         """
-        return self._sw_ratio is not None
+        return self._sw_ratio is not None or (self._chunk_mode and self._has_swa)
 
     @property
     def _spans_per_block(self) -> int:
@@ -309,22 +312,46 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     ) -> tuple[int, int] | None:
         """`(byte runs a chunk is spread over, chunks each run is cut into)`.
 
-        None where a chunk comes out the whole span -- what a prefill step at
-        or above a span asks for -- so neither list grows.
-
-        The axis says where a chunk sits. A context cut gives an area the
-        in-block range [a * span, (a + 1) * span), so a chunk of it is one
-        run of bytes; a head cut gives every area every token of some heads,
-        so the span is the block and a chunk is one run per head. That band
-        has to be one number -- the two lists carry one grid -- so regions
-        that disagree, and a piece narrower than a head, get none.
-
-        A packed block holds a token's K beside its V, so a token range is one
-        run in each -- unless the peer pairing already read the two apart,
-        which is what `kv_runs` reports.
+        The runs are `_block_runs`; the chunks are what a prefill step leaves
+        of a span. None where a chunk comes out the whole span -- what a step
+        at or above one asks for -- so neither list grows.
         """
         if not self._chunk_mode:
             return None
+        cut = self._block_runs(split=split, kv_runs=kv_runs)
+        if cut is None:
+            return None
+        spans, runs = cut
+        span_tokens = block_size // spans
+        chunk_tokens = kv_chunk_tokens(
+            span_tokens=span_tokens,
+            prefill_step_tokens=(
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            chunk_tokens=connector_option(self.vllm_config, "chunk_tokens", 0),
+        )
+        chunks = span_tokens // chunk_tokens
+        # What keeps the arithmetic downstream free of the axis: a block is a
+        # whole number of chunks however its spans are cut.
+        assert chunk_tokens * chunks * spans == block_size
+        if chunks == 1:
+            return None
+        return runs, chunks
+
+    def _block_runs(self, *, split: int, kv_runs: int) -> tuple[int, int] | None:
+        """`(token spans a block is cut into, byte runs one span is)`.
+
+        Both ranges that name less than a block read this. The axis says where
+        a token range sits: a context cut gives an area the in-block range
+        [a * span, (a + 1) * span), so a range of it is one run of bytes; a
+        head cut gives every area every token of some heads, so the span is the
+        block and a range is one run per head. That band has to be one number
+        -- the lists carry one grid -- so regions that disagree, and a piece
+        narrower than a head, get none.
+
+        A packed block holds a token's K beside its V, so a range is one run in
+        each, unless the peer pairing already read the two apart (`kv_runs`).
+        """
         if self._kv_split_axis is KVSplitAxis.NON_HEAD:
             spans, heads_per_span = self._kv_areas, 1
         else:
@@ -345,22 +372,47 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             spans, heads_per_span = 1, bands.pop()
         if heads_per_span % split:
             return None
-        parts = self._kv_per_block // kv_runs
-        span_tokens = block_size // spans
-        chunk_tokens = kv_chunk_tokens(
-            span_tokens=span_tokens,
-            prefill_step_tokens=(
-                self.vllm_config.scheduler_config.max_num_batched_tokens
-            ),
-            chunk_tokens=connector_option(self.vllm_config, "chunk_tokens", 0),
-        )
-        chunks = span_tokens // chunk_tokens
-        # What keeps the arithmetic downstream free of the axis: a block is a
-        # whole number of chunks however its spans are cut.
-        assert chunk_tokens * chunks * spans == block_size
-        if chunks == 1:
+        return spans, self._kv_per_block // kv_runs * heads_per_span // split
+
+    def _window_grid(self) -> tuple[int, int] | None:
+        """`(byte runs one window-wide piece is, pieces a block is cut into)`.
+
+        None where window mode registered no range. Where the kernel addresses
+        the cache in window-wide blocks, a piece IS one of them and so one run.
+        Where it addresses whole blocks, a piece is a token range of one, which
+        the head cut spreads exactly as it spreads a chunk.
+        """
+        if self._sw_ratio is None:
             return None
-        return parts * heads_per_span // split, chunks
+        window = self.block_size // self._sw_ratio
+        if self._swa_kernel_blocks != {window} and self._swa_kernel_blocks != {
+            self.block_size
+        }:
+            # One number cuts the range, and only these two are a granule or a
+            # whole block of it. A third would be cut into pieces that are
+            # neither, with the descriptor count unchanged.
+            raise RuntimeError(
+                "RBLN NIXL: a window range needs every sliding-window group "
+                f"addressed in blocks of {window} or {self.block_size} tokens, "
+                f"and this engine's are {sorted(self._swa_kernel_blocks)}."
+            )
+        if self._swa_kernel_blocks == {window}:
+            return 1, self._sw_ratio
+        cut = self._block_runs(split=1, kv_runs=1)
+        if cut is None:
+            raise RuntimeError(
+                "RBLN NIXL: a window range over a block-wide kernel view names "
+                "a token range of a block, which needs one head band across "
+                "every region -- and this engine's regions disagree on it."
+            )
+        if cut[0] != 1:
+            raise RuntimeError(
+                "RBLN NIXL: a window range over a block-wide kernel view needs "
+                "a head cut, which leaves one token range a block. This cache "
+                f"is cut on the {self._kv_split_axis.name} axis into "
+                f"{self._kv_areas} area(s)."
+            )
+        return cut[1], self._sw_ratio
 
     @staticmethod
     def _slice_head_bounds(
@@ -458,8 +510,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             and split == 1
             and replica_fanout == 1
         ), (
-            "RBLN NIXL: SWA window mode is not supported with pipeline "
-            "parallelism or heterogeneous tensor parallelism"
+            "RBLN NIXL: the whole-engine descriptor ranges are not supported "
+            "with pipeline parallelism or heterogeneous tensor parallelism"
         )
         assert not self._has_mamba, "RBLN NIXL connector does not support Mamba layers."
 
@@ -469,32 +521,29 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         blocks_data: list[tuple[int, int, int]] = []
 
         # A whole block is one range whatever it packs, since K and V are
-        # adjacent in it. The window range cuts that same block into the
-        # `sw_ratio` blocks the kernel addresses it in, each one contiguous run
-        # of `sliding_window` tokens over whatever the region holds.
-        # `_own_engine_layout` does not narrow the ratio -- read it once.
-        sw_ratio = self._sw_ratio
-        assert sw_ratio is not None
+        # adjacent in it.
         pieces: list[tuple[int, int, int, int]] = []
-        for units in (1, sw_ratio):
-            for i, base_addr in enumerate(local_base_addresses):
-                kv_block_len = (
-                    self.get_backend_aware_kv_block_len(
-                        layer_idx=i, first_split=True, mamba_view=False
-                    )
-                    // block_size_ratio
+        for i, base_addr in enumerate(local_base_addresses):
+            kv_block_len = (
+                self.get_backend_aware_kv_block_len(
+                    layer_idx=i, first_split=True, mamba_view=False
                 )
-                unit_len = kv_block_len // units
-                stride = self.block_len_per_layer[i] // block_size_ratio
-                if units == 1:
-                    pieces.append((base_addr, kv_block_len, stride, self.device_id))
-                for block_id in range(num_blocks):
-                    addr = base_addr + block_id * stride
-                    for unit in range(units):
-                        blocks_data.append(
-                            (addr + unit * unit_len, unit_len, self.device_id)
-                        )
+                // block_size_ratio
+            )
+            stride = self.block_len_per_layer[i] // block_size_ratio
+            pieces.append((base_addr, kv_block_len, stride, self.device_id))
+            for block_id in range(num_blocks):
+                blocks_data.append(
+                    (base_addr + block_id * stride, kv_block_len, self.device_id)
+                )
 
+        # Both further ranges cut the same block, and differ only in the piece:
+        # a window's is `sliding_window` tokens, a chunk's a prefill step.
+        window = self._window_grid_cut
+        if window is not None:
+            blocks_data += self._chunk_range_descs(
+                pieces, num_blocks=num_blocks, grid=window
+            )
         # Asked for here rather than handed in, so that the block size it is
         # derived from is the block size this list was built with.
         grid = self._shard_chunk_grid(block_size=block_size, split=1)
@@ -505,11 +554,13 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
 
         logger.info(
             "RBLN NIXL: %d local descriptor(s) for this engine over %d region(s) "
-            "x %d block(s): whole, %d sliding-window granule(s) each, and %s.",
+            "x %d block(s): whole, %s, and %s.",
             len(blocks_data),
             len(local_base_addresses),
             num_blocks,
-            self._sw_ratio,
+            f"a window range of {window[0]} run(s) x {window[1]} granule(s)"
+            if window is not None
+            else "no window range",
             f"a chunk range of {grid[0]} run(s) x {grid[1]} chunk(s)"
             if grid is not None
             else "no chunk range",

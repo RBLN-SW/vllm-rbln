@@ -193,7 +193,9 @@ class RblnNixlWorkerBase(
         # This engine's own grid, set once registration knows the geometry.
         # None wherever a chunk is the whole span (see `_shard_chunk_grid`).
         self._chunk_grid: tuple[int, int] | None = None
-        # What the sliding-window kernel's own view says, read at registration.
+        # The window range's grid, and the observation it is cut by. Both are
+        # the runner's answer, so both wait for registration.
+        self._window_grid_cut: tuple[int, int] | None = None
         self._swa_kernel_blocks: set[int] = set()
         # How far the request being transferred fills its last block, parked
         # for the length of one upstream call (`_tail_viewed_as`).
@@ -223,15 +225,8 @@ class RblnNixlWorkerBase(
             isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
         self._sw_ratio: int | None = None
-        # Chunk mode turns window mode on rather than asking for it: a hybrid
-        # is describable only by the whole-engine lists, and those carry a
-        # second range only in window mode. Without it `_own_engine_layout` is
-        # false and the whole list goes to upstream, which has room for neither
-        # that range nor the chunk range beside it.
         swa_window_mode = connector_option(self.vllm_config, "swa_window_mode", False)
-        if self._has_swa and (
-            swa_window_mode or connector_option(self.vllm_config, "chunk_mode", False)
-        ):
+        if self._has_swa and swa_window_mode:
             ratios: set[int] = set()
             for spec in self._group_specs:
                 if not isinstance(spec, SlidingWindowSpec):
@@ -249,8 +244,8 @@ class RblnNixlWorkerBase(
                     raise RuntimeError(
                         "RBLN NIXL: a window range needs a window that moves "
                         "through its block, and this engine pins every one to "
-                        "the block's first kernel block. Turn off whichever of "
-                        "swa_window_mode and chunk_mode asked for one."
+                        "the block's first kernel block. Turn swa_window_mode "
+                        "off."
                     )
             if len(ratios) > 1:
                 # The builder reads a group as windowed from its spec and then
@@ -265,7 +260,7 @@ class RblnNixlWorkerBase(
                     "block(s)."
                 )
             self._sw_ratio = next((r for r in ratios if r != 1), None)
-            if self._sw_ratio is None and swa_window_mode:
+            if self._sw_ratio is None:
                 # Doing nothing is right here -- a granule would be the block,
                 # so the range would repeat what the whole one names. Saying so
                 # is what was missing: the knob is set and nothing follows.
@@ -282,12 +277,6 @@ class RblnNixlWorkerBase(
                     raise RuntimeError(
                         "RBLN NIXL: SWA window mode is not supported with a "
                         "sliding-window MLA cache."
-                    )
-                if not swa_window_mode:
-                    logger.warning(
-                        "RBLN NIXL: chunk_mode turned SWA window mode on over "
-                        "swa_window_mode=0 -- a hybrid engine is "
-                        "describable only by the lists that range sits in."
                     )
                 logger.info(
                     "SWA window mode on: %d sliding_window-sized desc(s) per "

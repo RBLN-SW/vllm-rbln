@@ -43,6 +43,7 @@ from tests.vllm.distributed.kv_connector.utils import (
     patch_in_package,
     patched_in_package,
     sliding_window_spec,
+    window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -1088,7 +1089,7 @@ class TestPpConstraints:
         w.transfer_topo = MagicMock()
         w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
-        w._sw_ratio = sw_ratio
+        window_mode(w, sw_ratio)
         w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
         w.use_mla = use_mla
         return w
@@ -1163,6 +1164,7 @@ class TestPublishHandshakeMetadata:
         cls=None,
         has_mamba=False,
         cross_layers=False,
+        swa_kernel_block=None,
     ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
@@ -1177,9 +1179,9 @@ class TestPublishHandshakeMetadata:
         w.transfer_topo = MagicMock()
         w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
-        w._sw_ratio = None
+        window_mode(w, None)
         w._has_swa = False
-        w._swa_kernel_blocks = set()
+        w._swa_kernel_blocks = set() if swa_kernel_block is None else {swa_kernel_block}
         w.use_mla = False
         # Chiplet geometry travels with the metadata so a consumer with a
         # different TP degree can match head bands. Defaults are host-bounce's
@@ -1237,6 +1239,27 @@ class TestPublishHandshakeMetadata:
             w.xfer_handshake_metadata.agent_metadata_bytes
         )
         assert (decoded.kv_areas, decoded.kv_slices) == (4, 2)
+
+    def test_advertises_the_kernel_block_the_window_is_cut_by(self):
+        """A peer cuts its window range by its own runner's answer, and the two
+        sides have to be cut by one number. Nothing else in the blob says which
+        -- `block_size` and `sliding_window` are both legal values of it."""
+        w = self._publish(
+            pp_rank=0, pp_size=1, layer_names=["l0"], swa_kernel_block=128
+        )
+        decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            w.xfer_handshake_metadata.agent_metadata_bytes
+        )
+        assert decoded.swa_kernel_block == 128
+
+    def test_a_shard_holding_no_window_advertises_zero(self):
+        # Not None: the field is an int over the wire, and zero is what the
+        # pairing reads as "nothing to disagree with".
+        w = self._publish(pp_rank=0, pp_size=1, layer_names=["l0"])
+        decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            w.xfer_handshake_metadata.agent_metadata_bytes
+        )
+        assert decoded.swa_kernel_block == 0
 
     def test_wraps_upstream_and_folds_compat(self):
         w = self._publish(pp_rank=1, pp_size=2, layer_names=["l7", "l8"])
@@ -1455,7 +1478,7 @@ class TestTheLayoutReachesTheDescriptors:
     def _worker(kv_per_block, *, kv_slices=1, tp_size=1):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.use_host_buffer = False
-        w._sw_ratio = None
+        window_mode(w, None)
         w._kv_areas = 1
         w._kv_slices = kv_slices
         w._kv_per_block = kv_per_block
@@ -1636,11 +1659,12 @@ class TestTailBlockTrim:
 
 
 class TestChunkModeWithASlidingWindow:
-    """A hybrid engine is let into chunk mode because window mode already
-    gave its list a second descriptor range, which a third can follow. The
-    per-shard lists it would otherwise be sent to cannot name two KV groups:
-    their region-to-group map holds one group per region, and under HMA both
-    groups share every region."""
+    """A hybrid engine is let into chunk mode because it owns the whole-engine
+    descriptor lists, which is where a chunk range can sit. The per-shard lists
+    it would otherwise be sent to cannot name two KV groups: their
+    region-to-group map holds one group per region, and under HMA both groups
+    share every region. A window range is a separate knob and no longer the
+    price of admission."""
 
     @staticmethod
     def _register(monkeypatch, *, specs, chunk_mode=True, axis=None):
@@ -1701,11 +1725,15 @@ class TestChunkModeWithASlidingWindow:
             sliding_window_spec(block_size=64, sliding_window=16),
         ]
 
-    def test_a_windowed_engine_enters_chunk_mode(self, monkeypatch):
+    def test_a_hybrid_enters_chunk_mode_without_a_window_range(self, monkeypatch):
+        # What the class docstring used to describe the other way round: the
+        # second range is no longer the price of admission, because a hybrid
+        # owns the whole-engine lists on its own.
         worker = self._register(monkeypatch, specs=self._hybrid_specs())
 
-        assert worker._sw_ratio == 4
+        assert worker._sw_ratio is None
         assert worker._chunk_mode is True
+        assert worker._own_engine_layout
 
     def test_two_groups_without_a_window_are_still_refused(self, monkeypatch):
         # Nothing gave this engine a second range, so a third has nowhere to go.

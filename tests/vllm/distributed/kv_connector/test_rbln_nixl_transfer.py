@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
     sliding_window_spec,
+    window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -54,7 +55,7 @@ class TestComputeDescIds:
         # Full group -> offset 0; SWA group -> offset num_full_descs. Each id is
         # also expanded across regions as region_id * num_blocks + id.
         worker = build_worker(monkeypatch)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 2
         full_spec = MagicMock()  # not a SlidingWindowSpec
         worker._group_specs = [
@@ -73,7 +74,7 @@ class TestComputeDescIds:
         # A block_size_ratio widens the per-region block span (num_blocks *= ratio),
         # shifting both the region stride and the SWA offset.
         worker = build_worker(monkeypatch)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 1
         worker._group_specs = [sliding_window_spec(block_size=64, sliding_window=32)]
 
@@ -86,7 +87,7 @@ class TestComputeDescIds:
         # The SWA desc formula indexes physical blocks directly; the connector
         # pins one physical block per logical, so >1 is rejected.
         worker = build_worker(monkeypatch)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 1
         worker._group_specs = [sliding_window_spec(block_size=64, sliding_window=32)]
         with pytest.raises(AssertionError, match="physical_blocks_per_logical"):
@@ -94,7 +95,7 @@ class TestComputeDescIds:
 
     def test_empty_groups_yield_empty(self, monkeypatch):
         worker = build_worker(monkeypatch)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 1
         worker._group_specs = [MagicMock()]
         out = worker._compute_desc_ids([[]], 4, None, 1)
@@ -105,7 +106,7 @@ class TestComputeDescIds:
         # Two groups over two regions, four blocks: num_full_descs = 8, so the
         # SWA range is [8, 24) at sw_ratio 2 a block, and chunks start at 24.
         worker = build_worker(monkeypatch, block_size=64)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 2
         worker._chunk_mode = True
         worker._kv_areas = 1
@@ -161,6 +162,39 @@ class TestComputeDescIds:
 
         assert list(out) == [0, 1, 4, 5, 12, 13, 20, 21]
 
+    def test_chunk_mode_alone_sends_the_windowed_group_whole(self, monkeypatch):
+        # The knobs are separate now. With no window range the sliding-window
+        # group's blocks go whole, and the chunk range sits one range earlier
+        # -- right after the whole-block range, not after a window range that
+        # was never built.
+        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
+        window_mode(worker, None)
+        worker._has_swa = True
+
+        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
+
+        whole = worker.num_regions * 4
+        # Full group: block 0 whole (0, 4), block 1 as its first chunk from a
+        # range that now starts at `whole`; SWA group: block 2 whole (2, 6).
+        assert list(out) == [0, 4, whole + 4, whole + 6, whole + 20, whole + 22, 2, 6]
+
+    def test_a_block_wide_kernel_spreads_a_granule_over_its_runs(self, monkeypatch):
+        # Same spec, other geometry: a granule is a token range of a block, so
+        # every run of it goes and the range is `runs` times as long.
+        worker = self._hybrid_worker(monkeypatch, grid=None, tail=None)
+        window_mode(worker, 2, runs=3)
+
+        out = worker._compute_desc_ids([[0], [2]], 4, None, 1)
+
+        whole = worker.num_regions * 4
+        # SWA block 2, region r: whole + (r*4 + 2)*(3*2) + granule + run*2.
+        assert list(out) == [0, 4] + [
+            whole + (r * 4 + 2) * 6 + gran + run * 2
+            for r in range(2)
+            for gran in range(2)
+            for run in range(3)
+        ]
+
     def test_no_chunk_grid_is_todays_ids(self, monkeypatch):
         # A geometry whose span a chunk cannot cut registered no third range,
         # so no index may reach past the second.
@@ -182,7 +216,7 @@ class TestDescIdsForAPackedBlock:
     @staticmethod
     def _worker(kv_per_block, spec):
         w = object.__new__(RblnNixlPullConnectorWorker)
-        w._sw_ratio = 2
+        window_mode(w, 2)
         w._kv_per_block = kv_per_block
         w.num_regions = 2
         w._chunk_grid = None
@@ -309,7 +343,7 @@ class TestTheWindowsOwnGranules:
     @staticmethod
     def _ids(valid_tokens, blocks):
         w = object.__new__(RblnNixlPullConnectorWorker)
-        w._sw_ratio = 2
+        window_mode(w, 2)
         w.block_size = 64
         w.num_regions = 1
         w._chunk_grid = None
