@@ -38,41 +38,41 @@ def _apply_prefix_caching_block_size(
         "prefill_chunk_size must be specified in rbln_config.json"
     )
     rbln_config: OptimumRBLNConfig = vllm_config.additional_config
-    prefix_block_size = rbln_config.prefix_block_size
-    if prefix_block_size is None:
-        prefix_block_size = prefill_chunk_size
+    sub_block_size = rbln_config.sub_block_size
+    if sub_block_size is None:
+        sub_block_size = prefill_chunk_size
         logger.debug(
-            "Prefix block size is set to %s based on prefill_chunk_size",
-            prefix_block_size,
+            "Sub-block size is set to %s based on prefill_chunk_size",
+            sub_block_size,
         )
     else:
-        if prefix_block_size % prefill_chunk_size != 0:
+        if sub_block_size % prefill_chunk_size != 0:
             raise ValueError(
-                "prefix_block_size ({}) is not divisible "
+                "sub_block_size ({}) is not divisible "
                 "by prefill_chunk_size ({}). "
                 "Please check the value of prefill_chunk_size "
-                "in rbln_config.json".format(prefix_block_size, prefill_chunk_size)
+                "in rbln_config.json".format(sub_block_size, prefill_chunk_size)
             )
-        if prefix_block_size > kvcache_block_size:
+        if sub_block_size > kvcache_block_size:
             raise ValueError(
-                "prefix_block_size ({}) is greater than "
+                "sub_block_size ({}) is greater than "
                 "kvcache_block_size ({}). "
                 "Please check the value of kvcache_block_size "
-                "in rbln_config.json".format(prefix_block_size, kvcache_block_size)
+                "in rbln_config.json".format(sub_block_size, kvcache_block_size)
             )
         logger.debug(
-            "Prefix block size is set to %s based on additional_config",
-            prefix_block_size,
+            "Sub-block size is set to %s based on additional_config",
+            sub_block_size,
         )
-    if kvcache_block_size % prefix_block_size != 0:
+    if kvcache_block_size % sub_block_size != 0:
         raise ValueError(
             "kvcache_block_size ({}) is not divisible "
-            "by prefix_block_size ({}). "
-            "Please check the value of prefix_block_size in rbln_config.json".format(
-                kvcache_block_size, prefix_block_size
+            "by sub_block_size ({}). "
+            "Please check the value of sub_block_size in additional_config".format(
+                kvcache_block_size, sub_block_size
             )
         )
-    vllm_config.cache_config.block_size = prefix_block_size
+    vllm_config.cache_config.block_size = sub_block_size
     rbln_config.attn_block_size = kvcache_block_size
 
 
@@ -85,8 +85,8 @@ def update_block_size(
     """
     Update the block size in the vllm_config based on the provided kvcache_block_size
     and prefill_chunk_size. For models with prefix caching enabled, the block size
-    is set to the prefix block size, which is determined based on the prefill_chunk_size
-    and user-provided prefix_block_size.
+    is set to the sub-block size, which is determined based on the prefill_chunk_size
+    and user-provided sub_block_size.
     """
     vllm_config.cache_config.user_specified_block_size = True
     if vllm_config.cache_config.enable_prefix_caching:

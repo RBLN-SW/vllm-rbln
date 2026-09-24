@@ -52,9 +52,9 @@ def test_defaults_when_nothing_is_passed(parser):
 
 
 def test_an_optimum_field_reaches_the_config(parser):
-    args = parser.parse_args(["--rbln-prefix-block-size", "256"])
+    args = parser.parse_args(["--rbln-sub-block-size", "256"])
     config = _resolve(OptimumRBLNConfig, args.additional_config)
-    assert config.prefix_block_size == 256
+    assert config.sub_block_size == 256
 
 
 def test_the_overrides_arrive_as_a_mapping(parser):
@@ -121,7 +121,7 @@ def test_the_capture_writes_only_where_this_path_reads(monkeypatch):
         return args.additional_config
 
     assert captured(None)["user_max_num_batched_tokens"] == 512
-    assert captured({"prefix_block_size": 64})["user_max_num_batched_tokens"] == 512
+    assert captured({"sub_block_size": 64})["user_max_num_batched_tokens"] == 512
     assert captured(OptimumRBLNConfig()).user_max_num_batched_tokens == 512
     assert captured("something") == "something"
 
@@ -132,6 +132,21 @@ def test_the_former_overrides_key_is_accepted():
     assert config.optimum_overrides == {"device": [0]}
 
 
+@pytest.mark.parametrize("size", [0, -1])
+def test_a_sub_block_size_of_zero_or_less_is_rejected(size):
+    """The converter divides by the size, so 0 is refused before it gets there.
+    Unset is None, not 0."""
+    with pytest.raises(ValueError, match="greater_than"):
+        _resolve(OptimumRBLNConfig, {"sub_block_size": size})
+    assert OptimumRBLNConfig().sub_block_size is None
+
+
+def test_the_former_prefix_block_size_key_is_accepted():
+    """TODO(vllm-rbln>=0.14.0): delete with the key."""
+    config = _resolve(OptimumRBLNConfig, {"prefix_block_size": 256})
+    assert config.sub_block_size == 256
+
+
 def test_only_compile_fields_change_the_hash():
     """A field the sync derives cannot key the artifact it was derived from."""
     base = OptimumRBLNConfig().compute_hash()
@@ -140,20 +155,20 @@ def test_only_compile_fields_change_the_hash():
     assert OptimumRBLNConfig(num_blocks_synced=True).compute_hash() == base
     assert OptimumRBLNConfig(use_custom_sampler=False).compute_hash() == base
     assert OptimumRBLNConfig(user_max_num_batched_tokens=512).compute_hash() != base
-    assert OptimumRBLNConfig(prefix_block_size=256).compute_hash() != base
+    assert OptimumRBLNConfig(sub_block_size=256).compute_hash() != base
 
 
 def test_coexists_with_additional_config(parser):
     """`add_rbln_cli_args` installs the merging action, and it now runs here too."""
     args = parser.parse_args(
         [
-            "--rbln-prefix-block-size",
+            "--rbln-sub-block-size",
             "256",
             "--additional-config.num_devices_per_local_rank",
             "4",
         ]
     )
     assert args.additional_config == {
-        "prefix_block_size": 256,
+        "sub_block_size": 256,
         "num_devices_per_local_rank": 4,
     }
