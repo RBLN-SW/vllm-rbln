@@ -290,7 +290,6 @@ class TestCompilerConformance:
             for spec in req.specifier
             if spec.operator in {">=", "==", "~="}
         )
-        # rebel.compile takes dtype since 0.11.3.dev570 (rebel_compiler#13921)
         assert floor < Version("0.11.3.dev570"), (
             "the rebel-compiler pin now guarantees rebel.compile(dtype=...); "
             "remove check_dtype_option_supported, its call in vllm_impl, "
