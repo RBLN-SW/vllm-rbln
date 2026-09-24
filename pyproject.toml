@@ -54,9 +54,6 @@ dependencies = [
 examples = [
     "qwen_vl_utils",
 ]
-# Upstream's audio extra, re-exported so `vllm-rbln[audio]` is what whisper's
-# transcription endpoint needs: soundfile decodes, PyAV is the fallback decoder
-# and the default resampler.
 audio = [
     "vllm[audio]",
 ]
