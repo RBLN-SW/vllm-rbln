@@ -30,7 +30,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlConnectorMetadata,
 )
 
-from tests.vllm.distributed.kv_connector.utils import setattr_in_package
+from tests.vllm.distributed.kv_connector.utils import (
+    mock_vllm_config,
+    setattr_in_package,
+    sliding_window_spec,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import metadata as md
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     RBLN_NIXL_CONNECTOR_VERSION,
@@ -39,6 +43,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
     RblnNixlConnectorMetadata,
     connector_option,
     rbln_compat_hash,
+    transfer_shape,
 )
 
 _BASE_FIELDS = dict(
@@ -307,14 +312,106 @@ class TestRblnNixlConnectorMetadata:
         assert promoted.reqs_to_save == {"r1": "save"}
         assert promoted.reqs_in_batch == {"r2"}
         assert promoted.push_finished_blocks == {"r3": ([1],)}
+        assert promoted.push_early_flush == set()
+        assert promoted.push_stream_total == {}
         assert promoted.valid_tokens == {}
         # Upstream asserts on its own type in several places.
         assert isinstance(promoted, NixlConnectorMetadata)
 
-    def test_promotion_carries_the_token_counts(self):
-        # Promotion runs on an instance this side already filled, not only on a
-        # bare upstream one, so the added field has to survive it.
+    def test_the_added_fields_do_not_bleed_into_each_other(self):
+        # They are filled by different paths on different steps -- the flush on
+        # a preemption, the total on every streamed offer, the token count only
+        # on a handover -- so a promotion that aliased them would show up as
+        # one path clearing another.
         meta = RblnNixlConnectorMetadata()
+        meta.push_early_flush = {"r0"}
+        meta.push_stream_total = {"r1": 4}
         meta.valid_tokens = {"r2": 33}
 
-        assert RblnNixlConnectorMetadata.promote(meta).valid_tokens == {"r2": 33}
+        promoted = RblnNixlConnectorMetadata.promote(meta)
+
+        assert promoted.push_early_flush == {"r0"}
+        assert promoted.push_stream_total == {"r1": 4}
+        assert promoted.valid_tokens == {"r2": 33}
+
+
+class TestTransferShape:
+    """The reduction both sides run. Its inputs are two config objects, so a
+    case here states a deployment rather than a worker."""
+
+    @staticmethod
+    def _groups(*specs):
+        return [MagicMock(kv_cache_spec=spec) for spec in specs]
+
+    def _hybrid(self):
+        # gpt-oss' shape: one full-attention group and one sliding-window
+        # group, the only one where a prefix offer has two groups to tell apart.
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        return self._groups(
+            MagicMock(spec=FullAttentionSpec),
+            sliding_window_spec(block_size=64, sliding_window=16),
+        )
+
+    @pytest.mark.parametrize(
+        ("writes_into_peer", "streams"), [(True, True), (False, False)]
+    )
+    def test_streaming_is_inert_on_the_side_that_does_not_write(
+        self, writes_into_peer, streams
+    ):
+        # One `--kv-transfer-config` is handed to both ends of a P/D pair, so
+        # the knob reaches the reading side too. Acting on it there would give
+        # that side's descriptor lists a window range nothing reads.
+        shape = transfer_shape(
+            mock_vllm_config(push_stream=True),
+            self._hybrid(),
+            writes_into_peer=writes_into_peer,
+        )
+
+        assert shape.streams_prefix is streams
+        # The lists a streamed write needs, which a hybrid owns without a
+        # window range -- that knob is asked for separately now.
+        assert shape.owns_engine_lists is streams
+        assert shape.has_window_range is False
+
+    @pytest.mark.parametrize(
+        ("push_stream", "kv_buffer_device", "streams"),
+        [(True, "rbln", True), (False, "rbln", False), (True, "cpu", False)],
+    )
+    def test_host_staging_takes_no_prefix(self, push_stream, kv_buffer_device, streams):
+        # Host staging registers one full-shape buffer per layer and moves a
+        # request at a time, so there is nothing for a prefix to be named in.
+        config = mock_vllm_config(push_stream=push_stream)
+        config.kv_transfer_config.kv_buffer_device = kv_buffer_device
+
+        shape = transfer_shape(config, self._hybrid(), writes_into_peer=True)
+
+        assert shape.streams_prefix is streams
+
+    def test_the_counted_group_is_the_one_that_does_not_slide(self):
+        # Not the first: a sliding-window group holds one block whatever the
+        # prompt length, so an offer sized from it would be one block for every
+        # request. Which position it sits in is the model's business.
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        groups = self._groups(
+            sliding_window_spec(block_size=64, sliding_window=16),
+            MagicMock(spec=FullAttentionSpec),
+        )
+
+        shape = transfer_shape(
+            mock_vllm_config(chunk_mode=True), groups, writes_into_peer=True
+        )
+
+        assert shape.counted_group == 1
+
+    def test_the_knob_is_still_reported_as_asked_for(self):
+        # `wants_stream` is what an operator typed; `streams_prefix` is what
+        # this side does about it. A refusal reads the first.
+        shape = transfer_shape(
+            mock_vllm_config(push_stream=True),
+            self._hybrid(),
+            writes_into_peer=False,
+        )
+
+        assert shape.wants_stream is True

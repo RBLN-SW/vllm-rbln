@@ -42,7 +42,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
     RblnNixlAgentMetadata,
-    connector_option,
     rbln_compat_hash,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
@@ -91,7 +90,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "RBLN NIXL: cross-layer-blocks mode is not supported with "
                 "pipeline_parallel_size > 1."
             )
-        if self._has_swa:
+        if self._shape.has_swa:
             raise RuntimeError(
                 "RBLN NIXL: sliding-window attention is not supported with "
                 "pipeline_parallel_size > 1."
@@ -168,6 +167,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             kv_slices=self._kv_slices,
             kv_split_axis=self._kv_split_axis,
             kv_per_block=self._kv_per_block,
+            # Zero where this shard holds no sliding-window group, and where
+            # its groups disagree -- neither can cut a window range, so there
+            # is nothing for a peer to pair on.
+            swa_kernel_block=(
+                next(iter(self._swa_kernel_blocks))
+                if len(self._swa_kernel_blocks) == 1
+                else 0
+            ),
         )
         base_hash = self.compat_hash
         assert base_hash is not None
@@ -370,7 +377,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self.block_len_per_layer = list(xfer.block_lens)
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = xfer.base_addrs
         self._registered_descs.append(xfer.reg_handle)
-        assert len(self.block_len_per_layer) == len(xfer.base_addrs)
+        assert len(self.block_len_per_layer) == len(xfer.base_addrs), (
+            f"RBLN NIXL: the adapter returned {len(xfer.base_addrs)} region "
+            f"address(es) for {len(self.block_len_per_layer)} block length(s); "
+            "every descriptor here is (address, length) by position"
+        )
 
         # Upstream keys REPLICATE vs SPLIT off this list and indexes it 1:1 with
         # block_len_per_layer, which is chiplet-expanded here -- so the flags are
@@ -411,10 +422,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             f"the plugin reported {self._kv_slices} logical slice(s) per shard"
         )
 
-        # A head axis of extent one cannot be cut, so the compiler replicates
-        # instead and more than one slice there has no other explanation. Above
-        # one head both axes fit the same count, so an axis that is not derived
-        # stays HEAD rather than guessed.
+        # A rank's head axis of extent one cannot be cut, so the compiler
+        # replicates instead and more than one slice there has no other
+        # explanation. Above one head it is a head band: nothing here
+        # context-cuts a rank holding several, and the adapter's return could
+        # not say so anyway -- both cuts give the same length and slice count.
         region_cut = [
             (heads, self._logical_region_slices[r])
             for r, heads in enumerate(logical_kv_heads)
@@ -438,37 +450,49 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "RBLN NIXL (D2D): a context-cut KV cache whose block packs K "
                 "and V is not supported."
             )
-        # A chunk is a token range of a block, and a second attention shape
-        # needs a descriptor of its own to be left out of one. A sliding
-        # window has that already -- window mode's second range -- so it may
-        # sit beside the one full-attention group whose blocks a chunk cuts.
-        # Exactly one, because every group's blocks are cut the same way.
-        self._chunk_mode = connector_option(self.vllm_config, "chunk_mode", False)
+        # A chunk cuts the blocks of one full-attention group. Exactly one,
+        # because every group's blocks are cut the same way, and any other
+        # group has to be a sliding window -- which draws its block ids from a
+        # pool of its own and so is never the group a chunk is sized against.
+        # Read here rather than in `__init__`: the runner binds the views this
+        # asks about while initializing the KV cache, which is after the
+        # connector exists.
+        self._swa_kernel_blocks = self._observe_swa_kernel_block()
+        if self._shape.has_swa:
+            logger.info(
+                "RBLN NIXL: the sliding-window kernel addresses this cache in "
+                "blocks of %s token(s).",
+                sorted(self._swa_kernel_blocks),
+            )
         full_groups = sum(
             not isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
         )
-        if self._chunk_mode and not (
+        # Streaming names part of a block for its own reason and needs the
+        # same shape to do it: one group whose blocks it counts in, and any
+        # other group described by a range of its own.
+        cutter = "chunk_mode" if self._shape.chunk_mode else "a streamed write"
+        if (self._shape.writes_part_of_a_block) and not (
             full_groups == 1
             and (len(self._group_specs) == 1 or self._own_engine_layout)
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode needs one "
-                "full-attention KV-cache group, and any other group to be a "
-                "sliding window whose view it can extend. Got "
-                f"groups={len(self._group_specs)}, full={full_groups}, "
-                f"swa={self._has_swa}, sw_ratio={self._sw_ratio}."
+                f"RBLN NIXL (D2D): {cutter} needs one full-attention KV-cache "
+                "group, and any other group to be a sliding window whose view "
+                f"it can extend. Got groups={len(self._group_specs)}, "
+                f"full={full_groups}, swa={self._shape.has_swa}, "
+                f"sw_ratio={self._shape.window_ratio}."
             )
-        # A windowed engine keeps the whole-engine lists, and those name a
-        # block's chunks without naming which span holds the request's last
-        # token -- so a block cut into several spans would send chunks past
-        # the request's own blocks. A head cut leaves one span a block.
+        # An engine that owns the whole-engine lists names a block's chunks
+        # there without naming which span holds the request's last token -- so
+        # a block cut into several spans would send chunks past the request's
+        # own blocks. A head cut leaves one span a block.
         if (
-            self._chunk_mode
+            (self._shape.writes_part_of_a_block)
             and self._own_engine_layout
             and self._kv_split_axis is KVSplitAxis.NON_HEAD
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode on a sliding-window engine needs "
+                f"RBLN NIXL (D2D): {cutter} on a sliding-window engine needs "
                 "a head cut, which leaves one token range a block. This cache "
                 f"is cut on the {self._kv_split_axis.name} axis into "
                 f"{self._kv_areas} area(s)."
@@ -478,7 +502,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # the block. A head cut gives every area every token, and reads no
         # span out of a position at all.
         if (
-            self._chunk_mode
+            (self._shape.writes_part_of_a_block)
             and self._kv_split_axis is KVSplitAxis.NON_HEAD
             and not (
                 self._kv_areas == self._kv_slices
@@ -486,7 +510,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             )
         ):
             raise RuntimeError(
-                "RBLN NIXL (D2D): chunk_mode on a context-cut KV "
+                "RBLN NIXL (D2D): cutting a block on a context-cut KV "
                 "cache needs unreplicated chiplet areas that divide the "
                 f"block. Got areas={self._kv_areas}, "
                 f"slices={self._kv_slices}, block_size={self.block_size}."
@@ -503,11 +527,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             else "",
         )
 
-        # One grid for this engine. Each descriptor list derives its own from
-        # the block size it was built with; this is the one a transfer reads
-        # back, and it has to answer for the list it selects in.
+        # One grid per range for this engine. Each descriptor list derives its
+        # chunk grid from the block size it was built with; these are the ones
+        # a transfer reads back, and they have to answer for the list it
+        # selects in. The window range has no such parameter, so the builders
+        # read the value parked here rather than ask twice.
         self._chunk_grid = self._shard_chunk_grid(block_size=self.block_size, split=1)
-        if self._chunk_mode and self._chunk_grid is None:
+        self._window_grid_cut = self._window_grid()
+        if self._shape.chunk_mode and self._chunk_grid is None:
             # Said once here rather than per peer: every list is cut by the
             # same two numbers, and a peer whose block holds a different
             # count is refused at the handshake.

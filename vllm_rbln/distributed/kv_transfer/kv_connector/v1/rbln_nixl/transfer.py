@@ -68,38 +68,39 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
     """
 
     @contextmanager
-    def _tail_viewed_as(self, valid_tokens: int | None, prompt_blocks: int | None):
-        """Park how far a request's last block is filled, for upstream's call.
+    def _tail_viewed_as(
+        self,
+        valid_tokens: int | None,
+        prompt_blocks: int | None,
+        pieces: tuple[tuple[int, int | None, tuple[int, int]], ...] = (),
+    ):
+        """Park which part of a request's blocks this transfer names.
 
         `_compute_desc_ids` is what selects the descriptors, and it takes block
         ids and nothing else -- upstream's signature, with no room for a token
         count. A plain attribute suffices: one transfer reaches it twice, both
         synchronously, and a worker moves one request at a time on one thread
         (the read path on the worker's, the write path on the single writer's).
+
+        A write naming the whole request parks how far its last block is filled
+        and lets the tail be derived. One naming part of it -- a streamed batch
+        -- parks the chunk ranges it decided on instead. They arrive by the same
+        door because the block ids alone cannot say which of the two this is.
+
+        The pieces are one side's, so a caller with two lists parks each
+        around its own call.
         """
         prev = self._request_tail
-        self._request_tail = (valid_tokens, prompt_blocks)
+        self._request_tail = (valid_tokens, prompt_blocks, pieces)
         try:
             yield
         finally:
             self._request_tail = prev
 
     def _prompt_blocks(self, block_ids: BlockIds) -> int | None:
-        """How many blocks the request holds, read off the group a chunk cuts.
-
-        A sliding-window group's list is clipped to its own window, so summing
-        the groups describes no request. Chunk mode registers against exactly
-        one full-attention group, which is the one the token count describes;
-        an engine without one has no chunk range for this to size.
-        """
-        return next(
-            (
-                len(group)
-                for g, group in enumerate(block_ids)
-                if not isinstance(self._group_specs[g], SlidingWindowSpec)
-            ),
-            None,
-        )
+        """How many blocks the request holds, read off the group a chunk cuts."""
+        counted = self._shape.counted_group
+        return None if counted is None else len(block_ids[counted])
 
     def _window_granules(
         self, blocks: list[int], valid_tokens: int, sw_ratio: int
@@ -160,70 +161,101 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             num_blocks = int(num_blocks * block_size_ratio)
 
         # Both lists run region-major then block. A whole block is one
-        # descriptor, and the window range that follows holds the `sw_ratio`
-        # kernel blocks that tile it (`register_local_xfer_handler`).
-        sw_ratio = self._sw_ratio
-        assert sw_ratio is not None
+        # descriptor, and the window range that follows cuts that same block
+        # into `runs x granules` (`_window_grid`). Without window mode that
+        # range is absent, so the chunk range starts one range earlier.
+        window = self._window_grid_cut
+        window_units = window[0] * window[1] if window is not None else 0
         region_ids = np.arange(self.num_regions)[:, None]
         num_whole_descs = self.num_regions * num_blocks
-        # One number for the whole request, whichever list this call is for.
+        # One decision for the whole request, whichever list this call is for:
+        # the chunk ranges a streamed batch named, or how many chunks of the
+        # last block a whole-request write still owes.
         tail = self._request_tail
-        if tail is None or self._chunk_grid is None:
+        pieces = tail[2] if tail is not None else ()
+        if tail is None or pieces or self._chunk_grid is None:
             needed = None
         else:
             # A chunk range exists only where a full-attention group does, and
-            # that group is what `_prompt_blocks` counts.
+            # that group is what the shape counts in.
             prompt_blocks = tail[1]
             assert prompt_blocks is not None
             needed = self._tail_chunks(
                 prompt_blocks, tail[0], chunks_per_span=self._chunk_grid[1]
             )
+
+        def whole(blocks: list[int]) -> np.ndarray:
+            return (region_ids * num_blocks + np.asarray(blocks)[None, :]).flatten()
+
+        def chunks_of(
+            block_id: int, span_ix: int | None, chunk_span: tuple[int, int]
+        ) -> np.ndarray:
+            assert self._chunk_grid is not None
+            # A context cut never reaches these lists: registration refuses one
+            # beside a window range, so no piece parked here names a span.
+            assert span_ix is None
+            return _chunk_desc_ids(
+                start=num_whole_descs * (1 + window_units),
+                positions=np.arange(self.num_regions, dtype=np.int64),
+                num_blocks=num_blocks,
+                block_id=block_id,
+                per_block=1,
+                grid=self._chunk_grid,
+                chunk_span=chunk_span,
+            )
+
         all_descs: list[np.ndarray] = []
         for g, group in enumerate(block_ids):
-            if not group:
-                continue
             is_sw = isinstance(self._group_specs[g], SlidingWindowSpec)
-            group_arr = np.asarray(group)[None, :]
-
-            def whole(blocks_arr):
-                return (region_ids * num_blocks + blocks_arr).flatten()
-
             if is_sw:
+                if window is None:
+                    # Window mode registered no range: this group's blocks go
+                    # whole, and the chunk range cuts the full-attention
+                    # group's last block only.
+                    if group:
+                        all_descs.append(whole(group))
+                    continue
+                runs, granules_per_block = window
                 # Nothing having said how many tokens the request holds leaves
                 # nothing to say where its window is, so every granule goes --
                 # which is the block itself.
-                picked = (
-                    [(block, gran) for block in group for gran in range(sw_ratio)]
-                    if tail is None or tail[0] is None
-                    else self._window_granules(group, tail[0], sw_ratio)
-                )
-                ids = (
-                    region_ids * num_blocks
-                    + np.asarray([block for block, _ in picked])[None, :]
-                )
-                granules = np.asarray([gran for _, gran in picked], dtype=np.int64)
-                all_descs.append(
-                    (ids * sw_ratio + granules[None, :] + num_whole_descs).ravel()
-                )
+                if group:
+                    picked = (
+                        [(b, gran) for b in group for gran in range(granules_per_block)]
+                        if tail is None or tail[0] is None
+                        else self._window_granules(group, tail[0], granules_per_block)
+                    )
+                    ids = (
+                        region_ids * num_blocks
+                        + np.asarray([b for b, _ in picked])[None, :]
+                    )
+                    granules = np.asarray([gran for _, gran in picked], dtype=np.int64)
+                    # A granule is one run of bytes only where the kernel
+                    # addresses the cache in window-wide blocks; otherwise the
+                    # head cut spreads it, and every run of it goes.
+                    all_descs.append(
+                        (
+                            ids[:, :, None] * window_units
+                            + granules[None, :, None]
+                            + np.arange(runs, dtype=np.int64)[None, None, :]
+                            * granules_per_block
+                            + num_whole_descs
+                        ).ravel()
+                    )
                 continue
-            if needed is None:
-                all_descs.append(whole(group_arr))
-                continue
-            # The last block leaves the whole-block range and comes back as the
-            # chunks that hold tokens, from the third range.
-            assert self._chunk_grid is not None
-            all_descs.append(whole(group_arr[:, :-1]))
-            all_descs.append(
-                _chunk_desc_ids(
-                    start=num_whole_descs * (1 + sw_ratio),
-                    positions=np.arange(self.num_regions, dtype=np.int64),
-                    num_blocks=num_blocks,
-                    block_id=group[-1],
-                    per_block=1,
-                    grid=self._chunk_grid,
-                    chunk_span=(0, needed),
-                )
-            )
+            # The full-attention group, which is the one a chunk cuts. Its
+            # whole blocks may be empty while its pieces are not: a batch can
+            # owe nothing but the rest of a block it half-wrote.
+            keep = group if needed is None else group[:-1]
+            if keep:
+                all_descs.append(whole(keep))
+            if needed is not None and group:
+                # The last block leaves the whole-block range and comes back as
+                # the chunks that hold tokens, from the third range.
+                all_descs.append(chunks_of(group[-1], None, (0, needed)))
+            all_descs += [
+                chunks_of(block_id, span_ix, span) for block_id, span_ix, span in pieces
+            ]
         return np.concatenate(all_descs) if all_descs else np.empty(0, dtype=int)
 
     def _get_block_descs_ids_for_shard(
@@ -302,7 +334,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         if not 0 <= lo < hi <= chunks:
             raise RuntimeError(
                 f"RBLN NIXL: chunk range [{lo}, {hi}) is outside the "
-                f"{chunks} chunk(s) a block holds"
+                f"{chunks} chunk(s) a span holds"
             )
         region_group_ids = self._shard_region_group_ids[(engine_id, global_rank)]
         per_block = self._shard_descs_per_block[(engine_id, global_rank)]
@@ -337,8 +369,16 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         -- the same bytes in more descriptors is a loss.
 
         Rounds up, because every token counted has to reach the peer.
+
+        Asked of whatever may name part of a block rather than of chunk mode
+        alone: a streamed batch closes a block the forward pass is still
+        filling, and the chunks above the count hold KV nobody has written.
         """
-        if not self._chunk_mode or not num_valid_tokens or num_blocks <= 0:
+        if (
+            not self._shape.writes_part_of_a_block
+            or not num_valid_tokens
+            or num_blocks <= 0
+        ):
             return None
         rem = num_valid_tokens - (num_blocks - 1) * self.block_size
         if not 1 <= rem <= self.block_size:

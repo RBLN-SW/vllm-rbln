@@ -37,6 +37,7 @@ import inspect
 import pathlib
 import pkgutil
 import textwrap
+from typing import TypeGuard
 
 
 def _lifetimes() -> tuple[type, list[type]]:
@@ -92,14 +93,28 @@ def _collisions(base: type, mixins: list[type]) -> list[str]:
     return sorted(found)
 
 
-def _sw_ratio_asked_as_a_question() -> list[str]:
-    """Where the package reads `_sw_ratio` for yes/no rather than for its value.
+def _is_window_question(node: ast.AST) -> TypeGuard[ast.Attribute]:
+    """`self._shape.<window field>`, the read that answers "is there a window"."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr in ("window_ratio", "has_window_range")
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "_shape"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "self"
+    )
 
-    `_own_engine_layout` is that question. Asking it off the ratio again ties
-    the descriptor layout to one feature's knob, which is what the connector
-    spent a round untangling -- and the two stop agreeing the moment the layout
-    stops meaning "a window is present". Two reads are not the question and are
-    left out: deriving the ratio, and the property that answers it.
+
+def _window_asked_outside_the_layout() -> list[str]:
+    """Where the package asks the shape for a window rather than asking layout.
+
+    Two questions ride on the window and they came apart: `_own_engine_layout`
+    is "does this engine build the whole-engine lists", which a hybrid writing
+    part of a block also answers yes, and `_window_grid` is "is there a window
+    range, and how is it cut". Asking either off the ratio ties the descriptor
+    layout back to one knob, which is what the connector spent a round
+    untangling. Reading the ratio for its value is not the question, and
+    neither is `base_worker` reporting what the knob itself came to.
     """
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import rbln_nixl
 
@@ -107,12 +122,13 @@ def _sw_ratio_asked_as_a_question() -> list[str]:
     found: list[str] = []
     for path in sorted(root.glob("*.py")):
         if path.name == "base_worker.py":
-            continue  # where the ratio is derived from the group specs
+            continue  # where the window knob's own outcome is reported
         tree = ast.parse(path.read_text())
         answers = {
             node
             for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "_own_engine_layout"
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("_own_engine_layout", "_window_grid")
         }
         skip = {id(sub) for node in answers for sub in ast.walk(node)}
         for node in ast.walk(tree):
@@ -125,14 +141,11 @@ def _sw_ratio_asked_as_a_question() -> list[str]:
             else:
                 continue
             for test in tests:
-                for sub in ast.walk(test):
-                    if (
-                        isinstance(sub, ast.Attribute)
-                        and sub.attr == "_sw_ratio"
-                        and isinstance(sub.value, ast.Name)
-                        and sub.value.id == "self"
-                    ):
-                        found.append(f"{path.name}:{sub.lineno}")
+                found += [
+                    f"{path.name}:{sub.lineno}"
+                    for sub in ast.walk(test)
+                    if _is_window_question(sub)
+                ]
     return sorted(set(found))
 
 
@@ -271,19 +284,18 @@ def test_the_check_sees_a_read_across_two_lifetimes():
 
 def test_the_layout_question_is_asked_in_one_place():
     # `_own_engine_layout` is what every builder, peer mirror and index
-    # arithmetic dispatches on. Reading the ratio for yes/no instead binds the
+    # arithmetic dispatches on. Asking the shape for a window instead binds the
     # descriptor layout to whichever feature happens to set the ratio.
-    assert _sw_ratio_asked_as_a_question() == []
+    assert _window_asked_outside_the_layout() == []
 
 
-def test_the_check_sees_a_ratio_asked_as_a_question():
-    # Without this the test above passes on a rule that matches nothing.
-    tree = ast.parse("if self._sw_ratio is None:\n    pass\n")
-    asked = [
-        sub
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        for sub in ast.walk(node.test)
-        if isinstance(sub, ast.Attribute) and sub.attr == "_sw_ratio"
-    ]
-    assert len(asked) == 1
+def test_the_check_sees_a_window_asked_outside_the_layout():
+    # Without this the test above passes on a rule that matches nothing. The
+    # nesting is the part that can silently stop matching: the read the rule
+    # looks for goes through the shape, not straight off `self`.
+    tree = ast.parse(
+        "if self._shape.window_ratio is None:\n    pass\n"
+        "if self._shape.has_window_range:\n    pass\n"
+        "if self.window_ratio:\n    pass\n"
+    )
+    assert len([n for n in ast.walk(tree) if _is_window_question(n)]) == 2

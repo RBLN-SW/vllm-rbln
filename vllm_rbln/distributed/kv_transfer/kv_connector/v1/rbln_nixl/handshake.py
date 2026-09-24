@@ -157,7 +157,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             "same regions in the same order, but this peer narrows ours to "
             f"{region_ids} of {self.num_regions}"
         )
-        assert len(handles) == len(plan.all_source_ranks)
+        assert len(handles) == len(plan.all_source_ranks), (
+            f"RBLN NIXL: {len(handles)} handle(s) for "
+            f"{len(plan.all_source_ranks)} source rank(s); the plan pairs "
+            "them by position"
+        )
         # A pipeline-parallel peer cannot reach here (rejected during the
         # handshake), so the rank we hold is the peer's TP rank as planned.
         return handles[plan.all_source_ranks.index(global_rank)]
@@ -327,7 +331,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if self.use_host_buffer:
             return
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
-        if tp_ratio != 1 and self._has_swa:
+        if tp_ratio != 1 and self._shape.has_swa:
             raise RuntimeError(
                 "RBLN NIXL D2D: sliding-window attention is not supported with "
                 f"heterogeneous tensor parallelism (tp_ratio={tp_ratio})."
@@ -342,6 +346,23 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 "attention cache is packed for the rbln_custom_ops kernels and "
                 "split for rbln_triton_ops, so both ends of a transfer must "
                 "run under the same use_custom_kernel setting."
+            )
+        peer_swa_block = nixl_agent_meta.swa_kernel_block
+        # Only a window range is cut by this number. Without one the lists are
+        # whole blocks of the full-attention view, which is the same shape
+        # under either geometry, so the pair is describable and stays allowed.
+        if (
+            self._window_grid_cut is not None
+            and peer_swa_block
+            and peer_swa_block not in self._swa_kernel_blocks
+        ):
+            raise RuntimeError(
+                f"RBLN NIXL D2D: the peer's sliding-window kernel addresses "
+                f"its cache in {peer_swa_block}-token blocks and this "
+                f"worker's in {sorted(self._swa_kernel_blocks)}, so the two "
+                "window ranges name different pieces of the same block. Both "
+                "ends have to run under the same sub-block prefix caching "
+                "setting."
             )
         n_remote = len(nixl_agent_meta.kv_caches_base_addr)
         peer_layers = len(nixl_agent_meta.registered_layer_names)
@@ -421,10 +442,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
         # Both ranges that name less than a block cut it by a number derived
         # from OUR block size -- the chunk grid from it, the window range from
-        # `_sw_ratio` -- and both lists are cut by that one number. A peer whose
+        # `window_ratio` -- and both lists are cut by that one number. A peer whose
         # block holds a different count is then cut into pieces that are not its
         # own, while every byte count still fits.
-        if (self._chunk_mode or self._own_engine_layout) and (
+        if (self._shape.writes_part_of_a_block or self._own_engine_layout) and (
             nixl_agent_meta.block_size != self.block_size
         ):
             raise RuntimeError(
@@ -664,9 +685,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
     def _is_head_matched_peer(self, remote_tp_size: int) -> bool:
         """Whether this peer is served by ``_build_head_matched_remote``.
 
-        Any unequal TP degree, in either direction, on D2D without SWA
-        window mode. ``tp_ratio`` is pure arithmetic on the two TP sizes, so this
-        is safe to ask before the engine is registered.
+        Any unequal TP degree, in either direction, on D2D where this engine
+        does not own the whole-engine lists. ``_own_engine_layout`` reads a knob
+        registration settles, so this answers only from then on.
         """
         if self.use_host_buffer or self._own_engine_layout:
             return False
@@ -748,7 +769,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             # runs none in the reverse shape, where ours is the finer one.
             local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
             if pp_size > 1 or local_pp > 1:
-                if self._has_swa:
+                if self._shape.has_swa:
                     raise RuntimeError(
                         "RBLN NIXL: sliding-window attention combined with "
                         "pipeline-parallel P/D is not supported."
@@ -1118,10 +1139,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         where upstream names a block once and our list names it per range.
         """
         # Trimming narrows a block rather than a peer, and the per-shard ids
-        # are what can leave part of one out -- except where a sliding window
-        # already gave the whole-engine list a second range, which is the one
-        # list that can carry a third and the only one that can name two KV
-        # groups.
+        # are what can leave part of one out. Streaming narrows neither: its
+        # own descriptors are what give a notification room to say which blocks
+        # a write filled. Both give way to a sliding window, whose view leaves
+        # the whole-engine list the only place such a range can sit.
         return (
             pp_size > 1
             or partial
@@ -1129,7 +1150,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             or split > 1
             or fanout > 1
             or kv_runs > 1
-            or (self._chunk_mode and not self._own_engine_layout)
+            or ((self._shape.writes_part_of_a_block) and not self._own_engine_layout)
         )
 
     def _register_shard_xfer_state(
@@ -1150,12 +1171,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # descriptors on one block. A head cut names no span with a position,
         # so none of that applies to it.
         assert (
-            not self._chunk_mode
+            not (self._shape.writes_part_of_a_block)
             or self._spans_per_block == 1
             or (peer_areas is None and split == 1 and replica_fanout == 1)
         )
         # Compute the local region ids once and reuse them for the handler
-        # (PP context is always the shard path: SWA + PP is rejected earlier).
+        # (SWA never reaches a pipelined peer: it is rejected earlier).
         region_ids = self._shard_local_region_ids(
             registered_layer_names, peer_areas=peer_areas
         )
@@ -1347,7 +1368,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
 
         remote_engine_id = nixl_agent_meta.engine_id
         remote_info = self.topo.get_engine_info(remote_engine_id)
-        assert remote_info.remote_tp_size == remote_tp_size
+        assert remote_info.remote_tp_size == remote_tp_size, (
+            f"RBLN NIXL: {remote_engine_id} is registered at TP "
+            f"{remote_info.remote_tp_size} and handshaking at {remote_tp_size}"
+        )
         # A producer with FEWER TP ranks is matched per head band; the other
         # direction never reaches here, rejected during the handshake.
         pp_tp_ratio = self.topo.tp_ratio(remote_tp_size)
@@ -1364,7 +1388,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         assert self.topo.block_size_ratio(nixl_agent_meta.block_size) == 1, (
             "PP over NIXL P/D requires equal P/D block sizes."
         )
-        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
+        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks, (
+            f"RBLN NIXL: {remote_engine_id} advertised "
+            f"{nixl_agent_meta.num_blocks} block(s) after registering "
+            f"{self.dst_num_blocks[remote_engine_id]}; a descriptor id is "
+            "region * blocks + block"
+        )
         rpl = self._regions_per_layer()
         n_remote = len(nixl_agent_meta.kv_caches_base_addr)
         assert (
@@ -1428,66 +1457,56 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
         indexes_into_remote = not self.topo.is_kv_replicated(engine_id) and tp_ratio > 0
 
-        # SWA window mode never meets fan-in: unequal TP is head-matched, and
-        # _check_d2d_region_pairing rejects SWA with any of it.
+        # The whole-engine lists never meet fan-in: unequal TP is head-matched,
+        # and _check_d2d_region_pairing rejects SWA with any of it.
         assert tp_ratio >= 0, (
-            "RBLN NIXL SWA window mode does not support remote TP > local TP "
+            "RBLN NIXL whole-engine lists do not support remote TP > local TP "
             f"(tp_ratio={tp_ratio})."
         )
 
         blocks_data: list[tuple[int, int, int]] = []
         num_blocks = nixl_agent_meta.num_blocks
 
-        # Two passes when SWA is present: Full descs first, then the window
-        # range over the same base addresses, cutting each block into the
-        # `sw_ratio` kernel blocks that tile it.
-        # `_own_engine_layout` does not narrow the ratio -- read it once.
-        sw_ratio = self._sw_ratio
-        assert sw_ratio is not None
         pieces: list[tuple[int, int, int, int]] = []
-        for units in (1, sw_ratio):
-            for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
-                local_block_len = self.get_backend_aware_kv_block_len(
-                    layer_idx=i, first_split=True, mamba_view=False
+        for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
+            local_block_len = self.get_backend_aware_kv_block_len(
+                layer_idx=i, first_split=True, mamba_view=False
+            )
+            remote_kv_block_len = local_block_len // block_size_ratio
+            if block_size_ratio > 1:
+                local_block_len = remote_kv_block_len
+            rank_offset = (
+                self.tp_rank % tp_ratio * remote_kv_block_len
+                if indexes_into_remote
+                else 0
+            )
+            page_size = nixl_agent_meta.block_lens[i]
+            pieces.append(
+                (
+                    base_addr + rank_offset,
+                    local_block_len,
+                    page_size,
+                    nixl_agent_meta.device_id,
                 )
-                remote_kv_block_len = local_block_len // block_size_ratio
-                if block_size_ratio > 1:
-                    local_block_len = remote_kv_block_len
-                desc_len = local_block_len // units
-                rank_offset = (
-                    self.tp_rank % tp_ratio * remote_kv_block_len
-                    if indexes_into_remote
-                    else 0
-                )
-                page_size = nixl_agent_meta.block_lens[i]
-                # The step from one granule to the next is the peer's own, as
-                # the K-to-V step was in `_head_matched_desc`; the two ends hold
-                # the same layout here.
-                unit_stride = page_size // units
-                if units == 1:
-                    pieces.append(
-                        (
-                            base_addr + rank_offset,
-                            desc_len,
-                            page_size,
-                            nixl_agent_meta.device_id,
-                        )
+            )
+            for block_id in range(num_blocks):
+                blocks_data.append(
+                    (
+                        base_addr + block_id * page_size + rank_offset,
+                        local_block_len,
+                        nixl_agent_meta.device_id,
                     )
-                for block_id in range(num_blocks):
-                    addr = base_addr + block_id * page_size + rank_offset
-                    for unit in range(units):
-                        blocks_data.append(
-                            (
-                                addr + unit * unit_stride,
-                                desc_len,
-                                nixl_agent_meta.device_id,
-                            )
-                        )
+                )
 
         # Derived here rather than passed between the lists: a range one side
-        # carries and the other does not pairs chunk descriptors against whole
+        # carries and the other does not pairs its descriptors against whole
         # blocks, and the length check ahead of a transfer compares how many
         # indices each side named, not how far they reach.
+        window = self._window_grid_cut
+        if window is not None:
+            blocks_data += self._chunk_range_descs(
+                pieces, num_blocks=num_blocks, grid=window
+            )
         grid = self._shard_chunk_grid(block_size=nixl_agent_meta.block_size, split=1)
         if grid is not None:
             blocks_data += self._chunk_range_descs(
@@ -1496,11 +1515,13 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
 
         logger.info(
             "RBLN NIXL: %d remote descriptor(s) for engine %s rank %d: whole, "
-            "%d sliding-window granule(s) each, and %s.",
+            "%s, and %s.",
             len(blocks_data),
             engine_id,
             remote_tp_rank,
-            self._sw_ratio,
+            f"a window range of {window[0]} run(s) x {window[1]} granule(s)"
+            if window is not None
+            else "no window range",
             f"a chunk range of {grid[0]} run(s) x {grid[1]} chunk(s)"
             if grid is not None
             else "no chunk range",

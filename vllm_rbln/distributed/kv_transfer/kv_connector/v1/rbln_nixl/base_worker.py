@@ -20,14 +20,6 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
-    get_representative_spec_type,
-)
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.handshake import (
     RblnNixlHandshakeMixin,
@@ -35,15 +27,18 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.handshake impor
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
     connector_option,
+    transfer_shape,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.registration import (
     RblnNixlRegistrationMixin,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
+    RequestTail,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
     RblnNixlTransferMixin,
 )
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -65,16 +60,21 @@ class RblnNixlWorkerBase(
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
+        # Settled first because nothing in it is an attribute upstream sets --
+        # the knobs and the groups are both arguments. That is what lets the
+        # scheduler run the same reduction and reach the same answer.
+        self._shape = transfer_shape(
+            vllm_config,
+            kv_cache_config.kv_cache_groups,
+            writes_into_peer=self._writes_into_peer,
+        )
+
         # Upstream's PP>1 refusal reads "not FullAttentionSpec" as "the region
         # count varies per layer", misjudging one merged group of full
         # attention specs: uniform per layer, yet not a FullAttentionSpec.
         # Mamba and sliding window merge the same way and do vary, so suppress
         # for that shape alone. TODO: drop once upstream tests uniformity.
-        groups = kv_cache_config.kv_cache_groups
-        group_spec = groups[0].kv_cache_spec if len(groups) == 1 else None
-        suppress = isinstance(group_spec, UniformTypeKVCacheSpecs) and issubclass(
-            get_representative_spec_type(group_spec), FullAttentionSpec
-        )
+        suppress = self._shape.groups_uniform_per_layer
         scheduler_config = vllm_config.scheduler_config
         hma_disabled = scheduler_config.disable_hybrid_kv_cache_manager
         scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled or suppress
@@ -116,13 +116,22 @@ class RblnNixlWorkerBase(
 
         # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
         # buffer; restore it — NIXL cannot register RBLN device memory.
-        self.use_host_buffer = self.kv_buffer_device == "cpu"
+        self.use_host_buffer = self._shape.use_host_buffer
         if self.use_host_buffer:
-            # Either knob puts a second descriptor range on the lists. Refused
+            # Each knob needs the descriptor lists of the direct path. Refused
             # here rather than left inert, since an operator who named one is
-            # owed the reason it cannot be served.
-            for knob in ("chunk_mode", "swa_window_mode"):
-                if connector_option(vllm_config, knob, False):
+            # owed the reason it cannot be served. `push_stream` only on the
+            # side that would act on it: the other gets the same config and
+            # the shape has already made it inert there.
+            for knob, asked in (
+                ("chunk_mode", self._shape.chunk_mode),
+                ("swa_window_mode", self._shape.wants_window),
+                (
+                    "push_stream",
+                    self._shape.wants_stream and self._shape.writes_into_peer,
+                ),
+            ):
+                if asked:
                     raise RuntimeError(
                         f"RBLN NIXL: {knob} needs the descriptor lists of the "
                         "direct path; host staging registers one full-shape "
@@ -130,8 +139,6 @@ class RblnNixlWorkerBase(
                         "upstream built, and a second range extends neither."
                     )
 
-        # 0 is "nobody named one": a stripe is a byte width, so no width is a
-        # width the adapter is never handed.
         # 0 is a width the adapter takes, so it cannot stand for "nobody named
         # one" -- this knob carries its absence instead.
         self._stripe_width = connector_option(
@@ -152,10 +159,6 @@ class RblnNixlWorkerBase(
         # (`get_kv_cache_shape`), which is one unless the attention cache packs
         # both. Host staging registers whole logical buffers and stays here.
         self._kv_per_block: int = 1
-        # Whether a transfer may carry less than a whole block. What it
-        # leaves out is a token range of that block.
-        self._chunk_mode: bool = False
-
         # Model-wide counts, not this rank's share. None where the layer has
         # no head band (`_layer_kv_heads`).
         self._logical_region_kv_heads: list[int | None] = []
@@ -193,9 +196,13 @@ class RblnNixlWorkerBase(
         # This engine's own grid, set once registration knows the geometry.
         # None wherever a chunk is the whole span (see `_shard_chunk_grid`).
         self._chunk_grid: tuple[int, int] | None = None
+        # The window range's grid, and the observation it is cut by. Both are
+        # the runner's answer, so both wait for registration.
+        self._window_grid_cut: tuple[int, int] | None = None
+        self._swa_kernel_blocks: set[int] = set()
         # How far the request being transferred fills its last block, parked
         # for the length of one upstream call (`_tail_viewed_as`).
-        self._request_tail: tuple[int | None, int | None] | None = None
+        self._request_tail: RequestTail | None = None
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.
         self.local_seen_layer_names: list[str] = []
@@ -210,85 +217,40 @@ class RblnNixlWorkerBase(
 
         # SWA window mode: a second range at the same NIXL base addrs as the
         # Full range, cutting each block into the kernel blocks a window moves
-        # in. Storage and host copies stay Full.
+        # in. Storage and host copies stay Full. Which knobs ask for it, and
+        # whether this engine can serve one, the shape has already settled.
         self._group_specs: list[Any] = [
             g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
         ]
-        # Whether the model has a sliding window at all, which decides the model
-        # parallelism guards; `_sw_ratio` is the window mode's desc layout and only
-        # ever set when that flag is on.
-        self._has_swa = any(
-            isinstance(spec, SlidingWindowSpec) for spec in self._group_specs
-        )
-        self._sw_ratio: int | None = None
-        # Chunk mode turns window mode on rather than asking for it: a hybrid
-        # is describable only by the whole-engine lists, and those carry a
-        # second range only in window mode. Without it `_own_engine_layout` is
-        # false and the whole list goes to upstream, which has room for neither
-        # that range nor the chunk range beside it.
-        swa_window_mode = connector_option(self.vllm_config, "swa_window_mode", False)
-        if self._has_swa and (
-            swa_window_mode or connector_option(self.vllm_config, "chunk_mode", False)
+        if self._shape.wants_window and not self._shape.has_window_range:
+            raise RuntimeError(
+                "RBLN NIXL: swa_window_mode asks for a second descriptor range "
+                "of one sliding window, and this engine has no window to cut "
+                "by -- no sliding-window group, or one as wide as its block."
+            )
+        if (
+            self._shape.wants_stream
+            and self._shape.writes_into_peer
+            and not self._shape.streams_prefix
         ):
-            ratios: set[int] = set()
-            for spec in self._group_specs:
-                if not isinstance(spec, SlidingWindowSpec):
-                    continue
-                assert spec.block_size % spec.sliding_window == 0
-                ratio = spec.block_size // spec.sliding_window
-                ratios.add(ratio)
-                if ratio == 1:
-                    continue
-                # Which granule the range names is read off the request's token
-                # count, and that is where the window is only where it slides.
-                # This spec's manager leases one block a request and the runner
-                # reads its first granule, wherever the count points.
-                if isinstance(spec, RBLNSlidingWindowSpec):
-                    raise RuntimeError(
-                        "RBLN NIXL: a window range needs a window that moves "
-                        "through its block, and this engine pins every one to "
-                        "the block's first kernel block. Turn off whichever of "
-                        "swa_window_mode and chunk_mode asked for one."
-                    )
-            if len(ratios) > 1:
-                # The builder reads a group as windowed from its spec and then
-                # cuts it by the one ratio this engine carries, so a group that
-                # tiles its block differently would be named in another group's
-                # granules -- part of its block, with the descriptor count
-                # unchanged.
-                raise RuntimeError(
-                    "RBLN NIXL: every sliding-window group has to cut its "
-                    "block into the same number of kernel blocks, and this "
-                    f"engine's groups cut it into {sorted(ratios)} kernel "
-                    "block(s)."
-                )
-            self._sw_ratio = next((r for r in ratios if r != 1), None)
-            if self._sw_ratio is None and swa_window_mode:
-                # Doing nothing is right here -- a granule would be the block,
-                # so the range would repeat what the whole one names. Saying so
-                # is what was missing: the knob is set and nothing follows.
-                logger.info(
-                    "RBLN NIXL: swa_window_mode registered no window range. "
-                    "Every sliding-window group here holds a window as wide as "
-                    "its block, so a granule is the block."
-                )
-            if self._sw_ratio is not None:
-                # Fail at startup rather than at the first handshake: the
-                # two desc ranges `register_local_xfer_handler` builds and a
-                # key-only latent have not been combined.
-                if self.use_mla:
-                    raise RuntimeError(
-                        "RBLN NIXL: SWA window mode is not supported with a "
-                        "sliding-window MLA cache."
-                    )
-                if not swa_window_mode:
-                    logger.warning(
-                        "RBLN NIXL: chunk_mode turned SWA window mode on over "
-                        "swa_window_mode=0 -- a hybrid engine is "
-                        "describable only by the lists that range sits in."
-                    )
-                logger.info(
-                    "SWA window mode on: %d sliding_window-sized desc(s) per "
-                    "block alongside the Full descs at shared base addrs.",
-                    self._sw_ratio,
-                )
+            raise RuntimeError(
+                "RBLN NIXL: push_stream hands over a prefill's closed "
+                "prefix ahead of the request, and this engine cannot say "
+                "which of its KV cache groups a batch filled -- that "
+                "takes lists of its own, and neither a single group nor a "
+                "sliding window gives it any."
+            )
+        if self._shape.has_window_range:
+            # A backstop: `patches/attention.py` refuses a sliding-window MLA
+            # layer while the engine is being built, so no such group reaches
+            # here. The two desc ranges `register_local_xfer_handler` builds
+            # and a key-only latent have not been combined.
+            assert not self.use_mla, (
+                "RBLN NIXL: SWA window mode is not supported with a "
+                "sliding-window MLA cache."
+            )
+            logger.info(
+                "SWA window mode on: %d sliding_window-sized desc(s) per "
+                "block alongside the Full descs at shared base addrs.",
+                self._shape.window_ratio,
+            )
