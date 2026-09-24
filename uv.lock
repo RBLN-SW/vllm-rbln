@@ -1529,6 +1529,10 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+audio = [
+    { name = "soundfile" },
+    { name = "soxr" },
+]
 image = [
     { name = "opencv-python-headless" },
 ]
@@ -3031,6 +3035,36 @@ wheels = [
 ]
 
 [[package]]
+name = "soundfile"
+version = "0.14.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "cffi" },
+    { name = "numpy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/soundfile/0.14.0/soundfile-0.14.0.tar.gz", hash = "sha256:ba1c1a2d618bca5c406647c83b89f07cc8810fa506a50622a6993ba130c1de11" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/soundfile/0.14.0/soundfile-0.14.0-py2.py3-none-any.whl", hash = "sha256:8ba81ae3a89fd5ab3bef8a8eb481fbbe794e806309675a89b4df48b8d31908a8" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/soundfile/0.14.0/soundfile-0.14.0-py2.py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:1e38bac1853412871318e82a1ba69a8be677619b56025bbfcccdb41b6cafe82d" },
+]
+
+[[package]]
+name = "soxr"
+version = "1.1.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/soxr/1.1.0/soxr-1.1.0.tar.gz", hash = "sha256:9f228ae21c78fa9359ca98d8a5e8e91f30639e438e574133dace62c5b5309e44" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/soxr/1.1.0/soxr-1.1.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:26925618945f1a44dfbd783cc572874f0685e9ecdf46b96f4000f6b8c9c8b825" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/soxr/1.1.0/soxr-1.1.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3da87e3ffa3e41823d873b051c7ecb2acebd8d1b6b46b752f5facf10a0d84ab9" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/soxr/1.1.0/soxr-1.1.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3b033078e86f3c4a658e5697fac8995764fad9e799563616b630136b613167f1" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/soxr/1.1.0/soxr-1.1.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f4977323ef9c3aa3c2a26ff5fe0191c84b8fd759daf7afb1f25a91a55ad8b730" },
+]
+
+[[package]]
 name = "sse-starlette"
 version = "3.4.6"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
@@ -3471,6 +3505,18 @@ wheels = [
     { url = "https://wheels.vllm.ai/568afb3a13806beb53bb2e6bd518269357b237c0/vllm-0.26.0%2Bcpu-cp38-abi3-manylinux_2_34_x86_64.whl" },
 ]
 
+[package.optional-dependencies]
+audio = [
+    { name = "av", version = "17.1.0", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
+    { name = "av", version = "18.0.0", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.11'" },
+    { name = "mistral-common", extra = ["audio"] },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }, marker = "python_full_version >= '3.12'" },
+    { name = "soundfile" },
+    { name = "soxr" },
+]
+
 [[package]]
 name = "vllm-rbln"
 source = { editable = "." }
@@ -3491,6 +3537,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+audio = [
+    { name = "vllm", extra = ["audio"] },
+]
 build = [
     { name = "build" },
     { name = "setuptools-scm" },
@@ -3553,8 +3602,9 @@ requires-dist = [
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
     { name = "vllm", specifier = "==0.26.0+cpu", index = "https://wheels.vllm.ai/0.26.0/cpu" },
+    { name = "vllm", extras = ["audio"], marker = "extra == 'audio'", index = "https://wheels.vllm.ai/0.26.0/cpu" },
 ]
-provides-extras = ["examples", "test", "build", "dev", "runtime", "kv-connectors"]
+provides-extras = ["examples", "audio", "test", "build", "dev", "runtime", "kv-connectors"]
 
 [[package]]
 name = "watchfiles"
