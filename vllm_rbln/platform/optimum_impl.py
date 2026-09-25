@@ -157,5 +157,7 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
         _disable_prefix_caching(vllm_config, "pooling models")
     elif _uses_sliding_window(hf_config):
         _disable_prefix_caching(vllm_config, "sliding window models")
+    elif model_config.is_hybrid:
+        _disable_prefix_caching(vllm_config, "hybrid models")
     elif (getattr(hf_config, "quantization_config", None) or {}).get("kv_cache_scheme"):
         _disable_prefix_caching(vllm_config, "quantized KV cache models")
