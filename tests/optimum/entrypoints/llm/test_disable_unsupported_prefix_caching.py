@@ -15,7 +15,7 @@
 from types import SimpleNamespace
 
 import pytest
-from vllm.transformers_utils.config import get_config
+from vllm.config import ModelConfig
 
 from vllm_rbln.platform.optimum_impl import disable_unsupported_prefix_caching
 
@@ -35,16 +35,13 @@ QUANTIZED_LINEARS_ONLY = [
     "RedHatAI/Llama-3.3-70B-Instruct-quantized.w8a8",
 ]
 
+HYBRID = ["Qwen/Qwen3.5-0.8B"]
+
 
 def _vllm_config(model_id: str) -> SimpleNamespace:
-    """The fields the guard reads, around the hf_config vLLM would load."""
-    hf_config = get_config(model_id, trust_remote_code=False)
+    """The fields the guard reads, around the ModelConfig vLLM would build."""
     return SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=hf_config,
-            architectures=hf_config.architectures,
-            runner_type="generate",
-        ),
+        model_config=ModelConfig(model_id, trust_remote_code=False),
         cache_config=SimpleNamespace(enable_prefix_caching=True),
     )
 
@@ -61,3 +58,10 @@ def test_quantized_linears_alone_keep_prefix_caching(model_id):
     vllm_config = _vllm_config(model_id)
     disable_unsupported_prefix_caching(vllm_config)
     assert vllm_config.cache_config.enable_prefix_caching is True
+
+
+@pytest.mark.parametrize("model_id", HYBRID)
+def test_hybrid_disables_prefix_caching(model_id):
+    vllm_config = _vllm_config(model_id)
+    disable_unsupported_prefix_caching(vllm_config)
+    assert vllm_config.cache_config.enable_prefix_caching is False

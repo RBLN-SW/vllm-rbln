@@ -102,6 +102,9 @@ class RBLNOptimumScheduler(Scheduler):
         self.grammar_compile_error_reqs: set[str] = set()
         self.reset_preempted_req_ids: set[str] = set()
         self.observability_config = vllm_config.observability_config
+        self.spec_decode_metrics_level = (
+            self.observability_config.per_request_spec_decode_metrics
+        )
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
             self.kv_metrics_collector = KVCacheMetricsCollector(
@@ -109,6 +112,8 @@ class RBLNOptimumScheduler(Scheduler):
             )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+        self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
+        self.model_uses_mrope = vllm_config.model_config.uses_mrope
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -260,6 +265,9 @@ class RBLNOptimumScheduler(Scheduler):
             raise NotImplementedError("enable_return_routed_experts is not supported.")
 
         self.enable_return_routed_experts = False
+        if vllm_config.model_config.return_sampling_mask:
+            raise NotImplementedError("return_sampling_mask is not supported.")
+        self.return_sampling_mask = False
         # Encoder-related.
         # It is not used in RBLN.
         # But for reuse original functions(e.g. free_request) in vLLM,
@@ -282,6 +290,7 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Speculative decoding is not supported on the optimum path
         self.use_eagle = False
+        self.num_prefill_lookahead = 0
         self.num_spec_tokens = 0
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
@@ -431,6 +440,9 @@ class RBLNOptimumScheduler(Scheduler):
                     num_new_local_computed_tokens,
                     request.shared_prefix_boundary,
                 ) = self.kv_cache_manager.get_computed_blocks(request)
+                self.kv_cache_manager.record_prefix_cache_stats(
+                    request, num_new_local_computed_tokens
+                )
 
                 # Get the cached blocks for prefix caching.
                 # using new_computed_blocks, num_new_local_computed_tokens
@@ -606,7 +618,9 @@ class RBLNOptimumScheduler(Scheduler):
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(
-                req, req_to_new_blocks[req.request_id].get_block_ids()
+                req,
+                req_to_new_blocks[req.request_id].get_block_ids(),
+                uses_mrope=self.model_uses_mrope,
             )
             for req in scheduled_new_reqs
         ]
@@ -710,6 +724,7 @@ class RBLNOptimumScheduler(Scheduler):
         self,
         request: Request,
         timestamp: float,
+        drop_stale_output: bool = False,
     ) -> None:
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"

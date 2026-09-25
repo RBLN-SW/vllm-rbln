@@ -12,6 +12,14 @@ supported-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 
+[manifest]
+overrides = [
+    { name = "torch", specifier = "==2.13.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchaudio", specifier = "==2.11.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchcodec", specifier = "==0.16.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchvision", specifier = "==0.28.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
+]
+
 [[package]]
 name = "accelerate"
 version = "1.14.0"
@@ -1061,14 +1069,14 @@ wheels = [
 
 [[package]]
 name = "hf-xet"
-version = "1.5.2"
+version = "1.6.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.5.2/hf_xet-1.5.2.tar.gz", hash = "sha256:73044bd31bae33c984af832d19c752a0dffb67518fee9ddbd91d616e1101cf47" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.6.0/hf_xet-1.6.0.tar.gz", hash = "sha256:2e58454a340b3556dfa4972d5451aff4fba8dd42a236600ba1a1d2b1514f0fef" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.5.2/hf_xet-1.5.2-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8d7446f72abbf7e01ca5ff131786bc2e74a56393462c17a6bf1e303fbab81db4" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.5.2/hf_xet-1.5.2-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:e396ab0faf6298199ad7a95305c3ca8498cb825978a6485be6d00587ee4ec577" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.5.2/hf_xet-1.5.2-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "md5:0f946e0bc033c931e2abd9c238e04aad" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.5.2/hf_xet-1.5.2-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:cde8cd167126bb6109b2ceb19b844433a4988643e8f3e01dd9dd0e4a34535097" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.6.0/hf_xet-1.6.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f2f7278c05c22fd60cb436cda1269649b3e81db65ecdc8496e5e164aa4143e7b" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.6.0/hf_xet-1.6.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:35cec30d75c6f9eb9c16a77cef68e85a103b72e24d4b473714ec9ff06428bab9" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.6.0/hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "md5:8b996bcfd15a12d7fd64caf229fddf48" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/hf-xet/1.6.0/hf_xet-1.6.0-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:8fb4f71cba6129110c3374a33f919001ff130488fc23553698e34cc1c2a1198c" },
 ]
 
 [[package]]
@@ -1082,6 +1090,19 @@ dependencies = [
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/httpcore/1.0.9/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/httpcore/1.0.9/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55" },
+]
+
+[[package]]
+name = "httpcore2"
+version = "2.13.1"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "h11" },
+    { name = "truststore" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/httpcore2/2.13.1/httpcore2-2.13.1.tar.gz", hash = "sha256:e0aa977abe17e69a3b820a24542a6fa88702676d83880b8d194dcd18408e5103" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/httpcore2/2.13.1/httpcore2-2.13.1-py3-none-any.whl", hash = "sha256:e1e05d4f25f7d7d496bfb96748f6f4b67657b03da069b3a68c36069f3db73d0a" },
 ]
 
 [[package]]
@@ -1120,17 +1141,24 @@ wheels = [
 ]
 
 [[package]]
-name = "httpx-sse"
-version = "0.4.3"
+name = "httpx2"
+version = "2.13.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/httpx-sse/0.4.3/httpx_sse-0.4.3.tar.gz", hash = "sha256:9b1ed0127459a66014aec3c56bebd93da3c1bc8bb6618c8082039a44889a755d" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpcore2" },
+    { name = "idna" },
+    { name = "truststore" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/httpx2/2.13.1/httpx2-2.13.1.tar.gz", hash = "sha256:e48744a19e3af5ee48313d0ce5fe941d5422fae5705ea922a4aabf94d7800dfa" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/httpx-sse/0.4.3/httpx_sse-0.4.3-py3-none-any.whl", hash = "sha256:0ac1c9fe3c0afad2e0ebb25a934a59f4c7823b60792691f779fad2c5568830fc" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/httpx2/2.13.1/httpx2-2.13.1-py3-none-any.whl", hash = "sha256:6dff50fabc270ee5fd25d845d0b078ed20564579744d6d962850975996d2f9a4" },
 ]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.24.0"
+version = "1.33.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "click" },
@@ -1140,12 +1168,13 @@ dependencies = [
     { name = "httpx" },
     { name = "packaging" },
     { name = "pyyaml" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/huggingface-hub/1.24.0/huggingface_hub-1.24.0.tar.gz", hash = "sha256:18431ff4daae0749aa9ba102fc952e314c98e1d30ebdec5319d85ca0a83e1ae5" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/huggingface-hub/1.33.0/huggingface_hub-1.33.0.tar.gz", hash = "sha256:367be21a201db9523eddf8aeac7048f2602c1b308691c97640d5e72ed188007e" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/huggingface-hub/1.24.0/huggingface_hub-1.24.0-py3-none-any.whl", hash = "sha256:6ed4120a84a6beec900640aa7e346bd766a6b7341e41526fef5dc8bd81fb7d59" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/huggingface-hub/1.33.0/huggingface_hub-1.33.0-py3-none-any.whl", hash = "sha256:04e434b06e100eddbce9a6e817d72693a7884b10a79bd67ab48080d5c07eb899" },
 ]
 
 [[package]]
@@ -1478,15 +1507,15 @@ wheels = [
 
 [[package]]
 name = "mcp"
-version = "1.28.1"
+version = "2.2.0"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "anyio" },
-    { name = "httpx" },
-    { name = "httpx-sse" },
+    { name = "httpx2" },
     { name = "jsonschema" },
+    { name = "mcp-types" },
+    { name = "opentelemetry-api" },
     { name = "pydantic" },
-    { name = "pydantic-settings" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "python-multipart" },
     { name = "sse-starlette" },
@@ -1495,9 +1524,22 @@ dependencies = [
     { name = "typing-inspection" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/mcp/1.28.1/mcp-1.28.1.tar.gz", hash = "sha256:d51e36a5f5644faea4f85ea649bfffa6bc6c26770d42798ad6a3de3d2ba69683" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/mcp/2.2.0/mcp-2.2.0.tar.gz", hash = "sha256:2dc37ecb1974becdcebdbf7561e7c15a07dbbf20ba21ba16c3593b3038b3afbd" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/mcp/1.28.1/mcp-1.28.1-py3-none-any.whl", hash = "sha256:2726bca5e7193f61c5dde8b12500a6de2d9acf6d1a1c0be9e8c2e706437991df" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/mcp/2.2.0/mcp-2.2.0-py3-none-any.whl", hash = "sha256:bde982589473a060ae145e3406e9a5333fe538c97229ba841f5a7f92be004f81" },
+]
+
+[[package]]
+name = "mcp-types"
+version = "2.2.0"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/mcp-types/2.2.0/mcp_types-2.2.0.tar.gz", hash = "sha256:d3ed53703ddd10d9c6399f29d322bb66f3f67ab41348ac8556ba23e07fedefad" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/mcp-types/2.2.0/mcp_types-2.2.0-py3-none-any.whl", hash = "sha256:ea476b73ee86709ab5abc9452385ed36cc05907e582355622e294595c9a04f13" },
 ]
 
 [[package]]
@@ -1992,9 +2034,9 @@ dependencies = [
     { name = "packaging" },
     { name = "tokenizers" },
     { name = "torch" },
-    { name = "torchaudio", marker = "platform_python_implementation == 'CPython'" },
-    { name = "torchcodec", marker = "platform_python_implementation == 'CPython'" },
-    { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
+    { name = "torchaudio" },
+    { name = "torchcodec" },
+    { name = "torchvision" },
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
@@ -2630,7 +2672,7 @@ wheels = [
 
 [[package]]
 name = "rebel-compiler"
-version = "0.11.3.dev499+g59b3fe53.prod"
+version = "0.11.3.dev535+g66bbb96f.prod"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "attrs" },
@@ -2650,11 +2692,11 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev499+g59b3fe53.prod/rebel_compiler-0.11.3.dev499+g59b3fe53.prod-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:7865f98ddc1b467d19e72d3348cbbe44" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev499+g59b3fe53.prod/rebel_compiler-0.11.3.dev499+g59b3fe53.prod-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:10af5737c5b05dae1e37ff460ce217a5" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev499+g59b3fe53.prod/rebel_compiler-0.11.3.dev499+g59b3fe53.prod-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:ea51fefd36b89129c780a3d33bf41367" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev499+g59b3fe53.prod/rebel_compiler-0.11.3.dev499+g59b3fe53.prod-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:85cba69e5a30a97a8cd5f05af37b200b" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev499+g59b3fe53.prod/rebel_compiler-0.11.3.dev499+g59b3fe53.prod-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:33ead71a7a19d3d846616d23f05474ee" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev535+g66bbb96f.prod/rebel_compiler-0.11.3.dev535+g66bbb96f.prod-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:53e0b16c4f72b9b1fd7551ff44634769" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev535+g66bbb96f.prod/rebel_compiler-0.11.3.dev535+g66bbb96f.prod-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:7c29f97de39e10c324ae0ef65c16dcef" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev535+g66bbb96f.prod/rebel_compiler-0.11.3.dev535+g66bbb96f.prod-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:d5b2ba96ca8453e17b51c206b179dc90" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev535+g66bbb96f.prod/rebel_compiler-0.11.3.dev535+g66bbb96f.prod-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:a3cec7984622c772043e52ec9c029a12" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.11.3.dev535+g66bbb96f.prod/rebel_compiler-0.11.3.dev535+g66bbb96f.prod-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:5e35f5c30212145bd0fad5f560e81a37" },
 ]
 
 [[package]]
@@ -3146,7 +3188,7 @@ wheels = [
 
 [[package]]
 name = "torch"
-version = "2.11.0+cpu"
+version = "2.13.0+cpu"
 source = { registry = "https://download.pytorch.org/whl/cpu" }
 dependencies = [
     { name = "filelock" },
@@ -3159,18 +3201,17 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:f378df648bf7fb94bbc820dfec37d3d346bd1703c692a2215edebf6edcef8b75", upload-time = "2026-04-27T21:55:27Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:8a56a8c95531ef0e454510ba8bbd9d11dc7a9000337265210b10f6bfeacdd485", upload-time = "2026-04-28T00:05:47Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:f82e2ae20c1545bb03997d1cc3143d94e14b800038669ee1aca45808a9acc338", upload-time = "2026-04-28T00:06:24Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:45025d7752dbc6b4c784c03afaee9c5f19730ce084b2e43fc9a2fe1677d9ff86", upload-time = "2026-04-28T00:07:02Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:8713bb8679376ea0ec25742100b6cfb8447e0904c48bddefb9eb0ac1abbfa60a", upload-time = "2026-04-28T00:07:37Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:f8481ea9088e4e5b81178a75aabdbb658bde8639bc1a15fd5d8f930abc966735", upload-time = "2026-04-28T00:08:11Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:768f22924a25cad2adeb9c6cbac5159e71067c8d4019b1511960d7435a5ca652", upload-time = "2026-04-28T00:08:47Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:f5cbb61180a9793d9e12fe115a2310d2600bd449dfb9a01ec5640e21359fa5ea", upload-time = "2026-07-08T19:27:32Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:6746dbcbeb526eb61330b76b41ff1b4eb848951103a892eeb080dfa2b264667b", upload-time = "2026-07-08T19:28:16Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:4ca4a9394b0c771238a4f73590fdbbc4debad85ed0fa63d026ae1b085da7d6e2", upload-time = "2026-07-08T19:29:03Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:3fbf9c9d1f3c10c2d59d04aca426dee9ccc6ceb32d255c61e93acc3b4f75fae6", upload-time = "2026-07-08T19:29:54Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:d20fa53ee744502fa4c69818a720b05ca0d37abd055d4f6e66cae155114bc691", upload-time = "2026-07-08T19:30:45Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:b222c15a0fc2ce207d1c1a59700b46c8fa6748df1f447ad11e5c870dde0933d9", upload-time = "2026-07-08T19:31:35Z" },
 ]
 
 [[package]]
 name = "torch-rbln"
-version = "0.5.0rc1"
+version = "0.5.0rc4"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "libcst" },
@@ -3181,11 +3222,11 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc1/torch_rbln-0.5.0rc1-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:0cd6e3efc792b0b7f2663b359b2e398e" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc1/torch_rbln-0.5.0rc1-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:68f2e2a9f36adf86409011452f17cb60" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc1/torch_rbln-0.5.0rc1-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:88ffeaf4ea1af87ebfebcda311ce4b27" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc1/torch_rbln-0.5.0rc1-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:05e8f39ce1eaaf580410534f0aca364a" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc1/torch_rbln-0.5.0rc1-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:beb1aecaabdf74a0cdd7009441421bfa" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:1df61127817b113665358df094430698" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:101ed1f3cb938bd1421caf0e1133f3b5" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:99a66a08033593268a5a2b0d2d8ef736" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:2ee28d92c0a553bb235193cca32c518b" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:0bfc98f39c1be47792138846e617b803" },
 ]
 
 [[package]]
@@ -3204,21 +3245,20 @@ wheels = [
 
 [[package]]
 name = "torchcodec"
-version = "0.14.0+cpu"
+version = "0.16.0+cpu"
 source = { registry = "https://download.pytorch.org/whl/cpu" }
 wheels = [
-    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:0f1e5a4153a4739053b477474eaef1a94414f97e438b2702966fe6c75a93b589", upload-time = "2026-06-03T12:38:55Z" },
-    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:67bb31bbac7f6484d67c92e92495b0044c5cdc25898e5f3a78daf279c7270bf4", upload-time = "2026-06-03T12:38:55Z" },
-    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:0da64ee68e8103a28906e0950acc40e2501d81894c3cb2b17e461336c08ab42f", upload-time = "2026-06-03T12:38:55Z" },
-    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:7deaf484f8986d5246d81336faa8b89327192114c33b0f4582737dc0acec52ab", upload-time = "2026-06-03T12:38:55Z" },
-    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:d277e8425af0ee4dab20e1e09499171f83acbfe2f5be03e5879490279c0dfd2f", upload-time = "2026-06-03T12:38:55Z" },
-    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:30216522430b59064943509429d64eccd642e78dab6a008f46806e4f98dfd0ee", upload-time = "2026-06-03T12:38:55Z" },
-    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.14.0%2Bcpu-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:10c84b5c9eaa835c5f4cd988e1b8a4b2faff0c36f39cd9f0ca4c734e5c519a05", upload-time = "2026-06-03T12:38:56Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d3b1c4e1ef963ce4f1e8b3e9a837e1d8e2f7d79b795b7dad8482eb9921e937d5", upload-time = "2026-08-13T11:55:28Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ba08634c44e0a262baf6b9e35999603f6d42bb70e2d8b6953d07301ba9c02657", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b1014ea437a95d8565b13a56d604d5297b38edf4b6b72c279126a890b3a21efc", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5c8631a707f8bf0e68d7bc9f6b03b5cc43173091bc7fe0e0605db95be506ef15", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2538c329441cb64b27a53530bf476db1735532344fe132b081d02e4ae67bbe4c", upload-time = "2026-08-13T11:55:29Z" },
+    { url = "https://download.pytorch.org/whl/cpu/torchcodec-0.16.0%2Bcpu-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c16af9d6b2c8096542dc25e57b7db6185cb6785e2cff30ee14856789e598e248", upload-time = "2026-08-13T11:55:29Z" },
 ]
 
 [[package]]
 name = "torchvision"
-version = "0.26.0+cpu"
+version = "0.28.0+cpu"
 source = { registry = "https://download.pytorch.org/whl/cpu" }
 dependencies = [
     { name = "numpy" },
@@ -3226,13 +3266,12 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:967048f44f5bfcd05afed1c4b595cb30b4419fa0e08c296be403c88e82396c30", upload-time = "2026-03-23T15:36:09Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:7fcc4584e9f2f8914f898a01437f25b16222fb0bfb3fdeba59cb1b0c640b0995", upload-time = "2026-03-23T15:36:09Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:cf547dc0975eb40bc3249be4ccbeb736597d2c3ece305b1c4e5b7a5dd7363567", upload-time = "2026-03-23T15:36:09Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:16c4f11eda096dc377e82238c8ebb26c7013622c0f1b2c4dcf85fc70f96c0ea7", upload-time = "2026-03-23T15:36:09Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0%2Bcpu-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:870a97101168d4da68039d3d51f0c781047065e82dc4c19b2eb0ddff08486180", upload-time = "2026-03-23T15:36:09Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0%2Bcpu-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:78e88d0a57bfadcd17042aa92fe4dd1059e48fcaa2e54a10ac7f438c2eca10d5", upload-time = "2026-03-23T15:36:09Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0%2Bcpu-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:99f86ec0a83b9e4b5428a452bf667f99a9ae27d4c32bd4b2081fe917303e7710", upload-time = "2026-03-23T15:36:09Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:fc38699d69d11e563a5b1c02f621f639c4caa9e2ffe6b1ddd4aceedffc0d0578", upload-time = "2026-07-08T12:26:39Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:1dad604dfc0177ecebe0891bd9701fe2c62ec3f7819a247be541b3fb6effee99", upload-time = "2026-07-08T12:26:39Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:b545d46f4d2f9d30381281cf22874bfe1d32a8a7b0ee8396fccde89f30c6a9d9", upload-time = "2026-07-08T12:26:40Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:c6373ec4c2f922e89f45ac91889404d312ba29a31f205b0ad9a725a3894ca246", upload-time = "2026-07-08T12:26:39Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:1aa741ae0eb8668b6287dd667548e2dd10179c828db68bfdee1519763b9c5b99", upload-time = "2026-07-08T12:26:39Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.28.0%2Bcpu-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:870d0d42f2eb80f4870cd35e51eea52f596a408a671b28136f06a808846f24c5", upload-time = "2026-07-08T12:26:39Z" },
 ]
 
 [[package]]
@@ -3285,6 +3324,15 @@ wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/triton/3.7.1/triton-3.7.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:58c0e131da05134a2a4788ccbcc0c1105cf0f54c8e98f19e34cd465396dc15eb" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/triton/3.7.1/triton-3.7.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2020153b08280415ec0da6607834e79166442147e78e144df06b508c75b186d2" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/triton/3.7.1/triton-3.7.1-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10ba85fa2cca4a2fbdeb36bf1cb082f2c252bda55bf9fccd74f65ec5bc647e68" },
+]
+
+[[package]]
+name = "truststore"
+version = "0.10.4"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/truststore/0.10.4/truststore-0.10.4.tar.gz", hash = "sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/truststore/0.10.4/truststore-0.10.4-py3-none-any.whl", hash = "sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981" },
 ]
 
 [[package]]
@@ -3400,8 +3448,8 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.26.0+cpu"
-source = { registry = "https://wheels.vllm.ai/0.26.0/cpu" }
+version = "0.30.0+cpu"
+source = { registry = "https://wheels.vllm.ai/0.30.0/cpu" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -3414,6 +3462,7 @@ dependencies = [
     { name = "einops" },
     { name = "fastapi", extra = ["standard"] },
     { name = "filelock" },
+    { name = "huggingface-hub" },
     { name = "ijson" },
     { name = "intel-openmp" },
     { name = "jsonschema" },
@@ -3468,7 +3517,7 @@ dependencies = [
     { name = "xgrammar" },
 ]
 wheels = [
-    { url = "https://wheels.vllm.ai/568afb3a13806beb53bb2e6bd518269357b237c0/vllm-0.26.0%2Bcpu-cp38-abi3-manylinux_2_34_x86_64.whl" },
+    { url = "https://wheels.vllm.ai/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm-0.30.0%2Bcpu-cp38-abi3-manylinux_2_39_x86_64.whl" },
 ]
 
 [[package]]
@@ -3476,8 +3525,6 @@ name = "vllm-rbln"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
-    { name = "fastapi", extra = ["standard"] },
-    { name = "openai" },
     { name = "optimum-rbln" },
     { name = "pyyaml" },
     { name = "setuptools" },
@@ -3526,12 +3573,10 @@ requires-dist = [
     { name = "arctic-inference", marker = "extra == 'test'", specifier = "==0.1.1" },
     { name = "build", marker = "extra == 'build'" },
     { name = "datasets", specifier = ">=4.0.0" },
-    { name = "fastapi", extras = ["standard"], specifier = "<0.137" },
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0.dev0,<0.12.1" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.1.0.dev0,<0.1.1" },
-    { name = "openai", specifier = ">=2.25.0" },
     { name = "optimum-rbln", specifier = ">=0.11.3a8,<0.11.4" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
@@ -3542,17 +3587,17 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils", marker = "extra == 'examples'" },
-    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "~=0.11.3.dev499" },
+    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = "~=0.11.3.dev530" },
     { name = "setuptools", specifier = ">=64" },
     { name = "setuptools-scm", specifier = ">=8" },
     { name = "setuptools-scm", marker = "extra == 'build'" },
     { name = "simphile", marker = "extra == 'dev'" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = ">=0.5.0rc1,<0.5.1" },
+    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = ">=0.5.0rc4,<0.5.1" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "vllm", specifier = "==0.26.0+cpu", index = "https://wheels.vllm.ai/0.26.0/cpu" },
+    { name = "vllm", specifier = "==0.30.0+cpu", index = "https://wheels.vllm.ai/0.30.0/cpu" },
 ]
 provides-extras = ["examples", "test", "build", "dev", "runtime", "kv-connectors"]
 

@@ -27,7 +27,7 @@ logger = init_logger(__name__)
 
 
 def patch_upstream() -> None:
-    _allow_gemma4_global_per_layer_attribute_access()
+    pass
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
@@ -94,29 +94,6 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     sync_vllm_and_optimum(vllm_config)
 
 
-def _allow_gemma4_global_per_layer_attribute_access() -> None:
-    """Let vLLM's gemma4 config convertor read ``head_dim`` on transformers 5.15.
-
-    transformers 5.15 makes it per-layer and raises on a top-level read.
-    Fixed upstream in vllm-project/vllm#49797. TODO(vllm>=0.28.0): delete.
-    """
-    from vllm.config import model as vllm_model_config
-
-    if getattr(vllm_model_config, "_rbln_gemma4_get_config_patched", False):
-        return
-
-    orig_get_config = vllm_model_config.get_config
-
-    def get_config(*args, **kwargs):
-        config = orig_get_config(*args, **kwargs)
-        if config.model_type == "gemma4":
-            config.text_config.allow_global_per_layer_attribute_access = True
-        return config
-
-    vllm_model_config.get_config = get_config
-    vllm_model_config._rbln_gemma4_get_config_patched = True
-
-
 def _disable_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable prefix caching with warning message."""
     logger.warning(
@@ -180,5 +157,7 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
         _disable_prefix_caching(vllm_config, "pooling models")
     elif _uses_sliding_window(hf_config):
         _disable_prefix_caching(vllm_config, "sliding window models")
+    elif model_config.is_hybrid:
+        _disable_prefix_caching(vllm_config, "hybrid models")
     elif (getattr(hf_config, "quantization_config", None) or {}).get("kv_cache_scheme"):
         _disable_prefix_caching(vllm_config, "quantized KV cache models")
