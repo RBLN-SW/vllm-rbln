@@ -38,15 +38,12 @@ dependencies = [
     "setuptools-scm>=8",
     "pyyaml",
     "datasets>=4.0.0",
-    "vllm==0.26.0+cpu",
-    # vllm 0.26.0 imports openai.types.responses.NamespaceTool (openai>=2.25.0) but declares openai>=2.0.0
-    "openai>=2.25.0",
-    "fastapi[standard]<0.137",
+    "vllm==0.30.0+cpu",
     "torch",
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln>=0.5.0rc1,<0.5.1 ; platform_machine == 'x86_64'",
+    "torch-rbln>=0.5.0rc4,<0.5.1 ; platform_machine == 'x86_64'",
     "optimum-rbln>=0.11.3a8,<0.11.4",
 ]
 
@@ -75,7 +72,7 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler~=0.11.3.dev499",
+    "rebel-compiler~=0.11.3.dev530",
 ]
 kv_connectors = [
     "nixl-rbln>=0.1.0.dev0,<0.1.1",
@@ -188,10 +185,19 @@ environments = [
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
+# optimum-rbln 0.11.3a8 pins the torch 2.11 family while vllm 0.30.0 and
+# torch-rbln 0.5.0rc4 require torch 2.13. Overrides replace every declared
+# constraint on these four packages. TODO(optimum-rbln built on torch 2.13): delete.
+override-dependencies = [
+    "torch==2.13.0+cpu",
+    "torchvision==0.28.0+cpu",
+    "torchaudio==2.11.0+cpu",
+    "torchcodec==0.16.0+cpu",
+]
 
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0.26.0/cpu"
+url = "https://wheels.vllm.ai/0.30.0/cpu"
 explicit = true
 
 [[tool.uv.index]]
