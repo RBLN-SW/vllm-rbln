@@ -322,9 +322,10 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        if envs.VLLM_USE_V2_MODEL_RUNNER:
+        if vllm_config.use_v2_model_runner:
             raise ValueError(
-                "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
+                "Model runner V2 is not supported for RBLN backend. "
+                "Set VLLM_USE_V2_MODEL_RUNNER=0."
             )
 
         _impl().check_and_update(vllm_config)

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import vllm.envs as envs
 from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
@@ -45,11 +44,12 @@ class RBLNKVCacheCoordinator(UnitaryKVCacheCoordinator):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
         self.scheduler_block_size = scheduler_block_size
-        assert envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL is None, (
-            "VLLM_PREFIX_CACHE_RETENTION_INTERVAL is not supported on the RBLN "
+        assert kv_cache_config.prefix_cache_retention_interval in (None, 0), (
+            "prefix_cache_retention_interval is not supported on the RBLN "
             "optimum path. Leave it unset."
         )
         self.retention_interval = None
+        self.num_reprefillable_tokens = 0
 
         self.block_pool = RBLNBlockPool(
             kv_cache_config.num_blocks,
