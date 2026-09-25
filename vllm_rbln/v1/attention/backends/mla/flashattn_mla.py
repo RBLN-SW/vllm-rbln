@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MLAAttentionImpl,
 )
+from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 from vllm_rbln.config import RBLNConfig
@@ -107,7 +108,13 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
         indexer=None,
         q_pad_num_heads: int | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
+        # Upstream routes sparse top-k indices to the impl through a shared
+        # buffer that the index group builder assigns. RBLN's patched Indexer
+        # returns them and the patched MLAAttention.forward passes them in, so
+        # the builder has nothing to drive here; it is accepted only because
+        # MLAAttention.__init__ passes it to every sparse impl.
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
