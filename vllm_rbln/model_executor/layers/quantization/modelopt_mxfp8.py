@@ -35,9 +35,18 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
     Upstream's MIXED_PRECISION config leaves an MXFP8 layer unquantized, which
     would load the e4m3 bytes into a bf16 parameter and drop the block scales.
     Here the layer loads the fp8 weight and its ``[N, K/32]`` e8m0 scale (the
-    checkpoint's ``weight_scale_inv``, renamed by the model) and dequantizes
-    them to one bf16 weight after loading.
+    checkpoint's ``weight_scale_inv``, renamed by the model).
+
+    ``keep_fp8`` (W8A16) keeps the fp8 weight on the device and dequantizes it
+    in the graph, per 32-wide group; the compiler packs that pattern into its
+    fp8 group-32 dense (rblnTensor-pack-fp8-group-dense), so the weight costs
+    half the DRAM and half the fetch. Otherwise the weight is dequantized to
+    bf16 once, after loading.
     """
+
+    def __init__(self, keep_fp8: bool = False) -> None:
+        super().__init__()
+        self.keep_fp8 = keep_fp8
 
     def create_weights(
         self,
@@ -87,12 +96,8 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Dequantize to bf16 once, on the host: e8m0 -> 2^(e - 127) exactly (a
-        # bf16 whose exponent field is e and mantissa zero IS that power of
-        # two), times the fp8 weight per 32-wide group. The compiler's weight
-        # layout pass takes the block-FP8 (128-granular) dequant pattern but
-        # not a 32-wide group, so the layer runs as a plain bf16 linear.
-        # TODO(perf): W8A16 for these linears needs a group-32 kernel path.
+        # e8m0 -> 2^(e - 127) exactly: a bf16 whose exponent field is e and
+        # mantissa zero IS that power of two.
         weight = layer.weight.data
         device = weight.device
         out_features, in_features = weight.shape
@@ -100,6 +105,12 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         scale = (layer.weight_scale.data.to("cpu").to(torch.int16) << 7).view(
             torch.bfloat16
         )
+        if self.keep_fp8:
+            layer.weight = Parameter(weight, requires_grad=False)
+            layer.weight_scale = Parameter(scale.to(device), requires_grad=False)
+            return
+        # Dequantize to bf16 once, on the host, times the fp8 weight per
+        # 32-wide group; the layer then runs as a plain bf16 linear.
         dequant = (
             weight.to("cpu").view(out_features, in_groups, MXFP8_GROUP_SIZE).to(torch.bfloat16)
             * scale[:, :, None]
@@ -115,4 +126,15 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.nn.functional.linear(x, layer.weight, bias)
+        weight = layer.weight
+        if self.keep_fp8:
+            # The group-32 dequant the compiler packs: [N, K/32, 32] fp8 times
+            # a [N, K/32, 1] scale, flattened back to [N, K].
+            out_features, in_features = weight.shape
+            weight = (
+                weight.view(
+                    out_features, in_features // MXFP8_GROUP_SIZE, MXFP8_GROUP_SIZE
+                ).to(x.dtype)
+                * layer.weight_scale.to(x.dtype)[:, :, None]
+            ).view(out_features, in_features)
+        return torch.nn.functional.linear(x, weight, bias)
