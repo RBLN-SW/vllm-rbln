@@ -91,6 +91,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.attention import _resolve_kv_cache
+from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
 from vllm_rbln.v1.attention.backends.minimax_m3 import (
     MSA_SPARSE_BLOCK_SIZE,
     RBLNMiniMaxM3IndexerBackend,
@@ -563,9 +564,13 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
         )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
+        # KV8: the cache is a uint8 byte container of e4m3/e5m2 values, dequantized with
+        # per-tensor scales (1.0 unless a checkpoint provides them; the M3 checkpoint has no
+        # KV quantization, like MiniMax-M2.7's KV8).
+        self.kv_cache_fp8_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
+        if self.kv_cache_dtype not in ("auto", "bfloat16") and self.kv_cache_fp8_dtype is None:
             raise NotImplementedError(
-                "the RBLN MSA attention kernel reads a bf16 K/V cache; got "
+                "the RBLN MSA attention kernel reads a bf16 or fp8 K/V cache; got "
                 f"kv_cache_dtype={self.kv_cache_dtype!r}"
             )
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
@@ -586,6 +591,12 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         self.scale_tensor = torch.tensor(
             self.scaling, dtype=torch.float32, device=vllm_config.device_config.device
+        )
+        self.k_scale_tensor = torch.tensor(
+            1.0, dtype=torch.float32, device=vllm_config.device_config.device
+        )
+        self.v_scale_tensor = torch.tensor(
+            1.0, dtype=torch.float32, device=vllm_config.device_config.device
         )
 
     def get_attn_backend(self) -> type[RBLNMiniMaxM3SparseBackend]:
@@ -677,6 +688,11 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             main_metadata.seq_lens.to(torch.int32),
             main_metadata.block_tables,
             topk_index,
+            *(
+                (self.k_scale_tensor, self.v_scale_tensor, self.kv_cache_fp8_dtype)
+                if self.kv_cache_fp8_dtype is not None
+                else ()
+            ),
         )
         # [B, H_kv, G, L, D] -> [B, L, H * D]
         attn_output = attn_output.view(batch, num_heads, seq_len, head_dim).transpose(

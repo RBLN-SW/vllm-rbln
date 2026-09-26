@@ -49,6 +49,7 @@ class RBLNMiniMaxM3SparseBackend(AttentionBackend):
     """
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
+    supported_kv_cache_dtypes: ClassVar[list[str]] = ["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]
     accept_output_buffer: bool = False
 
     @staticmethod
