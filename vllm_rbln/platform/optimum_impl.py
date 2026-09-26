@@ -159,5 +159,11 @@ def disable_unsupported_prefix_caching(vllm_config: "VllmConfig") -> None:
         _disable_prefix_caching(vllm_config, "sliding window models")
     elif model_config.is_hybrid:
         _disable_prefix_caching(vllm_config, "hybrid models")
+        # vLLM already set these for prefix caching before this hook ran.
+        # Reset them to the values it uses when prefix caching is off.
+        cache_config = vllm_config.cache_config
+        if not cache_config.user_specified_mamba_block_size:
+            cache_config.mamba_block_size = model_config.max_model_len
+        cache_config.mamba_cache_mode = "none"
     elif (getattr(hf_config, "quantization_config", None) or {}).get("kv_cache_scheme"):
         _disable_prefix_caching(vllm_config, "quantized KV cache models")

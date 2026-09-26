@@ -102,6 +102,24 @@ steps:
     command:
       - "uv run --no-sync pytest -x -vvs tests/optimum/optimum_compile/converter --durations 0"
 
+  - label: ":pytest: tests/optimum/lora"
+    if_changed: *if_changed
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources: *cpu-only-resources
+    secrets: *secrets
+    depends_on: *needs_venv
+    command:
+      - "uv run --no-sync pytest -x -vvs tests/optimum/lora --durations 0"
+
+  - label: ":pytest: tests/optimum/test_optimum_rbln_config.py"
+    if_changed: *if_changed
+    image: "${DEVTOOLS_DOCKER_IMAGE}"
+    resources: *cpu-only-resources
+    secrets: *secrets
+    depends_on: *needs_venv
+    command:
+      - "uv run --no-sync pytest -x -vvs tests/optimum/test_optimum_rbln_config.py --durations 0"
+
   # ===========================================================================
   # NPU suites
   # ===========================================================================
