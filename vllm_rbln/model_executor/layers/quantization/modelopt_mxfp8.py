@@ -37,16 +37,12 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
     Here the layer loads the fp8 weight and its ``[N, K/32]`` e8m0 scale (the
     checkpoint's ``weight_scale_inv``, renamed by the model).
 
-    ``keep_fp8`` (W8A16) keeps the fp8 weight on the device and dequantizes it
-    in the graph, per 32-wide group; the compiler packs that pattern into its
-    fp8 group-32 dense (rblnTensor-pack-fp8-group-dense), so the weight costs
-    half the DRAM and half the fetch. Otherwise the weight is dequantized to
-    bf16 once, after loading.
+    W8A16: the fp8 weight stays on the device and is dequantized in the graph,
+    per 32-wide group; the compiler packs that pattern into its fp8 group-32
+    dense (rblnTensor-pack-fp8-group-dense), so the weight costs half the DRAM
+    and half the fetch. The checkpoint's scale is raw e8m0 bytes, which the
+    block-FP8 methods (float scales) do not load, hence a method of its own.
     """
-
-    def __init__(self, keep_fp8: bool = False) -> None:
-        super().__init__()
-        self.keep_fp8 = keep_fp8
 
     def create_weights(
         self,
@@ -100,25 +96,11 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         # mantissa zero IS that power of two.
         weight = layer.weight.data
         device = weight.device
-        out_features, in_features = weight.shape
-        in_groups = in_features // MXFP8_GROUP_SIZE
         scale = (layer.weight_scale.data.to("cpu").to(torch.int16) << 7).view(
             torch.bfloat16
         )
-        if self.keep_fp8:
-            layer.weight = Parameter(weight, requires_grad=False)
-            layer.weight_scale = Parameter(scale.to(device), requires_grad=False)
-            return
-        # Dequantize to bf16 once, on the host, times the fp8 weight per
-        # 32-wide group; the layer then runs as a plain bf16 linear.
-        dequant = (
-            weight.to("cpu").view(out_features, in_groups, MXFP8_GROUP_SIZE).to(torch.bfloat16)
-            * scale[:, :, None]
-        ).view(out_features, in_features)
-        layer.weight = Parameter(dequant.to(device), requires_grad=False)
-        # The scale is folded in; drop it so nothing (state dict, allocator)
-        # keeps the uint8 copy around.
-        del layer.weight_scale
+        layer.weight = Parameter(weight, requires_grad=False)
+        layer.weight_scale = Parameter(scale.to(device), requires_grad=False)
 
     def apply(
         self,
@@ -126,15 +108,13 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        weight = layer.weight
-        if self.keep_fp8:
-            # The group-32 dequant the compiler packs: [N, K/32, 32] fp8 times
-            # a [N, K/32, 1] scale, flattened back to [N, K].
-            out_features, in_features = weight.shape
-            weight = (
-                weight.view(
-                    out_features, in_features // MXFP8_GROUP_SIZE, MXFP8_GROUP_SIZE
-                ).to(x.dtype)
-                * layer.weight_scale.to(x.dtype)[:, :, None]
-            ).view(out_features, in_features)
+        # The group-32 dequant the compiler packs: [N, K/32, 32] fp8 times a
+        # [N, K/32, 1] scale, flattened back to [N, K].
+        out_features, in_features = layer.weight.shape
+        weight = (
+            layer.weight.view(
+                out_features, in_features // MXFP8_GROUP_SIZE, MXFP8_GROUP_SIZE
+            ).to(x.dtype)
+            * layer.weight_scale.to(x.dtype)[:, :, None]
+        ).view(out_features, in_features)
         return torch.nn.functional.linear(x, weight, bias)

@@ -53,12 +53,8 @@ class RBLNModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
                 return RBLNModelOptFp8LinearMethod(self.fp8_config)
             # Upstream has no MXFP8 linear and leaves the layer unquantized,
             # which loads the e4m3 bytes into bf16 and drops the block scales.
-            # Attention projections stay fp8 (W8A16); the rest still dequantize
-            # to bf16 at load.
             if quant_algo == "MXFP8":
-                return RBLNModelOptMxFp8LinearMethod(
-                    keep_fp8=".self_attn." in f".{prefix}"
-                )
+                return RBLNModelOptMxFp8LinearMethod()
         return super().get_quant_method(layer, prefix)
 
 
