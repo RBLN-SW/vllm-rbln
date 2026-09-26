@@ -34,6 +34,7 @@ and replaces the compute with RBLN-friendly code:
 The MTP head and the vision tower are not modeled; their weights are skipped.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -103,6 +104,13 @@ from vllm_rbln.v1.worker.utils import (
 )
 
 logger = init_logger(__name__)
+
+# The MSA sparse kernels exist only in the rblnscf ("new") kernel set, and in that
+# mode the dense layers' GQA attention has to take the CP op (the only rblnscf
+# body). The converter can only act on an explicit request, and this module is
+# imported in the engine process before the model is traced, so request it here.
+os.environ.setdefault("RBLN_KERNEL_MODE", "new")
+os.environ.setdefault("RBLN_EXP_USE_GCE", "1")
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
