@@ -32,6 +32,7 @@ from vllm.distributed import (
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
+from vllm.pooling_params import PoolingParams
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -252,6 +253,26 @@ def test_load_model_skips_the_pad_block_pool_on_the_ec_producer(
 
     assert model_runner.model is model
     assert not hasattr(model_runner, "available_blocks")
+
+
+def test_pool_hands_build_pooling_cursor_the_seq_lens_tensor(model_runner):
+    scheduler_output = _schedule_new_request(
+        "req_0",
+        block_ids=([1],),
+        outer_block_ids=[1],
+        pooling_params=PoolingParams(task="embed"),
+    )
+    model_runner._update_states(scheduler_output)
+    _, num_scheduled_tokens_np = model_runner._prepare_inputs(scheduler_output)
+    model_runner.model.pooler = lambda hidden_states, pooling_metadata: [
+        hidden_states[-1]
+    ]
+
+    output = model_runner._pool(torch.zeros(3, 8), 3, num_scheduled_tokens_np)
+
+    # The whole prompt was scheduled, so the pooled row is delivered.
+    assert len(output.pooler_output) == 1
+    assert output.pooler_output[0] is not None
 
 
 def test_update_states_new_request(model_runner):
