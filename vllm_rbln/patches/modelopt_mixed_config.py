@@ -24,6 +24,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
+from vllm_rbln.model_executor.layers.quantization.modelopt_mxfp8 import (
+    RBLNModelOptMxFp8LinearMethod,
+)
 from vllm_rbln.model_executor.layers.quantization.nvfp4 import (
     RBLNModelOptNvFp4FusedMoE,
 )
@@ -45,8 +48,13 @@ class RBLNModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
                     self.w4a16_nvfp4_config, layer.moe_config
                 )
         elif isinstance(layer, LinearBase) and not self.is_layer_excluded(prefix):
-            if self._resolve_quant_algo(prefix) == "FP8":
+            quant_algo = self._resolve_quant_algo(prefix)
+            if quant_algo == "FP8":
                 return RBLNModelOptFp8LinearMethod(self.fp8_config)
+            # Upstream has no MXFP8 linear and leaves the layer unquantized,
+            # which loads the e4m3 bytes into bf16 and drops the block scales.
+            if quant_algo == "MXFP8":
+                return RBLNModelOptMxFp8LinearMethod()
         return super().get_quant_method(layer, prefix)
 
 
@@ -54,7 +62,8 @@ class RBLNModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
     reason=(
         "Override the built-in ModelOpt MIXED_PRECISION (modelopt_mixed) config "
         "so NVFP4 routed-expert MoE layers dequantise through the RBLN "
-        "group-dequantise custom op instead of the upstream CUDA/Marlin kernels."
+        "group-dequantise custom op instead of the upstream CUDA/Marlin kernels, "
+        "and MXFP8 linears keep their fp8 weight + e8m0 block scales (W8A16)."
     )
 )
 def register_rbln_modelopt_mixed_config() -> None:
