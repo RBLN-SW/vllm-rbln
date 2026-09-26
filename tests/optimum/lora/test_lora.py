@@ -17,14 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 from vllm import SamplingParams, TextPrompt
-from vllm.config import (
-    CacheConfig,
-    LoRAConfig,
-    ModelConfig,
-    SchedulerConfig,
-    VllmConfig,
-    set_current_vllm_config,
-)
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
@@ -37,59 +30,25 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_rbln.model_executor.models.optimum import ModelInputForRBLN
-from vllm_rbln.model_executor.models.optimum.model_base import KVCacheBlockAdapter
+from vllm_rbln.model_executor.models.optimum.model_base import (
+    KVCacheBlockAdapter,
+    RBLNOptimumDecoderMixin,
+)
 
 NUM_LORAS = 5
-BLOCK_SIZE = 16
+BLOCK_SIZE = 128
 NUM_BLOCKS = 8
 BATCH_SIZE = 4
 MAX_LORA_RANK = 8
 MAX_MODEL_LEN = 128
 MODEL_PATH = "facebook/opt-125m"
-VOCAB_SIZE = 32000
 
-V0_PATH = "vllm_rbln.worker.optimum_model_runner.RBLNOptimumModelRunner.load_model"  # noqa
-V1_PATH = "vllm_rbln.v1.worker.optimum_model_runner.RBLNOptimumModelRunner.load_model"  # noqa
+LOAD_MODEL_PATH = (
+    "vllm_rbln.v1.worker.optimum_model_runner.RBLNOptimumModelRunner.load_model"  # noqa
+)
 
 result = []
 golden = []
-
-
-def get_vllm_config(async_scheduling=False):
-    model_config = ModelConfig(
-        MODEL_PATH,
-        dtype=torch.float,
-        seed=42,
-    )
-    scheduler_config = SchedulerConfig(
-        max_num_seqs=BATCH_SIZE,
-        max_num_batched_tokens=MAX_MODEL_LEN,
-        max_model_len=MAX_MODEL_LEN,
-        async_scheduling=async_scheduling,
-    )
-    cache_config = CacheConfig(
-        block_size=BLOCK_SIZE,
-        swap_space=0,
-        cache_dtype="auto",
-    )
-    lora_config = LoRAConfig(
-        max_lora_rank=MAX_LORA_RANK, max_cpu_loras=NUM_LORAS, max_loras=NUM_LORAS
-    )
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        scheduler_config=scheduler_config,
-        cache_config=cache_config,
-        lora_config=lora_config,
-    )
-    return vllm_config
-
-
-def get_lora_requests():
-    lora_requests = [
-        LoRARequest(str(i + 1), i + 1, "/path/adapter" + str(i + 1))
-        for i in range(NUM_LORAS)
-    ]
-    return lora_requests
 
 
 def parse_lora_int_ids(running_requests_ids):
@@ -100,18 +59,21 @@ def parse_lora_int_ids(running_requests_ids):
 
 
 async def add_lora_request(llm, lora_int_ids):
-    lora_requests = [
-        LoRARequest(str(lora_int_id), lora_int_id, "/path/adapter" + str(lora_int_id))
-        for lora_int_id in lora_int_ids
-    ]
     sampling_params = SamplingParams(
         n=1, temperature=0.0, top_p=1.0, ignore_eos=True, max_tokens=2
     )
 
     generators = []
 
-    for i, lora_request in enumerate(lora_requests):
-        lora_int_id = lora_request.lora_int_id
+    for i, lora_int_id in enumerate(lora_int_ids):
+        # 0 means no adapter, which LoRARequest rejects as an id.
+        lora_request = (
+            LoRARequest(
+                str(lora_int_id), lora_int_id, "/path/adapter" + str(lora_int_id)
+            )
+            if lora_int_id
+            else None
+        )
         generator = llm.generate(
             prompt=TextPrompt(prompt=f"hello {lora_int_id}", multi_modal_data=None),
             sampling_params=sampling_params,
@@ -125,7 +87,7 @@ async def add_lora_request(llm, lora_int_ids):
         pass
 
 
-class MockModelWrapper(nn.Module):
+class MockModelWrapper(nn.Module, RBLNOptimumDecoderMixin):
     class MockModel:
         def __init__(self):
             self.rbln_config = SimpleNamespace(
@@ -140,16 +102,29 @@ class MockModelWrapper(nn.Module):
         def set_lora_int_ids(self, lora_int_ids):
             self.lora_int_ids = lora_int_ids
 
-    def __init__(self):
+    def __init__(self, vllm_config: VllmConfig):
         super().__init__()
         self.model = self.MockModel()
-        self.logits_processor = LogitsProcessor(VOCAB_SIZE, logits_as_input=True)
+        self.dtype = vllm_config.model_config.dtype
+        self.decoder_batch_size = vllm_config.scheduler_config.max_num_seqs
+        self.use_multiple_decoder = False
+        self.rbln_model_config = {
+            "batch_size": BATCH_SIZE,
+            "max_seq_len": MAX_MODEL_LEN,
+            "kvcache_num_blocks": NUM_BLOCKS + 1,
+            "kvcache_block_size": BLOCK_SIZE,
+        }
+        self.vocab_size = vllm_config.model_config.get_vocab_size()
+        self.logits_processor = LogitsProcessor(self.vocab_size, logits_as_input=True)
         self.sampler = Sampler()
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
         request_nums = input_ids.shape[0]
-        fake_logits = torch.zeros(request_nums, 1, VOCAB_SIZE)
+        fake_logits = torch.zeros(request_nums, 1, self.vocab_size)
 
         running_requests_ids = model_input.running_requests_ids
         parsed_lora_int_ids = parse_lora_int_ids(running_requests_ids)
@@ -174,14 +149,15 @@ class MockModelWrapper(nn.Module):
 
 def fake_load_model(self):
     with set_current_vllm_config(self.vllm_config, check_compile=False):
-        self.model = MockModelWrapper()
+        self.model = MockModelWrapper(self.vllm_config)
         self.use_optimum_lora = True
         self.valid_lora_ids = list(range(NUM_LORAS + 1))
         self.model.kv_block_adapter = KVCacheBlockAdapter(
-            vllm_config=get_vllm_config(),
+            vllm_config=self.vllm_config,
             estimated_kvcache_num_blocks=NUM_BLOCKS + 1,
         )
-        self.valid_lora_ids = list(range(NUM_LORAS + 1))
+        if self.use_rbln_sampler:
+            self.prepare_rbln_sampler()
 
 
 def clear_global_vars():
@@ -232,29 +208,18 @@ async def list_loras():
 
 
 @pytest.mark.asyncio
-async def test_add_lora_v0(monkeypatch):
+async def test_add_lora(monkeypatch):
     clear_global_vars()
-    monkeypatch.setenv("VLLM_USE_V1", "0")
-    monkeypatch.setattr(V0_PATH, fake_load_model)
-    await add_lora()
-    validate_vars()
-
-
-@pytest.mark.asyncio
-async def test_add_lora_v1(monkeypatch):
-    clear_global_vars()
-    monkeypatch.setenv("VLLM_USE_V1", "1")
-    monkeypatch.setattr(V1_PATH, fake_load_model)
+    monkeypatch.setattr(LOAD_MODEL_PATH, fake_load_model)
 
     await add_lora()
     validate_vars()
 
 
 @pytest.mark.asyncio
-async def test_list_lora_v1(monkeypatch):
+async def test_list_lora(monkeypatch):
     clear_global_vars()
-    monkeypatch.setenv("VLLM_USE_V1", "1")
-    monkeypatch.setattr(V1_PATH, fake_load_model)
+    monkeypatch.setattr(LOAD_MODEL_PATH, fake_load_model)
 
     lora_ids = await list_loras()
     assert set(lora_ids) == {1, 2, 3, 4, 5}
