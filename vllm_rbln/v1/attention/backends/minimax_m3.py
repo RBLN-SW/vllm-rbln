@@ -91,9 +91,10 @@ class RBLNMiniMaxM3SparseBackend(AttentionBackend):
 
 
 class RBLNMiniMaxM3IndexerBackend(AttentionBackend):
-    """Key-only side cache of the MiniMax-M3 lightning indexer."""
+    """Key-only side cache of the MiniMax-M3 lightning indexer (bf16, or fp8 under KV8)."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[str]] = ["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]
     accept_output_buffer: bool = False
 
     @staticmethod

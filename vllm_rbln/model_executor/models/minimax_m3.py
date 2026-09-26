@@ -442,10 +442,20 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         super().__init__()
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
-        self.dtype = torch.bfloat16
+        vllm_config = get_current_vllm_config()
+        # KV8 follows the main cache: an fp8 kv_cache_dtype stores the index keys as fp8 too
+        # (uint8 container, per-tensor k_scale 1.0), as DeepseekV32IndexerCache does. The
+        # indexer kernel routes to its fp8 body off the uint8 cache.
+        cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
+        self.fp8_dtype = _fp8_cache_dtype(cache_dtype)
+        self.dtype = (
+            kv_cache_dtype_str_to_dtype(cache_dtype, vllm_config.model_config)
+            if self.fp8_dtype is not None
+            else torch.bfloat16
+        )
         self.prefix = prefix
         self.cache_config = cache_config
-        compilation_config = get_current_vllm_config().compilation_config
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -678,6 +688,11 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_metadata.seq_lens.to(torch.int32),
             index_metadata.block_tables,
             self.topk_blocks,
+            *(
+                (self.k_scale_tensor, self.indexer_cache.fp8_dtype)
+                if self.indexer_cache.fp8_dtype is not None
+                else ()
+            ),
         )
         attn_output = torch.ops.rbln_custom_ops.sparse_attn_minimax_attn(
             q5,
