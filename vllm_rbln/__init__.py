@@ -35,18 +35,6 @@ def register_model():
     """
     # TODO(vllm-rbln>=0.14.0): delete, with the entry point in pyproject.toml.
 
-    # MiniMax-M3: upstream's model binds FlashInfer / CUDA / Triton kernels at
-    # import, so the RBLN copy (MSA custom ops, RBLN MoE runner) overrides it.
-    _MINIMAX_M3_MODULE = "vllm_rbln.model_executor.models.minimax_m3"
-    ModelRegistry.register_model(
-        "MiniMaxM3SparseForCausalLM",
-        f"{_MINIMAX_M3_MODULE}:RBLNMiniMaxM3SparseForCausalLM",
-    )
-    ModelRegistry.register_model(
-        "MiniMaxM3SparseForConditionalGeneration",
-        f"{_MINIMAX_M3_MODULE}:RBLNMiniMaxM3SparseForConditionalGeneration",
-    )
-
 
 def register_ops():
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa

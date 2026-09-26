@@ -41,6 +41,7 @@ from . import (
     llama_eagle3,
     metrics,
     minimax_m2,
+    minimax_m3,
     mla,
     modelopt_mixed_config,
     models_utils,

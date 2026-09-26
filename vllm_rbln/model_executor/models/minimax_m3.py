@@ -1016,6 +1016,12 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(nn.Module, SupportsPP):
     def lm_head(self) -> nn.Module:
         return self.language_model.lm_head
 
+    @property
+    def logits_processor(self) -> nn.Module:
+        # The RBLN runner fuses compute_logits into the compiled graph only when
+        # the top-level model exposes its logits processor.
+        return self.language_model.logits_processor
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.embed_input_ids(input_ids)
 
