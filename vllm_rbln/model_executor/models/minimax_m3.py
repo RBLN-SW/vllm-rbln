@@ -184,7 +184,9 @@ def _per_head_norm(
     return norm(x).view(shape)
 
 
-def _swiglu_oai(x: torch.Tensor, alpha: float, beta: float, limit: float) -> torch.Tensor:
+def _swiglu_oai(
+    x: torch.Tensor, alpha: float, beta: float, limit: float
+) -> torch.Tensor:
     """``gate.clamp(max=limit) * sigmoid(alpha * gate) * (up.clamp(+-limit) + beta)``
     over a ``[..., 2 * I]`` (gate | up) tensor."""
     gate, up = x.chunk(2, dim=-1)
@@ -259,7 +261,9 @@ class RBLNMiniMaxM3MoE(nn.Module):
                 f"the number of experts {config.num_local_experts}."
             )
 
-        self.routed_scaling_factor = float(getattr(config, "routed_scaling_factor", 1.0))
+        self.routed_scaling_factor = float(
+            getattr(config, "routed_scaling_factor", 1.0)
+        )
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
 
         self.use_routing_bias = getattr(config, "use_routing_bias", False)
@@ -442,9 +446,10 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         vllm_config = get_current_vllm_config()
-        # KV8 follows the main cache: an fp8 kv_cache_dtype stores the index keys as fp8 too
-        # (uint8 container, per-tensor k_scale 1.0), as DeepseekV32IndexerCache does. The
-        # indexer kernel routes to its fp8 body off the uint8 cache.
+        # KV8 follows the main cache: an fp8 kv_cache_dtype stores the index keys as
+        # fp8 too (uint8 container, per-tensor k_scale 1.0), as
+        # DeepseekV32IndexerCache does. The indexer kernel routes to its fp8 body off
+        # the uint8 cache.
         cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
         self.fp8_dtype = _fp8_cache_dtype(cache_dtype)
         self.dtype = (
@@ -573,11 +578,14 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
         )
-        # KV8: the cache is a uint8 byte container of e4m3/e5m2 values, dequantized with
-        # per-tensor scales (1.0 unless a checkpoint provides them; the M3 checkpoint has no
-        # KV quantization, like MiniMax-M2.7's KV8).
+        # KV8: the cache is a uint8 byte container of e4m3/e5m2 values, dequantized
+        # with per-tensor scales (1.0 unless a checkpoint provides them; the M3
+        # checkpoint has no KV quantization, like MiniMax-M2.7's KV8).
         self.kv_cache_fp8_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
-        if self.kv_cache_dtype not in ("auto", "bfloat16") and self.kv_cache_fp8_dtype is None:
+        if (
+            self.kv_cache_dtype not in ("auto", "bfloat16")
+            and self.kv_cache_fp8_dtype is None
+        ):
             raise NotImplementedError(
                 "the RBLN MSA attention kernel reads a bf16 or fp8 K/V cache; got "
                 f"kv_cache_dtype={self.kv_cache_dtype!r}"
@@ -648,7 +656,9 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         q = _per_head_norm(q, self.q_norm, num_heads, head_dim)
         k = _per_head_norm(k, self.k_norm, num_kv, head_dim)
         q, k = self.rotary_emb(positions, q, k)
-        index_q = _per_head_norm(index_q, self.index_q_norm, self.num_idx_heads, self.idx_head_dim)
+        index_q = _per_head_norm(
+            index_q, self.index_q_norm, self.num_idx_heads, self.idx_head_dim
+        )
         index_k = self.index_k_norm(index_k)
         index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
 
@@ -767,7 +777,9 @@ class RBLNMiniMaxM3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = RBLNGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RBLNGemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.post_attention_layernorm = RBLNGemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -945,7 +957,9 @@ class RBLNMiniMaxM3Model(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
@@ -1063,7 +1077,9 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(nn.Module, SupportsPP):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.language_model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
