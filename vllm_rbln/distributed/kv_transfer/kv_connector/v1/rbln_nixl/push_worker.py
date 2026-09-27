@@ -136,9 +136,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         peer_ranks = self._overlapping_ranks.get(engine_id)
         if not peer_ranks:
             # Chunk mode asks for per-shard state, so a request written in
-            # pieces cannot arrive on this route -- unless a sliding window
-            # kept it here.
-            assert not self._chunk_mode or self._sw_ratio is not None
+            # pieces cannot arrive on this route -- unless this engine owns
+            # the whole-engine lists.
+            assert not self._chunk_mode or self._own_engine_layout
             tail: AbstractContextManager = (
                 self._tail_viewed_as(
                     self._valid_tokens.get(req_id),
@@ -146,7 +146,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     # inside `_xfer_blocks`, after the count is taken.
                     self._prompt_blocks(meta.local_physical_block_ids),
                 )
-                if self._chunk_mode
+                if self._chunk_mode or self._own_engine_layout
                 else nullcontext()
             )
             with tail:

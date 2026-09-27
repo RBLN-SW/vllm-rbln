@@ -43,8 +43,8 @@ if TYPE_CHECKING:
 # upstream does with ``NIXL_CONNECTOR_VERSION``. Folded into the NIXL compat
 # hash so an RBLN peer on another schema fails the handshake cleanly; earlier
 # bumps are `git log -L` on this line.
-#   7: the read path's completion notification carries a count, not a TP size
-RBLN_NIXL_CONNECTOR_VERSION: int = 7
+#   8: swa_kernel_block, and a window range cut by it rather than by the spec
+RBLN_NIXL_CONNECTOR_VERSION: int = 8
 
 
 class KVSplitAxis(Enum):
@@ -81,6 +81,11 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # build, so two peers off one build can differ and the version cannot tell
     # them apart. The default is the layout every version through 4 had.
     kv_per_block: int = 1
+    # Tokens a block holds in the view the sliding-window kernel reads
+    # (`_observe_swa_kernel_block`). 0 where the shard cuts no window range by
+    # it, so a PP stage without such a group pairs with any peer. Two engines
+    # whose runners chose differently cut a window range differently.
+    swa_kernel_block: int = 0
 
     @property
     def registered_layer_names(self) -> list[str]:

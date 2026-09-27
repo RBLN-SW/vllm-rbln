@@ -33,6 +33,7 @@ import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker a
 from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
     set_mock_connector_options,
+    window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
     RblnNixlPullConnectorWorker,
@@ -74,7 +75,7 @@ def _push_worker():
     # What __init__ leaves on a D2D worker with the SWA window mode off, which is
     # the shape the pairing predicates read before an engine is registered.
     w.use_host_buffer = False
-    w._sw_ratio = None
+    window_mode(w, None)
     # Off, as the connector option is; the trim tests turn it on.
     w._chunk_mode = False
     w._valid_tokens = {}
@@ -756,7 +757,8 @@ class TestReplicaFanOut:
         w.shutdown = lambda: None
         w._kv_areas, w._kv_slices = areas, slices
         w._kv_per_block = 1
-        w._sw_ratio = None
+        window_mode(w, None)
+        w._chunk_mode = False
         w.use_host_buffer = False
         w.device_id = 0
         w.block_len_per_layer = [4096] * 2
@@ -848,7 +850,7 @@ class TestTheThreeListsAgree:
         w.shutdown = lambda: None
         w._kv_areas, w._kv_slices = 4, 4
         w._kv_per_block = 1
-        w._sw_ratio = None
+        window_mode(w, None)
         w.use_host_buffer = False
         w.device_id = 0
         w.engine_id = "eng-local"
@@ -970,7 +972,8 @@ class TestTheDelegatingRouteHandsTheListOver:
             remote_tp_size=1, remote_block_size=16, remote_physical_blocks_per_logical=1
         )
         worker._chunk_mode = True
-        worker._sw_ratio = sw_ratio
+        window_mode(worker, sw_ratio)
+        worker._chunk_grid = None
         worker._request_tail = None
         worker._group_specs = [MagicMock()]  # one full-attention group
         worker._valid_tokens = {"r0": 17}

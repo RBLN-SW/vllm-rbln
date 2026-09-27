@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
     sliding_window_spec,
+    window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -68,7 +69,7 @@ class TestComputeDescIds:
         # Full group -> offset 0; SWA group -> offset num_full_descs. Each id is
         # also expanded across regions as region_id * num_blocks + id.
         worker = build_worker(monkeypatch)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 2
         full_spec = MagicMock()  # not a SlidingWindowSpec
         worker._group_specs = [
@@ -79,27 +80,28 @@ class TestComputeDescIds:
         # dst_num_blocks=4 -> num_full_descs = num_regions(2) * 4 = 8.
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        # Full ids [0,1] -> r*4 + id: 0,1 then 4,5. SWA id [2] -> r*4 + 2 + 8.
-        assert list(out) == [0, 1, 4, 5, 10, 14]
+        # Full ids [0,1] -> r*4 + id: 0,1 then 4,5. SWA id [2] -> the granules
+        # of that block, (r*4 + 2) * sw_ratio + {0,1} + 8.
+        assert list(out) == [0, 1, 4, 5, 12, 13, 20, 21]
 
     def test_block_size_ratio_scales_block_span(self, monkeypatch):
         # A block_size_ratio widens the per-region block span (num_blocks *= ratio),
         # shifting both the region stride and the SWA offset.
         worker = build_worker(monkeypatch)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 1
         worker._group_specs = [sliding_window_spec(block_size=64, sliding_window=32)]
 
         # dst_num_blocks=2, ratio=2 -> num_blocks=4, num_full_descs = 1*4 = 4.
         out = worker._compute_desc_ids([[1]], 2, 2.0, 1)
-        # single region: 0*4 + 1 + offset(4) = 5.
-        assert list(out) == [5]
+        # single region: (0*4 + 1) * sw_ratio + {0,1} + offset(4) = 6, 7.
+        assert list(out) == [6, 7]
 
     def test_rejects_multi_physical_blocks_per_logical(self, monkeypatch):
         # The SWA desc formula indexes physical blocks directly; the connector
         # pins one physical block per logical, so >1 is rejected.
         worker = build_worker(monkeypatch)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 1
         worker._group_specs = [sliding_window_spec(block_size=64, sliding_window=32)]
         with pytest.raises(AssertionError, match="physical_blocks_per_logical"):
@@ -107,7 +109,7 @@ class TestComputeDescIds:
 
     def test_empty_groups_yield_empty(self, monkeypatch):
         worker = build_worker(monkeypatch)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 1
         worker._group_specs = [MagicMock()]
         out = worker._compute_desc_ids([[]], 4, None, 1)
@@ -116,9 +118,9 @@ class TestComputeDescIds:
     @staticmethod
     def _hybrid_worker(monkeypatch, *, grid=(2, 2), tail=None):
         # Two groups over two regions, four blocks: num_full_descs = 8, so the
-        # SWA range is [8, 16) and the chunk range starts at 16.
+        # SWA range is [8, 24) at sw_ratio 2 a block, and chunks start at 24.
         worker = build_worker(monkeypatch, block_size=64)
-        worker._sw_ratio = 2
+        window_mode(worker, 2)
         worker.num_regions = 2
         worker._chunk_mode = True
         worker._kv_areas = 1
@@ -139,32 +141,22 @@ class TestComputeDescIds:
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
         # Full group keeps block 0 (ids 0, 4) and drops block 1; block 1's
-        # first chunk arrives at 16 + (r*4 + 1)*runs*chunks + run*chunks:
-        # region 0 -> 16+4, 16+6; region 1 -> 16+20, 16+22.
-        assert list(out) == [0, 4, 20, 22, 36, 38, 10, 14]
+        # first chunk arrives at 24 + (r*4 + 1)*runs*chunks + run*chunks:
+        # region 0 -> 24+4, 24+6; region 1 -> 24+20, 24+22. The window takes
+        # the one granule 65 tokens put it in.
+        assert list(out) == [0, 4, 28, 30, 44, 46, 12, 20]
 
-    def test_a_packed_block_moves_only_the_ranges_that_hold_its_halves(
-        self, monkeypatch
-    ):
-        # A whole block is one descriptor however it is packed; the window
-        # range holds two, and the chunk range starts past both.
-        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
-        worker._kv_per_block = 2
-
-        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
-
-        # Whole 0, 4 as before; chunks from 8 * (1 + 2); window at 8 + id * 2.
-        assert list(out) == [0, 4, 28, 30, 44, 46, 12, 13, 20, 21]
-
-    def test_the_windowed_group_is_never_cut(self, monkeypatch):
-        # Its descriptor IS the window, so there is no unwritten tail in it --
-        # and its blocks are the ones a chunk range does not describe.
+    def test_the_windowed_group_takes_no_chunk_range(self, monkeypatch):
+        # A granule holds no unwritten tail -- it is the window, not a block a
+        # request stopped partway into -- so a windowed group's ids stay in the
+        # window range and never reach the chunk range beyond it.
         worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        # The SWA ids are the same two the range gave before chunking existed.
-        assert list(out)[-2:] == [10, 14]
+        whole = worker.num_regions * 4
+        assert list(out)[-2:] == [12, 20]
+        assert all(whole <= i < whole * (1 + worker._sw_ratio) for i in out[-2:])
 
     def test_a_last_block_needing_every_chunk_is_left_whole(self, monkeypatch):
         # The benefit test: the same bytes in more descriptors is a loss, so
@@ -173,7 +165,7 @@ class TestComputeDescIds:
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        assert list(out) == [0, 1, 4, 5, 10, 14]
+        assert list(out) == [0, 1, 4, 5, 13, 21]
 
     def test_no_parked_tail_is_todays_ids(self, monkeypatch):
         # Nothing said how far the request fills its last block -- every block
@@ -182,7 +174,40 @@ class TestComputeDescIds:
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        assert list(out) == [0, 1, 4, 5, 10, 14]
+        assert list(out) == [0, 1, 4, 5, 12, 13, 20, 21]
+
+    def test_chunk_mode_alone_sends_the_windowed_group_whole(self, monkeypatch):
+        # The knobs are separate now. With no window range the sliding-window
+        # group's blocks go whole, and the chunk range sits one range earlier
+        # -- right after the whole-block range, not after a window range that
+        # was never built.
+        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
+        window_mode(worker, None)
+        worker._has_swa = True
+
+        out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
+
+        whole = worker.num_regions * 4
+        # Full group: block 0 whole (0, 4), block 1 as its first chunk from a
+        # range that now starts at `whole`; SWA group: block 2 whole (2, 6).
+        assert list(out) == [0, 4, whole + 4, whole + 6, whole + 20, whole + 22, 2, 6]
+
+    def test_a_block_wide_kernel_spreads_a_granule_over_its_runs(self, monkeypatch):
+        # Same spec, other geometry: a granule is a token range of a block, so
+        # every run of it goes and the range is `runs` times as long.
+        worker = self._hybrid_worker(monkeypatch, grid=None, tail=None)
+        window_mode(worker, 2, runs=3)
+
+        out = worker._compute_desc_ids([[0], [2]], 4, None, 1)
+
+        whole = worker.num_regions * 4
+        # SWA block 2, region r: whole + (r*4 + 2)*(3*2) + granule + run*2.
+        assert list(out) == [0, 4] + [
+            whole + (r * 4 + 2) * 6 + gran + run * 2
+            for r in range(2)
+            for gran in range(2)
+            for run in range(3)
+        ]
 
     def test_no_chunk_grid_is_todays_ids(self, monkeypatch):
         # A geometry whose span a chunk cannot cut registered no third range,
@@ -191,7 +216,7 @@ class TestComputeDescIds:
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
-        assert list(out) == [0, 1, 4, 5, 10, 14]
+        assert list(out) == [0, 1, 4, 5, 12, 20]
 
 
 # What each layout puts in one block.
@@ -205,7 +230,7 @@ class TestDescIdsForAPackedBlock:
     @staticmethod
     def _worker(kv_per_block, spec):
         w = object.__new__(RblnNixlPullConnectorWorker)
-        w._sw_ratio = 2
+        window_mode(w, 2)
         w._kv_per_block = kv_per_block
         w.num_regions = 2
         w._chunk_grid = None
@@ -231,9 +256,10 @@ class TestDescIdsForAPackedBlock:
     def test_the_sliding_window_range_starts_past_every_whole_desc(self):
         sw = MagicMock(spec=SlidingWindowSpec)
         # num_regions(2) * num_blocks(4) whole descs come first; the window
-        # range then names a packed block's halves in order.
+        # range then names the `sw_ratio` kernel blocks that tile each block,
+        # and one of those is a run of bytes however K and V sit in it.
         assert sorted(self._ids(PACKED, sw)) == [10, 11, 18, 19]
-        assert sorted(self._ids(SPLIT, sw)) == [9, 13]
+        assert sorted(self._ids(SPLIT, sw)) == [10, 11, 18, 19]
 
 
 class TestTailChunks:
@@ -317,3 +343,71 @@ class TestTailChunks:
         w = self._worker(monkeypatch)
         with pytest.raises(RuntimeError, match="different KV"):
             w._tail_chunks(3, num_valid_tokens, chunks_per_span=1)
+
+
+class TestTheWindowsOwnGranules:
+    """Which granules of a block a window's group names.
+
+    `sw_ratio` 2 over a 64-token block: a granule is 32 tokens, so a block
+    holds two and a window is one of them or one either side of a boundary.
+    One region keeps the ids readable -- the window range starts at 4, and a
+    granule is `4 + block * 2 + granule`.
+    """
+
+    @staticmethod
+    def _ids(valid_tokens, blocks):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        window_mode(w, 2)
+        w.block_size = 64
+        w.num_regions = 1
+        w._chunk_grid = None
+        w._request_tail = (valid_tokens, None)
+        w._group_specs = [MagicMock(spec=SlidingWindowSpec)]
+        return list(
+            w._compute_desc_ids(
+                [blocks],
+                dst_num_blocks=4,
+                block_size_ratio=None,
+                physical_blocks_per_logical=1,
+            )
+        )
+
+    def test_a_window_inside_one_granule_names_that_one(self):
+        # 64 tokens end a granule, so the last 32 are exactly the second one.
+        assert self._ids(64, [3]) == [11]
+
+    def test_one_token_fewer_reaches_back_into_the_earlier_granule(self):
+        # The pair to the case above: 63 tokens put the window over 31..62, and
+        # token 31 is the last of the first granule -- so it is named, barely.
+        # The arithmetic that decides this is `(valid - sw) // sw`, whose answer
+        # only moves at this input; every other count here reads the same under
+        # an off-by-one in it.
+        assert self._ids(63, [2, 3]) == [10, 11]
+
+    def test_a_window_across_a_granule_boundary_names_both(self):
+        # 48 tokens put the window over tokens 16..47, which is the back of the
+        # first granule and the front of the second -- both inside the last
+        # block, so the block named before it contributes nothing.
+        assert self._ids(48, [2, 3]) == [10, 11]
+
+    def test_a_window_across_a_block_boundary_names_one_in_each(self):
+        # 65 tokens put it over 33..64: the last granule of the earlier block
+        # and the first of the later one. The two are not adjacent addresses,
+        # which is the case a single block-wide descriptor cannot express.
+        assert self._ids(65, [2, 3]) == [9, 10]
+
+    def test_a_list_that_cannot_reach_the_earlier_granule_names_one(self):
+        # Guard: a list shape the other cases do not build. The straddle wants
+        # the block before and a one-block list lacks it -- and upstream clips
+        # the producer's list and the consumer's alike, so a peer is short
+        # there too and names one.
+        assert self._ids(65, [3]) == [10]
+
+    def test_a_straddle_is_what_makes_it_two_granules(self):
+        # The straddle is what the count decides; the list decides only
+        # whether the earlier granule is reachable, and every path equalises
+        # the two lists from the tail before this runs.
+        for tokens in (32, 64, 96):
+            assert len(self._ids(tokens, [2, 3])) == 1
+        for tokens in (33, 48, 65, 80):
+            assert len(self._ids(tokens, [2, 3])) == 2

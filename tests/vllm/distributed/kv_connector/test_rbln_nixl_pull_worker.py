@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
+    window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -341,6 +342,9 @@ class TestShardReadPath:
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w._shard_chunk_grids = {("eng", r): None for r in range(pp_size)}
         w._chunk_mode = False
+        # The whole-engine route parks a token count for either mode, so both
+        # knobs are read here.
+        window_mode(w, None)
         w._recv_valid_tokens = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
@@ -537,6 +541,9 @@ class TestShardReadPath:
         w._remote_pp_size = {}  # unknown engine defaults to a single stage
         w._overlapping_ranks = {}  # nothing narrowed -> upstream's handle covers it
         w._chunk_mode = False
+        # The whole-engine route parks a token count for either mode, so both
+        # knobs are read here.
+        window_mode(w, None)
         w._recv_valid_tokens = {}
         w.transfer_topo = MagicMock()
         meta = MagicMock()
@@ -559,7 +566,7 @@ class TestShardReadPath:
         w._overlapping_ranks = {}
         w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
         w._chunk_mode = True
-        w._sw_ratio = 8
+        window_mode(w, 8)
         w._chunk_grid = None
         w._request_tail = None
         w._group_specs = [MagicMock()]  # one full-attention group
@@ -592,7 +599,7 @@ class TestShardReadPath:
         w._overlapping_ranks = {}
         w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
         w._chunk_mode = True
-        w._sw_ratio = None
+        window_mode(w, None)
         w._recv_valid_tokens = {}
         w.transfer_topo = MagicMock()
         meta = MagicMock()
@@ -703,7 +710,7 @@ class TestUpstreamReachesTheOverride:
         # descriptors.
         w = TestShardReadPath._read_worker(pp_size=1)
         w._overlapping_ranks = {}  # nothing narrowed -> delegate to upstream
-        w._sw_ratio = 2
+        window_mode(w, 2)
         # The desc-id formula spaces a block's ids by this; separate K/V regions
         # put one id per block, which is the layout this case is written for.
         w._kv_per_block = 1

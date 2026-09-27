@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import functools
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -204,6 +205,11 @@ class KvGeometry:
     slices: int = 1
     per_layer_heads: dict[str, int] = field(default_factory=dict)
     draft_layers: tuple[str, ...] = ()
+    #: Tokens a block holds in the view the sliding-window kernel reads, which
+    #: the runner picks independently of `block_size`. None means it reads
+    #: whole blocks. Registered tensors are unaffected -- a pool hands over its
+    #: full-attention view -- so this shapes the forward context alone.
+    swa_kernel_block: int | None = None
 
     def __post_init__(self) -> None:
         # The byte arithmetic here partitions one allocation, but a replicated
@@ -368,6 +374,37 @@ class KvGeometry:
                 )
             out[name] = torch.zeros(shape, dtype=dtype).as_subclass(_OnDevice)
         return out
+
+    def forward_context_caches(
+        self, *, dtype: torch.dtype = torch.bfloat16
+    ) -> dict[str, Any]:
+        """What the runner binds per layer, which is every layer unfiltered.
+
+        A sliding-window layer's view is addressed in `swa_kernel_block` tokens
+        where the runner chose that, so the same storage carries proportionally
+        more, shorter blocks. This is the only place the two geometries differ.
+        """
+        from vllm_rbln.v1.attention.backends.flash_attention import (
+            RBLNFlashAttentionBackend,
+        )
+
+        kernel_block = self.swa_kernel_block
+        if self.spec != "swa" or kernel_block is None:
+            return self.kv_caches(dtype=dtype)
+        assert self.block_size % kernel_block == 0
+        ratio = self.block_size // kernel_block
+        return {
+            name: torch.zeros(
+                RBLNFlashAttentionBackend.get_kv_cache_shape(
+                    num_blocks=self.num_blocks * ratio,
+                    block_size=kernel_block,
+                    num_kv_heads=self.heads_of(name),
+                    head_size=HEAD_SIZE,
+                ),
+                dtype=dtype,
+            )
+            for name in self.layers
+        }
 
     # --- view 3: what the adapter reports back -------------------------------
     def xfer_tables(self, kv_caches: dict[str, Any]) -> Any:
@@ -722,6 +759,45 @@ def sliding_window_spec(*, block_size, sliding_window):
     return spec
 
 
+def window_mode(worker: Any, ratio: int | None, *, runs: int = 1) -> None:
+    """Put a worker in window mode the way registration would.
+
+    Three values, not one. The ratio says how many granules tile a block; the
+    grid says how one granule's bytes are laid out, defaulting to the geometry
+    where a granule IS a kernel block and so one run; the observation is the
+    geometry that grid belongs to, which a peer is refused against.
+
+    `_has_swa` follows a ratio, which cannot exist without a window. Turning
+    the mode off says nothing about whether the engine has one, so a stub that
+    means a hybrid sets that itself.
+    """
+    worker._sw_ratio = ratio
+    if ratio is None:
+        worker._swa_kernel_blocks = set()
+        worker._window_grid_cut = None
+        if not hasattr(worker, "_has_swa"):
+            worker._has_swa = False
+        return
+    worker._has_swa = True
+    block_size = getattr(worker, "block_size", None)
+    # The observation the grid was chosen from, so a stub pairs with a peer the
+    # way the engine it stands for would.
+    worker._swa_kernel_blocks = (
+        set()
+        if block_size is None
+        else {block_size // ratio if runs == 1 else block_size}
+    )
+    # Derived, not restated: registration reads the grid off the observation,
+    # and a helper spelling the answer out keeps agreeing with a rule that has
+    # moved. `_window_grid` answers from those two where the kernel block is
+    # the window; where it is the whole block it asks `_block_runs`, whose
+    # region tables a bare worker lacks -- which is why `runs` is a parameter.
+    if block_size is not None and runs == 1:
+        worker._window_grid_cut = worker._window_grid()
+    else:
+        worker._window_grid_cut = (runs, ratio)
+
+
 def build_worker(
     monkeypatch,
     *,
@@ -740,9 +816,15 @@ def build_worker(
     layer_names=("layer0",),
     chunk_mode=False,
     chunk_tokens=0,
+    swa_kernel_block=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
-    the RBLN overrides read and `nixl_rbln` faked present or absent."""
+    the RBLN overrides read and `nixl_rbln` faked present or absent.
+
+    ``swa_kernel_block`` is the runner's choice of how many tokens a block holds
+    in the view the sliding-window kernel reads; the default is the geometry
+    where that is the window itself.
+    """
     import sys
     import types
     from collections import defaultdict
@@ -842,4 +924,20 @@ def build_worker(
     kv_cache_config.kv_cache_groups = groups + opted_out
     kv_cache_config.transfer_groups = groups
     kv_cache_config.transfer_group_ids = tuple(range(len(groups)))
+    kv_cache_config.kv_cache_groups = [
+        MagicMock(kv_cache_spec=spec, layer_names=[f"g{i}.l0"])
+        for i, spec in enumerate(specs or [])
+    ]
+    # A real dict, because the connector reads a sliding-window layer's view
+    # out of it and a mock would answer every key with a mock. Only the token
+    # axis is read, so one is all the view needs to carry.
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    ctx: dict[str, Any] = {}
+    for i, spec in enumerate(specs or []):
+        if not isinstance(spec, SlidingWindowSpec):
+            continue
+        tokens = spec.sliding_window if swa_kernel_block is None else swa_kernel_block
+        ctx[f"g{i}.l0"] = SimpleNamespace(kv_cache=torch.zeros(1, 1, tokens, 1))
+    vllm_config.compilation_config.static_forward_context = ctx
     return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)

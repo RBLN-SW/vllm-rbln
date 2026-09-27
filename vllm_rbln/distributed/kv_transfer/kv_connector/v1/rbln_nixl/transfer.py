@@ -41,9 +41,9 @@ def _chunk_desc_ids(
     """Descriptor ids for chunks `[lo, hi)` of one block, in `positions`.
 
     `start` is where the chunk range begins: one whole-block range before it on
-    a shard's lists, and on the whole-engine lists a sliding window's view as
-    well, which holds a block's halves where the whole-block range holds the
-    block. That offset is the only thing the two callers differ in, so the
+    a shard's lists, and on the whole-engine lists a window range as well,
+    which holds the granules that tile a block where the whole-block range
+    holds the block. That offset is the only thing the two callers differ in, so the
     arithmetic lives here -- an index computed one way and a descriptor emitted
     the other lands on bytes nothing reports.
     """
@@ -68,7 +68,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
     """
 
     @contextmanager
-    def _tail_viewed_as(self, valid_tokens: int | None, prompt_blocks: int):
+    def _tail_viewed_as(self, valid_tokens: int | None, prompt_blocks: int | None):
         """Park how far a request's last block is filled, for upstream's call.
 
         `_compute_desc_ids` is what selects the descriptors, and it takes block
@@ -84,18 +84,53 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         finally:
             self._request_tail = prev
 
-    def _prompt_blocks(self, block_ids: BlockIds) -> int:
+    def _prompt_blocks(self, block_ids: BlockIds) -> int | None:
         """How many blocks the request holds, read off the group a chunk cuts.
 
         A sliding-window group's list is clipped to its own window, so summing
         the groups describes no request. Chunk mode registers against exactly
-        one full-attention group, which is the one the token count describes.
+        one full-attention group, which is the one the token count describes;
+        an engine without one has no chunk range for this to size.
         """
         return next(
-            len(group)
-            for g, group in enumerate(block_ids)
-            if not isinstance(self._group_specs[g], SlidingWindowSpec)
+            (
+                len(group)
+                for g, group in enumerate(block_ids)
+                if not isinstance(self._group_specs[g], SlidingWindowSpec)
+            ),
+            None,
         )
+
+    def _window_granules(
+        self, blocks: list[int], valid_tokens: int, sw_ratio: int
+    ) -> list[tuple[int, int]]:
+        """(block, the granule in it) the request's window lands in.
+
+        A window is the last `sliding_window` tokens, so the group's last block
+        holds the newest one and the token count says where inside. It spans one
+        granule, or two when it straddles a boundary -- and the second of those
+        sits in the block before, so a list too short to reach it names one and
+        says nothing.
+
+        What keeps the two ends agreeing is upstream's `get_sw_clipped_blocks`,
+        which cuts an SWA group to `blocks_per_sw` = `cdiv(sliding_window,
+        block_size) + 1` from the tail. Both ends of a read run it -- the
+        producer in `request_finished` before it publishes the ids, the consumer
+        in `update_state_after_alloc` on its own -- so neither is clipped here
+        and a short list means the peer was short too.
+        """
+        sw = self.block_size // sw_ratio
+        newest = (valid_tokens - 1) // sw
+        oldest = max(0, valid_tokens - sw) // sw
+        # The group's list ends at the block holding the newest token, so a
+        # position in it is a logical block counted back from there.
+        last_block = newest // sw_ratio
+        return [
+            (block_id, granule % sw_ratio)
+            for i, block_id in enumerate(blocks)
+            for granule in range(oldest, newest + 1)
+            if granule // sw_ratio == last_block - (len(blocks) - 1 - i)
+        ]
 
     def _compute_desc_ids(
         self,
@@ -107,9 +142,9 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         region_group_ids: list[int] | None = None,
         uses_region_group_mapping: bool | None = None,
     ) -> np.ndarray:
-        if self._sw_ratio is None:
-            # No SWA view opt: upstream's Full/SSM desc layout applies, and the
-            # 0.30.0 per-region arguments belong to it.
+        if not self._own_engine_layout:
+            # Upstream's Full/SSM desc layout applies, and the 0.30.0
+            # per-region arguments belong to it.
             return super()._compute_desc_ids(
                 block_ids,
                 dst_num_blocks,
@@ -132,20 +167,25 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             num_blocks = int(num_blocks * block_size_ratio)
 
         # Both lists run region-major then block. A whole block is one
-        # descriptor, and the window range that follows holds `_kv_per_block`
-        # per block (`register_local_xfer_handler`).
-        kv_per_block = self._kv_per_block
+        # descriptor, and the window range that follows cuts that same block
+        # into `runs x granules` (`_window_grid`). Without window mode that
+        # range is absent, so the chunk range starts one range earlier.
+        window = self._window_grid_cut
+        window_units = window[0] * window[1] if window is not None else 0
         region_ids = np.arange(self.num_regions)[:, None]
         num_whole_descs = self.num_regions * num_blocks
         # One number for the whole request, whichever list this call is for.
         tail = self._request_tail
-        needed = (
-            None
-            if tail is None or self._chunk_grid is None
-            else self._tail_chunks(
-                tail[1], tail[0], chunks_per_span=self._chunk_grid[1]
+        if tail is None or self._chunk_grid is None:
+            needed = None
+        else:
+            # A chunk range exists only where a full-attention group does, and
+            # that group is what `_prompt_blocks` counts.
+            prompt_blocks = tail[1]
+            assert prompt_blocks is not None
+            needed = self._tail_chunks(
+                prompt_blocks, tail[0], chunks_per_span=self._chunk_grid[1]
             )
-        )
         all_descs: list[np.ndarray] = []
         for g, group in enumerate(block_ids):
             if not group:
@@ -157,12 +197,40 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
                 return (region_ids * num_blocks + blocks_arr).flatten()
 
             if is_sw:
-                # A window's group keeps every block whole: its descriptor is
-                # the window, so there is no unwritten tail inside it.
-                ids = whole(group_arr)[:, None]
+                if window is None:
+                    # Window mode registered no range: this group's blocks go
+                    # whole, and the chunk range cuts the full-attention
+                    # group's last block only.
+                    all_descs.append(whole(group_arr))
+                    continue
+                runs, granules_per_block = window
+                # Nothing having said how many tokens the request holds leaves
+                # nothing to say where its window is, so every granule goes --
+                # which is the block itself.
+                picked = (
+                    [
+                        (block, gran)
+                        for block in group
+                        for gran in range(granules_per_block)
+                    ]
+                    if tail is None or tail[0] is None
+                    else self._window_granules(group, tail[0], granules_per_block)
+                )
+                ids = (
+                    region_ids * num_blocks
+                    + np.asarray([block for block, _ in picked])[None, :]
+                )
+                granules = np.asarray([gran for _, gran in picked], dtype=np.int64)
+                # A granule is one run of bytes only where the kernel addresses
+                # the cache in window-wide blocks; otherwise the head cut
+                # spreads it, and every run of it goes.
                 all_descs.append(
                     (
-                        ids * kv_per_block + np.arange(kv_per_block) + num_whole_descs
+                        ids[:, :, None] * window_units
+                        + granules[None, :, None]
+                        + np.arange(runs, dtype=np.int64)[None, None, :]
+                        * granules_per_block
+                        + num_whole_descs
                     ).ravel()
                 )
                 continue
@@ -175,7 +243,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
             all_descs.append(whole(group_arr[:, :-1]))
             all_descs.append(
                 _chunk_desc_ids(
-                    start=num_whole_descs * (1 + kv_per_block),
+                    start=num_whole_descs * (1 + window_units),
                     positions=np.arange(self.num_regions, dtype=np.int64),
                     num_blocks=num_blocks,
                     block_id=group[-1],
