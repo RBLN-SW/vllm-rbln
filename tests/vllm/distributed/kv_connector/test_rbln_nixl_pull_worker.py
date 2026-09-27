@@ -96,6 +96,16 @@ class TestShardReadPath:
         w.world_size = 1
         w.num_blocks = 8
         w.dst_num_blocks = {"eng": 8, "local": 8}
+        # 0.30.0 state the inherited read path reads: the per-region block
+        # counts it sizes descriptors from, and the context-parallel ranks it
+        # offsets by. One shard everywhere here, so no offset applies.
+        w.dst_region_num_blocks = {"eng": [8, 8], "local": [8, 8]}
+        w.dst_region_group_ids = {"eng": [0, 0], "local": [0, 0]}
+        w.region_group_ids = [0, 0]
+        w.dcp_size = 1
+        w.pcp_size = 1
+        w.dcp_rank = 0
+        w.pcp_rank = 0
         w._recving_transfers = defaultdict(list)
         w._engine_last_active = {}
         # What upstream's failure path reads: it logs with the engine id, looks the
@@ -120,6 +130,9 @@ class TestShardReadPath:
             remote_tp_size=peer_tp_size,
             remote_block_size=16,
             remote_physical_blocks_per_logical=1,
+            # 0.30.0 compares this against ours to decide whether the peer
+            # shards its KV cache; a mock would not order against an int.
+            remote_dcp_size=1,
         )
         topo.tp_ratio.return_value = 1
         topo.block_size_ratio.return_value = 1

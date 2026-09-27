@@ -625,6 +625,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         port: int,
         remote_tp_size: int,
         expected_engine_id: str,
+        remote_dcp_size: int = 1,
         remote_pp_size: int = 1,
         notif_agents_only: bool = False,
     ) -> tuple[dict[tuple[int, int], str], float]:
@@ -642,13 +643,16 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         asks, and no caller derives it: it is relayed from the producer
         through kv_transfer_params, while the read handshake and a producer's
         own reverse handshake both pass nothing and take the default of 1.
-        Asking the peer is why this override exists.
+        Asking the peer is why this override exists, and it can go once a read
+        path caller carries the peer's pp_size rather than defaulting it.
         """
         # Background thread needs a device context (see upstream _nixl_handshake).
         if not self.use_host_buffer:
             current_platform.set_device(self.device_id)
 
-        p_remote_tp_ranks = self.topo.handshake_target_ranks(remote_tp_size)
+        p_remote_tp_ranks = self.topo.handshake_target_ranks(
+            remote_tp_size, remote_dcp_size
+        )
         path = make_zmq_path("tcp", host, port)
         remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
         overlapping: list[int] = []
@@ -663,9 +667,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
             metas = {(0, first_rank): first_meta}
             pp_size = first_meta.pp_size
-            # TODO(vllm>=0.29.0): the reason above expires -- the read path
-            # gains a caller that carries pp_size, and remote_dcp_size lands
-            # ahead of remote_pp_size in this signature.
             if remote_pp_size > 1 and remote_pp_size != pp_size:
                 raise RuntimeError(
                     f"RBLN NIXL: caller expects peer {expected_engine_id} to run "
@@ -1170,7 +1171,20 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         trimmed: dict[str, Any] = {
             "kv_caches_base_addr": nixl_agent_meta.kv_caches_base_addr[lo:hi],
             "block_lens": nixl_agent_meta.block_lens[lo:hi],
+            "block_strides": nixl_agent_meta.block_strides[lo:hi],
         }
+        # The rest arrived with 0.30.0 and are region-indexed the same way, so
+        # they follow the window. Optional on the wire: a peer that sends none
+        # keeps sending none rather than an empty list upstream would index.
+        for field in (
+            "region_group_ids",
+            "region_names",
+            "region_mem_types",
+            "region_num_blocks",
+        ):
+            value = getattr(nixl_agent_meta, field)
+            if value is not None:
+                trimmed[field] = value[lo:hi]
         trimmed["registered_layer_names"] = list(
             nixl_agent_meta.registered_layer_names[start:end]
         )

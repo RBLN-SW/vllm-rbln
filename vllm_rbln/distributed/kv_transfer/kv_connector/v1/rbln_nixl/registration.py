@@ -463,6 +463,16 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
+        # The 0.30.0 read path looks its own engine up in these the way it
+        # looks a peer up, so registering has to seed them here as well.
+        self.dst_region_num_blocks[self.engine_id] = self.region_num_blocks
+        self.dst_region_group_ids[self.engine_id] = self.region_group_ids
+        self.dst_region_mem_types[self.engine_id] = self.region_mem_types
+        self._uses_region_group_mapping = len(set(self.region_group_ids)) > 1
+        self.dst_uses_region_group_mapping[self.engine_id] = (
+            self._uses_region_group_mapping
+        )
+        self._mixed_mem_types = len(set(self.region_mem_types)) > 1
 
         # Register local/src descr for NIXL xfer.
         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (

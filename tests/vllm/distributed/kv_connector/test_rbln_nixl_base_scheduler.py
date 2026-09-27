@@ -97,7 +97,10 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched.side_channel_port = 5000
     # The save path is gated on this, so save tests must turn it on.
     sched.use_host_buffer = use_host_buffer
-    sched._is_hma_required = False  # get_sw_clipped_blocks (inherited) reads this
+    sched._is_hma_required = False  # get_exchange_clipped_blocks reads this
+    # 0.30.0 takes the transfer rank count off the scheduler, and clipping
+    # now routes block ids through the config first.
+    sched.transfer_tp_size = 1
     sched.blocks_per_sw = [0]
     sched._kv_lease_duration = 30
     sched._reqs_need_recv = {}

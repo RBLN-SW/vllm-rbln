@@ -685,6 +685,7 @@ def build_worker(
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
     import sys
     import types
+    from collections import defaultdict
     from unittest.mock import MagicMock
 
     from vllm.config import CacheConfig, SchedulerConfig
@@ -730,6 +731,19 @@ def build_worker(
         # positional pairing applies; 1 keeps these cases homogeneous.
         self.transfer_topo = MagicMock()
         self.transfer_topo.tp_ratio.return_value = 1
+        # State vllm 0.30.0 added to the real __init__ and the inherited entry
+        # points now read. The parallel sizes are the single-shard values these
+        # tests build against, so no rank ever offsets off them.
+        self.dcp_size = 1
+        self.pcp_size = 1
+        self.dcp_rank = 0
+        self.pcp_rank = 0
+        self.dst_region_num_blocks = {}
+        self.dst_region_group_ids = {}
+        self.dst_region_mem_types = {}
+        self.dst_uses_region_group_mapping = {}
+        self._recving_transfers = defaultdict(list)
+        self._engine_ttl = 0.0
 
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 

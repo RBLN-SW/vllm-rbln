@@ -612,7 +612,7 @@ class TestRegisterKvCachesImpl:
     def test_a_draft_layer_with_its_own_page_size_is_registered(self, monkeypatch):
         # Requiring one size for every non-MLA tensor would reject this outright;
         # registration has to describe each region by its own geometry.
-        worker = _prep_impl_worker(monkeypatch)
+        worker = _prep_impl_worker(monkeypatch, names=("l0", "l1", "l2"))
         target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
         draft = _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32)
         worker._layer_specs = {"l0": target, "l1": target, "l2": draft}
@@ -828,7 +828,10 @@ class TestRegisterKvCachesImpl:
         target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
         draft = _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32)
         worker._layer_specs = {"l0": target, "l1": draft}
-        worker.kv_cache_config = MagicMock(kv_cache_tensors=[object(), object()])
+        worker.kv_cache_config = MagicMock(
+            kv_cache_tensors=[object(), object()],
+            kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+        )
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
@@ -849,7 +852,10 @@ class TestRegisterKvCachesImpl:
         worker = _prep_impl_worker(monkeypatch)
         spec = _impl_layer_spec(page_size_bytes=4096)
         worker._layer_specs = {"l0": spec, "l1": spec}
-        worker.kv_cache_config = MagicMock(kv_cache_tensors=[object(), object()])
+        worker.kv_cache_config = MagicMock(
+            kv_cache_tensors=[object(), object()],
+            kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+        )
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
