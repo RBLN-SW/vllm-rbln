@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
+    set_shape,
     window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
@@ -121,7 +122,7 @@ class TestShardReadPath:
         # block is two 32-token areas, each cut into `grid[1]` chunks.
         w = cls._trim_worker()
         w.block_size = 64
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._shard_chunk_grids = {("eng", 1): grid}
         return w
 
@@ -340,7 +341,7 @@ class TestShardReadPath:
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w._shard_chunk_grids = {("eng", r): None for r in range(pp_size)}
-        w._chunk_mode = False
+        set_shape(w, chunk_mode=False)
         # Neither knob, so nothing is parked. Either one on is what the two
         # `..._parks_the_count` cases cover.
         window_mode(w, None)
@@ -488,7 +489,7 @@ class TestShardReadPath:
         # last block holds one token, so only the first of the two areas is
         # read and each stage issues half the descriptors.
         w = self._read_worker(pp_size=2)
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._kv_areas = 2
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         w.block_size = 16
@@ -510,7 +511,7 @@ class TestShardReadPath:
         w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
         w._remote_pp_size = {}  # unknown engine defaults to a single stage
         w._overlapping_ranks = {}  # nothing narrowed -> upstream's handle covers it
-        w._chunk_mode = False
+        set_shape(w, chunk_mode=False)
         # Neither knob, so nothing is parked. Either one on is what the two
         # `..._parks_the_count` cases cover.
         window_mode(w, None)
@@ -535,8 +536,7 @@ class TestShardReadPath:
         w._remote_pp_size = {}
         w._overlapping_ranks = {}
         w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
-        w._chunk_mode = True
-        window_mode(w, 8)
+        window_mode(w, 8, chunk_mode=True)
         w._chunk_grid = None
         w._request_tail = None
         w._group_specs = [MagicMock()]  # one full-attention group
@@ -557,7 +557,7 @@ class TestShardReadPath:
         # The token count and the request's own block count, parked for the
         # length of that call: upstream's `_compute_desc_ids` is what selects
         # the descriptors and its signature has no room for either.
-        assert seen == [(17, 2)]
+        assert seen == [(17, 2, ())]
         assert w._request_tail is None
 
     def test_the_window_knob_alone_parks_the_count(self):
@@ -589,7 +589,7 @@ class TestShardReadPath:
         ):
             w._read_blocks_for_req("r0", meta)
 
-        assert seen == [(17, 2)]
+        assert seen == [(17, 2, ())]
 
     def test_a_producer_holding_nothing_leaves_the_window_whole(self):
         # Zero is how a producer that kept no blocks reports itself, and it is
@@ -620,7 +620,7 @@ class TestShardReadPath:
         ):
             w._read_blocks_for_req("r0", meta)
 
-        assert seen == [(None, 2)]
+        assert seen == [(None, 2, ())]
 
     def test_a_chunked_engine_without_a_window_may_not_reach_it(self):
         # The other side of the same rule: nothing else leaves a chunked
@@ -630,8 +630,7 @@ class TestShardReadPath:
         w._remote_pp_size = {}
         w._overlapping_ranks = {}
         w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
-        w._chunk_mode = True
-        window_mode(w, None)
+        window_mode(w, None, chunk_mode=True)
         w.transfer_topo = MagicMock()
         meta = MagicMock()
         meta.remote.engine_id = "eng"
@@ -743,7 +742,6 @@ class TestUpstreamReachesTheOverride:
         w = TestShardReadPath._read_worker(pp_size=1)
         w._overlapping_ranks = {}  # nothing narrowed -> delegate to upstream
         window_mode(w, 2)
-        # The desc-id formula spaces a block's ids by this; separate K/V regions
         # put one id per block, which is the layout this case is written for.
         w._kv_per_block = 1
         w._chunk_grid = None  # no chunk range: the two ranges as before

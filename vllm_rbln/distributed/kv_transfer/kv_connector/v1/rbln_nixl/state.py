@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
+    TransferShape,
     connector_option,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
@@ -30,6 +31,13 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+#: What a transfer parks for `_compute_desc_ids`, whose signature is
+#: upstream's: the request's final token count and block count, and the chunk
+#: ranges a streamed batch named on the side that call is for.
+RequestTail = tuple[
+    int | None, int | None, tuple[tuple[int, int | None, tuple[int, int]], ...]
+]
 
 
 def kv_chunk_tokens(
@@ -106,12 +114,14 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _viewed_region_ids: list[int] | None = None
 
     _group_specs: list[Any]
-    _has_swa: bool
-    _sw_ratio: int | None
+    #: What the knobs and the groups settled, before any geometry. Both sides
+    #: derive it from the same inputs (`transfer_shape`), so neither can hold
+    #: an answer of its own.
+    _shape: TransferShape
     #: Tokens one block holds in the view the sliding-window kernel reads, per
     #: sliding-window group, which is not `block_size` where that kernel takes
-    #: a window a block. Observed at registration, not derived. Empty where
-    #: this rank holds no such group.
+    #: a window a block. Geometry, so the shape does not carry it: observed at
+    #: registration, not derived. Empty where this rank holds no such group.
     _swa_kernel_blocks: set[int]
 
     _kv_areas: int
@@ -121,7 +131,6 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: registration derives it, the handshake pairs and advertises on it, and
     #: both a shard list's descriptors and a chunk range's runs are cut by it.
     _kv_per_block: int
-    _chunk_mode: bool
     _logical_region_kv_heads: list[int | None]
     _logical_region_slices: list[int]
     local_seen_layer_names: list[str]
@@ -139,7 +148,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     #: `_window_grid()` for this engine, parked so a transfer does
     #: not recompute the head band per request.
     _window_grid_cut: tuple[int, int] | None
-    _request_tail: tuple[int | None, int | None] | None
+    _request_tail: "RequestTail | None"
 
     def _observe_swa_kernel_block(self) -> set[int]:
         """Tokens a block holds in the view the sliding-window kernel reads.
@@ -174,12 +183,13 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         """Whether the whole-engine lists carry a range upstream has no room for.
 
         Upstream names a region's block once. A window range cuts that block
-        again; a chunk range needs a list that can name both KV groups, which
-        a per-shard list cannot since each names one. So a hybrid in chunk mode
-        belongs here too, while a single-group engine's chunk range rides the
-        shard lists. A window as wide as the block adds no range at all.
+        again; naming part of a block needs a list that can name both KV
+        groups, which a per-shard list cannot since each names one. So a hybrid
+        belongs here whether a knob or a streamed write cuts that block, while
+        a single-group engine's chunk range rides the shard lists. A window as
+        wide as the block adds no range at all.
         """
-        return self._sw_ratio is not None or (self._chunk_mode and self._has_swa)
+        return self._shape.owns_engine_lists
 
     @property
     def _spans_per_block(self) -> int:
@@ -190,6 +200,15 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         area every token of some heads, so they are one.
         """
         return self._kv_areas if self._kv_split_axis is KVSplitAxis.NON_HEAD else 1
+
+    def _chunks_per_block(self, chunk_grid: tuple[int, int] | None) -> int:
+        """Chunks a whole block is cut into.
+
+        The grid cuts one span, and a context cut gives a block several. Every
+        count that names part of a block -- what `_tail_chunks` returns, the
+        coverage unit, the window's own high-water mark -- is in this one.
+        """
+        return self._spans_per_block * (1 if chunk_grid is None else chunk_grid[1])
 
     @property
     def topo(self) -> RblnTransferTopology:
@@ -354,9 +373,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
 
         The runs are `_block_runs`; the chunks are what a prefill step leaves
         of a span. None where a chunk comes out the whole span -- what a step
-        at or above one asks for -- so neither list grows.
+        at or above one asks for -- so neither list grows. A side that writes a
+        request in pieces asks for a grid as the knob does.
         """
-        if not self._chunk_mode:
+        if not self._shape.writes_part_of_a_block:
             return None
         cut = self._block_runs(split=split, kv_runs=kv_runs)
         if cut is None:
@@ -373,7 +393,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         chunks = span_tokens // chunk_tokens
         # What keeps the arithmetic downstream free of the axis: a block is a
         # whole number of chunks however its spans are cut.
-        assert chunk_tokens * chunks * spans == block_size
+        assert chunk_tokens * chunks * spans == block_size, (
+            f"RBLN NIXL: {spans} span(s) of {chunks} chunk(s) of "
+            f"{chunk_tokens} token(s) do not tile a {block_size}-token block"
+        )
         if chunks == 1:
             return None
         return runs, chunks
@@ -422,9 +445,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         Where it addresses whole blocks, a piece is a token range of one, which
         the head cut spreads exactly as it spreads a chunk.
         """
-        if self._sw_ratio is None:
+        ratio = self._shape.window_ratio
+        if ratio is None:
             return None
-        window = self.block_size // self._sw_ratio
+        window = self.block_size // ratio
         if self._swa_kernel_blocks != {window} and self._swa_kernel_blocks != {
             self.block_size
         }:
@@ -437,7 +461,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 f"and this engine's are {sorted(self._swa_kernel_blocks)}."
             )
         if self._swa_kernel_blocks == {window}:
-            return 1, self._sw_ratio
+            return 1, ratio
         cut = self._block_runs(split=1, kv_runs=1)
         if cut is None:
             # Two ways to reach this, and the counts tell them apart: regions
@@ -457,7 +481,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 f"is cut on the {self._kv_split_axis.name} axis into "
                 f"{self._kv_areas} area(s)."
             )
-        return cut[1], self._sw_ratio
+        return cut[1], ratio
 
     @staticmethod
     def _slice_head_bounds(
