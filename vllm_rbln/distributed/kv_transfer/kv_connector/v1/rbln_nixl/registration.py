@@ -385,6 +385,23 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             f"account for {len(self.block_len_per_layer)} transfer region(s); "
             "mislabelling one would silently pick the wrong descriptor layout."
         )
+        # vllm 0.30.0 added four per-region lists upstream builds while walking
+        # the caches. This path registers through the adapter instead, so they
+        # are filled here, in the same logical-major, area-minor order as
+        # `_region_is_mla`. Every RBLN region is one area of one layer's cache,
+        # so they hold the whole block count and one memory type.
+        self.region_names = [
+            name for name, regions in layer_regions for _ in range(regions * areas)
+        ]
+        self.region_num_blocks = [self.num_blocks] * len(self.block_len_per_layer)
+        self.region_mem_types = [self.nixl_memory_type] * len(self.block_len_per_layer)
+        group_of = {
+            layer: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for layer in group.layer_names
+        }
+        self.region_group_ids = [group_of[name] for name in self.region_names]
+
         self._logical_region_kv_heads = self._logical_head_bands(layer_regions)
         # `slice_ids` is per area, and replicas of one slice share an id, so
         # the DISTINCT ids over a region's areas are its own slice count.

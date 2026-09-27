@@ -19,6 +19,7 @@
 
 import sys
 import types
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -162,7 +163,9 @@ def _fake_nixl_rbln(xfer_result):
     return module
 
 
-def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
+def _prep_impl_worker(
+    monkeypatch, *, num_blocks=128, block_size=64, names=("l0", "l1")
+):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = build_worker(
         monkeypatch,
@@ -188,6 +191,12 @@ def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
     worker._registered_descs = []
     worker.dst_num_blocks = {}
     worker.src_xfer_handles_by_block_size = {}
+    # The engine hands the worker one group naming every layer it will
+    # register; `build_worker` fakes the config from specs alone, so the names
+    # the region table is keyed on have to come from here.
+    worker.kv_cache_config.kv_cache_groups = [
+        SimpleNamespace(layer_names=list(names), kv_cache_spec=None)
+    ]
     return worker
 
 
