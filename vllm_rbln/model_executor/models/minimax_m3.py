@@ -111,7 +111,6 @@ logger = init_logger(__name__)
 # body). The converter can only act on an explicit request, and this module is
 # imported in the engine process before the model is traced, so request it here.
 os.environ.setdefault("RBLN_KERNEL_MODE", "new")
-os.environ.setdefault("RBLN_EXP_USE_GCE", "1")
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
