@@ -31,12 +31,20 @@ and replaces the compute with RBLN-friendly code:
 * MoE goes through the RBLN ``MoERunner`` (router callback) with the
   routed-scaling factor and the shared expert applied here.
 
-The MTP head and the vision tower are not modeled; their weights are skipped.
+The MTP head is not modeled; its weights are skipped. The vision tower is
+upstream's module tree, run through its own compiled graph (see
+``RBLNMiniMaxM3SparseForConditionalGeneration``).
 """
 
+import importlib.util
+import math
+import sys
 from collections.abc import Iterable
+from pathlib import Path
+from types import ModuleType
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -70,18 +78,27 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    kv_cache_dtype_str_to_dtype,
+    set_default_torch_dtype,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -1013,16 +1030,118 @@ class RBLNMiniMaxM3SparseForCausalLM(nn.Module, SupportsPP):
         return loader.load_weights(weights)
 
 
-# Vision-side weight prefixes of the VL checkpoint; the tower is not modeled.
-_VISION_PREFIXES = ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")
+def _load_upstream_common(name: str) -> ModuleType:
+    """Import ``vllm.models.minimax_m3.common.<name>`` without running the
+    package ``__init__``, which imports the NVIDIA model (CUDA custom ops) at
+    import time. The ``common`` modules only use absolute imports."""
+    full_name = f"vllm.models.minimax_m3.common.{name}"
+    if (module := sys.modules.get(full_name)) is not None:
+        return module
+    import vllm.models
+
+    path = Path(vllm.models.__file__).parent / "minimax_m3" / "common" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(full_name, path)
+    assert spec is not None and spec.loader is not None, path
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[full_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-class RBLNMiniMaxM3SparseForConditionalGeneration(nn.Module, SupportsPP):
-    """Text-only entry point for the MiniMax M3 (VL) checkpoint.
+_mm_preprocess = _load_upstream_common("mm_preprocess")
+_vision_tower = _load_upstream_common("vision_tower")
+
+
+# Patches per image the compiled vision encoder takes (48 x 48 grid, 672 x 672 px).
+MM_ENCODER_PATCH_BUCKET = 2304
+
+
+class _RBLNVisionEncoder(nn.Module):
+    """Fixed-length forward of upstream ``MiniMaxVLVisionModel`` for one image,
+    compiled for the device.
+
+    ``forward(pixel_values [N, C*T*P*P], cos [N, D], sin [N, D],
+    key_bias [1, 1, 1, N]) -> [N / merge^2, text_hidden]`` with ``N`` the bucket:
+    rows past the image's patches are padding, masked out as keys by
+    ``key_bias`` and dropped from the output by the caller. The tower is modeled
+    in fp32, which the device runs as dlfp16: the late layers grow a few
+    massive-activation tokens that every other token attends to, and bf16 loses
+    too much there. Weights are the tower's own (the patch embed as a reshaped
+    view).
+    """
+
+    def __init__(self, tower: nn.Module):
+        super().__init__()
+        vm = tower.vision_model
+        attn = vm.encoder.layers[0].self_attn
+        self.tower = tower
+        self.num_heads = attn.num_heads_per_partition
+        self.head_dim = attn.head_dim
+        # Conv3d with stride == kernel over one patch == a linear.
+        w = vm.embeddings.patch_embedding.weight
+        self.patch_weight = w.reshape(w.shape[0], -1)
+        # rotate_half of the first rot_dim dims as a matmul, so no last-dim slice
+        # at 39 / 78: (x @ rot)[j] = -x[j + half] for j < half, x[j - half] for
+        # half <= j < rot_dim, 0 beyond.
+        half = (vm.t_dim + vm.h_dim + vm.w_dim) // 2
+        rot = torch.zeros(self.head_dim, self.head_dim)
+        for j in range(half):
+            rot[j + half, j] = -1.0
+            rot[j, j + half] = 1.0
+        self.rot = rot.to(device=w.device, dtype=w.dtype)
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        key_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        vm = self.tower.vision_model
+        n = pixel_values.shape[0]
+        hidden = vm.pre_layrnorm(F.linear(pixel_values, self.patch_weight))
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        scale = self.head_dim**-0.5
+        for layer in vm.encoder.layers:
+            attn = layer.self_attn
+            qkv, _ = attn.qkv_proj(layer.layer_norm1(hidden))
+            qkv = qkv.view(n, 3, self.num_heads, self.head_dim)
+            q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # [N, heads, D]
+            q = q * cos + torch.matmul(q, self.rot) * sin
+            k = k * cos + torch.matmul(k, self.rot) * sin
+            q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+            scores = torch.matmul(q, k.transpose(1, 2)) * scale + key_bias[0]
+            out = torch.matmul(torch.softmax(scores, dim=-1), v)
+            out, _ = attn.out_proj(out.transpose(0, 1).reshape(n, -1))
+            hidden = hidden + out
+            mlp, _ = layer.fc1(layer.layer_norm2(hidden))
+            mlp, _ = layer.fc2(layer.act(mlp))
+            hidden = hidden + mlp
+        hidden = self.tower.multi_modal_projector(hidden)
+        return self.tower.patch_merge_mlp(hidden)
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    _mm_preprocess.MiniMaxM3VLMultiModalProcessor,
+    info=_mm_preprocess.MiniMaxM3VLProcessingInfo,
+    dummy_inputs=_mm_preprocess.MiniMaxM3VLDummyInputsBuilder,
+)
+class RBLNMiniMaxM3SparseForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP
+):
+    """Top-level (VL) entry point for the MiniMax M3 checkpoint.
 
     Builds the text backbone from ``config.text_config`` under the
-    ``language_model`` prefix (the checkpoint's naming) and drops the vision
-    tower's weights.
+    ``language_model`` prefix (the checkpoint's naming). The vision tower
+    (ViT + projector + patch merger) is upstream's module tree, run through its
+    own compiled graph, one image at a time padded to
+    ``MM_ENCODER_PATCH_BUCKET`` patches (see ``_RBLNVisionEncoder``). The
+    runner compiles and warms it up (``compile_mm_encoder`` /
+    ``warmup_mm_encoder``) and caches its outputs; they reach the language
+    model's graph as ``mm_embeds`` / ``mm_mask`` (see ``forward``).
+    ``--limit-mm-per-prompt '{"image": 0, "video": 0}'`` skips the tower and
+    gives the text-only model.
     """
 
     packed_modules_mapping = {
@@ -1030,17 +1149,59 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(nn.Module, SupportsPP):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "multi_modal_projector.": "vision_tower.multi_modal_projector.",
+            "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
+        },
+        orig_to_new_substr={
+            ".mlp.fc1.": ".fc1.",
+            ".mlp.fc2.": ".fc2.",
+        },
+    )
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality == "image":
+            return _mm_preprocess.MiniMaxM3VLProcessingInfo.IMAGE_TOKEN
+        if modality == "video":
+            return _mm_preprocess.MiniMaxM3VLProcessingInfo.VIDEO_TOKEN
+        raise ValueError(f"Unsupported modality: {modality!r}")
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
         self.quant_config = vllm_config.quant_config
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=config.text_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-            architectures=["MiniMaxM3SparseForCausalLM"],
-        )
+
+        # fp32 tower (dlfp16 on the device, see ``_RBLNVisionEncoder``); only
+        # the first pipeline stage encodes.
+        self.vision_tower = None
+        mm_config = vllm_config.model_config.multimodal_config
+        if get_pp_group().is_first_rank and any(
+            mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")
+        ):
+            with set_default_torch_dtype(torch.float32):
+                self.vision_tower = _vision_tower.MiniMaxVLVisionModel(
+                    config=PretrainedConfig.from_dict(config.vision_config),
+                    text_hidden_size=config.text_config.hidden_size,
+                    projector_hidden_size=getattr(
+                        config, "projector_hidden_size", None
+                    ),
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "vision_tower"),
+                )
+        # Set by ``compile_mm_encoder``; kept out of the module tree (it shares
+        # the tower's parameters).
+        object.__setattr__(self, "_mm_encoder", None)
+
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["MiniMaxM3SparseForCausalLM"],
+            )
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
@@ -1059,8 +1220,101 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(nn.Module, SupportsPP):
         # the top-level model exposes its logits processor.
         return self.language_model.logits_processor
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.language_model.embed_input_ids(input_ids)
+    def compile_mm_encoder(self, compile_fn) -> None:
+        """Called by the runner at model load with its compile wrapper."""
+        assert self.vision_tower is not None
+        encoder = _RBLNVisionEncoder(self.vision_tower).eval()
+        object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
+
+    def _encoder_inputs(
+        self, pixel_values: torch.Tensor | None, grid_thw: list[int]
+    ) -> list[torch.Tensor]:
+        """Pad one image to the bucket and build its host 3D-RoPE and key mask.
+        ``pixel_values`` None gives an all-padding (warm-up) image."""
+        tower = self.vision_tower
+        assert tower is not None
+        vm = tower.vision_model
+        bucket = MM_ENCODER_PATCH_BUCKET
+        num_patches = math.prod(grid_thw)
+        assert num_patches <= bucket, (
+            f"an image of {num_patches} patches (grid {grid_thw}) exceeds the "
+            f"vision encoder's {bucket}-patch bucket"
+        )
+        dtype = tower.dtype
+        device = next(tower.parameters()).device
+        patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
+        padded = torch.zeros(bucket, patch_dim, dtype=dtype)
+        if pixel_values is not None:
+            padded[:num_patches] = pixel_values.to(dtype)
+
+        # Upstream's _get_3d_rope_embed on host copies of the frequencies.
+        t, h, w = grid_thw
+        merge = tower.spatial_merge_size
+
+        def spatial_ids(ids: torch.Tensor) -> torch.Tensor:
+            return (
+                ids.reshape(h // merge, merge, w // merge, merge)
+                .permute(0, 2, 1, 3)
+                .unsqueeze(0)
+                .expand(t, -1, -1, -1, -1)
+                .flatten()
+            )
+
+        t_ids = torch.arange(t).unsqueeze(1).expand(-1, h * w).flatten()
+        h_ids = spatial_ids(torch.arange(h).unsqueeze(1).expand(-1, w))
+        w_ids = spatial_ids(torch.arange(w).unsqueeze(0).expand(h, -1))
+        freqs = torch.cat(
+            [
+                torch.outer(t_ids.float(), vm.inv_freq_t.cpu()),
+                torch.outer(h_ids.float(), vm.inv_freq_h.cpu()),
+                torch.outer(w_ids.float(), vm.inv_freq_w.cpu()),
+            ],
+            dim=-1,
+        )
+        half = freqs.shape[-1]
+        head_dim = vm.encoder.layers[0].self_attn.head_dim
+        cos = torch.ones(bucket, head_dim)
+        sin = torch.zeros(bucket, head_dim)
+        cos[:num_patches, :half] = cos[:num_patches, half : 2 * half] = freqs.cos()
+        sin[:num_patches, :half] = sin[:num_patches, half : 2 * half] = freqs.sin()
+
+        key_bias = torch.zeros(1, 1, 1, bucket)
+        key_bias[..., num_patches:] = -30000.0
+        return [x.to(device=device, dtype=dtype) for x in (padded, cos, sin, key_bias)]
+
+    def warmup_mm_encoder(self) -> None:
+        """Run the compiled encoder once on an all-padding image."""
+        side = math.isqrt(MM_ENCODER_PATCH_BUCKET)
+        with torch.inference_mode():
+            self._mm_encoder(*self._encoder_inputs(None, [1, side, side]))
+
+    def _encode_image(
+        self, pixel_values: torch.Tensor, grid_thw: list[int]
+    ) -> torch.Tensor:
+        assert self.vision_tower is not None and self._mm_encoder is not None
+        embeds = self._mm_encoder(*self._encoder_inputs(pixel_values, grid_thw))
+        merge = self.vision_tower.spatial_merge_size
+        return embeds[: math.prod(grid_thw) // (merge * merge)].cpu()
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        if "pixel_values_videos" in kwargs:
+            raise NotImplementedError(
+                "MiniMax-M3 video inputs are not supported on RBLN"
+            )
+        pixel_values = kwargs.get("pixel_values")
+        if pixel_values is None:
+            return ()
+        assert self._mm_encoder is not None, "the vision encoder is not compiled"
+        image_grid_thw = kwargs["image_grid_thw"]
+        assert isinstance(pixel_values, torch.Tensor)
+        assert isinstance(image_grid_thw, torch.Tensor)
+        grid_thw = image_grid_thw.tolist()
+        sizes = [math.prod(g) for g in grid_thw]
+        with torch.inference_mode():
+            return tuple(
+                self._encode_image(pv, g)
+                for pv, g in zip(pixel_values.split(sizes), grid_thw)
+            )
 
     def forward(
         self,
@@ -1068,8 +1322,25 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(nn.Module, SupportsPP):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        mm_embeds: torch.Tensor | None = None,
+        mm_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
+        # ``mm_embeds`` [B, L, H] holds the vision embeddings at image / video
+        # placeholder tokens and zeros elsewhere; ``mm_mask`` [B, L, 1] is 1 at
+        # those tokens. Every prefill graph of a multimodal model takes them, so
+        # text-only and image chunks share one graph.
+        if (
+            mm_embeds is not None
+            and inputs_embeds is None
+            and get_pp_group().is_first_rank
+        ):
+            assert mm_mask is not None
+            text_embeds = self.language_model.embed_input_ids(input_ids)
+            # Tensor-first: a scalar-first binary op (``1 - mm_mask``) lowers to a
+            # wrong device tensor-const.
+            inputs_embeds = torch.where(mm_mask > 0.5, mm_embeds, text_embeds)
+            input_ids = None
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -1081,11 +1352,11 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(nn.Module, SupportsPP):
         return self.language_model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def text_only():
-            for name, weight in weights:
-                if name.startswith(_VISION_PREFIXES):
+        def maybe_text_only():
+            for name, weight in self.hf_to_vllm_mapper.apply(weights):
+                if self.vision_tower is None and name.startswith("vision_tower."):
                     continue
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(text_only())
+        return loader.load_weights(maybe_text_only())
