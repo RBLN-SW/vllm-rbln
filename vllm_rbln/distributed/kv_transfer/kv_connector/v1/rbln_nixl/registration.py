@@ -150,6 +150,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             kv_caches_base_addr=base_meta.kv_caches_base_addr,
             num_blocks=base_meta.num_blocks,
             block_lens=base_meta.block_lens,
+            block_strides=base_meta.block_strides,
             kv_cache_layout=base_meta.kv_cache_layout,
             block_size=base_meta.block_size,
             ssm_sizes=base_meta.ssm_sizes,
@@ -364,6 +365,12 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         )
         self.device_id = device_id
         self.block_len_per_layer = list(xfer.block_lens)
+        # The adapter hands back one contiguous run of blocks per area, so a
+        # block's stride is its own length. Upstream keeps the two apart because
+        # a region can be a strided window into a larger tensor; on RBLN it
+        # never is, and the D2D descriptor builder already reads addresses as
+        # `base + block * block_len`.
+        self.block_stride_per_layer = list(xfer.block_lens)
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = xfer.base_addrs
         self._registered_descs.append(xfer.reg_handle)
         assert len(self.block_len_per_layer) == len(xfer.base_addrs)
@@ -453,6 +460,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.tp_rank],
             num_blocks=self.num_blocks,
             block_lens=self.block_len_per_layer,
+            block_strides=self.block_stride_per_layer,
             kv_cache_layout=self.kv_cache_layout,
             block_size=self.block_size,
             ssm_sizes=self._mamba_ssm_size,
