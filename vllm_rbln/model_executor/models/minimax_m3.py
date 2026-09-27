@@ -26,7 +26,7 @@ and replaces the compute with RBLN-friendly code:
 * the dense layers use the generic ``Attention`` (RBLN flash backend);
 * the sparse layers run the MSA lightning indexer and the block-sparse GQA
   attention through ``rbln_custom_ops.sparse_attn_minimax_indexer`` /
-  ``sparse_attn_minimax_attn``, each reading its paged cache from the
+  ``sparse_attn_minimax_gqa``, each reading its paged cache from the
   attention metadata (a graph input) like the DSA path does;
 * MoE goes through the RBLN ``MoERunner`` (router callback) with the
   routed-scaling factor and the shared expert applied here.
@@ -713,7 +713,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 else ()
             ),
         )
-        attn_output = torch.ops.rbln_custom_ops.sparse_attn_minimax_attn(
+        attn_output = torch.ops.rbln_custom_ops.sparse_attn_minimax_gqa(
             q5,
             k5,
             v5,
