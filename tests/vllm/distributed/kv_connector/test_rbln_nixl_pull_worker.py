@@ -100,6 +100,9 @@ class TestShardReadPath:
         # counts it sizes descriptors from, and the context-parallel ranks it
         # offsets by. One shard everywhere here, so no offset applies.
         w.dst_region_num_blocks = {"eng": [8, 8], "local": [8, 8]}
+        w._mixed_mem_types = False
+        w._uses_region_group_mapping = False
+        w.dst_uses_region_group_mapping = {"eng": False, "local": False}
         w.dst_region_group_ids = {"eng": [0, 0], "local": [0, 0]}
         w.region_group_ids = [0, 0]
         w.dcp_size = 1
@@ -114,10 +117,13 @@ class TestShardReadPath:
         w._recving_metadata = {}
         w._invalid_block_ids = queue.Queue()
         w._failed_recv_reqs = queue.Queue()
+        w._recv_failures = set()
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
         # single group, 2 regions per shard
-        w.kv_cache_config = MagicMock(kv_cache_groups=[0])
+        # transfer_groups is what 0.30.0 checks the per-group list lengths
+        # against; one group here, matching kv_cache_groups.
+        w.kv_cache_config = MagicMock(kv_cache_groups=[0], transfer_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
@@ -151,6 +157,12 @@ class TestShardReadPath:
         meta = MagicMock()
         meta.remote = remote
         meta.local_physical_block_ids = local_ids
+        # 0.30.0 counts the KV cache groups off the logical list. A mock's
+        # __len__ answers 0, which reads as a full prefix hit and skips the
+        # transfer these cases are about. One block per logical block here, so
+        # the two lists are the same.
+        meta.local_block_ids = local_ids
+        meta.local_num_computed_blocks = [0] * len(local_ids)
         return meta
 
     def test_reads_every_stage(self):
@@ -188,8 +200,8 @@ class TestShardReadPath:
         w.nixl_wrapper.release_xfer_handle.assert_called_once_with(first)
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
         # Reported failed exactly once, which is what the engine counts.
-        assert w._failed_recv_reqs.qsize() == 1
-        assert w._failed_recv_reqs.get_nowait() == "r0"
+        # 0.30.0 collects these in a set the handler is handed, not a queue.
+        assert w._recv_failures == {"r0"}
 
     def test_prefix_hit_notifies_each_stage_no_read(self):
         # Full prefix hit (empty local list): no read, one notif per stage.

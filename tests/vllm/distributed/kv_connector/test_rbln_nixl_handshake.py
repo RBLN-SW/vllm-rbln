@@ -1377,6 +1377,16 @@ class TestValidateRemoteAgentHandshake:
         w.num_regions = num_layers * 2 * areas
         w.block_len_per_layer = [64] * (num_layers * 2 * areas)
         w.dst_num_blocks = {"eng": dst_num_blocks}
+        # 0.30.0 keeps the peer's per-region block counts alongside its
+        # total; every region here holds the whole count.
+        w.dst_region_num_blocks = {"eng": [dst_num_blocks] * (num_layers * 2 * areas)}
+        w.region_group_ids = [0] * (num_layers * 2 * areas)
+        w.dst_region_group_ids = {"eng": [0] * (num_layers * 2 * areas)}
+        w.dst_uses_region_group_mapping = {"eng": False}
+        w._uses_region_group_mapping = False
+        w.nixl_memory_type = "VRAM"
+        w.region_mem_types = ["VRAM"] * (num_layers * 2 * areas)
+        w.dst_region_mem_types = {"eng": ["VRAM"] * (num_layers * 2 * areas)}
         w.vllm_config = MagicMock()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
         # add_remote_agent reads the cached copy __init__ makes of it.
@@ -2556,6 +2566,8 @@ class TestCleanupRemoteEngine:
         w._remote_shard_layer_names = defaultdict(dict, {"eng": {0: ("l0",)}})
         w._overlapping_ranks = defaultdict(list, {"eng": [0]})
         w._remote_pp_size = {"eng": 1}
+        # The 0.30.0 sweep drops a stale engine's in-flight reads too.
+        w._recving_transfers = defaultdict(list)
 
         with patch.object(NixlBaseConnectorWorker, "_cleanup_remote_engine"):
             NixlBaseConnectorWorker._evict_stale_engines(w)

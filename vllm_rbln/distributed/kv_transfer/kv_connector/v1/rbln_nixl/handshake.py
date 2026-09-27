@@ -66,6 +66,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
     narrowed, upstream's handle serves.
     """
 
+    # Upstream owns this one, and `_regions_viewed_as` reorders it for the
+    # duration of a peer-region view; declaring it keeps the reassignment from
+    # leaving the type unresolvable here.
+    block_len_per_layer: list[int]
+
     def _add_remote_agent_head_matched(
         self,
         nixl_agent_meta: RblnNixlAgentMetadata,
@@ -981,12 +986,15 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
     def _regions_viewed_as(self, region_ids: list[int] | None):
         """Make our per-region arrays answer to a peer's region positions.
 
-        Upstream's remote descriptor builder feeds the PEER's region position into
-        `get_backend_aware_kv_block_len` and `_is_region_replicated`, which index
-        OUR arrays. That only means our region while our band starts at our
-        region 0 -- true for a pipeline stage, false for a consumer holding every
-        layer while the producer is pipelined, where **the length read belongs to
-        a different layer than the address it is paired with**.
+        Upstream's remote descriptor builder feeds the PEER's region position
+        into `_is_region_replicated` and, since 0.30.0, straight into
+        `block_len_per_layer` -- both of which index OUR arrays. That only means
+        our region while our band starts at our region 0 -- true for a pipeline
+        stage, false for a consumer holding every layer while the producer is
+        pipelined, where **the length read belongs to a different layer than the
+        address it is paired with**. So the lengths are reordered for the
+        duration too, not just routed through the accessor that used to own
+        this translation.
 
         A plain attribute suffices: upstream reaches those two methods only from
         registration and from a handshake, and runs handshakes one at a time on a
@@ -995,11 +1003,15 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         request exists to start a handshake. So no second view is ever live.
         """
         prev = self._viewed_region_ids
+        prev_lens = self.block_len_per_layer
         self._viewed_region_ids = region_ids
+        if region_ids is not None:
+            self.block_len_per_layer = [prev_lens[r] for r in region_ids]
         try:
             yield
         finally:
             self._viewed_region_ids = prev
+            self.block_len_per_layer = prev_lens
 
     def _register_remote_engine_prelude(
         self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
@@ -1256,9 +1268,20 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 )
 
     def _validate_remote_agent_handshake(
-        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        remote_dcp_size: int = 1,
     ) -> None:
         assert isinstance(nixl_agent_meta, RblnNixlAgentMetadata)
+        # The RBLN descriptor arithmetic addresses a peer rank's whole region;
+        # a decode-context-parallel peer holds a slice of one, which no pairing
+        # here expresses. Refuse it rather than pair the wrong bytes.
+        if remote_dcp_size != 1:
+            raise RuntimeError(
+                "RBLN NIXL does not support a decode-context-parallel peer: "
+                f"peer reports dcp_size={remote_dcp_size}."
+            )
         self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
         self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
         self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)

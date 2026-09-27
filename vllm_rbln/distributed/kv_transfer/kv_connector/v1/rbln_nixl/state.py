@@ -159,11 +159,18 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     def get_backend_aware_kv_block_len(
         self, layer_idx: int, first_split: bool = True, mamba_view: bool = False
     ) -> int:
-        return super().get_backend_aware_kv_block_len(
-            layer_idx=self._viewed_region(layer_idx),
-            first_split=first_split,
-            mamba_view=mamba_view,
-        )
+        """One K/V element's block length, read through the peer's view.
+
+        K and V sit in separate regions here, so an attention block's element
+        is the whole block; a Mamba block instead holds a conv and an ssm part
+        of different sizes, which `virtually_split_kv_in_blocks` indexes apart.
+        vllm 0.30.0 removed the base method along with that split, so the
+        subclass that kept the split carries the body too.
+        """
+        region_id = self._viewed_region(layer_idx)
+        if self.topo.virtually_split_kv_in_blocks and mamba_view:
+            return self._mamba_ssm_size[not first_split]
+        return self.block_len_per_layer[region_id]
 
     # ------------------------------------------------------------------
     # Hybrid Full + SWA desc layout (RDMA payload only)

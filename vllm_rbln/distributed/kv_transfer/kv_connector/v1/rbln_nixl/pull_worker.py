@@ -171,7 +171,10 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                 )
                 for submitted in handles:
                     self.nixl_wrapper.release_xfer_handle(submitted)
-                self._handle_failed_transfer(req_id, handle)
+                # 0.30.0 no longer queues the request itself: the handler
+                # records the failure into the set its caller hands it, and
+                # get_finished drains that set.
+                self._handle_failed_transfer(req_id, handle, self._recv_failures)
                 return
 
         if handles:
