@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import tempfile
 from types import MethodType, SimpleNamespace
 
@@ -34,6 +35,7 @@ from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.v1.core.sched.output import CachedRequestData
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
 
 import vllm_rbln.v1.worker.optimum_model_runner as runner_module
@@ -722,6 +724,32 @@ def test_execute_model_on_the_ec_producer_returns_the_empty_encoder_output(
     assert encoded == [(0, 3)]
     assert output.req_ids == ["req_0"]
     assert output.sampled_token_ids == [[]]
+
+
+def test_execute_model_on_the_ec_producer_enters_the_connector_on_an_idle_step(
+    model_runner, monkeypatch
+):
+    model_runner.vllm_config.ec_transfer_config = ECTransferConfig(
+        ec_connector="RblnECNixlConnector", ec_role="ec_producer"
+    )
+    model_runner.is_ec_producer = True
+    entered = []
+
+    @contextlib.contextmanager
+    def record_entry(scheduler_output, encoder_cache):
+        entered.append(scheduler_output)
+        yield None
+
+    monkeypatch.setattr(model_runner, "maybe_get_ec_connector_output", record_entry)
+    idle_step = _schedule_new_request(block_ids=([1],), outer_block_ids=[1])
+    assert idle_step.total_num_scheduled_tokens == 0
+
+    output = model_runner.execute_model(idle_step)
+
+    # The connector polls its transfers inside this context, so a producer
+    # must enter it even when nothing new was scheduled.
+    assert entered == [idle_step]
+    assert output is EMPTY_MODEL_RUNNER_OUTPUT
 
 
 def test_update_states_rejects_a_streaming_request(model_runner):
