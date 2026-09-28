@@ -439,7 +439,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
             for handle in self._recving_transfers.pop(req_id, []):
                 self.nixl_wrapper.release_xfer_handle(handle)
-            self._handle_failed_transfer(req_id, None)
+            self._handle_failed_transfer(req_id, None, self._recv_failures)
 
         try:
             self._cleanup_remote_engine(engine_id, log_eviction=False)

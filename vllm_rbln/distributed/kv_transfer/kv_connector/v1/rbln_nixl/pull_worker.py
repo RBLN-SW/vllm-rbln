@@ -52,7 +52,7 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                 error=None,
                 dst_engine_id=engine_id,
             )
-            self._handle_failed_transfer(req_id, None)
+            self._handle_failed_transfer(req_id, None, self._recv_failures)
             return
         # Keep the engine off the staleness sweep: upstream does this on the
         # read path this one replaces, and a swept producer loses the state

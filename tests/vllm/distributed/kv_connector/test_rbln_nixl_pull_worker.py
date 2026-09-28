@@ -112,11 +112,11 @@ class TestShardReadPath:
         w._recving_transfers = defaultdict(list)
         w._engine_last_active = {}
         # What upstream's failure path reads: it logs with the engine id, looks the
-        # request's metadata up, queues the failure and the invalidated blocks.
+        # request's metadata up, records the failure in the set its caller hands
+        # it, and queues the invalidated blocks.
         w.engine_id = "local"
         w._recving_metadata = {}
         w._invalid_block_ids = queue.Queue()
-        w._failed_recv_reqs = queue.Queue()
         w._recv_failures = set()
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
@@ -443,5 +443,5 @@ class TestAReadDeferredPastTheTeardown:
 
         w._read_blocks_for_req("r0", meta)
 
-        assert list(w._failed_recv_reqs.queue) == ["r0"]
+        assert w._recv_failures == {"r0"}
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 0

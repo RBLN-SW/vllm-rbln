@@ -21,7 +21,6 @@
 # nixl-rbln is the only stand-in.
 
 import collections
-import queue
 import threading
 import time
 from collections import Counter, defaultdict
@@ -3365,8 +3364,7 @@ class TestADeadPeerIsReported:
         w.nixl_wrapper = MagicMock()
         w._recving_metadata = {}
         w._recving_transfers = collections.defaultdict(list)
-        w._invalid_block_ids = queue.Queue()
-        w._failed_recv_reqs = queue.Queue()
+        w._recv_failures = set()
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
         w._remote_agents = {"eng": {(0, 0): "agent0", (0, 1): "agent1"}}
@@ -3403,8 +3401,7 @@ class TestADeadPeerIsReported:
 
         w._send_heartbeats(self._heartbeat({"r0"}))
 
-        assert list(w._failed_recv_reqs.queue) == ["r0"]
-        assert list(w._invalid_block_ids.queue) == [{1, 2}]
+        assert w._recv_failures == {"r0"}
         # The in-flight handle goes with it: left in place, _pop_done_transfers
         # would report r0 a second time with its metadata already gone.
         w.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
@@ -3445,10 +3442,9 @@ class TestAReadThatMovedNoBlock:
         w = TestADeadPeerIsReported._worker()
         w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
 
-        w._handle_failed_transfer("r0", None)
+        w._handle_failed_transfer("r0", None, w._recv_failures)
 
-        assert w._failed_recv_reqs.empty()
-        assert w._invalid_block_ids.empty()
+        assert not w._recv_failures
 
     def test_a_second_report_says_the_same(self):
         # The handshake done-callback runs on the executor thread, so it and
@@ -3457,10 +3453,10 @@ class TestAReadThatMovedNoBlock:
         w = TestADeadPeerIsReported._worker()
         w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
 
-        w._handle_failed_transfer("r0", None)
-        w._handle_failed_transfer("r0", None)
+        w._handle_failed_transfer("r0", None, w._recv_failures)
+        w._handle_failed_transfer("r0", None, w._recv_failures)
 
-        assert w._failed_recv_reqs.empty()
+        assert not w._recv_failures
 
 
 class TestMetadataTakenMidSweep:
@@ -3492,4 +3488,4 @@ class TestMetadataTakenMidSweep:
 
         # Reading the live view would raise here; the sweep still covers every
         # read it set out to, including the one taken from under it.
-        assert list(w._failed_recv_reqs.queue) == ["r0", "r1", "r2"]
+        assert w._recv_failures == {"r0", "r1", "r2"}

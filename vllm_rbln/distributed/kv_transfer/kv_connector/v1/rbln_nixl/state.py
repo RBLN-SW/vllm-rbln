@@ -92,7 +92,12 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         )
         return self.transfer_topo
 
-    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
+    def _handle_failed_transfer(
+        self,
+        req_id: str,
+        handle: int | None,
+        failed_req_ids: set[str] | None = None,
+    ) -> bool:
         """Upstream's failure report, minus the reads nothing is waiting on.
 
         A read with no local block moved nothing: `load_kv_async` is returned
@@ -109,8 +114,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         meta = self._recving_metadata.get(req_id)
         if meta is not None and not meta.local_block_ids:
             assert handle is None
-            return
-        super()._handle_failed_transfer(req_id, handle)
+            return True
+        return super()._handle_failed_transfer(req_id, handle, failed_req_ids)
 
     def _layer_overlap(
         self, registered_layer_names: tuple[str, ...] | list[str]
