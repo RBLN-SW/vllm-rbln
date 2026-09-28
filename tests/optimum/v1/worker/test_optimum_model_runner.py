@@ -32,7 +32,8 @@ from vllm.distributed import (
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
-from vllm.sampling_params import PoolingParams, SamplingParams
+from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.sample.metadata import SamplingMetadata
 
