@@ -156,7 +156,7 @@ def _schedule_new_request(
         num_common_prefix_blocks=0,
         finished_req_ids=set(finished_req_ids) if finished_req_ids else set(),
         free_encoder_mm_hashes=[],
-        block_table_dict={req_id: outer_block_ids},
+        block_table_dict={req_id: outer_block_ids for req_id in req_ids},
         cached_block_table=cached_block_table if cached_block_table else [],
         cached_length=cached_length if cached_length else [],
         dummy_block=None,

@@ -63,6 +63,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
+    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -272,6 +273,11 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             pin_memory=PIN_MEMORY,
         )
 
+        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+            raise NotImplementedError(
+                "VLLM_COMPUTE_NANS_IN_LOGITS is not supported on the optimum "
+                "model path."
+            )
         if envs.VLLM_RBLN_METRICS:
             self.model_performance_tracker = PerformanceTracker("MODEL")
             self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
@@ -367,6 +373,22 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # with self.synchronize_input_prep():
             self._update_states(scheduler_output)
+
+            # The EC producer has no decoder: encode the new requests' items and
+            # publish them. The scheduler finishes an encoder-only request once
+            # its prompt is consumed.
+            if self.is_ec_producer:
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output, encoder_cache=self.encoder_cache
+                ):
+                    for new_req in scheduler_output.scheduled_new_reqs:
+                        self._execute_mm_encoder(
+                            self.requests[new_req.req_id].mm_features,
+                            0,
+                            len(new_req.prompt_token_ids),
+                        )
+                    return make_empty_encoder_model_runner_output(scheduler_output)
+
             if not num_scheduled_tokens:
                 # FIXME If the model keeps an attention manager (Gemma3),
                 # clear its per-request state.
@@ -378,20 +400,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     self.model.attention_manager.clear()
                 # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
-
-            # The EC producer has no decoder: encode the new requests' items,
-            # publish them, and report the requests done.
-            if self.is_ec_producer:
-                with self.maybe_get_ec_connector_output(
-                    scheduler_output, encoder_cache=self.encoder_cache
-                ):
-                    for new_req in scheduler_output.scheduled_new_reqs:
-                        self._execute_mm_encoder(
-                            self.requests[new_req.req_id].mm_features,
-                            0,
-                            len(new_req.prompt_token_ids),
-                        )
-                return self._make_producer_output(scheduler_output)
 
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
                 scheduler_output
@@ -903,46 +911,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 is_mm_embed[rows] |= pos.is_embed[start_idx:end_idx]
         return mm_embeds, is_mm_embed.unsqueeze(0)
 
-    def _make_producer_output(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> ModelRunnerOutput:
-        """Build a ModelRunnerOutput that tells the engine core every
-        request is finished (by returning the EOS token).
-
-        Without this, the engine keeps scheduling decode steps for a
-        request that will never produce real tokens.
-        """
-        if not scheduler_output.num_scheduled_tokens:
-            return EMPTY_MODEL_RUNNER_OUTPUT
-
-        # Multimodal configs (e.g. Qwen3-VL) leave the top-level
-        # hf_config.eos_token_id as None and carry the real value inside
-        # text_config / generation_config. Walk the fallbacks so the
-        # scheduler never sees a None token id.
-        eos = None
-        for cfg in (
-            getattr(self.model_config, "hf_text_config", None),
-            self.model_config.hf_config,
-            getattr(self.model_config, "hf_generation_config", None),
-        ):
-            if cfg is None:
-                continue
-            cand = getattr(cfg, "eos_token_id", None)
-            if isinstance(cand, list):
-                cand = next((x for x in cand if x is not None), None)
-            if cand is not None:
-                eos = cand
-                break
-        if eos is None:
-            eos = 0
-
-        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-        return ModelRunnerOutput(
-            req_ids=req_ids,
-            req_id_to_index={rid: idx for idx, rid in enumerate(req_ids)},
-            sampled_token_ids=[[eos] for _ in req_ids],
-        )
-
     def _update_states(self, scheduler_output: "RBLNSchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1027,11 +995,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             if req_id in self.requests:
-                # For streaming case only.
-                req_state = self._update_streaming_request(req_id, new_req_data)
-                self._init_mrope_positions(req_state)
-                reqs_to_add.append(req_state)
-                continue
+                # Upstream resumes the request here via _update_streaming_request.
+                raise NotImplementedError(
+                    "Streaming input is not supported on the optimum model path."
+                )
 
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
@@ -1372,16 +1339,15 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             raw_pooler_output,
         )
 
-        pooler_output: list[torch.Tensor | None] = []
-        for raw_output, seq_len, prompt_len in zip(
-            raw_pooler_output, seq_lens_cpu, pooling_metadata.prompt_lens, strict=False
-        ):
-            output = raw_output if seq_len == prompt_len else None
-            pooler_output.append(output)
+        finished_mask = pooling_metadata.get_pooling_cursor().get_finished_mask()
+        pooler_output: list[torch.Tensor | None] = [
+            output if finished else None
+            for output, finished in zip(raw_pooler_output, finished_mask, strict=True)
+        ]
 
         return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            req_ids=self.input_batch.req_ids.copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
@@ -1452,9 +1418,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         dict[str, int],
         list[int],
     ]:
-        num_nans_in_logits = {}
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
-            num_nans_in_logits = self._get_nans_in_logits(logits)
+        num_nans_in_logits: dict[str, int] = {}
 
         num_reqs = self.input_batch.num_reqs
         # Copy some objects so they don't get modified after returning.
