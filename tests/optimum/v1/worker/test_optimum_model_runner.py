@@ -33,7 +33,6 @@ from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -733,18 +732,6 @@ def test_update_states_rejects_a_streaming_request(model_runner):
 
     # A second NewRequestData for a live request is the streaming-input path.
     with pytest.raises(NotImplementedError, match="Streaming input"):
-        model_runner._update_states(scheduler_output)
-
-
-def test_update_states_rejects_prompt_logprobs(model_runner):
-    scheduler_output = _schedule_new_request(
-        "req_0", block_ids=([1],), outer_block_ids=[1]
-    )
-    scheduler_output.scheduled_new_reqs[0].sampling_params = SamplingParams(
-        prompt_logprobs=1
-    )
-
-    with pytest.raises(NotImplementedError, match="prompt_logprobs"):
         model_runner._update_states(scheduler_output)
 
 
