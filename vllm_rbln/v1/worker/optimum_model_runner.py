@@ -378,17 +378,14 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             if self.is_ec_producer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output, encoder_cache=self.encoder_cache
-                ) as ec_connector_output:
+                ):
                     for new_req in scheduler_output.scheduled_new_reqs:
                         self._execute_mm_encoder(
                             self.requests[new_req.req_id].mm_features,
                             0,
                             len(new_req.prompt_token_ids),
                         )
-                return ModelRunnerOutput.with_ec_conn_output(
-                    make_empty_encoder_model_runner_output(scheduler_output),
-                    ec_connector_output,
-                )
+                    return make_empty_encoder_model_runner_output(scheduler_output)
 
             if not num_scheduled_tokens:
                 # FIXME If the model keeps an attention manager (Gemma3),
