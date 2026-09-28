@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -118,6 +119,7 @@ def _schedule_new_request(
     preempted_req_ids: list[str] | None = None,
     cached_block_table: list[int] | None = None,
     cached_length: list[int] | None = None,
+    pooling_params: PoolingParams | None = None,
 ) -> RBLNSchedulerOutput:
     new_reqs = []
     num_scheduled_tokens = {}
@@ -134,8 +136,8 @@ def _schedule_new_request(
                 req_id=req_id,
                 prompt_token_ids=request_token_ids,
                 mm_features=[],
-                sampling_params=SamplingParams(),
-                pooling_params=None,
+                sampling_params=None if pooling_params else SamplingParams(),
+                pooling_params=pooling_params,
                 block_ids=block_ids,
                 num_computed_tokens=new_computed_tokens,
                 lora_request=None,

@@ -251,7 +251,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # FIXME enable async scheduling for optimum model runner
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.enable_prefix_caching = cache_config.enable_prefix_caching
-        self.seq_lens = np.zeros(self.max_num_reqs, dtype=np.int32)
+        self.seq_lens = torch.zeros(self.max_num_reqs, dtype=torch.int32)
+        self.seq_lens_np = self.seq_lens.numpy()
         self.sort_batch_by_length = False
 
         # self.uniform_decode_query_len = 1
@@ -565,7 +566,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.set_active_loras(self.input_batch, is_prefill)
 
         # Set seq_lens
-        self.seq_lens[:num_reqs] = (
+        self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs]
             + num_scheduled_tokens_np[:num_reqs]
         )
