@@ -98,22 +98,22 @@ class SubBlockHasher:
     def hash_tokens(
         self,
         token_ids: Sequence[int],
+        request: Request,
         *,
         parent_hash: BlockHash | None = None,
         num_hashed_tokens: int = 0,
-        request: Request,
         start_mm_idx: int = 0,
     ) -> tuple[list[BlockHash], list[tuple[Any, ...] | None], int]:
         """Return sub-block hashes for *full* sub-blocks in ``token_ids``.
 
         Args:
             token_ids: Full token sequence of the request.
+            request: Source of the extra hash keys (LoRA, cache_salt,
+                multimodal, prompt_embeds) mixed into each sub-block hash.
             parent_hash: Hash of the last sub-block before the range we
                 are hashing (``None`` for the very first sub-block).
             num_hashed_tokens: Number of tokens already hashed (i.e. the
                 start offset into ``token_ids``).
-            request: Source of the extra hash keys (LoRA, cache_salt,
-                multimodal, prompt_embeds) mixed into each sub-block hash.
             start_mm_idx: Starting multimodal feature index for
                 incremental hashing with multimodal requests.
 
@@ -656,9 +656,9 @@ class RBLNKVCacheManager(KVCacheManager):
 
         new_hashes, new_extra_keys, new_mm_idx = self.sub_block_hasher.hash_tokens(
             request.all_token_ids,
+            request,
             parent_hash=parent_hash,
             num_hashed_tokens=num_hashed_tokens,
-            request=request,
             start_mm_idx=state.mm_idx,
         )
         if new_hashes:
