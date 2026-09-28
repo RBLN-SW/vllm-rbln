@@ -228,7 +228,9 @@ class RblnPlatform(Platform):
         orig_create_engine_config = EngineArgs.create_engine_config
 
         def create_engine_config(self, *args, **kwargs):
-            model_impl = resolve_model_impl(self.additional_config, self.model_impl)
+            model_impl = resolve_model_impl(
+                self.additional_config, self.model_impl, engine_args=self
+            )
             # Upstream reads this field too, and there `transformers` means its
             # own Transformers backend, which refuses several of the models
             # optimum-rbln supports. Hand the default back so that resolution is

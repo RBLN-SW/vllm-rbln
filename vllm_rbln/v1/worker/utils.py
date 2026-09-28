@@ -391,6 +391,11 @@ DYNAMIC_KV_SUPPORTED_CONNECTORS = (
     "RblnNixlPushConnector",
     "RBLNLMCacheConnectorV1",
 )
+# vLLM's wrapper for running several connectors at once. It is not itself in the
+# set above because it registers nothing of its own: `register_kv_caches` and the
+# post-resize finalize both fan out to its children, so the resize is open for it
+# exactly when it is open for every child.
+MULTI_CONNECTOR = "MultiConnector"
 
 
 def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
@@ -439,18 +444,25 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "does not accept a dynamic KV input"
         )
     kv_transfer = vllm_config.kv_transfer_config
-    if (
-        kv_transfer is not None
-        and kv_transfer.kv_connector not in DYNAMIC_KV_SUPPORTED_CONNECTORS
-    ):
-        # The worker registers with the connector only once the resize has
-        # allocated. That is connector-agnostic, so one outside this set is
-        # untried rather than known broken.
-        return (
-            f"kv_connector={kv_transfer.kv_connector!r} is not among the "
-            "connectors the dynamic-KV resize is open for "
-            f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
-        )
+    if kv_transfer is not None:
+        names = [kv_transfer.kv_connector]
+        if kv_transfer.kv_connector == MULTI_CONNECTOR:
+            # With no children the wrapper's own name stays and is reported:
+            # nothing was checked. Nesting is not walked, so a MultiConnector
+            # child reads as untried like any other name outside the set.
+            children = kv_transfer.kv_connector_extra_config.get("connectors")
+            if children:
+                names = [child.get("kv_connector", "<unnamed>") for child in children]
+        unsupported = [n for n in names if n not in DYNAMIC_KV_SUPPORTED_CONNECTORS]
+        if unsupported:
+            # The worker registers with the connector only once the resize has
+            # allocated. That is connector-agnostic, so one outside this set is
+            # untried rather than known broken.
+            return (
+                f"kv_connector={', '.join(repr(n) for n in unsupported)} is not "
+                "among the connectors the dynamic-KV resize is open for "
+                f"({', '.join(DYNAMIC_KV_SUPPORTED_CONNECTORS)})"
+            )
     return None
 
 

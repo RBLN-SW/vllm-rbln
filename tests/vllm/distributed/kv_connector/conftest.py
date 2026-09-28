@@ -64,6 +64,7 @@ def make_worker(monkeypatch, tmp_path_factory):
         kv_cache: KvGeometry | None = None,
         swa_view_opt: bool = False,
         register: bool = True,
+        stripe_width: int | None = None,
     ) -> Any:
         geometry = kv_cache or KvGeometry()
         config = engine_config(
@@ -74,6 +75,7 @@ def make_worker(monkeypatch, tmp_path_factory):
                 else draft_model_dir(draft_root, draft_kv_heads)
             ),
             block_size=geometry.block_size,
+            stripe_width=stripe_width,
         )
         # Left open for the test's duration: get_current_attn_backends reads it
         # during __init__, and later production calls read it again.
