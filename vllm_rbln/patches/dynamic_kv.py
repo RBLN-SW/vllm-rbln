@@ -138,7 +138,7 @@ def check_enough_kv_cache_blocks_after_resize(
     """Fail loudly when the resized pool cannot hold one max-length request."""
     # NOTE(RBLN): upstream's `check_enough_kv_cache_memory` runs against the
     # pre-compile estimate and nothing re-checks the number substituted here, so
-    # without this the server starts and then rejects every request.
+    # without this the server starts and a prompt that cannot fit waits forever.
     one_request = sum(
         cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
