@@ -22,7 +22,6 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -36,7 +35,6 @@ from vllm.utils.cpu_resource_utils import (
     get_allowed_cpu_list,
     get_visible_memory_node,
 )
-from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -464,32 +462,6 @@ def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
     return (
         rbln_config.use_dynamic_kv_cache is not False
         and dynamic_kv_unsupported_reason(vllm_config) is None
-    )
-
-
-@dataclass(frozen=True)
-class KvMinimum:
-    """The fewest blocks a KV cache pool can serve with."""
-
-    one_request: int
-
-    @property
-    def needed(self) -> int:
-        # +1: the block pool keeps block 0 as the null block.
-        return 1 + self.one_request
-
-
-def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
-    """Blocks one max-length request needs, summed over the groups sharing the
-    pool."""
-    return KvMinimum(
-        one_request=sum(
-            cdiv(
-                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-                group.kv_cache_spec.page_size_bytes,
-            )
-            for group in cfg.kv_cache_groups
-        )
     )
 
 

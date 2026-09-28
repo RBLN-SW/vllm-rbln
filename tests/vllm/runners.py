@@ -59,9 +59,9 @@ def kv_blocks_needed(
 
     vLLM sizes the pool in units of ``group_size * page_size``, so each term
     sums over groups: a full-attention group holds the whole context, a
-    sliding-window group only what its layout keeps. The pool has to serve the
-    larger of one max-length request and one full decode batch, plus the null
-    block.
+    sliding-window group only what its layout keeps. Production only requires
+    one max-length request; tests also fit one full decode batch so nothing is
+    preempted. Plus the null block.
 
     Does not model Mamba/linear attention, KV sharing, or mixed window sizes;
     pin num_gpu_blocks_override on the spec for those.
