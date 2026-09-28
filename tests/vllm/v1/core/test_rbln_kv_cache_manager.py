@@ -1064,7 +1064,7 @@ class TestKVEvents:
         assert by_group[0].block_hashes == by_group[1].block_hashes
 
         hashes, _, _ = SubBlockHasher(sha256, SUB_BLOCK_SIZE).hash_tokens(
-            list(range(1000, 1008))
+            list(range(1000, 1008)), request=_plain_request()
         )
         manager._group_infos[1].sub_block_index.update(7, hashes)
         manager._on_block_evicted(7)
