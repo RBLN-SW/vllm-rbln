@@ -32,7 +32,6 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
@@ -51,6 +50,7 @@ from vllm_rbln.v1.core.utils import (
     should_defer_spec_step,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.kv_cache import rewind_recovers_failed_kv_loads
 
 logger = init_logger(__name__)
 
@@ -124,11 +124,15 @@ class RBLNScheduler(Scheduler):
         # a full block table.
         self._pending_runner_block_deltas: dict[str, KVCacheBlocks] = {}
         self._kv_load_failure_req_ids: set[str] = set()
-        groups = self.kv_cache_config.kv_cache_groups
-        self._hybrid_kv_cache = len(groups) > 1 or (
-            bool(groups) and isinstance(groups[0].kv_cache_spec, SlidingWindowSpec)
+        # Upstream rewinds a failed load to its first invalid block. Only a
+        # single full-attention group keeps every earlier block for that;
+        # a sliding-window or multi-group layout recomputes instead.
+        self._rewind_recovers_failed_loads = rewind_recovers_failed_kv_loads(
+            self.kv_cache_config
         )
-        self._preempted_hybrid_blocks: dict[
+        # Block table and computed count of a preempted request whose output
+        # is still in flight, so a load failure reported later still reaches it.
+        self._preempted_block_tables: dict[
             str, tuple[tuple[tuple[int, ...], ...], int]
         ] = {}
 
@@ -487,7 +491,7 @@ class RBLNScheduler(Scheduler):
                 request_id = request.request_id
 
                 if (
-                    request_id in self._preempted_hybrid_blocks
+                    request_id in self._preempted_block_tables
                     and request.num_in_flight_tokens
                 ):
                     # Keep ordinary preemptions in waiting: a valid in-flight
@@ -1050,11 +1054,11 @@ class RBLNScheduler(Scheduler):
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
     ) -> set[str]:
-        groups = self.kv_cache_config.kv_cache_groups
-        if not self._hybrid_kv_cache:
+        if self._rewind_recovers_failed_loads:
             return super()._handle_invalid_blocks(
                 invalid_block_ids, num_scheduled_tokens
             )
+        groups = self.kv_cache_config.kv_cache_groups
 
         affected = []
         blocks_to_evict = set(invalid_block_ids)
@@ -1069,7 +1073,7 @@ class RBLNScheduler(Scheduler):
         ]
         pending.extend(
             self.requests[request_id]
-            for request_id in self._preempted_hybrid_blocks
+            for request_id in self._preempted_block_tables
             if self.requests[request_id].status == RequestStatus.PREEMPTED
         )
         # A consumer may have reclaimed the failed SWA block while retaining
@@ -1078,7 +1082,7 @@ class RBLNScheduler(Scheduler):
             previous_count = len(pending)
             for request in list(pending):
                 if request.status == RequestStatus.PREEMPTED:
-                    block_ids, computed = self._preempted_hybrid_blocks[
+                    block_ids, computed = self._preempted_block_tables[
                         request.request_id
                     ]
                 else:
@@ -1136,7 +1140,7 @@ class RBLNScheduler(Scheduler):
                     request.num_computed_tokens = 0
                     self.failed_recving_kv_req_ids.add(request.request_id)
             logger.warning(
-                "Recomputing %d requests after hybrid KV load failure", len(affected)
+                "Recomputing %d requests after a KV load failure", len(affected)
             )
         return {request.request_id for request in affected}
 
@@ -1152,11 +1156,11 @@ class RBLNScheduler(Scheduler):
     ) -> dict[str, Any] | None:
         if (
             self.connector is not None
-            and self._hybrid_kv_cache
+            and not self._rewind_recovers_failed_loads
             and request.num_in_flight_tokens
         ):
             blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks
-            self._preempted_hybrid_blocks[request.request_id] = (
+            self._preempted_block_tables[request.request_id] = (
                 tuple(
                     tuple(
                         block.block_id if not block.is_null else -1 for block in group
@@ -1215,7 +1219,7 @@ class RBLNScheduler(Scheduler):
         # never be scheduled again.
         self._pending_runner_block_deltas.pop(request.request_id, None)
         self._kv_load_failure_req_ids.discard(request.request_id)
-        self._preempted_hybrid_blocks.pop(request.request_id, None)
+        self._preempted_block_tables.pop(request.request_id, None)
         return super()._free_request(request, delay_free_blocks)
 
     def update_from_output(
@@ -1228,7 +1232,7 @@ class RBLNScheduler(Scheduler):
         for request_id in scheduler_output.num_scheduled_tokens:
             request = self.requests.get(request_id)
             if request is None or not request.num_in_flight_tokens:
-                self._preempted_hybrid_blocks.pop(request_id, None)
+                self._preempted_block_tables.pop(request_id, None)
 
         if isinstance(self.kv_cache_manager, RBLNKVCacheManager):
             # Now that execute_model has written KV data and

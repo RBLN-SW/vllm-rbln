@@ -123,7 +123,7 @@ class TestSchedulerInit:
 
 class TestHybridLoadFailure:
     @staticmethod
-    def _scheduler(*, is_async=False, async_scheduling=False):
+    def _scheduler(*, is_async=False, async_scheduling=False, kv_cache_specs=None):
         sched = create_rbln_scheduler(
             block_size=16,
             num_blocks=32,
@@ -133,7 +133,11 @@ class TestHybridLoadFailure:
             additional_config={"enable_sub_block_cache": False},
             use_kv_connector=MockKVConfig(matched_tokens=48, is_async=is_async),
             async_scheduling=async_scheduling,
-            kv_cache_specs=[full_attention_spec(16), sliding_window_spec(16, 4)],
+            kv_cache_specs=(
+                [full_attention_spec(16), sliding_window_spec(16, 4)]
+                if kv_cache_specs is None
+                else kv_cache_specs
+            ),
         )
         sched.recompute_kv_load_failures = True
         return sched
@@ -170,6 +174,61 @@ class TestHybridLoadFailure:
         assert request.num_external_computed_tokens == 0
         groups = sched.kv_cache_manager.get_blocks(request.request_id).blocks
         assert all(not group[0].is_null for group in groups)
+        sched.update_from_output(retry, make_model_runner_output(retry))
+        _drain(sched)
+        assert request.is_finished()
+
+    def test_a_lone_sliding_window_group_recomputes_too(self):
+        # The window frees the blocks behind it whether or not a full-attention
+        # group sits beside it, so a rewind has nothing to land on here either.
+        sched = self._scheduler(kv_cache_specs=[sliding_window_spec(16, 4)])
+        assert not sched._rewind_recovers_failed_loads
+        request = self._request()
+        sched.add_request(request)
+        output = sched.schedule()
+        (blocks,) = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        assert blocks[0].is_null
+        result = make_model_runner_output(output)
+        result.kv_connector_output = KVConnectorOutput(
+            invalid_block_ids={blocks[2].block_id}
+        )
+
+        sched.update_from_output(output, result)
+
+        assert request.status == RequestStatus.PREEMPTED
+        assert request.num_computed_tokens == 0
+        assert request.skip_reading_prefix_cache
+        retry = sched.schedule()
+        assert request.request_id in retry.preempted_req_ids
+        (blocks,) = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        assert not blocks[0].is_null
+        sched.update_from_output(retry, make_model_runner_output(retry))
+        _drain(sched)
+        assert request.is_finished()
+
+    def test_a_lone_full_attention_group_keeps_the_upstream_rewind(self):
+        # Every block stays put under full attention, so upstream's rewind to
+        # the first invalid block recovers the load without a preemption.
+        sched = self._scheduler(kv_cache_specs=[full_attention_spec(16)])
+        assert sched._rewind_recovers_failed_loads
+        request = self._request()
+        sched.add_request(request)
+        output = sched.schedule()
+        (blocks,) = sched.kv_cache_manager.get_blocks(request.request_id).blocks
+        result = make_model_runner_output(output)
+        result.kv_connector_output = KVConnectorOutput(
+            invalid_block_ids={blocks[2].block_id}
+        )
+
+        sched.update_from_output(output, result)
+
+        assert request.status == RequestStatus.RUNNING
+        assert request.num_computed_tokens == 32
+        assert not request.skip_reading_prefix_cache
+        assert request.request_id not in sched._kv_load_failure_req_ids
+        retry = sched.schedule()
+        assert request.request_id not in retry.preempted_req_ids
+        assert retry.num_scheduled_tokens[request.request_id] == 16
         sched.update_from_output(retry, make_model_runner_output(retry))
         _drain(sched)
         assert request.is_finished()
@@ -320,7 +379,7 @@ class TestHybridLoadFailure:
         else:
             assert request.status == RequestStatus.FINISHED_ERROR
             assert request.request_id not in sched.requests
-        assert not sched._preempted_hybrid_blocks
+        assert not sched._preempted_block_tables
 
     def test_preempted_request_can_finish_while_waiting_for_inflight_output(self):
         sched = self._scheduler(async_scheduling=True)
@@ -338,7 +397,7 @@ class TestHybridLoadFailure:
         assert list(request.output_token_ids) == [100]
         assert request.is_finished()
         assert not sched.waiting and not sched.skipped_waiting
-        assert not sched._preempted_hybrid_blocks
+        assert not sched._preempted_block_tables
         assert not sched.schedule().num_scheduled_tokens
 
     def test_failure_does_not_propagate_through_valid_shared_prefix(self):

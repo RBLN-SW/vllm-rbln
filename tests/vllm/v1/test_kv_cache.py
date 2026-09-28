@@ -21,9 +21,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowManager, RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import (
+    RBLNSlidingWindowManager,
+    RBLNSlidingWindowSpec,
+    rewind_recovers_failed_kv_loads,
+)
 
 
 def _spec(*, block_size=16, sliding_window=16):
@@ -75,6 +86,75 @@ class TestRBLNSlidingWindowSpec:
         # physical block and ignores it, so None is safe.
         spec = _spec()
         assert spec.max_memory_usage_bytes(None) == spec.page_size_bytes
+
+
+class TestRewindRecoversFailedKvLoads:
+    # Upstream's load-failure rewind needs every earlier block in place and a
+    # single block table; that holds only for one full-attention group.
+    @staticmethod
+    def _full():
+        return FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+        )
+
+    @staticmethod
+    def _sliding():
+        return SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=8,
+            dtype=torch.float16,
+            sliding_window=4,
+        )
+
+    @staticmethod
+    def _config(*groups):
+        return KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(list(layers), spec) for layers, spec in groups
+            ],
+        )
+
+    def test_one_full_attention_group_rewinds(self):
+        assert rewind_recovers_failed_kv_loads(self._config((["l0"], self._full())))
+
+    def test_no_attention_group_rewinds(self):
+        assert rewind_recovers_failed_kv_loads(self._config())
+
+    def test_one_sliding_window_group_recomputes(self):
+        for sliding in (self._sliding(), _spec(sliding_window=4)):
+            assert not rewind_recovers_failed_kv_loads(self._config((["l0"], sliding)))
+
+    def test_two_groups_recompute(self):
+        assert not rewind_recovers_failed_kv_loads(
+            self._config((["l0"], self._full()), (["l1"], self._sliding()))
+        )
+
+    def test_a_uniform_group_is_judged_by_its_layers(self):
+        full = self._full()
+        assert rewind_recovers_failed_kv_loads(
+            self._config(
+                (
+                    ["l0", "l1"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=16, kv_cache_specs={"l0": full, "l1": full}
+                    ),
+                )
+            )
+        )
+        sliding = self._sliding()
+        assert not rewind_recovers_failed_kv_loads(
+            self._config(
+                (
+                    ["l0", "l1"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=16, kv_cache_specs={"l0": sliding, "l1": sliding}
+                    ),
+                )
+            )
+        )
 
 
 class TestRBLNSlidingWindowManager:

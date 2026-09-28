@@ -21,10 +21,39 @@ from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
+
+
+def _layer_specs(group: KVCacheGroupSpec) -> dict[str, KVCacheSpec]:
+    """Each layer's own spec, unwrapping a uniform-type group."""
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return {name: spec.kv_cache_specs[name] for name in group.layer_names}
+    return {name: spec for name in group.layer_names}
+
+
+def rewind_recovers_failed_kv_loads(kv_cache_config: KVCacheConfig) -> bool:
+    """Whether upstream's rewind can recover a failed KV load.
+
+    Upstream truncates ``num_computed_tokens`` at the first invalid block and
+    keeps the request running. That needs every earlier block still in place
+    and one block table per request. A sliding-window group frees the blocks
+    behind its window, so the rewind can land on a null block, and a
+    multi-group model keeps one block table per group. Both take the
+    scheduler's recompute path instead; only a single full-attention group
+    can rewind.
+    """
+    groups = kv_cache_config.kv_cache_groups
+    return len(groups) <= 1 and all(
+        isinstance(spec, FullAttentionSpec)
+        for group in groups
+        for spec in _layer_specs(group).values()
+    )
 
 
 def select_canonical_kv_layers_per_pool(kv_cache_config: KVCacheConfig) -> set[str]:
@@ -35,13 +64,9 @@ def select_canonical_kv_layers_per_pool(kv_cache_config: KVCacheConfig) -> set[s
     Token-level connectors must retain every layer's own view instead.
     """
     layer_to_spec = {
-        name: (
-            group.kv_cache_spec.kv_cache_specs[name]
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-            else group.kv_cache_spec
-        )
+        name: spec
         for group in kv_cache_config.kv_cache_groups
-        for name in group.layer_names
+        for name, spec in _layer_specs(group).items()
     }
     chosen = set()
     for tensor in kv_cache_config.kv_cache_tensors:
