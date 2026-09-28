@@ -11,39 +11,66 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Keep the post-step draft fetch out of the prefill path.
+"""Two `EngineCore` patches: the shutdown that faults on RBLN, and the
+post-step draft fetch the prefill path does not need.
 
-``EngineCore.post_step`` pulls the drafts out of the worker that produced them so
-the scheduler can size and allocate the next verification step. It runs whenever
-spec decode is on and async scheduling is off -- on RBLN that is every PP run,
-since PP under async scheduling is not supported yet
-(see ``platform/vllm_impl.py``).
+``EngineCore.post_step`` fetches the drafts the next step verifies. Between
+prefill chunks there is nothing to verify, and upstream's own consumer says so
+-- ``Scheduler.update_draft_token_ids`` drops the value on arrival. Under PP
+the fetch is a synchronous round-trip to the last stage, issued where
+``step_with_batch_queue`` would otherwise refill ``batch_queue``, so paying it
+for nothing costs the pipeline its depth.
 
-Between decode steps the fetch is a true dependence: step N's drafts are what
-step N+1 verifies. Between prefill chunks there is none, and upstream's own
-consumer says so -- ``Scheduler.update_draft_token_ids`` drops the value on
-arrival ("Ignore draft tokens for prefill chunks"). ``post_step`` only receives
-``model_executed``, so it cannot tell the two apart.
-
-At ``pipeline_parallel_size == 1`` that costs nothing: the engine has one batch
-in flight and already blocks each step. Under PP it costs the pipeline. The
-fetch is a synchronous round-trip to ``output_rank``, the last stage, issued
-right after ``step_with_batch_queue`` returns early to refill ``batch_queue`` --
-so the engine cannot get back to ``schedule()`` until the chunk has traversed
-every stage, and the pipeline runs about one microbatch deep.
-
-The guard is the consumer's own condition moved ahead of the round-trip. The
-step that schedules a request's last chunk already reports ``is_prefill_chunk ==
-False`` (``_update_after_schedule`` advances ``num_computed_tokens`` first), so
-the fetch resumes on exactly the step whose drafts the next one will verify.
-
-Self-disabling: with async scheduling the ``not async_scheduling`` term is false
-and the guard is never reached.
+The guard is that consumer's own condition moved ahead of the round-trip, so
+the fetch resumes on exactly the step whose drafts the next one verifies: the
+step that schedules a request's last chunk already reports
+``is_prefill_chunk == False``.
 """
 
+from importlib.metadata import version
+
+import torch
+from packaging.version import Version
+from vllm.distributed import parallel_state
 from vllm.v1.engine.core import EngineCore
 
 from vllm_rbln.patches import register_patch
+
+assert Version(version("torch_rbln")) < Version("0.12.0"), (
+    "torch-rbln 0.12.0 fixes the empty_host_cache error. Delete "
+    "patched_cleanup_dist_env_and_memory, _no_host_cache_to_empty and this "
+    "assert."
+)
+
+original_cleanup_dist_env_and_memory = parallel_state.cleanup_dist_env_and_memory
+
+
+def _no_host_cache_to_empty() -> None:
+    """Stand in for torch.accelerator.empty_host_cache() during cleanup."""
+
+
+@register_patch(
+    # EngineCore is the only caller and it from-imports the name, so its own
+    # binding is the one that has to change; replacing the definition in
+    # parallel_state leaves that binding pointing at the original.
+    target="vllm.v1.engine.core.cleanup_dist_env_and_memory",
+    reason=(
+        "torch.accelerator.empty_host_cache() faults in the RBLN accelerator "
+        "once a device tensor has existed, so EngineCore takes the process "
+        "down on its way out. Upstream guards the call with `except "
+        "AttributeError`, which torch 2.9 made unreachable by shipping the "
+        "API, and a fault is not an exception anyway. Neutralise that one "
+        "call and delegate the rest."
+    ),
+)
+def patched_cleanup_dist_env_and_memory(shutdown_ray: bool = False) -> None:
+    accelerator = torch.accelerator
+    original_empty_host_cache = accelerator.empty_host_cache
+    accelerator.empty_host_cache = _no_host_cache_to_empty
+    try:
+        original_cleanup_dist_env_and_memory(shutdown_ray)
+    finally:
+        accelerator.empty_host_cache = original_empty_host_cache
 
 
 @register_patch(
