@@ -12,32 +12,6 @@ supported-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 
-[manifest]
-overrides = [
-    { name = "torch", specifier = "==2.13.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchaudio", specifier = "==2.11.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchcodec", specifier = "==0.16.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchvision", specifier = "==0.28.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
-]
-
-[[package]]
-name = "accelerate"
-version = "1.14.0"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-dependencies = [
-    { name = "huggingface-hub" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "psutil" },
-    { name = "pyyaml" },
-    { name = "safetensors" },
-    { name = "torch" },
-]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/accelerate/1.14.0/accelerate-1.14.0.tar.gz", hash = "sha256:41b9c4377a54e0b460a959b0defa1b736e4ca0a2373252d9a539964c2afe3c8d" }
-wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/accelerate/1.14.0/accelerate-1.14.0-py3-none-any.whl", hash = "sha256:e94390c2863b873be18f623f9df48a0d8fe5eff13ea7f1a00092b0a7904888c6" },
-]
-
 [[package]]
 name = "aiofile"
 version = "3.9.0"
@@ -641,26 +615,6 @@ source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/detect-installer/0.1.0/detect_installer-0.1.0.tar.gz", hash = "sha256:00ad7ba0a36e3cf7d08a40d3643011746dbc112597c7d475cc91c416710ca4e7" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/detect-installer/0.1.0/detect_installer-0.1.0-py3-none-any.whl", hash = "sha256:034fb20fd665c36e6ba52b8821525ea07fb4f7f938cac459df889fb33801528a" },
-]
-
-[[package]]
-name = "diffusers"
-version = "0.38.0"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-dependencies = [
-    { name = "filelock" },
-    { name = "httpx" },
-    { name = "huggingface-hub" },
-    { name = "importlib-metadata" },
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "regex" },
-    { name = "requests" },
-    { name = "safetensors" },
-]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/diffusers/0.38.0/diffusers-0.38.0.tar.gz", hash = "sha256:1e094ec5c16f18c42fb89d37f07a94cf9aab3ebbe527ab059c609597b8857626" }
-wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/diffusers/0.38.0/diffusers-0.38.0-py3-none-any.whl", hash = "sha256:18e53f9e539096320470f62c6360a6fd5727ff28cffda566265316e13fcdb612" },
 ]
 
 [[package]]
@@ -2026,27 +1980,6 @@ dependencies = [
 sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-semantic-conventions-ai/0.5.1/opentelemetry_semantic_conventions_ai-0.5.1.tar.gz", hash = "sha256:153906200d8c1d2f8e09bd78dbef526916023de85ac3dab35912bfafb69ff04c" }
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/opentelemetry-semantic-conventions-ai/0.5.1/opentelemetry_semantic_conventions_ai-0.5.1-py3-none-any.whl", hash = "sha256:25aeb22bd261543b4898a73824026d96770e5351209c7d07a0b1314762b1f6e4" },
-]
-
-[[package]]
-name = "optimum-rbln"
-version = "0.11.3a8"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-dependencies = [
-    { name = "accelerate" },
-    { name = "diffusers" },
-    { name = "packaging" },
-    { name = "tokenizers" },
-    { name = "torch" },
-    { name = "torchaudio" },
-    { name = "torchcodec" },
-    { name = "torchvision" },
-    { name = "transformers" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a8/optimum_rbln-0.11.3a8.tar.gz", hash = "sha256:840ceb4aaf7c60fc1ca19a0f737ec757f21fe0edd0c7ab29fafc871844ab403b" }
-wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a8/optimum_rbln-0.11.3a8-py3-none-any.whl", hash = "sha256:bd2296e5996598ba46574c2c1b5b701bab5d8eee1d1f61cf0fb03545c8881108" },
 ]
 
 [[package]]
@@ -3571,7 +3504,6 @@ name = "vllm-rbln"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
-    { name = "optimum-rbln" },
     { name = "pyyaml" },
     { name = "setuptools" },
     { name = "setuptools-scm" },
@@ -3626,7 +3558,6 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0.dev0,<0.12.1" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.1.0.dev0,<0.1.1" },
-    { name = "optimum-rbln", specifier = ">=0.11.3a8,<0.11.4" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
