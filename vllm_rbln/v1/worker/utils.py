@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
-from vllm.config import KVTransferConfig, ModelConfig, ParallelConfig, VllmConfig
+from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
@@ -398,23 +398,6 @@ DYNAMIC_KV_SUPPORTED_CONNECTORS = (
 MULTI_CONNECTOR = "MultiConnector"
 
 
-def configured_kv_connectors(kv_transfer: KVTransferConfig) -> list[str]:
-    """The connector names this config actually runs, in config order.
-
-    A `MultiConnector` is replaced by what it wraps. With nothing to wrap its own
-    name stays and is reported, because an empty child list means nothing was
-    checked rather than everything passing. A child that is itself a
-    `MultiConnector` is likewise left as that name, so the nested shape reads as
-    untried like any other name outside the set.
-    """
-    if kv_transfer.kv_connector != MULTI_CONNECTOR:
-        return [kv_transfer.kv_connector]
-    children = kv_transfer.kv_connector_extra_config.get("connectors")
-    if not children:
-        return [MULTI_CONNECTOR]
-    return [child.get("kv_connector", "<unnamed>") for child in children]
-
-
 def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
     """Why this configuration cannot size its KV cache from the compiled
     placement, or None when it can.
@@ -462,11 +445,15 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
         )
     kv_transfer = vllm_config.kv_transfer_config
     if kv_transfer is not None:
-        unsupported = [
-            name
-            for name in configured_kv_connectors(kv_transfer)
-            if name not in DYNAMIC_KV_SUPPORTED_CONNECTORS
-        ]
+        names = [kv_transfer.kv_connector]
+        if kv_transfer.kv_connector == MULTI_CONNECTOR:
+            # With no children the wrapper's own name stays and is reported:
+            # nothing was checked. Nesting is not walked, so a MultiConnector
+            # child reads as untried like any other name outside the set.
+            children = kv_transfer.kv_connector_extra_config.get("connectors")
+            if children:
+                names = [child.get("kv_connector", "<unnamed>") for child in children]
+        unsupported = [n for n in names if n not in DYNAMIC_KV_SUPPORTED_CONNECTORS]
         if unsupported:
             # The worker registers with the connector only once the resize has
             # allocated. That is connector-agnostic, so one outside this set is

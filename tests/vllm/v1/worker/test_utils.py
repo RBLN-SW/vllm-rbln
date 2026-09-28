@@ -1690,8 +1690,12 @@ class TestDynamicKvUnsupportedReason:
         )
 
     def test_every_supported_connector_is_registered(self):
-        # The suite conftest applies the registry, as production does.
-        for name in worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS:
+        # The suite conftest applies the registry, as production does. A stale
+        # MULTI_CONNECTOR would stop the fan-out and fall back just as silently.
+        for name in (
+            *worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS,
+            worker_utils.MULTI_CONNECTOR,
+        ):
             assert name in KVConnectorFactory._registry
 
     def test_multi_connector_is_supported_when_every_child_is(self):
