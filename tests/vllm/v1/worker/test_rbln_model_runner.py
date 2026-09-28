@@ -527,6 +527,19 @@ class TestSelectCanonicalKvLayersPerPool:
             self._cfg(groups, ["sw0", "full0"], ["full1"])
         ) == {"full0", "full1"}
 
+    def test_a_uniform_group_tolerates_a_kv_sharing_layer(self):
+        # Upstream appends a KV-sharing layer to its target's group by name
+        # only; the wrapper holds no spec for it and must not be indexed.
+        full = self._full()
+        groups = [
+            self._group(
+                ["full0", "full1", "shared0"], self._uniform(full0=full, full1=full)
+            )
+        ]
+        assert select_canonical_kv_layers_per_pool(
+            self._cfg(groups, ["full0"], ["full1"])
+        ) == {"full0", "full1"}
+
     def test_a_uniform_sliding_window_group_falls_back_to_first_layer(self):
         sliding = object.__new__(SlidingWindowSpec)
         groups = [self._group(["sw0", "sw1"], self._uniform(sw0=sliding, sw1=sliding))]

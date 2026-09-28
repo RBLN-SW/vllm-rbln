@@ -30,11 +30,19 @@ from vllm.v1.request import Request
 
 
 def _layer_specs(group: KVCacheGroupSpec) -> dict[str, KVCacheSpec]:
-    """Each layer's own spec, unwrapping a uniform-type group."""
+    """Each layer's own spec, unwrapping a uniform-type group.
+
+    A KV-sharing layer is appended to its target's group by name only, so a
+    uniform-type group may list a layer it holds no spec for; skip it.
+    """
     spec = group.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
-        return {name: spec.kv_cache_specs[name] for name in group.layer_names}
-    return {name: spec for name in group.layer_names}
+        return {
+            name: spec.kv_cache_specs[name]
+            for name in group.layer_names
+            if name in spec.kv_cache_specs
+        }
+    return dict.fromkeys(group.layer_names, spec)
 
 
 def rewind_recovers_failed_kv_loads(kv_cache_config: KVCacheConfig) -> bool:
