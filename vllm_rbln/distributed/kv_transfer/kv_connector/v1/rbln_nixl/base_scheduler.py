@@ -136,7 +136,7 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
             ) < req.num_prompt_tokens
 
             if not is_partial:
-                clipped_block_id_groups = self.get_sw_clipped_blocks(
+                clipped_block_id_groups = self.get_exchange_clipped_blocks(
                     self._block_ids_need_save.pop(req_id)
                 )
                 meta.add_new_req_to_save(

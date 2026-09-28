@@ -19,6 +19,7 @@
 
 import sys
 import types
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -162,7 +163,9 @@ def _fake_nixl_rbln(xfer_result):
     return module
 
 
-def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
+def _prep_impl_worker(
+    monkeypatch, *, num_blocks=128, block_size=64, names=("l0", "l1")
+):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = build_worker(
         monkeypatch,
@@ -188,6 +191,12 @@ def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
     worker._registered_descs = []
     worker.dst_num_blocks = {}
     worker.src_xfer_handles_by_block_size = {}
+    # The engine hands the worker one group naming every layer it will
+    # register; `build_worker` fakes the config from specs alone, so the names
+    # the region table is keyed on have to come from here.
+    worker.kv_cache_config.kv_cache_groups = [
+        SimpleNamespace(layer_names=list(names), kv_cache_spec=None)
+    ]
     return worker
 
 
@@ -603,7 +612,7 @@ class TestRegisterKvCachesImpl:
     def test_a_draft_layer_with_its_own_page_size_is_registered(self, monkeypatch):
         # Requiring one size for every non-MLA tensor would reject this outright;
         # registration has to describe each region by its own geometry.
-        worker = _prep_impl_worker(monkeypatch)
+        worker = _prep_impl_worker(monkeypatch, names=("l0", "l1", "l2"))
         target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
         draft = _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32)
         worker._layer_specs = {"l0": target, "l1": target, "l2": draft}
@@ -819,7 +828,10 @@ class TestRegisterKvCachesImpl:
         target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
         draft = _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32)
         worker._layer_specs = {"l0": target, "l1": draft}
-        worker.kv_cache_config = MagicMock(kv_cache_tensors=[object(), object()])
+        worker.kv_cache_config = MagicMock(
+            kv_cache_tensors=[object(), object()],
+            kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+        )
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
@@ -840,7 +852,10 @@ class TestRegisterKvCachesImpl:
         worker = _prep_impl_worker(monkeypatch)
         spec = _impl_layer_spec(page_size_bytes=4096)
         worker._layer_specs = {"l0": spec, "l1": spec}
-        worker.kv_cache_config = MagicMock(kv_cache_tensors=[object(), object()])
+        worker.kv_cache_config = MagicMock(
+            kv_cache_tensors=[object(), object()],
+            kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+        )
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
@@ -1093,6 +1108,7 @@ class TestPublishHandshakeMetadata:
             device_id=0,
             num_blocks=4,
             block_lens=[8192, 8192],
+            block_strides=[8192, 8192],
             kv_cache_layout="HND",
             block_size=16,
             ssm_sizes=(0, 0),

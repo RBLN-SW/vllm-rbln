@@ -82,9 +82,14 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                 == len(self.kv_cache_config.kv_cache_groups)
             )
             local_block_ids, remote_block_ids = self._apply_prefix_caching(
-                local_block_ids,
-                remote_block_ids,
-                remote_info.remote_physical_blocks_per_logical,
+                decode_block_ids=local_block_ids,
+                prefill_block_ids=remote_block_ids,
+                decode_physical_per_logical=(
+                    self._physical_blocks_per_logical_kv_block
+                ),
+                prefill_physical_per_logical=(
+                    remote_info.remote_physical_blocks_per_logical
+                ),
             )
 
         n_read_blocks = sum(len(g) for g in local_block_ids)
@@ -166,7 +171,10 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                 )
                 for submitted in handles:
                     self.nixl_wrapper.release_xfer_handle(submitted)
-                self._handle_failed_transfer(req_id, handle)
+                # 0.30.0 no longer queues the request itself: the handler
+                # records the failure into the set its caller hands it, and
+                # get_finished drains that set.
+                self._handle_failed_transfer(req_id, handle, self._recv_failures)
                 return
 
         if handles:

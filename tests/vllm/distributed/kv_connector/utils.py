@@ -65,8 +65,12 @@ def engine_config(
     same shape is free. The connector never mutates it.
     """
     from vllm.config import KVTransferConfig
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
     from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.v1.attention.backends.flash_attention import (
+        RBLNFlashAttentionBackend,
+    )
 
     extra: dict[str, Any] = {}
     if speculative_model is not None:
@@ -74,7 +78,7 @@ def engine_config(
             "model": speculative_model,
             "num_speculative_tokens": 2,
         }
-    return make_vllm_config(
+    config = make_vllm_config(
         model=MODEL,
         block_size=block_size,
         kv_transfer_config=KVTransferConfig(
@@ -87,6 +91,20 @@ def engine_config(
         ),
         **extra,
     )
+    # A NIXL worker reads the resolved layout in __init__, and the engine core
+    # is what resolves it -- which these tests skip by building the worker
+    # directly. Run the real resolver over the backend's own preference list
+    # rather than naming a layout here, so the tests see what production sees.
+    resolve_kv_cache_layout(
+        config,
+        [
+            [
+                layout.name
+                for layout in RBLNFlashAttentionBackend.supported_kv_cache_layouts()
+            ]
+        ],
+    )
+    return config
 
 
 def draft_model_dir(dest: Any, kv_heads: int) -> str:
@@ -539,6 +557,7 @@ def peer_meta(
         device_id=0,
         num_blocks=geometry.num_blocks,
         block_lens=block_lens,
+        block_strides=block_lens,
         attn_backend_name="RBLN_FLASH_ATTN",
         kv_cache_layout="HND",
         block_size=geometry.block_size,
@@ -666,6 +685,7 @@ def build_worker(
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
     import sys
     import types
+    from collections import defaultdict
     from unittest.mock import MagicMock
 
     from vllm.config import CacheConfig, SchedulerConfig
@@ -711,6 +731,19 @@ def build_worker(
         # positional pairing applies; 1 keeps these cases homogeneous.
         self.transfer_topo = MagicMock()
         self.transfer_topo.tp_ratio.return_value = 1
+        # State vllm 0.30.0 added to the real __init__ and the inherited entry
+        # points now read. The parallel sizes are the single-shard values these
+        # tests build against, so no rank ever offsets off them.
+        self.dcp_size = 1
+        self.pcp_size = 1
+        self.dcp_rank = 0
+        self.pcp_rank = 0
+        self.dst_region_num_blocks = {}
+        self.dst_region_group_ids = {}
+        self.dst_region_mem_types = {}
+        self.dst_uses_region_group_mapping = {}
+        self._recving_transfers = defaultdict(list)
+        self._engine_ttl = 0.0
 
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
