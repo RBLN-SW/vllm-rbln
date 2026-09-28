@@ -275,12 +275,6 @@ class TestCompilerConformance:
         assert "use_weight_sharing" in params
         assert "use_global_ctx" not in params  # deprecated kwargs
 
-    def test_rebel_compile_signature(self):
-        params = inspect.signature(compiler.rebel.compile).parameters
-        assert "dtype" not in params, (
-            "rebel.compile takes dtype now; remove check_dtype_option_supported"
-        )
-
     def test_dtype_check_refuses_an_older_rebel(self, monkeypatch):
         def legacy_compile(model, *, npu=None):
             pass

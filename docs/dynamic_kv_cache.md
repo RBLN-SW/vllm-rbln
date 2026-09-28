@@ -138,7 +138,7 @@ feature is absent there rather than disabled.
 | Flash causal attention disabled | This dispatches to an attention kernel that does not accept a dynamic KV input. |
 | A DFlash drafter (`--speculative-config '{"method": "dflash", ...}'`) | The drafter is non-causal on RBLN, and its attention kernel does not accept a dynamic KV input. `use_non_causal` lives on the draft config only, so the method is the signal. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
-| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. |
+| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. A `MultiConnector` is read through to its children and is open exactly when all of them are; one that wraps nothing, or that wraps another `MultiConnector`, is not. |
 
 ## When Start-up Refuses
 
