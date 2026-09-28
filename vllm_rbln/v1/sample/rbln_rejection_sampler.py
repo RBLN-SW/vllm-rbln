@@ -73,12 +73,10 @@ class RBLNRejectionSampler(RejectionSampler):
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
 
-        # NOTE(RBLN): the host draws every step; settle the rates there, padded to K.
-        if self.synthetic_conditional_rates is not None:
-            rates = torch.zeros(num_spec_tokens, dtype=torch.float32)
-            width = min(num_spec_tokens, self.synthetic_conditional_rates.shape[0])
-            rates[:width] = self.synthetic_conditional_rates[:width].cpu()
-            self.synthetic_conditional_rates = rates
+        if use_rbln_sampler and self.synthetic_conditional_rates is not None:
+            # The NPU impl draws the synthetic acceptance on the host.
+            assert self.synthetic_conditional_rates.shape[0] == num_spec_tokens
+            self.synthetic_conditional_rates = self.synthetic_conditional_rates.cpu()
         self.impl = (
             RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
             if use_rbln_sampler
