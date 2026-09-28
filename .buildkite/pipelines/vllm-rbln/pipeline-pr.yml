@@ -37,6 +37,20 @@ _sync: &sync |
   uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
   bash .buildkite/scripts/rebel-compiler-override.sh
 
+_dshm: &dshm
+  - kubernetes:
+      podSpecPatch:
+        containers:
+          - name: container-0
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 4Gi
+
 steps:
   - label: ":pytest: [CR13] pytest"
     key: "vllm-rbln-pytest-cr13"
@@ -49,6 +63,7 @@ steps:
         product: "RBLN-CR13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
+    plugins: *dshm
     timeout_in_minutes: 60
     command:
       - *sync
