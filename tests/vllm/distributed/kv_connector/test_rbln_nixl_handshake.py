@@ -35,7 +35,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
     NixlPullConnectorWorker,
-    NixlPushConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
@@ -84,6 +83,7 @@ def _encode_payload(
         device_id=0,
         num_blocks=4,
         block_lens=[8192] * n_regions,
+        block_strides=[8192] * n_regions,
         kv_cache_layout="HND",
         block_size=16,
         ssm_sizes=(0, 0),
@@ -103,13 +103,17 @@ def _encode_payload(
 
 def _agent_meta(**overrides):
     """A minimal RblnNixlAgentMetadata for the region-slicing cases."""
+    # RBLN registers a region's blocks contiguously, so a caller that gives
+    # lengths and no strides means the two are the same list.
+    block_lens = list(overrides.pop("block_lens", [8192]))
     fields = dict(
         engine_id="eng",
         agent_metadata=b"agent",
         kv_caches_base_addr=[0x1000],
         device_id=0,
         num_blocks=4,
-        block_lens=[8192],
+        block_lens=block_lens,
+        block_strides=list(block_lens),
         kv_cache_layout="HND",
         block_size=16,
         ssm_sizes=(0, 0),
@@ -320,17 +324,18 @@ class TestUpstreamReachesTheHandshake:
         assert w._engine_clock_offset["eng"] == pytest.approx(1.0)
 
     def test_the_push_writer_reaches_it_and_unpacks_the_pair(self):
-        # P's first write to a decode engine goes through upstream's blocking
-        # _ensure_d_handshake, which unpacks (agents, clock_offset). A dict of
-        # two shards, as here, unpacks into its own keys instead of raising, so
-        # the engine would store an int where an agent map belongs.
+        # P's first write to a decode engine goes through the handshake, which
+        # unpacks (agents, clock_offset). A dict of two shards, as here, unpacks
+        # into its own keys instead of raising, so the engine would store an int
+        # where an agent map belongs. vllm 0.30.0 folded push's own blocking
+        # _ensure_d_handshake into the base _ensure_handshake.
         sock = _FakeSock(pp_size=2)
         w = self._worker(cls=RblnNixlPushConnectorWorker)
 
         with _patched_socket(sock):
-            assert NixlPushConnectorWorker._ensure_d_handshake(
-                w, "eng", "h", 1234, 1, "req-0"
-            )
+            fut = NixlBaseConnectorWorker._ensure_handshake(w, "eng", "h", 1234, 1)
+            assert fut is not None
+            fut.result(timeout=5)
 
         assert w._remote_agents["eng"] == {(0, 0): "agent-0", (1, 0): "agent-1"}
 
@@ -344,7 +349,7 @@ class TestUpstreamReachesTheHandshake:
 
         with _patched_socket(sock):
             fut = NixlBaseConnectorWorker._ensure_handshake(
-                w, "eng", "h", 1234, 1, 3, True
+                w, "eng", "h", 1234, 1, pp_size=3, notif_agents_only=True
             )
             with pytest.raises(RuntimeError, match="pipeline size 3, peer reports 2"):
                 fut.result()
@@ -361,7 +366,7 @@ class TestUpstreamReachesTheHandshake:
 
         with _patched_socket(sock):
             fut = NixlBaseConnectorWorker._ensure_handshake(
-                w, "eng", "h", 1234, 2, 2, True
+                w, "eng", "h", 1234, 2, pp_size=2, notif_agents_only=True
             )
             fut.result()
 
@@ -781,7 +786,9 @@ class TestPpHandshakeFanout:
             _patched_socket(_FakeSock(pp_size=2)),
             pytest.raises(RuntimeError, match="larger tensor-parallel size"),
         ):
-            w._nixl_handshake("h", 1234, 4, "eng", 2, True)
+            w._nixl_handshake(
+                "h", 1234, 4, "eng", remote_pp_size=2, notif_agents_only=True
+            )
 
     def test_both_sides_pipelined_is_allowed_on_the_pull_side(self):
         # The shape the push-side guard below must not take with it: reading,
@@ -808,7 +815,9 @@ class TestPpHandshakeFanout:
             _patched_socket(_FakeSock(pp_size=2)),
             pytest.raises(RuntimeError, match="pipelined consumer"),
         ):
-            w._nixl_handshake("h", 1234, 1, "eng", 2, True)
+            w._nixl_handshake(
+                "h", 1234, 1, "eng", remote_pp_size=2, notif_agents_only=True
+            )
 
     def test_a_pipelined_consumer_is_fine_when_the_producer_is_not(self):
         # The count is right whenever the producer has one stage: every rank of
@@ -818,7 +827,9 @@ class TestPpHandshakeFanout:
         w._add_notif_only_remote_agent = MagicMock(return_value="n0")
 
         with _patched_socket(_FakeSock(pp_size=1)):
-            agents, _ = w._nixl_handshake("h", 1234, 1, "eng", 1, True)
+            agents, _ = w._nixl_handshake(
+                "h", 1234, 1, "eng", remote_pp_size=1, notif_agents_only=True
+            )
 
         assert agents == {(0, 0): "n0"}
 
@@ -1366,6 +1377,16 @@ class TestValidateRemoteAgentHandshake:
         w.num_regions = num_layers * 2 * areas
         w.block_len_per_layer = [64] * (num_layers * 2 * areas)
         w.dst_num_blocks = {"eng": dst_num_blocks}
+        # 0.30.0 keeps the peer's per-region block counts alongside its
+        # total; every region here holds the whole count.
+        w.dst_region_num_blocks = {"eng": [dst_num_blocks] * (num_layers * 2 * areas)}
+        w.region_group_ids = [0] * (num_layers * 2 * areas)
+        w.dst_region_group_ids = {"eng": [0] * (num_layers * 2 * areas)}
+        w.dst_uses_region_group_mapping = {"eng": False}
+        w._uses_region_group_mapping = False
+        w.nixl_memory_type = "VRAM"
+        w.region_mem_types = ["VRAM"] * (num_layers * 2 * areas)
+        w.dst_region_mem_types = {"eng": ["VRAM"] * (num_layers * 2 * areas)}
         w.vllm_config = MagicMock()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
         # add_remote_agent reads the cached copy __init__ makes of it.
@@ -2545,6 +2566,8 @@ class TestCleanupRemoteEngine:
         w._remote_shard_layer_names = defaultdict(dict, {"eng": {0: ("l0",)}})
         w._overlapping_ranks = defaultdict(list, {"eng": [0]})
         w._remote_pp_size = {"eng": 1}
+        # The 0.30.0 sweep drops a stale engine's in-flight reads too.
+        w._recving_transfers = defaultdict(list)
 
         with patch.object(NixlBaseConnectorWorker, "_cleanup_remote_engine"):
             NixlBaseConnectorWorker._evict_stale_engines(w)

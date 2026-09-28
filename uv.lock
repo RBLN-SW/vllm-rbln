@@ -3222,11 +3222,11 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:1df61127817b113665358df094430698" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:101ed1f3cb938bd1421caf0e1133f3b5" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:99a66a08033593268a5a2b0d2d8ef736" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:2ee28d92c0a553bb235193cca32c518b" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:0bfc98f39c1be47792138846e617b803" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:3f082c86fe605d76f48df3ec28d20adc" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:c49bb8fd0f496d83affdc3946f419d1d" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:b73c9d5a0c3686a62be562a285626b23" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:d41e4bb818dcc59e8f2081f5cf3dd5d7" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:32c98dfd6dddb8a7beba2523bd21cf34" },
 ]
 
 [[package]]

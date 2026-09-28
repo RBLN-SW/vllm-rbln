@@ -150,6 +150,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             kv_caches_base_addr=base_meta.kv_caches_base_addr,
             num_blocks=base_meta.num_blocks,
             block_lens=base_meta.block_lens,
+            block_strides=base_meta.block_strides,
             kv_cache_layout=base_meta.kv_cache_layout,
             block_size=base_meta.block_size,
             ssm_sizes=base_meta.ssm_sizes,
@@ -364,6 +365,12 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         )
         self.device_id = device_id
         self.block_len_per_layer = list(xfer.block_lens)
+        # The adapter hands back one contiguous run of blocks per area, so a
+        # block's stride is its own length. Upstream keeps the two apart because
+        # a region can be a strided window into a larger tensor; on RBLN it
+        # never is, and the D2D descriptor builder already reads addresses as
+        # `base + block * block_len`.
+        self.block_stride_per_layer = list(xfer.block_lens)
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = xfer.base_addrs
         self._registered_descs.append(xfer.reg_handle)
         assert len(self.block_len_per_layer) == len(xfer.base_addrs)
@@ -378,6 +385,23 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             f"account for {len(self.block_len_per_layer)} transfer region(s); "
             "mislabelling one would silently pick the wrong descriptor layout."
         )
+        # vllm 0.30.0 added four per-region lists upstream builds while walking
+        # the caches. This path registers through the adapter instead, so they
+        # are filled here, in the same logical-major, area-minor order as
+        # `_region_is_mla`. Every RBLN region is one area of one layer's cache,
+        # so they hold the whole block count and one memory type.
+        self.region_names = [
+            name for name, regions in layer_regions for _ in range(regions * areas)
+        ]
+        self.region_num_blocks = [self.num_blocks] * len(self.block_len_per_layer)
+        self.region_mem_types = [self.nixl_memory_type] * len(self.block_len_per_layer)
+        group_of = {
+            layer: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for layer in group.layer_names
+        }
+        self.region_group_ids = [group_of[name] for name in self.region_names]
+
         self._logical_region_kv_heads = self._logical_head_bands(layer_regions)
         # `slice_ids` is per area, and replicas of one slice share an id, so
         # the DISTINCT ids over a region's areas are its own slice count.
@@ -439,6 +463,16 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
+        # The 0.30.0 read path looks its own engine up in these the way it
+        # looks a peer up, so registering has to seed them here as well.
+        self.dst_region_num_blocks[self.engine_id] = self.region_num_blocks
+        self.dst_region_group_ids[self.engine_id] = self.region_group_ids
+        self.dst_region_mem_types[self.engine_id] = self.region_mem_types
+        self._uses_region_group_mapping = len(set(self.region_group_ids)) > 1
+        self.dst_uses_region_group_mapping[self.engine_id] = (
+            self._uses_region_group_mapping
+        )
+        self._mixed_mem_types = len(set(self.region_mem_types)) > 1
 
         # Register local/src descr for NIXL xfer.
         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
@@ -453,6 +487,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.tp_rank],
             num_blocks=self.num_blocks,
             block_lens=self.block_len_per_layer,
+            block_strides=self.block_stride_per_layer,
             kv_cache_layout=self.kv_cache_layout,
             block_size=self.block_size,
             ssm_sizes=self._mamba_ssm_size,

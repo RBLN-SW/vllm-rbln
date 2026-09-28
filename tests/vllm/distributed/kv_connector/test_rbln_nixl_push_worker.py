@@ -224,6 +224,20 @@ class TestPerShardWrite:
         w.num_blocks = 8
         w.dst_num_blocks = {"eng": 8}
         w._engine_last_active = {}
+        # 0.30.0 state the inherited write path reads. One memory type and one
+        # group here, so neither mapping ever kicks in.
+        w.dst_region_num_blocks = {"eng": [8, 8]}
+        w.dst_region_group_ids = {"eng": [0, 0]}
+        w.region_group_ids = [0, 0]
+        w._mixed_mem_types = False
+        w._uses_region_group_mapping = False
+        w.dst_uses_region_group_mapping = {"eng": False}
+        w._engine_ttl = 0.0
+        w._recving_transfers = defaultdict(list)
+        w.dcp_size = 1
+        w.pcp_size = 1
+        w.dcp_rank = 0
+        w.pcp_rank = 0
         w.kv_cache_config = MagicMock(kv_cache_groups=[0])
         # single group, 2 regions per shard
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(ranks)}
@@ -275,7 +289,9 @@ class TestPerShardWrite:
         # Calling the override directly keeps passing if upstream renames the
         # hook it dispatches to, so one case has to arrive through the caller.
         worker = self._writing_worker(ranks=1)
-        worker._ensure_d_handshake = lambda *_args: True
+        # 0.30.0 folded push's blocking _ensure_d_handshake into the base
+        # _ensure_handshake, which returns None once the peer is known.
+        worker._ensure_handshake = lambda *_args, **_kw: None
         worker._physical_blocks_per_logical_kv_block = 1
 
         NixlPushConnectorWorker._do_start_push_kv(
@@ -463,10 +479,16 @@ class TestWriterCompletionAccounting:
 
     @staticmethod
     def _feed(worker, notif):
-        """One notification in, upstream's own done-report out."""
+        """One notification in, upstream's own done-report out.
+
+        0.30.0 returns (done, failed) here; these cases never fail a transfer,
+        so only the done half is compared.
+        """
         worker._pending_completion_notifs.put(notif)
         worker._get_new_notifs()
-        return worker._pop_done_transfers(worker._recving_transfers)
+        done, failed = worker._pop_done_transfers(worker._recving_transfers)
+        assert not failed
+        return done
 
     def test_a_pipelined_producer_settles_on_its_last_stage(self):
         # Four stages write into this one rank; upstream expects pp_size * 1.

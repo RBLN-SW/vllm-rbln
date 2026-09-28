@@ -42,6 +42,7 @@ _BASE_FIELDS = dict(
     device_id=0,
     num_blocks=64,
     block_lens=[8192, 8192],
+    block_strides=[8192, 8192],
     kv_cache_layout="HND",
     block_size=16,
     ssm_sizes=(0, 0),

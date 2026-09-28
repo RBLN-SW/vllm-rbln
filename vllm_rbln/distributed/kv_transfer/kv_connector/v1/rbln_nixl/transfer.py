@@ -40,14 +40,21 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         dst_num_blocks: int,
         block_size_ratio: float | None,
         physical_blocks_per_logical: int,
+        region_num_blocks: list[int] | None = None,
+        region_group_ids: list[int] | None = None,
+        uses_region_group_mapping: bool | None = None,
     ) -> np.ndarray:
         if self._sw_ratio is None:
-            # No SWA view opt: upstream's Full/SSM desc layout applies.
+            # No SWA view opt: upstream's Full/SSM desc layout applies, and the
+            # 0.30.0 per-region arguments belong to it.
             return super()._compute_desc_ids(
                 block_ids,
                 dst_num_blocks,
                 block_size_ratio,
                 physical_blocks_per_logical,
+                region_num_blocks=region_num_blocks,
+                region_group_ids=region_group_ids,
+                uses_region_group_mapping=uses_region_group_mapping,
             )
 
         # The SWA desc formula below indexes physical blocks directly; the
