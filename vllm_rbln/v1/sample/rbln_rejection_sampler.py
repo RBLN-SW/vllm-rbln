@@ -662,7 +662,16 @@ def rbln_rejection_sample(
             bonus.to(dtype=recovered_token_ids.dtype),
             drawn_token,
         )
-        num_accepted = synthetic_num_accepted.reshape(batch_size)
+        # Stop `num_accepted` at the first id outside [0, vocab).
+        valid = (draft_per_batch >= 0) & (draft_per_batch < target_logits.shape[-1])
+        still_valid = torch.ones_like(valid[:, 0])
+        leading_valid = torch.zeros_like(synthetic_num_accepted.reshape(batch_size))
+        for position in range(max_spec_len):
+            still_valid = still_valid & valid[:, position]
+            leading_valid = leading_valid + still_valid.to(leading_valid.dtype)
+        num_accepted = torch.minimum(
+            synthetic_num_accepted.reshape(batch_size), leading_valid
+        )
     # `all_accepted` is True for inactive rows too (0 == 0), which is what the
     # bonus placement wants; recovery needs `num_draft_tokens > 0` to exclude them.
     all_accepted = num_accepted == num_draft_tokens

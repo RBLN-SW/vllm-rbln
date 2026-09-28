@@ -640,3 +640,19 @@ def test_synthetic_acceptance_is_capped_by_the_drafted_count(impl):
         [3, 10, PLACEHOLDER_TOKEN_ID],
         [2, 4, 11],
     ]
+
+
+def test_synthetic_acceptance_stops_at_an_out_of_range_draft_id(impl):
+    """An id at or past the vocabulary counts as a rejection, as in the Torch
+    kernels: the row stops there and carries the op's token."""
+    output = run_rejection_sample(
+        impl,
+        draft_token_ids=[3, VOCAB_SIZE],
+        target_argmax_token_ids=SYNTHETIC_ARGMAX,
+        bonus_token_ids=[1],
+        metadata=make_sampling_metadata(
+            temperature=None, all_greedy=True, all_random=False
+        ),
+        synthetic_conditional_rates=torch.ones(NUM_SPEC_TOKENS),
+    )
+    assert output.tolist() == [[3, 6, PLACEHOLDER_TOKEN_ID]]
