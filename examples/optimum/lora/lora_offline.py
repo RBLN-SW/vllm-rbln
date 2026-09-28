@@ -106,7 +106,7 @@ def main(
         enable_lora=True,
         max_lora_rank=max_lora_rank,
         max_loras=len(ADAPTERS),
-        additional_config={"rbln_config": rbln_config},
+        additional_config={"optimum_overrides": rbln_config},
     )
     tokenizer = AutoTokenizer.from_pretrained(model)
 

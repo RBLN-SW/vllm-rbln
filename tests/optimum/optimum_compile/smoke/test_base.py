@@ -94,7 +94,7 @@ class SmokeBase:
             if cls.HF_OVERRIDES:
                 kwargs["hf_overrides"] = _make_hf_overrides(cls.HF_OVERRIDES)
             cls.model_path = cls.MODEL_ID
-            cls.llm = LLM(model=cls.MODEL_ID, **kwargs)
+            cls.llm = LLM(model=cls.MODEL_ID, model_impl="optimum", **kwargs)
 
         @classmethod
         def tearDownClass(cls) -> None:

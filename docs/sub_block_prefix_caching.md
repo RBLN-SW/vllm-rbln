@@ -13,7 +13,7 @@ The matched sub-blocks are copied into a new block,
 since the block containing the partial matches cannot be reused directly.
 
 Sub-block prefix caching is automatically enabled when
-`enable_prefix_caching=True` and `VLLM_RBLN_SUB_BLOCK_CACHE=true` (default)
+`enable_prefix_caching=True` and `--rbln-enable-sub-block-cache` (default)
 and all KV cache groups have an *eligible spec type* with
 `block_size > sub_block_size` and `block_size % sub_block_size == 0`.
 

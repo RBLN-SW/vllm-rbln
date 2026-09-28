@@ -241,3 +241,22 @@ def test_config_unpickles_where_vllm_rbln_has_not_been_imported(tmp_path):
     )
 
     assert child.returncode == 0, child.stderr
+
+
+def test_axk2_is_mla_once_the_registry_has_been_applied():
+    """The MLA patch has to outlive our own ModelRegistry registration.
+
+    Registrations are applied before patches, so a patch that decided whether to
+    apply by asking the registry whether the architecture is known would read
+    our own registration as upstream's and skip itself. The model then builds
+    with use_mla False and the A.X-K2 forward asserts on it.
+    """
+    from vllm.transformers_utils.model_arch_config_convertor import (
+        ModelArchConfigConvertorBase,
+    )
+
+    convertor = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="axk2", kv_lora_rank=512)
+    )
+
+    assert ModelArchConfigConvertorBase.is_deepseek_mla(convertor)

@@ -1,0 +1,50 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+from vllm_rbln.patches.registry import add_registration
+
+
+@add_registration(
+    reason=(
+        "Register the RBLN KV connectors. A registration rather than an import "
+        "for its side effect, so that both apply sites cover it: the process "
+        "that resolves the model path reaches no other one."
+    )
+)
+def register_rbln_kv_connectors() -> None:
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    KVConnectorFactory.register_connector(
+        "RblnNixlPullConnector",
+        "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl",
+        "RblnNixlPullConnector",
+    )
+    # The name the read path shipped under, kept because it is what deployments
+    # put in kv_transfer_config.
+    KVConnectorFactory.register_connector(
+        "RblnNixlConnector",
+        "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl",
+        "RblnNixlPullConnector",
+    )
+    KVConnectorFactory.register_connector(
+        "RblnNixlPushConnector",
+        "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl",
+        "RblnNixlPushConnector",
+    )
+    KVConnectorFactory.register_connector(
+        "RBLNLMCacheConnectorV1",
+        "vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_lmcache_connector",
+        "RBLNLMCacheConnectorV1",
+    )

@@ -83,11 +83,6 @@ _EXPECT_ACCEPTANCE = {"ngram", "suffix", "eagle", "eagle3"}
 
 
 @pytest.fixture(autouse=True)
-def _use_reference_sampler(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
-
-
-@pytest.fixture(autouse=True)
 def _pin_aux_layers(request, monkeypatch):
     from vllm_rbln import envs
 
@@ -121,13 +116,22 @@ def test_speculative_decoding_matches_reference(
     if draft := spec_config.get("model"):
         spec_config = {**spec_config, "model": local_weights_path(draft)}
 
-    with vllm_runner(target, **extra_kwargs) as ref_model:
+    # The reference sampler, on both runs: the RBLN one compiles a graph of its
+    # own, and acceptance is being compared, not sampler implementations.
+    reference_sampler = {"use_custom_sampler": False}
+
+    with vllm_runner(
+        target, **extra_kwargs, additional_config=reference_sampler
+    ) as ref_model:
         ref_outputs = ref_model.generate_greedy_logprobs(
             [PROMPT], MAX_TOKENS, NUM_LOGPROBS
         )
 
     with vllm_runner(
-        target, **extra_kwargs, speculative_config=spec_config
+        target,
+        **extra_kwargs,
+        speculative_config=spec_config,
+        additional_config=reference_sampler,
     ) as spec_model:
         spec_outputs = spec_model.generate_greedy_logprobs(
             [PROMPT], MAX_TOKENS, NUM_LOGPROBS

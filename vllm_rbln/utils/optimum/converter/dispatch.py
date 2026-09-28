@@ -18,6 +18,7 @@ import os
 from typing import TYPE_CHECKING
 
 from vllm_rbln import envs
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.paths import is_compiled_dir
 
@@ -63,8 +64,9 @@ def _generate_model_path_name(
     batch_size = vllm_config.scheduler_config.max_num_seqs
     block_size = vllm_config.cache_config.block_size
     max_model_len = vllm_config.model_config.max_model_len
-    num_devices = envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK
-    additional_config = vllm_config.additional_config.get("rbln_config", None)
+    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+    num_devices = rbln_config.num_devices_per_local_rank
+    rbln_overrides = rbln_config.optimum_overrides
     # The user's explicit max_num_batched_tokens becomes the compiled prefill
     # chunk size (folded in by sync_from_vllm, which runs after this). Include
     # the raw value so runs that would compile different binaries don't collide
@@ -85,9 +87,7 @@ def _generate_model_path_name(
         "max_num_batched_tokens": user_max_num_batched_tokens,
         "memory_budget": memory_budget,
     }
-    stripped_config = (
-        _strip_runtime_only_keys(additional_config) if additional_config else {}
-    )
+    stripped_config = _strip_runtime_only_keys(rbln_overrides) if rbln_overrides else {}
     if stripped_config:
         config_dict["rbln_config"] = stripped_config
 
@@ -117,7 +117,8 @@ def _resolve_rbln_config(vllm_config: VllmConfig) -> dict | None:
         "compiled_models",
         _generate_model_path_name(vllm_config=vllm_config),
     )
-    vllm_config.additional_config["cached_model_path"] = cached_model_path
+    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+    rbln_config.cached_model_path = cached_model_path
     if is_compiled_dir(cached_model_path):
         logger.info("Found cached compiled model at %s", cached_model_path)
         vllm_config.model_config.model = cached_model_path

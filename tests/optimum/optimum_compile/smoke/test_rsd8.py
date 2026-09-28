@@ -32,7 +32,7 @@ class TestQwen25VL(MultimodalSmoke.Test):
         "block_size": 1024,
         "max_model_len": 2048,
         "max_num_seqs": 1,
-        "additional_config": {"rbln_config": {"visual": {"max_seq_len": [512]}}},
+        "additional_config": {"optimum_overrides": {"visual": {"max_seq_len": [512]}}},
     }
     # Shrink the image so its vision-token count fits the visual max_seq_len.
     MM_PROCESSOR_KWARGS = {"min_pixels": 64 * 14 * 14, "max_pixels": 64 * 14 * 14}
@@ -50,7 +50,7 @@ class TestQwen35VL(MultimodalSmoke.Test):
         "block_size": 4096,
         "max_model_len": 8192,
         "max_num_seqs": 1,
-        "additional_config": {"rbln_config": {"visual": {"max_seq_len": [512]}}},
+        "additional_config": {"optimum_overrides": {"visual": {"max_seq_len": [512]}}},
     }
     # Cap the image so its vision-token count fits the visual max_seq_len (512).
     MM_PROCESSOR_KWARGS = {"min_pixels": 64 * 16 * 16, "max_pixels": 64 * 16 * 16}

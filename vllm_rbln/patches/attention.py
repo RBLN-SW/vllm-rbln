@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.patches import register_patch
+from vllm_rbln.patches.registry import MIN_PATCH_PRIORITY
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionBackend,
     RBLNFlashAttentionMetadata,
@@ -97,13 +98,12 @@ def _resolve_kv_cache(
         "but upstream get_attention_context reads the attention layer's "
         "embedded kv_cache, which Dynamo bakes into the graph as a get_attr "
         "constant. Return kv_cache=None so callers (notably the "
-        "maybe_transfer_kv_layer wrapper) never touch it. Applied immediately "
-        "at import: maybe_transfer_kv_layer binds get_attention_context into "
-        "its closure when the patched_unified_attention_with_output wrap "
-        "below is constructed, so this override must already be in place by "
-        "then."
+        "maybe_transfer_kv_layer wrapper) never touch it. Applied first: "
+        "maybe_transfer_kv_layer binds get_attention_context into its closure "
+        "when the unified_attention_with_output wrap below is built, so this "
+        "override has to be in place by then."
     ),
-    apply_immediately=True,
+    priority=MIN_PATCH_PRIORITY,
 )
 def patched_get_attention_context(
     layer_name: str,
@@ -150,21 +150,7 @@ def patched_get_attention_context(
     return attn_metadata, attn_layer, None, layer_slot_mapping
 
 
-@register_patch(
-    target=(
-        "vllm.model_executor.layers.attention.attention.unified_attention_with_output"
-    ),
-    reason=(
-        "RBLN resolves the KV cache from attention metadata (a graph input) "
-        "instead of the layer's embedded cache, and wraps the replacement in "
-        "maybe_transfer_kv_layer for KV-transfer connector support. The wrap "
-        "is constructed here at import time and snapshots "
-        "get_attention_context into its closure, which is why the "
-        "get_attention_context patch above uses apply_immediately=True."
-    ),
-)
-@maybe_transfer_kv_layer
-def patched_unified_attention_with_output(
+def _unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -202,6 +188,23 @@ def patched_unified_attention_with_output(
         output_scale=output_scale,
         output_block_scale=output_block_scale,
     )
+
+
+@register_patch(
+    target=(
+        "vllm.model_executor.layers.attention.attention.unified_attention_with_output"
+    ),
+    reason=(
+        "RBLN resolves the KV cache from attention metadata (a graph input) "
+        "instead of the layer's embedded cache, and wraps the replacement in "
+        "maybe_transfer_kv_layer for KV-transfer connector support. That wrap "
+        "snapshots get_attention_context, so it is built here rather than at "
+        "import, after the patch above has replaced it."
+    ),
+    build=True,
+)
+def _build_unified_attention_with_output():
+    return maybe_transfer_kv_layer(_unified_attention_with_output)
 
 
 @register_patch(

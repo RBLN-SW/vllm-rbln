@@ -7,6 +7,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
 
+from vllm_rbln.patches.registry import add_registration
+
 ARCH = "AXK2ForCausalLM"
 MODEL_TYPE = "axk2"
 MODEL_CLASS_PATH = "vllm_rbln.patches.axk2.model:AXK2ForCausalLM"
@@ -19,8 +21,29 @@ def _upstream_has_axk2() -> bool:
     return ARCH in ModelRegistry.get_supported_archs()
 
 
-def _patch_condition() -> bool:
-    return not _upstream_has_axk2()
+@add_registration(
+    reason=(
+        "A.X K2 is vendored here until upstream vLLM ships it. Registering "
+        "through ModelRegistry keeps the architecture resolvable the way "
+        "upstream resolves every other one."
+    )
+)
+def register_axk2() -> None:
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    from vllm_rbln.patches.axk2.config import AXK2Config
+
+    # Once upstream registers the architecture our copy would shadow it, so fail
+    # loudly to get this vendored path removed instead of silently overriding it.
+    if _upstream_has_axk2():
+        raise RuntimeError(
+            "upstream vLLM now ships the axk2 architecture; delete "
+            "vllm_rbln/patches/axk2/ and this registration."
+        )
+
+    _CONFIG_REGISTRY[MODEL_TYPE] = AXK2Config
+    ModelRegistry.register_model(ARCH, MODEL_CLASS_PATH)
 
 
 def _register_is_deepseek_mla_patch() -> None:
@@ -41,7 +64,6 @@ def _register_is_deepseek_mla_patch() -> None:
             "axk2 is an MLA model but upstream decides MLA-ness from a hardcoded "
             "model_type tuple that does not list it"
         ),
-        condition=_patch_condition,
     )
     def is_deepseek_mla(self) -> bool:
         hf_text_config = self.hf_text_config

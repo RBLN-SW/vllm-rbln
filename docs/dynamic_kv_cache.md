@@ -1,7 +1,7 @@
 ## Dynamic KV Cache Sizing Overview
 
 The KV cache is sized from the compiled artifact's placement and a per-chiplet
-memory snapshot. The alternative, which `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` goes
+memory snapshot. The alternative, which `--no-rbln-use-dynamic-kv-cache` goes
 back to, is a pre-compile estimate of free device memory: a whole-card figure
 with no notion of chiplets, so on a quad-chiplet card it can exceed the
 per-chiplet budget and the engine allocates a cache that does not fit.
@@ -71,10 +71,9 @@ actual post-resize tensors and does not cache a block count. Nothing is register
 early, so nothing has to be unregistered. Every other mode keeps the start-up
 order.
 
-> The dynamic path needs `VLLM_RBLN_USE_VLLM_MODEL=1` and
-> `VLLM_RBLN_USE_DEVICE_TENSOR=1`, and turns itself off without them. Only
-> `DynamoRuntime` applies adaptive buffer sizes; the other runtimes ignore them
-> silently.
+> The dynamic path needs `--model-impl vllm` and `VLLM_RBLN_USE_DEVICE_TENSOR=1`,
+> and turns itself off without them. Only `DynamoRuntime` applies adaptive buffer
+> sizes; the other runtimes ignore them silently.
 
 Key components:
 
@@ -91,12 +90,11 @@ Key components:
 
 ## Enabling and Configuring
 
-| Variable | Default | Description |
+| Option | Default | Description |
 | --- | --- | --- |
-| `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` | `1` | Size the KV cache from the compiled placement and the device. `0` goes back to the pre-compile estimate. |
+| `--rbln-use-dynamic-kv-cache` (`additional_config={"use_dynamic_kv_cache": ...}`) | unset | Size the KV cache from the compiled placement and the device. `--no-rbln-use-dynamic-kv-cache` goes back to the pre-compile estimate. Unset, a configuration the path cannot size turns it off on its own; set, such a configuration is refused at start-up. `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` still sets it, with a deprecation warning, until 0.14.0. |
 
 ```bash
-export VLLM_RBLN_USE_VLLM_MODEL=1
 export VLLM_RBLN_USE_DEVICE_TENSOR=1
 export VLLM_CACHE_ROOT=<a fresh directory>
 ```
@@ -122,10 +120,12 @@ the pool rather than report on it.
 
 ## Where It Turns Itself Off
 
-A configuration the mechanism cannot size is not a refusal: refusing would stop a
-run that `VLLM_RBLN_USE_DYNAMIC_KV_CACHE=0` would have served. The feature logs
-one warning and the run continues on the pre-compile estimate, with no KV
-dimension marked dynamic: `mark_dynamic` follows this decision, not the flag.
+A configuration the mechanism cannot size is not a refusal while the option is
+unset: refusing would stop a run that `--no-rbln-use-dynamic-kv-cache` would
+have served. The feature logs one warning and the run continues on the
+pre-compile estimate, with no KV dimension marked dynamic: `mark_dynamic` follows
+this decision, not the option. An explicit `--rbln-use-dynamic-kv-cache` is a
+request, and start-up refuses it with the same reason.
 `dynamic_kv_unsupported_reason` in `v1/worker/utils.py` holds the whole list, and
 both the engine patch and the worker read it. The optimum-rbln path is not on it:
 it installs neither the engine patch nor a worker that carries a sizer, so the
@@ -135,7 +135,8 @@ feature is absent there rather than disabled.
 | --- | --- |
 | `VLLM_RBLN_USE_DEVICE_TENSOR=0` | The artifact carries no dynamic KV dimension. |
 | `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
-| Flash causal attention disabled, or non-causal attention enabled | These dispatch to attention kernels that do not accept a dynamic KV input. |
+| Flash causal attention disabled | This dispatches to an attention kernel that does not accept a dynamic KV input. |
+| A DFlash drafter (`--speculative-config '{"method": "dflash", ...}'`) | The drafter is non-causal on RBLN, and its attention kernel does not accept a dynamic KV input. `use_non_causal` lives on the draft config only, so the method is the signal. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
 | A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. A `MultiConnector` is read through to its children and is open exactly when all of them are; one that wraps nothing, or that wraps another `MultiConnector`, is not. |
 
@@ -164,12 +165,11 @@ would serve from the pre-compile estimate this feature exists to replace.
 - **No KV block fits.** On some chiplet the non-KV base already exceeds
   `total * gpu_memory_utilization`. Raise `--gpu-memory-utilization`, or give the
   model more devices.
-
 Three more cases warn and continue on the pre-compile estimate, because each is
 an explicit request from the caller:
 
-- Compile and warm-up are skipped (`--enforce-eager`, `VLLM_RBLN_COMPILE_MODEL=0`,
-  `VLLM_RBLN_ENABLE_WARM_UP=0`). Nothing compiles, so no program carries a placement.
+- Compile and warm-up are skipped (`--enforce-eager`, `VLLM_RBLN_ENABLE_WARM_UP=0`).
+  Nothing compiles, so no program carries a placement.
 - `--num-gpu-blocks-override` is set. The override pins the count and wins.
 - `RBLN_DUMMY_DEVICE` is set (a compile-only run). There is no device to
   measure, so the count stays at the estimate for the scheduler, and the KV

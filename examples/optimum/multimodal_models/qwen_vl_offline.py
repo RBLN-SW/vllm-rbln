@@ -202,7 +202,7 @@ def main(
         max_model_len=8192,
         max_num_seqs=1,
         additional_config={
-            "rbln_config": {
+            "optimum_overrides": {
                 "device": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
                 "visual": {
                     "device": [16],

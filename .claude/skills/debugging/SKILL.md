@@ -53,7 +53,7 @@ Run the reproducer again, plus the tests around the code you touched, and read t
 - Does the same defect exist on the other path?
 - Does the fix change behavior on the other path?
 
-Only `__init__.py` and `platform/__init__.py` branch on the flag. If the fix seems to need a new `if envs.VLLM_RBLN_USE_VLLM_MODEL` anywhere else, the shape is wrong — stop and ask.
+Only `__init__.py` and `platform/__init__.py` branch on the model path. If the fix seems to need a new branch on it anywhere else, the shape is wrong, so stop and ask.
 
 ## 7. Report the gaps
 

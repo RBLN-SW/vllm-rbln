@@ -1416,6 +1416,7 @@ wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:4310c55f3e7d0feccdd0fd83ceefd6aa" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bc7f11e06e4a5a015198c2bf4645d5ab67472776297b2abeace5a5829811680c" },
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:f872bba4ea16c4c845730c59e88d78b2" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache/0.5.4/lmcache-0.5.4-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:3f0c6f0e2a156da830cd2be52c2c6b8c" },
 ]
 
 [[package]]

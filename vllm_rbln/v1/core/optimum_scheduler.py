@@ -44,6 +44,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.optimum_kv_cache_manager import RBLNKVCacheManager
 
@@ -208,13 +209,8 @@ class RBLNOptimumScheduler(Scheduler):
         self.failed_recving_kv_req_ids: set[str] = set()
 
         # Create the KV cache manager.
-        if (
-            self.vllm_config.additional_config is not None
-            and "attn_block_size" in self.vllm_config.additional_config
-        ):
-            attn_block_size = self.vllm_config.additional_config["attn_block_size"]
-        else:
-            attn_block_size = None
+        rbln_config: OptimumRBLNConfig = self.vllm_config.additional_config
+        attn_block_size = rbln_config.attn_block_size
         # gemma3/gemma4: optimum-rbln's chunked prefill touches extra KV-cache
         # slots beyond the prompt (partition-alignment + trailing chunk
         # write-extent), so `allocate_slots` must reserve them. The prefill chunk
@@ -226,10 +222,7 @@ class RBLNOptimumScheduler(Scheduler):
         image_prefill_chunk_size = None
         if needs_chunked_prefill_pad:
             prefill_chunk_size = self.scheduler_config.max_num_batched_tokens
-            if vllm_config.additional_config is not None:
-                image_prefill_chunk_size = vllm_config.additional_config.get(
-                    "image_prefill_chunk_size"
-                )
+            image_prefill_chunk_size = rbln_config.image_prefill_chunk_size
 
         # Create the KV cache manager.
         if hash_block_size is None:

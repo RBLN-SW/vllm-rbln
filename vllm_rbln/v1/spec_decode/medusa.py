@@ -64,10 +64,7 @@ class RBLNMedusaProposer(MedusaProposer):
             return logits
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
-        if (
-            self.vllm_config.speculative_config.enforce_eager
-            or not rbln_config.compile_model
-        ):
+        if self.vllm_config.speculative_config.enforce_eager:
             self.model_executable = model_wrapper
         else:
             self.model_executable = compile(
@@ -81,6 +78,7 @@ class RBLNMedusaProposer(MedusaProposer):
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                 use_direct_dispatch=True,
+                dtype=rbln_config.compile_dtype,
             )
 
     def propose(

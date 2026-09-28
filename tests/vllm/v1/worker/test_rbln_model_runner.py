@@ -19,6 +19,7 @@
 # only repeat itself -- it builds a real runner and carries its own device marker.
 
 import contextlib
+import json
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -582,10 +583,11 @@ class TestResolveBatchDescriptor:
 @pytest.mark.maybe_use_device
 @pytest.mark.parametrize(("backend", "should_exit"), [("mp", True), ("uni", False)])
 def test_async_output_inherits_runner_fail_fast_policy(
-    make_model_runner, monkeypatch, backend, should_exit
+    make_model_runner, monkeypatch, capfd, backend, should_exit
 ):
     monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
     config = make_runner_config(distributed_executor_backend=backend)
+    config.parallel_config.rank = 2
     # The CPU lane disables async scheduling at platform setup. Exercise the
     # deferred output path with CPU tensors after that setup has completed.
     config.scheduler_config.async_scheduling = True
@@ -625,6 +627,14 @@ def test_async_output_inherits_runner_fail_fast_policy(
         exit_process.assert_called_once_with(70)
         assert isinstance(excinfo.value, SystemExit)
         assert excinfo.value.code == 70
+        (event,) = [
+            json.loads(line)
+            for line in capfd.readouterr().err.splitlines()
+            if line.startswith('{"event":"rbln.worker.fatal"')
+        ]
+        assert event["where"] == "AsyncRBLNModelRunnerOutput.get_output"
+        assert event["rank"] == 2
+        assert event["dp_rank"] == config.parallel_config.data_parallel_rank
     else:
         exit_process.assert_not_called()
         assert excinfo.value is error
@@ -668,10 +678,11 @@ class TestShapeConfigWiring:
         # both need data parallelism to specialize at all -- so this runner is built
         # with a peer and a ladder of buckets, or the top and the first would be the
         # same entry and the answers indistinguishable.
-        monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setenv("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", "4")
-        runner = make_model_runner(data_parallel_size=2, max_num_seqs=8)
-        monkeypatch.undo()
+        runner = make_model_runner(
+            data_parallel_size=2,
+            max_num_seqs=8,
+            additional_config={"decode_batch_bucket_limit": 4},
+        )
         buckets = runner.bucketing_manager.decode_batch_buckets
         assert len(buckets) > 1, buckets
 
@@ -951,9 +962,22 @@ class TestDummyRunFlushesTheDeferredLoad:
         assert order == []
 
 
+def _copy_groups(*groups):
+    # One KV cache group per entry of layer names; the eager copy path reads
+    # only a group's block_size and layer_names.
+    return SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(block_size=8), layer_names=list(names)
+            )
+            for names in groups
+        ]
+    )
+
+
 class TestProcessKvCacheCopyOps:
-    # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager
-    # and compile_model. Forced deterministically.
+    # Path selection: use_runtime = not USE_DEVICE_TENSOR and not enforce_eager.
+    # Forced deterministically.
     @pytest.mark.parametrize(
         "block_axis, shape",
         [(0, (4, 2, 1, 1, 8, 2)), (1, (2, 4, 1, 1, 8, 2))],
@@ -968,6 +992,8 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[kv],
             kv_cache_names=["l0"],
             kv_cache_block_axes={"l0": block_axis},
+            kv_cache_config=_copy_groups(["l0"]),
+            _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -987,6 +1013,8 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[kv],
             kv_cache_names=["l0"],
             kv_cache_block_axes={"l0": 0},
+            kv_cache_config=_copy_groups(["l0"]),
+            _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -1006,6 +1034,8 @@ class TestProcessKvCacheCopyOps:
             kv_caches=[latent, scale],
             kv_cache_names=["latent", "scale"],
             kv_cache_block_axes={"latent": 0, "scale": 0},
+            kv_cache_config=_copy_groups(["latent", "scale"]),
+            _kernel_block_sizes=[8],
             model_config=SimpleNamespace(use_mla=True, enforce_eager=True),
             runtime_holder=[None],
         )
@@ -1014,6 +1044,26 @@ class TestProcessKvCacheCopyOps:
         assert (latent[2, 3:, :] == 0.0).all()
         assert (scale[2, :3] == 9.0).all()
         assert (scale[2, 3:] == 0.0).all()
+
+    def test_only_the_op_group_is_copied(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
+        # Two groups sharing a buffer keep their blocks apart by block id, so a
+        # copy for one group must not touch the other group's layer.
+        kv = torch.zeros(2, 4, 2, 1, 1, 8, 2)
+        kv[0, 1] = 5.0
+        kv[1, 1] = 6.0
+        r = _make_runner_stub(
+            kv_caches=[kv[0], kv[1]],
+            kv_cache_names=["a", "b"],
+            kv_cache_block_axes={"a": 0, "b": 0},
+            kv_cache_config=_copy_groups(["a"], ["b"]),
+            _kernel_block_sizes=[8, 8],
+            model_config=SimpleNamespace(use_mla=False, enforce_eager=True),
+            runtime_holder=[None],
+        )
+        r._process_kv_cache_copy_ops([KVCacheCopyOp(1, 1, 2, 8)])
+        assert (kv[0, 2] == 0.0).all()
+        assert (kv[1, 2] == 6.0).all()
 
     def test_runtime_copy_when_compiled_non_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
@@ -1190,21 +1240,23 @@ class TestCalcSpecDecodeMetadata:
 
 class TestSortBatchByLength:
     # __init__ enables the sort on REBEL CR13 and wherever
-    # VLLM_RBLN_BATCH_ATTN_OPT is set; other parts keep the scheduler's order.
+    # --rbln-use-batch-attn-opt is set; other parts keep the scheduler's order.
     @pytest.mark.parametrize(
         ("is_cr13", "use_batch_attn_opt", "expected"),
         [
-            (True, "0", True),
-            (False, "0", False),
-            (False, "1", True),
+            (True, False, True),
+            (False, False, False),
+            (False, True, True),
         ],
     )
     def test_resolved_from_device_and_flag(
         self, monkeypatch, make_model_runner, is_cr13, use_batch_attn_opt, expected
     ):
         monkeypatch.setattr(current_platform, "is_cr13", lambda: is_cr13)
-        monkeypatch.setenv("VLLM_RBLN_BATCH_ATTN_OPT", use_batch_attn_opt)
-        runner = make_model_runner(init_kv_cache=False)
+        runner = make_model_runner(
+            init_kv_cache=False,
+            additional_config={"use_batch_attn_opt": use_batch_attn_opt},
+        )
         assert runner.sort_batch_by_length is expected
 
 
@@ -1312,8 +1364,8 @@ class TestUsesFixedDecodeWindow:
 
 
 class TestAllocateKvCacheTensors:
-    # Device selection: "cpu" if not compiling, else self.device if device-tensor,
-    # else "meta". The mapping/validation logic is exercised on CPU.
+    # Device selection: self.device if device-tensor, else "meta". The
+    # mapping/validation logic is exercised on CPU.
     @staticmethod
     def _cfg():
         return SimpleNamespace(
@@ -1327,27 +1379,21 @@ class TestAllocateKvCacheTensors:
             ],
         )
 
-    def _runner(self, *, compile_model=True):
+    def _runner(self):
         return _make_runner_stub(
-            device=torch.device("cpu"),
-            runner_only_attn_layers=set(),
-            rbln_config=RBLNConfig(compile_model=compile_model),
+            device=torch.device("cpu"), runner_only_attn_layers=set()
         )
 
-    def test_cpu_when_not_compiling(self):
-        raw = self._runner(compile_model=False)._allocate_kv_cache_tensors(self._cfg())
+    def test_meta_without_device_tensor(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert set(raw) == {"l0", "l1", "l2"}
-        assert raw["l0"].device.type == "cpu"
+        assert raw["l0"].device.type == "meta"
         # Layers sharing a pool share the same buffer object.
         assert raw["l0"] is raw["l1"]
         assert raw["l0"] is not raw["l2"]
 
-    def test_meta_when_compiling_without_device_tensor(self, monkeypatch):
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert raw["l0"].device.type == "meta"
-
-    def test_self_device_when_compiling_with_device_tensor(self, monkeypatch):
+    def test_self_device_with_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert raw["l0"].device.type == "cpu"  # self.device is cpu here

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# RblnPlatform on the vllm model path only (VLLM_RBLN_USE_VLLM_MODEL=1). Written
+# RblnPlatform on the vllm model path only (--model-impl vllm). Written
 # against outcomes rather than call paths -- a real config is built so the engine's
 # own entry point (VllmConfig.__post_init__ -> check_and_update_config) does the
 # work, and the assertions read the resulting config, the raised error, or the
@@ -28,6 +28,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from pydantic import ValidationError
 from vllm.config import CompilationMode, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -35,7 +36,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_rbln.platform as platform
 from tests.vllm.vllm_config import local_model_path
-from vllm_rbln.config import RBLNConfig
+from vllm_rbln.config import OptimumRBLNConfig, RBLNConfig
 from vllm_rbln.platform import (
     RBLN_DEFAULT_GPU_MEMORY_UTILIZATION,
     RBLN_DEFAULT_MAX_NUM_SEQS,
@@ -50,6 +51,22 @@ _ENGINE_ARGS = dict(
     block_size=1024,
     max_num_batched_tokens=128,
     enable_chunked_prefill=True,
+)
+
+# Modules that bind platform.USE_DEVICE_TENSOR into their own namespace at
+# import. _apply_model_impl cannot reach them, so none may be imported before
+# the model path is resolved.
+_DEVICE_FLAG_COPIERS = frozenset(
+    {
+        "vllm_rbln.patches.deepseek_mtp",
+        "vllm_rbln.platform.vllm_impl",
+        "vllm_rbln.v1.sample.rbln_rejection_sampler",
+        "vllm_rbln.v1.sample.rbln_sampler",
+        "vllm_rbln.v1.spec_decode.dflash",
+        "vllm_rbln.v1.spec_decode.eagle",
+        "vllm_rbln.v1.spec_decode.medusa",
+        "vllm_rbln.v1.worker.rbln_model_runner",
+    }
 )
 
 _STANDALONE = "RBLN_CTX_STANDALONE"
@@ -117,7 +134,7 @@ class TestPlatformIdentity:
 
     def test_device_tensor_needs_both_switches(self):
         assert platform.USE_DEVICE_TENSOR is (
-            platform.envs.VLLM_RBLN_USE_VLLM_MODEL
+            platform.envs.model_impl_from_env() == "vllm"
             and platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR
         )
 
@@ -170,6 +187,18 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
             reconfigure(lambda config: None)
 
+    def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
+        def custom_kernel(dynamic):
+            def mutate(config):
+                config.additional_config.use_custom_kernel = True
+                config.additional_config.use_dynamic_kv_cache = dynamic
+
+            return mutate
+
+        with pytest.raises(ValueError, match="RBLN_USE_CUSTOM_KERNEL"):
+            reconfigure(custom_kernel(True))
+        reconfigure(custom_kernel(None))
+
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
@@ -206,7 +235,7 @@ class TestRejectedConfigs:
 
     @pytest.mark.parametrize("ranks", [dict(data_parallel_size=2), dict(ep=True)])
     def test_dp_and_ep_need_the_moe_tokens_mask(self, reconfigure, ranks):
-        with pytest.raises(ValueError, match="VLLM_RBLN_USE_MOE_TOKENS_MASK"):
+        with pytest.raises(ValueError, match="--rbln-use-moe-tokens-mask"):
             reconfigure(_ranks(moe_tokens_mask=False, **ranks))
 
     def test_tp_inherits_neither_dp_rule(self, reconfigure):
@@ -304,6 +333,31 @@ class TestDtype:
     def test_enforce_fp32_overrides_a_supported_dtype(self):
         config = _build(dtype="float16", additional_config={"enforce_model_fp32": True})
         assert config.model_config.dtype == torch.float32
+
+
+class TestCompileDtype:
+    @staticmethod
+    def _with_dtype(config):
+        config.additional_config = replace(
+            config.additional_config, compile_dtype="float16"
+        )
+
+    @pytest.fixture
+    def older_rebel(self, monkeypatch):
+        import vllm_rbln.compilation.compiler as compiler
+
+        def legacy_compile(model, *, npu=None):
+            pass
+
+        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
+
+    def test_empty_dtype_skips_the_probe(self, reconfigure, older_rebel):
+        config = reconfigure(lambda config: None)
+        assert config.additional_config.compile_dtype == ""
+
+    def test_refused_at_startup_on_an_older_rebel(self, reconfigure, older_rebel):
+        with pytest.raises(ValueError, match="dtype"):
+            reconfigure(self._with_dtype)
 
 
 class TestWorkerAndScheduler:
@@ -585,6 +639,21 @@ class TestDeviceName:
         monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
         assert RblnPlatform.is_cr13() is expected
 
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("RBLN-CA25", True),
+            ("RBLN-CA22", True),
+            (" rbln-ca02 ", True),
+            ("RBLN-CR03", False),
+            ("RBLN-CR13", False),
+        ],
+    )
+    def test_is_ca_matches_the_soc_name_prefix(self, monkeypatch, name, expected):
+        """A family, not one part: a new RBLN-CA* needs no code change here."""
+        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
+        assert RblnPlatform.is_ca() is expected
+
 
 class TestAdditionalForwardContext:
     def test_kv_cache_bases_passes_through(self):
@@ -799,3 +868,270 @@ class TestDflashTokenBudget:
             config.scheduler_config.max_num_scheduled_tokens = 8
 
         assert reconfigure(mutate).scheduler_config.max_num_scheduled_tokens == 8
+
+
+# Resolving the vllm path reads the host's device now that RBLN-CA* refuses it,
+# so the chip is named here rather than inherited from whatever card ran this.
+@pytest.mark.usefixtures("cr13")
+class TestModelImpl:
+    """`--model-impl` decides the path, and the path decides the device.
+
+    The frontend only learns it after the arguments are parsed, later than the
+    module scope where RblnPlatform's device identity is first computed, so the
+    values are assigned again from the parsed config.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore(self):
+        before = platform.envs.model_impl_from_env()
+        yield
+        platform._apply_model_impl(before)
+
+    @pytest.mark.parametrize(
+        ("model_impl", "expected"),
+        [("vllm", ("rbln", "rbln", "rbln-ccl")), ("optimum", ("cpu", "cpu", ""))],
+    )
+    def test_the_path_moves_the_device_identity(self, model_impl, expected):
+        platform._apply_model_impl(model_impl)
+        assert (
+            RblnPlatform.device_name,
+            RblnPlatform.device_type,
+            RblnPlatform.dist_backend,
+        ) == expected
+
+    def test_the_path_picks_the_impl_module(self):
+        platform._apply_model_impl("vllm")
+        assert platform._impl().__name__.endswith("vllm_impl")
+        platform._apply_model_impl("optimum")
+        assert platform._impl().__name__.endswith("optimum_impl")
+
+    @pytest.fixture
+    def on_the_other_path(self, monkeypatch):
+        """Start where the flag has to move the platform from.
+
+        The suite exports the deprecated variable and this module resolved it at
+        import, so without this the assertions below would pass on import-time
+        state and prove nothing.
+        """
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        # Set, not deleted, so monkeypatch has the key recorded and can roll
+        # back what _apply_model_impl writes.
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        platform._apply_model_impl("optimum")
+
+    def test_building_a_config_from_the_flag_alone_reaches_the_device(
+        self, on_the_other_path
+    ):
+        """`LLM(...)` builds its config without ever parsing a command line.
+
+        It is the entry point that skips `add_cli_args`, so a wrapper installed
+        from there would never see this call, and a run with the flag set would
+        stay on the optimum path.
+        """
+        assert RblnPlatform.device_type == "cpu"
+
+        config = _build(model_impl="vllm")
+
+        assert isinstance(config.additional_config, RBLNConfig)
+        assert RblnPlatform.device_type == "rbln"
+        assert platform.USE_DEVICE_TENSOR is True
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
+
+    def test_auto_reads_the_model_off_the_engine_args(self, monkeypatch):
+        """The wrapper is the only place `auto` can be handed a model to read.
+
+        Resolution takes the flag and the additional_config as arguments, and
+        the model sits on the EngineArgs the wrapper is called on. This one is
+        an architecture optimum-rbln runs, and the suite runs on the vllm path.
+        """
+        monkeypatch.setattr(platform.envs, "INHERITED_MODEL_IMPL", None)
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        platform._apply_model_impl("vllm")
+
+        config = _build()
+
+        assert isinstance(config.additional_config, OptimumRBLNConfig)
+        assert RblnPlatform.device_type == "cpu"
+
+    def test_a_built_config_passed_in_keeps_its_path(self, on_the_other_path):
+        """`LLM(additional_config=RBLNConfig(...))` hands in a resolved object.
+
+        The wrapper must read the path off it rather than overwrite it with a
+        dict, which would drop every other field the caller set. The class is
+        what states the path; nothing here says it a second time.
+        """
+        given = RBLNConfig(use_w8a8=True)
+
+        config = _build(additional_config=given)
+
+        assert config.additional_config is given
+        assert config.additional_config.use_w8a8 is True
+        assert RblnPlatform.device_type == "rbln"
+
+    def test_the_write_back_keeps_the_rest_of_additional_config(
+        self, on_the_other_path
+    ):
+        """The flag picks the path and additional_config keeps carrying options.
+
+        The two arrive separately now, so a run that sets both has to end up
+        with the path the flag named and every field the dict held.
+        """
+        config = _build(model_impl="vllm", additional_config={"use_w8a8": True})
+
+        assert isinstance(config.additional_config, RBLNConfig)
+        assert config.additional_config.use_w8a8 is True
+
+    def test_a_second_engine_does_not_take_the_first_one_s_path(self, monkeypatch):
+        """The published path is for the processes this one spawns.
+
+        Read back here it would let the first engine decide for every one after
+        it, and `LLM(...)` built with no path of its own would run on that one
+        instead of the default. Both engines are resolved in this process, which
+        is where two `LLM(...)` calls in one script build their configs.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        monkeypatch.setattr(EngineArgs, "create_engine_config", lambda self: None)
+        monkeypatch.setattr(
+            EngineArgs, "_rbln_model_impl_patched", False, raising=False
+        )
+        monkeypatch.setattr(platform.envs, "INHERITED_MODEL_IMPL", None)
+        monkeypatch.delenv("VLLM_RBLN_USE_VLLM_MODEL", raising=False)
+        RblnPlatform._capture_model_impl()
+
+        first = EngineArgs(model=local_model_path(_MODEL), model_impl="vllm")
+        EngineArgs.create_engine_config(first)
+        assert platform._MODEL_IMPL == "vllm"
+
+        # Left at `auto`, so the path is the model's own: optimum-rbln runs this
+        # architecture, and the first engine's answer is not consulted.
+        second = EngineArgs(model=local_model_path(_MODEL))
+        EngineArgs.create_engine_config(second)
+        assert platform._MODEL_IMPL == "optimum"
+
+    def test_the_upstream_flag_picks_the_path_and_is_handed_back(self):
+        """`--model-impl` says which path runs, and upstream never sees that.
+
+        Its own meaning for the value is a different question: `transformers`
+        there is vLLM's Transformers backend, which refuses several models
+        optimum-rbln supports, and it is asked at config time. Putting the
+        default back leaves that resolution exactly as it would have been.
+        """
+        config = _build(model_impl="vllm")
+
+        assert isinstance(config.additional_config, RBLNConfig)
+        assert config.model_config.model_impl == "auto"
+
+    def test_a_ray_actor_is_told_the_path(self):
+        """Ray copies a chosen set of names, not the environment.
+
+        The leading underscore keeps the resolved path out of the VLLM_RBLN_*
+        namespace, and out of the `VLLM_` prefix Ray copies on. Without the
+        platform listing it, an actor would start on the default path and run
+        the worker against upstream nobody patched.
+        """
+        from vllm.ray.ray_env import get_env_vars_to_copy
+
+        copied = get_env_vars_to_copy(
+            additional_vars=set(RblnPlatform.additional_env_vars)
+        )
+
+        assert platform.envs.RESOLVED_MODEL_IMPL_ENV in copied
+
+    def test_a_bare_string_additional_config_is_left_to_upstream(self):
+        """`_MergeAdditionalConfig` keeps the bare string the CLI action takes,
+        and `VllmConfig`, which types the field, is what refuses it. Merging the
+        path into it first raises a TypeError from an operator instead."""
+        with pytest.raises(ValidationError, match="additional_config"):
+            _build(additional_config="something")
+
+    def test_creating_the_engine_config_publishes_the_path(self, monkeypatch):
+        """The wrapper is the only place the flag and the spawned processes meet.
+
+        It writes the path back into additional_config, so the config that
+        reaches a worker states its own path, and publishes it for the entry
+        points that run before that config arrives.
+        """
+        from vllm.engine.arg_utils import EngineArgs
+
+        seen = []
+        monkeypatch.setattr(
+            EngineArgs,
+            "create_engine_config",
+            lambda self, *a, **k: seen.append(self.additional_config),
+            raising=False,
+        )
+        monkeypatch.delattr(EngineArgs, "_rbln_model_impl_patched", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        RblnPlatform._capture_model_impl()
+
+        EngineArgs.create_engine_config(
+            SimpleNamespace(additional_config={"model_impl": "vllm"}, model_impl="auto")
+        )
+
+        assert seen == [{"model_impl": "vllm"}]
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
+        assert RblnPlatform.device_type == "rbln"
+
+    def test_a_disabled_path_stops_the_config(self, monkeypatch):
+        """The wrapper resolves the path, so a disabled one fails here."""
+        from vllm.engine.arg_utils import EngineArgs
+
+        monkeypatch.setattr(
+            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
+        )
+        monkeypatch.setattr(
+            EngineArgs, "create_engine_config", lambda self, *a, **k: None
+        )
+        monkeypatch.delattr(EngineArgs, "_rbln_model_impl_patched", raising=False)
+        monkeypatch.setenv(platform.envs.RESOLVED_MODEL_IMPL_ENV, _UNTOUCHED)
+        RblnPlatform._capture_model_impl()
+
+        with pytest.raises(ValueError, match="RBLN-CA25"):
+            EngineArgs.create_engine_config(
+                SimpleNamespace(
+                    max_num_batched_tokens=None,
+                    additional_config=None,
+                    model_impl="vllm",
+                )
+            )
+        assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == _UNTOUCHED
+
+    def test_the_modules_that_copy_the_device_flag_import_late(self):
+        """They bind USE_DEVICE_TENSOR at their own import.
+
+        That is only correct while none of them is imported before the path is
+        resolved, so the platform module is the only one _apply_model_impl has
+        to reach. A new early import here would silently pin a stale value.
+        """
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys;"
+            "from vllm.platforms import current_platform;"
+            "import vllm_rbln;"
+            "vllm_rbln.register_model();"
+            "vllm_rbln.register_ops();"
+            "applied = sys.modules.get('vllm_rbln.patches.registry');"
+            "print(applied and applied._applied_patch_keys,"
+            " [m for m in sys.modules if m in COPIERS])".replace(
+                "COPIERS", repr(_DEVICE_FLAG_COPIERS)
+            )
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("VLLM_RBLN")
+                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
+            },
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        # "None []": the registry was never imported, so nothing was applied and
+        # no module bound a stale USE_DEVICE_TENSOR.
+        assert out.stdout.strip().endswith("None []"), out.stdout

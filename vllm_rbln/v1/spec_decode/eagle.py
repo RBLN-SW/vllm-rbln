@@ -447,10 +447,7 @@ class RBLNEagleProposer(EagleProposer):
             return hidden_states, torch.ops.rbln.argmax(logits)
 
         rbln_config: RBLNConfig = self.vllm_config.additional_config
-        if (
-            self.vllm_config.speculative_config.enforce_eager
-            or not rbln_config.compile_model
-        ):
+        if self.vllm_config.speculative_config.enforce_eager:
             self.model_executable = model_wrapper
         else:
             self.model_executable = compile(
@@ -466,6 +463,7 @@ class RBLNEagleProposer(EagleProposer):
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                 use_static_output=True,
                 use_direct_dispatch=True,
+                dtype=rbln_config.compile_dtype,
             )
 
     def _build_dummy_attn_metadata(
@@ -491,9 +489,9 @@ class RBLNEagleProposer(EagleProposer):
             num_actual_tokens=num_tokens,
             max_query_len=num_tokens_per_req,
             max_seq_len=seq_lens.max().item(),
-            block_table_tensor=self.runner.input_batch.block_table[0].get_cpu_tensor()[
-                :num_reqs
-            ],
+            block_table_tensor=self.runner.input_batch.block_table[
+                self.kv_cache_gid
+            ].get_cpu_tensor()[:num_reqs],
             slot_mapping=torch.tensor(0),  # dummy
             causal=True,
         )

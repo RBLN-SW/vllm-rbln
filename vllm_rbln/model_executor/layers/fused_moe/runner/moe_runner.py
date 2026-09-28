@@ -76,7 +76,8 @@ class RBLNMoERunner(MoERunner):
       **directly**, bypassing the modular/monolithic kernel plumbing.
     * When ``dp_size > 1``: tokens are padded to ``max_pads_across_dp`` and
       dispatched across DP ranks via all-gather or, when
-      ``VLLM_RBLN_DISPATCH_ALL2ALL``/``COMBINE_ALL2ALL`` are set, via the RBLN
+      ``--rbln-use-all2all-dispatch``/``--rbln-use-all2all-combine`` are set,
+      via the RBLN
       CCL all2all kernels (``send_mask`` registered in ``__init__``); partial
       expert outputs are combined with reduce-scatter or the all2all-combine path.
     """

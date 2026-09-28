@@ -22,13 +22,10 @@ import pytest
 
 from tests.vllm import conftest
 from tests.vllm.model_specs import (
-    ATOM,
-    CA25,
     CR03,
     CR13,
     CR23,
     KNOWN_CHIPS,
-    REBEL,
     CompileModelSpec,
 )
 
@@ -63,9 +60,7 @@ def on_chip(monkeypatch):
     ("chips", "runs"),
     [
         (KNOWN_CHIPS, True),
-        (REBEL, True),
         (frozenset({CR03}), True),
-        (ATOM, False),
         (frozenset({CR13, CR23}), False),
     ],
 )
@@ -78,22 +73,22 @@ def test_host_chip_decides(on_chip, chips, runs):
 
 def test_skip_reason_names_both_sides(on_chip):
     on_chip(CR03)
-    item = _item(CompileModelSpec("m/x", chips=frozenset({CR13, CA25})))
+    item = _item(CompileModelSpec("m/x", chips=frozenset({CR13, CR23})))
     conftest._skip_other_chips([item])
-    assert _skip_reason(item) == "needs RBLN-CA25/RBLN-CR13, host is RBLN-CR03"
+    assert _skip_reason(item) == "needs RBLN-CR13/RBLN-CR23, host is RBLN-CR03"
 
 
 def test_only_whole_model_items_are_filtered(on_chip):
     """A spec also feeds unit tests that never touch an NPU."""
     on_chip(CR03)
-    item = _item(CompileModelSpec("m/x", chips=ATOM), marked=False)
+    item = _item(CompileModelSpec("m/x", chips=frozenset({CR13})), marked=False)
     conftest._skip_other_chips([item])
     assert _skip_reason(item) is None
 
 
 def test_unresolved_chip_filters_nothing(on_chip):
     on_chip(None)
-    item = _item(CompileModelSpec("m/x", chips=ATOM))
+    item = _item(CompileModelSpec("m/x", chips=frozenset({CR13})))
     conftest._skip_other_chips([item])
     assert _skip_reason(item) is None
 
@@ -110,7 +105,6 @@ def test_item_without_a_spec_is_left_alone(on_chip):
     ("chips", "message"),
     [
         (frozenset(), "at least one chip"),
-        (ATOM & REBEL, "at least one chip"),
         (frozenset({"RBLN-CR99"}), "Unknown chips"),
     ],
 )

@@ -93,6 +93,13 @@ def test_scrub_env_defaults_to_the_process_environment():
         os.environ.update(saved)
 
 
+def test_the_published_path_is_spelled_the_way_the_source_spells_it():
+    """utils.py cannot import the name without pulling the platform in early."""
+    from vllm_rbln.envs import RESOLVED_MODEL_IMPL_ENV
+
+    assert RESOLVED_MODEL_IMPL_ENV in SCRUBBED_EXTRA
+
+
 def test_extra_entries_are_real_additions():
     """An entry the prefix rule already covers is a dead line."""
     redundant = sorted(k for k in SCRUBBED_EXTRA if k.startswith("VLLM_RBLN_"))

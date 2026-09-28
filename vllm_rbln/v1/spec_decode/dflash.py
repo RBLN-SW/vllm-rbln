@@ -75,11 +75,7 @@ class RBLNDFlashProposer(DFlashProposer):
             )
 
     def __init__(self, vllm_config, device: torch.device, runner=None):
-        rbln_config: RBLNConfig = vllm_config.additional_config
-        if (
-            vllm_config.speculative_config.enforce_eager
-            or not rbln_config.compile_model
-        ):
+        if vllm_config.speculative_config.enforce_eager:
             # The attention ops are pattern stubs the compiler replaces, so an
             # eager context write would silently write nothing.
             raise NotImplementedError(
@@ -307,6 +303,7 @@ class RBLNDFlashProposer(DFlashProposer):
             runtime_holder=self.runner.runtime_holder,
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             use_static_output=True,
+            dtype=rbln_config.compile_dtype,
         )
         self.model_executable = compile(model_wrapper, **compile_kwargs)
         self._project_context_kv = compile(project_context_kv, **compile_kwargs)

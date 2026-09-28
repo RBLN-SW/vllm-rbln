@@ -3,10 +3,10 @@ model: MiniMaxAI/MiniMax-M2.7
 
 env:
   VLLM_DISABLE_COMPILE_CACHE: "1"
-  VLLM_RBLN_USE_VLLM_MODEL: "1"
-  VLLM_RBLN_BATCH_ATTN_OPT: "1"
 
 serve:
+  model_impl: vllm
+  rbln_use_batch_attn_opt: true
   max_model_len: 16384
   block_size: 8192
   max_num_batched_tokens: 1024

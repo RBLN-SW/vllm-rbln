@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_rbln import envs
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.block_size import (
     get_block_ratio,
@@ -61,12 +61,13 @@ def sync_from_optimum(
     """
 
     params = RBLNParams.from_rbln_config(vllm_config, compiled_rbln_config)
+    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
 
     # The compiled artefact is the source of truth. Strip the user's
-    # additional_config down to device-only keys so submodule placement
+    # optimum_overrides down to device-only keys so submodule placement
     # can still be overridden, but no other parameter sneaks in.
-    vllm_config.additional_config["rbln_config"] = _keep_only_device_keys(
-        vllm_config.additional_config.get("rbln_config", {})
+    rbln_config.optimum_overrides = _keep_only_device_keys(
+        rbln_config.optimum_overrides
     )
 
     assert params.num_blocks is not None, (
@@ -132,8 +133,8 @@ def sync_from_optimum(
 
     # Set num_blocks in cache_config based on rbln_config.json
     update_num_blocks(vllm_config, params.num_blocks)
-    # Sync num_devices in envs with optimum pre-compiled model
-    envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = params.num_devices
+    # The compiled model fixes num_devices too.
+    rbln_config.num_devices_per_local_rank = params.num_devices
 
 
 def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
@@ -143,7 +144,8 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
     # calculation and update once, in the main process, to avoid redundant
     # calculations and potential inconsistencies. We use an additional_config
     # flag to track whether we have already synced num_blocks.
-    if vllm_config.additional_config.get("num_blocks_synced", False):
+    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+    if rbln_config.num_blocks_synced:
         logger.debug(
             "num_blocks already synced to %s, skipping...",
             vllm_config.cache_config.num_gpu_blocks,
@@ -154,7 +156,7 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
         num_blocks = vllm_config.cache_config.num_gpu_blocks_override
         # This is kept for optimum based num blocks
         # not considering ob-ib logic for prefix caching
-        vllm_config.additional_config["num_blocks_override"] = num_blocks
+        rbln_config.num_blocks_override = num_blocks
     blk_ratio = get_block_ratio(vllm_config)
 
     if is_full_block_available(num_blocks, vllm_config):
@@ -166,7 +168,7 @@ def update_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> None:
 
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         vllm_config.cache_config.num_gpu_blocks_override = adjusted_num_blocks
-    vllm_config.additional_config["num_blocks_synced"] = True
+    rbln_config.num_blocks_synced = True
 
 
 def update_mamba_block_size(vllm_config: VllmConfig, params: "RBLNParams") -> None:

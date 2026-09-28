@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=True
     # ====================================================================
     # --- COMPILE / RUNTIME ---
-    VLLM_RBLN_COMPILE_MODEL: bool = True
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
@@ -88,24 +87,18 @@ if TYPE_CHECKING:
 def get_num_devices_per_local_rank() -> int:
     """Number of NPU devices assigned to each local rank.
 
-    Resolves ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``. For backward
-    compatibility the deprecated ``VLLM_RBLN_TP_SIZE`` is still honored as a
-    fallback when the new variable is unset, and emits a deprecation warning.
+    Resolves ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK``, and the older
+    ``VLLM_RBLN_TP_SIZE`` as a fallback when it is unset. Both are deprecated;
+    `_env_overrides` warns, naming the flag that replaces them. Nothing here
+    may log: this module has to stay importable while `vllm` is, and
+    `vllm_rbln.logger` imports `vllm`.
     """
     new_value = os.environ.get("VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK")
+    if new_value is not None:
+        return int(new_value)
+
     legacy_value = os.environ.get("VLLM_RBLN_TP_SIZE")
-
-    if legacy_value is not None:
-        from vllm_rbln.logger import init_logger
-
-        init_logger(__name__).warning_once(
-            "VLLM_RBLN_TP_SIZE is deprecated and will be removed in a future "
-            "release. Please use VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK instead."
-        )
-        if new_value is None:
-            return int(legacy_value)
-
-    return int(new_value) if new_value is not None else 1
+    return int(legacy_value) if legacy_value is not None else 1
 
 
 def get_decode_batch_bucket_strategy() -> str:
@@ -168,6 +161,33 @@ def use_auto_port() -> bool:
     )
 
 
+# Not a knob, so it is a plain constant and has no entry below: the frontend
+# writes the resolved model path here for the processes it spawns, which run
+# their plugin entry points before the config reaches them. The leading
+# underscore keeps it out of the VLLM_RBLN_* namespace that `environment_variables`
+# owns, while leaving it where `env | grep RBLN` finds it. Setting it by hand
+# does nothing the frontend does not overwrite.
+RESOLVED_MODEL_IMPL_ENV = "_VLLM_RBLN_RESOLVED_MODEL_IMPL"
+
+# Read once, at import: the variable names what the process that spawned this one
+# resolved, and `_apply_model_impl` overwrites it for the processes this one
+# spawns. Reading it later would hand this process its own answer back, and a
+# second engine built without a path of its own would take the first one's.
+INHERITED_MODEL_IMPL = os.environ.get(RESOLVED_MODEL_IMPL_ENV) or None
+
+
+def model_impl_from_env() -> str:
+    """The model path this process was started on, for a reader with no config."""
+    if INHERITED_MODEL_IMPL:
+        return INHERITED_MODEL_IMPL
+    # TODO(vllm-rbln>=0.14.0): delete, with VLLM_RBLN_USE_VLLM_MODEL itself.
+    # Silent here on purpose: `vllm_rbln.platform` calls this while `vllm` is
+    # still importing itself, and a logger would pull `vllm` back in.
+    # `resolve_model_impl` warns instead.
+    legacy = os.environ.get("VLLM_RBLN_USE_VLLM_MODEL", "False")
+    return "vllm" if legacy.lower() in ("true", "1") else "optimum"
+
+
 # extended environments
 environment_variables = {
     # ====================================================================
@@ -216,13 +236,6 @@ environment_variables = {
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=True
     # ====================================================================
     # --- COMPILE / RUNTIME ---
-    # If true, will compile models using torch.compile.
-    # Otherwise, run the CPU eager mode, if possible.
-    "VLLM_RBLN_COMPILE_MODEL": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_COMPILE_MODEL", "True").lower() in ("true", "1")
-        )
-    ),
     # If true, will compile models using strict mode.
     "VLLM_RBLN_COMPILE_STRICT_MODE": (
         lambda: (
@@ -271,10 +284,10 @@ environment_variables = {
         )
     ),
     # Disable only for debugging worker failures without terminating the worker.
-    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: (
-        os.environ.get("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False").lower()
-        in ("true", "1")
-    ),
+    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: os.environ.get(
+        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False"
+    ).lower()
+    in ("true", "1"),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype
@@ -285,9 +298,8 @@ environment_variables = {
         )
     ),
     # --- DYNAMIC KV CACHE ---
-    # Size the KV cache from the compiled artifact instead of the estimate.
-    # Configurations the path cannot size turn it off on their own
-    # (`dynamic_kv_unsupported_reason`); 0 turns it off everywhere.
+    # TODO(vllm-rbln>=0.14.0): delete. Resolved into
+    # `RBLNConfig.use_dynamic_kv_cache`; `--rbln-use-dynamic-kv-cache` is the flag.
     "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": (
         lambda: (
             os.environ.get("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "True").lower()
@@ -398,7 +410,6 @@ RBLN_COMPILE_ENV = frozenset(
         "VLLM_RBLN_USE_VLLM_MODEL",
         "VLLM_RBLN_NUM_HIDDEN_LAYERS",
         "VLLM_RBLN_USE_DEVICE_TENSOR",
-        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
     }
 )
 
@@ -421,11 +432,11 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
-        "VLLM_RBLN_COMPILE_MODEL",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
         "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",
         "VLLM_RBLN_SPECIALIZE_MOE_DECODE",
         "VLLM_RBLN_USE_MOE_TOKENS_MASK",
         "VLLM_RBLN_DISPATCH_ALL2ALL",

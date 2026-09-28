@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared helpers for the suite (``VLLM_RBLN_USE_VLLM_MODEL=1``)."""
+"""Shared helpers for the suite (``--model-impl vllm``)."""
 
 from __future__ import annotations
 
@@ -31,29 +31,31 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import ParamSpec
 
-# What the suite pins: the switch that selects vLLM modelling over optimum, plus
-# the knobs whose source default the suite must not take. Nothing that merely
-# repeats a default -- pinning those would hide the day one is flipped.
+# What the suite pins: the knobs whose source default it must not take. Nothing
+# that merely repeats a default -- pinning those would hide the day one is
+# flipped. The model path is not here; `pytest_configure` adopts it.
 VLLM_RBLN_ENV = {
     "RBLN_ROOT_IP": "127.0.0.1",
     "RBLN_LOCAL_IP": "127.0.0.1",
     "VLLM_DISABLE_COMPILE_CACHE": "1",
     "VLLM_LOGGING_LEVEL": "DEBUG",
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-    "VLLM_RBLN_USE_VLLM_MODEL": "1",
 }
 
 SCRUBBED_PREFIXES = ("VLLM_RBLN_",)
 
 # Knobs outside that prefix that still decide what the suite runs: two upstream
-# ones RblnPlatform branches on, and the compiler flag VLLM_RBLN_USE_CUSTOM_KERNEL
-# resolves from instead of a private copy.
+# ones RblnPlatform branches on, the compiler flag VLLM_RBLN_USE_CUSTOM_KERNEL
+# resolves from, and the model path a parent process publishes. That last one is
+# spelled out rather than imported, which would pull the platform in before
+# `pytest_configure` runs; `test_utils.py` checks the spelling against `envs`.
 SCRUBBED_EXTRA = frozenset(
     {
         "VLLM_USE_V2_MODEL_RUNNER",
         "VLLM_DISABLE_COMPILE_CACHE",
         "VLLM_WORKER_MULTIPROC_METHOD",
         "RBLN_USE_CUSTOM_KERNEL",
+        "_VLLM_RBLN_RESOLVED_MODEL_IMPL",
     }
 )
 

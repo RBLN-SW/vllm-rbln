@@ -56,6 +56,7 @@ def engine_config(
     speculative_model: str | None = None,
     block_size: int = BLOCK_SIZE,
     kv_role: str = "kv_both",
+    stripe_width: int | None = None,
 ) -> Any:
     """A real VllmConfig with a kv_transfer_config, through EngineArgs.
 
@@ -80,6 +81,9 @@ def engine_config(
             kv_connector="RblnNixlConnector",
             kv_role=kv_role,
             kv_buffer_device=kv_buffer_device,
+            kv_connector_extra_config=(
+                {} if stripe_width is None else {"stripe_width": stripe_width}
+            ),
         ),
         **extra,
     )
@@ -409,9 +413,16 @@ def fake_nixl_rbln(geometry: KvGeometry, kv_caches: dict[str, Any]) -> Any:
     # from the geometry, so nothing else here would ever read `regions` -- and
     # the byte offset in it is the only thing telling a layer's K from its V.
     module.regions_seen = []
+    # Backend-lifecycle overrides ride this call on the D2D path, and the
+    # adapter treats a missing one as "keep the plugin default", so what is
+    # absent is as much the contract as what is present.
+    module.register_kwargs_seen = []
 
     def _register_kv_regions(wrapper: Any, regions: Any, *a: Any, **k: Any) -> Any:
         module.regions_seen.append(list(regions))
+        module.register_kwargs_seen.append(
+            {n: v for n, v in k.items() if n not in ("mem", "rbln_ctx_ptr")}
+        )
         return geometry.xfer_tables(kv_caches)
 
     module.register_kv_regions = _register_kv_regions
@@ -638,6 +649,7 @@ def build_worker(
     use_mla=False,
     pp_size=1,
     hma_disabled=False,
+    stripe_width=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -692,6 +704,11 @@ def build_worker(
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
     vllm_config = MagicMock()
+    # A real dict: read through a mock, every knob answers with a mock of its
+    # own, and a connector that tests one for absence never sees it missing.
+    vllm_config.kv_transfer_config.kv_connector_extra_config = (
+        {} if stripe_width is None else {"stripe_width": stripe_width}
+    )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # What the worker sets before it builds the connector; `register_kv_caches`
     # takes the count from here.

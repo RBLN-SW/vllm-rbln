@@ -14,6 +14,7 @@
 
 from typing import TYPE_CHECKING
 
+from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.registry import (
     is_enc_dec_arch,
@@ -38,18 +39,19 @@ logger = init_logger(__name__)
 
 def sync_from_vllm(vllm_config: VllmConfig) -> None:
     """
-    vllm_config.additional_config["rbln_config"] -> optimum
-    1. Parse RBLNParams from vllm_config.additional_config["rbln_config"].
+    vllm_config.additional_config.optimum_overrides -> optimum
+    1. Parse RBLNParams from vllm_config.additional_config.optimum_overrides.
     2. Update vllm_config based on the parsed RBLNParams
     to ensure consistency between vLLM and RBLN configurations.
     3. Validate the updated block size
     """
-    rbln_overrides = vllm_config.additional_config.get("rbln_config", {})
+    rbln_config: OptimumRBLNConfig = vllm_config.additional_config
+    rbln_overrides = rbln_config.optimum_overrides
     params = RBLNParams.from_rbln_config(vllm_config, rbln_overrides)
 
     if params.dtype is not None:
         raise ValueError(
-            "`dtype` cannot be set in `additional_config`'s `rbln_config`. "
+            "`dtype` cannot be set in `additional_config`'s `optimum_overrides`. "
             "optimum-rbln takes the compile dtype as a load argument, not as "
             "an rbln_config field. Use vLLM's `dtype` argument instead "
             "(e.g. `LLM(dtype=...)` or `--dtype`)."
@@ -57,19 +59,19 @@ def sync_from_vllm(vllm_config: VllmConfig) -> None:
 
     if params.batch_size is not None:
         logger.info(
-            "Setting max_num_seqs to %d based on rbln_config in additional_config",
+            "Setting max_num_seqs to %d based on additional_config.optimum_overrides",
             params.batch_size,
         )
         vllm_config.scheduler_config.max_num_seqs = params.batch_size
     if params.max_seq_len is not None:
         logger.info(
-            "Setting max_model_len to %d based on rbln_config in additional_config",
+            "Setting max_model_len to %d based on additional_config.optimum_overrides",
             params.max_seq_len,
         )
         vllm_config.model_config.max_model_len = params.max_seq_len
     if params.kvcache_block_size is not None:
         logger.info(
-            "Setting block_size to %d based on rbln_config in additional_config",
+            "Setting block_size to %d based on additional_config.optimum_overrides",
             params.kvcache_block_size,
         )
         vllm_config.cache_config.block_size = params.kvcache_block_size

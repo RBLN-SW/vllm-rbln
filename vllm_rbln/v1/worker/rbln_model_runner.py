@@ -137,6 +137,7 @@ from vllm_rbln.v1.core.utils import (
     num_base_tokens,
     resolve_propagated_token_write,
     step_is_prefill,
+    sub_block_size_in_use,
 )
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
@@ -499,7 +500,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             and self.rbln_config.specialize_moe_decode
         )
         # The batched dynamic decode kernel (REBEL CR13, or any device with
-        # VLLM_RBLN_BATCH_ATTN_OPT) processes the first valid_batch[p] rows of
+        # --rbln-use-batch-attn-opt) processes the first valid_batch[p] rows of
         # partition p and early-exits on the rest, which is only correct when
         # rows are sorted by descending sequence length.
         self.sort_batch_by_length = (
@@ -2026,6 +2027,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             placeholder_pos=dict(self._placeholder_pos),
             logprobs_tensors=self._async_logprobs_tensors,
             fail_fast=self.fail_fast,
+            rank=self.parallel_config.rank,
+            dp_rank=self.parallel_config.data_parallel_rank,
         )
         return async_output
 
@@ -2270,7 +2273,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
             return hidden_states, logits, combined_hidden_states
 
-        if self.model_config.enforce_eager or not self.rbln_config.compile_model:
+        if self.model_config.enforce_eager:
             self.model_executable = model_wrapper
             self.compute_logits = self.model.compute_logits
         else:
@@ -2290,6 +2293,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # output buffer can be reused across steps even under async scheduling.
                 use_static_output=True,
                 use_direct_dispatch=True,
+                dtype=self.rbln_config.compile_dtype,
             )
             # NOTE(RBLN): We compile compute_logits separately to cover cases when
             # `self.use_wrapped_compute_logits` is `False`
@@ -2305,6 +2309,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 runtime_holder=self.runtime_holder,
                 mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
                 use_static_output=True,
+                dtype=self.rbln_config.compile_dtype,
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
@@ -2870,13 +2875,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = (
-                "cpu"
-                if not self.rbln_config.compile_model
-                else self.device
-                if USE_DEVICE_TENSOR
-                else "meta"
-            )
+            device = self.device if USE_DEVICE_TENSOR else "meta"
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
@@ -3147,11 +3146,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
 
-        if (
-            not USE_DEVICE_TENSOR
-            and not self.model_config.enforce_eager
-            and self.rbln_config.compile_model
-        ):
+        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
@@ -3196,15 +3191,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize KV cache based on `kv_cache_config`."""
-        if self.rbln_config.enable_sub_block_cache and (
-            len(kv_cache_config.kv_cache_groups) > 1
-        ):
-            raise NotImplementedError(
-                "Sub-block prefix caching does not support "
-                "multi-group KV caches yet.  "
-                "Set VLLM_RBLN_SUB_BLOCK_CACHE=false to disable."
-            )
-
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
@@ -3215,7 +3201,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
         kernel_block_sizes = prepare_kernel_block_sizes(
-            kv_cache_config, self.attn_groups
+            kv_cache_config,
+            self.attn_groups,
+            sub_block_size_in_use(
+                enable_prefix_caching=self.cache_config.enable_prefix_caching,
+                sub_block_cache=self.rbln_config.enable_sub_block_cache,
+                block_size=self.cache_config.block_size,
+                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                kv_cache_config=kv_cache_config,
+                sub_block_size=self.rbln_config.sub_block_size,
+            ),
         )
         self._kernel_block_sizes = kernel_block_sizes
 
@@ -3689,13 +3684,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if (
-            not USE_DEVICE_TENSOR
-            and not self.model_config.enforce_eager
-            and self.rbln_config.compile_model
-        ):
+        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
-            # in this path (VLLM_RBLN_USE_VLLM_MODEL).
+            # in this path (--model-impl vllm).
             for op in copy_ops:
                 runtime = self.runtime_holder[0]
                 runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
@@ -3704,12 +3695,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         for op in copy_ops:
+            group = self.kv_cache_config.kv_cache_groups[op.group_id]
+            # The op names manager blocks; the cache is addressed in kernel
+            # blocks, so the two must coincide for the group.
+            assert (
+                self._kernel_block_sizes[op.group_id] == group.kv_cache_spec.block_size
+            )
+            layer_names = set(group.layer_names)
             src = op.src_block_id
             dst = op.dst_block_id
             nt = op.num_tokens
             for layer_name, kv_cache in zip(
                 self.kv_cache_names, self.kv_caches, strict=True
             ):
+                if layer_name not in layer_names:
+                    continue
                 # An MLA-family cache is blocks-first whatever the kernel, and
                 # the indexer scale one has no axis after its tokens.
                 if self.model_config.use_mla:

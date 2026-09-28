@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_rbln.config import build_optimum_rbln_config
 from vllm_rbln.utils.optimum.converter.from_vllm import sync_from_vllm
 
 DECODER_ARCH = "LlamaForCausalLM"
@@ -26,7 +27,7 @@ def _vllm_config(rbln_config: dict) -> SimpleNamespace:
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=[DECODER_ARCH])
         ),
-        additional_config={"rbln_config": rbln_config},
+        additional_config=build_optimum_rbln_config({"optimum_overrides": rbln_config}),
     )
 
 

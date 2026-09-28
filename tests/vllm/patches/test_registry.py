@@ -16,12 +16,16 @@
 # applies and verifies them. Its state lives in module globals the conftest has
 # already populated, so tests that mutate them swap in isolated ones.
 
+import json
+import os
+import subprocess
 import sys
 import types
 from typing import Any
 
 import pytest
 
+import vllm_rbln.envs as platform_envs
 import vllm_rbln.patches.registry as reg
 from vllm_rbln.patches.registry import (
     MAX_PATCH_PRIORITY,
@@ -49,6 +53,7 @@ def isolated(monkeypatch):
     monkeypatch.setattr(reg, "_REGISTERED_PATCH_DESCRIPTORS", [])
     monkeypatch.setattr(reg, "_applied_registration_keys", set())
     monkeypatch.setattr(reg, "_applied_patch_keys", set())
+    monkeypatch.setattr(reg, "_built_replacements", {})
 
 
 @pytest.fixture
@@ -67,7 +72,7 @@ def _patch(
     priority=50,
     condition=None,
     verify=None,
-    apply_immediately=False,
+    build=False,
 ):
     return PatchDescriptor(
         key=key,
@@ -78,7 +83,7 @@ def _patch(
         condition=condition,
         verify=verify,
         priority=priority,
-        apply_immediately=apply_immediately,
+        build=build,
     )
 
 
@@ -215,12 +220,6 @@ class TestAddRegistration:
 
 
 class TestRegisterPatch:
-    def test_apply_immediately_with_explicit_priority_raises(self):
-        with pytest.raises(ValueError, match="cannot influence"):
-            register_patch(
-                target="m.x", reason="r", apply_immediately=True, priority=10
-            )
-
     def test_registers_descriptor_with_given_fields(self, isolated):
         @register_patch(target="m.x", reason="r", key="mykey", priority=20)
         def replacement():
@@ -253,27 +252,16 @@ class TestRegisterPatch:
         [descriptor] = reg._REGISTERED_PATCH_DESCRIPTORS
         assert descriptor.key == f"custom.mod.{replacement.__qualname__}"
 
-    def test_apply_immediately_patches_at_registration(self, isolated, fake_target):
-        @register_patch(target=_TARGET, reason="r", key="k", apply_immediately=True)
+    def test_registration_does_not_touch_the_target(self, isolated, fake_target):
+        """Importing a patches module must leave upstream alone; only
+        apply_registered_patches installs anything."""
+        original = fake_target.symbol
+
+        @register_patch(target=_TARGET, reason="r", key="k")
         def replacement():
             pass
 
-        assert fake_target.symbol is replacement
-
-    def test_apply_immediately_respects_false_condition(self, isolated, fake_target):
-        # Registered, but a False condition keeps it from applying at import time.
-        @register_patch(
-            target=_TARGET,
-            reason="r",
-            key="k",
-            apply_immediately=True,
-            condition=lambda: False,
-        )
-        def replacement():
-            pass
-
-        assert len(reg._REGISTERED_PATCH_DESCRIPTORS) == 1
-        assert fake_target.symbol == "ORIGINAL"
+        assert fake_target.symbol is original
 
 
 class TestApplyRegistrations:
@@ -350,3 +338,143 @@ class TestApplyRegisteredPatches:
         )
         apply_registered_patches()
         assert order == ["b", "a"]
+
+    def test_build_calls_the_factory_at_apply_time(self, isolated, fake_target):
+        # The factory must not run while the module is being imported, and its
+        # result is what lands on the target.
+        calls: list = []
+
+        def factory():
+            calls.append(fake_target.symbol)
+            return "BUILT"
+
+        reg._REGISTERED_PATCH_DESCRIPTORS.append(
+            _patch(key="k", replacement=factory, build=True)
+        )
+        assert calls == []
+        apply_registered_patches()
+        assert calls == ["ORIGINAL"]
+        assert fake_target.symbol == "BUILT"
+
+    def test_build_sees_an_earlier_patch(self, isolated, fake_target):
+        # The point of build=: a factory that reads a target another patch
+        # replaces has to observe the replacement, not the original.
+        reg._REGISTERED_PATCH_DESCRIPTORS.extend(
+            [
+                _patch(key="a", replacement="PATCHED", priority=0),
+                _patch(
+                    key="b",
+                    target="_registry_test_target.other",
+                    replacement=lambda: f"wraps {fake_target.symbol}",
+                    priority=50,
+                    build=True,
+                ),
+            ]
+        )
+        apply_registered_patches()
+        assert fake_target.other == "wraps PATCHED"
+
+    def test_build_verifies_against_the_built_object(self, isolated, fake_target):
+        # A factory that returns a fresh object each call would fail the default
+        # verify unless the registry reuses the object it installed.
+        reg._REGISTERED_PATCH_DESCRIPTORS.append(
+            _patch(key="k", replacement=lambda: object(), build=True)
+        )
+        apply_registered_patches()
+        assert fake_target.symbol is reg._built_replacements["k"]
+
+
+_PLUGIN_LOAD_PROBE = """
+import json, sys
+from vllm.plugins import load_general_plugins
+load_general_plugins()
+imported = "vllm_rbln.patches" in sys.modules
+applied = applicable = []
+if imported:
+    from vllm_rbln.patches import registry
+    applied = sorted(registry._applied_patch_keys)
+    applicable = sorted(
+        d.key for d in registry._REGISTERED_PATCH_DESCRIPTORS
+        if d.condition is None or d.condition()
+    )
+print("RESULT" + json.dumps(
+    {"imported": imported, "applied": applied, "applicable": applicable}
+))
+"""
+
+_NOTHING_APPLIED = {"imported": False, "applied": [], "applicable": []}
+
+
+def _load_plugins_in(**environ: str) -> dict[str, Any]:
+    """What the plugin entry point applied in a process started with ``environ``.
+
+    Every RBLN knob is dropped first, the resolved path included: this suite
+    exports it, and inheriting it would answer the question the probe asks.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("VLLM_RBLN") and k != platform_envs.RESOLVED_MODEL_IMPL_ENV
+    }
+    out = subprocess.run(
+        [sys.executable, "-c", _PLUGIN_LOAD_PROBE],
+        capture_output=True,
+        text=True,
+        env=env | environ,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    line = next(ln for ln in out.stdout.splitlines() if ln.startswith("RESULT"))
+    return json.loads(line.removeprefix("RESULT"))
+
+
+class TestApplySites:
+    """Which process applies the patches.
+
+    ``register_ops`` covers every process that inherits a resolved model path;
+    the process that resolves it applies them from the platform hook instead.
+    Both apply the whole registry, and a narrower set would leave a process
+    half-patched, so that is pinned here rather than left to the call site.
+    """
+
+    @pytest.mark.parametrize("model_impl", ["vllm", "optimum"])
+    def test_only_the_native_path_touches_upstream(self, model_impl):
+        """The guarantee the whole split rests on.
+
+        A process handed the resolved path applies from its plugin entry point.
+        On the optimum path it applies nothing, and does not even import
+        `patches`, which is what keeps that path's upstream pristine.
+        """
+        result = _load_plugins_in(**{platform_envs.RESOLVED_MODEL_IMPL_ENV: model_impl})
+
+        if model_impl == "optimum":
+            assert result == _NOTHING_APPLIED
+        else:
+            assert result["imported"]
+            assert result["applicable"]
+            assert result["applied"] == result["applicable"]
+
+    def test_the_resolving_process_applies_nothing_yet(self):
+        """The deprecated variable is not a resolved path.
+
+        It answers in the process that parses the arguments too, where
+        `--model-impl optimum` can still overrule it. Applying here on its
+        answer would put that run on patched upstream with nothing left to undo
+        it, so this process waits for the platform hook.
+        """
+        assert _load_plugins_in(VLLM_RBLN_USE_VLLM_MODEL="1") == _NOTHING_APPLIED
+
+    def test_patch_upstream_applies_everything(self, monkeypatch):
+        import vllm_rbln.patches as patches
+        from vllm_rbln.platform import vllm_impl
+
+        applied: list = []
+        monkeypatch.setattr(
+            patches, "apply_registered_patches", lambda: applied.append("patches")
+        )
+        monkeypatch.setattr(
+            patches, "apply_registrations", lambda: applied.append("registrations")
+        )
+
+        vllm_impl.patch_upstream()
+
+        assert applied == ["registrations", "patches"]

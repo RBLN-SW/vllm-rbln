@@ -73,7 +73,7 @@ class RBLNRejectionSampler(RejectionSampler):
             assert not self.synthetic_mode, (
                 "RBLNRejectionSampler does not support synthetic rejection "
                 "sampling (rejection_sample_method='synthetic'). Use "
-                "`VLLM_RBLN_SAMPLER=0` for this mode."
+                "--no-rbln-use-custom-sampler for this mode."
             )
         self.impl = (
             RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
@@ -354,8 +354,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
             use_global_ctx=True if not USE_DEVICE_TENSOR else None,
             global_device_id=0 if not USE_DEVICE_TENSOR else None,
-            # Built only under VLLM_RBLN_SAMPLER, so a bundle saved with the
-            # sampler off misses this op and forces a partial compile.
+            # Built only under --rbln-use-custom-sampler, so a bundle saved
+            # with the sampler off misses this op and forces a partial compile.
             use_cache=False,
         )
         # The graph's small inputs, one set per shape. The same tensors every

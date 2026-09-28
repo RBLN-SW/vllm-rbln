@@ -35,12 +35,12 @@ _ID_KEYS = (
     ("dp", "data_parallel_size", 1),
 )
 
-# Chips, named as RblnPlatform.get_device_name() reports them.
-CA22, CA25 = "RBLN-CA22", "RBLN-CA25"
+# Chips, named as RblnPlatform.get_device_name() reports them. The vllm model
+# path runs on REBEL alone, so the family is the whole vocabulary here; ATOM is
+# the optimum model path's, and tests/optimum/ is where it is covered.
 CR03, CR13, CR23 = "RBLN-CR03", "RBLN-CR13", "RBLN-CR23"
-ATOM = frozenset({CA22, CA25})
 REBEL = frozenset({CR03, CR13, CR23})
-KNOWN_CHIPS = ATOM | REBEL
+KNOWN_CHIPS = REBEL
 
 
 @dataclass(frozen=True)
@@ -51,9 +51,7 @@ class CompileModelSpec:
     envs: dict[str, str] = field(default_factory=dict)
     rsd: int = 1
     id: str | None = None
-    # The chips this model can run on; the default is every chip. Union the
-    # families for a model that runs on both -- ATOM & REBEL is the empty set,
-    # not "both", since the two are disjoint.
+    # The chips this model can run on; the default is every chip.
     chips: AbstractSet[str] = KNOWN_CHIPS
     # Layers to build for this model, overriding the session default. Ignored
     # when --num-hidden-layers is given, so a lane can always force its own

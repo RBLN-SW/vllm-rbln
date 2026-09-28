@@ -13,19 +13,23 @@
 # limitations under the License.
 """Utilities for RBLN worker. (CPU affinity, batch reorder, ...)"""
 
+import contextlib
+import json
 import math
 import os
 import platform
+import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
 from vllm.config import KVTransferConfig, ModelConfig, ParallelConfig, VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
@@ -47,6 +51,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 from vllm_rbln import envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
@@ -57,26 +62,95 @@ logger = init_logger(__name__)
 _F = TypeVar("_F", bound=Callable[..., Any])
 # EX_SOFTWARE: an unhandled worker error, not the device's error number.
 _FAIL_FAST_EXIT_CODE = 70
+# One JSON line per fatal, for pipelines that index container logs. The schema
+# version moves only when a field is renamed or changes meaning.
+_FATAL_EVENT = "rbln.worker.fatal"
+_EVENT_SCHEMA_VERSION = 1
+_EVENT_MESSAGE_LIMIT = 500
+# Both recording threads share this deadline. A stalled pipe or logging handler
+# may lose a record but must not hold the worker alive.
+_FATAL_RECORD_TIMEOUT_S = 1.0
 
 
-def abort_worker(exc: Exception, *, where: str) -> NoReturn:
-    """Exit without device cleanup when logging returns or raises.
+def _write_event_line(line: str) -> None:
+    """Write raw JSON to fd 2, bypassing logging locks and formatters."""
+    data = line.encode("utf-8", "replace")
+    while data:
+        written = os.write(2, data)
+        data = data[written:]
 
-    No exit deadline is guaranteed if logging blocks on a handler lock or I/O.
+
+def _fatal_event(
+    exc: Exception, *, where: str, rank: int | None, dp_rank: int | None
+) -> str:
+    now = datetime.now(timezone.utc)
+    record = {
+        "event": _FATAL_EVENT,
+        "schema_version": _EVENT_SCHEMA_VERSION,
+        "ts": now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z",
+        "source": "vllm-rbln",
+        "pid": os.getpid(),
+        "where": where,
+        "exception_type": type(exc).__name__,
+        "exception_message": str(exc)[:_EVENT_MESSAGE_LIMIT],
+        "exit_code": _FAIL_FAST_EXIT_CODE,
+        "rank": rank,
+        "dp_rank": dp_rank,
+        # The worker sees only the exception. Whether a device or storage is at
+        # fault is for the layers below the worker to report; readers must not
+        # turn "unknown" into a cause.
+        "cause": "unknown",
+    }
+    return json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def abort_worker(
+    exc: Exception,
+    *,
+    where: str,
+    rank: int | None = None,
+    dp_rank: int | None = None,
+) -> NoReturn:
+    """Exit without device cleanup once the failure is recorded or the record
+    has had its chance.
+
+    The event bypasses logging on stderr; the readable log uses the configured
+    handler. Separate threads let either proceed if the other stalls, without
+    guaranteeing output order. Their combined wait is _FATAL_RECORD_TIMEOUT_S.
     """
+
+    def record_event() -> None:
+        with contextlib.suppress(OSError):
+            _write_event_line(
+                _fatal_event(exc, where=where, rank=rank, dp_rank=dp_rank)
+            )
+
     try:
-        logger.error(
-            "RBLN worker %d: %s raised %s: %s. Ending this worker process "
-            "with exit code %d so the executor detects the failure.",
-            os.getpid(),
-            where,
-            type(exc).__name__,
-            exc,
-            _FAIL_FAST_EXIT_CODE,
-            exc_info=exc,
+        deadline = time.monotonic() + _FATAL_RECORD_TIMEOUT_S
+        recorders = (
+            threading.Thread(target=record_event, name="rbln-fatal-event", daemon=True),
+            threading.Thread(
+                target=logger.error,
+                args=(
+                    "RBLN worker %d: %s raised %s: %s. Ending this worker process "
+                    "with exit code %d so the executor detects the failure.",
+                    os.getpid(),
+                    where,
+                    type(exc).__name__,
+                    exc,
+                    _FAIL_FAST_EXIT_CODE,
+                ),
+                kwargs={"exc_info": exc},
+                name="rbln-fatal-log",
+                daemon=True,
+            ),
         )
+        for recorder in recorders:
+            recorder.start()
+        for recorder in recorders:
+            recorder.join(max(0.0, deadline - time.monotonic()))
     finally:
-        # StreamHandler flushes each record; avoid shutdown's handler locks.
+        # os._exit ends the process even while a recorder is still blocked.
         os._exit(_FAIL_FAST_EXIT_CODE)
 
 
@@ -94,7 +168,17 @@ def worker_fail_fast(function: _F) -> _F:
             return function(self, *args, **kwargs)
         except Exception as exc:
             if fail_fast:
-                abort_worker(exc, where=function.__qualname__)
+                config = getattr(self, "parallel_config", None)
+                abort_worker(
+                    exc,
+                    where=function.__qualname__,
+                    rank=getattr(self, "rank", None),
+                    dp_rank=(
+                        config.data_parallel_rank
+                        if config is not None
+                        else getattr(self, "dp_rank", None)
+                    ),
+                )
             raise
 
     return guarded  # type: ignore[return-value]
@@ -296,9 +380,6 @@ def compile_and_warmup_skip_reason(vllm_config: VllmConfig) -> str | None:
     """Why the compile and warm-up will be skipped, or None if they will run."""
     if vllm_config.model_config.enforce_eager:
         return "enforce_eager is set"
-    rbln_config: RBLNConfig = vllm_config.additional_config
-    if not rbln_config.compile_model:
-        return "VLLM_RBLN_COMPILE_MODEL is off"
     if not envs.VLLM_RBLN_ENABLE_WARM_UP:
         return "VLLM_RBLN_ENABLE_WARM_UP is off"
     return None
@@ -338,12 +419,12 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
     """Why this configuration cannot size its KV cache from the compiled
     placement, or None when it can.
 
-    Every reason here is a property of the deployment or of the kernel the model
-    dispatches to, not a request from the caller, so the feature turns itself off
-    and the run serves the pre-compile estimate. A caller who asked for something
-    the mechanism then fails at still gets a hard failure: those live in
-    `DynamicKvSizer`. The optimum path is not among them -- it installs neither
-    the engine patch nor a worker that carries a sizer.
+    Every reason here is decidable before the compile, from the deployment or
+    the kernel the model dispatches to. With `use_dynamic_kv_cache` unset the
+    feature turns itself off on one and serves the pre-compile estimate; set,
+    start-up refuses with the same reason. What fails only after the compile
+    is a hard failure in `DynamicKvSizer`. The optimum path is not among them --
+    it installs neither the engine patch nor a worker that carries a sizer.
     """
     if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
         return (
@@ -363,10 +444,13 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "flash causal attention is off, so the model dispatches to an "
             "attention kernel that does not accept a dynamic KV input"
         )
-    if vllm_config.attention_config.use_non_causal:
+    speculative = vllm_config.speculative_config
+    if speculative is not None and speculative.method == "dflash":
+        # `use_non_causal` lives on the draft config only; the RBLN drafter is
+        # non-causal by requirement.
         return (
-            "non-causal attention dispatches to a kernel that does not accept "
-            "a dynamic KV input"
+            "the DFlash drafter is non-causal, and its attention kernel does "
+            "not accept a dynamic KV input"
         )
     if vllm_config.cache_config.block_size == vllm_config.model_config.max_model_len:
         # This selects the normal-attention kernels unless the model supplies
@@ -377,16 +461,6 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "does not accept a dynamic KV input"
         )
     kv_transfer = vllm_config.kv_transfer_config
-    if kv_transfer is not None:
-        unregistered = [
-            name
-            for name in DYNAMIC_KV_SUPPORTED_CONNECTORS
-            if name not in KVConnectorFactory._registry
-        ]
-        assert not unregistered, (
-            "DYNAMIC_KV_SUPPORTED_CONNECTORS names connectors the factory never "
-            f"registered: {unregistered}"
-        )
     if kv_transfer is not None:
         unsupported = [
             name
@@ -408,12 +482,13 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
 def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
     """Whether this run sizes its KV cache from the compiled placement.
 
-    The flag alone is not the answer: a configuration the path cannot size
+    The field alone is not the answer: a configuration the path cannot size
     turns it off, and `mark_dynamic` must follow that decision or the artifact
     carries a dynamic dim nothing will ever resize.
     """
+    rbln_config: RBLNConfig = vllm_config.additional_config
     return (
-        envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE
+        rbln_config.use_dynamic_kv_cache is not False
         and dynamic_kv_unsupported_reason(vllm_config) is None
     )
 
@@ -1033,7 +1108,9 @@ def set_omp_num_threads(
 
 
 def prepare_kernel_block_sizes(
-    kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
+    sub_block_size: int | None = None,
 ) -> list[int]:
     """
     Generate kernel_block_sizes that matches each block_size.
@@ -1045,6 +1122,7 @@ def prepare_kernel_block_sizes(
     Args:
         kv_cache_config: The KV cache configuration.
         attn_groups: Attention groups indexed by KV cache group id.
+        sub_block_size: Sub-block prefix caching granularity, None when off.
 
     Returns:
         List of kernel block sizes for each cache group.
@@ -1059,10 +1137,18 @@ def prepare_kernel_block_sizes(
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
         if isinstance(kv_cache_spec, SlidingWindowSpec):
-            # Both sliding-window kernels address the cache in windows, not
-            # in the manager's blocks; upstream BlockTable rejects a block the
-            # window does not divide.
-            kernel_block_sizes.append(kv_cache_spec.sliding_window)
+            if sub_block_size is None or isinstance(
+                kv_cache_spec, RBLNSlidingWindowSpec
+            ):
+                # The shift kernel holds one window per block; the append kernel
+                # gathers whole blocks around the window, whatever their size.
+                kernel_block_sizes.append(kv_cache_spec.sliding_window)
+            else:
+                # A sub-block copy slices the buffer the compiled graph reads,
+                # and this layer shares it with a full-attention layer on the
+                # manager block: the append kernel takes the same block, so the
+                # slice is one geometry for both.
+                kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size

@@ -153,10 +153,10 @@ class RBLNFlashAttentionMetadata:
 
     def __post_init__(self):
         # FIXME(RBLN): to_dynamic_index does not accept int64 inputs.Thus in the
-        # VLLM_RBLN_USE_CUSTOM_KERNEL=0 path, rebel-compiler automatically converts
+        # --no-rbln-use-custom-kernel path, rebel-compiler automatically converts
         # integer tensor inputs to a supported dtype.
         # However, this preprocessing is somewhat missing in the triton-rbln kernel
-        # path(VLLM_RBLN_USE_CUSTOM_KERNEL=1), so we explicitly cast the input to a
+        # path(--rbln-use-custom-kernel), so we explicitly cast the input to a
         # supported dtype here. This can be removed when the triton-rbln kernel path
         # performs the same dtype conversion.
 
@@ -208,7 +208,7 @@ class RBLNFlashAttentionMetadataBuilder(
         if self.swa_appends and self.use_custom_kernel:
             raise NotImplementedError(
                 "Sliding window attention on REBEL CR13 is not supported with "
-                "VLLM_RBLN_USE_CUSTOM_KERNEL=1: rbln_triton_ops has no "
+                "--rbln-use-custom-kernel: rbln_triton_ops has no "
                 "sliding_window_attention_v1 kernel."
             )
 
@@ -373,7 +373,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
     ) -> None:
         vllm_config = get_current_vllm_config()
         rbln_config: RBLNConfig = vllm_config.additional_config
-        self.compile_model = rbln_config.compile_model
         self.use_custom_kernel = rbln_config.use_custom_kernel
         self.enforce_eager = vllm_config.model_config.enforce_eager
         self.device = vllm_config.device_config.device
@@ -457,13 +456,13 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if self.use_custom_kernel:
                 raise NotImplementedError(
                     "fp8 KV cache is not supported with "
-                    "VLLM_RBLN_USE_CUSTOM_KERNEL=1: the rbln_triton_ops "
+                    "--rbln-use-custom-kernel: the rbln_triton_ops "
                     "attention kernels take no dequant scales."
                 )
             if self.sliding_window is not None or not self.is_causal or self.is_normal:
                 raise NotImplementedError(
                     "fp8 KV cache is only supported by the flash causal "
-                    "attention path (VLLM_RBLN_FLASH_CAUSAL_ATTN=1, "
+                    "attention path (--rbln-use-flash-causal-attn, "
                     "block_size != max_model_len, no sliding window); got "
                     f"sliding_window={self.sliding_window}, "
                     f"is_causal={self.is_causal}, is_normal={self.is_normal}."
@@ -571,7 +570,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
-                    compile_model=self.compile_model,
                 )
             else:
                 assert self.sliding_window == kv_cache.size(-2), (
@@ -591,7 +589,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.local_block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -608,7 +605,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         if self.is_batch_attention_opt and b_size > 1
                         else None,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
 
@@ -624,7 +620,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -637,7 +632,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
             else:
@@ -661,7 +655,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         k_quantize_scale,
                         v_quantize_scale,
                         cache_dtype,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -677,7 +670,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         k_quantize_scale,
                         v_quantize_scale,
                         cache_dtype,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
         else:
@@ -693,7 +685,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -707,7 +698,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         self.scale,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
             else:
@@ -722,7 +712,6 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
                 else:
@@ -736,13 +725,12 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.seq_lens,
                         attn_metadata.block_tables,
                         self.sinks,
-                        compile_model=self.compile_model,
                         use_custom_kernel=self.use_custom_kernel,
                     )
 
         # 2. attention output reshape for attention backend return
         # attn_output = [batch,H*4,L,D] -> [batch,L,H*4,D] -> [batch*L,H*4,D]
-        if self.enforce_eager or not self.compile_model:
+        if self.enforce_eager:
             attn_output = attn_output.reshape(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)

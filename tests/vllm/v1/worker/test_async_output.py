@@ -16,6 +16,7 @@
 # which the scheduler mutates in place, and the writeback queue, which the main
 # thread drains a step later.
 
+import json
 import os
 import subprocess
 import sys
@@ -50,7 +51,9 @@ def _output(req_ids):
     )
 
 
-def _async_output(tokens, *, invalid_req_indices=(), fail_fast=False):
+def _async_output(
+    tokens, *, invalid_req_indices=(), fail_fast=False, rank=None, dp_rank=None
+):
     req_ids = [f"r{i}" for i in range(len(tokens))]
     queue: PendingTokenWriteback = deque()
     async_out = AsyncRBLNModelRunnerOutput(
@@ -62,6 +65,8 @@ def _async_output(tokens, *, invalid_req_indices=(), fail_fast=False):
         placeholder_pos={req_id: 3 for req_id in req_ids},
         logprobs_tensors=None,
         fail_fast=fail_fast,
+        rank=rank,
+        dp_rank=dp_rank,
     )
     return async_out, queue
 
@@ -109,6 +114,27 @@ class TestGetOutput:
         else:
             assert exit_codes == []
             assert excinfo.value is error
+
+    def test_output_thread_failure_names_its_rank(self, monkeypatch, capfd):
+        # The decorator's receiver here is the output, not the worker, so the
+        # ranks must travel with the output for the event to name them.
+        async_out, _ = _async_output([[7]], fail_fast=True, rank=2, dp_rank=1)
+        monkeypatch.setattr(
+            async_out._sampled_token_ids_cpu,
+            "copy_",
+            Mock(side_effect=RuntimeError("device output failed")),
+        )
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "0")
+        monkeypatch.setattr(worker_utils.os, "_exit", Mock(side_effect=SystemExit(70)))
+        with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(SystemExit):
+            pool.submit(async_out.get_output).result(timeout=5)
+        (event,) = [
+            json.loads(line)
+            for line in capfd.readouterr().err.splitlines()
+            if line.startswith('{"event":"rbln.worker.fatal"')
+        ]
+        assert event["where"] == "AsyncRBLNModelRunnerOutput.get_output"
+        assert (event["rank"], event["dp_rank"]) == (2, 1)
 
     def test_output_thread_failure_terminates_the_process(self):
         result = subprocess.run(

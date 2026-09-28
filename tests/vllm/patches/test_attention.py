@@ -24,6 +24,7 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
+from vllm_rbln.patches import attention
 from vllm_rbln.patches.attention import patched_get_kv_cache_spec
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
@@ -81,3 +82,102 @@ class TestSlidingWindowSpec:
         cr13(True)
         with pytest.raises(NotImplementedError, match="MLA"):
             patched_get_kv_cache_spec(_layer(16), _config(use_mla=True))
+
+
+class TestKvTransferWrap:
+    """`unified_attention_with_output` is wrapped for KV-transfer connectors.
+
+    `maybe_transfer_kv_layer` imports `get_attention_context` when it decorates,
+    so the wrap has to be built after that name has been replaced. Building it
+    at import instead would freeze upstream's version into the closure, and the
+    connector would then read the layer's embedded KV cache -- the one thing the
+    override exists to stop.
+    """
+
+    @staticmethod
+    def _captured_attention_context(wrapper):
+        cells = dict(zip(wrapper.__code__.co_freevars, wrapper.__closure__ or ()))
+        return cells["get_attention_context"].cell_contents
+
+    def test_the_wrap_closed_over_the_patched_attention_context(self):
+        import vllm.model_executor.layers.attention.attention as upstream
+
+        captured = self._captured_attention_context(
+            upstream.unified_attention_with_output
+        )
+
+        assert captured is attention.patched_get_attention_context
+
+    def test_the_wrap_is_around_our_replacement(self):
+        import vllm.model_executor.layers.attention.attention as upstream
+
+        wrapped = upstream.unified_attention_with_output.__wrapped__
+
+        assert wrapped is attention._unified_attention_with_output
+
+    @pytest.fixture
+    def connector(self, monkeypatch):
+        """Turn the wrapper's connector branch on, and record what it saves."""
+        from vllm.model_executor.layers.attention import kv_transfer_utils as kvt
+
+        saved: dict = {}
+
+        class _Connector:
+            def has_connector_metadata(self):
+                return True
+
+            def wait_for_layer_load(self, layer_name):
+                saved["waited"] = layer_name
+
+            def save_kv_layer(self, layer_name, kv_cache, attn_metadata):
+                saved["layer_name"] = layer_name
+                saved["kv_cache"] = kv_cache
+
+        monkeypatch.setattr(kvt, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(kvt, "is_v1_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(kvt, "get_kv_transfer_group", _Connector)
+        return saved
+
+    @pytest.fixture
+    def forward_context(self, monkeypatch):
+        """The layer carries a KV cache the override must keep out of reach."""
+        embedded = torch.full((2, 1, 1), 7.0)
+        impl_saw: dict = {}
+
+        class _Impl:
+            def forward(self, layer, q, k, v, kv_cache, attn_metadata, **kwargs):
+                impl_saw["kv_cache"] = kv_cache
+
+        layer = SimpleNamespace(layer_index=0, impl=_Impl(), kv_cache=embedded)
+        context = SimpleNamespace(
+            attn_metadata=SimpleNamespace(kv_caches=[torch.zeros(1)]),
+            no_compile_layers={"layer.0": layer},
+            slot_mapping={"layer.0": torch.zeros(1)},
+            additional_kwargs={},
+        )
+        monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+        # Upstream's own get_attention_context reads it from its module too, so
+        # a wrap that closed over that one runs here rather than raising, and
+        # the assertions below show what it hands the connector instead.
+        import vllm.model_executor.layers.attention.attention as upstream
+
+        monkeypatch.setattr(upstream, "get_forward_context", lambda: context)
+        return impl_saw
+
+    def test_the_connector_is_offered_no_kv_cache(self, connector, forward_context):
+        """The override returns kv_cache=None, and this is who reads it.
+
+        Whether the wrap closed over the patched version or upstream's decides
+        what lands here: None, or the cache embedded in the layer, which Dynamo
+        would bake into the graph as a constant.
+        """
+        import vllm.model_executor.layers.attention.attention as upstream
+
+        upstream.unified_attention_with_output(
+            torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1), "layer.0"
+        )
+
+        assert connector["layer_name"] == "layer.0"
+        assert connector["kv_cache"] is None
+        # The attention op still resolves its own, from the metadata.
+        assert forward_context["kv_cache"] is not None

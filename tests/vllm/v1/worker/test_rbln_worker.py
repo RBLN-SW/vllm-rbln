@@ -17,17 +17,23 @@
 # patched out. Device execution stays in the e2e tier.
 
 import inspect
+import json
 import os
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 import vllm.platforms.interface as platform_interface
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import ProfilerConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+from vllm.tracing import otel
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
@@ -82,7 +88,7 @@ def _make_vllm_config(
             num_gpu_blocks_override=None,
             block_size=16,
         ),
-        attention_config=SimpleNamespace(use_non_causal=False),
+        speculative_config=None,
         scheduler_config=SimpleNamespace(),
         device_config=SimpleNamespace(device=torch.device("cpu"), device_type="cpu"),
         kv_transfer_config=None,
@@ -103,6 +109,7 @@ def _fake_super_init(
     self.is_driver_worker = is_driver_worker
     self.model_config = vllm_config.model_config
     self.parallel_config = vllm_config.parallel_config
+    self.parallel_config.rank = rank
     self.cache_config = vllm_config.cache_config
     self.scheduler_config = vllm_config.scheduler_config
     self.device_config = vllm_config.device_config
@@ -215,6 +222,76 @@ class CustomMultiprocExecutor(MultiprocExecutor):
 
 class TestWorkerFailFast:
     @pytest.mark.parametrize(
+        "phase",
+        [
+            "init_device",
+            "determine_available_memory",
+            "initialize_from_config",
+            "compile_or_warm_up_model",
+        ],
+    )
+    def test_startup_failure_records_exception_before_exit(
+        self, make_worker, monkeypatch, capfd, phase
+    ):
+        worker = make_worker(vllm_config=_make_vllm_config(backend="mp"), rank=1)
+        error = RuntimeError("startup operation failed")
+        operation = Mock(side_effect=error)
+        worker.model_runner = Mock()
+        args: tuple[object, ...] = ()
+        if phase == "init_device":
+            monkeypatch.setattr(wm, "init_worker_distributed_environment", operation)
+        elif phase == "determine_available_memory":
+            worker.model_runner.model.named_parameters = operation
+        elif phase == "initialize_from_config":
+            monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", operation)
+            args = (SimpleNamespace(num_blocks=1),)
+        else:
+            assert phase == "compile_or_warm_up_model"
+            monkeypatch.setattr(
+                worker, "_ensure_rbln_host_threads_before_compile", Mock()
+            )
+            monkeypatch.setattr(
+                worker, "_ensure_rbln_cpu_affinity_after_warmup", Mock()
+            )
+            monkeypatch.setattr(wm, "compile_and_warmup_skip_reason", lambda _: None)
+            worker.dynamic_kv = dks.DynamicKvSizer(
+                worker.vllm_config, worker.model_runner, 0
+            )
+            worker.model_runner.warmup_model = operation
+        monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "0")
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        monkeypatch.setattr(otel.trace, "get_tracer", provider.get_tracer)
+
+        def exit_after_span(code):
+            if phase != "determine_available_memory":
+                (span,) = exporter.get_finished_spans()
+                assert span.attributes["code.filepath"] == wm.__file__
+                assert span.events[0].attributes["exception.message"] == str(error)
+            raise SystemExit(code)
+
+        exit_process = Mock(side_effect=exit_after_span)
+        monkeypatch.setattr(worker_utils.os, "_exit", exit_process)
+
+        try:
+            with pytest.raises(SystemExit):
+                getattr(worker, phase)(*args)
+        finally:
+            provider.shutdown()
+
+        operation.assert_called_once()
+        exit_process.assert_called_once_with(70)
+        (event,) = [
+            json.loads(line)
+            for line in capfd.readouterr().err.splitlines()
+            if line.startswith('{"event":"rbln.worker.fatal"')
+        ]
+        assert event["where"] == f"RBLNWorker.{phase}"
+        assert event["rank"] == 1
+        assert event["exception_message"] == str(error)
+
+    @pytest.mark.parametrize(
         ("backend", "ray_v2", "disabled", "should_exit"),
         [
             pytest.param("mp", None, "0", True, id="mp"),
@@ -243,6 +320,8 @@ class TestWorkerFailFast:
             ),
             ("sample_tokens", "sample_tokens", (None,)),
             ("execute_dummy_batch", "_dummy_run", ()),
+            ("load_model", "load_model", ()),
+            ("get_kv_cache_spec", "get_kv_cache_spec", ()),
         ],
     )
     def test_step_failure_uses_executor_policy(
@@ -272,6 +351,7 @@ class TestWorkerFailFast:
         error = RuntimeError("worker step failed")
         step = Mock(side_effect=error)
         worker.model_runner = SimpleNamespace(**{runner_method: step})
+        monkeypatch.setattr(wm, "set_current_vllm_config", lambda _: nullcontext())
         monkeypatch.setenv("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", disabled)
         exit_process = Mock(side_effect=SystemExit(70))
         monkeypatch.setattr(worker_utils.os, "_exit", exit_process)
@@ -500,6 +580,10 @@ def _params():
 
 
 class TestDetermineAvailableMemory:
+    @pytest.fixture(autouse=True)
+    def _device_tensor_on(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
     # Isolates the worker's own arithmetic by capturing the kwargs it hands to
     # the already-tested estimate_available_memory. Golden values are _params().
     @staticmethod
@@ -518,8 +602,8 @@ class TestDetermineAvailableMemory:
         speculative_config=None,
         dynamic=False,
     ):
-        monkeypatch.setattr(dks.envs, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE", dynamic)
         vcfg = _make_vllm_config(quantization=quantization)
+        vcfg.additional_config.use_dynamic_kv_cache = None if dynamic else False
         vcfg.model_config.hf_config = hf_config
         worker = make_worker(vllm_config=vcfg, device_name=device_name)
         worker.device = torch.device("cpu")
@@ -754,9 +838,16 @@ class TestDetermineAvailableMemory:
 
 
 class TestInitializeFromConfig:
+    @pytest.fixture(autouse=True)
+    def _device_tensor_on(self, monkeypatch):
+        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
+
     @staticmethod
-    def _init(make_worker, monkeypatch, kv_cfg):
+    def _init(make_worker, monkeypatch, kv_cfg, *, dynamic=True):
         worker = make_worker()
+        worker.vllm_config.additional_config.use_dynamic_kv_cache = (
+            None if dynamic else False
+        )
         monkeypatch.setattr(wm, "ensure_kv_transfer_initialized", lambda *a: None)
         init_calls = []
         worker.model_runner = SimpleNamespace(
@@ -768,9 +859,8 @@ class TestInitializeFromConfig:
         return worker, init_calls
 
     def test_sets_num_gpu_blocks(self, make_worker, monkeypatch):
-        monkeypatch.setattr(dks.envs, "VLLM_RBLN_USE_DYNAMIC_KV_CACHE", False)
         kv_cfg = SimpleNamespace(num_blocks=123)
-        worker, init_calls = self._init(make_worker, monkeypatch, kv_cfg)
+        worker, init_calls = self._init(make_worker, monkeypatch, kv_cfg, dynamic=False)
         assert worker.cache_config.num_gpu_blocks == 123
         assert worker.cache_config.num_cpu_blocks == 123
         assert init_calls == [kv_cfg]
@@ -799,15 +889,12 @@ class TestCompileOrWarmUpModel:
         monkeypatch,
         *,
         enforce_eager=False,
-        compile_model=True,
         warm_up=True,
         warmup_side_effect=None,
         data_parallel_size=1,
     ):
         vcfg = _make_vllm_config(
-            enforce_eager=enforce_eager,
-            data_parallel_size=data_parallel_size,
-            additional_config=RBLNConfig(compile_model=compile_model),
+            enforce_eager=enforce_eager, data_parallel_size=data_parallel_size
         )
         vcfg.model_config.seed = 0
         worker = make_worker(vllm_config=vcfg)
@@ -881,11 +968,6 @@ class TestCompileOrWarmUpModel:
 
     def test_skips_when_enforce_eager(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch, enforce_eager=True)
-        worker.compile_or_warm_up_model()
-        assert calls == []
-
-    def test_skips_when_compile_disabled(self, make_worker, monkeypatch):
-        worker, calls = self._worker(make_worker, monkeypatch, compile_model=False)
         worker.compile_or_warm_up_model()
         assert calls == []
 
@@ -1182,6 +1264,7 @@ class TestKvRegistrationOrder:
     @staticmethod
     def _worker(calls, *, defers):
         return SimpleNamespace(
+            fail_fast=False,
             cache_config=SimpleNamespace(num_gpu_blocks=None, num_cpu_blocks=None),
             vllm_config=_make_vllm_config(),
             model_runner=SimpleNamespace(
@@ -1189,8 +1272,6 @@ class TestKvRegistrationOrder:
                 register_kv_caches_with_connector=lambda: calls.append("register"),
             ),
             dynamic_kv=SimpleNamespace(
-                assert_attention_layout=lambda: None,
-                assert_cache_layout=lambda: None,
                 shrink_for_compile=lambda cfg: cfg,
                 apply_num_blocks=lambda n: calls.append("resize"),
                 defers_kv_registration=defers,

@@ -16,14 +16,21 @@
 # (device DRAM, NUMA, CPU affinity) only the inputs are mocked and the real
 # computed values asserted.
 
+import json
 import math
 import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.cpu_resource_utils import LogicalCPUInfo
@@ -36,7 +43,6 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa: F401
 import vllm_rbln.envs as envs
 import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.config import RBLNConfig
@@ -157,10 +163,149 @@ class TestWorkerFailFast:
         assert exit_codes == [70]
 
     def test_logging_failure_does_not_prevent_exit(self, monkeypatch, exit_codes):
+        errors: list[threading.ExceptHookArgs] = []
+        monkeypatch.setattr(threading, "excepthook", errors.append)
+
         def broken_log(*args, **kwargs):
             raise OSError("log unavailable")
 
         monkeypatch.setattr(worker_utils.logger, "error", broken_log)
+        with pytest.raises(SystemExit) as excinfo:
+            worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
+
+        assert len(errors) == 1
+        assert isinstance(errors[0].exc_value, OSError)
+
+    @pytest.mark.parametrize("blocked", ["event", "log", "both"])
+    def test_blocked_record_preserves_other_output_and_exit(
+        self, monkeypatch, exit_codes, blocked
+    ):
+        release = threading.Event()
+        recorded = {name: threading.Event() for name in ("event", "log")}
+        finished = {name: threading.Event() for name in recorded}
+
+        def record(name):
+            try:
+                if blocked in (name, "both"):
+                    release.wait()
+                recorded[name].set()
+            finally:
+                finished[name].set()
+
+        monkeypatch.setattr(
+            worker_utils, "_write_event_line", lambda line: record("event")
+        )
+        monkeypatch.setattr(worker_utils.logger, "error", lambda *a, **k: record("log"))
+        monkeypatch.setattr(worker_utils, "_FATAL_RECORD_TIMEOUT_S", 0.5)
+        try:
+            started = time.monotonic()
+            with pytest.raises(SystemExit) as excinfo:
+                worker_utils.abort_worker(RuntimeError("device failed"), where="step")
+            assert time.monotonic() - started < 0.9
+            for name in recorded:
+                assert recorded[name].is_set() == (blocked not in (name, "both"))
+        finally:
+            release.set()
+            for done in finished.values():
+                assert done.wait(5)
+        assert excinfo.value.code == 70
+        assert exit_codes == [70]
+
+    def test_exit_is_not_held_by_a_stalled_stderr_consumer(self):
+        # Fill stderr without a reader. The JSON write may stall, but the
+        # readable log on stdout and the process exit must still complete.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent("""
+                    import os
+
+                    import vllm_rbln.v1.worker.utils as worker_utils
+
+                    read_end, write_end = os.pipe()
+                    os.set_blocking(write_end, False)
+                    try:
+                        while True:
+                            os.write(write_end, b"x" * 65536)
+                    except BlockingIOError:
+                        pass
+                    os.set_blocking(write_end, True)
+                    os.dup2(write_end, 2)
+                    print("aborting on a full stderr pipe", flush=True)
+                    worker_utils.abort_worker(
+                        RuntimeError("stderr consumer stalled"), where="step"
+                    )
+                """),
+            ],
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(sys.path),
+                "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": "0",
+                "VLLM_LOGGING_STREAM": "ext://sys.stdout",
+                "VLLM_LOGGING_CONFIG_PATH": "",
+            },
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert "aborting on a full stderr pipe" in result.stdout, result.stderr
+        assert "stderr consumer stalled" in result.stdout, result.stderr
+        assert result.returncode == 70, result.stdout + result.stderr
+
+    @staticmethod
+    def _event_lines(capfd):
+        return [
+            json.loads(line)
+            for line in capfd.readouterr().err.splitlines()
+            if line.startswith('{"event":')
+        ]
+
+    def test_fatal_is_one_json_line_naming_the_failure_site(self, exit_codes, capfd):
+        error = RuntimeError("model step failed\nsecond line")
+
+        @worker_fail_fast
+        def step(worker):
+            raise error
+
+        worker = SimpleNamespace(
+            fail_fast=True,
+            rank=3,
+            parallel_config=SimpleNamespace(data_parallel_rank=1),
+        )
+        with pytest.raises(SystemExit):
+            step(worker)
+        (event,) = self._event_lines(capfd)
+        assert event["event"] == "rbln.worker.fatal"
+        assert event["schema_version"] == 1
+        assert event["source"] == "vllm-rbln"
+        assert event["pid"] == os.getpid()
+        assert event["where"].endswith("step")
+        assert event["exception_type"] == "RuntimeError"
+        assert event["exception_message"] == str(error)
+        assert event["exit_code"] == 70
+        assert (event["rank"], event["dp_rank"]) == (3, 1)
+        # The worker cannot tell a device or storage fault from any other error.
+        assert event["cause"] == "unknown"
+        assert event["ts"].endswith("Z")
+
+    def test_fatal_event_leaves_unknown_ranks_null(self, exit_codes, capfd):
+        @worker_fail_fast
+        def step(worker):
+            raise ValueError("no rank on this receiver")
+
+        with pytest.raises(SystemExit):
+            step(SimpleNamespace(fail_fast=True))
+        (event,) = self._event_lines(capfd)
+        assert event["rank"] is None and event["dp_rank"] is None
+
+    def test_event_write_failure_does_not_prevent_exit(self, monkeypatch, exit_codes):
+        def broken_write(line):
+            raise OSError("stderr closed")
+
+        monkeypatch.setattr(worker_utils, "_write_event_line", broken_write)
         with pytest.raises(SystemExit) as excinfo:
             worker_utils.abort_worker(RuntimeError("device failed"), where="step")
         assert excinfo.value.code == 70
@@ -222,6 +367,16 @@ def _kv_config(*specs):
     # a duck-typed config avoids KVCacheConfig's cross-group validation.
     groups = [SimpleNamespace(kv_cache_spec=s) for s in specs]
     return SimpleNamespace(kv_cache_groups=groups)
+
+
+def _sliding(window, spec_cls=SlidingWindowSpec):
+    return spec_cls(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+        sliding_window=window,
+    )
 
 
 def _backend(sizes):
@@ -365,6 +520,22 @@ class TestPrepareKernelBlockSizes:
             sliding_window=16,
         )
         assert prepare_kernel_block_sizes(_kv_config(sw), [[]]) == [16]
+
+    @pytest.mark.parametrize(
+        "spec_cls, expected",
+        [(SlidingWindowSpec, 64), (RBLNSlidingWindowSpec, 8)],
+        ids=["append_kernel", "shift_kernel"],
+    )
+    def test_sub_block_caching_puts_the_append_kernel_on_the_manager_block(
+        self, spec_cls, expected
+    ):
+        # The append kernel then slices the buffer it shares with a full-
+        # attention layer in that layer's geometry; the shift kernel cannot
+        # leave its window.
+        sw = _sliding(8, spec_cls)
+        assert prepare_kernel_block_sizes(_kv_config(sw), [[]], sub_block_size=16) == [
+            expected
+        ]
 
     def test_attention_uses_select_common_block_size(self):
         # AttentionSpec group -> select_common_block_size splits 32 to a backend-
@@ -1001,8 +1172,9 @@ class TestReplicationFactorIsGated:
     ):
         """Measure with the card DRAM capacity pinned, not read off the host.
 
-        The CI fleet is ATOM (~15.7 GiB), so letting the RBLN-CR branch read the
-        real card makes every figure in this class ~9x too small.
+        The RBLN-CR branch reads the driver's capacity when it is allowed to, so
+        a host that reports anything other than REBEL_DRAM_NBYTES would move
+        every figure in this class.
         """
         mock_platform.get_device_name.return_value = "RBLN-CR03"
         mock_envs.VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK = 1
@@ -1425,7 +1597,8 @@ class TestDynamicKvUnsupportedReason:
     def _cfg(
         use_custom_kernel=False,
         use_flash_causal_attn=True,
-        use_non_causal=False,
+        use_dynamic_kv_cache=None,
+        speculative_method=None,
         block_size=16,
         max_model_len=32,
         kv_transfer_config=None,
@@ -1434,8 +1607,13 @@ class TestDynamicKvUnsupportedReason:
             additional_config=RBLNConfig(
                 use_custom_kernel=use_custom_kernel,
                 use_flash_causal_attn=use_flash_causal_attn,
+                use_dynamic_kv_cache=use_dynamic_kv_cache,
             ),
-            attention_config=SimpleNamespace(use_non_causal=use_non_causal),
+            speculative_config=(
+                None
+                if speculative_method is None
+                else SimpleNamespace(method=speculative_method)
+            ),
             cache_config=SimpleNamespace(block_size=block_size),
             model_config=SimpleNamespace(max_model_len=max_model_len),
             kv_transfer_config=kv_transfer_config,
@@ -1463,8 +1641,6 @@ class TestDynamicKvUnsupportedReason:
         )
 
     def test_the_triton_kernels_are_unsupported(self):
-        # rbln_triton_ops goes through the compiler's triton converter, so the
-        # KV input never reaches a whitelisted paged_* custom op.
         reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))
         assert "RBLN_USE_CUSTOM_KERNEL" in reason
 
@@ -1473,14 +1649,20 @@ class TestDynamicKvUnsupportedReason:
         [
             ({"block_size": 32}, "block_size == max_model_len"),
             ({"use_flash_causal_attn": False}, "flash causal attention is off"),
-            ({"use_non_causal": True}, "non-causal attention"),
+            ({"speculative_method": "dflash"}, "DFlash drafter is non-causal"),
         ],
-        ids=["normal-attention", "flash-causal-off", "non-causal"],
+        ids=["normal-attention", "flash-causal-off", "dflash-drafter"],
     )
     def test_non_paged_attention_is_unsupported(self, config_overrides, expected):
         reason = dynamic_kv_unsupported_reason(self._cfg(**config_overrides))
         assert reason is not None
         assert expected in reason
+
+    def test_a_causal_drafter_is_supported(self):
+        assert (
+            dynamic_kv_unsupported_reason(self._cfg(speculative_method="eagle3"))
+            is None
+        )
 
     def test_an_unlisted_kv_transfer_connector_is_unsupported(self):
         # The worker drives the registration behind the resize, so the set is
@@ -1506,6 +1688,11 @@ class TestDynamicKvUnsupportedReason:
             )
             is None
         )
+
+    def test_every_supported_connector_is_registered(self):
+        # The suite conftest applies the registry, as production does.
+        for name in worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS:
+            assert name in KVConnectorFactory._registry
 
     def test_multi_connector_is_supported_when_every_child_is(self):
         # NIXL for P/D plus lmcache-rbln for offload is the shape in use. The
@@ -1559,23 +1746,6 @@ class TestDynamicKvUnsupportedReason:
         )
         assert "MultiConnector" in reason
 
-    def test_a_supported_connector_the_factory_never_registered_fails_loudly(
-        self, monkeypatch
-    ):
-        # A typo in the allowlist would otherwise send every deployment of that
-        # connector down the static path with only a warning to show for it.
-        monkeypatch.setattr(
-            worker_utils,
-            "DYNAMIC_KV_SUPPORTED_CONNECTORS",
-            worker_utils.DYNAMIC_KV_SUPPORTED_CONNECTORS + ("RblnNixlConnectr",),
-        )
-        with pytest.raises(AssertionError, match="RblnNixlConnectr"):
-            dynamic_kv_unsupported_reason(
-                self._cfg(
-                    kv_transfer_config=SimpleNamespace(kv_connector="RblnNixlConnector")
-                )
-            )
-
     def test_the_flag_alone_does_not_enable_it(self):
         # `mark_dynamic` follows this, not the flag: marking a dim nothing will
         # resize leaves the compile with a symbolic extent it cannot lower.
@@ -1584,6 +1754,8 @@ class TestDynamicKvUnsupportedReason:
         )
         assert worker_utils.dynamic_kv_enabled(self._cfg()) is True
 
-    def test_the_flag_off_disables_it(self, monkeypatch):
-        monkeypatch.setenv("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", "0")
-        assert worker_utils.dynamic_kv_enabled(self._cfg()) is False
+    def test_off_disables_it(self):
+        assert (
+            worker_utils.dynamic_kv_enabled(self._cfg(use_dynamic_kv_cache=False))
+            is False
+        )

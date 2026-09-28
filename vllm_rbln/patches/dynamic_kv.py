@@ -25,7 +25,6 @@ from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-import vllm_rbln.envs as envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.registry import register_patch
 from vllm_rbln.v1.worker.utils import (
@@ -63,13 +62,14 @@ def resolve_rank_num_blocks(num_blocks_per_rank: list[Any]) -> int | None:
         "construction, and the true block count exists only after warm-up, "
         "when the compiled artifact reports its memory profile."
     ),
-    condition=lambda: envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE,
 )
 def patched_initialize_kv_caches(
     self: EngineCore, vllm_config: VllmConfig
 ) -> KVCacheConfig:
     kv_cache_config = engine_core_original_initialize_kv_caches(self, vllm_config)
 
+    if vllm_config.additional_config.use_dynamic_kv_cache is False:
+        return kv_cache_config
     # The workers resolve this independently and stay on the estimate too.
     if (reason := dynamic_kv_unsupported_reason(vllm_config)) is not None:
         logger.warning(
@@ -86,7 +86,7 @@ def patched_initialize_kv_caches(
         # WARNING: two features that each size the KV cache are on, one ignored.
         logger.warning(
             "dynamic KV cache: --num-gpu-blocks-override=%d wins over "
-            "VLLM_RBLN_USE_DYNAMIC_KV_CACHE; the block pool stays at %d.",
+            "the dynamic KV cache; the block pool stays at %d.",
             override,
             kv_cache_config.num_blocks,
         )
