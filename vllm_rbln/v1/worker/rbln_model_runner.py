@@ -2909,8 +2909,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     ) -> set[str]:
         """Pick one layer to stand for each KV cache buffer.
 
-        Layers that share a buffer (`kv_cache_extents`) must be named once,
-        for `mark_static_address` and for the connector. A `KVCacheTensor` is
+        Layers that share a buffer (`kv_cache_extents`) must be named once
+        for `mark_static_address`. A `KVCacheTensor` is
         not a buffer: it lists many layers, each with its own. Prefer a
         full-attention layer: its view counts blocks the way the scheduler
         does, and a sliding-window view does not.
@@ -3254,26 +3254,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.cross_layers_kv_cache, self.cross_layers_attn_backend
             )
         else:
-            kv_caches = dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
-            # Filter to one Full-preferred canonical layer per pool so
-            # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
-            # SWA-layer views alias the same storage, so no separate
-            # registration is needed.
-            canonical_layers = self._select_canonical_kv_layers_per_pool(
-                self.kv_cache_config
+            # Every layer, in layer-index order. A token-level connector
+            # addresses each layer through its own view and group. Cache groups
+            # overlay one another, so one layer per buffer would drop every
+            # sliding-window layer that shares a full-attention layer's buffer.
+            kv_transfer_group.register_kv_caches(
+                dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
             )
-            missing = canonical_layers - kv_caches.keys()
-            assert not missing, f"Canonical layers missing from kv_caches: {missing}"
-            # Iterate in layer-index order (self.kv_cache_names): NIXL
-            # assigns region indices in iteration order, and set iteration
-            # would vary with PYTHONHASHSEED, breaking the P/D region <->
-            # layer agreement.
-            filtered_kv_caches = {
-                name: kv_caches[name]
-                for name in self.kv_cache_names
-                if name in canonical_layers
-            }
-            kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
         kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
 
