@@ -127,12 +127,12 @@ def patched_initialize_kv_caches(
         old_num_blocks,
         num_blocks,
     )
-    assert_kv_cache_minimum(vllm_config, kv_cache_config)
+    check_enough_kv_cache_blocks_after_resize(vllm_config, kv_cache_config)
     _log_gpu_kv_cache_size(vllm_config, kv_cache_config)
     return kv_cache_config
 
 
-def assert_kv_cache_minimum(
+def check_enough_kv_cache_blocks_after_resize(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
     """Fail loudly when the resized pool cannot hold one max-length request."""
