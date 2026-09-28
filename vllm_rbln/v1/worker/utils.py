@@ -39,7 +39,6 @@ from vllm.utils.cpu_resource_utils import (
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    ChunkedLocalAttentionSpec,
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
@@ -473,51 +472,24 @@ class KvMinimum:
     """The fewest blocks a KV cache pool can serve with."""
 
     one_request: int
-    decode_batch: int
 
     @property
     def needed(self) -> int:
         # +1: the block pool keeps block 0 as the null block.
-        return 1 + max(self.one_request, self.decode_batch)
+        return 1 + self.one_request
 
 
 def minimum_kv_blocks(vllm_config: VllmConfig, cfg: KVCacheConfig) -> KvMinimum:
-    """Blocks one max-length request and one full decode batch need, summed over
-    the groups sharing the pool."""
-    max_model_len = vllm_config.model_config.max_model_len
-    in_flight_tokens = getattr(
-        vllm_config,
-        "max_in_flight_tokens",
-        vllm_config.scheduler_config.max_num_batched_tokens,
-    )
-    one_request = 0
-    per_seq = 0
-    for group in cfg.kv_cache_groups:
-        spec = group.kv_cache_spec
-        one_request += cdiv(
-            spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
-        )
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = next(iter(spec.kv_cache_specs.values()))
-        admission = getattr(spec, "max_admission_blocks_per_request", None)
-        if admission is None and isinstance(
-            spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)
-        ):
-            raise AttributeError(
-                f"{type(spec).__name__} no longer exposes "
-                "max_admission_blocks_per_request; the per-sequence minimum "
-                "would silently fall back to one block."
-            )
-        # Positional: the first parameter is max_num_batched_tokens before the
-        # vllm bump and max_in_flight_tokens after it; the position is the same.
-        # The value has to be the runtime gate's, or the pool is sized against a
-        # smaller per-request peak than the scheduler later enforces.
-        per_seq += (
-            admission(in_flight_tokens, max_model_len) if admission is not None else 1
-        )
+    """Blocks one max-length request needs, summed over the groups sharing the
+    pool."""
     return KvMinimum(
-        one_request=one_request,
-        decode_batch=vllm_config.scheduler_config.max_num_seqs * per_seq,
+        one_request=sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in cfg.kv_cache_groups
+        )
     )
 
 

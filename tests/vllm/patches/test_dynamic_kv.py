@@ -199,54 +199,18 @@ def test_rejects_a_pool_that_cannot_hold_one_request(
     assert "max_model_len" in str(excinfo.value)
 
 
-def test_a_decode_batch_can_need_more_than_one_request():
-    # 64 sequences at one block each beat the 4 blocks a single request takes.
-    minimum = minimum_kv_blocks(
-        _config(8192, 32768, max_num_seqs=64), _kv(0, _full_spec(8192))
-    )
-    assert (minimum.one_request, minimum.decode_batch, minimum.needed) == (4, 64, 65)
+def test_a_decode_batch_does_not_raise_the_minimum():
+    # Like upstream, a pool short of max_num_seqs sequences only caps
+    # concurrency; the scheduler preempts instead of failing.
+    cfg = _config(8192, 32768, max_num_seqs=64)
+    minimum = minimum_kv_blocks(cfg, _kv(0, _full_spec(8192)))
+    assert (minimum.one_request, minimum.needed) == (4, 5)
+    assert_kv_cache_minimum(cfg, _kv(5, _full_spec(8192)))
 
 
 def test_groups_sharing_the_pool_are_summed():
     # gpt-oss shape: a full group and a 128-token sliding window group at 8192.
-    cfg = _config(8192, 32768, max_num_seqs=1, max_num_batched_tokens=512)
+    cfg = _config(8192, 32768, max_num_seqs=128, max_num_batched_tokens=512)
     minimum = minimum_kv_blocks(cfg, _kv(0, _full_spec(8192), _swa_spec(8192, 128)))
-    # full: 4; sliding: cdiv(127 + 512, 8192) + 1 = 2 -> 6 for one request;
-    # a decode step: 1 + (cdiv(128, 8192) + 1) = 3.
-    assert (minimum.one_request, minimum.decode_batch, minimum.needed) == (6, 3, 7)
-
-
-def test_a_window_spec_without_the_admission_method_is_loud():
-    # A vLLM rename must not degrade the per-sequence term to one block.
-    from vllm.v1.kv_cache_interface import SlidingWindowSpec
-
-    class _Renamed(SlidingWindowSpec):
-        max_admission_blocks_per_request = None  # type: ignore[assignment]
-
-        def __init__(self):
-            pass
-
-        @property
-        def page_size_bytes(self):
-            return 1 << 20
-
-        def max_memory_usage_bytes(self, cfg):
-            return 4 << 20
-
-    with pytest.raises(AttributeError, match="max_admission_blocks_per_request"):
-        minimum_kv_blocks(_config(8192, 32768), _kv(0, _Renamed()))
-
-
-def test_a_uniform_type_group_keeps_the_window_admission_cap():
-    # An all-sliding-window model whose layers differ in hidden size reaches the
-    # sizer wrapped. The wrapper is not a SlidingWindowSpec, so the guard above
-    # cannot see it and the per-sequence term would drop to one block.
-    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
-
-    cfg = _config(128, 2048, max_num_seqs=2, max_num_batched_tokens=128)
-    wrapped = UniformTypeKVCacheSpecs(
-        block_size=128, kv_cache_specs={"layers.0.attn": _swa_spec(128, 128)}
-    )
-    minimum = minimum_kv_blocks(cfg, _kv(0, wrapped))
-    # sliding: cdiv(127 + 128, 128) + 1 = 3 per sequence, over 2 sequences.
-    assert (minimum.one_request, minimum.decode_batch) == (3, 6)
+    # full: 4; sliding: cdiv(127 + 512, 8192) + 1 = 2 -> 6 for one request.
+    assert (minimum.one_request, minimum.needed) == (6, 7)

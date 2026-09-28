@@ -135,8 +135,7 @@ def patched_initialize_kv_caches(
 def assert_kv_cache_minimum(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
-    """Fail loudly when the resized pool cannot hold one max-length request or
-    one full decode batch."""
+    """Fail loudly when the resized pool cannot hold one max-length request."""
     # NOTE(RBLN): upstream's `check_enough_kv_cache_memory` runs against the
     # pre-compile estimate and nothing re-checks the number substituted here, so
     # without this the server starts and then rejects every request.
@@ -148,10 +147,8 @@ def assert_kv_cache_minimum(
         f"{kv_cache_config.num_blocks} blocks, but it needs {minimum.needed}: "
         f"{minimum.one_request} for one request of max_model_len="
         f"{vllm_config.model_config.max_model_len} across "
-        f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), "
-        f"{minimum.decode_batch} for max_num_seqs="
-        f"{vllm_config.scheduler_config.max_num_seqs} decode steps, plus the null "
-        "block. Reduce max_model_len or max_num_seqs, raise "
+        f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), plus the null "
+        "block. Reduce max_model_len, raise "
         "gpu_memory_utilization, or give the model more devices."
     )
 

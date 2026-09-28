@@ -55,7 +55,7 @@ def kv_blocks_needed(
     max_num_seqs: int,
     pipeline_parallel_size: int,
 ) -> int:
-    """Blocks the shared KV pool needs, mirroring ``minimum_kv_blocks``.
+    """Blocks a test KV pool needs to run one full decode batch unpreempted.
 
     vLLM sizes the pool in units of ``group_size * page_size``, so each term
     sums over groups: a full-attention group holds the whole context, a
