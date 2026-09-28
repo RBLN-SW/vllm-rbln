@@ -93,11 +93,17 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched.block_size = 16
     sched.engine_id = "test-engine"
     sched.kv_cache_config = MagicMock()
+    # 0.30.0 routes every exchanged block list through the config first; these
+    # cases have one group and nothing to drop, so it answers with its input.
+    sched.kv_cache_config.select_transfer_block_ids.side_effect = lambda ids: ids
     sched.side_channel_host = "localhost"
     sched.side_channel_port = 5000
     # The save path is gated on this, so save tests must turn it on.
     sched.use_host_buffer = use_host_buffer
-    sched._is_hma_required = False  # get_sw_clipped_blocks (inherited) reads this
+    sched._is_hma_required = False  # get_exchange_clipped_blocks reads this
+    # 0.30.0 takes the transfer rank count off the scheduler, and clipping
+    # now routes block ids through the config first.
+    sched.transfer_tp_size = 1
     sched.blocks_per_sw = [0]
     sched._kv_lease_duration = 30
     sched._reqs_need_recv = {}
@@ -213,7 +219,9 @@ class TestBuildConnectorMeta:
             "remote_host": "1.2.3.4",
             "remote_port": 6000,
         }
-        sched._reqs_need_recv["recv"] = (req, [1, 2])
+        # 0.30.0 widened the entry to carry the computed-block count and
+        # whether the request parks in WAITING_FOR_REMOTE_KVS.
+        sched._reqs_need_recv["recv"] = (req, [1, 2], (), True)
         sched._reqs_in_batch = {"x"}
         sched._reqs_not_processed = {"y"}
 
@@ -240,7 +248,7 @@ class TestRequestFinished:
 
         delay, params = sched.request_finished(req, ([1],))
         assert (delay, params) == (False, None)
-        assert sched._reqs_need_recv["remote-prefill"] == (req, [])
+        assert sched._reqs_need_recv["remote-prefill"] == (req, [], (), False)
         assert req.kv_transfer_params["do_remote_prefill"] is False
 
     def test_not_remote_decode_frees_immediately(self):

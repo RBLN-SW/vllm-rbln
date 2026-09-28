@@ -38,14 +38,28 @@ class TestComputeDescIds:
         worker = build_worker(monkeypatch)  # _sw_ratio is None
         captured = []
 
-        def super_impl(self, block_ids, dst, ratio, phys):
-            captured.append((block_ids, dst, ratio, phys))
+        # 0.30.0 added three per-region keywords; the delegation has to carry
+        # them through rather than drop them on the way to upstream.
+        def super_impl(self, block_ids, dst, ratio, phys, **region_kwargs):
+            captured.append((block_ids, dst, ratio, phys, region_kwargs))
             return "super"
 
         monkeypatch.setattr(NixlBaseConnectorWorker, "_compute_desc_ids", super_impl)
-        out = worker._compute_desc_ids([[0]], 4, None, 1)
+        out = worker._compute_desc_ids([[0]], 4, None, 1, region_num_blocks=[4])
         assert out == "super"
-        assert captured == [([[0]], 4, None, 1)]
+        assert captured == [
+            (
+                [[0]],
+                4,
+                None,
+                1,
+                {
+                    "region_num_blocks": [4],
+                    "region_group_ids": None,
+                    "uses_region_group_mapping": None,
+                },
+            )
+        ]
 
     def test_sw_group_shifted_by_full_desc_count_across_regions(self, monkeypatch):
         # Full group -> offset 0; SWA group -> offset num_full_descs. Each id is
