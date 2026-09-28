@@ -21,6 +21,7 @@
 from typing import Any
 
 from vllm.config import VllmConfig
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_kv_cache_capacity
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -29,7 +30,6 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.registry import register_patch
 from vllm_rbln.v1.worker.utils import (
     dynamic_kv_unsupported_reason,
-    minimum_kv_blocks,
     rescale_kv_cache_config,
 )
 
@@ -127,31 +127,35 @@ def patched_initialize_kv_caches(
         old_num_blocks,
         num_blocks,
     )
-    assert_kv_cache_minimum(vllm_config, kv_cache_config)
+    check_enough_kv_cache_blocks_after_resize(vllm_config, kv_cache_config)
     _log_gpu_kv_cache_size(vllm_config, kv_cache_config)
     return kv_cache_config
 
 
-def assert_kv_cache_minimum(
+def check_enough_kv_cache_blocks_after_resize(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> None:
-    """Fail loudly when the resized pool cannot hold one max-length request or
-    one full decode batch."""
+    """Fail loudly when the resized pool cannot hold one max-length request."""
     # NOTE(RBLN): upstream's `check_enough_kv_cache_memory` runs against the
     # pre-compile estimate and nothing re-checks the number substituted here, so
-    # without this the server starts and then rejects every request.
-    minimum = minimum_kv_blocks(vllm_config, kv_cache_config)
-    if kv_cache_config.num_blocks >= minimum.needed:
+    # without this the server starts and a prompt that cannot fit waits forever.
+    one_request = sum(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in kv_cache_config.kv_cache_groups
+    )
+    # +1: the block pool keeps block 0 as the null block.
+    if kv_cache_config.num_blocks > one_request:
         return
     raise ValueError(
         f"The KV cache sized from the compiled placement holds "
-        f"{kv_cache_config.num_blocks} blocks, but it needs {minimum.needed}: "
-        f"{minimum.one_request} for one request of max_model_len="
+        f"{kv_cache_config.num_blocks} blocks, but it needs {one_request + 1}: "
+        f"{one_request} for one request of max_model_len="
         f"{vllm_config.model_config.max_model_len} across "
-        f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), "
-        f"{minimum.decode_batch} for max_num_seqs="
-        f"{vllm_config.scheduler_config.max_num_seqs} decode steps, plus the null "
-        "block. Reduce max_model_len or max_num_seqs, raise "
+        f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), plus the null "
+        "block. Reduce max_model_len, raise "
         "gpu_memory_utilization, or give the model more devices."
     )
 
