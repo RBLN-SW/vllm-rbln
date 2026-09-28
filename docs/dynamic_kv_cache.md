@@ -160,9 +160,9 @@ would serve from the pre-compile estimate this feature exists to replace.
 - **The count cannot hold one request.** After the resize the pool must hold
   `1 + one max_model_len request` blocks, the 1 being the null block, summed
   over the KV cache groups that share the pool; a sliding-window group counts
-  vLLM's per-request admission blocks (the window plus one unaligned block)
-  rather than the whole context. As upstream, a pool smaller than
-  `max_num_seqs` sequences only caps concurrency.
+  vLLM's per-request admission blocks (the window plus `max_in_flight_tokens`,
+  plus one unaligned block) rather than the whole context. As upstream, a pool
+  smaller than `max_num_seqs` sequences only caps concurrency.
 - **No KV block fits.** On some chiplet the non-KV base already exceeds
   `total * gpu_memory_utilization`. Raise `--gpu-memory-utilization`, or give the
   model more devices.
