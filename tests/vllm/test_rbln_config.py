@@ -84,7 +84,7 @@ def test_every_field_gets_a_flag(parser):
 def test_a_field_of_the_other_path_is_rejected():
     """Both paths' flags are registered, so the class is what narrows them."""
     with pytest.raises(ValueError, match="are not fields"):
-        build_rbln_config({"prefix_block_size": 256})
+        build_rbln_config({"optimum_overrides": {}})
 
 
 def test_defaults_when_nothing_is_passed(parser):

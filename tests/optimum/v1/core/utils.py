@@ -100,7 +100,7 @@ def create_scheduler(
         cache_config=cache_config,
         structured_outputs_config=structured_outputs_config,
         additional_config={
-            "prefix_block_size": block_size,
+            "sub_block_size": block_size,
             "optimum_overrides": {
                 "prefill_chunk_size": block_size,
             },
