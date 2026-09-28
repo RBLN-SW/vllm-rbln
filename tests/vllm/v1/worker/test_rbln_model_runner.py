@@ -30,7 +30,11 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -506,6 +510,29 @@ class TestSelectCanonicalKvLayersPerPool:
         assert select_canonical_kv_layers_per_pool(
             self._cfg(groups, ["full0"], ["full1"])
         ) == {"full0", "full1"}
+
+    @staticmethod
+    def _uniform(**layers):
+        # A uniform-type group carries each layer's own spec; the wrapper
+        # itself is neither full nor sliding-window attention.
+        return UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=layers)
+
+    def test_unwraps_a_uniform_full_attention_group(self):
+        full = self._full()
+        groups = [
+            self._group(["sw0"], SimpleNamespace()),
+            self._group(["full0", "full1"], self._uniform(full0=full, full1=full)),
+        ]
+        assert select_canonical_kv_layers_per_pool(
+            self._cfg(groups, ["sw0", "full0"], ["full1"])
+        ) == {"full0", "full1"}
+
+    def test_a_uniform_sliding_window_group_falls_back_to_first_layer(self):
+        sliding = object.__new__(SlidingWindowSpec)
+        groups = [self._group(["sw0", "sw1"], self._uniform(sw0=sliding, sw1=sliding))]
+        assert select_canonical_kv_layers_per_pool(
+            self._cfg(groups, ["sw0", "sw1"])
+        ) == {"sw0"}
 
 
 class TestGetSupportedTasks:
