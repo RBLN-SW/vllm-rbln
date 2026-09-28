@@ -280,6 +280,7 @@ class _GroupPartialMatch:
 class _GroupInfo:
     """Per-group configuration for sub-block caching."""
 
+    group_id: int
     block_size: int
     sub_blocks_per_block: int
     sub_block_index: SubBlockIndex
@@ -340,10 +341,11 @@ class RBLNKVCacheManager(KVCacheManager):
 
         # Build per-group info.
         self._group_infos: list[_GroupInfo] = []
-        for group in kv_cache_config.kv_cache_groups:
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
             bs = group.kv_cache_spec.block_size
             self._group_infos.append(
                 _GroupInfo(
+                    group_id=gid,
                     block_size=bs,
                     sub_blocks_per_block=bs // sub_block_size,
                     sub_block_index=SubBlockIndex(),
@@ -370,16 +372,6 @@ class RBLNKVCacheManager(KVCacheManager):
         self.enable_kv_cache_events = self.block_pool.enable_kv_cache_events
         self.block_pool.enable_kv_cache_events = False
         self._sub_block_event_queue: list[KVCacheEvent] = []
-
-        # Upstream gates hybrid (multi-group) KV cache manager off when
-        # KV events are enabled (see vllm/config/vllm.py
-        # ``need_disable_hybrid_kv_cache_manager``).
-        if self.enable_kv_cache_events and len(self._group_infos) > 1:
-            raise ValueError(
-                "KV cache events are not supported with multi-group (hybrid) "
-                "sub-block caching. Upstream disables the hybrid KV cache "
-                "manager when KV events are enabled."
-            )
 
         self._install_eviction_hook()
 
@@ -717,7 +709,7 @@ class RBLNKVCacheManager(KVCacheManager):
             return
         blk_sub_hashes = state.hashes[sub_start:sub_end]
         first_fresh_idx = gi.sub_block_index.update(blk.block_id, blk_sub_hashes)
-        self._emit_block_stored(request, state, sub_start, sub_end, first_fresh_idx)
+        self._emit_block_stored(request, state, sub_start, sub_end, first_fresh_idx, gi)
 
     def _index_partial_block(self, request: Request, mark_cached: bool) -> None:
         """Index sub-blocks of the last partial block per group.
@@ -756,7 +748,9 @@ class RBLNKVCacheManager(KVCacheManager):
             first_fresh_idx = gi.sub_block_index.update(
                 blk.block_id, partial_sub_hashes
             )
-            self._emit_block_stored(request, state, sub_start, sub_end, first_fresh_idx)
+            self._emit_block_stored(
+                request, state, sub_start, sub_end, first_fresh_idx, gi
+            )
 
             if mark_cached:
                 # Give the block a synthetic block_hash so the upstream block pool
@@ -780,7 +774,7 @@ class RBLNKVCacheManager(KVCacheManager):
         ``BlockRemoved`` for hashes whose last holder was this block."""
         for gi in self._group_infos:
             fully_removed = gi.sub_block_index.pop(block_id)
-            self._emit_block_removed(fully_removed)
+            self._emit_block_removed(fully_removed, gi)
 
     def _install_eviction_hook(self) -> None:
         # Monkey-patch the block pool's eviction method to also clean up the
@@ -806,6 +800,7 @@ class RBLNKVCacheManager(KVCacheManager):
         sub_start: int,
         sub_end: int,
         first_fresh_idx: int,
+        gi: _GroupInfo,
     ) -> None:
         """Emit a single ``BlockStored`` for the fresh suffix of one update.
 
@@ -826,6 +821,7 @@ class RBLNKVCacheManager(KVCacheManager):
         tok_end = sub_end * self.sub_block_size
         token_ids = request.all_token_ids[tok_start:tok_end]
         extras = state.extra_keys[fresh_start:sub_end]
+        kind, sliding_window = self.kv_cache_event_metadata[gi.group_id]
         self._sub_block_event_queue.append(
             BlockStored(
                 block_hashes=[maybe_convert_block_hash(h) for h in fresh_hashes],
@@ -842,10 +838,15 @@ class RBLNKVCacheManager(KVCacheManager):
                 medium=MEDIUM_GPU,
                 lora_name=(request.lora_request.name if request.lora_request else None),
                 extra_keys=extras if any(e is not None for e in extras) else None,
+                group_idx=gi.group_id,
+                kv_cache_spec_kind=kind,
+                kv_cache_spec_sliding_window=sliding_window,
             )
         )
 
-    def _emit_block_removed(self, fully_removed: list[BlockHash]) -> None:
+    def _emit_block_removed(
+        self, fully_removed: list[BlockHash], gi: _GroupInfo
+    ) -> None:
         """Emit a single ``BlockRemoved`` for hashes whose last holder is gone."""
         if not self.enable_kv_cache_events or not fully_removed:
             return
@@ -853,5 +854,6 @@ class RBLNKVCacheManager(KVCacheManager):
             BlockRemoved(
                 block_hashes=[maybe_convert_block_hash(h) for h in fully_removed],
                 medium=MEDIUM_GPU,
+                group_idx=gi.group_id,
             )
         )
