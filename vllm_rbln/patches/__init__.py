@@ -27,7 +27,6 @@ from vllm_rbln.patches.registry import (
 from . import (
     attention,
     axk2,
-    deepseek_eagle3,
     deepseek_mtp,
     deepseek_v2,
     distributed_utils,
@@ -38,7 +37,6 @@ from . import (
     gpt_oss_mxfp4_config,
     kv_connector_factory,
     kv_connector_utils,
-    llama_eagle3,
     metrics,
     minimax_m2,
     mla,
