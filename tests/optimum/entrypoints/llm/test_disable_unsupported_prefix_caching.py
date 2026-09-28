@@ -15,7 +15,8 @@
 from types import SimpleNamespace
 
 import pytest
-from vllm.config import ModelConfig
+from vllm.config import CacheConfig, ModelConfig
+from vllm.engine.arg_utils import EngineArgs
 
 from vllm_rbln.platform.optimum_impl import disable_unsupported_prefix_caching
 
@@ -42,7 +43,7 @@ def _vllm_config(model_id: str) -> SimpleNamespace:
     """The fields the guard reads, around the ModelConfig vLLM would build."""
     return SimpleNamespace(
         model_config=ModelConfig(model_id, trust_remote_code=False),
-        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        cache_config=CacheConfig(enable_prefix_caching=True),
     )
 
 
@@ -64,4 +65,20 @@ def test_quantized_linears_alone_keep_prefix_caching(model_id):
 def test_hybrid_disables_prefix_caching(model_id):
     vllm_config = _vllm_config(model_id)
     disable_unsupported_prefix_caching(vllm_config)
+    assert vllm_config.cache_config.enable_prefix_caching is False
+
+
+@pytest.mark.parametrize("model_id", HYBRID)
+def test_hybrid_engine_config_builds_with_prefix_caching_off(model_id):
+    # The upstream hybrid verifier runs before the platform hook and derives
+    # mamba_block_size for prefix caching on. Disabling it afterwards must leave
+    # a config VllmConfig still accepts.
+    vllm_config = EngineArgs(
+        model=model_id,
+        model_impl="optimum",
+        hf_overrides={"text_config.num_hidden_layers": 2, "vision_config.depth": 1},
+        block_size=4096,
+        max_model_len=8192,
+        max_num_seqs=1,
+    ).create_engine_config()
     assert vllm_config.cache_config.enable_prefix_caching is False
