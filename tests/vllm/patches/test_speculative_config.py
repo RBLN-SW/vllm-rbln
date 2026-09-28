@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The two `SpeculativeConfig` patches: the draft's parallel config, and the
+"""The two `SpeculativeConfig` patches: the draft's expert parallelism, and the
 drafting reservation DFlash does not need.
 
 Config objects only -- no checkpoint, no device.
@@ -24,51 +24,45 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
-from vllm.model_executor.models.interfaces import supports_pp
-from vllm.model_executor.models.llama import LlamaForCausalLM
-from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 
 from vllm_rbln.patches.speculative_config import (
+    _orig_create_draft_parallel_config,
     create_draft_parallel_config,
     max_num_new_slots_for_drafting,
     upstream_max_num_new_slots_for_drafting,
 )
 
 
-@pytest.mark.parametrize("target_pp", [1, 2, 4])
-def test_draft_never_inherits_target_pipeline_size(target_pp):
-    target = ParallelConfig(pipeline_parallel_size=target_pp, tensor_parallel_size=1)
+def test_the_draft_never_inherits_expert_parallelism():
+    # A MoE target with an EAGLE-family head: upstream forwards the flag and
+    # `verify_with_parallel_config` then refuses the head for having no experts.
+    target = ParallelConfig(tensor_parallel_size=1, enable_expert_parallel=True)
 
     draft = create_draft_parallel_config(target, 1)
 
-    assert draft.pipeline_parallel_size == 1
-    # world_size is derived in the validator, so it has to come out right at
-    # construction; there is no field to correct afterwards.
-    assert draft.world_size == 1
+    assert not draft.enable_expert_parallel
+
+
+def test_everything_else_still_comes_from_upstream():
+    # Why this delegates instead of building a ParallelConfig of its own: a
+    # hand-rolled copy silently drops whatever field upstream adds next.
+    target = ParallelConfig(
+        tensor_parallel_size=1,
+        enable_expert_parallel=True,
+        max_parallel_loading_workers=3,
+    )
+
+    ours = create_draft_parallel_config(target, 2)
+    theirs = _orig_create_draft_parallel_config(target, 2)
+    theirs.enable_expert_parallel = False
+
+    assert ours == theirs
 
 
 def test_the_patch_is_the_one_installed():
     assert (
         SpeculativeConfig.create_draft_parallel_config is create_draft_parallel_config
     )
-
-
-def test_tensor_parallel_size_still_comes_from_the_argument():
-    target = ParallelConfig(pipeline_parallel_size=4, tensor_parallel_size=1)
-
-    draft = create_draft_parallel_config(target, 2)
-
-    assert draft.tensor_parallel_size == 2
-    assert draft.world_size == 2
-
-
-def test_the_draft_head_is_what_fails_supports_pp():
-    # Why the inherited pipeline size is fatal rather than merely wasteful: the
-    # draft head reaches verify_with_parallel_config and cannot satisfy it. If
-    # upstream ever gives the head an intermediate_tensors forward, this flips and
-    # the patch has lost its reason.
-    assert supports_pp(LlamaForCausalLM)
-    assert not supports_pp(Eagle3LlamaForCausalLM)
 
 
 def _spec_config(method: str, *, num_speculative_tokens: int = 3) -> SpeculativeConfig:
