@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 import vllm_rbln.v1.worker.dynamic_kv_sizer as dks
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
@@ -95,6 +96,51 @@ def _bind_sizing(sizer) -> None:
         setattr(sizer, name, lambda *a, _m=method, **kw: _m(sizer, *a, **kw))
 
 
+def _full_spec(block_size=16384):
+    return FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+    )
+
+
+def _sliding_spec(block_size=16384, sliding_window=128):
+    return SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+    )
+
+
+def _group(spec):
+    return SimpleNamespace(kv_cache_spec=spec)
+
+
+class TestInt16BlockIdCap:
+    def test_full_attention_alone_caps_at_the_int16_max(self):
+        cfg = SimpleNamespace(kv_cache_groups=[_group(_full_spec())])
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384]) == (32767, 0)
+
+    def test_the_group_with_the_most_kernel_blocks_per_block_decides(self):
+        cfg = SimpleNamespace(
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())]
+        )
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 128]) == (255, 1)
+
+    def test_a_sliding_window_kept_at_the_manager_block_is_not_split(self):
+        cfg = SimpleNamespace(
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())]
+        )
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 16384]) == (
+            32767,
+            0,
+        )
+
+    def test_no_attention_group_means_no_cap(self):
+        cfg = SimpleNamespace(kv_cache_groups=[])
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, []) is None
+
+
 class TestComputeDynamicKvNumBlocks:
     """`compute_num_blocks` = placement slope x memory snapshot.
 
@@ -116,7 +162,16 @@ class TestComputeDynamicKvNumBlocks:
         ):
             yield
 
-    def _sizer(self, *, programs, snapshot, tp_size=1, gmu=1.0):
+    def _sizer(
+        self,
+        *,
+        programs,
+        snapshot,
+        tp_size=1,
+        gmu=1.0,
+        kv_cache_groups=(),
+        kernel_block_sizes=(),
+    ):
         sizer = SimpleNamespace(
             rank=0,
             device=torch.device("cpu"),
@@ -131,7 +186,9 @@ class TestComputeDynamicKvNumBlocks:
                 kv_cache_config=SimpleNamespace(
                     num_blocks=self.HINT,
                     kv_cache_tensors=_kv_cache_tensors_for(programs),
-                )
+                    kv_cache_groups=list(kv_cache_groups),
+                ),
+                _kernel_block_sizes=list(kernel_block_sizes),
             ),
             programs=list(programs),
             memory_snapshot=lambda device: (snapshot, "stub"),
@@ -193,6 +250,40 @@ class TestComputeDynamicKvNumBlocks:
         )
         assert full == 35 * 1024
         assert half == full // 2
+
+    def test_the_sliding_window_kernel_block_ids_cap_the_count(self, caplog):
+        programs = [_program([HEAD_SPLIT])]
+        groups = [_group(_full_spec()), _group(_sliding_spec())]
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=self._snapshot([0] * 4),
+            kv_cache_groups=groups,
+            kernel_block_sizes=[16384, 128],
+        )
+        with caplog.at_level("WARNING", logger=dks.logger.name):
+            n = DynamicKvSizer.compute_num_blocks(sizer)
+        # 35 * 1024 blocks fit the memory; 255 * 128 is the last id in int16.
+        assert n == 255
+        assert (
+            "capping 35840 blocks to 255: KV cache group 1 maps each 16384-token "
+            "block to 128 kernel block ids" in caplog.text
+        )
+
+    def test_a_count_under_the_int16_cap_is_left_alone(self):
+        programs = [_program([HEAD_SPLIT])]
+        snapshot = self._snapshot([0] * 4)
+        uncapped = DynamicKvSizer.compute_num_blocks(
+            self._sizer(programs=programs, snapshot=snapshot, gmu=0.005)
+        )
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=snapshot,
+            gmu=0.005,
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())],
+            kernel_block_sizes=[16384, 128],
+        )
+        assert uncapped < 255
+        assert DynamicKvSizer.compute_num_blocks(sizer) == uncapped
 
     def test_the_snapshot_is_taken_on_the_program_s_device(self):
         seen = []

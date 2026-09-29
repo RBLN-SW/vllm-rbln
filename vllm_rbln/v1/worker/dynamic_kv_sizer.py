@@ -28,7 +28,11 @@ import torch
 import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+)
 
 from vllm_rbln.compilation.backends import set_compile_stage
 from vllm_rbln.logger import init_logger
@@ -108,6 +112,8 @@ COMPILE_KV_CACHE_NUM_BLOCKS = 4
 DYNAMIC_KV_ALLOCATOR_RESERVE_BYTES = 48 * 1024 * 1024
 # Per chiplet, for the copy command streams sub-block prefix caching uploads.
 DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES = 64 * 1024 * 1024
+# The compiled attention ops take kernel block ids as int16.
+MAX_KERNEL_BLOCK_ID = torch.iinfo(torch.int16).max
 
 
 def kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
@@ -116,6 +122,25 @@ def kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
     scaled.kv_cache_tensors = copy.deepcopy(cfg.kv_cache_tensors)
     rescale_kv_cache_config(scaled, num_blocks)
     return scaled
+
+
+def max_num_blocks_for_int16_block_ids(
+    kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+) -> tuple[int, int] | None:
+    """The largest pool whose kernel block ids stay within int16, and the KV
+    cache group that sets it; None when no attention group is bound."""
+    tightest = None
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        if not isinstance(spec, AttentionSpec) or group_id >= len(kernel_block_sizes):
+            continue
+        blocks_per_kv_block = spec.block_size // kernel_block_sizes[group_id]
+        cap = MAX_KERNEL_BLOCK_ID // blocks_per_kv_block
+        if tightest is None or cap < tightest[0]:
+            tightest = (cap, group_id)
+    return tightest
 
 
 def empty_rbln_device_caches() -> bool:
@@ -512,6 +537,27 @@ class DynamicKvSizer:
             gmu,
             format_fits(fits),
         )
+        mr = self.model_runner
+        int16_cap = max_num_blocks_for_int16_block_ids(
+            mr.kv_cache_config, mr._kernel_block_sizes
+        )
+        if int16_cap is not None and num_blocks > int16_cap[0]:
+            cap, group_id = int16_cap
+            block_size = mr.kv_cache_config.kv_cache_groups[
+                group_id
+            ].kv_cache_spec.block_size
+            logger.warning(
+                "[Dynamic KV] capping %d blocks to %d: KV cache group %d maps each "
+                "%d-token block to %d kernel block ids, which must stay within "
+                "int16 (max %d).",
+                num_blocks,
+                cap,
+                group_id,
+                block_size,
+                block_size // mr._kernel_block_sizes[group_id],
+                MAX_KERNEL_BLOCK_ID,
+            )
+            num_blocks = cap
         if num_blocks <= 0:
             raise RuntimeError(
                 "[Dynamic KV] no KV block fits: on some chiplet the non-KV base "
