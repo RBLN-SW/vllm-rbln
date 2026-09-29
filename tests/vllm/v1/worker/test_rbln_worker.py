@@ -671,9 +671,12 @@ class TestDetermineAvailableMemory:
         monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 999)
         monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
         worker.speculative_config = None
-        spec = SimpleNamespace(
-            max_memory_usage_bytes=lambda cfg: 4000, page_size_bytes=100
+        spec = SimpleNamespace()
+        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: ["g"])
+        monkeypatch.setattr(
+            dks, "_max_memory_usage_bytes_from_groups", lambda cfg, groups: 8000
         )
+        monkeypatch.setattr(dks, "_pool_bytes_per_block", lambda groups: 100)
         worker.model_runner = SimpleNamespace(
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
@@ -683,7 +686,7 @@ class TestDetermineAvailableMemory:
         )
         _attach_sizer(worker)
         with caplog.at_level("WARNING"):
-            assert worker.determine_available_memory() == 8200
+            assert worker.determine_available_memory() == 8100
         assert "short of one max-length request" in caplog.text
 
     def test_dynamic_kv_skips_the_snapshot_on_a_dummy_device(

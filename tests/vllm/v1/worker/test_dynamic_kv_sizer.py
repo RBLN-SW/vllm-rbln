@@ -667,9 +667,12 @@ class TestOnlyTheShrunkModeReplacesTheEstimate:
     def test_the_one_request_floor_is_only_for_the_shrunk_estimate(self, monkeypatch):
         """The floor exists because the shrink makes the estimate a placeholder.
         Every other mode serves this estimate, so raising it resizes the pool."""
-        spec = SimpleNamespace(
-            max_memory_usage_bytes=lambda cfg: 4000, page_size_bytes=100
+        spec = SimpleNamespace()
+        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: ["g"])
+        monkeypatch.setattr(
+            dks, "_max_memory_usage_bytes_from_groups", lambda cfg, groups: 8000
         )
+        monkeypatch.setattr(dks, "_pool_bytes_per_block", lambda groups: 100)
         monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 999)
 
         def sizer(mode):
@@ -690,7 +693,7 @@ class TestOnlyTheShrunkModeReplacesTheEstimate:
             active = DynamicKvSizer.pre_compile_estimate(
                 sizer(dks.DynamicKvMode.ACTIVE), {}
             )
-            assert active == 8200
+            assert active == 8100
             for mode in (dks.DynamicKvMode.PINNED, dks.DynamicKvMode.INERT):
                 assert DynamicKvSizer.pre_compile_estimate(sizer(mode), {}) == 999
 
