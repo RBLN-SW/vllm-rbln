@@ -2907,29 +2907,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _select_canonical_kv_layers_per_pool(
         self, kv_cache_config: KVCacheConfig
     ) -> set[str]:
-        """Pick one layer per HMA pool as the canonical handle.
+        """Pick one layer to stand for each KV cache buffer.
 
-        Both `mark_static_address` (last-write-wins on storage->name) and the
-        KV connector's `register_kv_caches` (uses the chosen layer's view as
-        NIXL's descriptor stride) need a single layer per pool.
-
-        Prefer a Full-attention layer — its view's `cache.shape[-2]` equals the
-        logical `cache_config.block_size`, matching the scheduler / connector /
-        runtime copy block_id space. A SWA layer's view (`shape[-2] ==
-        sliding_window`, kernel granularity) would mis-address logical
-        block_ids. Falls back to the first layer in `layers` when no Full
-        layer is present.
+        Layers that share a buffer (`kv_cache_extents`) must be named once,
+        for `mark_static_address` and for the connector. A `KVCacheTensor` is
+        not a buffer: it lists many layers, each with its own. Prefer a
+        full-attention layer: its view counts blocks the way the scheduler
+        does, and a sliding-window view does not.
         """
         layer_to_spec: dict[str, KVCacheSpec] = {
             layer_name: attn_group.kv_cache_spec
             for attn_group in self._kv_cache_spec_attn_group_iterator()
             for layer_name in attn_group.layer_names
         }
+        pools: defaultdict[tuple[int, int], list[str]] = defaultdict(list)
+        for layer_name, extent in kv_cache_extents(kv_cache_config).items():
+            pools[extent].append(layer_name)
         chosen: set[str] = set()
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            pool_layers = kv_cache_tensor.layers
-            if not pool_layers:
-                continue
+        for pool_layers in pools.values():
             full_layer = next(
                 (
                     ln
