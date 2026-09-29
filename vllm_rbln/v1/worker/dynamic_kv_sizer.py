@@ -229,8 +229,10 @@ class DynamicKvSizer:
             )
 
         estimate = estimate_available_memory(**estimate_kwargs)
+        # vllm checks one request against this estimate minus the null block
+        # BlockPool holds back, so the floor carries that block too.
         one_request = sum(
-            spec.max_memory_usage_bytes(self.vllm_config)
+            spec.max_memory_usage_bytes(self.vllm_config) + spec.page_size_bytes
             for spec in self.model_runner.get_kv_cache_spec().values()
         )
         if self.mode is DynamicKvMode.ACTIVE and estimate < one_request:
