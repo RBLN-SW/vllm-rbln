@@ -477,6 +477,29 @@ def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
+def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
+    """Each layer's `(start, length)` in the backing allocation.
+
+    Cache groups alias each other since vllm 0.29.0 (#51718), so layers that
+    land on one extent are one cache. Distinct extents never partly overlap:
+    that would need an allocation the layers index into, and a graph input
+    cannot carry a storage offset.
+    """
+    extents: dict[str, tuple[int, int]] = {}
+    for kv_tensor in cfg.kv_cache_tensors:
+        for position, layer_name in enumerate(kv_tensor.layers):
+            start = kv_tensor.offset + position * kv_tensor.layer_stride
+            extents[layer_name] = (start, kv_tensor.layer_stride)
+    bounds = sorted({(start, start + n) for start, n in extents.values()})
+    for (_, end), (start, _) in zip(bounds, bounds[1:]):
+        if end > start:
+            raise ValueError(
+                f"KV cache extents {bounds} overlap partially; the layout "
+                "cannot be realized as whole tensors"
+            )
+    return extents
+
+
 def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
     """Retarget `cfg` at `num_blocks`, in place.
 

@@ -50,6 +50,7 @@ from vllm_rbln.v1.worker.utils import (
     compile_and_warmup_skip_reason,
     dynamic_kv_unsupported_reason,
     estimate_available_memory,
+    kv_cache_extents,
     rescale_kv_cache_config,
 )
 
@@ -428,18 +429,19 @@ class DynamicKvSizer:
                 hint_blocks,
                 format_placements(group_specs),
             )
-        tensors = self.model_runner.kv_cache_config.kv_cache_tensors
-        # A KV input is a layer's cache. Since vllm 0.30.0 one KVCacheTensor
-        # describes a whole cache group, so its count no longer tracks them.
-        num_layers = sum(len(t.layers) for t in tensors)
-        specs = self._specs_covering_tensors(groups, num_layers)
+        cfg = self.model_runner.kv_cache_config
+        tensors = cfg.kv_cache_tensors
+        # A KV input is one allocated cache, and the layers on one extent share
+        # it, so the count is the extents rather than the layer total.
+        num_caches = len(set(kv_cache_extents(cfg).values()))
+        specs = self._specs_covering_tensors(groups, num_caches)
         logger.info(
             "[Dynamic KV] the slope is summed over %d KV input(s) from %d set(s); "
-            "vllm allocated %d KV cache tensor(s) for %d layer(s).",
+            "vllm allocated %d KV cache tensor(s) over %d cache(s).",
             len(specs),
             len(groups),
             len(tensors),
-            num_layers,
+            num_caches,
         )
         growth = kv_growth(specs, hint_blocks)
         program = groups[0][1]
@@ -448,30 +450,30 @@ class DynamicKvSizer:
 
     @staticmethod
     def _specs_covering_tensors(
-        groups: list[tuple[list[Any], Any]], num_layers: int
+        groups: list[tuple[list[Any], Any]], num_caches: int
     ) -> list[Any]:
-        """The KV inputs the slope is summed over: every layer's cache once.
+        """The KV inputs the slope is summed over: every cache once.
 
         A group is one program's KV input set. Two programs binding the same
         caches (prefill and decode) form two groups, because dynamo names the
         symbols and the arg positions differently; summing both would charge
         every cache twice. `InputSpec` carries no identity, so the number of
-        layers vllm allocated for is what says which case this is.
+        caches vllm allocated is what says which case this is.
         """
         flat = [spec for group_specs, _ in groups for spec in group_specs]
-        if len(flat) == num_layers:
+        if len(flat) == num_caches:
             # Disjoint sets (a target's and a drafter's): the sum is the answer.
             return flat
         sizes = {len(group_specs) for group_specs, _ in groups}
-        if sizes == {num_layers}:
-            # Every group already covers every layer, so one of them is it.
+        if sizes == {num_caches}:
+            # Every group already covers every cache, so one of them is it.
             return list(groups[0][0])
         raise RuntimeError(
             f"the compiled programs carry {len(flat)} KV input(s) across "
             f"{len(groups)} set(s) of {sorted(sizes)}, which neither sum to nor "
-            f"individually match the {num_layers} layer(s) vllm allocated a "
-            "KV cache for. The placement cannot be attributed to layers, so "
-            "the block count would be wrong."
+            f"individually match the {num_caches} cache(s) vllm allocated. The "
+            "placement cannot be attributed to them, so the block count would "
+            "be wrong."
         )
 
     def _size_kv_from_snapshot(
@@ -696,7 +698,7 @@ class DynamicKvSizer:
         gc.collect()
 
         released = empty_rbln_device_caches()
-        logical_bytes = sum(t.size for t in old_cfg.kv_cache_tensors)
+        logical_bytes = max((t.size for t in old_cfg.kv_cache_tensors), default=0)
         logger.info(
             "[Dynamic KV] released the outgoing %d-block KV cache: "
             "outgoing_kv_logical_bytes=%d unbound_layers=%d kv_device_types=%s "

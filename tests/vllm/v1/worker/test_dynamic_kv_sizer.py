@@ -68,16 +68,16 @@ def _program(placements, name="0/0", runtime=None, device=None, extent=4):
     )
 
 
-def _kv_cache_tensors_for(programs):
-    """One KVCacheTensor per KV input the grouping will charge; the sizer checks
-    the two counts agree."""
-    try:
-        groups = dks.select_kv_input_groups(list(programs))
-    except RuntimeError:
-        return []
+def _kv_cache_tensors(num_caches: int, stride: int = 1024):
+    """One KVCacheTensor listing the caches vllm allocated, as its builder
+    produces them; the sizer counts their extents against the compiled
+    programs. One layer per extent, so the count is the layer count."""
     return [
-        SimpleNamespace(layers=[f"layer.{i}"])
-        for i, _ in enumerate(s for g, _ in groups for s in g)
+        SimpleNamespace(
+            layers=[f"layer.{i}" for i in range(num_caches)],
+            layer_stride=stride,
+            offset=0,
+        )
     ]
 
 
@@ -116,7 +116,12 @@ class TestComputeDynamicKvNumBlocks:
         ):
             yield
 
-    def _sizer(self, *, programs, snapshot, tp_size=1, gmu=1.0):
+    def _sizer(self, *, programs, snapshot, num_caches=None, tp_size=1, gmu=1.0):
+        if num_caches is None:
+            # Every program binds the same caches unless a test says otherwise.
+            num_caches = sum(
+                spec.physical_placement is not None for spec in programs[0].input_specs
+            )
         sizer = SimpleNamespace(
             rank=0,
             device=torch.device("cpu"),
@@ -130,7 +135,7 @@ class TestComputeDynamicKvNumBlocks:
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(
                     num_blocks=self.HINT,
-                    kv_cache_tensors=_kv_cache_tensors_for(programs),
+                    kv_cache_tensors=_kv_cache_tensors(num_caches),
                 )
             ),
             programs=list(programs),
@@ -245,11 +250,7 @@ class TestComputeDynamicKvNumBlocks:
         sizer = self._sizer(
             programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
         )
-        # Two programs, two groups, but vllm allocated two tensors, not four.
-        sizer.model_runner.kv_cache_config.kv_cache_tensors = [
-            SimpleNamespace(layers=["layer.0"]),
-            SimpleNamespace(layers=["layer.1"]),
-        ]
+        # Two programs, two groups, but vllm allocated two caches, not four.
         with caplog.at_level("INFO"):
             n = DynamicKvSizer.compute_num_blocks(sizer)
         assert "summed over 2 KV input(s) from 2 set(s)" in caplog.text
@@ -266,7 +267,7 @@ class TestComputeDynamicKvNumBlocks:
         with caplog.at_level("INFO"):
             DynamicKvSizer.compute_num_blocks(sizer)
         assert "summed over 2 KV input(s) from 1 set(s)" in caplog.text
-        assert "vllm allocated 2 KV cache tensor(s) for 2 layer(s)" in caplog.text
+        assert "vllm allocated 1 KV cache tensor(s) over 2 cache(s)" in caplog.text
 
     def test_a_count_that_matches_neither_reading_is_refused(self):
         programs = [
@@ -276,11 +277,7 @@ class TestComputeDynamicKvNumBlocks:
         sizer = self._sizer(
             programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
         )
-        sizer.model_runner.kv_cache_config.kv_cache_tensors = [
-            SimpleNamespace(layers=["layer.0"]),
-            SimpleNamespace(layers=["layer.1"]),
-            SimpleNamespace(layers=["layer.2"]),
-        ]
+        sizer.model_runner.kv_cache_config.kv_cache_tensors = _kv_cache_tensors(3)
         with pytest.raises(RuntimeError, match="neither sum to nor"):
             DynamicKvSizer.compute_num_blocks(sizer)
 
@@ -728,7 +725,7 @@ class TestDynamicKvFailuresRaise:
             kv_blocks_before_shrink=211 if shrunk else None,
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(
-                    num_blocks=211, kv_cache_tensors=_kv_cache_tensors_for(programs)
+                    num_blocks=211, kv_cache_tensors=_kv_cache_tensors(2)
                 )
             ),
             programs=list(programs),

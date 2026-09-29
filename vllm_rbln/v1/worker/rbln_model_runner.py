@@ -169,6 +169,7 @@ from vllm_rbln.v1.worker.utils import (
     copy_host_device_kv_blocks,
     dynamic_kv_enabled,
     get_kv_cache_names,
+    kv_cache_extents,
     prepare_kernel_block_sizes,
     reorder_input_batch,
 )
@@ -2873,19 +2874,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        # One KVCacheTensor covers a whole cache group since vllm 0.30.0, with
-        # layer `l` at `offset + l * layer_stride`. Allocate each layer on its
-        # own anyway: the RBLN runtime binds every KV cache as its own graph
-        # input and rejects sixteen slices of one buffer (RUN_INTERNAL out of
-        # `prepare_inputs`). `layer_stride` is one layer's bytes, so the sizes
-        # still come from the layout upstream describes.
+        # One buffer per extent, so the layers that alias one cache get one
+        # tensor and the rest get their own. Not one pool the layers slice: a
+        # graph input is a whole tensor, and dynamo refuses a slice's offset.
         device = self.device if USE_DEVICE_TENSOR else "meta"
-        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            for layer_name in kv_cache_tensor.layers:
-                kv_cache_raw_tensors[layer_name] = torch.zeros(
-                    kv_cache_tensor.layer_stride, dtype=torch.int8, device=device
-                )
+        extent_of = kv_cache_extents(kv_cache_config)
+        buffers = {
+            extent: torch.zeros(extent[1], dtype=torch.int8, device=device)
+            for extent in set(extent_of.values())
+        }
+        kv_cache_raw_tensors = {
+            layer_name: buffers[extent] for layer_name, extent in extent_of.items()
+        }
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -3231,7 +3231,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
 
-        total_gb = sum(t.size for t in kv_cache_config.kv_cache_tensors) / 1024**3
+        # Every tensor reports the whole allocation, not its own share of it.
+        total_gb = (
+            max((t.size for t in kv_cache_config.kv_cache_tensors), default=0) / 1024**3
+        )
         logger.info(
             "KV cache initialized: blocks=%d, groups=%d, tensors=%d, total=%.3f GiB",
             kv_cache_config.num_blocks,

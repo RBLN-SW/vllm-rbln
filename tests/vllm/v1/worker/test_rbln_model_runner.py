@@ -1445,16 +1445,29 @@ class TestAllocateKvCacheTensors:
         assert set(raw) == {"l0", "l1", "l2"}
         assert raw["l0"].device.type == "meta"
 
-    def test_each_layer_gets_its_own_allocation(self, monkeypatch):
+    def test_each_layer_gets_one_layers_worth(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        # One layer's worth of bytes each, from `layer_stride`.
         assert all(t.numel() == self.LAYER_STRIDE for t in raw.values())
-        # Separate allocations: the RBLN runtime takes each layer's cache as
-        # its own graph input and cannot bind slices of one buffer.
+
+    def test_groups_share_the_buffer_at_a_layer_position(self, monkeypatch):
+        # A block costs the widest group, not the sum of them. l0 and l2 are
+        # the first layer of their group, so they overlay.
         # meta tensors all report data_ptr()==0, so compare identity.
-        storages = {id(t.untyped_storage()) for t in raw.values()}
-        assert len(storages) == len(raw)
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+        assert id(raw["l0"].untyped_storage()) == id(raw["l2"].untyped_storage())
+
+    def test_layer_positions_do_not_share(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+        assert id(raw["l0"].untyped_storage()) != id(raw["l1"].untyped_storage())
+
+    def test_every_layer_starts_at_byte_zero(self, monkeypatch):
+        # The compiler refuses a graph input that carries a storage offset.
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+        assert all(t.storage_offset() == 0 for t in raw.values())
 
     def test_self_device_with_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
