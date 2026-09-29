@@ -2874,18 +2874,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        # One buffer per extent, so the layers that alias one cache get one
-        # tensor and the rest get their own. Not one pool the layers slice: a
-        # graph input is a whole tensor, and dynamo refuses a slice's offset.
+        # One allocation the layers slice at their extent, as upstream's
+        # `allocate_kv_cache` does: every KVCacheTensor reports the whole pool
+        # and the cache groups alias each other from byte 0.
         device = self.device if USE_DEVICE_TENSOR else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
-        buffers = {
-            extent: torch.zeros(extent[1], dtype=torch.int8, device=device)
-            for extent in set(extent_of.values())
-        }
-        kv_cache_raw_tensors = {
-            layer_name: buffers[extent] for layer_name, extent in extent_of.items()
-        }
+        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        if extent_of:
+            sizes = {t.size for t in kv_cache_config.kv_cache_tensors}
+            assert len(sizes) == 1, (
+                f"KV cache tensors disagree on the pool size: {sorted(sizes)}"
+            )
+            pool = torch.zeros(sizes.pop(), dtype=torch.int8, device=device)
+            for layer_name, (start, length) in extent_of.items():
+                kv_cache_raw_tensors[layer_name] = pool[start : start + length]
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:

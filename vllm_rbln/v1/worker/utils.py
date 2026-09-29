@@ -481,9 +481,8 @@ def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
     """Each layer's `(start, length)` in the backing allocation.
 
     Cache groups alias each other since vllm 0.29.0 (#51718), so layers that
-    land on one extent are one cache. Distinct extents never partly overlap:
-    that would need an allocation the layers index into, and a graph input
-    cannot carry a storage offset.
+    land on one extent are one cache. Distinct extents never partly overlap,
+    which the caller relies on to place each layer on its own.
     """
     extents: dict[str, tuple[int, int]] = {}
     for kv_tensor in cfg.kv_cache_tensors:

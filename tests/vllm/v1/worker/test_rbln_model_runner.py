@@ -1452,22 +1452,19 @@ class TestAllocateKvCacheTensors:
 
     def test_groups_share_the_buffer_at_a_layer_position(self, monkeypatch):
         # A block costs the widest group, not the sum of them. l0 and l2 are
-        # the first layer of their group, so they overlay.
+        # the first layer of their group, so they overlay: the same bytes of
+        # the pool at the same offset.
         # meta tensors all report data_ptr()==0, so compare identity.
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert id(raw["l0"].untyped_storage()) == id(raw["l2"].untyped_storage())
 
-    def test_layer_positions_do_not_share(self, monkeypatch):
+    def test_layer_positions_sit_a_stride_apart(self, monkeypatch):
+        # One pool, so a layer's place in it is its storage offset.
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert id(raw["l0"].untyped_storage()) != id(raw["l1"].untyped_storage())
-
-    def test_every_layer_starts_at_byte_zero(self, monkeypatch):
-        # The compiler refuses a graph input that carries a storage offset.
-        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert all(t.storage_offset() == 0 for t in raw.values())
+        assert raw["l0"].storage_offset() == 0
+        assert raw["l1"].storage_offset() == self.LAYER_STRIDE
 
     def test_self_device_with_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
