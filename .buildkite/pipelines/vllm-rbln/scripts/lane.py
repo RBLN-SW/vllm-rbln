@@ -93,9 +93,6 @@ _LANE_ENV = {
     # A launch compiles before it serves, which takes far longer than the
     # default this allows.
     "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
-    # Weights stay resident. Offloading them is what a lane measuring either
-    # speed or a score is least willing to pay for.
-    "VLLM_RBLN_DISABLE_OFFLOAD": "1",
 }
 
 
