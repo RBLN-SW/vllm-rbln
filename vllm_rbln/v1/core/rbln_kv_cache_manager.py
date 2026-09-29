@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -306,6 +307,9 @@ class RBLNKVCacheManager(KVCacheManager):
             return False
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
+            # The shift kernel overwrites the prefix with the latest window.
+            if isinstance(spec, RBLNSlidingWindowSpec):
+                return False
             if not isinstance(spec, _SUB_BLOCK_ELIGIBLE_SPECS):
                 return False
             bs = spec.block_size
