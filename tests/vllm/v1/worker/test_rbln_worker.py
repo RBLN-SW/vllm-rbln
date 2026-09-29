@@ -618,6 +618,7 @@ class TestDetermineAvailableMemory:
         # is called from on both the dynamic and the default path.
         monkeypatch.setattr(dks, "estimate_available_memory", record)
         monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
+        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: [])
         # WorkerBase always carries the field; None is what no spec decode means.
         worker.speculative_config = speculative_config
         worker.model_runner = SimpleNamespace(
