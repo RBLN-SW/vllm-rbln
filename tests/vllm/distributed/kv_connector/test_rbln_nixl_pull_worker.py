@@ -120,10 +120,11 @@ class TestShardReadPath:
         w._recv_failures = set()
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
-        # single group, 2 regions per shard
-        # transfer_groups is what 0.30.0 checks the per-group list lengths
-        # against; one group here, matching kv_cache_groups.
-        w.kv_cache_config = MagicMock(kv_cache_groups=[0], transfer_groups=[0])
+        # The assert counts the groups that take part in a transfer, and the
+        # two views deliberately disagree here: a config with a group that
+        # opted out has more cache groups than transfer groups, so counting
+        # the wrong one rejects a request that is in fact well formed.
+        w.kv_cache_config = MagicMock(kv_cache_groups=[0, 1], transfer_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}

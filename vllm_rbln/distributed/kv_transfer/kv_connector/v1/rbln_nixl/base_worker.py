@@ -69,7 +69,10 @@ class RblnNixlWorkerBase(
         # attention specs: uniform per layer, yet not a FullAttentionSpec.
         # Mamba and sliding window merge the same way and do vary, so suppress
         # for that shape alone. TODO: drop once upstream tests uniformity.
-        groups = kv_cache_config.kv_cache_groups
+        # The transfer view, because that is what upstream derives
+        # `_is_hma_required` from -- a group that opted out of KV transfer
+        # is not part of the judgement this suppression predicts.
+        groups = kv_cache_config.transfer_groups
         group_spec = groups[0].kv_cache_spec if len(groups) == 1 else None
         suppress = isinstance(group_spec, UniformTypeKVCacheSpecs) and issubclass(
             get_representative_spec_type(group_spec), FullAttentionSpec
@@ -185,7 +188,7 @@ class RblnNixlWorkerBase(
         # host copies stay Full; _sw_ratio is None collapses to upstream Full-only.
         # `register_local_xfer_handler` builds that second range and documents it.
         self._group_specs: list[Any] = [
-            g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
+            g.kv_cache_spec for g in self.kv_cache_config.transfer_groups
         ]
         # Whether the model has a sliding window at all, which decides the model
         # parallelism guards; `_sw_ratio` is the view-opt's desc layout and only
