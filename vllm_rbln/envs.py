@@ -274,9 +274,9 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # Disable RBLN file offloading during model load / warm-up (default).
-    # Set to 0 to page weight host backings to disk when
-    # VLLM_RBLN_USE_DEVICE_TENSOR is set.
+    # Disable RBLN file offloading during model loading and warm-up by default.
+    # Set to 0 to allow host-side weight data to be paged to disk
+    # when VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
     "VLLM_RBLN_DISABLE_OFFLOAD": (
         lambda: (
             os.environ.get("VLLM_RBLN_DISABLE_OFFLOAD", "True").lower() in ("true", "1")
