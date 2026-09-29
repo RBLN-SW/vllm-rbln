@@ -18,6 +18,7 @@ from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2Attention,
+    DeepseekV2DecoderLayer,
     DeepseekV2MoE,
     DeepseekV32IndexerCache,
 )
@@ -38,6 +39,24 @@ from vllm_rbln.v1.worker.utils import (
 
 logger = init_logger(__name__)
 _original_indexer_cache_init = DeepseekV32IndexerCache.__init__
+_original_decoder_layer_init = DeepseekV2DecoderLayer.__init__
+
+
+@register_patch(
+    target="vllm.model_executor.models.deepseek_v2.DeepseekV2DecoderLayer.__init__",
+    reason=(
+        "Disable the decoder-layer sequence-parallel MoE and restore the o_proj "
+        "all_reduce: its dim-0 reduce_scatter assumes 2-D hidden_states, but RBLN "
+        "keeps them 3-D."
+    ),
+)
+def patched_deepseek_v2_decoder_layer_init(
+    self: DeepseekV2DecoderLayer, *args, **kwargs
+) -> None:
+    _original_decoder_layer_init(self, *args, **kwargs)
+    if self.use_sequence_parallel_moe:
+        self.use_sequence_parallel_moe = False
+        self.self_attn.o_proj.reduce_results = True
 
 
 @register_patch(
