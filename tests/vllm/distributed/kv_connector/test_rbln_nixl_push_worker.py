@@ -1061,9 +1061,12 @@ class TestStreamedEngineHandleWrite:
         return w
 
     @staticmethod
-    def _offer(local_groups, remote_groups, tokens):
+    def _offer(worker, local_groups, remote_groups, tokens):
+        """An offer built for `worker`'s record, so the write is not refused."""
         meta = TestPerShardWrite._meta(local_groups, remote_groups)
-        meta.local_block_ids = pw.OfferedBlocks(local_groups, tokens)
+        meta.local_block_ids = pw.OfferedBlocks(
+            local_groups, tokens, worker._streamed["r0"].serial
+        )
         return meta
 
     @staticmethod
@@ -1090,7 +1093,7 @@ class TestStreamedEngineHandleWrite:
             remote_block_size=16,
             remote_physical_blocks_per_logical=2,
         )
-        meta = self._offer(([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16)
+        meta = self._offer(worker, ([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16)
 
         with pytest.raises(RuntimeError, match="expands a logical block"):
             worker._xfer_blocks_for_req("r0", meta)
@@ -1102,7 +1105,7 @@ class TestStreamedEngineHandleWrite:
         # window, which the kernel is still overwriting -- and the consumer's
         # registration of it is trimmed away rather than written.
         worker = self._worker()
-        meta = self._offer(([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16)
+        meta = self._offer(worker, ([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16)
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -1120,7 +1123,7 @@ class TestStreamedEngineHandleWrite:
         # which is the only one that may carry it.
         worker = self._worker()
         worker._valid_tokens = {"r0": 3 * 16 + 8}
-        meta = self._offer(([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
+        meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -1144,12 +1147,12 @@ class TestStreamedEngineHandleWrite:
         worker = self._worker()
         worker._valid_tokens = {"r0": 3 * 16 + 8}
         worker._xfer_blocks_for_req(
-            "r0", self._offer(([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16 + 8)
+            "r0", self._offer(worker, ([0, 1, 2, 3], []), ([4, 5], [6]), 3 * 16 + 8)
         )
         first = list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
 
         worker._xfer_blocks_for_req(
-            "r0", self._offer(([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
+            "r0", self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
         )
         second = list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
 
@@ -1164,7 +1167,7 @@ class TestStreamedEngineHandleWrite:
         # rounding it down and rounding it up stop agreeing.
         worker = self._worker()
         worker._valid_tokens = {"r0": 3 * 16 + 9}
-        meta = self._offer(([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
+        meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6]), 0)
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -1180,21 +1183,21 @@ class TestStreamedEngineHandleWrite:
         for kv_per_block in (2, 1):
             worker = self._worker(kv_per_block=kv_per_block)
             worker._valid_tokens = {"r0": 3 * 16 + 8}
-            worker._xfer_blocks_for_req("r0", self._offer(*offer))
+            worker._xfer_blocks_for_req("r0", self._offer(worker, *offer))
             remotes.append(
                 list(worker.nixl_wrapper.make_prepped_xfer.call_args.args[4])
             )
 
         assert remotes[0] == remotes[1]
 
-    def test_a_batch_that_writes_nothing_still_counts_toward_the_seal(self):
+    def test_a_batch_that_writes_nothing_still_raises_the_landed_count(self):
         # The per-shard route has the same guard: a batch issuing no write
-        # still raises the landed count, or the request sits one short of its
-        # seal forever. This route reaches it when the offer adds nothing past
-        # the high-water mark and the window's block is not in the offer.
+        # still raises the landed count, or `done` stays short of `issued`
+        # forever. This route reaches it when the offer adds nothing past the
+        # high-water mark and the window's block is not in the offer.
         worker = self._worker()
         worker._streamed["r0"].issued_hwm = 2
-        meta = self._offer(([0, 1, 2, 3], []), ([4, 5], [6]), 2 * 16)
+        meta = self._offer(worker, ([0, 1, 2, 3], []), ([4, 5], [6]), 2 * 16)
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -1208,7 +1211,7 @@ class TestStreamedEngineHandleWrite:
         worker = self._worker()
         worker._valid_tokens = {"r0": 4 * 16}
         worker._streamed["r0"].issued_hwm = 2
-        meta = self._offer(([0, 1, 2, 3], [7]), ([100, 101], [50]), 0)
+        meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([100, 101], [50]), 0)
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -1343,6 +1346,8 @@ class TestEarlySend:
         w._finished_blocks_inbox = queue.Queue()
         w._evict_finished_inbox = queue.Queue()
         w._push_writer_wake = threading.Event()
+        w._pending_d_registrations = {}
+        w._push_finished_blocks = {}
         return w
 
     @staticmethod
@@ -1441,6 +1446,215 @@ class TestEarlySend:
 
         assert first.offered_tokens == 1500
 
+    @staticmethod
+    def _writer_matches_the_inbox(worker):
+        """Upstream's writer step that pairs an offer with a D registration.
+
+        Copied from `nixl/push_worker.py` rather than driven through the real
+        loop: that loop is a thread with its own wake protocol, and the one
+        line this reproduces is the parking, which is a plain assignment into
+        a dict keyed by request id. Only the unmatched branch is here -- what
+        a matched list goes on to do is `_xfer_blocks_for_req`, which
+        `TestStreamWindow` drives with a worker built for a write.
+        """
+        while True:
+            try:
+                rid, blocks = worker._finished_blocks_inbox.get_nowait()
+            except queue.Empty:
+                return
+            if worker._pop_matching_registration(rid) is None:
+                worker._push_finished_blocks[rid] = blocks
+
+    def _two_offers_parked(self):
+        """A request whose second offer reached the writer before the first was
+        matched, which is the state the parking folds into one entry."""
+        worker = self._worker()
+
+        worker.start_early_push(self._meta(saves=["r0"]))
+        worker.release_early_offers()
+        worker.start_early_push(self._meta(saves=["r0"]))
+        worker.release_early_offers()
+        self._writer_matches_the_inbox(worker)
+        return worker
+
+    def test_the_handover_mark_is_what_survives_a_fold(self):
+        # The shorter path to the same fold, and the common one: the handover
+        # goes into the writer's inbox as well, so one offer ahead of it is
+        # enough. What the parking keeps is the one put last, which is why the
+        # mark rides it out and a count does not.
+        worker = self._worker()
+
+        worker.start_early_push(self._meta(saves=["r0"]))
+        worker.release_early_offers()
+        handover = self._meta(pushes=["r0"])
+        worker._seal_at_handover(handover)
+        for req_id, blocks in handover.push_finished_blocks.items():
+            worker._finished_blocks_inbox.put((req_id, blocks))
+        self._writer_matches_the_inbox(worker)
+
+        assert worker._push_finished_blocks["r0"].handover
+
+    def test_a_record_not_released_is_not_marked(self):
+        # Marking says the writer has no more batches to make, which is only
+        # true once the offers are with it. Unmarked, the batch upstream makes
+        # ends nothing and the request waits for its own handover.
+        worker = self._worker()
+        _send(worker)  # `released` left False
+        meta = self._meta(pushes=["r0"])
+
+        worker._seal_at_handover(meta)
+
+        assert not isinstance(meta.push_finished_blocks["r0"], pw.OfferedBlocks)
+
+    def test_a_released_offer_is_not_marked_as_the_handover(self):
+        # The mark is what ends a request, so an offer that carried it would
+        # end one on a batch written before the handover was even queued --
+        # handing its blocks back while that write is still reading them.
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"]))
+
+        worker.release_early_offers()
+
+        _, blocks = worker._finished_blocks_inbox.get_nowait()
+        assert not blocks.handover
+
+    def test_a_request_cannot_hand_over_and_be_flushed_on_one_step(self):
+        # The guard refuses a list no live record claims, and the handover is
+        # the one list the engine cannot number once it has dropped the
+        # record. So the two sets have to stay apart, and the scheduler is what
+        # keeps them apart -- this stops where it does not.
+        worker = self._worker()
+        _send(worker, released=True)
+        meta = self._meta(pushes=["r0"])
+        meta.push_early_flush = {"r0"}
+
+        with pytest.raises(AssertionError):
+            worker._seal_at_handover(meta)
+
+    def test_the_handover_carries_the_number_of_the_record_it_ends(self):
+        # The guard refuses a list whose number no live record claims, so a
+        # handover stamped with anything else is dropped -- and the request it
+        # was the last list of never ends.
+        worker = self._worker()
+        _send(worker, released=True)
+        meta = self._meta(pushes=["r0"])
+
+        worker._seal_at_handover(meta)
+
+        assert meta.push_finished_blocks["r0"].serial == worker._streamed["r0"].serial
+
+    def test_the_handover_offer_carries_no_token_count(self):
+        # `_stream_window` reads the length of a list that carries no count,
+        # and a count instead would shorten the window the handover exists to
+        # cover -- leaving the consumer short of the prompt's tail.
+        worker = self._worker()
+        meta = self._meta(pushes=["r0"])
+        _send(worker, released=True)
+
+        worker._seal_at_handover(meta)
+
+        assert meta.push_finished_blocks["r0"].offered_tokens == 0
+
+    def test_a_list_from_before_a_re_prefill_is_refused_whole(self):
+        # The record is back, so "is there a record" says yes. Only the number
+        # says this list belongs to the incarnation whose blocks are gone. And
+        # a refusal must leave no trace: a count raised here would make the
+        # live incarnation wait for a batch nobody will ever record.
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"]))
+        worker.release_early_offers()
+        _, stale = worker._finished_blocks_inbox.get_nowait()
+        worker.flush_early_sends({"r0"})
+        worker.start_early_push(self._meta(saves=["r0"]))
+        # The new incarnation offers too, or `released` stays False and the
+        # count below would read 0 whatever the guard did.
+        worker.release_early_offers()
+        meta = TestPerShardWrite._meta(([1, 2],), ([3],))
+        meta.local_block_ids = stale
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 0
+        assert worker._streamed["r0"].issued == 0
+
+    def test_a_flat_block_list_is_refused_where_it_is_built(self):
+        # Upstream rebuilds a flat list as a plain tuple of one group, and the
+        # number rides on the subclass -- so a lost number reads as "not ours"
+        # and the writer's guard waves it through. Refused at construction,
+        # where it is loud. The empty group below is the other side: a sliding
+        # window offers `[]` for the group it does not count.
+        pw.OfferedBlocks(([], [4, 5]), 0, 7)
+
+        with pytest.raises(RuntimeError, match="grouped per KV cache group"):
+            pw.OfferedBlocks([1, 2, 3], 0, 7)
+
+    def test_a_batch_is_filed_on_the_record_it_was_authorised_against(self):
+        # The descriptors are built with the lock down, so a flush can drop the
+        # record and a re-prefill install another before the handles are filed.
+        # Filed on whatever sits under the id then, the dead incarnation's
+        # batch would land on the live one and could end it before its own
+        # writes do.
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"]))
+        worker.release_early_offers()
+        _, live = worker._finished_blocks_inbox.get_nowait()
+        meta = TestPerShardWrite._meta(([1, 2],), ([3],))
+        meta.local_block_ids = live
+
+        def _re_prefill_mid_batch(*args, **kwargs):
+            worker._streamed["r0"] = pw._StreamedSend(released=True)
+            return 7
+
+        worker.nixl_wrapper.make_prepped_xfer.side_effect = _re_prefill_mid_batch
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert worker._streamed["r0"].transfers == []
+        # One handle per paired peer, and both belong to the dead incarnation.
+        assert worker._sending_transfers["r0"] == [7, 7]
+
+    def test_a_list_the_engine_still_owns_is_not_refused(self):
+        # The guard's other side: refusing too much is as wrong as refusing
+        # too little. The count rising is what says the guard let it past.
+        worker = self._worker()
+        worker.start_early_push(self._meta(saves=["r0"]))
+        worker.release_early_offers()
+        _, live = worker._finished_blocks_inbox.get_nowait()
+        meta = TestPerShardWrite._meta(([1, 2],), ([3],))
+        meta.local_block_ids = live
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert worker._streamed["r0"].issued == 1
+
+    def test_a_parked_list_writes_nothing_once_its_request_is_flushed(self):
+        # A parked list becomes a batch when the consumer's registration
+        # arrives, and the eviction the flush queues only reaches the writer on
+        # its next turn -- the registration can win that race. The list has read
+        # no block yet, so it is refused where bytes leave rather than waited for.
+        worker = self._two_offers_parked()
+        parked = worker._push_finished_blocks["r0"]
+        worker.flush_early_sends({"r0"})
+
+        meta = TestPerShardWrite._meta(([1, 2],), ([3],))
+        meta.local_block_ids = parked
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 0
+
+    def test_the_early_flush_settles_a_folded_offer_without_waiting(
+        self, monkeypatch, caplog
+    ):
+        # An offer that folded never became a batch, so the writer has
+        # nothing to record for it. Counting the lists instead would end the
+        # wait only at the deadline, whose warning says a batch was lost.
+        worker = self._two_offers_parked()
+        setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=0.0)
+
+        with caplog.at_level(logging.WARNING):
+            worker.flush_early_sends({"r0"})
+
+        assert "without recording it" not in caplog.text
+
     def test_the_offer_carries_the_device_work_that_wrote_it(self, monkeypatch):
         # Nothing else names when those blocks stop being written: the runtime's
         # transfer wait covers pending transfers, not compute.
@@ -1529,20 +1743,22 @@ class TestEarlySend:
         # One batch, one handle per overlapping peer rank.
         assert worker._streamed["r0"].transfers == [[ANY, ANY]]
 
-    def test_the_handover_is_the_last_batch_and_seals_the_count(self, monkeypatch):
+    def test_the_handover_is_marked_on_the_list_upstream_will_park(self, monkeypatch):
         # The request appearing here IS the engine saying it is over. It is one
         # more batch, not a duplicate: what was streamed is the prefix a
-        # prefill closed, and a prompt's last block is closed by nothing.
+        # prefill closed, and a prompt's last block is closed by nothing. The
+        # mark goes on the list because that is what upstream parks, and the
+        # blocks have to read back unchanged for its own readers.
         monkeypatch.setattr(
             NixlPushConnectorWorker, "start_load_kv", lambda self, metadata: None
         )
         worker = self._worker()
-        _send(worker, released=True, queued=2)
+        _send(worker, released=True)
         meta = self._meta(pushes=["r0"])
 
         worker.start_load_kv(meta)
 
-        assert worker._streamed["r0"].expected == 3
+        assert meta.push_finished_blocks["r0"].handover
         assert meta.push_finished_blocks == {"r0": ([1, 2],)}
 
     def test_the_handover_does_not_publish_what_upstream_could_report(
@@ -1574,7 +1790,7 @@ class TestEarlySend:
 
         worker.start_load_kv(meta)
 
-        assert meta.push_finished_blocks == {"r1": ([1, 2],)}
+        assert not isinstance(meta.push_finished_blocks["r1"], pw.OfferedBlocks)
 
     def test_the_writer_count_is_the_one_the_handover_would_have_sent(self):
         # Guard: an early write is the same one write the handover would have
@@ -1619,6 +1835,84 @@ class TestFlushEarlySends:
         w.nixl_wrapper.check_xfer_state.side_effect = states
         return w
 
+    def test_taking_waits_out_the_whole_budget_not_a_share_of_it(
+        self, monkeypatch, caplog
+    ):
+        # Giving up drops the record, and a batch the writer records after
+        # that is one nobody drains -- it goes to upstream, which reports a
+        # request this side held back. So a take stops at the latest the
+        # budget allows, however many requests are sharing it.
+        worker = self._worker(None)
+        bound = 0.04
+        setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=bound)
+        # Past a quarter of the budget, which is all a share of four would be,
+        # and well inside the whole of it -- the widest band on either side.
+        settles_at = int(0.6 * bound / pw._EARLY_FLUSH_POLL_INTERVAL_S)
+        polls = 0
+
+        class _SettlesLate(dict):
+            def get(self, key, default=None):
+                nonlocal polls
+                send = super().get(key, default)
+                if key == "r0":
+                    polls += 1
+                    if polls >= settles_at and send is not None:
+                        send.transfers = [[7]]
+                return send
+
+        _send(worker, "r0", released=True, issued=1, transfers=[])
+        # Settled already, so only `r0` decides what is logged and released.
+        for req_id, handle in (("r1", 8), ("r2", 9), ("r3", 10)):
+            _send(worker, req_id, released=True, issued=1, transfers=[[handle]])
+        worker._streamed = _SettlesLate(worker._streamed)
+
+        with caplog.at_level(logging.WARNING):
+            worker.flush_early_sends({"r0", "r1", "r2", "r3"})
+
+        # On half the budget `r0` is dropped before it settles, and warns.
+        assert "without recording it" not in caplog.text
+
+    def test_draining_shares_the_budget_out_and_spends_it_once(self, monkeypatch):
+        # Draining is where the budget is divided: a request holding many
+        # handles must not leave the rest of the call releasing theirs on one
+        # probe, and the call must still cost one budget rather than one each.
+        worker = self._worker(None)
+        worker.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        for req_id, handle in (("r0", 7), ("r1", 8), ("r2", 9)):
+            _send(worker, req_id, released=True, transfers=[[handle]])
+        bound = 0.03
+        setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=bound)
+
+        worker.flush_early_sends({"r0", "r1", "r2"})
+
+        probed = [
+            c.args[0] for c in worker.nixl_wrapper.check_xfer_state.call_args_list
+        ]
+        counts = [probed.count(h) for h in (7, 8, 9)]
+        # Taken first-come, one handle gets them all and the rest one probe.
+        assert max(counts) - min(counts) <= max(counts) // 2
+        # A budget each would cost three times this many probes.
+        assert len(probed) < 2 * bound / pw._EARLY_FLUSH_POLL_INTERVAL_S
+
+    def test_one_flush_spends_one_budget_however_many_handles(self, monkeypatch):
+        # The bound belongs to the call, not to each handle. A request holds a
+        # handle per batch per peer, and what brings a flush here is what makes
+        # every one of them wait the whole bound -- so per handle the engine
+        # thread pays it multiplied by a number nothing here bounds.
+        worker = self._worker(None)
+        worker.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        _send(worker, transfers=[[7, 8, 9]])
+        setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=0.02)
+
+        worker.flush_early_sends({"r0"})
+
+        # The first handle spends it; the rest are released on one probe.
+        probed = [
+            call.args[0] for call in worker.nixl_wrapper.check_xfer_state.call_args_list
+        ]
+        assert probed.count(8) == 1
+        assert probed.count(9) == 1
+
     def test_a_held_offer_is_dropped_rather_than_sent_later(self):
         # Its blocks go back to the allocator now; releasing the offer at the
         # next step would write into whatever took them.
@@ -1642,9 +1936,9 @@ class TestFlushEarlySends:
 
     def test_a_batch_issued_but_not_yet_recorded_is_waited_for(self):
         # The writer issues a batch before it records it, so a send read
-        # between the two looks idle. `queued` is what says otherwise.
+        # between the two looks idle. `issued` is what says otherwise.
         worker = self._worker(["DONE", "DONE"])
-        send = _send(worker, queued=2)
+        send = _send(worker, issued=2)
 
         def record_late():
             time.sleep(pw._EARLY_FLUSH_POLL_INTERVAL_S * 2)
@@ -1660,7 +1954,7 @@ class TestFlushEarlySends:
         assert worker.nixl_wrapper.release_xfer_handle.call_count == 2
         assert worker._streamed == {}
 
-    def test_a_batch_the_writer_finished_counts_toward_what_it_queued(
+    def test_a_batch_the_writer_finished_counts_toward_what_it_issued(
         self, monkeypatch, caplog
     ):
         # The writer moves a batch to `done` where it left no handle in flight,
@@ -1669,7 +1963,7 @@ class TestFlushEarlySends:
         # and then says the blocks are going back under a live write.
         setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=0.05)
         worker = self._worker(["DONE"])
-        _send(worker, queued=2, done=1)
+        _send(worker, issued=2, done=1)
 
         with caplog.at_level(logging.WARNING):
             worker.flush_early_sends({"r0"})
@@ -1683,7 +1977,7 @@ class TestFlushEarlySends:
         # with a write still reading them.
         setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=0.0)
         worker = self._worker(["DONE"])
-        _send(worker, queued=2)
+        _send(worker, issued=2)
 
         worker.flush_early_sends({"r0"})
 
@@ -2192,10 +2486,9 @@ class TestSettleOnCoverage:
 
 
 class TestABatchThatSendsNothing:
-    """A streamed request is reported when its landed batches reach the sealed
-    count, so a batch that issues no write still has to raise the count --
-    otherwise the request is one short of its seal forever and never
-    finishes."""
+    """A streamed request is reported once `done` reaches `issued`, so a batch
+    that issues no write still has to raise `done` -- otherwise `done` stays
+    one short of `issued` forever and the request never finishes."""
 
     @staticmethod
     def _worker():
@@ -2213,7 +2506,7 @@ class TestABatchThatSendsNothing:
 
         worker._xfer_blocks_for_req("r0", TestPerShardWrite._meta(([],), ([],)))
 
-        assert worker._streamed["r0"].done == 1
+        assert worker._streamed["r0"].done == worker._streamed["r0"].issued == 1
         assert worker.nixl_wrapper.make_prepped_xfer.call_count == 0
 
     def test_every_peer_failing_still_counts(self):
@@ -2261,12 +2554,33 @@ class TestSealedCompletion:
             NixlPushConnectorWorker, "get_finished", lambda self: (set(), set())
         )
 
+    def test_a_request_upstream_reported_leaves_no_record_and_no_handle(
+        self, monkeypatch
+    ):
+        # The lease is timed, so it falls due whatever the writer is doing,
+        # and a batch can be in flight when the record goes. Its handles go
+        # with it, and teardown reclaims what a record still holds.
+        monkeypatch.setattr(
+            NixlPushConnectorWorker, "get_finished", lambda self: ({"r0"}, set())
+        )
+        setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=0.0)
+        # Still writing: a landed batch would be released by the seal scan
+        # anyway, which would let this pass without the drop.
+        worker = self._worker(None)
+        worker.nixl_wrapper.check_xfer_state.return_value = "PROC"
+        _send(worker, transfers=[[7]], issued=1)
+
+        worker.get_finished()
+
+        assert "r0" not in worker._streamed
+        worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
+
     def test_a_landed_batch_is_not_reported_before_the_seal(self, monkeypatch):
         # The engine has not finished the request, so its blocks must not be
         # freed however much of its KV is already across.
         self._upstream_reports_nothing(monkeypatch)
         worker = self._worker(["DONE"])
-        _send(worker, transfers=[[7]], queued=1)
+        _send(worker, transfers=[[7]], issued=1)
 
         done_sending, _ = worker.get_finished()
 
@@ -2277,9 +2591,9 @@ class TestSealedCompletion:
     ):
         self._upstream_reports_nothing(monkeypatch)
         worker = self._worker(["DONE"])
-        _send(worker, transfers=[[7]], queued=1)
+        _send(worker, transfers=[[7]], issued=1)
         worker.get_finished()
-        worker._streamed["r0"].expected = 1
+        _send(worker, handover_written=True)
 
         done_sending, _ = worker.get_finished()
 
@@ -2290,7 +2604,12 @@ class TestSealedCompletion:
         # finish it.
         self._upstream_reports_nothing(monkeypatch)
         worker = self._worker(["DONE", "PROC", "DONE"])
-        _send(worker, transfers=[[7], [8]], queued=2, expected=2)
+        _send(
+            worker,
+            transfers=[[7], [8]],
+            issued=2,
+            handover_written=True,
+        )
 
         assert worker.get_finished()[0] == set()
 
@@ -2301,7 +2620,7 @@ class TestSealedCompletion:
         # retry finished before it had written anything.
         self._upstream_reports_nothing(monkeypatch)
         worker = self._worker(["DONE"])
-        _send(worker, transfers=[[7]], queued=1, expected=1)
+        _send(worker, transfers=[[7]], issued=1, handover_written=True)
         worker._reqs_to_send = {"r0": 1.0}
         worker._reqs_to_process = {"r0"}
         worker.consumer_notification_counts_by_req = {"r0": 1}
@@ -2325,8 +2644,8 @@ class TestSealedCompletion:
 
 
 class TestAStreamedSendThatLostAWrite:
-    """A batch raises the seal count whether or not its writes went out, so the
-    count alone reports a request whose KV never moved as sent -- freeing the
+    """A batch raises `issued` whether or not its writes went out, so the
+    counts alone report a request whose KV never moved as sent -- freeing the
     producer's blocks while the consumer is still waiting for them. The lease
     owns such a request instead."""
 
@@ -2358,7 +2677,7 @@ class TestAStreamedSendThatLostAWrite:
         worker = TestSealedCompletion._worker(["ERR"])
         # The failure path names this rank's own engine in its log line.
         worker.engine_id = "local"
-        _send(worker, transfers=[[7]], queued=1, expected=1)
+        _send(worker, transfers=[[7]], issued=1, handover_written=True)
         worker._reqs_to_send = {"r0": 1.0}
 
         done_sending, _ = worker.get_finished()
@@ -2369,7 +2688,13 @@ class TestAStreamedSendThatLostAWrite:
     def test_a_failed_send_is_left_to_its_lease(self, monkeypatch):
         TestSealedCompletion._upstream_reports_nothing(monkeypatch)
         worker = TestSealedCompletion._worker(["DONE"])
-        _send(worker, transfers=[[7]], queued=1, expected=1, failed=True)
+        _send(
+            worker,
+            transfers=[[7]],
+            issued=1,
+            handover_written=True,
+            failed=True,
+        )
         worker._reqs_to_send = {"r0": 1.0}
 
         done_sending, _ = worker.get_finished()
@@ -2658,7 +2983,9 @@ class TestStreamWindow:
         worker.block_size = 16
         worker._shard_chunk_grids = {("eng", 0): None}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 8)
+        meta.local_block_ids = pw.OfferedBlocks(
+            meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+        )
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -2673,7 +3000,9 @@ class TestStreamWindow:
         worker.block_size = 16
         worker._shard_chunk_grids = {("eng", 0): (2, 2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 8)
+        meta.local_block_ids = pw.OfferedBlocks(
+            meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+        )
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -2698,7 +3027,9 @@ class TestStreamWindow:
         worker._kv_split_axis = KVSplitAxis.NON_HEAD
         worker._shard_chunk_grids = {("eng", 0): (1, 2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 8)
+        meta.local_block_ids = pw.OfferedBlocks(
+            meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+        )
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -2719,7 +3050,9 @@ class TestStreamWindow:
         worker._kv_split_axis = KVSplitAxis.NON_HEAD
         worker._shard_chunk_grids = {("eng", 0): (1, 2)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 12)
+        meta.local_block_ids = pw.OfferedBlocks(
+            meta.local_block_ids, 3 * 16 + 12, worker._streamed["r0"].serial
+        )
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -2738,11 +3071,15 @@ class TestStreamWindow:
         worker._shard_chunk_grids = {("eng", 0): (2, 2)}
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        first.local_block_ids = pw.OfferedBlocks(first.local_block_ids, 3 * 16 + 8)
+        first.local_block_ids = pw.OfferedBlocks(
+            first.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+        )
         worker._xfer_blocks_for_req("r0", first)
 
         second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        second.local_block_ids = pw.OfferedBlocks(second.local_block_ids, 4 * 16)
+        second.local_block_ids = pw.OfferedBlocks(
+            second.local_block_ids, 4 * 16, worker._streamed["r0"].serial
+        )
         worker._xfer_blocks_for_req("r0", second)
 
         # Nothing goes whole in the second write: the only block it still owes
@@ -2765,15 +3102,48 @@ class TestStreamWindow:
         worker._valid_tokens = {"r0": 3 * 16 + 8}
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        first.local_block_ids = pw.OfferedBlocks(first.local_block_ids, 3 * 16 + 8)
+        first.local_block_ids = pw.OfferedBlocks(
+            first.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+        )
         worker._xfer_blocks_for_req("r0", first)
 
         second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        second.local_block_ids = pw.OfferedBlocks(second.local_block_ids, 4 * 16)
+        second.local_block_ids = pw.OfferedBlocks(
+            second.local_block_ids, 4 * 16, worker._streamed["r0"].serial
+        )
         worker._xfer_blocks_for_req("r0", second)
 
         # One transfer, the first batch's. The second names no descriptor.
         assert worker.nixl_wrapper.make_prepped_xfer.call_count == 1
+
+    def test_a_closing_batch_that_owes_only_a_chunk_names_no_whole_block(self):
+        # Four chunks a block. The first batch took the two the offer had
+        # filled, so the handover owes the third and its block never closes:
+        # nothing goes whole and the block list is empty. The cut has to take
+        # the block from the piece, not from the list's last element.
+        worker = self._worker(total=4)
+        worker.block_size = 16
+        set_shape(worker, chunk_mode=True)
+        worker._shard_chunk_grids = {("eng", 0): (2, 4)}
+        worker._valid_tokens = {"r0": 3 * 16 + 12}
+
+        first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        first.local_block_ids = pw.OfferedBlocks(
+            first.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+        )
+        worker._xfer_blocks_for_req("r0", first)
+
+        second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
+        second.local_block_ids = pw.OfferedBlocks(
+            second.local_block_ids, 0, worker._streamed["r0"].serial
+        )
+        worker._xfer_blocks_for_req("r0", second)
+
+        assert worker.nixl_wrapper.make_prepped_xfer.call_count == 2
+        descs = worker.nixl_wrapper.make_prepped_xfer.call_args.args[2]
+        whole = 2 * worker.num_blocks
+        assert all(d >= whole for d in descs)
+        assert len(descs) == 2 * 2  # 2 regions x 2 heads x 1 chunk
 
     def test_streaming_alone_stops_the_closing_batch_at_the_same_place(self):
         # The same two batches with the knob off: streaming reaches the chunk
@@ -2787,11 +3157,15 @@ class TestStreamWindow:
         worker._valid_tokens = {"r0": 3 * 16 + 8}
 
         first = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        first.local_block_ids = pw.OfferedBlocks(first.local_block_ids, 3 * 16 + 8)
+        first.local_block_ids = pw.OfferedBlocks(
+            first.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+        )
         worker._xfer_blocks_for_req("r0", first)
 
         second = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        second.local_block_ids = pw.OfferedBlocks(second.local_block_ids, 4 * 16)
+        second.local_block_ids = pw.OfferedBlocks(
+            second.local_block_ids, 4 * 16, worker._streamed["r0"].serial
+        )
         worker._xfer_blocks_for_req("r0", second)
 
         assert worker.nixl_wrapper.make_prepped_xfer.call_count == 1
@@ -2826,7 +3200,9 @@ class TestStreamWindow:
         worker.block_size = 16
         worker._shard_chunk_grids = {("eng", 0): (heads, gpb)}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5, 6, 7],))
-        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 49)
+        meta.local_block_ids = pw.OfferedBlocks(
+            meta.local_block_ids, 49, worker._streamed["r0"].serial
+        )
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -2873,7 +3249,9 @@ class TestStreamWindow:
         # a range that rounds the wrong way land on the same boundary.
         for tokens in [*range(6, 4 * 16, 6), 4 * 16, 0]:
             meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5, 6, 7],))
-            meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, tokens)
+            meta.local_block_ids = pw.OfferedBlocks(
+                meta.local_block_ids, tokens, worker._streamed["r0"].serial
+            )
             worker.nixl_wrapper.make_prepped_xfer.reset_mock()
             worker._xfer_blocks_for_req("r0", meta)
             for call in worker.nixl_wrapper.make_prepped_xfer.call_args_list:
@@ -2926,7 +3304,9 @@ class TestStreamWindow:
         worker.block_size = 16
         worker._shard_chunk_grids = {("eng", 0): (2, 2), ("eng", 1): second}
         meta = TestPerShardWrite._meta(([0, 1, 2, 3],), ([4, 5],))
-        meta.local_block_ids = pw.OfferedBlocks(meta.local_block_ids, 3 * 16 + 8)
+        meta.local_block_ids = pw.OfferedBlocks(
+            meta.local_block_ids, 3 * 16 + 8, worker._streamed["r0"].serial
+        )
 
         worker._xfer_blocks_for_req("r0", meta)
 
@@ -3011,14 +3391,38 @@ class TestStreamWindow:
 
         assert self._sent(worker) == [[1, 2]]
 
-    def test_a_record_not_released_is_not_counted(self):
-        worker = TestEarlySend._worker()
-        _send(worker)  # `released` left False, as an unreleased offer is
+    def test_a_batch_raises_the_writer_s_count_and_carries_the_mark(self):
+        # The count and the mark are the writer's, and this is where a batch
+        # begins. Seeding them in a test would leave the wiring from a real
+        # batch to either one pinned by nothing.
+        worker = self._worker(total=4)
+        _send(worker, released=True)
+        meta = TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
 
-        worker._seal_at_handover(SimpleNamespace(push_finished_blocks={"r0": ([1],)}))
-
+        worker._xfer_blocks_for_req("r0", meta)
         send = worker._streamed["r0"]
-        assert (send.queued, send.expected) == (0, None)
+        assert (send.issued, send.handover_written) == (1, False)
+
+        meta = TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
+        meta.local_block_ids = pw.OfferedBlocks(
+            meta.local_block_ids, 0, worker._streamed["r0"].serial, handover=True
+        )
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert (send.issued, send.handover_written) == (2, True)
+
+    def test_a_batch_for_an_unreleased_record_is_not_the_writer_s(self):
+        # A record exists from `start_early_push` until the next step's
+        # release, and a list reaching the writer inside that window would
+        # leave a count nothing can meet: `_submit_writes` files only a
+        # released request. Upstream's ordering keeps the window shut today.
+        worker = self._worker(total=4)  # the record it makes is not released
+
+        worker._xfer_blocks_for_req(
+            "r0", TestPerShardWrite._meta(([0, 1, 2],), ([4, 5],))
+        )
+
+        assert worker._streamed["r0"].issued == 0
 
 
 class TestRegistrationSurvivesEitherArrival:

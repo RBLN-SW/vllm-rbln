@@ -222,7 +222,10 @@ class RblnNixlPushConnector(
         that forward has not retired at this point: the model call this step is
         about to make is what it retires behind. Held so the release sits past
         that call.
+
+        The assert holds for the same reason as the read side's.
         """
+        assert self._deferred_load_meta is None
         self._deferred_load_meta = self._connector_metadata
 
     def flush_deferred_load(self) -> None:

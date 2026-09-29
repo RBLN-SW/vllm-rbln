@@ -318,6 +318,16 @@ class TestEarlyWriteWiring:
 
         return build
 
+    def test_a_second_hold_without_a_flush_stops(self, push_worker_connector):
+        # The pull side has the same guard; this pins that the write side did
+        # not skip it, which is what the suite would otherwise not notice.
+        connector = push_worker_connector()
+        connector._connector_metadata = "META"
+        connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+
+        with pytest.raises(AssertionError):
+            connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+
     def test_the_host_copy_runs_before_the_write_is_offered(
         self, monkeypatch, push_worker_connector
     ):

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import queue
 import threading
 import time
@@ -63,6 +64,13 @@ logger = init_logger(__name__)
 Span = tuple[int, int]
 
 
+#: Numbers `_StreamedSend` records so a list can name the one it was built
+#: for. Only equality means anything, and only inside one worker: a record is
+#: built on every step and thrown away where the request already has one, so
+#: the numbers a live record holds are sparse.
+_send_serials = itertools.count()
+
+
 class OfferedBlocks(tuple):
     """A released offer's block list, carrying the tokens it was built for.
 
@@ -77,10 +85,40 @@ class OfferedBlocks(tuple):
     """
 
     offered_tokens: int
+    #: Whether this is the handover, the last list the writer sees for this
+    #: request. Upstream's writer parks an unmatched list in
+    #: `_push_finished_blocks` by assignment, so a later one replaces an earlier
+    #: and the one put last is what a fold keeps. The batch carrying it is the
+    #: last batch, which ends the request where a count cannot.
+    handover: bool
+    #: Which `_StreamedSend` this list was built for. The engine drops that
+    #: record when the blocks are about to be reused, so a list whose number no
+    #: live record carries is one the writer must not send.
+    serial: int
 
-    def __new__(cls, groups: "BlockIds", offered_tokens: int) -> "OfferedBlocks":
+    def __new__(
+        cls,
+        groups: "BlockIds",
+        offered_tokens: int,
+        serial: int,
+        *,
+        handover: bool = False,
+    ) -> "OfferedBlocks":
+        if groups and not isinstance(groups[0], (list, tuple)):
+            # Upstream rebuilds a flat list as a plain tuple of one group
+            # (`_as_grouped_block_ids`), which drops these attributes -- and a
+            # lost `serial` looks like a list this side never stamped, which
+            # the writer's guard waves through.
+            # Refused rather than asserted: `-O` would restore the silent loss.
+            raise RuntimeError(
+                "RBLN NIXL push: an offered block list is grouped per KV cache "
+                f"group, and this one starts with {type(groups[0]).__name__}; "
+                "upstream would regroup it and drop what rides on it."
+            )
         self = super().__new__(cls, groups)
         self.offered_tokens = offered_tokens
+        self.handover = handover
+        self.serial = serial
         return self
 
 
@@ -115,15 +153,16 @@ class _StreamedSend:
 
     One record on the request id rather than a map per field. The fields are
     written at different points of a single lifetime -- offered, released to
-    the writer, issued, sealed, landed -- and there is no state in which only
+    the writer, issued, marked, landed -- and there is no state in which only
     some of them should exist, which is why ending it used to mean remembering
     to drop the request from all eight.
 
     Which thread writes which: `issued_hwm` and `issued_chunks` are the
-    writer's. `released`, `transfers`, `done` and `failed` cross between the
-    two, and every access to those is under `_sending_transfers_lock`. `total`
-    crosses unlocked -- every write of it is the same value, so the writer
-    cannot read a half-formed one. The rest is the engine thread's.
+    writer's. `released`, `transfers`, `issued`, `done`, `handover_written`
+    and `failed` cross between the two, and every access to those is under
+    `_sending_transfers_lock`. `total` crosses unlocked, every write of it
+    being the same value; `serial` never changes once the record is built. The
+    three `pending_offer` fields are the engine thread's.
     """
 
     # Blocks this rank has closed, held for the next step to hand over. None
@@ -146,13 +185,20 @@ class _StreamedSend:
     # the scheduler frees a request's blocks on that report unconditionally,
     # and this one is still prefilling.
     transfers: list[list[int]] = field(default_factory=list)
-    # Batches handed to the writer, and batches whose writes have landed.
-    queued: int = 0
+    # Batches the writer has begun, and batches whose writes have landed.
+    # Both count the writer's batches; what the engine handed over is not one
+    # -- see `OfferedBlocks.handover`.
+    issued: int = 0
     done: int = 0
-    # How many batches the request will have, once the engine says it is over.
-    # None until then: an unsealed request is never finished, however many of
-    # its batches have landed.
-    expected: int | None = None
+    # Which incarnation of the request this record belongs to. A list carries
+    # the number of the record it was built for, and the writer refuses a list no
+    # live record claims -- which is how a request that was flushed and then
+    # re-prefilled is told apart from the lists made before it.
+    serial: int = field(default_factory=lambda: next(_send_serials))
+    # Whether the batch carrying the handover has begun. The handover is the
+    # last list, so this says the writer has no more batches to make --
+    # see `OfferedBlocks.handover`.
+    handover_written: bool = False
     # Whether a peer's write was lost. The counts above cannot carry it: a
     # batch that never left still has to raise them.
     failed: bool = False
@@ -292,30 +338,38 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             if not sum(len(group) for group in meta.local_block_ids):
                 self._empty_receives.add(req_id)
 
-    def _seal_at_handover(self, metadata: "NixlConnectorMetadata") -> None:
-        """Fix how many batches a request written early will have.
+    def _seal_at_handover(self, metadata: "RblnNixlConnectorMetadata") -> None:
+        """Mark the handover, which is the last list the writer will see.
 
         Its arrival in `push_finished_blocks` IS the engine saying the request
-        is over, so nothing further will be handed to the writer for it.
-
-        The handover is one of those batches, not a duplicate of them. What was
+        is over. It is one more list, not a duplicate of the offers. What was
         streamed is the prefix of blocks a prefill CLOSED, and a prompt's last
         block is closed by nothing -- its tokens end mid-block. The handover
         carries the whole list, so it covers that tail, and the writer sends
         only the part past what it already wrote.
 
-        Runs before the call that hands the same metadata to the writer, whose
-        landed count would otherwise pass a total not yet set. Sealed rather
-        than published: upstream reports a request finished once the handles it
-        can see have landed, and this step's batch is not one of them.
+        Runs before the call that hands the same metadata to the writer, which
+        puts these very objects in its inbox. Marked rather than
+        published: upstream reports a request finished once the handles it can
+        see have landed, and this step's batch is not one of them.
         """
         with self._sending_transfers_lock:
-            for req_id in metadata.push_finished_blocks:
+            # A request whose blocks are going back cannot also be handing
+            # them over, and the writer's guard is only complete while that
+            # holds: a handover for a request the engine has already forgotten
+            # carries no serial, and the guard lets an unstamped list through.
+            assert not (
+                metadata.push_early_flush & metadata.push_finished_blocks.keys()
+            ), sorted(metadata.push_early_flush & metadata.push_finished_blocks.keys())
+            for req_id, blocks in list(metadata.push_finished_blocks.items()):
                 send = self._streamed.get(req_id)
                 if send is None or not send.released:
                     continue
-                send.queued += 1
-                send.expected = send.queued
+                # Marked on the list because that is what survives the fold,
+                # riding through the parking to the batch that carries it.
+                metadata.push_finished_blocks[req_id] = OfferedBlocks(
+                    blocks, 0, send.serial, handover=True
+                )
 
     def start_early_push(self, metadata: "RblnNixlConnectorMetadata") -> None:
         """Hold the prefill this stage has just closed, for the writer.
@@ -357,7 +411,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         behind, so the wait is a check rather than a stall, and ahead of the
         handover, so a request whose handover lands on this step is written by
         its offer too. Every offer goes on the step that reaches here --
-        `_seal_at_handover` counts only what has been released.
+        `_seal_at_handover` marks only what has been released.
 
         What guarantees a next step: an unfinished request keeps the engine
         stepping, and a finished one keeps it stepping on the connector's
@@ -365,7 +419,13 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         Suspect a held offer if a request ever stalls with its KV never arriving.
         """
         offers = [
-            (req_id, send, OfferedBlocks(send.pending_offer, send.pending_offer_tokens))
+            (
+                req_id,
+                send,
+                OfferedBlocks(
+                    send.pending_offer, send.pending_offer_tokens, send.serial
+                ),
+            )
             for req_id, send in self._streamed.items()
             if send.pending_offer is not None
         ]
@@ -381,7 +441,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             send.pending_offer = None
             send.pending_offer_tokens = 0
             send.pending_offer_done = None
-            send.queued += 1
             self._finished_blocks_inbox.put((req_id, block_ids))
         self._push_writer_wake.set()
 
@@ -392,34 +451,48 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         and complete; cancelling would leave the consumer a torn block. Wait
         for them instead -- bounded, because this runs on the engine main
         thread. Nothing here is reported as finished_sending: a preempted
-        request re-prefills into these blocks, and an aborted one is gone from
-        the scheduler, which asserts on a report for a request it does not
-        hold.
+        request re-prefills into these blocks, an aborted one is gone from the
+        scheduler, and one whose lease expired was reported by upstream --
+        and the scheduler asserts on a report for a request it does not hold.
         """
-        drained = False
-        for req_id in req_ids:
-            handles = self._take_early_handles(req_id)
+        if not req_ids:
+            return
+        # One budget of waiting for the call, not one per handle -- a request
+        # holds a handle per batch per peer. Taking gets the whole of it, for
+        # the reason `_take_early_handles` gives; draining divides what that
+        # left, which is nothing when a take spent it. Ordered, so the one
+        # request whose take can spend it is picked the same way twice.
+        budget_end = time.perf_counter() + _EARLY_FLUSH_DRAIN_TIMEOUT_S
+        left = sorted(req_ids)
+        for i, req_id in enumerate(left):
+            handles = self._take_early_handles(req_id, budget_end)
+            now = time.perf_counter()
+            share = now + (budget_end - now) / (len(left) - i)
             for handle in handles:
-                self._drain_early_handle(req_id, handle)
+                self._drain_early_handle(req_id, handle, share)
             self._evict_finished_inbox.put(req_id)
-            drained = True
-        if drained:
-            self._push_writer_wake.set()
+        self._push_writer_wake.set()
 
-    def _take_early_handles(self, req_id: ReqId) -> list[int]:
+    def _take_early_handles(self, req_id: ReqId, deadline: float) -> list[int]:
         """This request's handles, once the writer has recorded every batch.
 
         A batch is issued before it is recorded, so a send read between the two
         looks like it has nothing in flight and the blocks go back while that
-        write is still reading them. `queued` counts what the engine handed
-        over and the writer moves each batch into `transfers` or `done`, so
-        waiting for those to meet closes the window.
+        write is still reading them. `issued` counts the batches the writer
+        began and the writer moves each into `transfers` or `done`, so waiting
+        for those to meet closes that window. Nothing waits for a list that has not
+        become a batch: those have read no block yet, and the guard in
+        `_xfer_blocks_for_req` stops them ever doing so.
+
+        The deadline is the flush's whole budget, not a share of it. Giving
+        up here drops the record, and a batch the writer records after that is
+        one nobody drains -- so the latest the budget allows is the right
+        moment to stop, for every request in the call.
         """
-        deadline = time.perf_counter() + _EARLY_FLUSH_DRAIN_TIMEOUT_S
         while True:
             with self._sending_transfers_lock:
                 send = self._streamed.get(req_id)
-                settled = send is None or len(send.transfers) + send.done >= send.queued
+                settled = send is None or len(send.transfers) + send.done >= send.issued
                 if settled or time.perf_counter() >= deadline:
                     handles = (
                         [h for batch in send.transfers for h in batch] if send else []
@@ -427,23 +500,23 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     self._forget_send(req_id)
                     if not settled:
                         logger.warning(
-                            "RBLN NIXL push: the writer has issued a batch of "
-                            "request %s without recording it after %.1fs; its "
-                            "blocks are about to be reused.",
+                            "RBLN NIXL push: the writer has issued a batch "
+                            "of request %s without recording it inside this "
+                            "flush's %.1fs; its blocks are about to be reused.",
                             req_id,
                             _EARLY_FLUSH_DRAIN_TIMEOUT_S,
                         )
                     return handles
             time.sleep(_EARLY_FLUSH_POLL_INTERVAL_S)
 
-    def _drain_early_handle(self, req_id: ReqId, handle: int) -> None:
-        deadline = time.perf_counter() + _EARLY_FLUSH_DRAIN_TIMEOUT_S
+    def _drain_early_handle(self, req_id: ReqId, handle: int, deadline: float) -> None:
         while self.nixl_wrapper.check_xfer_state(handle) == "PROC":
             if time.perf_counter() >= deadline:
                 logger.warning(
                     "RBLN NIXL push: early write for request %s still in "
-                    "flight after %.1fs; releasing it and letting the step "
-                    "go on. The blocks it reads are about to be reused.",
+                    "flight when this flush's %.1fs ran out; releasing it and "
+                    "letting the step go on. The blocks it reads are about to "
+                    "be reused.",
                     req_id,
                     _EARLY_FLUSH_DRAIN_TIMEOUT_S,
                 )
@@ -653,6 +726,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         for req_id in done_recving:
             self._coverage_by_req.pop(req_id, None)
             self._coverage_units_by_req.pop(req_id, None)
+        # Upstream reports a request on its own only when it wrote the
+        # whole thing or the lease gave up on the consumer, and the lease is
+        # timed: it can fall due mid-batch. So the blocks go back here as they
+        # do on a preemption, and nothing below may report the request again.
+        self.flush_early_sends(done_sending & self._streamed.keys())
         sealed_done = self._finish_sealed_requests()
         if sealed_done:
             # Upstream drops the writer's state for what it reports itself,
@@ -678,7 +756,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
         Checked every step rather than only when a batch lands: a request
         whose batches all landed before the engine finished it is completed by
-        the seal, not by a completion.
+        the mark, not by a completion.
         """
         finished: set[ReqId] = set()
         with self._sending_transfers_lock:
@@ -693,7 +771,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 send.transfers = still_going
 
             for req_id, send in list(self._streamed.items()):
-                if send.expected is None or send.done < send.expected:
+                if not send.handover_written:
+                    continue
+                if send.done < send.issued:
                     continue
                 # A send that lost a write keeps its lease instead -- see
                 # `_handle_failed_transfer`.
@@ -719,8 +799,33 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         Runs on the writer thread, which is also where upstream writes
         `_engine_last_active` and runs the eviction sweep on this path, so the
         touch below needs no lock. Handles go out under the sending lock.
+
+        Bytes leave only from here, so this is where a list the engine has
+        already given up on is refused. The refusal, the count and the record the
+        route is chosen from share one acquisition: taken apart, a flush could
+        settle between them and the write go out for a re-prefilling request.
+
+        The writer's count rises here rather than where the handles are
+        recorded, which is the window `_take_early_handles` waits through. The
+        `released` guard keeps this accounting off a request upstream writes
+        in one go.
         """
         assert meta.remote is not None and self.transfer_topo is not None
+        with self._sending_transfers_lock:
+            send = self._streamed.get(req_id)
+            serial = getattr(meta.local_block_ids, "serial", None)
+            if serial is not None and (send is None or send.serial != serial):
+                # Built for a record the engine has dropped, or for an earlier
+                # incarnation of this request. Its blocks hold something else
+                # now. Upstream's eviction takes the parked list and the
+                # registration with it.
+                return
+            streamed = send if send is not None and send.released else None
+            if streamed is not None:
+                streamed.issued += 1
+                streamed.handover_written = streamed.handover_written or getattr(
+                    meta.local_block_ids, "handover", False
+                )
         engine_id = meta.remote.engine_id
         # Keep the engine off the staleness sweep: a swept peer loses the state
         # this path reads, and upstream refreshes it on the route it replaces.
@@ -740,8 +845,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 f"for {engine_id}, whose notification cannot name the part of "
                 "a request a chunked write fills"
             )
-            send = self._streamed.get(req_id)
-            if send is not None and send.released:
+            if streamed is not None:
                 # Streaming asks for the same state, and for the same reason
                 # is refused it where a sliding window is present: only the
                 # whole-engine list can name two KV cache groups. So this side
@@ -752,7 +856,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     f"is served by a whole-engine handle (peer {engine_id}), "
                     "which only a sliding window asks for."
                 )
-                return self._xfer_batch_over_engine_handle(req_id, meta, remote_info)
+                return self._xfer_batch_over_engine_handle(
+                    req_id, meta, remote_info, streamed
+                )
             tail: AbstractContextManager = (
                 self._tail_viewed_as(
                     self._valid_tokens.get(req_id),
@@ -840,7 +946,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             # Ordinary once an offer grows every step: a step that computes
             # tokens without closing a chunk leaves the window where it was.
             logger.debug("per-shard write req %s: nothing new to push", req_id)
-            return self._submit_writes(req_id, engine_id, notif_id, [])
+            return self._submit_writes(req_id, engine_id, notif_id, [], streamed)
 
         logger.debug(
             "per-shard write req %s: ranks=%d write_blocks=%d",
@@ -911,10 +1017,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 )
             )
 
-        self._submit_writes(req_id, engine_id, notif_id, writes)
+        self._submit_writes(req_id, engine_id, notif_id, writes, streamed)
 
     def _xfer_batch_over_engine_handle(
-        self, req_id: str, meta: "ReqMeta", remote_info: Any
+        self,
+        req_id: str,
+        meta: "ReqMeta",
+        remote_info: Any,
+        streamed: "_StreamedSend",
     ) -> None:
         """Write one batch of a streamed request over the whole-engine handle.
 
@@ -1012,7 +1122,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         )
         if not sum(len(g) for g in local_block_ids) and not pieces:
             logger.debug("streamed write req %s: nothing new to push", req_id)
-            return self._submit_writes(req_id, engine_id, notif_id, [])
+            return self._submit_writes(req_id, engine_id, notif_id, [], streamed)
 
         # Each side parks its own pieces: one call describes one list, and the
         # block ids in it are that side's.
@@ -1047,6 +1157,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     remote_descs,
                 )
             ],
+            streamed,
         )
 
     def _submit_writes(
@@ -1055,6 +1166,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         engine_id: str,
         notif_id: bytes,
         writes: "list[_Write]",
+        streamed: "_StreamedSend | None",
     ) -> None:
         """Issue this batch's transfers and account for what they produced.
 
@@ -1062,8 +1174,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         accounted for the same way whichever built it. Failure is per peer, not
         per request: the peers that submitted are still writing.
 
-        An empty batch is a batch too. A streamed request is finished by its
-        count reaching the seal, so one that never counts never finishes.
+        An empty batch is a batch too: a streamed request ends only once every
+        batch the writer began has landed, so a batch that never lands leaves
+        the request unfinished.
         """
         handles: list[int] = []
         for write in writes:
@@ -1101,19 +1214,24 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 self.xfer_stats.record_failed_transfer()
 
         with self._sending_transfers_lock:
-            send = self._streamed.get(req_id)
-            if send is not None and send.released:
+            # The record this batch was authorised against, not whatever sits
+            # under the id now: a flush can drop it and a re-prefill install
+            # another while the descriptors are being built, and accounting a
+            # dead incarnation's batch onto the live one ends it early.
+            if streamed is not None and self._streamed.get(req_id) is streamed:
                 # A peer that never submitted leaves a hole no later batch
                 # fills.
-                send.failed = send.failed or len(handles) < len(writes)
+                streamed.failed = streamed.failed or len(handles) < len(writes)
                 if handles:
-                    send.transfers.append(handles)
+                    streamed.transfers.append(handles)
                 else:
-                    # A batch that issued nothing is over where it stands, and
-                    # a request whose count never reaches its seal never
-                    # finishes.
-                    send.done += 1
+                    # A batch that issued nothing is over where it stands.
+                    streamed.done += 1
             elif writes:
+                # No live record: either upstream owns this request, or a
+                # flush gave up on it past its deadline. Filed here either
+                # way -- these handles are in flight, and upstream's map is
+                # what releases them.
                 self._sending_transfers[req_id].extend(handles)
 
     def _stream_window(
