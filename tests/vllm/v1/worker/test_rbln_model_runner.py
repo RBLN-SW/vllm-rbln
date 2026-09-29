@@ -30,7 +30,7 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -514,9 +514,14 @@ class TestSelectCanonicalKvLayersPerPool:
         return r
 
     @staticmethod
-    def _cfg(*pools):
+    def _cfg(*tensors):
+        # One tensor per group, each from byte 0 as upstream lays them out, so
+        # the layers at one position across the tensors share a buffer.
         return SimpleNamespace(
-            kv_cache_tensors=[SimpleNamespace(layers=list(p)) for p in pools]
+            kv_cache_tensors=[
+                KVCacheTensor(size=0, layers=list(t), layer_stride=1, block_stride=1)
+                for t in tensors
+            ]
         )
 
     def test_prefers_full_attention_layer(self):
@@ -525,14 +530,14 @@ class TestSelectCanonicalKvLayersPerPool:
             self._group(["full0"], self._full()),
         ]
         r = self._runner(groups)
-        assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0", "full0"])) == {
-            "full0"
-        }
+        assert r._select_canonical_kv_layers_per_pool(
+            self._cfg(["sw0"], ["full0"])
+        ) == {"full0"}
 
     def test_falls_back_to_first_layer(self):
         # No full-attention layer in the pool -> layers[0].
         r = self._runner([self._group(["sw0", "sw1"], SimpleNamespace())])
-        assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0", "sw1"])) == {
+        assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0"], ["sw1"])) == {
             "sw0"
         }
 
@@ -541,13 +546,10 @@ class TestSelectCanonicalKvLayersPerPool:
         assert r._select_canonical_kv_layers_per_pool(self._cfg([])) == set()
 
     def test_one_canonical_layer_per_pool(self):
-        groups = [
-            self._group(["full0"], self._full()),
-            self._group(["full1"], self._full()),
-        ]
-        r = self._runner(groups)
+        # One tensor listing two layers is two buffers, not one pool.
+        r = self._runner([self._group(["full0", "full1"], self._full())])
         assert r._select_canonical_kv_layers_per_pool(
-            self._cfg(["full0"], ["full1"])
+            self._cfg(["full0", "full1"])
         ) == {"full0", "full1"}
 
 

@@ -152,11 +152,15 @@ class TestRegisterKvCachesWithConnector:
         self, make_model_runner, monkeypatch
     ):
         registered = self._registrations(monkeypatch)
-        # One layer per group, so both survive the canonical-layer filter that
-        # keeps aliasing SWA views out of the registration.
+        # Both layers in one group, so each has its own buffer and both survive
+        # the canonical-layer filter; one group each would alias them.
         runner = make_model_runner(
             layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
             additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
         )
 
         runner.register_kv_caches_with_connector()
