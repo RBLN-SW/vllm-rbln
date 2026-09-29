@@ -28,6 +28,11 @@ import torch
 import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
+from vllm.v1.core.kv_cache_utils import (
+    _max_memory_usage_bytes_from_groups,
+    _pool_bytes_per_block,
+    get_kv_cache_groups,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_rbln.compilation.backends import set_compile_stage
@@ -229,15 +234,16 @@ class DynamicKvSizer:
             )
 
         estimate = estimate_available_memory(**estimate_kwargs)
-        one_request = sum(
-            spec.max_memory_usage_bytes(self.vllm_config)
-            for spec in self.model_runner.get_kv_cache_spec().values()
+        if self.mode is not DynamicKvMode.ACTIVE:
+            return estimate
+        groups = get_kv_cache_groups(
+            self.vllm_config, dict(self.model_runner.get_kv_cache_spec())
         )
-        if self.mode is DynamicKvMode.ACTIVE and estimate < one_request:
-            # vllm refuses a pool below one request against this estimate; the
-            # real count is sized from the device after warm-up. Only under the
-            # shrink: every other mode serves this estimate, so raising it here
-            # would change the pool instead of reporting on it.
+        # Mirrors vllm's capacity check, which holds back the null block.
+        one_request = _max_memory_usage_bytes_from_groups(self.vllm_config, groups)
+        if groups:
+            one_request += _pool_bytes_per_block(groups)
+        if estimate < one_request:
             logger.warning(
                 "[Dynamic KV] the pre-compile estimate (%.2f GiB) is short of one "
                 "max-length request (%.2f GiB); raising it to that so the compile "
