@@ -119,13 +119,17 @@ def _group(spec):
 class TestInt16BlockIdCap:
     def test_full_attention_alone_caps_at_the_int16_max(self):
         cfg = SimpleNamespace(kv_cache_groups=[_group(_full_spec())])
-        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384]) == (32767, 0)
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384]) == (32767, 0, 1)
 
     def test_the_group_with_the_most_kernel_blocks_per_block_decides(self):
         cfg = SimpleNamespace(
             kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())]
         )
-        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 128]) == (255, 1)
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 128]) == (
+            255,
+            1,
+            128,
+        )
 
     def test_a_sliding_window_kept_at_the_manager_block_is_not_split(self):
         cfg = SimpleNamespace(
@@ -134,6 +138,7 @@ class TestInt16BlockIdCap:
         assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 16384]) == (
             32767,
             0,
+            1,
         )
 
     def test_no_attention_group_means_no_cap(self):
@@ -265,8 +270,8 @@ class TestComputeDynamicKvNumBlocks:
         # 35 * 1024 blocks fit the memory; 255 * 128 is the last id in int16.
         assert n == 255
         assert (
-            "capping 35840 blocks to 255: KV cache group 1 maps each 16384-token "
-            "block to 128 kernel block ids" in caplog.text
+            "capping 35840 blocks to 255: KV cache group 1 maps each block to 128 "
+            "kernel block ids" in caplog.text
         )
 
     def test_a_count_under_the_int16_cap_is_left_alone(self):

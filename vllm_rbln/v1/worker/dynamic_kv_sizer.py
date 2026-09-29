@@ -126,9 +126,10 @@ def kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
 
 def max_num_blocks_for_int16_block_ids(
     kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
-) -> tuple[int, int] | None:
-    """The largest pool whose kernel block ids stay within int16, and the KV
-    cache group that sets it; None when no attention group is bound."""
+) -> tuple[int, int, int] | None:
+    """The largest pool whose kernel block ids stay within int16, the KV cache
+    group that sets it and that group's kernel blocks per block; None when no
+    attention group is bound."""
     tightest = None
     for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
         spec = group.kv_cache_spec
@@ -139,7 +140,7 @@ def max_num_blocks_for_int16_block_ids(
         blocks_per_kv_block = spec.block_size // kernel_block_sizes[group_id]
         cap = MAX_KERNEL_BLOCK_ID // blocks_per_kv_block
         if tightest is None or cap < tightest[0]:
-            tightest = (cap, group_id)
+            tightest = (cap, group_id, blocks_per_kv_block)
     return tightest
 
 
@@ -537,24 +538,19 @@ class DynamicKvSizer:
             gmu,
             format_fits(fits),
         )
-        mr = self.model_runner
         int16_cap = max_num_blocks_for_int16_block_ids(
-            mr.kv_cache_config, mr._kernel_block_sizes
+            self.model_runner.kv_cache_config, self.model_runner._kernel_block_sizes
         )
         if int16_cap is not None and num_blocks > int16_cap[0]:
-            cap, group_id = int16_cap
-            block_size = mr.kv_cache_config.kv_cache_groups[
-                group_id
-            ].kv_cache_spec.block_size
+            cap, group_id, blocks_per_kv_block = int16_cap
             logger.warning(
                 "[Dynamic KV] capping %d blocks to %d: KV cache group %d maps each "
-                "%d-token block to %d kernel block ids, which must stay within "
-                "int16 (max %d).",
+                "block to %d kernel block ids, which must stay within int16 "
+                "(max %d).",
                 num_blocks,
                 cap,
                 group_id,
-                block_size,
-                block_size // mr._kernel_block_sizes[group_id],
+                blocks_per_kv_block,
                 MAX_KERNEL_BLOCK_ID,
             )
             num_blocks = cap
