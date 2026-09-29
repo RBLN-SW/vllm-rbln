@@ -113,6 +113,7 @@ DYNAMIC_KV_ALLOCATOR_RESERVE_BYTES = 48 * 1024 * 1024
 # Per chiplet, for the copy command streams sub-block prefix caching uploads.
 DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES = 64 * 1024 * 1024
 # The compiled attention ops take kernel block ids as int16.
+# TODO(rebel-compiler): drop once they take int32 block ids.
 MAX_KERNEL_BLOCK_ID = torch.iinfo(torch.int16).max
 
 
