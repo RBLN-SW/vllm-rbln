@@ -238,7 +238,9 @@ def _ring_inputs(cache: RBLNDeepseekV4RingCache) -> tuple[torch.Tensor, ...]:
         f"of {cache.window} x {cache.width}"
     )
     ring = ring.view(ring.shape[0] * rings_per_page, cache.window, cache.width)
-    slots = metadata.local_block_tables.to(torch.int32) * rings_per_page
+    # [B, 1] like cache_offsets: a flat [B] device input only the host reads has no device
+    # consumer, and the compiler then leaves it without a per-node address (ISSUES B10).
+    slots = metadata.local_block_tables.reshape(-1, 1).to(torch.int32) * rings_per_page
     query_len = metadata.cache_offsets - metadata.cache_seq_lens
     return ring, slots, query_len.to(torch.int32)
 
@@ -360,15 +362,24 @@ class RBLNDeepseekV4Rope(nn.Module):
 _TID2EID_LANES = 64
 
 
+def _hc_scale_vec(scale: torch.Tensor, hc: int) -> torch.Tensor:
+    """[3] (pre, post, comb) scales -> [(2 + hc) * hc], one per mix; built on the host."""
+    s = scale.detach().to("cpu", torch.float32)
+    vec = torch.cat([s[0].expand(hc), s[1].expand(hc), s[2].expand(hc * hc)])
+    return vec.to(scale.device)
+
+
 def _hc_split_sinkhorn(
     mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc: int,
     iters: int, eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The reference ``hc_split_sinkhorn``: mixes [..., (2 + hc) * hc] -> pre [.., hc],
-    post [.., hc], comb [.., hc, hc] (Sinkhorn-normalized)."""
-    pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0:1] + hc_base[:hc]) + eps
-    post = 2 * torch.sigmoid(mixes[..., hc : 2 * hc] * hc_scale[1:2] + hc_base[hc : 2 * hc])
-    comb = mixes[..., 2 * hc :] * hc_scale[2:3] + hc_base[2 * hc :]
+    post [.., hc], comb [.., hc, hc] (Sinkhorn-normalized). ``hc_scale`` is the per-mix
+    expansion of the checkpoint's 3 scales (``_hc_scale_vec``): one multiply, one constant."""
+    z = mixes * hc_scale + hc_base
+    pre = torch.sigmoid(z[..., :hc]) + eps
+    post = 2 * torch.sigmoid(z[..., hc : 2 * hc])
+    comb = z[..., 2 * hc :]
     comb = comb.unflatten(-1, (hc, hc))
     comb = comb.softmax(dim=-1) + eps
     comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
@@ -818,6 +829,13 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
                 name,
                 nn.Parameter(torch.empty(shape, dtype=torch.float32), requires_grad=False),
             )
+        # Per-mix expansions of hc_*_scale, filled by finalize_hc_scales() after loading.
+        for name in ("hc_attn_scale_vec", "hc_ffn_scale_vec"):
+            self.register_buffer(name, torch.empty(mix_hc, dtype=torch.float32), persistent=False)
+
+    def finalize_hc_scales(self) -> None:
+        self.hc_attn_scale_vec = _hc_scale_vec(self.hc_attn_scale, self.hc_mult)
+        self.hc_ffn_scale_vec = _hc_scale_vec(self.hc_ffn_scale, self.hc_mult)
 
     def _hc_pre(self, x: torch.Tensor, fn, scale, base):
         # x [B, L, hc, H] -> y [B, L, H], post [B, L, hc], comb [B, L, hc, hc]
@@ -842,12 +860,12 @@ class RBLNDeepseekV4DecoderLayer(nn.Module):
         self, positions: torch.Tensor, x: torch.Tensor, input_ids: torch.Tensor
     ) -> torch.Tensor:
         residual = x
-        h, post, comb = self._hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        h, post, comb = self._hc_pre(x, self.hc_attn_fn, self.hc_attn_scale_vec, self.hc_attn_base)
         h = self.attn(positions, self.attn_norm(h))
         x = self._hc_post(h, residual, post, comb)
 
         residual = x
-        h, post, comb = self._hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        h, post, comb = self._hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale_vec, self.hc_ffn_base)
         h = self.ffn(self.ffn_norm(h), input_ids)
         return self._hc_post(h, residual, post, comb)
 
@@ -980,6 +998,9 @@ class RBLNDeepseekV4Model(nn.Module):
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+        for layer in self.layers:
+            if hasattr(layer, "finalize_hc_scales"):
+                layer.finalize_hc_scales()
         return loaded_params
 
 
