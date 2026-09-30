@@ -30,6 +30,7 @@ from . import (
     axk3,
     deepseek_mtp,
     deepseek_v2,
+    deepseek_v4,
     distributed_utils,
     dynamic_kv,
     ec_connector_factory,
