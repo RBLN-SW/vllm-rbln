@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -543,9 +544,25 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # MLA has no head axis to order, which is why upstream advertises no
         # required layout for it and the resolved value is meaningless here.
         # The allocator below is shape-agnostic either way.
-        assert self.use_mla or self.kv_cache_layout == "HND", (
-            "RBLN NIXL Connector only supports HND layout"
+        assert (
+            self.use_mla or KVCacheLayout[self.kv_cache_layout].is_block_contiguous
+        ), (
+            "RBLN NIXL Connector needs [H, N, C] contiguous inside a block, "
+            f"got {self.kv_cache_layout}"
         )
+        first = next(iter(kv_caches.values()))
+        kv_first = first.ndim > 1 and tuple(first.shape[:2]) == (2, self.num_blocks)
+        if not self.use_mla and kv_first:
+            # Upstream cuts regions by `cache.stride(0)`, which on a K/V-first
+            # cache spans a whole half and divides into nothing. It raises with
+            # the shapes and no remedy, so name the one here.
+            raise RuntimeError(
+                "RBLN NIXL: host staging cannot register a K/V-first KV cache "
+                f"(got {tuple(first.shape)}), which is what the rbln_triton_ops "
+                "kernels allocate. Upstream's `register_kv_caches`, which this "
+                "path delegates to, partitions a blocks-first cache only. Use "
+                "kv_buffer_device='rbln'."
+            )
         xfer_buffers: dict[str, torch.Tensor] = {}
 
         def _aligned_like(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -635,9 +652,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "kv_buffer_device='rbln'."
             )
         super().register_kv_caches(kv_caches)
-        # Every layer contributes the same number of regions (its K/V halves), so
-        # the count follows from the transfer table upstream just filled. The D2D
-        # path collects the list while it builds the regions instead.
+        # Every layer contributes the same number of regions -- one where the
+        # block holds K and V together -- so the count follows from the transfer
+        # table upstream just filled. The D2D path collects the list while it
+        # builds the regions instead.
         names = list(kv_caches.keys())
         per_layer, remainder = divmod(len(self.block_len_per_layer), len(names))
         assert remainder == 0, (

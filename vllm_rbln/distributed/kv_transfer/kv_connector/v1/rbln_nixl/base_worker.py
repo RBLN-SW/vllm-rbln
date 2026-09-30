@@ -66,12 +66,9 @@ class RblnNixlWorkerBase(
     ) -> None:
         # Upstream's PP>1 refusal reads "not FullAttentionSpec" as "the region
         # count varies per layer", misjudging one merged group of full
-        # attention specs: uniform per layer, yet not a FullAttentionSpec.
-        # Mamba and sliding window merge the same way and do vary, so suppress
-        # for that shape alone. TODO: drop once upstream tests uniformity.
-        # The transfer view, because that is what upstream derives
-        # `_is_hma_required` from -- a group that opted out of KV transfer
-        # is not part of the judgement this suppression predicts.
+        # attention specs. Mamba and sliding window merge the same way and do
+        # vary, so suppress for that shape alone, judged on the transfer view
+        # `_is_hma_required` comes from. TODO: drop once upstream tests that.
         groups = kv_cache_config.transfer_groups
         group_spec = groups[0].kv_cache_spec if len(groups) == 1 else None
         suppress = isinstance(group_spec, UniformTypeKVCacheSpecs) and issubclass(

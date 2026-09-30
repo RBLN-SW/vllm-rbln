@@ -300,7 +300,7 @@ class TestRegisterKvCaches:
 class TestInitializeHostXferBuffer:
     def test_allocates_one_buffer_per_layer_preserving_order(self, monkeypatch):
         worker = build_worker(monkeypatch, kv_buffer_device="cpu")
-        worker.kv_cache_layout = "HND"
+        worker.kv_cache_layout = "LBHNC"
         kv_caches = {
             "l0": torch.zeros(2, 4, dtype=torch.float16),
             "l1": torch.zeros(3, 5, dtype=torch.float16),
@@ -310,20 +310,45 @@ class TestInitializeHostXferBuffer:
         assert worker.host_xfer_buffers["l0"].shape == (2, 4)
         assert worker.host_xfer_buffers["l1"].shape == (3, 5)
 
-    def test_rejects_non_hnd_layout(self, monkeypatch):
+    def test_rejects_a_layout_that_splits_the_block(self, monkeypatch):
+        # vllm 0.30 renamed the layouts, and the resolved name for this backend
+        # is one of three. Only the identity permutation keeps [H, N, C]
+        # together, which is what the descriptor math addresses.
         worker = build_worker(monkeypatch, kv_buffer_device="cpu")
-        worker.kv_cache_layout = "NHD"
-        with pytest.raises(AssertionError, match="HND"):
+        worker.kv_cache_layout = "LBNHC"
+        with pytest.raises(AssertionError, match=r"\[H, N, C\] contiguous"):
             worker.initialize_host_xfer_buffer(
                 {"l0": torch.zeros(2, 4, dtype=torch.float16)}
             )
+
+    def test_rejects_a_k_v_first_cache(self, monkeypatch):
+        # The rbln_triton_ops cache puts K and V on the leading axis, and
+        # upstream's registration -- which this path delegates to -- cuts
+        # regions by `cache.stride(0)`, which then spans a whole half. It
+        # raises with the shapes alone, so the remedy has to be named here.
+        worker = build_worker(monkeypatch, kv_buffer_device="cpu", num_blocks=4)
+        worker.kv_cache_layout = "LBHNC"
+        with pytest.raises(RuntimeError, match="K/V-first"):
+            worker.initialize_host_xfer_buffer(
+                {"l0": torch.zeros(2, 4, 8, dtype=torch.float16)}
+            )
+
+    def test_accepts_a_blocks_first_cache(self, monkeypatch):
+        # The same two axes the other way round is what rbln_custom_ops
+        # allocates, and it is the shape this path supports.
+        worker = build_worker(monkeypatch, kv_buffer_device="cpu", num_blocks=4)
+        worker.kv_cache_layout = "LBHNC"
+        worker.initialize_host_xfer_buffer(
+            {"l0": torch.zeros(4, 2, 8, dtype=torch.float16)}
+        )
+        assert worker.host_xfer_buffers["l0"].shape == (4, 2, 8)
 
     def test_mla_accepts_any_layout(self, monkeypatch):
         # MLA has no head axis to order, so upstream advertises no required
         # layout and the resolved value is whatever the fallback picked. The
         # 3D latent shape must survive unchanged.
         worker = build_worker(monkeypatch, kv_buffer_device="cpu", use_mla=True)
-        worker.kv_cache_layout = "NHD"
+        worker.kv_cache_layout = "LBNHC"
         worker.initialize_host_xfer_buffer(
             {"l0": torch.zeros(4, 64, 576, dtype=torch.float16)}
         )
@@ -333,7 +358,7 @@ class TestInitializeHostXferBuffer:
         # The page-aligned host buffer is backed by an fp16 (2-byte) allocation,
         # so a cache whose byte footprint is odd cannot be tiled.
         worker = build_worker(monkeypatch, kv_buffer_device="cpu")
-        worker.kv_cache_layout = "HND"
+        worker.kv_cache_layout = "LBHNC"
         with pytest.raises(AssertionError, match="multiple of 2"):
             worker.initialize_host_xfer_buffer(
                 {"l0": torch.zeros(1, dtype=torch.uint8)}  # 1 byte
