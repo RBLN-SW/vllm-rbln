@@ -471,6 +471,7 @@ class RBLNWorker(WorkerBase):
         self.model_runner.initialize_kv_cache(
             self.dynamic_kv.shrink_for_compile(kv_cache_config)
         )
+        self.dynamic_kv.warn_if_block_ids_exceed_int16()
         if not self.dynamic_kv.defers_kv_registration:
             self.model_runner.register_kv_caches_with_connector()
 

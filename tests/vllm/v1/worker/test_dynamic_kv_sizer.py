@@ -146,6 +146,50 @@ class TestInt16BlockIdCap:
         assert dks.max_num_blocks_for_int16_block_ids(cfg, []) is None
 
 
+class TestWarnIfBlockIdsExceedInt16:
+    @staticmethod
+    def _sizer(num_blocks, *, mode, shrunk=False):
+        return SimpleNamespace(
+            mode=mode,
+            mode_reason="--num-gpu-blocks-override=1670",
+            compiled_with_shrunk_cache=shrunk,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=num_blocks,
+                    kv_cache_groups=[_group(_sliding_spec()), _group(_full_spec())],
+                ),
+                _kernel_block_sizes=[128, 16384],
+            ),
+        )
+
+    def _warn(self, sizer, caplog):
+        with caplog.at_level("WARNING", logger=dks.logger.name):
+            DynamicKvSizer.warn_if_block_ids_exceed_int16(sizer)
+        return caplog.text
+
+    def test_an_override_past_the_cap_is_kept_and_named(self, caplog):
+        sizer = self._sizer(1670, mode=dks.DynamicKvMode.PINNED)
+        text = self._warn(sizer, caplog)
+        assert (
+            "KV cache holds 1670 blocks (from --num-gpu-blocks-override=1670), "
+            "past the 255" in text
+        )
+        assert sizer.model_runner.kv_cache_config.num_blocks == 1670
+
+    def test_the_estimate_past_the_cap_is_named_as_such(self, caplog):
+        sizer = self._sizer(428, mode=dks.DynamicKvMode.DISABLED)
+        assert "(from vllm's estimate)" in self._warn(sizer, caplog)
+
+    def test_a_count_within_the_cap_says_nothing(self, caplog):
+        sizer = self._sizer(255, mode=dks.DynamicKvMode.PINNED)
+        assert self._warn(sizer, caplog) == ""
+
+    def test_the_shrunk_compile_is_left_to_the_resize(self, caplog):
+        sizer = self._sizer(4, mode=dks.DynamicKvMode.ACTIVE, shrunk=True)
+        sizer.model_runner.kv_cache_config.num_blocks = 1670
+        assert self._warn(sizer, caplog) == ""
+
+
 class TestComputeDynamicKvNumBlocks:
     """`compute_num_blocks` = placement slope x memory snapshot.
 

@@ -233,6 +233,33 @@ class DynamicKvSizer:
             len(programs),
         )
 
+    def warn_if_block_ids_exceed_int16(self) -> None:
+        """Warn when a pool the resize will not cap already overflows the int16
+        kernel block ids; the count is left as given."""
+        if self.compiled_with_shrunk_cache:
+            return
+        kv_cache_config = self.model_runner.kv_cache_config
+        int16_cap = max_num_blocks_for_int16_block_ids(
+            kv_cache_config, self.model_runner._kernel_block_sizes
+        )
+        if int16_cap is None or kv_cache_config.num_blocks <= int16_cap[0]:
+            return
+        cap, group_id, blocks_per_kv_block = int16_cap
+        source = (
+            self.mode_reason if self.mode is DynamicKvMode.PINNED else "vllm's estimate"
+        )
+        logger.warning(
+            "KV cache holds %d blocks (from %s), past the %d the compiled attention "
+            "ops can address: KV cache group %d maps each block to %d kernel block "
+            "ids, which must stay within int16 (max %d). The count is kept as given.",
+            kv_cache_config.num_blocks,
+            source,
+            cap,
+            group_id,
+            blocks_per_kv_block,
+            MAX_KERNEL_BLOCK_ID,
+        )
+
     def pre_compile_estimate(self, estimate_kwargs: dict[str, Any]) -> int:
         """The bytes vllm sizes the compile-time cache from: the estimate fed
         the per-chiplet snapshot on a real device, floored at one request when
