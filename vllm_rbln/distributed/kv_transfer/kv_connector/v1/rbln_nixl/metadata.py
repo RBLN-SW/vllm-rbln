@@ -15,9 +15,9 @@
 """What an RBLN producer advertises beyond upstream's ``NixlAgentMetadata``.
 
 Peers pair by what each holds rather than by position, on two axes, and each
-axis needs one thing upstream's struct does not carry: the layer names a shard
-registered, and the chiplet geometry its regions expanded into. Both describe
-the sender; the receiver derives its own side and matches.
+axis needs one thing upstream's struct does not carry: which PP stage a shard
+is, and the chiplet geometry its regions expanded into. Both describe the
+sender; the receiver derives its own side and matches.
 
 Kept in a subclass so upstream's struct and its compatibility hash stay
 untouched. Both ends are RBLN, so folding a private version tag into that hash
@@ -25,7 +25,7 @@ untouched. Both ends are RBLN, so folding a private version tag into that hash
 completing a handshake.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -35,16 +35,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlAgentMetadata
 if TYPE_CHECKING:
     from vllm.config import SpeculativeConfig
 
-# Bump on any incompatible change to the RBLN metadata schema or semantics.
-# Folded into the NIXL compatibility hash so an RBLN peer speaking a different
-# schema fails the handshake cleanly (both ends are RBLN). Upstream keeps its
-# own counterpart the same way (``NIXL_CONNECTOR_VERSION``).
-#   1: pp_rank / pp_size / registered_layer_names (the layer axis)
-#   2: + kv_areas / kv_slices (chiplet geometry)
-#   3: + the transfer direction in the hash
-#   4: + kv_split_axis (which axis the geometry above came from)
-#   5: + kv_per_block (whether a region's block holds K and V together)
-RBLN_NIXL_CONNECTOR_VERSION: int = 5
+# Bump on any incompatible change to the RBLN metadata schema or semantics, as
+# upstream does with ``NIXL_CONNECTOR_VERSION``. Folded into the NIXL compat
+# hash so an RBLN peer on another schema fails the handshake cleanly; earlier
+# bumps are `git log -L` on this line.
+#   6: cross_layers_blocks hashed, layer names folded onto 0.30's region ledger
+RBLN_NIXL_CONNECTOR_VERSION: int = 6
 
 
 class KVSplitAxis(Enum):
@@ -60,8 +56,8 @@ class KVSplitAxis(Enum):
 
 @dataclass
 class RblnNixlAgentMetadata(NixlAgentMetadata):
-    """``NixlAgentMetadata`` + which layers and which slice of the KV cache
-    this shard holds.
+    """``NixlAgentMetadata`` + which PP stage a shard is and which slice of
+    the KV cache it holds.
 
     New fields default to the single-shard, single-area values, so a blob decoded
     by upstream (which uses ``NixlAgentMetadata`` and ignores the extra fields)
@@ -70,8 +66,6 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
 
     pp_rank: int = 0
     pp_size: int = 1
-    # Registered KV-cache layer names, ordered as kv_caches_base_addr / block_lens.
-    registered_layer_names: list[str] = field(default_factory=list)
     # Physical areas one logical region expanded into, and how many of them are
     # DISTINCT rather than replicas (see `_slice_head_bounds`).
     kv_areas: int = 1
@@ -84,32 +78,44 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # them apart. The default is the layout every version through 4 had.
     kv_per_block: int = 1
 
+    @property
+    def registered_layer_names(self) -> list[str]:
+        """The layers this shard registered, in region order.
+
+        vllm 0.30 put ``region_names`` on the wire, which names a layer per
+        region -- the same fact this used to carry as its own field. A layer
+        owns a run of consecutive regions, so the run boundaries give the list
+        back and a peer that trims regions trims this with them.
+        """
+        return list(dict.fromkeys(self.region_names or ()))
+
 
 def rbln_compat_hash(
     base_hash: str,
     *,
     writes_into_peer: bool,
+    cross_layers_blocks: bool,
     speculative_config: "SpeculativeConfig | None" = None,
 ) -> str:
-    """Fold the RBLN schema version, the transfer direction and the draft model
-    into the upstream NIXL compat hash.
+    """Fold the RBLN schema version and the factors upstream's hash drops into
+    ``compute_nixl_compatibility_hash``'s result.
 
-    An extension rather than a change to ``compute_nixl_compatibility_hash``,
-    which stays upstream's. The direction belongs in it because the read and the
-    write path move bytes by protocols that do not meet: a producer that writes
-    into a consumer expecting to read finds a peer whose every length check
-    passes. This vLLM hashes nothing that separates them -- the connector name
-    is not a factor -- so this is the only place it can be settled.
+    An extension rather than a change to upstream's, which stays theirs. Each
+    factor here is one upstream cannot express: the transfer direction, because
+    a producer that writes into a consumer expecting to read passes every
+    length check; the draft model, because its attention layers are members of
+    the KV cache this connector registers while upstream's factors describe the
+    target alone; and ``cross_layers_blocks``, which scales the page by the
+    KV-cache tensor count and which 0.30 dropped from upstream's own factors.
 
-    The draft model belongs in it because its attention layers are members of
-    the KV cache this connector registers, while upstream's factors describe
-    the target alone. Model-level values only -- the hash is compared across
-    every shard, so a per-rank quantity would differ between PP stages.
+    Model-level values only -- the hash is compared across every shard, so a
+    per-rank quantity would differ between PP stages.
     """
     factors: dict[str, object] = {
         "base": base_hash,
         "rbln_nixl_connector_version": RBLN_NIXL_CONNECTOR_VERSION,
         "rbln_writes_into_peer": writes_into_peer,
+        "rbln_cross_layers_blocks": cross_layers_blocks,
     }
     if speculative_config is not None and (
         speculative_config.use_eagle() or speculative_config.uses_draft_model()

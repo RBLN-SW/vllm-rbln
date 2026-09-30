@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -137,9 +138,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             self._unwrapped_layer_spec(name).page_size_bytes for name in layer_names
         }
 
-    def _publish_handshake_metadata(
-        self, base_meta: NixlAgentMetadata, registered_layer_names
-    ) -> None:
+    def _publish_handshake_metadata(self, base_meta: NixlAgentMetadata) -> None:
         self._check_pp_constraints()
         pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
         pp_rank = get_pp_group().rank_in_group if pp_size > 1 else 0
@@ -158,9 +157,18 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             physical_blocks_per_logical_kv_block=(
                 base_meta.physical_blocks_per_logical_kv_block
             ),
+            # vllm 0.30 put the region ledger and the context-parallel sizes on
+            # the wire. Re-wrapping without them advertises the dataclass
+            # defaults, so a peer would describe our regions by its own
+            # geometry instead of reading ours.
+            region_num_blocks=base_meta.region_num_blocks,
+            region_group_ids=base_meta.region_group_ids,
+            region_names=base_meta.region_names,
+            region_mem_types=base_meta.region_mem_types,
+            dcp_size=base_meta.dcp_size,
+            pcp_size=base_meta.pcp_size,
             pp_rank=pp_rank,
             pp_size=pp_size,
-            registered_layer_names=list(registered_layer_names),
             kv_areas=self._kv_areas,
             kv_slices=self._kv_slices,
             kv_split_axis=self._kv_split_axis,
@@ -171,6 +179,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self.compat_hash = rbln_compat_hash(
             base_hash,
             writes_into_peer=self._writes_into_peer,
+            cross_layers_blocks=self.topo.cross_layers_blocks,
             speculative_config=self.vllm_config.speculative_config,
         )
         self.xfer_handshake_metadata = NixlHandshakePayload(
@@ -201,7 +210,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             is_mamba=self._has_mamba,
         )
         self.compat_hash = compute_nixl_compatibility_hash(
-            self.vllm_config, self.backend_name, self.topo.cross_layers_blocks
+            self.vllm_config,
+            self.backend_name,
+            transfer_mode=self._TRANSFER_MODE,
         )
 
         # Device id for the RBLN backend's RblnContext.
@@ -395,11 +406,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         ]
         self.region_num_blocks = [self.num_blocks] * len(self.block_len_per_layer)
         self.region_mem_types = [self.nixl_memory_type] * len(self.block_len_per_layer)
-        group_of = {
-            layer: group_id
-            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
-            for layer in group.layer_names
-        }
+        # Transfer-group index, not cache-group index: upstream's descriptor
+        # machinery indexes `transfer_groups`, and the two lists diverge as soon
+        # as a group opts out of KV transfer.
+        group_of = self.kv_cache_config.transfer_group_index_by_layer
         self.region_group_ids = [group_of[name] for name in self.region_names]
 
         self._logical_region_kv_heads = self._logical_head_bands(layer_regions)
@@ -495,10 +505,19 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            # The region ledger vllm 0.30 put on the wire. Upstream fills these
+            # inside the `register_kv_caches` this path replaces, so leaving
+            # them out advertises the dataclass defaults and a peer describes
+            # our regions by its own geometry.
+            region_num_blocks=self.region_num_blocks,
+            region_group_ids=self.region_group_ids,
+            region_names=self.region_names,
+            region_mem_types=self.region_mem_types,
+            dcp_size=self.dcp_size,
+            pcp_size=self.pcp_size,
         )
-        # Republish with what a peer needs to pair by content: the layer names
-        # this shard registered and the chiplet geometry they expanded into.
-        self._publish_handshake_metadata(agent_metadata, self.device_kv_caches.keys())
+        # Republish with the chiplet geometry the region ledger cannot express.
+        self._publish_handshake_metadata(agent_metadata)
 
     def _unwrapped_layer_spec(self, layer_name: str) -> Any:
         """This layer's own spec.
@@ -525,9 +544,25 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # MLA has no head axis to order, which is why upstream advertises no
         # required layout for it and the resolved value is meaningless here.
         # The allocator below is shape-agnostic either way.
-        assert self.use_mla or self.kv_cache_layout == "HND", (
-            "RBLN NIXL Connector only supports HND layout"
+        assert (
+            self.use_mla or KVCacheLayout[self.kv_cache_layout].is_block_contiguous
+        ), (
+            "RBLN NIXL Connector needs [H, N, C] contiguous inside a block, "
+            f"got {self.kv_cache_layout}"
         )
+        first = next(iter(kv_caches.values()))
+        kv_first = first.ndim > 1 and tuple(first.shape[:2]) == (2, self.num_blocks)
+        if not self.use_mla and kv_first:
+            # Upstream cuts regions by `cache.stride(0)`, which on a K/V-first
+            # cache spans a whole half and divides into nothing. It raises with
+            # the shapes and no remedy, so name the one here.
+            raise RuntimeError(
+                "RBLN NIXL: host staging cannot register a K/V-first KV cache "
+                f"(got {tuple(first.shape)}), which is what the rbln_triton_ops "
+                "kernels allocate. Upstream's `register_kv_caches`, which this "
+                "path delegates to, partitions a blocks-first cache only. Use "
+                "kv_buffer_device='rbln'."
+            )
         xfer_buffers: dict[str, torch.Tensor] = {}
 
         def _aligned_like(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -617,9 +652,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "kv_buffer_device='rbln'."
             )
         super().register_kv_caches(kv_caches)
-        # Every layer contributes the same number of regions (its K/V halves), so
-        # the count follows from the transfer table upstream just filled. The D2D
-        # path collects the list while it builds the regions instead.
+        # Every layer contributes the same number of regions -- one where the
+        # block holds K and V together -- so the count follows from the transfer
+        # table upstream just filled. The D2D path collects the list while it
+        # builds the regions instead.
         names = list(kv_caches.keys())
         per_layer, remainder = divmod(len(self.block_len_per_layer), len(names))
         assert remainder == 0, (
@@ -630,12 +666,12 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             [(name, per_layer) for name in names]
         )
         # Re-wrap upstream's published handshake metadata with this stage's PP
-        # identity + owned layer names (no-op degrade for pp_size == 1).
+        # identity and chiplet geometry (no-op degrade for pp_size == 1).
         if self.xfer_handshake_metadata is not None:
             base_agent_metadata = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(
                 self.xfer_handshake_metadata.agent_metadata_bytes
             )
-            self._publish_handshake_metadata(base_agent_metadata, kv_caches.keys())
+            self._publish_handshake_metadata(base_agent_metadata)
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Assign copy (d2h, h2d) operations when host buffer is used.

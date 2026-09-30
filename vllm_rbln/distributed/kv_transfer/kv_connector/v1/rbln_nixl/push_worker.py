@@ -114,18 +114,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # count and the loop below describing different peers.
         peer_ranks = self._overlapping_ranks.get(engine_id)
         if not peer_ranks:
-            # NOTE(RBLN): upstream aligns by truncating the longer list and
-            # keeping its HEAD -- the wrong end (see _trim_to_consumer_blocks)
-            # -- and the lengths match either way so nothing catches it. Trim
-            # first, only where upstream's expansion of the remote list is the
-            # identity: past that the two lengths are not the same unit.
-            if remote_info.remote_physical_blocks_per_logical == 1:
-                meta.local_physical_block_ids = self._trim_to_consumer_blocks(
-                    meta.local_physical_block_ids,
-                    meta.remote.block_ids,
-                    engine_id,
-                    meta.remote.request_id,
-                )
             return super()._xfer_blocks_for_req(req_id, meta)
 
         block_size_ratio = self.transfer_topo.block_size_ratio(
@@ -223,14 +211,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
     ) -> BlockIds:
         """Drop from our side the blocks the consumer already had.
 
-        NOTE(RBLN): the same trim the read path gets from upstream's
-        `_apply_prefix_caching`, with the roles swapped -- there the consumer is
-        local and the producer's longer list is trimmed to it, here the consumer
-        is the peer and ours is the longer one. It has to come off the END: the
-        consumer registers the uncached SUFFIX of a prompt, so dropping our tail
-        would hand it the wrong blocks under a partial prefix hit.
-
-        TODO(vllm>=0.27.2): delete -- upstream trims the write path itself there.
+        vllm 0.30 does this for the route that delegates to upstream. The
+        per-shard route below describes its own descriptors and never reaches
+        `_xfer_blocks_for_req`, so it still has to trim for itself. It has to
+        come off the END: the consumer registers the uncached SUFFIX of a
+        prompt, so dropping our tail would hand it the wrong blocks under a
+        partial prefix hit.
         """
         local = list(local_block_ids)
         for i, remote_group in enumerate(remote_block_ids):
