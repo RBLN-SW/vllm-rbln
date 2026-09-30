@@ -12,14 +12,6 @@ supported-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 
-[manifest]
-overrides = [
-    { name = "torch", specifier = "==2.13.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchaudio", specifier = "==2.11.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchcodec", specifier = "==0.16.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchvision", specifier = "==0.28.0+cpu", index = "https://download.pytorch.org/whl/cpu" },
-]
-
 [[package]]
 name = "accelerate"
 version = "1.14.0"
@@ -2030,23 +2022,23 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.3a8"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+version = "0.11.3a9"
+source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "accelerate" },
     { name = "diffusers" },
     { name = "packaging" },
     { name = "tokenizers" },
     { name = "torch" },
-    { name = "torchaudio" },
-    { name = "torchcodec" },
-    { name = "torchvision" },
+    { name = "torchaudio", marker = "platform_python_implementation == 'CPython'" },
+    { name = "torchcodec", marker = "platform_python_implementation == 'CPython'" },
+    { name = "torchvision", marker = "platform_python_implementation == 'CPython'" },
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a8/optimum_rbln-0.11.3a8.tar.gz", hash = "sha256:840ceb4aaf7c60fc1ca19a0f737ec757f21fe0edd0c7ab29fafc871844ab403b" }
+sdist = { url = "https://files.pythonhosted.org/packages/a1/26/675a90168656ec082bb37e7becd6951282b557b2b66f732b9333043457b1/optimum_rbln-0.11.3a9.tar.gz", hash = "sha256:87e981bf0c1567ed19f0a394d0c0987974b012cc5f0f200e8f60bf4115d78cae", size = 665222, upload-time = "2026-09-30T04:51:29.893Z" }
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/optimum-rbln/0.11.3a8/optimum_rbln-0.11.3a8-py3-none-any.whl", hash = "sha256:bd2296e5996598ba46574c2c1b5b701bab5d8eee1d1f61cf0fb03545c8881108" },
+    { url = "https://files.pythonhosted.org/packages/73/4f/35f0c08e0ab0256b4463745a3d3ca562ab98d5f8af16898fe3556a1a0af7/optimum_rbln-0.11.3a9-py3-none-any.whl", hash = "sha256:f3a04c8a78a4a13b879aa91d3ee63cf6a3dea0f774ae4c6446950390267aed16", size = 695848, upload-time = "2026-09-30T04:51:27.153Z" },
 ]
 
 [[package]]
@@ -3626,7 +3618,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0.dev0,<0.12.1" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.1.0.dev0,<0.1.1" },
-    { name = "optimum-rbln", specifier = ">=0.11.3a8,<0.11.4" },
+    { name = "optimum-rbln", specifier = ">=0.11.3a9,<0.11.4", index = "https://pypi.org/simple/" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
