@@ -148,10 +148,10 @@ class TestInt16BlockIdCap:
 
 class TestWarnIfBlockIdsExceedInt16:
     @staticmethod
-    def _sizer(num_blocks, *, mode, shrunk=False):
+    def _sizer(num_blocks, *, mode, shrunk=False, override=None):
         return SimpleNamespace(
             mode=mode,
-            mode_reason="--num-gpu-blocks-override=1670",
+            cache_config=SimpleNamespace(num_gpu_blocks_override=override),
             compiled_with_shrunk_cache=shrunk,
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(
@@ -168,7 +168,7 @@ class TestWarnIfBlockIdsExceedInt16:
         return caplog.text
 
     def test_an_override_past_the_cap_is_kept_and_named(self, caplog):
-        sizer = self._sizer(1670, mode=dks.DynamicKvMode.PINNED)
+        sizer = self._sizer(1670, mode=dks.DynamicKvMode.PINNED, override=1670)
         text = self._warn(sizer, caplog)
         assert (
             "KV cache holds 1670 blocks (from --num-gpu-blocks-override=1670), "
@@ -176,12 +176,19 @@ class TestWarnIfBlockIdsExceedInt16:
         )
         assert sizer.model_runner.kv_cache_config.num_blocks == 1670
 
+    @pytest.mark.parametrize(
+        "mode", [dks.DynamicKvMode.DISABLED, dks.DynamicKvMode.INERT]
+    )
+    def test_an_override_is_named_whatever_the_mode(self, mode, caplog):
+        sizer = self._sizer(1670, mode=mode, override=1670)
+        assert "(from --num-gpu-blocks-override=1670)" in self._warn(sizer, caplog)
+
     def test_the_estimate_past_the_cap_is_named_as_such(self, caplog):
         sizer = self._sizer(428, mode=dks.DynamicKvMode.DISABLED)
         assert "(from vllm's estimate)" in self._warn(sizer, caplog)
 
     def test_a_count_within_the_cap_says_nothing(self, caplog):
-        sizer = self._sizer(255, mode=dks.DynamicKvMode.PINNED)
+        sizer = self._sizer(255, mode=dks.DynamicKvMode.PINNED, override=255)
         assert self._warn(sizer, caplog) == ""
 
     def test_the_shrunk_compile_is_left_to_the_resize(self, caplog):

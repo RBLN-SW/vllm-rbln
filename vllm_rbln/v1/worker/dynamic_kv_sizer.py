@@ -245,8 +245,11 @@ class DynamicKvSizer:
         if int16_cap is None or kv_cache_config.num_blocks <= int16_cap[0]:
             return
         cap, group_id, blocks_per_kv_block = int16_cap
+        override = self.cache_config.num_gpu_blocks_override
         source = (
-            self.mode_reason if self.mode is DynamicKvMode.PINNED else "vllm's estimate"
+            f"--num-gpu-blocks-override={override}"
+            if override is not None
+            else "vllm's estimate"
         )
         logger.warning(
             "KV cache holds %d blocks (from %s), past the %d the compiled attention "
