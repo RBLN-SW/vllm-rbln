@@ -221,16 +221,29 @@ class RBLNMoERunner(MoERunner):
             else:
                 # -- origin/dev path: all-gather hidden first → router on full tokens --
                 # all-gather hidden_states across DP ranks (also serves as dispatch)
-                hidden_for_gather = hidden_flat.unsqueeze(0)  # [1, max_pad, H]
+                # A router may carry per-token columns (`gather_extra`, [t, C]) to ride along
+                # this gather (DeepSeek-V4's hash expert ids: a separate gather of a host-made
+                # tensor has no device CCL input).
+                extra = getattr(router, "gather_extra", None)
+                if extra is not None:
+                    extra = extra.reshape(t, -1).to(hidden_flat.dtype)
+                    if t < max_pad:
+                        extra = F.pad(extra, (0, 0, 0, max_pad - t))
+                    hidden_for_gather = torch.cat([hidden_flat, extra], dim=-1).unsqueeze(0)
+                else:
+                    hidden_for_gather = hidden_flat.unsqueeze(0)  # [1, max_pad, H]
                 all_hidden = get_dp_group().all_gather(
                     hidden_for_gather, dim=0
-                )  # [R, max_pad, H]
-                gathered_hidden = all_hidden.reshape(R * max_pad, H_dim)
+                )  # [R, max_pad, H (+ C)]
+                all_hidden = all_hidden.reshape(R * max_pad, -1)
+                gathered_hidden = all_hidden[:, :H_dim]
 
                 # Router on all gathered tokens (no Router DP)
                 # [R*max_pad, E]; forced ids (if any) are for the gathered rows too
                 all_router_logits, forced_ids = _split_router_out(
                     router(gathered_hidden)
+                    if extra is None
+                    else router(gathered_hidden, all_hidden[:, H_dim:])
                 )
                 all_router_logits = all_router_logits.reshape(R * max_pad, -1)
                 E = all_router_logits.shape[-1]
