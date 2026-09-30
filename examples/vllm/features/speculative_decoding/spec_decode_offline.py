@@ -15,10 +15,9 @@
 """Run speculative decoding using the vllm model path on RBLN.
 
 By default, generate from four text prompts and print the results.
-EAGLE, EAGLE3, and DFlash require a draft checkpoint compatible with the target.
-N-gram and suffix drafting reuse token sequences; MTP uses the target's MTP layers.
+EAGLE and EAGLE3 require a draft checkpoint compatible with the target.
+N-gram and suffix drafting reuse token sequences.
 Suffix requires arctic-inference and treats num-spec-tokens as an upper bound.
-DFlash requires device tensors, which are enabled by default on RBLN.
 """
 
 from argparse import BooleanOptionalAction
@@ -39,12 +38,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--method",
-        choices=["ngram", "suffix", "eagle", "eagle3", "mtp", "dflash"],
+        choices=["ngram", "suffix", "eagle", "eagle3"],
         default="eagle",
     )
     parser.add_argument("--model-dir", default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--eagle-dir", default=None)
-    parser.add_argument("--dflash-dir", default=None)
     parser.add_argument(
         "--backend", choices=["openai", "openai-chat"], default="openai"
     )
@@ -117,18 +115,9 @@ def main() -> None:
             "prompt_lookup_max": args.prompt_lookup_max,
             "prompt_lookup_min": args.prompt_lookup_min,
         }
-    elif args.method in ("suffix", "mtp"):
+    elif args.method == "suffix":
         speculative_config = {
             "method": args.method,
-            "num_speculative_tokens": args.num_spec_tokens,
-        }
-    elif args.method == "dflash":
-        dflash_dir = args.dflash_dir
-        if dflash_dir is None:
-            dflash_dir = "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
-        speculative_config = {
-            "method": "dflash",
-            "model": dflash_dir,
             "num_speculative_tokens": args.num_spec_tokens,
         }
     else:
