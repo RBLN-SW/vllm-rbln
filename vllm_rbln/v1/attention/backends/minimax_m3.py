@@ -17,9 +17,9 @@
 Two caches per sparse layer, mirroring the DSA (DeepSeek-V3.2) layout:
 
 * the main paged GQA K/V cache, read by the block-sparse attention kernel
-  (``rbln_custom_ops.sparse_attn_minimax_gqa``), and
+  (``rbln_custom_ops.sparse_attn_minimax_m3_msa``), and
 * the lightning-indexer's key-only side cache (one 128-wide vector per token),
-  read by ``rbln_custom_ops.sparse_attn_minimax_indexer``.
+  read by ``rbln_custom_ops.sparse_attn_minimax_m3_indexer``.
 
 Both reuse ``RBLNFlashAttentionMetadataBuilder``: the kernels take the same
 ``seq_lens`` (cache position) / ``block_tables`` the flash kernels take.

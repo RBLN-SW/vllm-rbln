@@ -25,8 +25,8 @@ and replaces the compute with RBLN-friendly code:
 * Gemma RMSNorm and the per-head QK norms are plain torch;
 * the dense layers use the generic ``Attention`` (RBLN flash backend);
 * the sparse layers run the MSA lightning indexer and the block-sparse GQA
-  attention through ``rbln_custom_ops.sparse_attn_minimax_indexer`` /
-  ``sparse_attn_minimax_gqa``, each reading its paged cache from the
+  attention through ``rbln_custom_ops.sparse_attn_minimax_m3_indexer`` /
+  ``sparse_attn_minimax_m3_msa``, each reading its paged cache from the
   attention metadata (a graph input) like the DSA path does;
 * MoE goes through the RBLN ``MoERunner`` (router callback) with the
   routed-scaling factor and the shared expert applied here.
@@ -699,7 +699,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         # Token positions of the top-k (+ local) blocks, per (batch, index head,
         # query): ascending, -1 padded; the attend consumes them like DSA's top-k.
-        topk_index = torch.ops.rbln_custom_ops.sparse_attn_minimax_indexer(
+        topk_index = torch.ops.rbln_custom_ops.sparse_attn_minimax_m3_indexer(
             index_q4,
             index_k3,
             index_cache,
@@ -713,7 +713,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 else ()
             ),
         )
-        attn_output = torch.ops.rbln_custom_ops.sparse_attn_minimax_gqa(
+        attn_output = torch.ops.rbln_custom_ops.sparse_attn_minimax_m3_msa(
             q5,
             k5,
             v5,
