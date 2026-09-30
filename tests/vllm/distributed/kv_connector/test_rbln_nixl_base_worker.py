@@ -122,6 +122,18 @@ class TestSwaViewRatio:
         # whether or not the view-opt is on.
         assert worker._has_swa
 
+    def test_a_group_that_does_not_transfer_is_not_a_window(self, monkeypatch):
+        # The specs this worker reasons about are the ones taking part in a
+        # transfer. A sliding-window group that opted out belongs to the cache
+        # but not to the wire, and counting it would arm the model-parallelism
+        # guards for a window no descriptor ever addresses.
+        worker = build_worker(
+            monkeypatch,
+            specs=[_full_attention_spec(block_size=64)],
+            non_transfer_specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+        )
+        assert worker._has_swa is False
+
     def test_pure_full_attention_keeps_ratio_none(self, monkeypatch):
         # A non-sliding-window group contributes no ratio.
         worker = build_worker(monkeypatch, swa_view_opt=True, specs=[MagicMock()])
@@ -235,13 +247,15 @@ class TestSwaViewDelegation:
         worker = build_worker(monkeypatch)  # _sw_ratio is None
         calls: list = []
 
-        def super_agent(self, meta, rank=0, size=1):
-            calls.append((rank, size))
+        # Defaults mirror upstream's own signature, so what the delegation
+        # forwards has to be asserted rather than left to an arity error.
+        def super_agent(self, meta, rank=0, size=1, dcp=1):
+            calls.append((rank, size, dcp))
             return "agent"
 
         monkeypatch.setattr(NixlBaseConnectorWorker, "add_remote_agent", super_agent)
-        assert worker.add_remote_agent(MagicMock(engine_id="peer"), 2, 4) == "agent"
-        assert calls == [(2, 4)]
+        assert worker.add_remote_agent(MagicMock(engine_id="peer"), 2, 4, 3) == "agent"
+        assert calls == [(2, 4, 3)]
 
     def test_add_remote_agent_is_idempotent_on_rehandshake(self, monkeypatch):
         # With SWA active, a remote already handshaked returns its cached name
@@ -351,6 +365,21 @@ class TestHmaRefusalSuppression:
 
         assert worker.hma_flag_seen_by_upstream_init is True
         assert worker._is_hma_required is False
+
+    def test_a_group_that_opted_out_of_transfer_does_not_count(self, monkeypatch):
+        # Upstream derives `_is_hma_required` from the transfer view, so that
+        # is the list this suppression has to predict. Counting cache groups
+        # instead sees two and suppresses nothing, and the refusal this exists
+        # to disarm fires on a layout upstream would have judged right.
+        specs = [_merged_uniform_spec(_full_attention_spec())]
+        worker = self._pp_worker(
+            monkeypatch,
+            specs,
+            non_transfer_specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+        )
+
+        assert worker.hma_flag_seen_by_upstream_init is True
+        assert worker._is_hma_required is True
 
     @pytest.mark.parametrize("hma_disabled", [False, True])
     @pytest.mark.parametrize(
@@ -484,6 +513,14 @@ class TestASlidingWindowOnThePeerSide(TestASlidingWindowInsideAPackedBlock):
         w._has_swa = True
         w._remote_agents = {}
         w.dst_num_blocks = {}
+        # The peer's region ledger, which registering it now records beside the
+        # block count.
+        w.dst_region_num_blocks = {}
+        w.dst_region_group_ids = {}
+        w.dst_region_mem_types = {}
+        w.dst_uses_region_group_mapping = {}
+        w.region_group_ids = []
+        w.nixl_memory_type = "VRAM"
         w.dst_xfer_side_handles = defaultdict(dict)
         w.kv_caches_base_addr = defaultdict(dict)
         topo = MagicMock()

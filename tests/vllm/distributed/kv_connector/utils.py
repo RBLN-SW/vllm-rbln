@@ -565,7 +565,7 @@ def peer_meta(
         physical_blocks_per_logical_kv_block=1,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        registered_layer_names=names,
+        region_names=names,
         kv_areas=geometry.areas,
         kv_slices=geometry.slices,
     )
@@ -674,6 +674,7 @@ def build_worker(
     num_blocks=128,
     block_size=64,
     specs=None,
+    non_transfer_specs=None,
     nixl_available=True,
     swa_view_opt=False,
     use_mla=False,
@@ -771,7 +772,14 @@ def build_worker(
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
-    kv_cache_config.kv_cache_groups = [
-        MagicMock(kv_cache_spec=spec) for spec in (specs or [])
-    ]
+    groups = [MagicMock(kv_cache_spec=spec) for spec in (specs or [])]
+    # Real `KVCacheConfig` derives the transfer view from `kv_cache_groups` by
+    # dropping the groups that opted out, and a MagicMock answers `len()` with
+    # 0 rather than raising -- so a connector reading the wrong view would see
+    # no groups at all. `non_transfer_specs` builds a config where the two
+    # genuinely differ, so a case that reads the wrong one can be seen to.
+    opted_out = [MagicMock(kv_cache_spec=spec) for spec in (non_transfer_specs or [])]
+    kv_cache_config.kv_cache_groups = groups + opted_out
+    kv_cache_config.transfer_groups = groups
+    kv_cache_config.transfer_group_ids = tuple(range(len(groups)))
     return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)

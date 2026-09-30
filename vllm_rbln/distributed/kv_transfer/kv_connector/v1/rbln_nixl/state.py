@@ -16,11 +16,13 @@ from collections import defaultdict
 from typing import Any, ClassVar
 
 import numpy as np
-from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnTransferTopology,
 )
 from vllm_rbln.logger import init_logger
 
@@ -81,11 +83,15 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _shard_descs_per_block: dict[tuple[str, int], int]
 
     @property
-    def topo(self) -> TransferTopology:
+    def topo(self) -> RblnTransferTopology:
         """The transfer topology, which registration produces.
 
         Upstream types it optional because it does not exist until the KV caches
-        are registered, and on the D2D path that is deferred past warm-up.
+        are registered, and on the D2D path that is deferred past warm-up. The
+        RBLN type is the one every reader here needs: 0.30 dropped
+        `cross_layers_blocks`, `virtually_split_kv_in_blocks` and
+        `get_transfer_cache_regions` from upstream's, and this connector reads
+        all three off it.
         """
         assert self.transfer_topo is not None, (
             "the transfer topology is read before the KV caches are registered"
@@ -192,10 +198,12 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         vllm 0.30.0 removed the base method along with that split, so the
         subclass that kept the split carries the body too.
         """
-        region_id = self._viewed_region(layer_idx)
         if self.topo.virtually_split_kv_in_blocks and mamba_view:
             return self._mamba_ssm_size[not first_split]
-        return self.block_len_per_layer[region_id]
+        # No translation here: `_regions_viewed_as` reorders the list itself for
+        # the duration of a peer view, so the index is already the peer's
+        # position. Translating again would apply the permutation twice.
+        return self.block_len_per_layer[layer_idx]
 
     # ------------------------------------------------------------------
     # Hybrid Full + SWA desc layout (RDMA payload only)
