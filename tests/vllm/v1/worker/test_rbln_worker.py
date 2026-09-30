@@ -1275,7 +1275,7 @@ class TestKvRegistrationOrder:
             ),
             dynamic_kv=SimpleNamespace(
                 shrink_for_compile=lambda cfg: cfg,
-                warn_if_block_ids_exceed_int16=lambda: None,
+                check_block_ids_fit_int16=lambda: None,
                 apply_num_blocks=lambda n: calls.append("resize"),
                 defers_kv_registration=defers,
             ),

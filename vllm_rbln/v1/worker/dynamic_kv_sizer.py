@@ -233,9 +233,9 @@ class DynamicKvSizer:
             len(programs),
         )
 
-    def warn_if_block_ids_exceed_int16(self) -> None:
-        """Warn when a pool the resize will not cap already overflows the int16
-        kernel block ids; the count is left as given."""
+    def check_block_ids_fit_int16(self) -> None:
+        """Refuse a pool the resize will not cap once its kernel block ids
+        overflow int16; the count is the user's or vllm's, not changed here."""
         if self.compiled_with_shrunk_cache:
             return
         kv_cache_config = self.model_runner.kv_cache_config
@@ -251,16 +251,13 @@ class DynamicKvSizer:
             if override is not None
             else "vllm's estimate"
         )
-        logger.warning(
-            "KV cache holds %d blocks (from %s), past the %d the compiled attention "
-            "ops can address: KV cache group %d maps each block to %d kernel block "
-            "ids, which must stay within int16 (max %d). The count is kept as given.",
-            kv_cache_config.num_blocks,
-            source,
-            cap,
-            group_id,
-            blocks_per_kv_block,
-            MAX_KERNEL_BLOCK_ID,
+        raise ValueError(
+            f"The KV cache holds {kv_cache_config.num_blocks} blocks (from {source}), "
+            f"but the compiled attention ops can address at most {cap}: KV cache "
+            f"group {group_id} maps each block to {blocks_per_kv_block} kernel block "
+            f"ids, which must stay within int16 (max {MAX_KERNEL_BLOCK_ID}). Set "
+            f"--num-gpu-blocks-override to {cap} or less, or leave it unset with the "
+            "dynamic KV cache on so the pool is sized under this limit."
         )
 
     def pre_compile_estimate(self, estimate_kwargs: dict[str, Any]) -> int:

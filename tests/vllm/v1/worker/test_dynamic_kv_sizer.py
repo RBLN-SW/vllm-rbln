@@ -146,7 +146,7 @@ class TestInt16BlockIdCap:
         assert dks.max_num_blocks_for_int16_block_ids(cfg, []) is None
 
 
-class TestWarnIfBlockIdsExceedInt16:
+class TestCheckBlockIdsFitInt16:
     @staticmethod
     def _sizer(num_blocks, *, mode, shrunk=False, override=None):
         return SimpleNamespace(
@@ -162,39 +162,32 @@ class TestWarnIfBlockIdsExceedInt16:
             ),
         )
 
-    def _warn(self, sizer, caplog):
-        with caplog.at_level("WARNING", logger=dks.logger.name):
-            DynamicKvSizer.warn_if_block_ids_exceed_int16(sizer)
-        return caplog.text
-
-    def test_an_override_past_the_cap_is_kept_and_named(self, caplog):
-        sizer = self._sizer(1670, mode=dks.DynamicKvMode.PINNED, override=1670)
-        text = self._warn(sizer, caplog)
+    @pytest.mark.parametrize(
+        "mode",
+        [dks.DynamicKvMode.PINNED, dks.DynamicKvMode.DISABLED, dks.DynamicKvMode.INERT],
+    )
+    def test_an_override_past_the_cap_is_refused_with_the_limit(self, mode):
+        sizer = self._sizer(1670, mode=mode, override=1670)
+        with pytest.raises(ValueError) as exc:
+            DynamicKvSizer.check_block_ids_fit_int16(sizer)
         assert (
-            "KV cache holds 1670 blocks (from --num-gpu-blocks-override=1670), "
-            "past the 255" in text
+            "holds 1670 blocks (from --num-gpu-blocks-override=1670), but the "
+            "compiled attention ops can address at most 255" in str(exc.value)
         )
         assert sizer.model_runner.kv_cache_config.num_blocks == 1670
 
-    @pytest.mark.parametrize(
-        "mode", [dks.DynamicKvMode.DISABLED, dks.DynamicKvMode.INERT]
-    )
-    def test_an_override_is_named_whatever_the_mode(self, mode, caplog):
-        sizer = self._sizer(1670, mode=mode, override=1670)
-        assert "(from --num-gpu-blocks-override=1670)" in self._warn(sizer, caplog)
-
-    def test_the_estimate_past_the_cap_is_named_as_such(self, caplog):
+    def test_the_estimate_past_the_cap_is_named_as_such(self):
         sizer = self._sizer(428, mode=dks.DynamicKvMode.DISABLED)
-        assert "(from vllm's estimate)" in self._warn(sizer, caplog)
+        with pytest.raises(ValueError, match=r"\(from vllm's estimate\)"):
+            DynamicKvSizer.check_block_ids_fit_int16(sizer)
 
-    def test_a_count_within_the_cap_says_nothing(self, caplog):
+    def test_a_count_within_the_cap_passes(self):
         sizer = self._sizer(255, mode=dks.DynamicKvMode.PINNED, override=255)
-        assert self._warn(sizer, caplog) == ""
+        DynamicKvSizer.check_block_ids_fit_int16(sizer)
 
-    def test_the_shrunk_compile_is_left_to_the_resize(self, caplog):
-        sizer = self._sizer(4, mode=dks.DynamicKvMode.ACTIVE, shrunk=True)
-        sizer.model_runner.kv_cache_config.num_blocks = 1670
-        assert self._warn(sizer, caplog) == ""
+    def test_the_shrunk_compile_is_left_to_the_resize(self):
+        sizer = self._sizer(1670, mode=dks.DynamicKvMode.ACTIVE, shrunk=True)
+        DynamicKvSizer.check_block_ids_fit_int16(sizer)
 
 
 class TestComputeDynamicKvNumBlocks:
