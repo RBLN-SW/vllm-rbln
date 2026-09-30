@@ -2014,6 +2014,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
 
         if not self.use_async_scheduling:
+            # Ride the drafts back with the output instead of making the engine
+            # pull them: the pull only answers while this step is still the
+            # worker's batch, which strands the first decode step's drafts.
+            output.rbln_draft_token_ids = self.take_draft_token_ids()
             return output
 
         async_output = AsyncRBLNModelRunnerOutput(
