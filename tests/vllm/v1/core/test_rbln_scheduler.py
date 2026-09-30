@@ -1489,3 +1489,23 @@ class TestDraftingLookahead:
             remote_prefill=True,
         )
         assert seen == [0]
+
+
+class TestSyncKVLoads:
+    """The model runner starts a connector's loads after the forward unless the
+    step says it holds a synchronous one, so a step that admits a synchronous
+    external hit has to say so, or the forward reads blocks not yet loaded."""
+
+    def test_a_synchronous_external_hit_is_flagged(self):
+        sched = create_rbln_scheduler(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=False)
+        )
+        request = create_requests(1, num_tokens=32)[0]
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+
+        output = sched.schedule()
+
+        # Only the 16 tokens past the hit are computed this step.
+        assert output.num_scheduled_tokens[request.request_id] == 16
+        assert output.has_sync_kv_loads
