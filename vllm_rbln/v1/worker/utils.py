@@ -245,6 +245,10 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if getattr(hf_config, "model_type", None) == "longcat_flash":
         return 2
     text_config = getattr(model_config, "hf_text_config", hf_config)
+    # DeepSeek-V4: up to six caches a layer (SWA ring, compressed KV, indexer key + scale,
+    # two compressor states), each named with its slot; see models/deepseek_v4.py.
+    if getattr(text_config, "model_type", None) == "deepseek_v4":
+        return 6
     # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
     # or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):

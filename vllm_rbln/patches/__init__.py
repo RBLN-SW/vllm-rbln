@@ -30,6 +30,7 @@ from . import (
     deepseek_eagle3,
     deepseek_mtp,
     deepseek_v2,
+    deepseek_v4,
     distributed_utils,
     dynamic_kv,
     engine_core,

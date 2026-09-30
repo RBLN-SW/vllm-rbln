@@ -44,12 +44,48 @@ def _routing_mask_dtype(
     # fused op keeps the weights' own dtype there and a widened mask would just
     # promote the whole [E, t] table for nothing.
     dtype = routing_weights.dtype
-    bias_is_routed = use_grouped_topk or scoring_func == "sigmoid"
+    bias_is_routed = use_grouped_topk or scoring_func in ("sigmoid", "sqrtsoftplus")
     if e_score_correction_bias is None or not bias_is_routed:
         return dtype
     if e_score_correction_bias.dtype.itemsize > dtype.itemsize:
         return e_score_correction_bias.dtype
     return dtype
+
+
+def _split_router_out(out):
+    """A router returns logits, or (logits, forced expert ids [t, top_k]) for a
+    layer whose experts are fixed per token (DeepSeek-V4's hash-routed layers)."""
+    if isinstance(out, tuple):
+        return out
+    return out, None
+
+
+def _apply_sqrtsoftplus_topk(
+    router_logits_2d,  # [T, E]
+    top_k,
+    renormalize,
+    e_score_correction_bias=None,
+    forced_ids=None,  # [T, top_k] int
+):
+    """DeepSeek-V4 routing: scores sqrt(softplus(logits)); experts from the top-k of
+    scores + bias, or `forced_ids` (hash routing); weights are the unbiased scores,
+    renormalized. Returns [E, T]."""
+    scores_t = F.softplus(router_logits_2d.float()).sqrt().transpose(0, 1)  # [E, T]
+    if forced_ids is not None:
+        selected_experts = forced_ids.to(torch.int64).transpose(0, 1)  # [top_k, T]
+    else:
+        scores_for_topk = scores_t
+        if e_score_correction_bias is not None:
+            scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)
+        _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
+    topk_weights = scores_t.gather(0, selected_experts)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=0, keepdim=True).clamp_min(
+            1e-20
+        )
+    masked_routing_weights = torch.zeros_like(scores_t)
+    masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+    return masked_routing_weights
 
 
 class RBLNMoERunner(MoERunner):
@@ -156,7 +192,7 @@ class RBLNMoERunner(MoERunner):
 
             if self.use_dispatch_all2all:
                 # --- Router DP path: local routing → all_gather logits ---
-                router_logits = router(hidden_states)
+                router_logits, forced_ids = _split_router_out(router(hidden_states))
                 router_logits_2d = router_logits.reshape(t, -1)  # [t, E]
                 E = router_logits_2d.shape[-1]
 
@@ -164,6 +200,15 @@ class RBLNMoERunner(MoERunner):
                     router_logits_2d = F.pad(
                         router_logits_2d, (0, 0, 0, max_pad - t), value=0.0
                     )  # [max_pad, E]
+                if forced_ids is not None:
+                    forced_ids = forced_ids.reshape(t, -1)
+                    if t < max_pad:
+                        forced_ids = F.pad(forced_ids, (0, 0, 0, max_pad - t))
+                    forced_ids = (
+                        get_dp_group()
+                        .all_gather(forced_ids.unsqueeze(0), dim=0)
+                        .reshape(R * max_pad, -1)
+                    )
 
                 # all_gather router_logits across DP ranks
                 rl_flat = router_logits_2d.reshape(1, -1)
@@ -183,7 +228,10 @@ class RBLNMoERunner(MoERunner):
                 gathered_hidden = all_hidden.reshape(R * max_pad, H_dim)
 
                 # Router on all gathered tokens (no Router DP)
-                all_router_logits = router(gathered_hidden)  # [R*max_pad, E]
+                # [R*max_pad, E]; forced ids (if any) are for the gathered rows too
+                all_router_logits, forced_ids = _split_router_out(
+                    router(gathered_hidden)
+                )
                 all_router_logits = all_router_logits.reshape(R * max_pad, -1)
                 E = all_router_logits.shape[-1]
 
@@ -235,6 +283,14 @@ class RBLNMoERunner(MoERunner):
                         all_router_logits_t
                     )  # [E, R*max_pad]
                     masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+            elif scoring_func == "sqrtsoftplus":
+                masked_routing_weights = _apply_sqrtsoftplus_topk(
+                    all_router_logits,
+                    self.top_k,
+                    renormalize,
+                    e_score_correction_bias,
+                    forced_ids,
+                )  # [E, R*max_pad]
             elif scoring_func == "softmax":
                 if use_grouped_topk:
                     masked_routing_weights = _apply_grouped_topk_torch(
@@ -421,7 +477,7 @@ class RBLNMoERunner(MoERunner):
             return final_hidden_states
 
         # --- DP == 1 path ---
-        router_logits = router(hidden_states)
+        router_logits, forced_ids = _split_router_out(router(hidden_states))
 
         # topk + softmax → masked_routing_weights
         orig_shape = hidden_states.shape
@@ -467,6 +523,14 @@ class RBLNMoERunner(MoERunner):
                     ).clamp_min(1e-20)
                 masked_routing_weights = torch.zeros_like(router_logits_t)  # [E, t]
                 masked_routing_weights.scatter_(0, selected_experts, topk_weights)
+        elif scoring_func == "sqrtsoftplus":
+            masked_routing_weights = _apply_sqrtsoftplus_topk(
+                router_logits_2d,
+                self.top_k,
+                renormalize,
+                e_score_correction_bias,
+                None if forced_ids is None else forced_ids.reshape(num_tokens, -1),
+            )  # [E, t]
         elif scoring_func == "softmax":
             if use_grouped_topk:
                 masked_routing_weights = _apply_grouped_topk_torch(

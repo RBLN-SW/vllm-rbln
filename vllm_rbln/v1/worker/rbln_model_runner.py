@@ -3039,10 +3039,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        own_storage = self._kv_layers_own_storage()
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             device = self.device if USE_DEVICE_TENSOR else "meta"
-            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            tensor = None
             for layer_name in kv_cache_tensor.shared_by:
+                if tensor is None or own_storage:
+                    tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
                 kv_cache_raw_tensors[layer_name] = tensor
 
         layer_names = set()
@@ -3061,6 +3064,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return
         for attn_groups in self.attn_groups:
             yield from attn_groups
+
+    def _kv_layers_own_storage(self) -> bool:
+        """Whether every KV layer gets its own buffer instead of sharing its pool's.
+
+        DeepSeek-V4's layers of one pool differ in dtype and shape (int8 KV8 rows, bf16
+        compressor states, fp8 index keys). A shared storage enters the compiled graph once,
+        as its canonical layer's view (`_select_canonical_kv_layers_per_pool`), and the other
+        layers' views cannot be rebuilt from it, so each layer takes its own buffer (more
+        memory: one pool's size a layer). A workaround until the KV tensor refactor.
+        """
+        text_config = getattr(self.model_config, "hf_text_config", self.model_config.hf_config)
+        return getattr(text_config, "model_type", None) == "deepseek_v4"
 
     def _select_canonical_kv_layers_per_pool(
         self, kv_cache_config: KVCacheConfig
@@ -3084,6 +3099,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for layer_name in attn_group.layer_names
         }
         chosen: set[str] = set()
+        if self._kv_layers_own_storage():
+            # every layer is its own pool
+            return {
+                layer_name
+                for kv_cache_tensor in kv_cache_config.kv_cache_tensors
+                for layer_name in kv_cache_tensor.shared_by
+            }
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             pool_layers = kv_cache_tensor.shared_by
             if not pool_layers:
@@ -3209,6 +3231,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         marked_layers.append((layer_name, view_dynamic_axis))
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
+                        # Layers of different dtypes can share one storage (a
+                        # hybrid model's groups: DeepSeek-V4's int8 KV8 rows and
+                        # bf16 compressor states); the deduped base keeps the
+                        # first layer's dtype, so each view names its own.
+                        view_dtype=dtype,
                         view_shape=kv_cache_shape,
                         permute_order=tuple(inv_order),
                         dynamic_axis=base_dynamic_axis,
