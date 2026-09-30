@@ -11,21 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fetch the post-step drafts only when a running request will verify them.
+"""Fetch the post-step drafts only when a running request can verify them.
 
-``EngineCore.post_step`` pulls the drafts out of the worker so the scheduler
-can size the next verification step. Under PP that pull is a synchronous
-round-trip to ``output_rank``, queued behind the step's own RPCs there, so the
-engine cannot reach ``schedule()`` until the chunk has crossed every stage and
-the pipeline runs one microbatch deep. ``pipeline_parallel_size == 1`` has no
-``batch_queue`` to starve.
+Under PP the pull is a synchronous round-trip to ``output_rank`` that stops the
+engine refilling ``batch_queue``, so the pipeline runs one microbatch deep.
+``is_prefill_chunk`` alone reads a just-scheduled last chunk as a decode;
+holding a sampled token is the execution fact that it can verify.
 
-Holding a sampled token is what separates a decoding request from one whose
-last prefill chunk is merely scheduled -- ``_update_after_schedule`` clears
-``is_prefill_chunk`` a full ``batch_queue`` before the output arrives.
-
-Known cost: a request's first decode step runs unspeculated -- its last chunk's
-drafts only cross while that step is still the worker's batch.
+The first decode step of each request goes unspeculated as a result, and
+loosening this guard does not recover it.
 """
 
 from vllm.v1.engine.core import EngineCore
