@@ -246,13 +246,11 @@ def _ring_inputs(cache: RBLNDeepseekV4RingCache) -> tuple[torch.Tensor, ...]:
 
 
 def _paged_inputs(cache: RBLNDeepseekV4PagedCache) -> tuple[torch.Tensor, ...]:
-    """(cache tensor, seq_idx [B, 1], block_table [B, P]) of a paged cache."""
+    """(cache tensor, block_table [B, P]) of a paged cache. Its seq_lens is not read: the ops
+    take the step position from the ring caches, and an input the graph captures but no op
+    uses is pruned from the compiled module (the runtime then sees too many inputs)."""
     metadata = _metadata(cache.prefix)
-    return (
-        _resolve_kv_cache(metadata, cache.layer_index),
-        metadata.seq_lens.to(torch.int32),
-        metadata.block_tables,
-    )
+    return _resolve_kv_cache(metadata, cache.layer_index), metadata.block_tables
 
 
 # --------------------------------------------------------------------------------------------
@@ -505,7 +503,7 @@ class RBLNDeepseekV4Indexer(nn.Module):
         k_cur = self.compressor(x, seq_idx)
         weights, _ = self.weights_proj(x)
         weights = weights.float() * self.weight_scale
-        k_cache, _, block_table = _paged_inputs(self.k_cache)
+        k_cache, block_table = _paged_inputs(self.k_cache)
         k_scale = _resolve_kv_cache(_metadata(self.k_scale.prefix), self.k_scale.layer_index)
         return torch.ops.rbln_custom_ops.sparse_attn_deepseek_v4_indexer(
             q.transpose(1, 2).contiguous(),
@@ -655,7 +653,7 @@ class RBLNDeepseekV4Attention(nn.Module):
         )
         if self.compress_ratio:
             kv_cmp = self.compressor(x, seq_idx).contiguous()
-            cmp_cache, _, cmp_block_table = _paged_inputs(self.cmp_cache)
+            cmp_cache, cmp_block_table = _paged_inputs(self.cmp_cache)
             topk_index = None
             if self.indexer is not None:
                 topk_index = self.indexer(x, qr, positions, seq_idx, query_len)
@@ -768,22 +766,22 @@ class RBLNDeepseekV4MoE(nn.Module):
         )
 
     def _router(self, hidden_states: torch.Tensor, input_ids: torch.Tensor):
-        num_local = input_ids.numel()
+        # Hash layers: the expert ids are a bf16 table lookup of the local tokens; under DP the
+        # runner carries them through its hidden-state gather (`gather_extra`) and hands the
+        # gathered rows back as `extra`.
+        eids_local = (
+            F.embedding(input_ids.reshape(-1), self.gate.tid2eid) if self.is_hash else None
+        )
 
-        def route(x: torch.Tensor):
+        def route(x: torch.Tensor, extra: torch.Tensor | None = None):
             logits, _ = self.gate(x.float())
             if not self.is_hash:
                 return logits
-            ids = input_ids.reshape(-1)
-            rows = x.reshape(-1, x.shape[-1]).shape[0]
-            if rows != num_local:
-                # The runner gathered every DP rank's (padded) tokens.
-                pad = rows // get_dp_group().world_size - num_local
-                ids = get_dp_group().all_gather(F.pad(ids, (0, pad)).unsqueeze(0), dim=0)
-                ids = ids.reshape(-1)
-            eids = F.embedding(ids, self.gate.tid2eid)[:, : self.top_k]
-            return logits, eids.to(torch.int32)
+            eids = eids_local if extra is None else extra
+            return logits, eids[:, : self.top_k].to(torch.int32)
 
+        if self.is_hash:
+            route.gather_extra = eids_local
         return route
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
