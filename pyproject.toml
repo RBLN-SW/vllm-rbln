@@ -213,7 +213,7 @@ url = "https://pypi.org/simple/"
 explicit = true
 
 [tool.uv.sources]
-vllm = { index = "vllm-cpu" }
+vllm = { index = "rbln-nexus-nightly" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
