@@ -138,7 +138,7 @@ feature is absent there rather than disabled.
 | Flash causal attention disabled | This dispatches to an attention kernel that does not accept a dynamic KV input. |
 | A DFlash drafter (`--speculative-config '{"method": "dflash", ...}'`) | The drafter is non-causal on RBLN, and its attention kernel does not accept a dynamic KV input. `use_non_causal` lives on the draft config only, so the method is the signal. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
-| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. |
+| A KV transfer connector other than the RBLN NIXL ones (`RblnNixlConnector`, `RblnNixlPullConnector`, `RblnNixlPushConnector`) or `RBLNLMCacheConnectorV1` | The worker registers with the connector only once the resize has allocated (see "KV transfer connectors" above). That ordering is connector-agnostic, so a connector outside `DYNAMIC_KV_SUPPORTED_CONNECTORS` in `v1/worker/utils.py` is untried rather than known broken, and is kept off until it has been. A `MultiConnector` is read through to its children and is open exactly when all of them are; one that wraps nothing, or that wraps another `MultiConnector`, is not. |
 
 ## When Start-up Refuses
 
@@ -157,11 +157,12 @@ would serve from the pre-compile estimate this feature exists to replace.
   inputs of the same shapes and dtypes with different shard layouts, i.e. the
   same tensors placed two ways; the runtime would re-place the cache on every
   switch.
-- **The count cannot hold one request or one decode batch.** After the resize
-  the pool must hold `1 + max(one request, max_num_seqs decode steps)` blocks,
-  the 1 being the null block, summed over the KV cache groups that share the
-  pool; a sliding-window group counts vLLM's per-request admission blocks (the
-  window plus one unaligned block) rather than the whole context.
+- **The count cannot hold one request.** After the resize the pool must hold
+  `1 + one max_model_len request` blocks, the 1 being the null block, summed
+  over the KV cache groups that share the pool; a sliding-window group counts
+  vLLM's per-request admission blocks (the window plus `max_in_flight_tokens`,
+  plus one unaligned block) rather than the whole context. As upstream, a pool
+  smaller than `max_num_seqs` sequences only caps concurrency.
 - **No KV block fits.** On some chiplet the non-KV base already exceeds
   `total * gpu_memory_utilization`. Raise `--gpu-memory-utilization`, or give the
   model more devices.

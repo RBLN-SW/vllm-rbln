@@ -157,7 +157,7 @@ def get_vllm_config(async_scheduling=False, max_num_seqs=None, dtype=torch.float
         enable_prefix_caching=True,
     )
     additional_config = {
-        "prefix_block_size": IB_SIZE,
+        "sub_block_size": IB_SIZE,
         "optimum_overrides": {
             "prefill_chunk_size": IB_SIZE,
         },
