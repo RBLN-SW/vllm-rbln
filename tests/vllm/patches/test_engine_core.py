@@ -162,6 +162,20 @@ def test_a_request_boundary_fetches_once_instead_of_every_step():
     assert engine.scheduler.updated == ["drafts"]
 
 
+def test_the_last_chunk_step_does_not_fetch():
+    """The step that clears `is_prefill_chunk` is the one this skips.
+
+    Its drafts are the ones a request would verify first, and skipping here is
+    what costs that verification -- see the module docstring. Pinned so the
+    trade is not reversed by accident.
+    """
+    engine = _engine([LAST_CHUNK_SCHEDULED])
+
+    patched_post_step(engine, model_executed=True)
+
+    assert engine.model_executor.calls == 0
+
+
 def test_the_guard_is_per_step_not_sticky():
     # A prefilling request must not suppress the fetch for a decode request
     # that joins the batch later in the same run.

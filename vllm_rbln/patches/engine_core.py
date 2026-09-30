@@ -13,22 +13,19 @@
 # limitations under the License.
 """Fetch the post-step drafts only when a running request will verify them.
 
-``EngineCore.post_step`` pulls the drafts out of the worker so the scheduler can
-size the next verification step. It runs whenever spec decode is on and async
-scheduling is off -- on RBLN that is every PP run, since PP under async
-scheduling is not supported yet (see ``platform/vllm_impl.py``).
+``EngineCore.post_step`` pulls the drafts out of the worker so the scheduler
+can size the next verification step. Under PP that pull is a synchronous
+round-trip to ``output_rank``, queued behind the step's own RPCs there, so the
+engine cannot reach ``schedule()`` until the chunk has crossed every stage and
+the pipeline runs one microbatch deep. ``pipeline_parallel_size == 1`` has no
+``batch_queue`` to starve.
 
-Under PP the fetch is a synchronous round-trip to ``output_rank`` that queues
-behind that step's own RPCs on the last stage, so the engine cannot get back to
-``schedule()`` until the chunk has traversed every stage and the pipeline runs
-about one microbatch deep. At ``pipeline_parallel_size == 1`` there is no
-``batch_queue`` to starve and it costs nothing.
+Holding a sampled token is what separates a decoding request from one whose
+last prefill chunk is merely scheduled -- ``_update_after_schedule`` clears
+``is_prefill_chunk`` a full ``batch_queue`` before the output arrives.
 
-A request verifies drafts once it holds a sampled token to decode from, which
-is what separates a decoding request from one whose last prefill chunk is
-merely scheduled: ``_update_after_schedule`` clears ``is_prefill_chunk`` when it
-advances ``num_computed_tokens``, a full ``batch_queue`` before the output that
-retires the request arrives.
+Known cost: a request's first decode step runs unspeculated -- its last chunk's
+drafts only cross while that step is still the worker's batch.
 """
 
 from vllm.v1.engine.core import EngineCore
