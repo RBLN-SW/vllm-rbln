@@ -172,7 +172,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
             max_num_seqs // pp_size,
         )
 
-        _validate_eagle3_pp_config(vllm_config)
+        _validate_aux_hidden_states_pp_config(vllm_config)
 
     # FIXME(jiwoo.park) This is a temporary workaround.
     if model_config.enforce_eager:
@@ -190,41 +190,44 @@ def _validate(vllm_config: "VllmConfig") -> None:
         )
 
 
-def _validate_eagle3_pp_config(vllm_config: "VllmConfig") -> None:
-    """Reject an EAGLE3 target whose aux collection is not pipeline-aware.
+def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
+    """Reject a target whose aux hidden state collection is not pipeline-aware.
 
     Called only when `pipeline_parallel_size > 1`. Upstream's model `forward`
     indexes the aux capture with a stage-local `enumerate` and drops the list
-    on every non-last stage, so a target outside `EAGLE3_PP_TARGET_ARCHS`
-    harvests the wrong layers and reaches the drafter short. That surfaces as a
-    shape mismatch mid-compile, or -- where the counts happen to line up -- not
-    at all, as a silently worse draft.
+    on every non-last stage, so a target outside `AUX_PP_TARGET_ARCHS` harvests
+    the wrong layers and reaches the drafter short. That surfaces as a shape
+    mismatch mid-compile, or -- where the counts happen to line up -- not at
+    all, as a silently worse draft.
 
-    TODO(vllm-project/vllm#50514): delete once that lands and is released.
+    TODO: delete once upstream's capture is pipeline-aware for these targets.
+    vllm-project/vllm#50514 converted llama, qwen2 and mimo in 0.30.0 and left
+    the rest, so the allowlist is now the set it did not reach.
     """
     from vllm_rbln.v1.spec_decode.eagle3_pp import (
-        EAGLE3_PP_TARGET_ARCHS,
-        eagle3_aux_hidden_states_enabled,
+        AUX_PP_TARGET_ARCHS,
+        aux_hidden_states_enabled,
     )
 
-    # A draft with `use_aux_hidden_state` off captures nothing, so upstream's
-    # forward is harmless and the split is fine.
-    if not eagle3_aux_hidden_states_enabled(vllm_config.speculative_config):
+    # A draft that wants no aux states captures nothing, so upstream's forward
+    # is harmless and the split is fine.
+    if not aux_hidden_states_enabled(vllm_config.speculative_config):
         return
 
     architectures = vllm_config.model_config.hf_config.architectures or []
-    if set(architectures) & EAGLE3_PP_TARGET_ARCHS:
+    if set(architectures) & AUX_PP_TARGET_ARCHS:
         return
 
     raise ValueError(
-        "EAGLE3 with pipeline_parallel_size="
+        f"A {vllm_config.speculative_config.method} draft consumes the target's "
+        "auxiliary hidden states, and collecting them across pipeline stages "
+        "needs a per-architecture patch that this target does not have yet. "
+        "pipeline_parallel_size="
         f"{vllm_config.parallel_config.pipeline_parallel_size} is supported on "
-        f"RBLN only for target architectures "
-        f"{sorted(EAGLE3_PP_TARGET_ARCHS)}, but got {list(architectures)}. "
-        "Collecting the target's auxiliary hidden states across pipeline "
-        "stages needs a per-architecture patch that this target does not have "
-        "yet. Run this target with pipeline_parallel_size=1, or with a draft "
-        "whose eagle_config sets use_aux_hidden_state=false."
+        f"RBLN only for target architectures {sorted(AUX_PP_TARGET_ARCHS)}, but "
+        f"got {list(architectures)}. Run this target with "
+        "pipeline_parallel_size=1, or with a draft that does not consume the "
+        "target's auxiliary hidden states."
     )
 
 

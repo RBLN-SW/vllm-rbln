@@ -214,23 +214,24 @@ class TestRejectedConfigs:
                 )
             )
 
-    def test_eagle3_under_pp_needs_a_patched_target(self, reconfigure):
+    @pytest.mark.parametrize("method", ["eagle3", "dflash"])
+    def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):
         # The default model is a plain LlamaForCausalLM, whose forward still
         # collects aux hidden states with a stage-local index. Asserting through
         # the hook rather than on the validator directly is the point: it is what
         # shows the guard is reached at all.
-        with pytest.raises(ValueError, match="EAGLE3 with pipeline_parallel_size"):
-            reconfigure(_eagle3_under_pp())
+        with pytest.raises(ValueError, match="auxiliary hidden states"):
+            reconfigure(_aux_draft_under_pp(method=method))
 
     def test_eagle3_under_pp_accepts_a_patched_target(self, reconfigure):
-        reconfigure(_eagle3_under_pp(arch="MiniMaxM2ForCausalLM"))
+        reconfigure(_aux_draft_under_pp(arch="MiniMaxM2ForCausalLM"))
 
     def test_eagle3_under_pp_accepts_a_draft_with_aux_off(self, reconfigure):
         # Nothing is captured anywhere then, so upstream's forward is harmless.
-        reconfigure(_eagle3_under_pp(eagle_config={"use_aux_hidden_state": False}))
+        reconfigure(_aux_draft_under_pp(eagle_config={"use_aux_hidden_state": False}))
 
     def test_eagle3_at_pp1_is_not_gated(self, reconfigure):
-        reconfigure(_eagle3_under_pp(pp_size=1))
+        reconfigure(_aux_draft_under_pp(pp_size=1))
 
     def test_dp_needs_a_divisible_token_budget(self, reconfigure):
         with pytest.raises(ValueError, match="divisible"):
@@ -253,8 +254,14 @@ class TestRejectedConfigs:
         assert RBLNConfig().use_moe_tokens_mask is True
 
 
-def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int = 2):
-    """A mutator that puts an EAGLE3 draft on a pipeline-parallel target.
+def _aux_draft_under_pp(
+    *,
+    arch: str | None = None,
+    eagle_config=None,
+    pp_size: int = 2,
+    method: str = "eagle3",
+):
+    """A mutator that puts an aux-consuming draft on a pipeline-parallel target.
 
     EngineArgs would have to resolve a real draft checkpoint to build this, so the
     speculative config is a stand-in shaped like the fields the guard reads.
@@ -265,10 +272,16 @@ def _eagle3_under_pp(*, arch: str | None = None, eagle_config=None, pp_size: int
         # The guard runs after the per-stage decode batch check, which would
         # otherwise raise first and mask it.
         config.scheduler_config.max_num_seqs = pp_size * 2
+        if method == "dflash":
+            # So does DFlash's prefill chunk check, which this stand-in would
+            # otherwise trip with an unset budget.
+            config.scheduler_config.max_num_scheduled_tokens = (
+                config.scheduler_config.max_num_batched_tokens
+            )
         if arch is not None:
             config.model_config.hf_config.architectures = [arch]
         config.speculative_config = SimpleNamespace(
-            method="eagle3",
+            method=method,
             draft_model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(eagle_config=eagle_config)
             ),
