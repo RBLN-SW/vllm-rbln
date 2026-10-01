@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
-    VLLM_RBLN_DISABLE_OFFLOAD: bool = False
+    VLLM_RBLN_DISABLE_OFFLOAD: bool = True
     VLLM_RBLN_DISABLE_WORKER_FAIL_FAST: bool = False
     # Default follows VLLM_RBLN_USE_DEVICE_TENSOR (see use_auto_port), so it is
     # True unless device-tensor mode is explicitly disabled.
@@ -274,13 +274,12 @@ environment_variables = {
             in ("true", "1")
         )
     ),
-    # Disable RBLN file offloading during model load / warm-up even when
-    # VLLM_RBLN_USE_DEVICE_TENSOR is set. Kill-switch for the offload path;
-    # weight host backings stay resident instead of being paged to disk.
+    # Disable RBLN file offloading during model loading and warm-up by default.
+    # Set to 0 to allow host-side weight data to be paged to disk
+    # when VLLM_RBLN_USE_DEVICE_TENSOR is enabled.
     "VLLM_RBLN_DISABLE_OFFLOAD": (
         lambda: (
-            os.environ.get("VLLM_RBLN_DISABLE_OFFLOAD", "False").lower()
-            in ("true", "1")
+            os.environ.get("VLLM_RBLN_DISABLE_OFFLOAD", "True").lower() in ("true", "1")
         )
     ),
     # Disable only for debugging worker failures without terminating the worker.

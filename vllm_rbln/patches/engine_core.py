@@ -11,20 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Two `EngineCore` patches: the shutdown that faults on RBLN, and the
-post-step draft fetch the prefill path does not need.
+"""Guard RBLN shutdown and fetch drafts only when a request can verify them.
 
-``EngineCore.post_step`` fetches the drafts the next step verifies. Between
-prefill chunks there is nothing to verify, and upstream's own consumer says so
--- ``Scheduler.update_draft_token_ids`` drops the value on arrival. Under PP
-the fetch is a synchronous round-trip to the last stage, issued where
-``step_with_batch_queue`` would otherwise refill ``batch_queue``, so paying it
-for nothing costs the pipeline its depth.
+``EngineCore`` cleanup skips ``torch.accelerator.empty_host_cache()``, which
+faults on RBLN after a device tensor has existed, until torch-rbln 0.12.0.
 
-The guard is that consumer's own condition moved ahead of the round-trip, so
-the fetch resumes on exactly the step whose drafts the next one verifies: the
-step that schedules a request's last chunk already reports
-``is_prefill_chunk == False``.
+Under PP the pull is a synchronous round-trip to ``output_rank`` that stops the
+engine refilling ``batch_queue``, so the pipeline runs one microbatch deep.
+``is_prefill_chunk`` alone reads a just-scheduled last chunk as a decode;
+holding a sampled token is the execution fact that it can verify.
+
+The first decode step of each request goes unspeculated as a result, and
+loosening this guard does not recover it.
 """
 
 from importlib.metadata import version
@@ -76,8 +74,8 @@ def patched_cleanup_dist_env_and_memory(shutdown_ray: bool = False) -> None:
 @register_patch(
     target="vllm.v1.engine.core.EngineCore.post_step",
     reason=(
-        "Skip the post-step draft fetch while every running request is still "
-        "mid-prefill. The scheduler discards drafts for prefill chunks, but "
+        "Skip the post-step draft fetch while no running request can verify "
+        "drafts yet. The scheduler discards drafts for prefill chunks, but "
         "under PP the fetch is a synchronous round-trip to the last stage that "
         "stops the engine from refilling batch_queue, so the pipeline runs one "
         "microbatch deep instead of pipeline_parallel_size."
@@ -88,7 +86,11 @@ def patched_cleanup_dist_env_and_memory(shutdown_ray: bool = False) -> None:
 def patched_post_step(self: EngineCore, model_executed: bool) -> None:
     if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
         running = self.scheduler.running
-        if running and all(request.is_prefill_chunk for request in running):
+        will_verify_drafts = any(
+            not request.is_prefill_chunk and request.num_output_tokens > 0
+            for request in running
+        )
+        if running and not will_verify_drafts:
             return
         draft_token_ids = self.model_executor.take_draft_token_ids()
         if draft_token_ids is not None:
