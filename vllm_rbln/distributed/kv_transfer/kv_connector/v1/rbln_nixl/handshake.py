@@ -162,10 +162,16 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if not self.use_host_buffer or block_size != self.block_size:
             return None
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
-        if tp_ratio >= 0:
-            return None
-        handles = self.src_xfer_handles_by_tp_ratio[tp_ratio]
         plan = self.tp_mappings[engine_id]
+        if not self._needs_split_local_xfer_handles(tp_ratio, plan):
+            # Asking upstream rather than repeating its predicate: a replicated
+            # MLA region is not split, so there is no handle to borrow and the
+            # ratio alone does not say that.
+            return None
+        # vllm 0.30 keys that split by (ratio, the peer's block size), because
+        # one ratio can now describe peers whose blocks differ. The guard above
+        # already settled that this peer's block size is ours.
+        handles = self.src_xfer_handles_by_tp_ratio[tp_ratio, block_size]
         assert region_ids == list(range(self.num_regions)), (
             "RBLN NIXL: borrowing upstream's split needs it to describe the "
             "same regions in the same order, but this peer narrows ours to "

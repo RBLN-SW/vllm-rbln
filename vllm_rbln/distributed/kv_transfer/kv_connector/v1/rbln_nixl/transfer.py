@@ -128,20 +128,22 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         *,
         count_stages: bool = True,
     ) -> bytes:
-        """Notification carrying how many of our ranks pair with one peer rank.
+        """Notification carrying what the peer on this path waits for.
 
-        NOTE(RBLN): upstream sends its own tensor-parallel size, which the peer
-        divides by its own to learn how many of us to hear from before settling
-        the request. A finer pipeline on our side multiplies that, each stage
-        pairing with the same peer rank for its own layers, so the read path
-        sends the count in the unit the peer divides by: ours times the peer's
-        TP. The write path must not -- 0.26's writer accounting multiplies OUR
-        `pp_size` back in, taking it from the producer's own kv_transfer_params,
-        so the stages would be counted twice.
+        NOTE(RBLN): the two paths send different units, because vllm 0.30
+        changed one of the two protocols and left the other alone. The read
+        path's peer counts notifications and settles the request when the
+        total arrives, deriving nothing from the number, so it is handed that
+        total: our readers of one peer rank, times our stages, since a finer
+        pipeline has each stage report for its own layers. The write path's
+        peer still divides by its own TP, so it is handed the quantity that
+        division expects, and it must not count stages -- the consumer's own
+        accounting multiplies the producer's stage count back in, off the
+        `pp_size` its `ReqMeta` carries, so they would be counted twice.
         """
         peers = max(1, self.world_size // remote_tp_size)
-        if count_stages:
-            remote_pp = self._remote_pp_size.get(engine_id, 1)
-            local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
-            peers *= max(1, local_pp // remote_pp)
-        return f"{remote_request_id}:{peers * remote_tp_size}".encode()
+        if not count_stages:
+            return f"{remote_request_id}:{peers * remote_tp_size}".encode()
+        remote_pp = self._remote_pp_size.get(engine_id, 1)
+        local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
+        return f"{remote_request_id}:{peers * max(1, local_pp // remote_pp)}".encode()

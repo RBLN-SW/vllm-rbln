@@ -85,7 +85,7 @@ def _encode_payload(
         num_blocks=4,
         block_lens=[8192] * n_regions,
         block_strides=[8192] * n_regions,
-        kv_cache_layout="HND",
+        kv_cache_layout="LBHNC",
         block_size=16,
         ssm_sizes=(0, 0),
         attn_backend_name="RBLN",
@@ -115,7 +115,7 @@ def _agent_meta(**overrides):
         num_blocks=4,
         block_lens=block_lens,
         block_strides=list(block_lens),
-        kv_cache_layout="HND",
+        kv_cache_layout="LBHNC",
         block_size=16,
         ssm_sizes=(0, 0),
         attn_backend_name="RBLN",
@@ -415,6 +415,37 @@ def test_peer_meta_block_length_mirrors_the_local_table():
             local = geo.xfer_tables(geo.kv_caches()).block_lens
             agent = decoder.decode(peer_meta(geo).agent_metadata_bytes)
         assert list(agent.block_lens) == list(local), geo
+
+
+def test_peer_meta_names_every_region_the_way_a_producer_does():
+    # A producer publishes the four region lists one entry per REGION, and
+    # `registered_layer_names` folds the names back to layers. At one chiplet
+    # area the per-layer and per-region forms read alike, which is what let the
+    # peer double drift to the per-layer one.
+    from vllm.config import set_current_vllm_config
+
+    from tests.vllm.distributed.kv_connector.utils import (
+        KvGeometry,
+        engine_config,
+        peer_meta,
+    )
+
+    decoder = msgspec.msgpack.Decoder(RblnNixlAgentMetadata)
+    geo = KvGeometry(areas=4, slices=4)
+
+    with set_current_vllm_config(engine_config(block_size=geo.block_size)):
+        agent = decoder.decode(peer_meta(geo).agent_metadata_bytes)
+
+    n_regions = len(agent.kv_caches_base_addr)
+    assert n_regions > len(geo.layers)  # or the two forms cannot be told apart
+    for field in (
+        "region_names",
+        "region_num_blocks",
+        "region_group_ids",
+        "region_mem_types",
+    ):
+        assert len(getattr(agent, field)) == n_regions, field
+    assert agent.registered_layer_names == list(geo.layers)
 
 
 def test_a_replicated_head_band_is_refused_rather_than_mismodelled():
@@ -1312,17 +1343,32 @@ class TestBaseFanInHandle:
     # emitting descriptors that span every producer's head band.
 
     @staticmethod
-    def _worker(*, host_buffer=True, tp_ratio=-4):
+    def _worker(
+        *, host_buffer=True, tp_ratio=-4, use_mla=False, source_ranks=(0, 1, 2, 3)
+    ):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w.use_host_buffer = host_buffer
         w.block_size = 16
         w.num_regions = 4
+        # Read by upstream's `_needs_split_local_xfer_handles`, which decides
+        # whether a split was built at all.
+        w.use_mla = use_mla
         w.transfer_topo = MagicMock()
         w.transfer_topo.tp_ratio.return_value = tp_ratio
-        w.src_xfer_handles_by_tp_ratio = {-4: [70, 71, 72, 73]}
-        w.tp_mappings = {"eng": MagicMock(all_source_ranks=(0, 1, 2, 3))}
+        # Keyed as upstream keys it: one ratio can describe peers whose block
+        # sizes differ, so the block size is part of the key.
+        w.src_xfer_handles_by_tp_ratio = {(-4, 16): [70, 71, 72, 73]}
+        w.tp_mappings = {"eng": MagicMock(all_source_ranks=source_ranks)}
         return w
+
+    def test_a_replicated_mla_peer_has_no_split_to_borrow(self):
+        # Upstream builds the split for everything but a pure-MLA mapping, whose
+        # one source rank writes the whole region. Reading the map on the ratio
+        # alone indexes a key it never wrote.
+        w = self._worker(use_mla=True, source_ranks=(0,))
+
+        assert w._base_fan_in_handle("eng", 0, 16, [0, 1, 2, 3], 4) is None
 
     def test_picks_the_split_for_this_producer(self):
         w = self._worker()
@@ -2871,7 +2917,7 @@ class TestHeadMatchedHandshakeChecks:
     # over host-bounce, so this branch is unreachable from them.
 
     @staticmethod
-    def _worker(*, local_len=128, block_size_ratio=1, layout="NHD", kv_heads=8):
+    def _worker(*, local_len=128, block_size_ratio=1, layout="LBNHC", kv_heads=8):
         # `local_len` and `kv_heads` take a list for one entry per logical region;
         # the transfer table repeats each across the 4 chiplet areas.
         w = object.__new__(RblnNixlPullConnectorWorker)
@@ -2893,7 +2939,7 @@ class TestHeadMatchedHandshakeChecks:
         return w
 
     @staticmethod
-    def _meta(*, remote_len, layout="NHD"):
+    def _meta(*, remote_len, layout="LBNHC"):
         # A TP1 peer keeps all 8 heads, cut into 4 slices -> 2 heads per area,
         # so its per-area block length must be twice ours for a head to cost the
         # same on both sides.
@@ -2929,7 +2975,7 @@ class TestHeadMatchedHandshakeChecks:
         w = self._worker()
         meta = _agent_meta(
             block_size=16,
-            kv_cache_layout="NHD",
+            kv_cache_layout="LBNHC",
             kv_areas=4,
             kv_slices=4,
             block_lens=[256],
@@ -2987,10 +3033,10 @@ class TestHeadMatchedHandshakeChecks:
             )
 
     def test_layout_mismatch_raises(self):
-        w = self._worker(layout="NHD")
+        w = self._worker(layout="LBNHC")
         with pytest.raises(RuntimeError, match="peer KV layout"):
             w._validate_head_matched_handshake(
-                self._meta(remote_len=256, layout="HND"), remote_tp_size=1
+                self._meta(remote_len=256, layout="LBHNC"), remote_tp_size=1
             )
 
 

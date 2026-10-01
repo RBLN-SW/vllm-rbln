@@ -300,8 +300,8 @@ class TestShardReadPath:
     def test_read_notif_counts_every_reader_of_a_producer_rank(
         self, local_tp, remote_tp, local_pp, remote_pp, expected_readers
     ):
-        # The producer divides the number we send by its own tensor-parallel
-        # size to get the count it waits for, so send it in that unit.
+        # The producer counts notifications and settles the request when the
+        # total arrives, so the number is that total and nothing derives it.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.world_size = local_tp
         w._remote_pp_size = {"eng": remote_pp}
@@ -311,8 +311,7 @@ class TestShardReadPath:
         notif = w._xfer_notif_id("eng", "req-1", remote_tp).decode()
         req_id, sent = notif.rsplit(":", 1)
         assert req_id == "req-1"
-        assert int(sent) % remote_tp == 0
-        assert int(sent) // remote_tp == expected_readers
+        assert int(sent) == expected_readers
 
     def test_delegates_when_the_handshake_narrowed_nothing(self):
         # A peer serving our whole band with our own head split: upstream's

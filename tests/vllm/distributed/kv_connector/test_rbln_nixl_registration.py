@@ -187,7 +187,7 @@ def _prep_impl_worker(
     worker._has_mamba = False
     worker.attn_backends = []
     worker.backend_name = "rbln"
-    worker.kv_cache_layout = "HND"
+    worker.kv_cache_layout = "LBHNC"
     worker._mamba_ssm_size = 0
     worker.model_config = MagicMock()
     worker.model_config.get_total_num_kv_heads.return_value = 8
@@ -1230,7 +1230,7 @@ class TestPublishHandshakeMetadata:
             num_blocks=4,
             block_lens=[8192] * len(names),
             block_strides=[8192] * len(names),
-            kv_cache_layout="HND",
+            kv_cache_layout="LBHNC",
             block_size=16,
             ssm_sizes=(0, 0),
             attn_backend_name="RBLN",
