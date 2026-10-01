@@ -51,7 +51,8 @@ The scheduler also requires `block_size >= max_num_batched_tokens >= sub_block_s
 
 For cross-engine prefix-aware routing (e.g., llm-d):
 enable KV events via `--kv-events-config` in vLLM and
-set the router's token processing block size to vLLM `--max-num-batched-tokens`
+set the router's token processing block size to the sub-block size:
+`--rbln-sub-block-size` when given, otherwise `--max-num-batched-tokens`
 (**not** `--block-size`; see [Using with llm-d](#using-with-llm-d)).
 
 ## Key components
@@ -322,20 +323,23 @@ This allows us to change emission granularity unilaterally.
 
 ### Using with llm-d
 
-llm-d's `precise-prefix-cache-scorer` chunks incoming prompts at its
+Plugin and field names below follow llm-d-router `v0.10.0`.
+
+llm-d's `precise-prefix-cache-producer` chunks incoming prompts at its
 configured block size, looks those keys up in the index it builds from our
 events, and scores pods by how many consecutive blocks match.  Routing
-works iff the scorer's `blockSize` equals the engine's emitted
-`block_size` — our sub-block size, which is the prefill chunk size
+works iff the producer's `blockSizeTokens` equals the engine's emitted
+`block_size`, which is our sub-block size:
+`--rbln-sub-block-size` when given, otherwise the prefill chunk size
 (`--max-num-batched-tokens`).
 
 > **Not** vLLM's `--block-size`.  For stock vLLM those two happen to be
 > the same knob, so generic guides tell you to align `--block-size` with
-> `blockSize`.  Here, `--block-size` is the big-block size (used for
-> attention-kernel layout) while the scorer sees sub-block events.  Align
-> `blockSize` with `--max-num-batched-tokens`, not `--block-size`.
+> `blockSizeTokens`.  Here, `--block-size` is the big-block size (used for
+> attention-kernel layout) while the producer sees sub-block events.  Align
+> `blockSizeTokens` with the sub-block size, not `--block-size`.
 
-For example, with prefill chunk size 128:
+For example, with sub-block size 128:
 
 - vllm-rbln:
   ```
@@ -344,11 +348,25 @@ For example, with prefill chunk size 128:
       --max-num-batched-tokens=128 \
       --kv-events-config='{"enable_kv_cache_events": true, "publisher": "zmq", ...}'
   ```
-- EPP `prefix-cache-scorer` plugin:
+  On REBEL CR13, `--rbln-sub-block-size=128` with a larger
+  `--max-num-batched-tokens` emits the same events.
+- EPP `precise-prefix-cache-producer` plugin:
   ```
   tokenProcessorConfig:
-    blockSize: 128
+    blockSizeTokens: 128
   ```
+
+`approx-prefix-cache-producer` does not read our events,
+but set its `blockSizeTokens` to the sub-block size too.
+It hashes the last, partially filled block as well,
+so with a larger block size two prompts that diverge inside the first router block
+share no key, and the router loses the pod that caches their common prefix.
+
+Its block boundaries follow the engine's tokens only when the config has a
+`token-producer` that tokenizes, e.g. with the `vllm` backend.
+Without one, EPP creates a `token-producer` with the `estimate` backend,
+which counts text bytes instead of tokens,
+so for text prompts its blocks do not line up with the engine's sub-blocks.
 
 llm-d doesn't need to know anything about the big-block layout.
 Other event fields (`token_ids`, `parent_block_hash`, `extra_keys`,
