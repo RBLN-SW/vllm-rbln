@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, ClassVar
 
 import numpy as np
@@ -27,6 +29,39 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+_SYS_CLASS_NET = Path("/sys/class/net")
+_LINK_POLL_S = 1.0
+# (read at, every link down), shared by every caller in the process.
+_link_poll: tuple[float, bool] = (-_LINK_POLL_S, False)
+
+
+def every_local_link_down() -> bool:
+    """Every physical link in this namespace is down; a veth has no `device`."""
+    global _link_poll
+    now = time.monotonic()
+    read_at, all_down = _link_poll
+    if now - read_at < _LINK_POLL_S:
+        return all_down
+    states = []
+    for dev in _SYS_CLASS_NET.iterdir():
+        if not (dev / "device").exists():
+            continue
+        try:
+            states.append((dev / "operstate").read_text().strip())
+        except FileNotFoundError:  # unregistered since the listing
+            continue
+    all_down = bool(states) and all(s == "down" for s in states)
+    _link_poll = (now, all_down)
+    return all_down
+
+
+def link_down_exit_s(kv_connector_extra_config: dict[str, Any]) -> float:
+    value = kv_connector_extra_config.get("link_down_exit_s", 0)
+    # float(True) is 1.0: a hand-written `true` would exit a second after the drop.
+    if isinstance(value, bool):
+        raise ValueError(f"link_down_exit_s takes seconds, got {value!r}")
+    return float(value)
 
 
 def _as_descs(blocks_data: list[tuple[int, int, int]]) -> np.ndarray:
@@ -82,6 +117,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _shard_region_group_ids: dict[tuple[str, int], tuple[int, ...]]
     _shard_descs_per_block: dict[tuple[str, int], int]
 
+    _engines_to_rehandshake: set[str]
+    _link_down_since: float | None
+    _link_down_exit_s: float
+
     @property
     def topo(self) -> RblnTransferTopology:
         """The transfer topology, which registration produces.
@@ -120,6 +159,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         if meta is not None and not meta.local_block_ids:
             assert handle is None
             return True
+        if meta is not None and meta.remote is not None:
+            self._engines_to_rehandshake.add(meta.remote.engine_id)
         return super()._handle_failed_transfer(req_id, handle, failed_req_ids)
 
     def _layer_overlap(

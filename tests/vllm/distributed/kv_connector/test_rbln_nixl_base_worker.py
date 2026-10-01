@@ -60,6 +60,19 @@ class TestRealWorkerRegistration:
         assert w.transfer_topo is None
 
 
+class TestLinkDownExitRole:
+    # A consumer serves its running requests on recompute while its links are
+    # down; only a producer may exit to be recycled.
+
+    def test_a_consumer_rejects_the_exit(self, monkeypatch):
+        with pytest.raises(RuntimeError, match="producer"):
+            build_worker(monkeypatch, kv_role="kv_consumer", link_down_exit_s=30)
+
+    def test_a_bool_is_refused_rather_than_read_as_one_second(self, monkeypatch):
+        with pytest.raises(ValueError, match="link_down_exit_s"):
+            build_worker(monkeypatch, kv_role="kv_producer", link_down_exit_s=True)
+
+
 class TestBackendSelection:
     def test_host_bounce_with_adapter_uses_rbln_backend(self, monkeypatch):
         worker = build_worker(monkeypatch, kv_buffer_device="cpu", nixl_available=True)

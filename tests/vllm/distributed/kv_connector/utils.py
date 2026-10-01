@@ -690,6 +690,8 @@ def build_worker(
     dcp_size=1,
     pcp_size=1,
     stripe_width=None,
+    kv_role="kv_both",
+    link_down_exit_s=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -753,9 +755,10 @@ def build_worker(
     vllm_config = MagicMock()
     # A real dict: read through a mock, every knob answers with a mock of its
     # own, and a connector that tests one for absence never sees it missing.
-    vllm_config.kv_transfer_config.kv_connector_extra_config = (
-        {} if stripe_width is None else {"stripe_width": stripe_width}
-    )
+    extra = {"stripe_width": stripe_width, "link_down_exit_s": link_down_exit_s}
+    vllm_config.kv_transfer_config.kv_connector_extra_config = {
+        k: v for k, v in extra.items() if v is not None
+    }
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # What the worker sets before it builds the connector; `register_kv_caches`
     # takes the count from here.
@@ -768,6 +771,7 @@ def build_worker(
     vllm_config.scheduler_config = SchedulerConfig(
         is_encoder_decoder=False, max_model_len=128
     )
+    vllm_config.kv_transfer_config.kv_role = kv_role
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     groups = [MagicMock(kv_cache_spec=spec) for spec in (specs or [])]
@@ -781,3 +785,14 @@ def build_worker(
     kv_cache_config.transfer_groups = groups
     kv_cache_config.transfer_group_ids = tuple(range(len(groups)))
     return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+
+
+def fake_sysfs_net(tmp_path, **operstate: str):
+    """A `/sys/class/net` with a veth and the given physical links."""
+    (tmp_path / "eth0").mkdir()
+    (tmp_path / "eth0" / "operstate").write_text("up\n")
+    for name, state in operstate.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "device").touch()
+        (tmp_path / name / "operstate").write_text(f"{state}\n")
+    return tmp_path
