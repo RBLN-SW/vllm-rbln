@@ -39,8 +39,8 @@ if TYPE_CHECKING:
 # upstream does with ``NIXL_CONNECTOR_VERSION``. Folded into the NIXL compat
 # hash so an RBLN peer on another schema fails the handshake cleanly; earlier
 # bumps are `git log -L` on this line.
-#   6: cross_layers_blocks hashed, layer names folded onto 0.30's region ledger
-RBLN_NIXL_CONNECTOR_VERSION: int = 6
+#   7: the read path's completion notification carries a count, not a TP size
+RBLN_NIXL_CONNECTOR_VERSION: int = 7
 
 
 class KVSplitAxis(Enum):

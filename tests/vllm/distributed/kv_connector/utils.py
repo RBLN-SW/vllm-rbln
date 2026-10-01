@@ -559,13 +559,21 @@ def peer_meta(
         block_lens=block_lens,
         block_strides=block_lens,
         attn_backend_name="RBLN_FLASH_ATTN",
-        kv_cache_layout="HND",
+        kv_cache_layout="LBHNC",
         block_size=geometry.block_size,
         ssm_sizes=(0, 0),
         physical_blocks_per_logical_kv_block=1,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        region_names=names,
+        # Region-major, area-minor and one entry per region, which is the order
+        # and the length a producer publishes; `registered_layer_names` folds it
+        # back to layers. Per-layer would read the same only at one area.
+        region_names=[
+            name for name in names for _ in range(regions_per_layer * geometry.areas)
+        ],
+        region_num_blocks=[geometry.num_blocks] * n_regions,
+        region_mem_types=["VRAM"] * n_regions,
+        region_group_ids=[0] * n_regions,
         kv_areas=geometry.areas,
         kv_slices=geometry.slices,
     )
@@ -679,7 +687,8 @@ def build_worker(
     swa_view_opt=False,
     use_mla=False,
     pp_size=1,
-    hma_disabled=False,
+    dcp_size=1,
+    pcp_size=1,
     stripe_width=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
@@ -704,13 +713,6 @@ def build_worker(
     monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_SWA_VIEW_OPT", swa_view_opt)
 
     def fake_super_init(self, vllm_config, engine_id, kv_cache_config):
-        # Upstream reads `disable_hybrid_kv_cache_manager` once in its own
-        # __init__, for its PP refusal and for `_is_hma_required`. Record what
-        # it was shown rather than restating its condition here, and leave
-        # `_is_hma_required` unset so only the override can produce it.
-        self.hma_flag_seen_by_upstream_init = (
-            vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
-        )
         self.vllm_config = vllm_config
         self.engine_id = engine_id
         self.kv_cache_config = kv_cache_config
@@ -735,8 +737,8 @@ def build_worker(
         # State vllm 0.30.0 added to the real __init__ and the inherited entry
         # points now read. The parallel sizes are the single-shard values these
         # tests build against, so no rank ever offsets off them.
-        self.dcp_size = 1
-        self.pcp_size = 1
+        self.dcp_size = dcp_size
+        self.pcp_size = pcp_size
         self.dcp_rank = 0
         self.pcp_rank = 0
         self.dst_region_num_blocks = {}
@@ -763,13 +765,9 @@ def build_worker(
     # _check_pp_constraints compares pipeline_parallel_size <= 1; a MagicMock
     # would raise TypeError there, so give it a real int.
     vllm_config.parallel_config.pipeline_parallel_size = pp_size
-    # Real, so that renaming the flag the override suppresses fails here rather
-    # than being absorbed. `VllmConfig.__post_init__` resolves it before a
-    # worker is built, so a bool is what production sees.
     vllm_config.scheduler_config = SchedulerConfig(
         is_encoder_decoder=False, max_model_len=128
     )
-    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     groups = [MagicMock(kv_cache_spec=spec) for spec in (specs or [])]

@@ -640,16 +640,17 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             )
         page_sizes = self._layer_page_sizes(kv_caches)
         if len(page_sizes) > 1:
-            # TODO(RBLN): delete once the pinned vLLM drops that assert --
-            # upstream already did, while standardising the KV-cache layout.
+            # TODO(RBLN): lift once the head bands below are read per region.
+            # Upstream stopped requiring one size a layer when it moved to
+            # per-region lengths; what still requires it is this side.
             raise RuntimeError(
                 "RBLN NIXL: host staging cannot register KV caches whose "
                 f"per-layer size differs (got {sorted(page_sizes)}), which is "
                 "what a speculative draft model with its own "
-                "num_key_value_heads produces. Upstream's "
-                "`register_kv_caches` asserts one size for every non-MLA "
-                "tensor and this path delegates to it. Use "
-                "kv_buffer_device='rbln'."
+                "num_key_value_heads produces. The head bands this path "
+                "derives below give every layer the same number of regions "
+                "and the same band, so a differing layer would be addressed "
+                "by another's geometry. Use kv_buffer_device='rbln'."
             )
         super().register_kv_caches(kv_caches)
         # Every layer contributes the same number of regions -- one where the

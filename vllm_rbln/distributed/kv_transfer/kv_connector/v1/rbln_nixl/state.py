@@ -109,8 +109,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         A read with no local block moved nothing: `load_kv_async` is returned
         only with a positive external token count, so such a request was never
         put in WAITING_FOR_REMOTE_KVS, and reporting it trips the scheduler's
-        `assert req_id in self.requests`. Upstream would also index
-        `local_block_ids[0]` to invalidate what was read.
+        `assert req_id in self.requests`.
 
         The entry stays: the handshake done-callback runs on the executor
         thread, so it and the heartbeat can reach one request, and dropping it

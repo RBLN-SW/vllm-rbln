@@ -45,7 +45,15 @@ class SupportsKVCacheRegistrationFinalize(Protocol):
 
 @runtime_checkable
 class SupportsDeferredLoad(Protocol):
-    """A connector that holds a KV load until a submission is in flight."""
+    """A connector that holds a KV load until a submission is in flight.
+
+    vllm 0.29 moved an async load behind the forward launch for the same
+    reason, but its signal is one boolean for the whole step. Two shapes it
+    cannot express are what this carries: a step with no forward of its own
+    still fires the load, into a context manager that wraps nothing, and a
+    step where any one connector wants a synchronous load drags every
+    connector's load in front of the forward.
+    """
 
     def flush_deferred_load(self) -> None: ...
 

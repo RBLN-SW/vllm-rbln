@@ -23,12 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    MambaSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from tests.vllm.distributed.kv_connector.utils import (
     KvGeometry,
@@ -39,14 +34,6 @@ from tests.vllm.distributed.kv_connector.utils import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
-
-
-def _merged_uniform_spec(inner):
-    """One group of same-type-but-not-identical layers, which is what
-    `get_kv_cache_groups` merges an MLA model with a sparse indexer into."""
-    return UniformTypeKVCacheSpecs(
-        block_size=inner.block_size, kv_cache_specs={"layer.0": inner}
-    )
 
 
 def _full_attention_spec(block_size=64):
@@ -96,6 +83,21 @@ class TestBackendSelection:
         # register device memory, so construction must fail loudly.
         with pytest.raises(RuntimeError, match="nixl-rbln"):
             build_worker(monkeypatch, kv_buffer_device="rbln", nixl_available=False)
+
+
+class TestContextParallelIsRefusedAtStartup:
+    @pytest.mark.parametrize(("dcp_size", "pcp_size"), [(2, 1), (1, 2), (2, 2)])
+    def test_a_context_parallel_engine_is_refused(
+        self, monkeypatch, dcp_size, pcp_size
+    ):
+        # A sharded rank holds a slice of a region, which is what the handshake
+        # already refuses a peer for. Catching ours at startup keeps the
+        # advertised size and the topology from disagreeing.
+        with pytest.raises(RuntimeError, match="context-parallel engine"):
+            build_worker(monkeypatch, dcp_size=dcp_size, pcp_size=pcp_size)
+
+    def test_a_single_shard_engine_is_built(self, monkeypatch):
+        assert build_worker(monkeypatch) is not None
 
 
 class TestLogicalBlockPinning:
@@ -326,106 +328,6 @@ class TestRegisterLocalXferHandlerSwa:
         assert [addr for addr, _, _ in swa] == [addr for addr, _, _ in full]
         assert {desc_len for _, desc_len, _ in full} == {full_len}
         assert {desc_len for _, desc_len, _ in swa} == {full_len // w._sw_ratio}
-
-
-class TestHmaRefusalSuppression:
-    """The override suppresses the hybrid-KV-manager flag across
-    `super().__init__()` for one merged group of full attention specs, and
-    puts it back. These build that layout and the ones it must leave alone.
-    """
-
-    @staticmethod
-    def _pp_worker(monkeypatch, specs, **kwargs):
-        return build_worker(monkeypatch, specs=specs, pp_size=4, **kwargs)
-
-    def test_the_flag_is_off_while_upstream_looks_at_it(self, monkeypatch):
-        # The refusal reads the flag inside `super().__init__()`, so that call
-        # is the only point where the suppression is observable at all.
-        specs = [_merged_uniform_spec(_full_attention_spec())]
-        worker = self._pp_worker(monkeypatch, specs)
-
-        assert worker.hma_flag_seen_by_upstream_init is True
-
-    def test_the_suppression_is_undone(self, monkeypatch):
-        # Both halves matter. `_is_hma_required` still gates the block-size
-        # and permute guards downstream, and the config object is shared, so a
-        # flag left flipped would outlive this constructor.
-        specs = [_merged_uniform_spec(_full_attention_spec())]
-        worker = self._pp_worker(monkeypatch, specs)
-
-        assert worker._is_hma_required is True
-        scheduler_config = worker.vllm_config.scheduler_config
-        assert scheduler_config.disable_hybrid_kv_cache_manager is False
-
-    def test_hma_switched_off_by_the_operator_stays_off(self, monkeypatch):
-        # The suppression is the manager's own flag, so for someone who turned
-        # the manager off there is nothing to suppress and nothing to require.
-        specs = [_merged_uniform_spec(_full_attention_spec())]
-        worker = self._pp_worker(monkeypatch, specs, hma_disabled=True)
-
-        assert worker.hma_flag_seen_by_upstream_init is True
-        assert worker._is_hma_required is False
-
-    def test_a_group_that_opted_out_of_transfer_does_not_count(self, monkeypatch):
-        # Upstream derives `_is_hma_required` from the transfer view, so that
-        # is the list this suppression has to predict. Counting cache groups
-        # instead sees two and suppresses nothing, and the refusal this exists
-        # to disarm fires on a layout upstream would have judged right.
-        specs = [_merged_uniform_spec(_full_attention_spec())]
-        worker = self._pp_worker(
-            monkeypatch,
-            specs,
-            non_transfer_specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-        )
-
-        assert worker.hma_flag_seen_by_upstream_init is True
-        assert worker._is_hma_required is True
-
-    @pytest.mark.parametrize("hma_disabled", [False, True])
-    @pytest.mark.parametrize(
-        "specs",
-        [
-            pytest.param(
-                [
-                    _merged_uniform_spec(
-                        MambaSpec(
-                            block_size=64, shapes=((1, 1),), dtypes=(torch.float16,)
-                        )
-                    )
-                ],
-                id="merged-mamba",
-            ),
-            pytest.param(
-                [
-                    _merged_uniform_spec(
-                        SlidingWindowSpec(
-                            block_size=64,
-                            num_kv_heads=1,
-                            head_size=64,
-                            dtype=torch.float16,
-                            sliding_window=128,
-                        )
-                    )
-                ],
-                id="merged-swa",
-            ),
-            pytest.param([_full_attention_spec()], id="unmerged"),
-            pytest.param(
-                [_merged_uniform_spec(_full_attention_spec())] * 2, id="two-groups"
-            ),
-        ],
-    )
-    def test_a_layout_upstream_judges_right_is_left_alone(
-        self, monkeypatch, specs, hma_disabled
-    ):
-        # Every later net -- upstream's `_has_mamba`, our `_has_swa` and
-        # `_check_pp_constraints` -- reads the group spec, not what a merged
-        # group wraps, so a merged Mamba or SWA group suppressed here would
-        # reach the PP region slicing with nothing left to refuse it.
-        worker = self._pp_worker(monkeypatch, specs, hma_disabled=hma_disabled)
-
-        assert worker.hma_flag_seen_by_upstream_init is hma_disabled
-        assert not hasattr(worker, "_is_hma_required")
 
 
 # What each layout puts in one block.
