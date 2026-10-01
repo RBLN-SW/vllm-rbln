@@ -134,6 +134,22 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
     ).all()
 
 
+@pytest.mark.parametrize(
+    ("max_model_len", "block_size", "expected_width"),
+    [(448, 448, 1), (672, 224, 3)],
+)
+def test_runner_block_table_has_no_token_alignment_padding(
+    max_model_len, block_size, expected_width
+):
+    vllm_config = get_vllm_config()
+    vllm_config.model_config.max_model_len = max_model_len
+    vllm_config.cache_config.block_size = block_size
+    runner = RBLNOptimumModelRunner(vllm_config, DEVICE)
+
+    block_table = runner.input_batch.block_table.block_tables[0].get_cpu_tensor()
+    assert block_table.shape[1] == expected_width
+
+
 def test_mask_block_table_fills_unused_slots_with_zero():
     # vLLM ids (1-based, 0 is the null block) for a request owning 4 of 8 slots.
     block_ids = torch.tensor([7, 9, 12, 15, 0, 0, 0, 0], dtype=torch.int32)
