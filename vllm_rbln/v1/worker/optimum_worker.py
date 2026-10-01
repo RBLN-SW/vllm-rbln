@@ -298,6 +298,11 @@ class RBLNOptimumWorker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        # Optimum owns per-layer [blocks, heads, tokens, head_dim] caches;
+        # there are no vLLM attention layers to query for layout support.
+        return ["LBHNC"]
+
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
         pass
 
