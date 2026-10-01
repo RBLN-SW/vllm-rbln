@@ -11,15 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Carrying EAGLE3 aux hidden states across a pipeline split.
+"""Carrying a draft's aux hidden states across a pipeline split.
 
 Everything here is architecture-independent: the slot naming, which indices a
 stage receives versus captures, and the handoff placeholder that has to advertise
 them. Only the capture itself is not, because it lives inside a model's `forward`
 and the tensors have to be graph outputs of that forward -- see
 `vllm_rbln/patches/minimax_m2.py` and `vllm_rbln/patches/axk2/model.py`.
-
-TODO(vllm-project/vllm#50514): delete once that lands and is released.
 """
 
 from __future__ import annotations
@@ -36,29 +34,32 @@ from vllm.sequence import IntermediateTensors
 # architecture absent from here harvests the wrong layers and comes up short at
 # the drafter. `RblnPlatform.check_and_update_config` rejects the combination
 # rather than letting it fail mid-compile.
-EAGLE3_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM", "AXK2ForCausalLM"})
+AUX_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM", "AXK2ForCausalLM"})
 
 # One handoff tensor carries every aux hidden state, concatenated on the feature
 # dim in ascending layer order, which is the layout the drafter's `fc` already expects.
 AUX_COMBINED = "aux_hidden_states"
 
 
-def eagle3_aux_hidden_states_enabled(
+def aux_hidden_states_enabled(
     speculative_config: SpeculativeConfig | None,
 ) -> bool:
-    """Whether an EAGLE3 draft consumes the target's aux hidden states.
+    """Whether the draft consumes the target's auxiliary hidden states.
 
-    A draft can turn them off in its `eagle_config`, and then nothing is captured
-    anywhere: `aux_hidden_state_layers` stays empty, so upstream's unpatched
-    forward is harmless under a pipeline split. The model runner and the startup
-    guard both have to agree on this, hence a single reader.
+    A DFlash draft always does. An EAGLE3 draft can turn them off in its
+    `eagle_config`, and then nothing is captured anywhere: `aux_hidden_state_layers`
+    stays empty, so upstream's unpatched forward is harmless under a split.
 
     Read from the config rather than from the drafter, which exists only on the
     last rank. Every stage has to know: the aux tensors are captured across the
-    stages and consumed only on the last one, so a non-last stage that thinks
-    EAGLE3 is off captures nothing and the last stage comes up short.
+    stages and consumed only on the last one, so a non-last stage that thinks the
+    draft wants none captures nothing and the last stage comes up short.
     """
-    if speculative_config is None or speculative_config.method != "eagle3":
+    if speculative_config is None:
+        return False
+    if speculative_config.method == "dflash":
+        return True
+    if speculative_config.method != "eagle3":
         return False
     eagle_config = getattr(
         speculative_config.draft_model_config.hf_config, "eagle_config", None
