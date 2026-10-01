@@ -1072,7 +1072,9 @@ class TestRegisterKvCachesImpl:
         worker._layer_specs = {"l0": target, "l1": draft}
         worker.kv_cache_config = MagicMock(
             kv_cache_tensors=[object(), object()],
-            kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=["l0", "l1"], kv_cache_spec=None)
+            ],
         )
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
@@ -1096,7 +1098,9 @@ class TestRegisterKvCachesImpl:
         worker._layer_specs = {"l0": spec, "l1": spec}
         worker.kv_cache_config = MagicMock(
             kv_cache_tensors=[object(), object()],
-            kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=["l0", "l1"], kv_cache_spec=None)
+            ],
         )
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
@@ -1374,7 +1378,7 @@ class TestPublishHandshakeMetadata:
         has_mamba=False,
         cross_layers=False,
         base_meta=None,
-        swa_kernel_block=None,
+        swa_kernel_blocks=frozenset(),
     ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
@@ -1391,7 +1395,7 @@ class TestPublishHandshakeMetadata:
         w._has_mamba = has_mamba
         window_mode(w, None)
         w._has_swa = False
-        w._swa_kernel_blocks = set() if swa_kernel_block is None else {swa_kernel_block}
+        w._swa_kernel_blocks = set(swa_kernel_blocks)
         w.use_mla = False
         # Chiplet geometry travels with the metadata so a consumer with a
         # different TP degree can match head bands. Defaults are host-bounce's
@@ -1492,7 +1496,7 @@ class TestPublishHandshakeMetadata:
         sides have to be cut by one number. Nothing else in the blob says which
         -- `block_size` and `sliding_window` are both legal values of it."""
         w = self._publish(
-            pp_rank=0, pp_size=1, layer_names=["l0"], swa_kernel_block=128
+            pp_rank=0, pp_size=1, layer_names=["l0"], swa_kernel_blocks={128}
         )
         decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
             w.xfer_handshake_metadata.agent_metadata_bytes
@@ -1503,6 +1507,17 @@ class TestPublishHandshakeMetadata:
         # Not None: the field is an int over the wire, and zero is what the
         # pairing reads as "nothing to disagree with".
         w = self._publish(pp_rank=0, pp_size=1, layer_names=["l0"])
+        decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            w.xfer_handshake_metadata.agent_metadata_bytes
+        )
+        assert decoded.swa_kernel_block == 0
+
+    def test_a_shard_whose_groups_disagree_advertises_zero(self):
+        # Two answers cannot be advertised as one, and the peer cuts our
+        # addresses by whatever this number says. Zero withdraws the claim.
+        w = self._publish(
+            pp_rank=0, pp_size=1, layer_names=["l0"], swa_kernel_blocks={16, 64}
+        )
         decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
             w.xfer_handshake_metadata.agent_metadata_bytes
         )
@@ -1706,9 +1721,9 @@ class TestWhatRegistrationSettles:
         assert plain.compat_hash != drafted.compat_hash
 
     def test_a_context_cut_over_a_packed_block_is_refused(self, make_worker):
-        # MLA is the cut's only model shape today and registers K alone, so
-        # nothing has run this pairing; a one-head attention model reaches the
-        # same axis with both halves in the block.
+        # The axis comes from a region holding one head, not from the model:
+        # a one-head attention model reaches it with both halves in the block,
+        # which is the pairing the refusal is about.
         geo = KvGeometry(layers=("l0",), heads=1, areas=4, slices=4)
         with pytest.raises(RuntimeError, match="packs K and V"):
             make_worker(kv_cache=geo)
@@ -1919,8 +1934,8 @@ class TestChunkModeWithASlidingWindow:
     descriptor lists, which is where a chunk range can sit. The per-shard lists
     it would otherwise be sent to cannot name two KV groups: their
     region-to-group map holds one group per region, and under HMA both groups
-    share every region. A window range is a separate knob and no longer the
-    price of admission."""
+    share every region. A window range is a separate knob, not the price of
+    admission."""
 
     @staticmethod
     def _register(monkeypatch, *, specs, chunk_mode=True, axis=None):
@@ -1982,9 +1997,8 @@ class TestChunkModeWithASlidingWindow:
         ]
 
     def test_a_hybrid_enters_chunk_mode_without_a_window_range(self, monkeypatch):
-        # What the class docstring used to describe the other way round: the
-        # second range is no longer the price of admission, because a hybrid
-        # owns the whole-engine lists on its own.
+        # The second range is not the price of admission: a hybrid owns the
+        # whole-engine lists on its own.
         worker = self._register(monkeypatch, specs=self._hybrid_specs())
 
         assert worker._sw_ratio is None

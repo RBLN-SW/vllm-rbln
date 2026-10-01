@@ -81,20 +81,20 @@ class RblnNixlAgentMetadata(NixlAgentMetadata):
     # build, so two peers off one build can differ and the version cannot tell
     # them apart. The default is the layout every version through 4 had.
     kv_per_block: int = 1
-    # Tokens a block holds in the view the sliding-window kernel reads
-    # (`_observe_swa_kernel_block`). 0 where the shard cuts no window range by
-    # it, so a PP stage without such a group pairs with any peer. Two engines
-    # whose runners chose differently cut a window range differently.
+    # Tokens a block holds in the view the sliding-window kernel reads. 0 where
+    # this shard has no single answer to advertise, which `registration.py`
+    # decides -- including host staging, which never looks. Two engines whose
+    # runners chose differently cut a window range differently.
     swa_kernel_block: int = 0
 
     @property
     def registered_layer_names(self) -> list[str]:
         """The layers this shard registered, in region order.
 
-        vllm 0.30 put ``region_names`` on the wire, which names a layer per
-        region -- the same fact this used to carry as its own field. A layer
-        owns a run of consecutive regions, so the run boundaries give the list
-        back and a peer that trims regions trims this with them.
+        vllm 0.30 puts ``region_names`` on the wire, which names a layer per
+        region. A layer owns a run of consecutive regions, so the run
+        boundaries give the list back and a peer that trims regions trims this
+        with them.
         """
         return list(dict.fromkeys(self.region_names or ()))
 

@@ -24,6 +24,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
     NixlPushConnectorWorker,
@@ -378,14 +381,19 @@ class TestPerShardWrite:
 
     def test_a_reported_request_drops_its_token_count(self, monkeypatch):
         # Nothing else pops it, so a count kept here would outlive its request.
+        # Stubbed on the hook 0.30 reports from, not on `get_finished`: that is
+        # a wrapper nothing calls, and stubbing it would run this body through
+        # a path the model runner never takes.
         worker = self._trimming_worker()
         worker._valid_tokens = {"r0": 17, "other": 9}
         worker._writer_counts_by_req = defaultdict(int)
         monkeypatch.setattr(
-            NixlPushConnectorWorker, "get_finished", lambda self: ({"r0"}, set())
+            NixlPushConnectorWorker,
+            "get_transfer_results",
+            lambda self: KVConnectorTransferResults(finished_sending={"r0"}),
         )
 
-        worker.get_finished()
+        worker.get_transfer_results()
 
         assert worker._valid_tokens == {"other": 9}
 
@@ -996,3 +1004,30 @@ class TestTheDelegatingRouteHandsTheListOver:
         # length of upstream's call and put back after it.
         assert seen == [(17, 3)]
         assert worker._request_tail is None
+
+    def test_the_window_knob_alone_parks_the_count(self, monkeypatch):
+        # The write side of the same rule: the window range rides the
+        # whole-engine list without chunk mode, so the count it is cut from
+        # has to be parked here too.
+        worker = TestPerShardWrite._writing_worker(ranks=1)
+        worker._overlapping_ranks = {}
+        worker.transfer_topo.get_engine_info.return_value = MagicMock(
+            remote_tp_size=1, remote_block_size=16, remote_physical_blocks_per_logical=1
+        )
+        worker._chunk_mode = False
+        window_mode(worker, 8)
+        worker._chunk_grid = None
+        worker._request_tail = None
+        worker._group_specs = [MagicMock()]  # one full-attention group
+        worker._valid_tokens = {"r0": 17}
+        meta = TestPerShardWrite._meta(([5, 6, 7],), ([9],))
+
+        seen: list = []
+        monkeypatch.setattr(
+            NixlPushConnectorWorker,
+            "_xfer_blocks_for_req",
+            lambda self, req_id, m: seen.append(self._request_tail),
+        )
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert seen == [(17, 3)]

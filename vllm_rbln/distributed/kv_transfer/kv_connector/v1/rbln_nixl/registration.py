@@ -474,9 +474,9 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             KVSplitAxis.NON_HEAD if region_non_head == {True} else KVSplitAxis.HEAD
         )
         # The cut is derived from a region holding one head, which is what
-        # makes a token range one run of its bytes. It says nothing about K and
-        # V sharing the block, and MLA -- the cut's only model shape today --
-        # registers K alone, so this pairing has never run.
+        # makes a token range one run of its bytes. It says nothing about
+        # whether K and V share the block, so the two have to be asked
+        # separately.
         if self._kv_split_axis is KVSplitAxis.NON_HEAD and self._kv_per_block > 1:
             raise RuntimeError(
                 "RBLN NIXL (D2D): a context-cut KV cache whose block packs K "

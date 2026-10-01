@@ -92,7 +92,7 @@ def _collisions(base: type, mixins: list[type]) -> list[str]:
     return sorted(found)
 
 
-def _sw_ratio_asked_as_a_question() -> list[str]:
+def _sw_ratio_asked_as_a_question(sources: dict[str, str] | None = None) -> list[str]:
     """Where the package reads `_sw_ratio` for yes/no rather than for its value.
 
     Two questions ride on the ratio and neither may be asked off it again.
@@ -100,17 +100,25 @@ def _sw_ratio_asked_as_a_question() -> list[str]:
     has no room for", which chunk mode also answers yes; `_window_grid` is "is
     there a window range, and how is it cut". Asking either off the ratio ties
     it back to one knob, which is what the connector spent a round untangling.
-    Three reads are not the question and are left out: deriving the ratio, and
-    the two that answer.
-    """
-    from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import rbln_nixl
 
-    root = pathlib.Path(rbln_nixl.__file__).parent
+    The two that answer are skipped by name, and `base_worker.py` whole: the
+    ratio is derived there, and the reads around that derivation are about
+    whether there is one to derive.
+
+    Args:
+        sources: filename -> source, for the test that feeds this a known
+            offender. Reads the package when absent.
+    """
+    if sources is None:
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import rbln_nixl
+
+        root = pathlib.Path(rbln_nixl.__file__).parent
+        sources = {p.name: p.read_text() for p in sorted(root.glob("*.py"))}
     found: list[str] = []
-    for path in sorted(root.glob("*.py")):
-        if path.name == "base_worker.py":
-            continue  # where the ratio is derived from the group specs
-        tree = ast.parse(path.read_text())
+    for name, source in sorted(sources.items()):
+        if name == "base_worker.py":
+            continue
+        tree = ast.parse(source)
         answers = {
             node
             for node in ast.walk(tree)
@@ -135,7 +143,7 @@ def _sw_ratio_asked_as_a_question() -> list[str]:
                         and isinstance(sub.value, ast.Name)
                         and sub.value.id == "self"
                     ):
-                        found.append(f"{path.name}:{sub.lineno}")
+                        found.append(f"{name}:{sub.lineno}")
     return sorted(set(found))
 
 
@@ -280,13 +288,23 @@ def test_the_layout_question_is_asked_in_one_place():
 
 
 def test_the_check_sees_a_ratio_asked_as_a_question():
-    # Without this the test above passes on a rule that matches nothing.
-    tree = ast.parse("if self._sw_ratio is None:\n    pass\n")
-    asked = [
-        sub
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        for sub in ast.walk(node.test)
-        if isinstance(sub, ast.Attribute) and sub.attr == "_sw_ratio"
-    ]
-    assert len(asked) == 1
+    # Without this the test above passes on a rule that matches nothing, and
+    # re-walking the tree here would pass on a rule of its own -- so this feeds
+    # the check an offender and asks what IT found.
+    assert _sw_ratio_asked_as_a_question(
+        {"made_up.py": "if self._sw_ratio is None:\n    pass\n"}
+    ) == ["made_up.py:1"]
+
+    # And the two exemptions are exemptions, not blind spots: the same read
+    # inside the functions that answer, and anywhere in the file that derives
+    # the ratio, is not a finding.
+    assert (
+        _sw_ratio_asked_as_a_question(
+            {
+                "made_up.py": "def _window_grid(self):\n"
+                "    if self._sw_ratio is None:\n        pass\n",
+                "base_worker.py": "if self._sw_ratio is None:\n    pass\n",
+            }
+        )
+        == []
+    )

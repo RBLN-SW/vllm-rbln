@@ -32,9 +32,6 @@ import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_schedule
 from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
 )
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    RblnNixlConnectorMetadata,
-)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
     RblnNixlPullConnectorScheduler,
 )
@@ -464,69 +461,6 @@ class TestRejectedBeforeScheduling:
 
         assert "rejected" in meta.reqs_to_recv
         assert meta.reqs_to_recv["rejected"].remote.block_ids == ()
-
-
-class TestTailTokenCountOnTheReadPath:
-    """The producer says how many tokens it holds in `kv_transfer_params`;
-    upstream reads it once for the match length and drops it. The read path
-    needs it to know how full the request's last block is."""
-
-    @staticmethod
-    def _params(remote_num_tokens):
-        return {
-            "do_remote_prefill": True,
-            "remote_engine_id": "prefill0",
-            "remote_request_id": "abc",
-            "remote_host": "localhost",
-            "remote_port": 5559,
-            "remote_block_ids": ([4, 5],),
-            "tp_size": 1,
-            "remote_num_tokens": remote_num_tokens,
-        }
-
-    def _meta_for(self, monkeypatch, remote_num_tokens):
-        sched = _scheduler()
-        sched.vllm_config = mock_vllm_config(chunk_mode=True)
-        req = _Request(
-            "r0",
-            # Apart from the producer's count: a consumer's own prompt length
-            # is not what the producer holds, and only one of them sizes the
-            # last block the producer hands over.
-            num_prompt_tokens=41,
-            kv_transfer_params=self._params(remote_num_tokens),
-        )
-        sched._reqs_need_recv["r0"] = (req, ([7],))
-        return sched.build_connector_meta(_sched_output("other", ([9],), 16))
-
-    def test_the_count_survives_into_the_metadata(self, monkeypatch):
-        meta = self._meta_for(monkeypatch, 33)
-        # Promoted, or the worker has no field to read it from.
-        assert isinstance(meta, RblnNixlConnectorMetadata)
-        assert meta.valid_tokens == {"r0": 33}
-
-    def test_a_producer_holding_nothing_is_left_out(self, monkeypatch):
-        # A request the serving layer turned away registers an empty receive
-        # and reports zero, which is not a last block anyone can size.
-        assert self._meta_for(monkeypatch, 0).valid_tokens == {}
-
-    def test_both_flags_off_collect_nothing(self, monkeypatch):
-        # The worker would not read it, and an entry nobody pops outlives its
-        # request.
-        assert self._with_knobs(chunk_mode=False).valid_tokens == {}
-
-    def test_window_mode_alone_collects_the_count(self, monkeypatch):
-        # The count is not the chunk range's alone: a window's group reads it
-        # to say which granule of a block its window sits in.
-        assert self._with_knobs(
-            chunk_mode=False, swa_window_mode=True
-        ).valid_tokens == {"r0": 33}
-
-    def _with_knobs(self, **knobs):
-        sched = _scheduler()
-        sched.vllm_config = mock_vllm_config(**knobs)
-        req = _Request("r0", num_prompt_tokens=33, kv_transfer_params=self._params(33))
-        sched._reqs_need_recv["r0"] = (req, ([7],))
-        return sched.build_connector_meta(_sched_output("other", ([9],), 16))
 
 
 class TestTailTokenCountOnTheWritePath:

@@ -182,8 +182,9 @@ class RblnNixlWorkerBase(
         # observation is the runner's; the grid adds this rank's own cut.
         self._window_grid_cut: tuple[int, int] | None = None
         self._swa_kernel_blocks: set[int] = set()
-        # How far the request being transferred fills its last block, parked
-        # for the length of one upstream call (`_tail_viewed_as`).
+        # The request's token count and its own block count, which together
+        # say how far its last block is filled. Parked for the length of one
+        # upstream call (`_tail_viewed_as`).
         self._request_tail: tuple[int | None, int | None] | None = None
         # Ordered local KV-cache layer names (one per layer), captured at
         # register_kv_caches.

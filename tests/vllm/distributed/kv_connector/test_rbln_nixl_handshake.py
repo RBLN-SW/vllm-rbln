@@ -1417,16 +1417,21 @@ class TestShardLocalRegions:
         assert w._chunk_descs_ids_for_shard("eng", 0, w.num_blocks, 0, (0, 1)).size == 0
 
     def test_no_chunk_grid_leaves_the_list_as_it_was(self):
-        # Guard: the grid is what the knob turns on, and off it must cost
-        # nothing -- a longer dlist is memory every peer pays for.
+        # Guard: the grid is what the knob turns on, and off it must leave
+        # the list as upstream built it. Measured against the grid on: `None`
+        # is also the default, so comparing the two spellings of off compares
+        # a call with itself.
         w = self._wired_worker()
 
-        _handle, plain = w._register_shard_local_xfer_handler(16, ("l2", "l3"))
-        _handle, none_grid = w._register_shard_local_xfer_handler(
+        _handle, off = w._register_shard_local_xfer_handler(
             16, ("l2", "l3"), chunk_grid=None
         )
+        _handle, on = w._register_shard_local_xfer_handler(
+            16, ("l2", "l3"), chunk_grid=(2, 2)
+        )
 
-        assert np.array_equal(none_grid, plain)
+        assert len(off) < len(on)
+        assert np.array_equal(on[: len(off)], off)
 
     def test_a_windowed_engine_carries_the_chunk_range_on_the_whole_engine_list(
         self,
@@ -1568,7 +1573,7 @@ class TestShardLocalRegions:
         # Derived once here and used for the local list; left out, the local
         # list holds whole blocks while every peer's carries the range.
         w = self._wired_worker()
-        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
         w._shard_descs_per_block = {}
@@ -1613,7 +1618,7 @@ class TestShardLocalRegions:
         # (`_build_head_matched_remote`); derived with a different one, the two
         # carry different grids and a transfer pairs them by position anyway.
         w = self._wired_worker()
-        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
         w._shard_descs_per_block = {}
@@ -1651,7 +1656,7 @@ class TestShardLocalRegions:
         w._chunk_mode = True
         w._kv_split_axis = KVSplitAxis.HEAD
         w._kv_areas = 2
-        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
 
@@ -1685,7 +1690,7 @@ class TestShardLocalRegions:
         w._chunk_mode = True
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         w._kv_areas = 2
-        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
 
@@ -1779,7 +1784,7 @@ class TestChunkSizing:
         assert w._shard_chunk_grid(block_size=block_size, split=1) is None
 
     def test_off_the_knob_there_is_no_grid(self):
-        # Off, neither list may grow: a longer dlist is memory every peer pays.
+        # A block length the shape could cut, so only the knob answers None.
         w = self._grid_worker(block_len=2048 * 256)
         w._chunk_mode = False
 
@@ -3071,6 +3076,7 @@ class TestADecodeContextParallelPeerIsRefused:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w._sw_ratio = None
+        w._chunk_mode = False
         w._remote_agents = {}
         w.dst_num_blocks = {}
         w.dst_region_num_blocks = {}
@@ -3122,6 +3128,7 @@ class TestARefusedPeerLeavesNothingBehind:
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w._sw_ratio = None
+        w._chunk_mode = False
         w._remote_agents = {}
         w.dst_num_blocks = {}
         w.dst_region_num_blocks = {}

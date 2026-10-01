@@ -262,6 +262,39 @@ class TestDescIdsForAPackedBlock:
         assert sorted(self._ids(SPLIT, sw)) == [10, 11, 18, 19]
 
 
+class TestWhichGroupTheCountDescribes:
+    """`_prompt_blocks` picks the group a chunk cuts, and on a hybrid that is
+    not group 0. A sliding-window group's list is clipped to its own window, so
+    counting it reports a length the request's token count never described."""
+
+    @staticmethod
+    def _worker(monkeypatch, specs):
+        w = build_worker(monkeypatch, block_size=64)
+        w._group_specs = specs
+        return w
+
+    def test_a_window_group_ahead_of_the_full_one_is_skipped(self, monkeypatch):
+        # gpt-oss' order: the sliding window is group 0 and holds two clipped
+        # blocks, the full-attention group behind it holds the request's five.
+        # Counting group 0 hands `_tail_chunks` a length its token count
+        # contradicts, which it refuses -- naming the count, not the group.
+        w = self._worker(
+            monkeypatch,
+            [sliding_window_spec(block_size=64, sliding_window=16), MagicMock()],
+        )
+
+        assert w._prompt_blocks(([90, 91], [1, 2, 3, 4, 5])) == 5
+
+    def test_an_engine_with_no_full_group_describes_no_request(self, monkeypatch):
+        # None rather than a number: there is nothing for a chunk to be sized
+        # against, and registration refuses that engine before this is read.
+        w = self._worker(
+            monkeypatch, [sliding_window_spec(block_size=64, sliding_window=16)]
+        )
+
+        assert w._prompt_blocks(([90, 91],)) is None
+
+
 class TestTailChunks:
     # `_tail_chunks` over a 64-token block cut into 4 areas by a context cut,
     # so a chunk is 16 tokens at one per area and the boundaries the table

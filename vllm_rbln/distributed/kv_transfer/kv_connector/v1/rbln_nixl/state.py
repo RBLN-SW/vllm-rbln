@@ -148,14 +148,16 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         kernel addresses the cache in is the runner's answer, and nothing the
         connector is handed repeats it -- a pool hands over its full-attention
         layer, and that view is the same shape either way. So read the runner's
-        own binding, which keeps every layer unfiltered.
+        own binding, which keeps every layer. Over the transfer view, because
+        `_sw_ratio` is derived from it and a refusal sourced from a group that
+        addresses no descriptor would refuse a pairing nothing transfers.
 
         A set, because a speculative draft brings its own groups and they need
         not agree; only a window range needs them to.
         """
         ctx = self.vllm_config.compilation_config.static_forward_context
         blocks: set[int] = set()
-        for group in self.kv_cache_config.kv_cache_groups:
+        for group in self.kv_cache_config.transfer_groups:
             if not isinstance(group.kv_cache_spec, SlidingWindowSpec):
                 continue
             cache = ctx[group.layer_names[0]].kv_cache
@@ -318,7 +320,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         num_blocks: int,
         grid: tuple[int, int],
     ) -> list[tuple[int, int, int]]:
-        """A third range: every block of every region, cut into token chunks.
+        """A range past the whole-block one: every block of every region, cut
+        into token chunks.
 
         `pieces` is `(base address, whole length, block stride, device id)` per
         region; the two sides differ in where those come from and in nothing
@@ -515,12 +518,13 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         """This engine's local descriptors, and the views of a block they name.
 
         A sliding window shortens the RDMA descriptor, not the tensor and not
-        the host copy: regions stay Full-sized whatever the groups are. The
-        list therefore carries whole blocks and then a `sliding_window`-length
-        view over the same addresses, and a transfer picks the range its group
-        needs (`_compute_desc_ids`). The prefix is enough because the tail a
-        window writes back is never read, and the two groups draw block ids
-        from disjoint pools.
+        the host copy: regions stay Full-sized whatever the groups are. So the
+        list carries whole blocks first, then the ranges the knobs asked for
+        over the same addresses -- a window range, a chunk range, or both --
+        and a transfer picks the one its group needs (`_compute_desc_ids`).
+        The window range names the granules the window sits in rather than a
+        prefix of the block, which is why `_window_grid` reads the request's
+        token count to find them.
         """
         if not self._own_engine_layout:
             if (

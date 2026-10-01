@@ -43,9 +43,10 @@ def _chunk_desc_ids(
     `start` is where the chunk range begins: one whole-block range before it on
     a shard's lists, and on the whole-engine lists a window range as well,
     which holds the granules that tile a block where the whole-block range
-    holds the block. That offset is the only thing the two callers differ in, so the
-    arithmetic lives here -- an index computed one way and a descriptor emitted
-    the other lands on bytes nothing reports.
+    holds the block. Each caller passes the geometry of its own lists; what
+    they share is the order inside the range, so that arithmetic lives here --
+    an index computed one way and a descriptor emitted the other lands on bytes
+    nothing reports.
     """
     runs, chunks = grid
     lo, hi = chunk_span
@@ -112,7 +113,7 @@ class RblnNixlTransferMixin(RblnNixlWorkerState):
         sits in the block before, so a list too short to reach it names one and
         says nothing.
 
-        What keeps the two ends agreeing is upstream's `get_sw_clipped_blocks`,
+        What keeps the two ends agreeing is upstream's `get_exchange_clipped_blocks`,
         which cuts an SWA group to `blocks_per_sw` = `cdiv(sliding_window,
         block_size) + 1` from the tail. Both ends of a read run it -- the
         producer in `request_finished` before it publishes the ids, the consumer

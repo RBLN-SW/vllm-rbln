@@ -153,6 +153,22 @@ class TestObservingTheKernelBlock:
         worker = build_worker(monkeypatch, kv_buffer_device="rbln", specs=[MagicMock()])
         assert worker._observe_swa_kernel_block() == set()
 
+    def test_a_group_that_does_not_transfer_is_not_observed(self, monkeypatch):
+        # The ratio this set is checked against comes from the transfer view,
+        # so a window that addresses no descriptor must not reach it -- the
+        # refusal it would arm is about a pairing nothing transfers.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            block_size=64,
+            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+            non_transfer_specs=[sliding_window_spec(block_size=64, sliding_window=32)],
+        )
+        # The opted-out window is the one above, and reading every group
+        # would report it
+        # -- which `_window_grid` then refuses against a ratio it never saw.
+        assert worker._observe_swa_kernel_block() == {16}
+
     def test_groups_addressed_differently_are_both_reported(self, monkeypatch):
         # A speculative draft brings its own groups and they need not agree.
         # Only a window range needs one number, so the disagreement is carried
@@ -210,9 +226,9 @@ class TestSwaWindowRatio:
         assert worker._has_swa is False
 
     def test_chunk_mode_leaves_the_window_knob_alone(self, monkeypatch):
-        # The two knobs name different ranges. Chunk mode used to turn this one
-        # on because that was the only way a hybrid owned its descriptor lists;
-        # `_own_engine_layout` answers that itself now.
+        # The two knobs name different ranges, and a hybrid owns its
+        # descriptor lists through `_own_engine_layout` rather than through
+        # this one.
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="rbln",  # chunk mode is the direct path's
@@ -275,9 +291,9 @@ class TestSwaWindowRatio:
         assert worker._sw_ratio == 4
 
     def test_a_hybrid_in_chunk_mode_owns_its_lists_without_a_window(self, monkeypatch):
-        # What the coupling above used to buy. A shard list names one KV group,
-        # so a hybrid's chunk range has nowhere but the whole-engine lists --
-        # and it reaches them without a window range beside it.
+        # A shard list names one KV group, so a hybrid's chunk range has
+        # nowhere but the whole-engine lists -- and it reaches them without a
+        # window range beside it.
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="rbln",
@@ -599,8 +615,6 @@ class TestRegisterLocalXferHandlerSwa:
         assert {int(length) for _, length, _ in chunks} == {32}
 
     def test_no_chunk_grid_leaves_the_two_ranges_alone(self, monkeypatch):
-        # Off the knob the list must not grow: a longer dlist is memory every
-        # peer pays for.
         worker = build_worker(monkeypatch, num_blocks=4, block_size=64)
         window_mode(worker, 2)
         worker._has_mamba = False

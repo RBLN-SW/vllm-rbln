@@ -130,8 +130,8 @@ def make_worker(monkeypatch, tmp_path_factory):
         config.cache_config.num_gpu_blocks = geometry.num_blocks
 
         # What the runner binds before it registers: every layer, unfiltered
-        # (`rbln_model_runner.initialize_kv_cache_tensors`). The connector
-        # reads a sliding-window layer's view from here, and nothing else does.
+        # (`rbln_model_runner.initialize_kv_cache_tensors`). This is where the
+        # connector reads a sliding-window layer's view.
         for name, view in geometry.forward_context_caches().items():
             config.compilation_config.static_forward_context[name] = SimpleNamespace(
                 kv_cache=view

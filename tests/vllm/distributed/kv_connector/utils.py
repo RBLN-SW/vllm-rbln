@@ -909,32 +909,34 @@ def build_worker(
     )
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
-    # One tensor, one position per layer: every layer has a buffer of its own,
-    # so registration keeps each.
+    # The pool lists exactly the layers the groups carry: `canonical_kv_layers`
+    # reads it to pick one layer per buffer, so a tensor naming a different set
+    # sends registration after layers nobody built. `layer_names` is for the
+    # cases that build no spec and still name their layers. A MagicMock answers
+    # `len()` with 0, so the two views must differ for a case to tell them apart.
+    all_specs = list(specs or []) + list(non_transfer_specs or [])
     kv_cache_config.kv_cache_tensors = [
-        KVCacheTensor(size=0, layers=list(layer_names), layer_stride=1, block_stride=1)
+        KVCacheTensor(
+            size=0,
+            layers=[f"g{i}.l0" for i in range(len(all_specs))] or list(layer_names),
+            layer_stride=1,
+            block_stride=1,
+        )
     ]
-    groups = [MagicMock(kv_cache_spec=spec) for spec in (specs or [])]
-    # Real `KVCacheConfig` derives the transfer view from `kv_cache_groups` by
-    # dropping the groups that opted out, and a MagicMock answers `len()` with
-    # 0 rather than raising -- so a connector reading the wrong view would see
-    # no groups at all. `non_transfer_specs` builds a config where the two
-    # genuinely differ, so a case that reads the wrong one can be seen to.
-    opted_out = [MagicMock(kv_cache_spec=spec) for spec in (non_transfer_specs or [])]
-    kv_cache_config.kv_cache_groups = groups + opted_out
-    kv_cache_config.transfer_groups = groups
-    kv_cache_config.transfer_group_ids = tuple(range(len(groups)))
-    kv_cache_config.kv_cache_groups = [
+    all_groups = [
         MagicMock(kv_cache_spec=spec, layer_names=[f"g{i}.l0"])
-        for i, spec in enumerate(specs or [])
+        for i, spec in enumerate(all_specs)
     ]
+    kv_cache_config.kv_cache_groups = all_groups
+    kv_cache_config.transfer_groups = all_groups[: len(specs or [])]
+    kv_cache_config.transfer_group_ids = tuple(range(len(specs or [])))
     # A real dict, because the connector reads a sliding-window layer's view
     # out of it and a mock would answer every key with a mock. Only the token
     # axis is read, so one is all the view needs to carry.
     from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
     ctx: dict[str, Any] = {}
-    for i, spec in enumerate(specs or []):
+    for i, spec in enumerate(all_specs):
         if not isinstance(spec, SlidingWindowSpec):
             continue
         tokens = spec.sliding_window if swa_kernel_block is None else swa_kernel_block

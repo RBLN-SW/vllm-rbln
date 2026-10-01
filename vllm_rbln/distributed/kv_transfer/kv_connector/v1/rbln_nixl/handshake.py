@@ -205,8 +205,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # rather than inside it, which is the order the local list takes --
         # a prepared transfer pairs the two by position.
         runs, chunks = grid
-        # `.tolist()` first: the array is uint64, and mixing that with a Python
-        # int makes numpy widen the address to float64.
         chunk_rows = [
             (
                 addr + r * (length // runs) + c * (length // runs // chunks),
@@ -1182,14 +1180,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         stage, false for a consumer holding every layer while the producer is
         pipelined, where **the length read belongs to a different layer than the
         address it is paired with**. So the lengths are reordered for the
-        duration too, not just routed through the accessor that used to own
-        this translation.
+        duration too, not only the positions the replication check reads.
 
         A plain attribute suffices: upstream reaches those two methods only from
-        registration and from a handshake, and runs handshakes one at a time on a
-        single-worker executor. Registration cannot overlap one either:
-        `finalize_kv_cache_registration` runs during worker warm-up, before a
-        request exists to start a handshake. So no second view is ever live.
+        registration and from a handshake, handshakes run one at a time on a
+        single-worker executor, and registration finishes during worker warm-up,
+        before a request exists to start one. So no second view is ever live.
         """
         prev = self._viewed_region_ids
         prev_lens = self.block_len_per_layer

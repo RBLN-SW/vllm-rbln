@@ -34,6 +34,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorTransferResults,
+    )
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
         NixlConnectorMetadata,
         ReqMeta,
@@ -110,11 +113,17 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         self._push_writer_thread.start()
         logger.info("nixl-push-writer thread started (rank=%d)", self.tp_rank)
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
-        done_sending, done_recving = super().get_finished()
-        for req_id in done_sending:
+    def get_transfer_results(self) -> "KVConnectorTransferResults":
+        """Drop the token count of a request that has been written.
+
+        0.30 reports from here; `get_finished` is a wrapper over this and
+        nothing calls it, so a body hung off that name would never run and the
+        count would outlive every request for the life of the process.
+        """
+        results = super().get_transfer_results()
+        for req_id in results.finished_sending:
             self._valid_tokens.pop(req_id, None)
-        return done_sending, done_recving
+        return results
 
     def _xfer_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         """Write this request's blocks, one transfer per paired peer rank.

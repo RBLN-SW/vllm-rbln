@@ -23,18 +23,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
     RblnNixlWorkerBase,
 )
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    RblnNixlConnectorMetadata,
-)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-        NixlConnectorMetadata,
         ReqMeta,
     )
-    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
@@ -45,38 +39,6 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
     The pairing itself lives in `RblnNixlWorkerBase`; what belongs here is the
     read -- which peers to issue it against.
     """
-
-    def __init__(
-        self,
-        vllm_config: "VllmConfig",
-        engine_id: str,
-        kv_cache_config: "KVCacheConfig",
-    ) -> None:
-        super().__init__(vllm_config, engine_id, kv_cache_config)
-        # The producer's token count per request, until the read consumes it.
-        self._recv_valid_tokens: dict[str, int] = {}
-
-    def get_finished(self) -> tuple[set[str], set[str]]:
-        """Drop the token count of a request that will not read it.
-
-        `start_load_kv` takes one for every request listed for receive, and
-        only the read consumes it -- a request that is deferred behind a
-        handshake and then ends before its read leaves an entry that nothing
-        else touches, for the life of the process. Upstream reports both the
-        completion and the failure here, so one site covers the two ways a
-        request can end without reading.
-        """
-        done_sending, done_recving = super().get_finished()
-        for req_id in done_recving:
-            self._recv_valid_tokens.pop(req_id, None)
-        return done_sending, done_recving
-
-    def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
-        assert isinstance(metadata, RblnNixlConnectorMetadata)
-        # Accumulated rather than replaced: a request waiting on a handshake is
-        # deferred and read on a later step, whose metadata does not list it.
-        self._recv_valid_tokens.update(metadata.valid_tokens)
-        super().start_load_kv(metadata)
 
     def _read_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         assert meta.remote is not None and self.transfer_topo is not None
@@ -100,7 +62,9 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         # mid-transfer.
         self._engine_last_active[engine_id] = time.perf_counter()
         pp_size = self._remote_pp_size.get(engine_id, 1)
-        valid_tokens = self._recv_valid_tokens.pop(req_id, None)
+        # `or None`: a producer that kept no blocks reports zero, and zero is
+        # not a last block anyone can size -- the whole block goes.
+        valid_tokens = meta.remote.num_tokens or None
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         # Per-shard lists exist exactly for peers serving part of what a
         # whole-engine handle covers. Re-deriving that from the parallel sizes

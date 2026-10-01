@@ -34,7 +34,6 @@ from tests.vllm.distributed.kv_connector.utils import (
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
-    RblnNixlConnectorMetadata,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
@@ -342,10 +341,9 @@ class TestShardReadPath:
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w._shard_chunk_grids = {("eng", r): None for r in range(pp_size)}
         w._chunk_mode = False
-        # The whole-engine route parks a token count for either mode, so both
-        # knobs are read here.
+        # Neither knob, so nothing is parked. Either one on is what the two
+        # `..._parks_the_count` cases cover.
         window_mode(w, None)
-        w._recv_valid_tokens = {}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
         w.dst_xfer_side_handles = {"eng": {r: 200 + r for r in range(pp_size)}}
         w._remote_agents = {
@@ -369,11 +367,14 @@ class TestShardReadPath:
         return w
 
     @staticmethod
-    def _meta(local_ids, remote_ids):
+    def _meta(local_ids, remote_ids, num_tokens=None):
         remote = MagicMock()
         remote.engine_id = "eng"
         remote.request_id = "r0"
         remote.block_ids = remote_ids
+        # Named, not left to the mock: upstream fills it from the producer's
+        # `remote_num_tokens`, and a mock answering an object reads as a count.
+        remote.num_tokens = num_tokens
         meta = MagicMock()
         meta.remote = remote
         meta.local_physical_block_ids = local_ids
@@ -400,7 +401,7 @@ class TestShardReadPath:
 
     def test_a_failed_stage_leaves_no_handles_behind(self):
         # A failed stage takes the request with it, so nothing may stay in
-        # flight: get_finished drops the metadata, and a leftover handle
+        # flight: the completion hook drops the metadata, and a leftover handle
         # completing later would report that request against metadata now gone.
         w = self._read_worker(pp_size=3)
         first = object()
@@ -491,45 +492,14 @@ class TestShardReadPath:
         w._kv_areas = 2
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         w.block_size = 16
-        w._recv_valid_tokens = {"r0": 33}
 
-        w._read_blocks_for_req("r0", self._meta([[7]], [[3, 4, 7]]))
+        w._read_blocks_for_req("r0", self._meta([[7]], [[3, 4, 7]], num_tokens=33))
 
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
         for c in w.nixl_wrapper.make_prepped_xfer.call_args_list:
             local_descs, remote_descs = c.args[2], c.args[4]
             assert len(local_descs) == len(remote_descs)
             assert len(remote_descs) == 1
-        # Consumed, so a later step cannot read it against another block list.
-        assert w._recv_valid_tokens == {}
-
-    def test_a_count_arriving_before_the_read_is_kept(self):
-        # A request whose handshake is still running is read on a later step,
-        # whose metadata no longer lists it -- so the counts accumulate.
-        w = self._read_worker(pp_size=1)
-        w._recv_valid_tokens = {"earlier": 5}
-        meta = RblnNixlConnectorMetadata()
-        meta.valid_tokens = {"r0": 33}
-
-        with patch.object(NixlPullConnectorWorker, "start_load_kv"):
-            w.start_load_kv(meta)
-
-        assert w._recv_valid_tokens == {"earlier": 5, "r0": 33}
-
-    def test_a_count_whose_request_never_reads_is_dropped(self):
-        # The other end of the case above: a request deferred behind a
-        # handshake can end before its read, and nothing else would touch its
-        # entry -- upstream reports a completion and a failure through the same
-        # set, so both ways out land here.
-        w = self._read_worker(pp_size=1)
-        w._recv_valid_tokens = {"r0": 33, "still_going": 5}
-
-        with patch.object(
-            NixlPullConnectorWorker, "get_finished", return_value=(set(), {"r0"})
-        ):
-            w.get_finished()
-
-        assert w._recv_valid_tokens == {"still_going": 5}
 
     def test_single_stage_read_delegates_to_upstream(self):
         # A producer that advertised pp_size 1 reads through the upstream path:
@@ -541,13 +511,13 @@ class TestShardReadPath:
         w._remote_pp_size = {}  # unknown engine defaults to a single stage
         w._overlapping_ranks = {}  # nothing narrowed -> upstream's handle covers it
         w._chunk_mode = False
-        # The whole-engine route parks a token count for either mode, so both
-        # knobs are read here.
+        # Neither knob, so nothing is parked. Either one on is what the two
+        # `..._parks_the_count` cases cover.
         window_mode(w, None)
-        w._recv_valid_tokens = {}
         w.transfer_topo = MagicMock()
         meta = MagicMock()
         meta.remote.engine_id = "eng"
+        meta.remote.num_tokens = None
 
         with patch.object(NixlPullConnectorWorker, "_read_blocks_for_req") as base_read:
             w._read_blocks_for_req("r0", meta)
@@ -570,11 +540,11 @@ class TestShardReadPath:
         w._chunk_grid = None
         w._request_tail = None
         w._group_specs = [MagicMock()]  # one full-attention group
-        w._recv_valid_tokens = {"r0": 17}
         w.transfer_topo = MagicMock()
         meta = MagicMock()
         meta.remote.engine_id = "eng"
         meta.remote.block_ids = [[1, 2]]
+        meta.remote.num_tokens = 17
 
         seen = []
         with patch.object(
@@ -590,6 +560,68 @@ class TestShardReadPath:
         assert seen == [(17, 2)]
         assert w._request_tail is None
 
+    def test_the_window_knob_alone_parks_the_count(self):
+        # The window range rides the whole-engine list on its own. Gated on
+        # chunk mode alone the knob goes silently no-op -- the SWA branch takes its
+        # `tail is None` path and names every granule of every block, which is
+        # the transfer the range exists to avoid.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._engine_last_active = {}
+        w._remote_pp_size = {}
+        w._overlapping_ranks = {}
+        w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
+        w._chunk_mode = False
+        window_mode(w, 8)
+        w._chunk_grid = None
+        w._request_tail = None
+        w._group_specs = [MagicMock()]  # one full-attention group
+        w.transfer_topo = MagicMock()
+        meta = MagicMock()
+        meta.remote.engine_id = "eng"
+        meta.remote.block_ids = [[1, 2]]
+        meta.remote.num_tokens = 17
+
+        seen = []
+        with patch.object(
+            NixlPullConnectorWorker,
+            "_read_blocks_for_req",
+            lambda self, req_id, m: seen.append(self._request_tail),
+        ):
+            w._read_blocks_for_req("r0", meta)
+
+        assert seen == [(17, 2)]
+
+    def test_a_producer_holding_nothing_leaves_the_window_whole(self):
+        # Zero is how a producer that kept no blocks reports itself, and it is
+        # not a last block anyone can size. Read as a count it would name no
+        # granule at all; the whole block is what a request with nothing said
+        # about it gets.
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._engine_last_active = {}
+        w._remote_pp_size = {}
+        w._overlapping_ranks = {}
+        w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
+        w._chunk_mode = False
+        window_mode(w, 8)
+        w._chunk_grid = None
+        w._request_tail = None
+        w._group_specs = [MagicMock()]  # one full-attention group
+        w.transfer_topo = MagicMock()
+        meta = MagicMock()
+        meta.remote.engine_id = "eng"
+        meta.remote.block_ids = [[1, 2]]
+        meta.remote.num_tokens = 0
+
+        seen = []
+        with patch.object(
+            NixlPullConnectorWorker,
+            "_read_blocks_for_req",
+            lambda self, req_id, m: seen.append(self._request_tail),
+        ):
+            w._read_blocks_for_req("r0", meta)
+
+        assert seen == [(None, 2)]
+
     def test_a_chunked_engine_without_a_window_may_not_reach_it(self):
         # The other side of the same rule: nothing else leaves a chunked
         # engine on a list that cannot leave part of a block out.
@@ -600,10 +632,10 @@ class TestShardReadPath:
         w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
         w._chunk_mode = True
         window_mode(w, None)
-        w._recv_valid_tokens = {}
         w.transfer_topo = MagicMock()
         meta = MagicMock()
         meta.remote.engine_id = "eng"
+        meta.remote.num_tokens = None
 
         with pytest.raises(AssertionError):
             w._read_blocks_for_req("r0", meta)
