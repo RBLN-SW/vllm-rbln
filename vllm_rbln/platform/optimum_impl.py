@@ -46,6 +46,10 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
 
+    if model_config.multimodal_config is not None:
+        # Optimum visual graphs expect pixels normalized by the CPU processor.
+        model_config.multimodal_config.mm_device_do_normalize = False
+
     if forces_fp32_dtype(model_config):
         model_config.dtype = torch.float32
 
