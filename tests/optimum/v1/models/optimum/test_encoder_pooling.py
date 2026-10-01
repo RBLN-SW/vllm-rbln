@@ -30,6 +30,7 @@ We assert that:
     plain encoders and ``RBLNClassifierPooler`` for the classification ones.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -105,3 +106,31 @@ def test_encoder_pooling(model_id, expected_seq_pool, expected_pooler):
     pooler_config = model.vllm_config.model_config.pooler_config
     assert pooler_config.seq_pooling_type == expected_seq_pool
     assert isinstance(model.pooler, expected_pooler)
+
+
+@pytest.mark.parametrize("classification", [False, True])
+def test_encoder_forward_removes_padded_requests(classification):
+    model = RBLNOptimumForEncoderModel.__new__(RBLNOptimumForEncoderModel)
+    torch.nn.Module.__init__(model)
+    model.batch_size = 4
+    model.rbln_model_config = SimpleNamespace(max_seq_len=5)
+    architecture = "BertForSequenceClassification" if classification else "BertModel"
+    model.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[architecture])
+    )
+    hidden_states = (
+        torch.arange(4, dtype=torch.float32).reshape(4, 1)
+        if classification
+        else torch.arange(40, dtype=torch.float32).reshape(4, 5, 2)
+    )
+    model.model = MagicMock()
+    model.model.forward.return_value = (hidden_states,)
+    model_input = SimpleNamespace(
+        input_tokens=torch.tensor([[1, 2, 3]]),
+        input_positions=torch.tensor([[0, 1, 2]]),
+    )
+
+    output = model(model_input)
+
+    expected = hidden_states[:1].squeeze(-1) if classification else hidden_states[0, :3]
+    torch.testing.assert_close(output, expected)
