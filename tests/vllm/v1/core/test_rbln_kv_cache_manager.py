@@ -961,6 +961,30 @@ class TestKVEvents:
             flat_tokens.extend(e.token_ids)
         assert flat_tokens == tokens
 
+    def test_remotely_loaded_blocks_are_announced_from_the_first(self):
+        # KV received over a connector is counted as computed before its blocks
+        # are cached, as RBLNScheduler does for WAITING_FOR_REMOTE_KVS; every full
+        # block it fills must still be announced, not only those after it.
+        manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
+        tokens = list(range(2 * 8 + 4))
+        request = make_request("0", tokens, 8)
+        manager.allocate_slots(
+            request,
+            0,
+            num_external_computed_tokens=len(tokens),
+            delay_cache_blocks=True,
+        )
+        request.num_computed_tokens = len(tokens)
+        # The load finished: cache what arrived, then step back one token to
+        # sample, as _update_waiting_for_remote_kv does.
+        manager.cache_blocks(request, request.num_computed_tokens)
+        request.num_computed_tokens = len(tokens) - 1
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+
+        flat_tokens = [t for e in self._stored(manager) for t in e.token_ids]
+        assert flat_tokens == tokens[: 2 * 8]
+
     def test_dedup_on_multi_turn_same_prefix(self):
         # A second request caching the same prefix skips already-indexed hashes
         # (first_fresh_idx dedup) -> no fresh BlockStored.

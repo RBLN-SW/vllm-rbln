@@ -243,12 +243,14 @@ class _SubHashState:
 
     ``extra_keys`` is aligned 1:1 with ``hashes`` and records the
     extra-keys tuple mixed into each sub-block's hash (or ``None`` when
-    the sub-block had no extras).
+    the sub-block had no extras). ``num_indexed_full_blocks`` counts, per
+    group, the leading full blocks whose sub-blocks are already indexed.
     """
 
     hashes: list[BlockHash]
     extra_keys: list[tuple[Any, ...] | None] = field(default_factory=list)
     mm_idx: int = 0
+    num_indexed_full_blocks: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -365,7 +367,7 @@ class RBLNKVCacheManager(KVCacheManager):
         # Requests for which sub-block indexing is pending.
         # Each entry stores the per-group full-block count snapshot
         # taken before allocate_slots, used to narrow the scan range.
-        self._pending_indexing: dict[str, tuple[Request, tuple[int, ...]]] = {}
+        self._pending_indexing: dict[str, Request] = {}
 
         # Sub-block-granular KV event queue. We intercept the upstream pool's
         # big-block event emission and publish sub-block events instead.
@@ -546,17 +548,7 @@ class RBLNKVCacheManager(KVCacheManager):
         When ``allocate_slots`` is called with ``delay_cache_blocks=False``,
         this is called automatically.  Otherwise the caller must call it
         """
-        num_full_blocks_before = tuple(
-            request.num_computed_tokens // gi.block_size for gi in self._group_infos
-        )
-        # setdefault, not assignment: async scheduling can schedule a request
-        # again before update_from_output drains this note, and the second call
-        # sees num_computed_tokens past the blocks the first one meant to index.
-        # The earliest note is the one that covers both.
-        self._pending_indexing.setdefault(
-            request.request_id,
-            (request, num_full_blocks_before),
-        )
+        self._pending_indexing[request.request_id] = request
 
     def drain_pending_copy_ops(self) -> list[KVCacheCopyOp]:
         """Return and clear all pending copy operations.
@@ -583,8 +575,8 @@ class RBLNKVCacheManager(KVCacheManager):
         ``num_computed_tokens`` is up-to-date and ``free()`` has already
         consumed its own pending entries.
         """
-        for request, num_full_blocks_before in self._pending_indexing.values():
-            self._index_newly_cached_blocks(request, num_full_blocks_before)
+        for request in self._pending_indexing.values():
+            self._index_newly_cached_blocks(request)
             self._index_partial_block(request, False)
         self._pending_indexing.clear()
 
@@ -596,10 +588,8 @@ class RBLNKVCacheManager(KVCacheManager):
         """
         # Consume this request's pending indexing entry and index all blocks
         # (full + partial) before releasing them.
-        pending = self._pending_indexing.pop(request.request_id, None)
-        if pending is not None:
-            _, num_full_blocks_before = pending
-            self._index_newly_cached_blocks(request, num_full_blocks_before)
+        if self._pending_indexing.pop(request.request_id, None) is not None:
+            self._index_newly_cached_blocks(request)
         self._index_partial_block(request, True)
 
         # Clean up request states
@@ -674,24 +664,25 @@ class RBLNKVCacheManager(KVCacheManager):
 
     # -- sub-block index maintenance ----------------------------------------
 
-    def _index_newly_cached_blocks(
-        self, request: Request, num_full_blocks_before: tuple[int, ...]
-    ) -> None:
-        """Index sub-blocks for newly cached full blocks since the last call."""
+    def _index_newly_cached_blocks(self, request: Request) -> None:
+        """Index sub-blocks for full blocks cached since the last call."""
+        # Resume from what this request has indexed, not from num_computed_tokens:
+        # KV loaded remotely (NIXL) or externally (LMCache) is counted as computed
+        # before its blocks are cached, so that would skip them. Blocks another
+        # request already indexed are re-visited; update() emits only fresh hashes.
+        state = self._get_or_compute_sub_hashes(request)
+        if not state.num_indexed_full_blocks:
+            state.num_indexed_full_blocks = [0] * len(self._group_infos)
         blocks = self.coordinator.get_blocks(request.request_id)
-        for gi, block_list, before in zip(
-            self._group_infos, blocks, num_full_blocks_before
-        ):
-            for blk_idx in range(before, len(block_list)):
+        for gid, (gi, block_list) in enumerate(zip(self._group_infos, blocks)):
+            num_indexed = state.num_indexed_full_blocks[gid]
+            for blk_idx in range(num_indexed, len(block_list)):
                 blk = block_list[blk_idx]
-                # Only for newly cached full blocks.
-                # NOTE: For a new request, num_full_blocks_before is zero
-                # because num_computed_tokens is set after scheduling.
-                # So this doesn't tell us which blocks are newly cached.
-                # _on_block_cached uses update() which is idempotent,
-                # so re-processing already-indexed blocks is fine.
-                if blk.block_hash is not None:
-                    self._on_block_cached(request, blk_idx, blk, gi)
+                if blk.block_hash is None:
+                    continue
+                self._on_block_cached(request, blk_idx, blk, gi)
+                num_indexed = blk_idx + 1
+            state.num_indexed_full_blocks[gid] = num_indexed
 
     def _on_block_cached(
         self,
