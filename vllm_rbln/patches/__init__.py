@@ -26,7 +26,9 @@ from vllm_rbln.patches.registry import (
 # ruff: noqa: F401
 from . import (
     attention,
+    ax_k1,
     axk2,
+    compressed_tensors_moe_method,
     deepseek_mtp,
     deepseek_v2,
     distributed_utils,
