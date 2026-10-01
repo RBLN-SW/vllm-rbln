@@ -71,6 +71,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -243,6 +244,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             block_sizes=[cache_config.block_size],
             kernel_block_sizes=[cache_config.block_size],  # FIXME: why do we need this?
             max_num_blocks_per_req=[cdiv(self.max_model_len, cache_config.block_size)],
+            # Optimum graphs consume block tables without per-token slot mappings
+            # or the token-alignment padding used by vLLM's slot-mapping kernel.
+            slot_mapping_modes=[SlotMappingMode.NONE],
             logitsprocs=logitsprocs,
             num_spec_tokens=0,  # No spec decode in optimum model runner
             is_pooling_model=self.is_pooling_model,
