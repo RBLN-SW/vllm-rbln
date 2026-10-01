@@ -56,18 +56,25 @@ def build_kv_cache_base_bindings(
     """Deduplicate KV cache inputs by storage and capture per-layer view info."""
     base_tensors: list[torch.Tensor] = []
     view_infos: list[KVCacheViewInfo] = []
-    base_index_by_storage: dict[tuple[int, int], int] = {}
+    base_index_by_view: dict[tuple[int, int, int, int], int] = {}
 
     layer_names = _get_ordered_layer_names(
         kv_cache_view_infos_by_layer, num_attn_module
     )
     for layer_name in layer_names:
         base_tensor = kv_cache_bases_by_layer[layer_name]
-        storage_key = _storage_key(base_tensor)
-        base_index = base_index_by_storage.get(storage_key)
+        # The byte window and not just the storage: layers share a buffer only
+        # where they are the same cache, and collapsing distinct windows would
+        # hand every one of them the first window's bytes.
+        view_key = (
+            *_storage_key(base_tensor),
+            base_tensor.storage_offset() * base_tensor.element_size(),
+            base_tensor.numel() * base_tensor.element_size(),
+        )
+        base_index = base_index_by_view.get(view_key)
         if base_index is None:
             base_index = len(base_tensors)
-            base_index_by_storage[storage_key] = base_index
+            base_index_by_view[view_key] = base_index
             base_tensors.append(base_tensor)
 
         view_info = kv_cache_view_infos_by_layer[layer_name]

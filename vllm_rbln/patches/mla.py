@@ -159,9 +159,6 @@ def patched_mla_attention_forward(
     output_shape: torch.Size | None = None,
     topk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if self.calculate_kv_scales:
-        torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
-
     if self.use_direct_call:
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata

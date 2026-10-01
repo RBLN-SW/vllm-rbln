@@ -618,6 +618,7 @@ class TestDetermineAvailableMemory:
         # is called from on both the dynamic and the default path.
         monkeypatch.setattr(dks, "estimate_available_memory", record)
         monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
+        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: [])
         # WorkerBase always carries the field; None is what no spec decode means.
         worker.speculative_config = speculative_config
         worker.model_runner = SimpleNamespace(
@@ -671,7 +672,12 @@ class TestDetermineAvailableMemory:
         monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 999)
         monkeypatch.setattr(wm, "estimate_model_kernel_size", lambda **kw: 111)
         worker.speculative_config = None
-        spec = SimpleNamespace(max_memory_usage_bytes=lambda cfg: 4000)
+        spec = SimpleNamespace()
+        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: ["g"])
+        monkeypatch.setattr(
+            dks, "_max_memory_usage_bytes_from_groups", lambda cfg, groups: 8000
+        )
+        monkeypatch.setattr(dks, "_pool_bytes_per_block", lambda groups: 100)
         worker.model_runner = SimpleNamespace(
             model=SimpleNamespace(named_parameters=lambda: iter(_params().items())),
             specialized_moe_decode=False,
@@ -681,7 +687,7 @@ class TestDetermineAvailableMemory:
         )
         _attach_sizer(worker)
         with caplog.at_level("WARNING"):
-            assert worker.determine_available_memory() == 8000
+            assert worker.determine_available_memory() == 8100
         assert "short of one max-length request" in caplog.text
 
     def test_dynamic_kv_skips_the_snapshot_on_a_dummy_device(
@@ -874,7 +880,15 @@ class TestInitializeFromConfig:
         tensors the compile runs against shrink, and the resize restores them."""
         kv_cfg = SimpleNamespace(
             num_blocks=123,
-            kv_cache_tensors=[SimpleNamespace(size=123 * 4096, shared_by=["layer.0"])],
+            kv_cache_tensors=[
+                SimpleNamespace(
+                    size=123 * 4096,
+                    layers=["layer.0"],
+                    layer_stride=123 * 4096,
+                    block_stride=4096,
+                    offset=0,
+                )
+            ],
         )
         worker, init_calls = self._init(make_worker, monkeypatch, kv_cfg)
         assert worker.cache_config.num_gpu_blocks == 123

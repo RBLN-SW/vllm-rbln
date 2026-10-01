@@ -169,6 +169,7 @@ from vllm_rbln.v1.worker.utils import (
     copy_host_device_kv_blocks,
     dynamic_kv_enabled,
     get_kv_cache_names,
+    kv_cache_extents,
     prepare_kernel_block_sizes,
     reorder_input_batch,
 )
@@ -2873,12 +2874,18 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            device = self.device if USE_DEVICE_TENSOR else "meta"
-            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = tensor
+        # One buffer per extent, so the layers that alias one cache get one
+        # tensor and the rest get their own. Not one pool the layers slice: a
+        # graph input is a whole tensor, and dynamo refuses a slice's offset.
+        device = self.device if USE_DEVICE_TENSOR else "meta"
+        extent_of = kv_cache_extents(kv_cache_config)
+        buffers = {
+            extent: torch.zeros(extent[1], dtype=torch.int8, device=device)
+            for extent in set(extent_of.values())
+        }
+        kv_cache_raw_tensors = {
+            layer_name: buffers[extent] for layer_name, extent in extent_of.items()
+        }
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -2900,29 +2907,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _select_canonical_kv_layers_per_pool(
         self, kv_cache_config: KVCacheConfig
     ) -> set[str]:
-        """Pick one layer per HMA pool as the canonical handle.
+        """Pick one layer to stand for each KV cache buffer.
 
-        Both `mark_static_address` (last-write-wins on storage->name) and the
-        KV connector's `register_kv_caches` (uses the chosen layer's view as
-        NIXL's descriptor stride) need a single layer per pool.
-
-        Prefer a Full-attention layer — its view's `cache.shape[-2]` equals the
-        logical `cache_config.block_size`, matching the scheduler / connector /
-        runtime copy block_id space. A SWA layer's view (`shape[-2] ==
-        sliding_window`, kernel granularity) would mis-address logical
-        block_ids. Falls back to the first layer in `shared_by` when no Full
-        layer is present.
+        Layers that share a buffer (`kv_cache_extents`) must be named once,
+        for `mark_static_address` and for the connector. A `KVCacheTensor` is
+        not a buffer: it lists many layers, each with its own. Prefer a
+        full-attention layer: its view counts blocks the way the scheduler
+        does, and a sliding-window view does not.
         """
         layer_to_spec: dict[str, KVCacheSpec] = {
             layer_name: attn_group.kv_cache_spec
             for attn_group in self._kv_cache_spec_attn_group_iterator()
             for layer_name in attn_group.layer_names
         }
+        pools: defaultdict[tuple[int, int], list[str]] = defaultdict(list)
+        for layer_name, extent in kv_cache_extents(kv_cache_config).items():
+            pools[extent].append(layer_name)
         chosen: set[str] = set()
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            pool_layers = kv_cache_tensor.shared_by
-            if not pool_layers:
-                continue
+        for pool_layers in pools.values():
             full_layer = next(
                 (
                     ln
@@ -3224,7 +3226,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
 
-        total_gb = sum(t.size for t in kv_cache_config.kv_cache_tensors) / 1024**3
+        # Every tensor reports the whole allocation, not its own share of it.
+        total_gb = (
+            max((t.size for t in kv_cache_config.kv_cache_tensors), default=0) / 1024**3
+        )
         logger.info(
             "KV cache initialized: blocks=%d, groups=%d, tensors=%d, total=%.3f GiB",
             kv_cache_config.num_blocks,

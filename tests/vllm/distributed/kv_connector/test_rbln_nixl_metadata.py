@@ -42,7 +42,8 @@ _BASE_FIELDS = dict(
     device_id=0,
     num_blocks=64,
     block_lens=[8192, 8192],
-    kv_cache_layout="HND",
+    block_strides=[8192, 8192],
+    kv_cache_layout="LBHNC",
     block_size=16,
     ssm_sizes=(0, 0),
     attn_backend_name="RBLN_FLASH_ATTN",
@@ -72,7 +73,7 @@ class TestRblnNixlAgentMetadata:
         m = _make(
             pp_rank=1,
             pp_size=2,
-            registered_layer_names=["model.layers.14", "model.layers.15"],
+            region_names=["model.layers.14", "model.layers.15"],
         )
         enc = msgspec.msgpack.Encoder().encode(m)
         back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(enc)
@@ -109,7 +110,7 @@ class TestRblnNixlAgentMetadata:
 
     def test_registered_layer_names_order_preserved(self):
         names = [f"model.layers.{i}" for i in range(14, 28)]
-        m = _make(pp_rank=1, pp_size=2, registered_layer_names=names)
+        m = _make(pp_rank=1, pp_size=2, region_names=names)
         back = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
             msgspec.msgpack.Encoder().encode(m)
         )
@@ -137,27 +138,40 @@ class TestRblnNixlAgentMetadata:
 
 class TestRblnCompatHash:
     def test_deterministic(self):
-        assert rbln_compat_hash("BASE", writes_into_peer=False) == rbln_compat_hash(
-            "BASE", writes_into_peer=False
-        )
+        assert rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=False
+        ) == rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
 
     def test_differs_from_base(self):
         # Folding our version in must move the hash, or a peer that speaks only
         # upstream's schema would match one that speaks ours.
-        assert rbln_compat_hash("BASE", writes_into_peer=False) != "BASE"
+        assert (
+            rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
+            != "BASE"
+        )
 
     def test_the_two_transfer_directions_do_not_share_a_hash(self):
         # A producer that writes into the consumer and one the consumer reads
         # from describe the same bytes, so every length check on the handshake
         # passes and only this separates them.
-        assert rbln_compat_hash("BASE", writes_into_peer=True) != rbln_compat_hash(
-            "BASE", writes_into_peer=False
-        )
+        assert rbln_compat_hash(
+            "BASE", writes_into_peer=True, cross_layers_blocks=False
+        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
 
     def test_distinguishes_base_hashes(self):
-        assert rbln_compat_hash("hash-a", writes_into_peer=False) != rbln_compat_hash(
-            "hash-b", writes_into_peer=False
+        assert rbln_compat_hash(
+            "hash-a", writes_into_peer=False, cross_layers_blocks=False
+        ) != rbln_compat_hash(
+            "hash-b", writes_into_peer=False, cross_layers_blocks=False
         )
+
+    def test_cross_layer_blocks_do_not_share_a_hash(self):
+        # The flag scales the page by the KV-cache tensor count, so two peers
+        # that disagree describe different block lengths. Upstream dropped it
+        # from its own factors in 0.30, leaving this the only place it is hashed.
+        assert rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=True
+        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
 
     @staticmethod
     def _spec_config(*, method="eagle3", model="draft-a", revision=None):
@@ -175,24 +189,32 @@ class TestRblnCompatHash:
     def test_no_speculation_leaves_the_factors_alone(self):
         # Only a deployment running a draft model should see its hash move.
         assert rbln_compat_hash(
-            "BASE", writes_into_peer=False, speculative_config=None
-        ) == rbln_compat_hash("BASE", writes_into_peer=False)
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=None,
+        ) == rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
 
     def test_a_draft_moves_the_hash(self):
         # Without this, P with a draft and D without it pair.
         assert rbln_compat_hash(
-            "BASE", writes_into_peer=False, speculative_config=self._spec_config()
-        ) != rbln_compat_hash("BASE", writes_into_peer=False)
+            "BASE",
+            writes_into_peer=False,
+            cross_layers_blocks=False,
+            speculative_config=self._spec_config(),
+        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
 
     def test_two_drafts_do_not_share_a_hash(self):
         # Two drafts register regions of different sizes past the target's depth.
         assert rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
+            cross_layers_blocks=False,
             speculative_config=self._spec_config(model="draft-a"),
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
+            cross_layers_blocks=False,
             speculative_config=self._spec_config(model="draft-b"),
         )
 
@@ -202,22 +224,27 @@ class TestRblnCompatHash:
         assert rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
+            cross_layers_blocks=False,
             speculative_config=self._spec_config(revision="r1"),
         ) != rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
+            cross_layers_blocks=False,
             speculative_config=self._spec_config(revision="r2"),
         )
 
     def test_a_method_without_a_draft_model_leaves_the_factors_alone(self):
         # Upstream hands n-gram the target's own config, so a hash keyed on a
         # draft config's presence would refuse a decode-only n-gram pairing.
-        plain = rbln_compat_hash("BASE", writes_into_peer=False)
+        plain = rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=False
+        )
         for method in ("ngram", "suffix"):
             assert (
                 rbln_compat_hash(
                     "BASE",
                     writes_into_peer=False,
+                    cross_layers_blocks=False,
                     speculative_config=self._spec_config(method=method),
                 )
                 == plain
@@ -228,13 +255,21 @@ class TestRblnCompatHash:
         assert rbln_compat_hash(
             "BASE",
             writes_into_peer=False,
+            cross_layers_blocks=False,
             speculative_config=self._spec_config(method="draft_model"),
-        ) != rbln_compat_hash("BASE", writes_into_peer=False)
+        ) != rbln_compat_hash("BASE", writes_into_peer=False, cross_layers_blocks=False)
 
     def test_version_is_folded(self, monkeypatch):
         # Bumping RBLN_NIXL_CONNECTOR_VERSION changes the hash (gates schema drift).
-        h1 = md.rbln_compat_hash("BASE", writes_into_peer=False)
+        h1 = md.rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=False
+        )
         setattr_in_package(
             monkeypatch, RBLN_NIXL_CONNECTOR_VERSION=RBLN_NIXL_CONNECTOR_VERSION + 1
         )
-        assert md.rbln_compat_hash("BASE", writes_into_peer=False) != h1
+        assert (
+            md.rbln_compat_hash(
+                "BASE", writes_into_peer=False, cross_layers_blocks=False
+            )
+            != h1
+        )

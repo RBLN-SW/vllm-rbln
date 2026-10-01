@@ -38,7 +38,6 @@ def _config(
     weight_type=scalar_types.uint8b128,
     group_size=-1,
     zero_points=False,
-    has_g_idx=False,
     in_features=128,
     out_features=64,
 ):
@@ -51,7 +50,6 @@ def _config(
         act_type=torch.float16,
         group_size=group_size,
         zero_points=zero_points,
-        has_g_idx=has_g_idx,
     )
 
 
@@ -108,13 +106,6 @@ class TestCanImplement:
         ok, reason = RBLNUnpackedwNa16LinearKernel.can_implement(_config(group_size=32))
         assert not ok
         assert "group_size=32" in reason
-
-    def test_rejects_activation_ordering(self):
-        ok, reason = RBLNUnpackedwNa16LinearKernel.can_implement(
-            _config(has_g_idx=True)
-        )
-        assert not ok
-        assert "ordering" in reason
 
 
 class TestProcessWeightsAfterLoading:

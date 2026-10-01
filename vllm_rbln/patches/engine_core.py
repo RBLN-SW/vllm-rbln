@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fetch the post-step drafts only when a running request can verify them.
+"""Guard RBLN shutdown and fetch drafts only when a request can verify them.
+
+``EngineCore`` cleanup skips ``torch.accelerator.empty_host_cache()``, which
+faults on RBLN after a device tensor has existed, until torch-rbln 0.12.0.
 
 Under PP the pull is a synchronous round-trip to ``output_rank`` that stops the
 engine refilling ``batch_queue``, so the pipeline runs one microbatch deep.
@@ -22,9 +25,50 @@ The first decode step of each request goes unspeculated as a result, and
 loosening this guard does not recover it.
 """
 
+from importlib.metadata import version
+
+import torch
+from packaging.version import Version
+from vllm.distributed import parallel_state
 from vllm.v1.engine.core import EngineCore
 
 from vllm_rbln.patches import register_patch
+
+assert Version(version("torch_rbln")) < Version("0.12.0"), (
+    "torch-rbln 0.12.0 fixes the empty_host_cache error. Delete "
+    "patched_cleanup_dist_env_and_memory, _no_host_cache_to_empty and this "
+    "assert."
+)
+
+original_cleanup_dist_env_and_memory = parallel_state.cleanup_dist_env_and_memory
+
+
+def _no_host_cache_to_empty() -> None:
+    """Stand in for torch.accelerator.empty_host_cache() during cleanup."""
+
+
+@register_patch(
+    # EngineCore is the only caller and it from-imports the name, so its own
+    # binding is the one that has to change; replacing the definition in
+    # parallel_state leaves that binding pointing at the original.
+    target="vllm.v1.engine.core.cleanup_dist_env_and_memory",
+    reason=(
+        "torch.accelerator.empty_host_cache() faults in the RBLN accelerator "
+        "once a device tensor has existed, so EngineCore takes the process "
+        "down on its way out. Upstream guards the call with `except "
+        "AttributeError`, which torch 2.9 made unreachable by shipping the "
+        "API, and a fault is not an exception anyway. Neutralise that one "
+        "call and delegate the rest."
+    ),
+)
+def patched_cleanup_dist_env_and_memory(shutdown_ray: bool = False) -> None:
+    accelerator = torch.accelerator
+    original_empty_host_cache = accelerator.empty_host_cache
+    accelerator.empty_host_cache = _no_host_cache_to_empty
+    try:
+        original_cleanup_dist_env_and_memory(shutdown_ray)
+    finally:
+        accelerator.empty_host_cache = original_empty_host_cache
 
 
 @register_patch(

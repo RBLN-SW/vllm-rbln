@@ -16,10 +16,10 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
     logger,
     maybe_prefix,
 )
@@ -44,7 +44,7 @@ def patched_load_module(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterable[str]:
-    if isinstance(module, PPMissingLayer):
+    if isinstance(module, (StageMissingLayer, PPMissingLayer)):
         return
 
     # Avoid infinite recursion since this function is typically
@@ -57,6 +57,7 @@ def patched_load_module(
                 logger.warning(
                     "Unable to collect loaded parameters for module %s", module
                 )
+                self._loaded_params_are_complete = False
             else:
                 yield from map(
                     lambda x: self._get_qualname(base_prefix, x),
@@ -72,13 +73,16 @@ def patched_load_module(
 
     EMBED_TOKENS = "embed_tokens"
     LM_HEAD = "lm_head"
-    tie_word_embeddings = any(p.startswith(LM_HEAD) for p in self.skip_prefixes)
-    tp_enabled = get_tensor_model_parallel_world_size() > 1
-    # NOTE(RBLN): Upstream skips lm_head weights for tied embeddings because
-    # lm_head.weight aliases embed_tokens.weight. In RBLN TP, the alias is
-    # intertionally broken: embed_tokens is replicated and lm_head is sharded.
-    # Capture embed_tokens weights so they can be replayed through
-    # lm_head.weight_loader below.
+    # NOTE(RBLN): a tied model ships no lm_head weights, and upstream covers
+    # that by aliasing the parameter. RBLNParallelLMHead declines the alias
+    # under TP -- embed_tokens is replicated, lm_head is vocab-sharded -- and
+    # records it, because upstream's parameter-identity check cannot see a
+    # tie that was never made. Capture embed_tokens to replay through
+    # lm_head.weight_loader below, which picks the rank-local vocab shard.
+    replays_tied_embedding = any(
+        getattr(child, "replays_tied_embedding", False)
+        for child in self.module.modules()
+    )
     embed_tokens: list[tuple[str, torch.Tensor]] = []
 
     def gen_weights(cur_weights: Iterable[tuple[str, torch.Tensor]]):
@@ -92,12 +96,7 @@ def patched_load_module(
         prefix = self._get_qualname(base_prefix, child_prefix)
 
         if child_prefix in child_modules:
-            if self._can_skip(prefix + "."):
-                logger.debug("Skipping module %s", prefix)
-
-                continue
-
-            if tie_word_embeddings and tp_enabled:
+            if replays_tied_embedding:
                 child_weights = gen_weights(child_weights)
             yield from self._load_module(
                 prefix, child_modules[child_prefix], child_weights
@@ -112,9 +111,7 @@ def patched_load_module(
                 prefix, child_params[child_prefix], child_weights
             )
         else:
-            can_skip_module = self._can_skip(prefix + ".")
-            can_skip_param = self._can_skip(prefix)
-            if can_skip_module or can_skip_param:
+            if self._can_skip(prefix):
                 logger.debug("Skipping missing %s", prefix)
 
                 continue
@@ -138,13 +135,12 @@ def patched_load_module(
             )
             raise ValueError(msg)
 
-    # NOTE(RBLN): Temporarily unskip lm_head and load the replayed embedding weights
-    # into it. ParallelLMHead.weight_loader will select the rank-local vocab shard.
+    # NOTE(RBLN): Load the replayed embedding weights into lm_head.
+    # ParallelLMHead.weight_loader selects the rank-local vocab shard. No
+    # unskipping is needed: the alias this would have to step around is the
+    # one RBLNParallelLMHead declined to make.
     assert len(embed_tokens) < 2
     if len(embed_tokens) == 1:
-        org_skip_prefixes = self.skip_prefixes
-        self.skip_prefixes = [p for p in org_skip_prefixes if not p.startswith(LM_HEAD)]
-
         for child_prefix, child_weights in self._groupby_prefix(embed_tokens):
             assert child_prefix == LM_HEAD
             prefix = self._get_qualname(base_prefix, child_prefix)
@@ -152,5 +148,3 @@ def patched_load_module(
                 yield from self._load_module(
                     prefix, child_modules[child_prefix], child_weights
                 )
-
-        self.skip_prefixes = org_skip_prefixes

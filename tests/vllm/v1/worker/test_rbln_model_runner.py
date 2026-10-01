@@ -30,7 +30,7 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -514,9 +514,14 @@ class TestSelectCanonicalKvLayersPerPool:
         return r
 
     @staticmethod
-    def _cfg(*pools):
+    def _cfg(*tensors):
+        # One tensor per group, each from byte 0 as upstream lays them out, so
+        # the layers at one position across the tensors share a buffer.
         return SimpleNamespace(
-            kv_cache_tensors=[SimpleNamespace(shared_by=list(p)) for p in pools]
+            kv_cache_tensors=[
+                KVCacheTensor(size=0, layers=list(t), layer_stride=1, block_stride=1)
+                for t in tensors
+            ]
         )
 
     def test_prefers_full_attention_layer(self):
@@ -525,29 +530,26 @@ class TestSelectCanonicalKvLayersPerPool:
             self._group(["full0"], self._full()),
         ]
         r = self._runner(groups)
-        assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0", "full0"])) == {
-            "full0"
-        }
+        assert r._select_canonical_kv_layers_per_pool(
+            self._cfg(["sw0"], ["full0"])
+        ) == {"full0"}
 
     def test_falls_back_to_first_layer(self):
-        # No full-attention layer in the pool -> shared_by[0].
+        # No full-attention layer in the pool -> layers[0].
         r = self._runner([self._group(["sw0", "sw1"], SimpleNamespace())])
-        assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0", "sw1"])) == {
+        assert r._select_canonical_kv_layers_per_pool(self._cfg(["sw0"], ["sw1"])) == {
             "sw0"
         }
 
-    def test_skips_empty_shared_by(self):
+    def test_skips_a_pool_with_no_layers(self):
         r = self._runner([self._group(["full0"], self._full())])
         assert r._select_canonical_kv_layers_per_pool(self._cfg([])) == set()
 
     def test_one_canonical_layer_per_pool(self):
-        groups = [
-            self._group(["full0"], self._full()),
-            self._group(["full1"], self._full()),
-        ]
-        r = self._runner(groups)
+        # One tensor listing two layers is two buffers, not one pool.
+        r = self._runner([self._group(["full0", "full1"], self._full())])
         assert r._select_canonical_kv_layers_per_pool(
-            self._cfg(["full0"], ["full1"])
+            self._cfg(["full0", "full1"])
         ) == {"full0", "full1"}
 
 
@@ -1404,12 +1406,29 @@ class TestUsesFixedDecodeWindow:
 class TestAllocateKvCacheTensors:
     # Device selection: self.device if device-tensor, else "meta". The
     # mapping/validation logic is exercised on CPU.
-    @staticmethod
-    def _cfg():
+    LAYER_STRIDE = 32
+
+    @classmethod
+    def _cfg(cls):
+        # Every tensor reports the whole pool, layer `l` sits at
+        # `offset + l * layer_stride`, and cache groups overlay from byte 0.
+        stride = cls.LAYER_STRIDE
         return SimpleNamespace(
             kv_cache_tensors=[
-                SimpleNamespace(size=64, shared_by=["l0", "l1"]),
-                SimpleNamespace(size=32, shared_by=["l2"]),
+                SimpleNamespace(
+                    size=2 * stride,
+                    layers=["l0", "l1"],
+                    layer_stride=stride,
+                    block_stride=8,
+                    offset=0,
+                ),
+                SimpleNamespace(
+                    size=2 * stride,
+                    layers=["l2"],
+                    layer_stride=stride,
+                    block_stride=8,
+                    offset=0,
+                ),
             ],
             kv_cache_groups=[
                 SimpleNamespace(layer_names=["l0", "l1"]),
@@ -1427,9 +1446,30 @@ class TestAllocateKvCacheTensors:
         raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
         assert set(raw) == {"l0", "l1", "l2"}
         assert raw["l0"].device.type == "meta"
-        # Layers sharing a pool share the same buffer object.
-        assert raw["l0"] is raw["l1"]
-        assert raw["l0"] is not raw["l2"]
+
+    def test_each_layer_gets_one_layers_worth(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+        assert all(t.numel() == self.LAYER_STRIDE for t in raw.values())
+
+    def test_groups_share_the_buffer_at_a_layer_position(self, monkeypatch):
+        # A block costs the widest group, not the sum of them. l0 and l2 are
+        # the first layer of their group, so they overlay.
+        # meta tensors all report data_ptr()==0, so compare identity.
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+        assert id(raw["l0"].untyped_storage()) == id(raw["l2"].untyped_storage())
+
+    def test_layer_positions_do_not_share(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+        assert id(raw["l0"].untyped_storage()) != id(raw["l1"].untyped_storage())
+
+    def test_every_layer_starts_at_byte_zero(self, monkeypatch):
+        # The compiler refuses a graph input that carries a storage offset.
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", False)
+        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
+        assert all(t.storage_offset() == 0 for t in raw.values())
 
     def test_self_device_with_device_tensor(self, monkeypatch):
         monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)

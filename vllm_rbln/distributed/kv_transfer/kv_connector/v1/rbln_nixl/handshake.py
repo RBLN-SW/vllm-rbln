@@ -71,11 +71,17 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
     narrowed, upstream's handle serves.
     """
 
+    # Upstream owns this one, and `_regions_viewed_as` reorders it for the
+    # duration of a peer-region view; declaring it keeps the reassignment from
+    # leaving the type unresolvable here.
+    block_len_per_layer: list[int]
+
     def _add_remote_agent_head_matched(
         self,
         nixl_agent_meta: RblnNixlAgentMetadata,
         remote_tp_rank: int,
         remote_tp_size: int,
+        remote_dcp_size: int = 1,
         registered_layer_names: tuple[str, ...] | list[str] | None = None,
     ) -> str:
         """Register a peer with a different TP degree, matching on head bands.
@@ -91,17 +97,22 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if agent_key in self._remote_agents.get(engine_id, {}):
             return self._remote_agents[engine_id][agent_key]
 
+        self._refuse_decode_context_parallel(remote_dcp_size)
         self._reject_uneven_region_slices(remote_tp_size)
-        self._register_remote_engine_prelude(nixl_agent_meta, remote_tp_size)
+        self._register_remote_engine_prelude(
+            nixl_agent_meta, remote_tp_size, remote_dcp_size
+        )
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
         if engine_id not in self.dst_num_blocks:
-            self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+            self._record_remote_region_ledger(engine_id, nixl_agent_meta)
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
             nixl_agent_meta.kv_caches_base_addr
         )
-        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+        self._validate_remote_agent_handshake(
+            nixl_agent_meta, remote_tp_size, remote_dcp_size
+        )
 
         _, peer_tp_rank = agent_key
         blocks_data = self._build_head_matched_remote(
@@ -151,10 +162,16 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if not self.use_host_buffer or block_size != self.block_size:
             return None
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
-        if tp_ratio >= 0:
-            return None
-        handles = self.src_xfer_handles_by_tp_ratio[tp_ratio]
         plan = self.tp_mappings[engine_id]
+        if not self._needs_split_local_xfer_handles(tp_ratio, plan):
+            # Asking upstream rather than repeating its predicate: a replicated
+            # MLA region is not split, so there is no handle to borrow and the
+            # ratio alone does not say that.
+            return None
+        # vllm 0.30 keys that split by (ratio, the peer's block size), because
+        # one ratio can now describe peers whose blocks differ. The guard above
+        # already settled that this peer's block size is ours.
+        handles = self.src_xfer_handles_by_tp_ratio[tp_ratio, block_size]
         assert region_ids == list(range(self.num_regions)), (
             "RBLN NIXL: borrowing upstream's split needs it to describe the "
             "same regions in the same order, but this peer narrows ours to "
@@ -434,7 +451,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
             for handle in self._recving_transfers.pop(req_id, []):
                 self.nixl_wrapper.release_xfer_handle(handle)
-            self._handle_failed_transfer(req_id, None)
+            self._handle_failed_transfer(req_id, None, self._recv_failures)
 
         try:
             self._cleanup_remote_engine(engine_id, log_eviction=False)
@@ -456,7 +473,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         after the handshake is never noticed here -- which is the one place a
         producer that has stopped answering is touched every step.
 
-        Mirrors `NixlBaseConnectorWorker._send_heartbeats` as of vllm 0.26.0,
+        Mirrors `NixlBaseConnectorWorker._send_heartbeats` as of vllm 0.30.0,
         differing only in the `except` body.
         """
         for engine_id, hb_info in metadata.heartbeat_by_engine.items():
@@ -468,6 +485,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     hb_info.host,
                     hb_info.port,
                     hb_info.tp_size,
+                    hb_info.dcp_size,
                     hb_info.pp_size,
                     self._hb_handshake_notif_only and hb_info.pp_size > 1,
                 )
@@ -713,6 +731,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         port: int,
         remote_tp_size: int,
         expected_engine_id: str,
+        remote_dcp_size: int = 1,
         remote_pp_size: int = 1,
         notif_agents_only: bool = False,
     ) -> tuple[dict[tuple[int, int], str], float]:
@@ -730,13 +749,16 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         asks, and no caller derives it: it is relayed from the producer
         through kv_transfer_params, while the read handshake and a producer's
         own reverse handshake both pass nothing and take the default of 1.
-        Asking the peer is why this override exists.
+        Asking the peer is why this override exists, and it can go once a read
+        path caller carries the peer's pp_size rather than defaulting it.
         """
         # Background thread needs a device context (see upstream _nixl_handshake).
         if not self.use_host_buffer:
             current_platform.set_device(self.device_id)
 
-        p_remote_tp_ranks = self.topo.handshake_target_ranks(remote_tp_size)
+        p_remote_tp_ranks = self.topo.handshake_target_ranks(
+            remote_tp_size, remote_dcp_size
+        )
         path = make_zmq_path("tcp", host, port)
         remote_rank_to_agent_name: dict[tuple[int, int], str] = {}
         overlapping: list[int] = []
@@ -751,9 +773,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
             metas = {(0, first_rank): first_meta}
             pp_size = first_meta.pp_size
-            # TODO(vllm>=0.29.0): the reason above expires -- the read path
-            # gains a caller that carries pp_size, and remote_dcp_size lands
-            # ahead of remote_pp_size in this signature.
             if remote_pp_size > 1 and remote_pp_size != pp_size:
                 raise RuntimeError(
                     f"RBLN NIXL: caller expects peer {expected_engine_id} to run "
@@ -826,7 +845,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                         # The peer's memory is never addressed from here, so
                         # no descriptors are built for it.
                         remote_rank_to_agent_name[(pp_rank, remote_tp_rank)] = (
-                            self._add_notif_only_remote_agent(metadata, remote_tp_size)
+                            self._add_notif_only_remote_agent(
+                                metadata, remote_tp_size, metadata.dcp_size
+                            )
                         )
                         continue
                     names = tuple(metadata.registered_layer_names)
@@ -856,6 +877,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                                 metadata,
                                 global_rank,
                                 remote_tp_size,
+                                metadata.dcp_size,
                                 registered_layer_names=names,
                             )
                         )
@@ -872,6 +894,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                             else metadata,
                             global_rank,
                             remote_tp_size,
+                            metadata.dcp_size,
                         )
                         remote_rank_to_agent_name[(pp_rank, remote_tp_rank)] = agent
 
@@ -1068,12 +1091,15 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
     def _regions_viewed_as(self, region_ids: list[int] | None):
         """Make our per-region arrays answer to a peer's region positions.
 
-        Upstream's remote descriptor builder feeds the PEER's region position into
-        `get_backend_aware_kv_block_len` and `_is_region_replicated`, which index
-        OUR arrays. That only means our region while our band starts at our
-        region 0 -- true for a pipeline stage, false for a consumer holding every
-        layer while the producer is pipelined, where **the length read belongs to
-        a different layer than the address it is paired with**.
+        Upstream's remote descriptor builder feeds the PEER's region position
+        into `_is_region_replicated` and, since 0.30.0, straight into
+        `block_len_per_layer` -- both of which index OUR arrays. That only means
+        our region while our band starts at our region 0 -- true for a pipeline
+        stage, false for a consumer holding every layer while the producer is
+        pipelined, where **the length read belongs to a different layer than the
+        address it is paired with**. So the lengths are reordered for the
+        duration too, not just routed through the accessor that used to own
+        this translation.
 
         A plain attribute suffices: upstream reaches those two methods only from
         registration and from a handshake, and runs handshakes one at a time on a
@@ -1082,14 +1108,21 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         request exists to start a handshake. So no second view is ever live.
         """
         prev = self._viewed_region_ids
+        prev_lens = self.block_len_per_layer
         self._viewed_region_ids = region_ids
+        if region_ids is not None:
+            self.block_len_per_layer = [prev_lens[r] for r in region_ids]
         try:
             yield
         finally:
             self._viewed_region_ids = prev
+            self.block_len_per_layer = prev_lens
 
     def _register_remote_engine_prelude(
-        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        remote_dcp_size: int = 1,
     ) -> None:
         """Replicate upstream ``add_remote_agent``'s prelude.
 
@@ -1108,12 +1141,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 remote_physical_blocks_per_logical=(
                     nixl_agent_meta.physical_blocks_per_logical_kv_block
                 ),
+                remote_dcp_size=remote_dcp_size,
             ),
         )
         self.tp_mappings[nixl_agent_meta.engine_id] = compute_tp_mapping(
             transfer_topology=self.topo,
             remote_tp_size=remote_tp_size,
             group_spec_types=self._group_spec_types,
+            remote_dcp_size=remote_dcp_size,
         )
 
     def _register_shard_xfer_state(
@@ -1150,7 +1185,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 kv_runs=kv_runs,
             )
         self.src_xfer_handles_by_remote[key] = handle
-        n_groups = len(self.kv_cache_config.kv_cache_groups)
+        n_groups = len(self.kv_cache_config.transfer_groups)
         assert n_groups == 1, (
             "RBLN NIXL per-shard transfers support a single KV-cache group, "
             f"got {n_groups}"
@@ -1258,10 +1293,20 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         trimmed: dict[str, Any] = {
             "kv_caches_base_addr": nixl_agent_meta.kv_caches_base_addr[lo:hi],
             "block_lens": nixl_agent_meta.block_lens[lo:hi],
+            "block_strides": nixl_agent_meta.block_strides[lo:hi],
         }
-        trimmed["registered_layer_names"] = list(
-            nixl_agent_meta.registered_layer_names[start:end]
-        )
+        # The rest arrived with 0.30.0 and are region-indexed the same way, so
+        # they follow the window. Optional on the wire: a peer that sends none
+        # keeps sending none rather than an empty list upstream would index.
+        for field in (
+            "region_group_ids",
+            "region_names",
+            "region_mem_types",
+            "region_num_blocks",
+        ):
+            value = getattr(nixl_agent_meta, field)
+            if value is not None:
+                trimmed[field] = value[lo:hi]
         return replace(nixl_agent_meta, **trimmed)
 
     def _validate_head_matched_handshake(
@@ -1329,10 +1374,82 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     "and D."
                 )
 
+    def _add_notif_only_remote_agent(
+        self,
+        metadata: NixlAgentMetadata,
+        remote_tp_size: int,
+        remote_dcp_size: int = 1,
+    ) -> str:
+        """Upstream's notif-only registration, with the DCP refusal in front.
+
+        Upstream builds no descriptors here and so never calls
+        `_validate_remote_agent_handshake` -- which is where every other route
+        refuses a decode-context-parallel peer. Without this the push decode
+        side accepts one and accounts its blocks.
+        """
+        self._refuse_decode_context_parallel(remote_dcp_size)
+        return super()._add_notif_only_remote_agent(
+            metadata, remote_tp_size, remote_dcp_size
+        )
+
+    @staticmethod
+    def _refuse_decode_context_parallel(remote_dcp_size: int) -> None:
+        """Refuse a decode-context-parallel peer before anything is recorded.
+
+        The RBLN descriptor arithmetic addresses a peer rank's whole region; a
+        DCP peer holds a slice of one, which no pairing here expresses. It has
+        to come first: a raise after the prelude leaves the peer registered
+        with the topology, and a failed handshake never reaches the teardown.
+        """
+        if remote_dcp_size != 1:
+            raise RuntimeError(
+                "RBLN NIXL does not support a decode-context-parallel peer: "
+                f"peer reports dcp_size={remote_dcp_size}."
+            )
+
+    def _record_remote_region_ledger(
+        self, engine_id: str, nixl_agent_meta: NixlAgentMetadata
+    ) -> None:
+        """The five entries upstream writes for a peer the first time it pairs.
+
+        Its transfer paths index all five unguarded, and the two RBLN routes
+        that register a peer themselves wrote only the block count -- which was
+        the whole of it before vllm 0.30 added the region ledger.
+        """
+        num_remote_regions = len(nixl_agent_meta.kv_caches_base_addr)
+        self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+        self.dst_region_num_blocks[engine_id] = (
+            nixl_agent_meta.region_num_blocks
+            or [nixl_agent_meta.num_blocks] * num_remote_regions
+        )
+        self.dst_region_group_ids[engine_id] = nixl_agent_meta.region_group_ids or (
+            self.region_group_ids
+            if len(self.region_group_ids) == num_remote_regions
+            else [0] * num_remote_regions
+        )
+        self.dst_uses_region_group_mapping[engine_id] = (
+            len(set(self.dst_region_group_ids[engine_id])) > 1
+        )
+        self.dst_region_mem_types[engine_id] = (
+            nixl_agent_meta.region_mem_types
+            or [self.nixl_memory_type] * num_remote_regions
+        )
+
     def _validate_remote_agent_handshake(
-        self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+        remote_dcp_size: int = 1,
     ) -> None:
         assert isinstance(nixl_agent_meta, RblnNixlAgentMetadata)
+        # The RBLN descriptor arithmetic addresses a peer rank's whole region;
+        # a decode-context-parallel peer holds a slice of one, which no pairing
+        # here expresses. Refuse it rather than pair the wrong bytes.
+        if remote_dcp_size != 1:
+            raise RuntimeError(
+                "RBLN NIXL does not support a decode-context-parallel peer: "
+                f"peer reports dcp_size={remote_dcp_size}."
+            )
         self._check_split_axis_constraints(nixl_agent_meta, remote_tp_size)
         self._check_mla_constraints(nixl_agent_meta, remote_tp_size)
         self._check_d2d_region_pairing(nixl_agent_meta, remote_tp_size)
@@ -1355,7 +1472,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     "RBLN NIXL: a KV cache that packs K and V into one block "
                     "requires equal P/D block sizes."
                 )
-            super()._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+            super()._validate_remote_agent_handshake(
+                nixl_agent_meta, remote_tp_size, remote_dcp_size
+            )
             return
 
         remote_engine_id = nixl_agent_meta.engine_id
@@ -1395,6 +1514,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         nixl_agent_meta: NixlAgentMetadata,
         remote_tp_rank: int = 0,
         remote_tp_size: int = 1,
+        remote_dcp_size: int = 1,
     ) -> str:
         if self._sw_ratio is None:
             if self._is_head_matched_peer(remote_tp_size):
@@ -1402,12 +1522,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 # instead of by position (_build_head_matched_remote).
                 assert isinstance(nixl_agent_meta, RblnNixlAgentMetadata)
                 return self._add_remote_agent_head_matched(
-                    nixl_agent_meta, remote_tp_rank, remote_tp_size
+                    nixl_agent_meta, remote_tp_rank, remote_tp_size, remote_dcp_size
                 )
             # Equal TP, or host staging's one region per layer: local region i
             # IS remote region i, which upstream's descriptor math assumes.
             return super().add_remote_agent(
-                nixl_agent_meta, remote_tp_rank, remote_tp_size
+                nixl_agent_meta, remote_tp_rank, remote_tp_size, remote_dcp_size
             )
         engine_id = nixl_agent_meta.engine_id
         agent_key = divmod(remote_tp_rank, remote_tp_size)
@@ -1420,7 +1540,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             )
             return self._remote_agents[engine_id][agent_key]
 
-        self._register_remote_engine_prelude(nixl_agent_meta, remote_tp_size)
+        self._refuse_decode_context_parallel(remote_dcp_size)
+        self._register_remote_engine_prelude(
+            nixl_agent_meta, remote_tp_size, remote_dcp_size
+        )
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -1431,12 +1554,14 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         block_size_ratio = self.topo.block_size_ratio(nixl_agent_meta.block_size)
 
         if engine_id not in self.dst_num_blocks:
-            self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+            self._record_remote_region_ledger(engine_id, nixl_agent_meta)
 
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
             nixl_agent_meta.kv_caches_base_addr
         )
-        self._validate_remote_agent_handshake(nixl_agent_meta, remote_tp_size)
+        self._validate_remote_agent_handshake(
+            nixl_agent_meta, remote_tp_size, remote_dcp_size
+        )
 
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
         indexes_into_remote = not self.topo.is_kv_replicated(engine_id) and tp_ratio > 0

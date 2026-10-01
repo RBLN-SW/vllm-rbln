@@ -119,7 +119,12 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         return tuple([] for _ in kv_cache_group_ids), 0
 
     def cache_blocks(
-        self, request: Request, num_tokens: int, retention_interval: int | None = None
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
         pass
 

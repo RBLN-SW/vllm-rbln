@@ -1016,21 +1016,27 @@ class TestStoppingVariety:
 
 
 class TestMinTokens:
-    def test_min_tokens_suppresses_eos(self):
-        # min_tokens=3: an EOS sample must NOT stop the request until it has
-        # generated 3 output tokens.
+    def test_an_ordinary_token_below_min_tokens_keeps_running(self):
+        # min_tokens=3: two ordinary tokens are not enough to stop.
         sched = create_rbln_scheduler()
         req = create_requests(1, num_tokens=10, max_tokens=20, min_tokens=3)[0]
         sched.add_request(req)
         out = sched.schedule()  # prefill -> 1 output token
         sched.update_from_output(out, make_model_runner_output(out, 0))
-        out = sched.schedule()  # decode EOS -> 2 tokens, still < min_tokens
-        sched.update_from_output(out, make_model_runner_output(out, EOS_TOKEN_ID))
+        out = sched.schedule()  # decode -> 2 tokens, still < min_tokens
+        sched.update_from_output(out, make_model_runner_output(out, 0))
         assert not req.is_finished()
-        out = sched.schedule()  # decode EOS -> 3 tokens, min reached -> stop
+
+    def test_a_sampled_eos_stops_even_below_min_tokens(self):
+        # check_stop reads min_tokens after the stop-token checks, not before:
+        # the sampler masks every stop token (EOS included) while the request is
+        # under min_tokens, so an EOS that still arrives is taken at face value.
+        sched = create_rbln_scheduler()
+        req = create_requests(1, num_tokens=10, max_tokens=20, min_tokens=3)[0]
+        sched.add_request(req)
+        out = sched.schedule()  # prefill -> 1 output token, below min_tokens
         sched.update_from_output(out, make_model_runner_output(out, EOS_TOKEN_ID))
         assert req.is_finished()
-        assert len(req.output_token_ids) == 3
 
 
 class TestMemoryFreed:
@@ -1483,3 +1489,23 @@ class TestDraftingLookahead:
             remote_prefill=True,
         )
         assert seen == [0]
+
+
+class TestSyncKVLoads:
+    """The model runner starts a connector's loads after the forward unless the
+    step says it holds a synchronous one, so a step that admits a synchronous
+    external hit has to say so, or the forward reads blocks not yet loaded."""
+
+    def test_a_synchronous_external_hit_is_flagged(self):
+        sched = create_rbln_scheduler(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=False)
+        )
+        request = create_requests(1, num_tokens=32)[0]
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+
+        output = sched.schedule()
+
+        # Only the 16 tokens past the hit are computed this step.
+        assert output.num_scheduled_tokens[request.request_id] == 16
+        assert output.has_sync_kv_loads

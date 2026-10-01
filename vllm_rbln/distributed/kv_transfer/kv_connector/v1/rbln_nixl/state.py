@@ -16,11 +16,13 @@ from collections import defaultdict
 from typing import Any, ClassVar
 
 import numpy as np
-from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlBaseConnectorWorker
 
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology import (
+    RblnTransferTopology,
 )
 from vllm_rbln.logger import init_logger
 
@@ -81,25 +83,33 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     _shard_descs_per_block: dict[tuple[str, int], int]
 
     @property
-    def topo(self) -> TransferTopology:
+    def topo(self) -> RblnTransferTopology:
         """The transfer topology, which registration produces.
 
         Upstream types it optional because it does not exist until the KV caches
-        are registered, and on the D2D path that is deferred past warm-up.
+        are registered, and on the D2D path that is deferred past warm-up. The
+        RBLN type is the one every reader here needs: 0.30 dropped
+        `cross_layers_blocks`, `virtually_split_kv_in_blocks` and
+        `get_transfer_cache_regions` from upstream's, and this connector reads
+        all three off it.
         """
         assert self.transfer_topo is not None, (
             "the transfer topology is read before the KV caches are registered"
         )
         return self.transfer_topo
 
-    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
+    def _handle_failed_transfer(
+        self,
+        req_id: str,
+        handle: int | None,
+        failed_req_ids: set[str] | None = None,
+    ) -> bool:
         """Upstream's failure report, minus the reads nothing is waiting on.
 
         A read with no local block moved nothing: `load_kv_async` is returned
         only with a positive external token count, so such a request was never
         put in WAITING_FOR_REMOTE_KVS, and reporting it trips the scheduler's
-        `assert req_id in self.requests`. Upstream would also index
-        `local_block_ids[0]` to invalidate what was read.
+        `assert req_id in self.requests`.
 
         The entry stays: the handshake done-callback runs on the executor
         thread, so it and the heartbeat can reach one request, and dropping it
@@ -109,8 +119,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         meta = self._recving_metadata.get(req_id)
         if meta is not None and not meta.local_block_ids:
             assert handle is None
-            return
-        super()._handle_failed_transfer(req_id, handle)
+            return True
+        return super()._handle_failed_transfer(req_id, handle, failed_req_ids)
 
     def _layer_overlap(
         self, registered_layer_names: tuple[str, ...] | list[str]
@@ -179,11 +189,20 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
     def get_backend_aware_kv_block_len(
         self, layer_idx: int, first_split: bool = True, mamba_view: bool = False
     ) -> int:
-        return super().get_backend_aware_kv_block_len(
-            layer_idx=self._viewed_region(layer_idx),
-            first_split=first_split,
-            mamba_view=mamba_view,
-        )
+        """One K/V element's block length, read through the peer's view.
+
+        K and V sit in separate regions here, so an attention block's element
+        is the whole block; a Mamba block instead holds a conv and an ssm part
+        of different sizes, which `virtually_split_kv_in_blocks` indexes apart.
+        vllm 0.30.0 removed the base method along with that split, so the
+        subclass that kept the split carries the body too.
+        """
+        if self.topo.virtually_split_kv_in_blocks and mamba_view:
+            return self._mamba_ssm_size[not first_split]
+        # No translation here: `_regions_viewed_as` reorders the list itself for
+        # the duration of a peer view, so the index is already the peer's
+        # position. Translating again would apply the permutation twice.
+        return self.block_len_per_layer[layer_idx]
 
     # ------------------------------------------------------------------
     # Hybrid Full + SWA desc layout (RDMA payload only)

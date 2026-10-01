@@ -15,9 +15,10 @@
 import torch
 from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.linear import (
+    LinearMethodBase,
     register_weight_loader_v2_supported_method,
 )
-from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8LinearMethod
+from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
@@ -25,15 +26,18 @@ from vllm.model_executor.parameter import (
 
 
 @register_weight_loader_v2_supported_method
-class RBLNModelOptFp8LinearMethod(ModelOptFp8LinearMethod):
+class RBLNModelOptFp8LinearMethod(LinearMethodBase):
     """Per-tensor ModelOpt FP8 linear for RBLN.
 
-    Replaces `process_weights_after_loading`/`apply` rather than registering an
-    FP8 linear kernel: upstream requantises a fused layer's halves to one max
-    scale, which is lossy and needs an eager fp8 quant this platform cannot run
-    at load time. `create_weights` is upstream's minus its
-    `init_fp8_linear_kernel` call, which has no kernel to select here.
+    A bespoke lifecycle rather than upstream's generic ModelOptLinearMethod:
+    that one requantises a fused layer's halves to one max scale, which is
+    lossy and needs an eager fp8 quant this platform cannot run at load time.
+    Keeping one scale per partition means no fp8 kernel fits either, so apply
+    dequantises and runs a plain linear. Registered via LINEAR_METHOD_BUILDERS.
     """
+
+    def __init__(self, quant_config: ModelOptFp8Config) -> None:
+        self.quant_config = quant_config
 
     def create_weights(
         self,
