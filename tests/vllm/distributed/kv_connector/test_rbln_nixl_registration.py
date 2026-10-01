@@ -17,8 +17,10 @@
 # registering that memory with NIXL -- the page and region arithmetic, the head
 # band each region carries, and the layouts registration refuses outright.
 
+import inspect
 import sys
 import types
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +30,9 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlAgentMetadata,
     NixlBaseConnectorWorker,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    compute_nixl_compatibility_hash,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -41,6 +46,9 @@ from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
     patch_in_package,
     patched_in_package,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl import (
+    registration,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
     KVSplitAxis,
@@ -162,7 +170,9 @@ def _fake_nixl_rbln(xfer_result):
     return module
 
 
-def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
+def _prep_impl_worker(
+    monkeypatch, *, num_blocks=128, block_size=64, names=("l0", "l1")
+):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = build_worker(
         monkeypatch,
@@ -177,7 +187,7 @@ def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
     worker._has_mamba = False
     worker.attn_backends = []
     worker.backend_name = "rbln"
-    worker.kv_cache_layout = "HND"
+    worker.kv_cache_layout = "LBHNC"
     worker._mamba_ssm_size = 0
     worker.model_config = MagicMock()
     worker.model_config.get_total_num_kv_heads.return_value = 8
@@ -188,6 +198,17 @@ def _prep_impl_worker(monkeypatch, *, num_blocks=128, block_size=64):
     worker._registered_descs = []
     worker.dst_num_blocks = {}
     worker.src_xfer_handles_by_block_size = {}
+    # `transfer_groups` is a SUBSET of `kv_cache_groups` -- the same objects,
+    # filtered by `enable_kv_transfer` -- so a config where one is not a slice
+    # of the other cannot exist. The two views still disagree here, the way a
+    # config with a non-transferring group does: a group that opted out sits
+    # ahead of the one that registers, so counting cache groups numbers the
+    # registered layers one too high.
+    opted_out = SimpleNamespace(layer_names=["opted-out"], kv_cache_spec=None)
+    transferring = SimpleNamespace(layer_names=list(names), kv_cache_spec=None)
+    worker.kv_cache_config.kv_cache_groups = [opted_out, transferring]
+    worker.kv_cache_config.transfer_groups = [transferring]
+    worker.kv_cache_config.transfer_group_index_by_layer = dict.fromkeys(names, 0)
     return worker
 
 
@@ -279,7 +300,7 @@ class TestRegisterKvCaches:
 class TestInitializeHostXferBuffer:
     def test_allocates_one_buffer_per_layer_preserving_order(self, monkeypatch):
         worker = build_worker(monkeypatch, kv_buffer_device="cpu")
-        worker.kv_cache_layout = "HND"
+        worker.kv_cache_layout = "LBHNC"
         kv_caches = {
             "l0": torch.zeros(2, 4, dtype=torch.float16),
             "l1": torch.zeros(3, 5, dtype=torch.float16),
@@ -289,20 +310,45 @@ class TestInitializeHostXferBuffer:
         assert worker.host_xfer_buffers["l0"].shape == (2, 4)
         assert worker.host_xfer_buffers["l1"].shape == (3, 5)
 
-    def test_rejects_non_hnd_layout(self, monkeypatch):
+    def test_rejects_a_layout_that_splits_the_block(self, monkeypatch):
+        # vllm 0.30 renamed the layouts, and the resolved name for this backend
+        # is one of three. Only the identity permutation keeps [H, N, C]
+        # together, which is what the descriptor math addresses.
         worker = build_worker(monkeypatch, kv_buffer_device="cpu")
-        worker.kv_cache_layout = "NHD"
-        with pytest.raises(AssertionError, match="HND"):
+        worker.kv_cache_layout = "LBNHC"
+        with pytest.raises(AssertionError, match=r"\[H, N, C\] contiguous"):
             worker.initialize_host_xfer_buffer(
                 {"l0": torch.zeros(2, 4, dtype=torch.float16)}
             )
+
+    def test_rejects_a_k_v_first_cache(self, monkeypatch):
+        # The rbln_triton_ops cache puts K and V on the leading axis, and
+        # upstream's registration -- which this path delegates to -- cuts
+        # regions by `cache.stride(0)`, which then spans a whole half. It
+        # raises with the shapes alone, so the remedy has to be named here.
+        worker = build_worker(monkeypatch, kv_buffer_device="cpu", num_blocks=4)
+        worker.kv_cache_layout = "LBHNC"
+        with pytest.raises(RuntimeError, match="K/V-first"):
+            worker.initialize_host_xfer_buffer(
+                {"l0": torch.zeros(2, 4, 8, dtype=torch.float16)}
+            )
+
+    def test_accepts_a_blocks_first_cache(self, monkeypatch):
+        # The same two axes the other way round is what rbln_custom_ops
+        # allocates, and it is the shape this path supports.
+        worker = build_worker(monkeypatch, kv_buffer_device="cpu", num_blocks=4)
+        worker.kv_cache_layout = "LBHNC"
+        worker.initialize_host_xfer_buffer(
+            {"l0": torch.zeros(4, 2, 8, dtype=torch.float16)}
+        )
+        assert worker.host_xfer_buffers["l0"].shape == (4, 2, 8)
 
     def test_mla_accepts_any_layout(self, monkeypatch):
         # MLA has no head axis to order, so upstream advertises no required
         # layout and the resolved value is whatever the fallback picked. The
         # 3D latent shape must survive unchanged.
         worker = build_worker(monkeypatch, kv_buffer_device="cpu", use_mla=True)
-        worker.kv_cache_layout = "NHD"
+        worker.kv_cache_layout = "LBNHC"
         worker.initialize_host_xfer_buffer(
             {"l0": torch.zeros(4, 64, 576, dtype=torch.float16)}
         )
@@ -312,7 +358,7 @@ class TestInitializeHostXferBuffer:
         # The page-aligned host buffer is backed by an fp16 (2-byte) allocation,
         # so a cache whose byte footprint is odd cannot be tiled.
         worker = build_worker(monkeypatch, kv_buffer_device="cpu")
-        worker.kv_cache_layout = "HND"
+        worker.kv_cache_layout = "LBHNC"
         with pytest.raises(AssertionError, match="multiple of 2"):
             worker.initialize_host_xfer_buffer(
                 {"l0": torch.zeros(1, dtype=torch.uint8)}  # 1 byte
@@ -335,6 +381,88 @@ class TestSetHostXferBufferOps:
 class TestRegisterKvCachesImpl:
     # The deferred D2D body: hands the logical K/V regions to
     # nixl_rbln.register_kv_regions and absorbs the returned transfer tables.
+    def test_the_compat_hash_gets_the_transfer_mode(self, monkeypatch):
+        # vllm 0.30 turned the third parameter into `transfer_mode`. It has a
+        # default, so anything passed there is accepted: a bool lands in it
+        # without raising and the hash stops separating push from pull, which
+        # is the one thing upstream added it for. Bind against the real
+        # signature -- the point is which parameter the value reaches.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec()
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        xfer_result = MagicMock()
+        xfer_result.base_addrs = [0x20000, 0x20100, 0x30000, 0x30100]
+        xfer_result.block_lens = [256, 256, 256, 256]
+        xfer_result.reg_handle = "reg-handle"
+        xfer_result.n_shards = 1
+        xfer_result.slices = 1
+        xfer_result.slice_ids = [0] * len(xfer_result.base_addrs)
+        fake = _fake_nixl_rbln(xfer_result)
+
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patched_in_package("rebel") as mock_rebel,
+            patch.object(
+                worker,
+                "register_local_xfer_handler",
+                return_value=("local-handle", [(0x0, 0, 0)]),
+            ),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+            call = registration.compute_nixl_compatibility_hash.call_args
+
+        bound = inspect.signature(compute_nixl_compatibility_hash).bind(
+            *call.args, **call.kwargs
+        )
+        bound.apply_defaults()
+        assert bound.arguments["transfer_mode"] == worker._TRANSFER_MODE
+
+    def test_region_group_ids_index_the_transfer_groups(self, monkeypatch):
+        # Upstream's descriptor machinery indexes `transfer_groups`, so a
+        # region's group id is a position in THAT list. The fixture puts a
+        # group that opted out of transfer ahead of the one that registers, so
+        # counting cache groups would number every region 1 instead of 0.
+        worker = _prep_impl_worker(monkeypatch)
+        spec = _impl_layer_spec()
+        worker._layer_specs = {"l0": spec, "l1": spec}
+        kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+
+        xfer_result = _impl_xfer_result()
+        fake = _fake_nixl_rbln(xfer_result)
+        topo = MagicMock(
+            virtually_split_kv_in_blocks=False,
+            _cross_layers_blocks=False,
+            cross_layers_blocks=False,
+        )
+        topo.get_transfer_cache_regions.side_effect = _split_kv(worker.num_blocks)
+
+        with (
+            _patch_worker_nixl_symbols(topo),
+            patch.dict(sys.modules, {"nixl_rbln": fake}),
+            patched_in_package("rebel") as mock_rebel,
+            patch.object(
+                worker,
+                "register_local_xfer_handler",
+                return_value=("local-handle", [(0x0, 0, 0)]),
+            ),
+        ):
+            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            worker._register_kv_caches_impl(kv_caches)
+
+        assert worker.region_group_ids == [0, 0, 0, 0]
+        assert worker._uses_region_group_mapping is False
+
     def test_registers_with_vram_segment_and_captures_xfer_tables(self, monkeypatch):
         worker = _prep_impl_worker(monkeypatch)
         spec = _impl_layer_spec()
@@ -603,7 +731,7 @@ class TestRegisterKvCachesImpl:
     def test_a_draft_layer_with_its_own_page_size_is_registered(self, monkeypatch):
         # Requiring one size for every non-MLA tensor would reject this outright;
         # registration has to describe each region by its own geometry.
-        worker = _prep_impl_worker(monkeypatch)
+        worker = _prep_impl_worker(monkeypatch, names=("l0", "l1", "l2"))
         target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
         draft = _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32)
         worker._layer_specs = {"l0": target, "l1": target, "l2": draft}
@@ -819,7 +947,10 @@ class TestRegisterKvCachesImpl:
         target = _impl_layer_spec(page_size_bytes=4096, num_kv_heads=8)
         draft = _impl_layer_spec(page_size_bytes=16384, num_kv_heads=32)
         worker._layer_specs = {"l0": target, "l1": draft}
-        worker.kv_cache_config = MagicMock(kv_cache_tensors=[object(), object()])
+        worker.kv_cache_config = MagicMock(
+            kv_cache_tensors=[object(), object()],
+            kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+        )
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
@@ -840,7 +971,10 @@ class TestRegisterKvCachesImpl:
         worker = _prep_impl_worker(monkeypatch)
         spec = _impl_layer_spec(page_size_bytes=4096)
         worker._layer_specs = {"l0": spec, "l1": spec}
-        worker.kv_cache_config = MagicMock(kv_cache_tensors=[object(), object()])
+        worker.kv_cache_config = MagicMock(
+            kv_cache_tensors=[object(), object()],
+            kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+        )
         kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
 
         fake = _fake_nixl_rbln(_impl_xfer_result())
@@ -1085,19 +1219,23 @@ class TestPublishHandshakeMetadata:
     # reach, so what a peer pairs on is advertised regardless of transport.
 
     @staticmethod
-    def _base_meta():
+    def _base_meta(layer_names=("l0", "l1")):
+        # One region per layer here, which is what the layer names derive from.
+        names = list(layer_names)
         return NixlAgentMetadata(
             engine_id="eng",
             agent_metadata=b"agent",
-            kv_caches_base_addr=[0x1000, 0x2000],
+            kv_caches_base_addr=[0x1000, 0x2000][: len(names)],
             device_id=0,
             num_blocks=4,
-            block_lens=[8192, 8192],
-            kv_cache_layout="HND",
+            block_lens=[8192] * len(names),
+            block_strides=[8192] * len(names),
+            kv_cache_layout="LBHNC",
             block_size=16,
             ssm_sizes=(0, 0),
             attn_backend_name="RBLN",
             physical_blocks_per_logical_kv_block=1,
+            region_names=names,
         )
 
     def _publish(
@@ -1112,6 +1250,7 @@ class TestPublishHandshakeMetadata:
         cls=None,
         has_mamba=False,
         cross_layers=False,
+        base_meta=None,
     ):
         w = object.__new__(cls or RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
@@ -1139,7 +1278,9 @@ class TestPublishHandshakeMetadata:
         pp_group.rank_in_group = pp_rank
         pp_group.world_size = pp_size
         with patched_in_package("get_pp_group", MagicMock(return_value=pp_group)):
-            w._publish_handshake_metadata(self._base_meta(), layer_names)
+            w._publish_handshake_metadata(
+                self._base_meta(layer_names) if base_meta is None else base_meta
+            )
         return w
 
     def test_publishing_is_where_the_pp_guard_fires(self):
@@ -1158,7 +1299,42 @@ class TestPublishHandshakeMetadata:
             layer_names=["l0"],
             cls=RblnNixlPushConnectorWorker,
         )
-        assert w.compat_hash == rbln_compat_hash("BASE", writes_into_peer=True)
+        assert w.compat_hash == rbln_compat_hash(
+            "BASE", writes_into_peer=True, cross_layers_blocks=False
+        )
+
+    def test_the_region_ledger_survives_the_re_wrap(self):
+        # The published payload is our subclass rebuilt field by field from
+        # upstream's. A field left out is not an error: it takes the dataclass
+        # default, so the peer reads `None` and describes our regions by its
+        # own geometry.
+        base = self._base_meta()
+        base.region_num_blocks = [3, 3]
+        base.region_group_ids = [0, 1]
+        base.region_names = ["l0", "l0"]
+        base.region_mem_types = ["VRAM", "VRAM"]
+        base.dcp_size = 1
+        base.pcp_size = 1
+
+        w = self._publish(pp_rank=0, pp_size=1, layer_names=["l0"], base_meta=base)
+
+        decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
+            w.xfer_handshake_metadata.agent_metadata_bytes
+        )
+        assert decoded.region_num_blocks == [3, 3]
+        assert decoded.region_group_ids == [0, 1]
+        assert decoded.region_names == ["l0", "l0"]
+        assert decoded.region_mem_types == ["VRAM", "VRAM"]
+
+    def test_cross_layer_blocks_reach_the_hash(self):
+        # vllm 0.30 dropped the flag from upstream's own factors, so a peer that
+        # scales its page by the tensor count and one that does not would match
+        # unless this path folds it in.
+        plain = self._publish(pp_rank=0, pp_size=1, layer_names=["l0"])
+        crossed = self._publish(
+            pp_rank=0, pp_size=1, layer_names=["l0"], cross_layers=True
+        )
+        assert plain.compat_hash != crossed.compat_hash
 
     def test_advertises_the_split_axis(self):
         # A consumer cannot derive it: the areas and slices it also receives are
@@ -1190,7 +1366,9 @@ class TestPublishHandshakeMetadata:
         w = self._publish(pp_rank=1, pp_size=2, layer_names=["l7", "l8"])
         # compat hash folded with our version and direction, mirrored into the
         # payload. A read-path worker must publish the read-path hash.
-        assert w.compat_hash == rbln_compat_hash("BASE", writes_into_peer=False)
+        assert w.compat_hash == rbln_compat_hash(
+            "BASE", writes_into_peer=False, cross_layers_blocks=False
+        )
         assert w.xfer_handshake_metadata.compatibility_hash == w.compat_hash
         decoded = msgspec.msgpack.Decoder(RblnNixlAgentMetadata).decode(
             w.xfer_handshake_metadata.agent_metadata_bytes
@@ -1236,10 +1414,10 @@ class TestPublishHandshakeMetadata:
 
         assert w.local_seen_layer_names == ["l0", "l1"]
         w._publish_handshake_metadata.assert_called_once()
-        published_meta, published_names = w._publish_handshake_metadata.call_args[0]
-        # Upstream's metadata is handed over decoded, not as bytes.
+        (published_meta,) = w._publish_handshake_metadata.call_args[0]
+        # Upstream's metadata is handed over decoded, not as bytes. The layers
+        # ride on it now, in `region_names`, rather than beside it.
         assert published_meta.engine_id == "eng"
-        assert list(published_names) == ["l0", "l1"]
 
     def test_single_stage_defaults(self):
         # pp_size == 1 still folds compat but advertises no-PP layer fields.

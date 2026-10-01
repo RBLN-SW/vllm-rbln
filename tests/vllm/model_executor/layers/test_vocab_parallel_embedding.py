@@ -85,6 +85,18 @@ class TestRBLNParallelLMHeadTieWeights:
         assert result is lm
         assert lm.weight is not embed.weight
 
+    def test_a_declined_alias_is_recorded_for_the_loader(self):
+        # The loader cannot infer this: upstream reads tying off parameter
+        # identity, and the split layout is precisely the absence of it.
+        lm = _lm_head(tp_size=2)
+        lm.tie_weights(SimpleNamespace(weight=torch.ones(4, 4)))
+        assert lm.replays_tied_embedding is True
+
+    def test_nothing_is_recorded_when_the_alias_holds(self):
+        lm = _lm_head(tp_size=1)
+        lm.tie_weights(SimpleNamespace(weight=torch.ones(4, 4)))
+        assert getattr(lm, "replays_tied_embedding", False) is False
+
     def test_gguf_returns_embed_tokens_unchanged(self):
         lm = _lm_head(tp_size=1, quant_config=SimpleNamespace(get_name=lambda: "gguf"))
         embed = SimpleNamespace(weight=torch.ones(4, 4))

@@ -96,18 +96,35 @@ class TestShardReadPath:
         w.world_size = 1
         w.num_blocks = 8
         w.dst_num_blocks = {"eng": 8, "local": 8}
+        # 0.30.0 state the inherited read path reads: the per-region block
+        # counts it sizes descriptors from, and the context-parallel ranks it
+        # offsets by. One shard everywhere here, so no offset applies.
+        w.dst_region_num_blocks = {"eng": [8, 8], "local": [8, 8]}
+        w._mixed_mem_types = False
+        w._uses_region_group_mapping = False
+        w.dst_uses_region_group_mapping = {"eng": False, "local": False}
+        w.dst_region_group_ids = {"eng": [0, 0], "local": [0, 0]}
+        w.region_group_ids = [0, 0]
+        w.dcp_size = 1
+        w.pcp_size = 1
+        w.dcp_rank = 0
+        w.pcp_rank = 0
         w._recving_transfers = defaultdict(list)
         w._engine_last_active = {}
         # What upstream's failure path reads: it logs with the engine id, looks the
-        # request's metadata up, queues the failure and the invalidated blocks.
+        # request's metadata up, records the failure in the set its caller hands
+        # it, and queues the invalidated blocks.
         w.engine_id = "local"
         w._recving_metadata = {}
         w._invalid_block_ids = queue.Queue()
-        w._failed_recv_reqs = queue.Queue()
+        w._recv_failures = set()
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
-        # single group, 2 regions per shard
-        w.kv_cache_config = MagicMock(kv_cache_groups=[0])
+        # The assert counts the groups that take part in a transfer, and the
+        # two views deliberately disagree here: a config with a group that
+        # opted out has more cache groups than transfer groups, so counting
+        # the wrong one rejects a request that is in fact well formed.
+        w.kv_cache_config = MagicMock(kv_cache_groups=[0, 1], transfer_groups=[0])
         w._shard_region_group_ids = {("eng", r): (0, 0) for r in range(pp_size)}
         w._shard_descs_per_block = {("eng", r): 1 for r in range(pp_size)}
         w.src_xfer_handles_by_remote = {("eng", r, 16): 100 + r for r in range(pp_size)}
@@ -120,6 +137,9 @@ class TestShardReadPath:
             remote_tp_size=peer_tp_size,
             remote_block_size=16,
             remote_physical_blocks_per_logical=1,
+            # 0.30.0 compares this against ours to decide whether the peer
+            # shards its KV cache; a mock would not order against an int.
+            remote_dcp_size=1,
         )
         topo.tp_ratio.return_value = 1
         topo.block_size_ratio.return_value = 1
@@ -138,6 +158,12 @@ class TestShardReadPath:
         meta = MagicMock()
         meta.remote = remote
         meta.local_physical_block_ids = local_ids
+        # 0.30.0 counts the KV cache groups off the logical list. A mock's
+        # __len__ answers 0, which reads as a full prefix hit and skips the
+        # transfer these cases are about. One block per logical block here, so
+        # the two lists are the same.
+        meta.local_block_ids = local_ids
+        meta.local_num_computed_blocks = [0] * len(local_ids)
         return meta
 
     def test_reads_every_stage(self):
@@ -175,8 +201,8 @@ class TestShardReadPath:
         w.nixl_wrapper.release_xfer_handle.assert_called_once_with(first)
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
         # Reported failed exactly once, which is what the engine counts.
-        assert w._failed_recv_reqs.qsize() == 1
-        assert w._failed_recv_reqs.get_nowait() == "r0"
+        # 0.30.0 collects these in a set the handler is handed, not a queue.
+        assert w._recv_failures == {"r0"}
 
     def test_prefix_hit_notifies_each_stage_no_read(self):
         # Full prefix hit (empty local list): no read, one notif per stage.
@@ -274,8 +300,8 @@ class TestShardReadPath:
     def test_read_notif_counts_every_reader_of_a_producer_rank(
         self, local_tp, remote_tp, local_pp, remote_pp, expected_readers
     ):
-        # The producer divides the number we send by its own tensor-parallel
-        # size to get the count it waits for, so send it in that unit.
+        # The producer counts notifications and settles the request when the
+        # total arrives, so the number is that total and nothing derives it.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.world_size = local_tp
         w._remote_pp_size = {"eng": remote_pp}
@@ -285,8 +311,7 @@ class TestShardReadPath:
         notif = w._xfer_notif_id("eng", "req-1", remote_tp).decode()
         req_id, sent = notif.rsplit(":", 1)
         assert req_id == "req-1"
-        assert int(sent) % remote_tp == 0
-        assert int(sent) // remote_tp == expected_readers
+        assert int(sent) == expected_readers
 
     def test_delegates_when_the_handshake_narrowed_nothing(self):
         # A peer serving our whole band with our own head split: upstream's
@@ -418,5 +443,5 @@ class TestAReadDeferredPastTheTeardown:
 
         w._read_blocks_for_req("r0", meta)
 
-        assert list(w._failed_recv_reqs.queue) == ["r0"]
+        assert w._recv_failures == {"r0"}
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 0

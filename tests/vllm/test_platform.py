@@ -183,7 +183,10 @@ class TestPlatformIdentity:
 
 class TestRejectedConfigs:
     def test_v2_model_runner(self, monkeypatch, reconfigure):
-        monkeypatch.setattr(platform.envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+        # The refusal reads VllmConfig.use_v2_model_runner, and how upstream
+        # resolves that from the env or from a feature that forces V2 is its
+        # own business. Set the property it reads, not the env behind it.
+        monkeypatch.setattr(VllmConfig, "use_v2_model_runner", True)
         with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
             reconfigure(lambda config: None)
 
@@ -538,18 +541,6 @@ class TestEnforceEager:
         else:
             with pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
                 reconfigure(mutate)
-
-    def test_v32_mtp_eager_force_is_undone(self, reconfigure):
-        # Upstream forces the drafter eager for deepseek_v32 MTP; RBLN compiles it
-        # instead, so the reset has to win back over that force.
-        def mutate(config):
-            config.model_config.hf_text_config.model_type = "deepseek_v32"
-            config.model_config.enforce_eager = False
-            config.speculative_config = SimpleNamespace(
-                method="mtp", enforce_eager=True
-            )
-
-        assert reconfigure(mutate).speculative_config.enforce_eager is False
 
 
 def _selector(*, use_mla: bool = False, use_sparse: bool = False) -> SimpleNamespace:

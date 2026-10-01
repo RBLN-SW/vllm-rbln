@@ -695,8 +695,6 @@ class RBLNDFlashProposer(DFlashProposer):
             query_start_loc=self.arange_cpu[: num_reqs + 1] * num_query_per_req,
             seq_lens=seq_lens,
             query_start_loc_cpu=self.arange_cpu[: num_reqs + 1] * num_query_per_req,
-            _seq_lens_cpu=None,
-            _num_computed_tokens_cpu=None,
             seq_lens_cpu_upper_bound=cad.seq_lens_cpu_upper_bound,
             num_reqs=num_reqs,
             num_actual_tokens=num_query_total,

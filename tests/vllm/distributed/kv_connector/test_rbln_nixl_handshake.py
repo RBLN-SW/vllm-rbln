@@ -21,7 +21,7 @@
 # nixl-rbln is the only stand-in.
 
 import collections
-import queue
+import inspect
 import threading
 import time
 from collections import Counter, defaultdict
@@ -36,7 +36,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import EngineTransferInfo
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
     NixlPullConnectorWorker,
-    NixlPushConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
@@ -85,14 +84,15 @@ def _encode_payload(
         device_id=0,
         num_blocks=4,
         block_lens=[8192] * n_regions,
-        kv_cache_layout="HND",
+        block_strides=[8192] * n_regions,
+        kv_cache_layout="LBHNC",
         block_size=16,
         ssm_sizes=(0, 0),
         attn_backend_name="RBLN",
         physical_blocks_per_logical_kv_block=1,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        registered_layer_names=list(layer_names),
+        region_names=list(layer_names),
         kv_slices=kv_slices,
     )
     payload = NixlHandshakePayload(
@@ -104,19 +104,23 @@ def _encode_payload(
 
 def _agent_meta(**overrides):
     """A minimal RblnNixlAgentMetadata for the region-slicing cases."""
+    # RBLN registers a region's blocks contiguously, so a caller that gives
+    # lengths and no strides means the two are the same list.
+    block_lens = list(overrides.pop("block_lens", [8192]))
     fields = dict(
         engine_id="eng",
         agent_metadata=b"agent",
         kv_caches_base_addr=[0x1000],
         device_id=0,
         num_blocks=4,
-        block_lens=[8192],
-        kv_cache_layout="HND",
+        block_lens=block_lens,
+        block_strides=list(block_lens),
+        kv_cache_layout="LBHNC",
         block_size=16,
         ssm_sizes=(0, 0),
         attn_backend_name="RBLN",
         physical_blocks_per_logical_kv_block=1,
-        registered_layer_names=[f"layer.{i}" for i in range(4)],
+        region_names=[f"layer.{i}" for i in range(4)],
     )
     fields.update(overrides)
     return RblnNixlAgentMetadata(**fields)
@@ -239,7 +243,11 @@ def _make_worker(
     # Full-model consumer: owns every producer stage's layer, so every stage
     # overlaps (the fan-out default). _FakeSock advertises stage i as "layer.i".
     w.local_seen_layer_names = ["layer.0", "layer.1", "layer.2"]
-    w.add_remote_agent = MagicMock(side_effect=lambda meta, rank, tps: f"agent-{rank}")
+    w.add_remote_agent = MagicMock(
+        # Strict arity: a caller that stops forwarding the peer's dcp_size
+        # must fail here, not be absorbed by a default.
+        side_effect=lambda meta, rank, tps, dcp: f"agent-{rank}"
+    )
     # Stubbed so the fan-out tests stay on stage enumeration; the body runs for
     # real in TestShardLocalRegions::test_register_shard_xfer_state_keys_the_stage.
     w._register_shard_xfer_state = MagicMock()
@@ -321,17 +329,18 @@ class TestUpstreamReachesTheHandshake:
         assert w._engine_clock_offset["eng"] == pytest.approx(1.0)
 
     def test_the_push_writer_reaches_it_and_unpacks_the_pair(self):
-        # P's first write to a decode engine goes through upstream's blocking
-        # _ensure_d_handshake, which unpacks (agents, clock_offset). A dict of
-        # two shards, as here, unpacks into its own keys instead of raising, so
-        # the engine would store an int where an agent map belongs.
+        # P's first write to a decode engine goes through the handshake, which
+        # unpacks (agents, clock_offset). A dict of two shards, as here, unpacks
+        # into its own keys instead of raising, so the engine would store an int
+        # where an agent map belongs. vllm 0.30.0 folded push's own blocking
+        # _ensure_d_handshake into the base _ensure_handshake.
         sock = _FakeSock(pp_size=2)
         w = self._worker(cls=RblnNixlPushConnectorWorker)
 
         with _patched_socket(sock):
-            assert NixlPushConnectorWorker._ensure_d_handshake(
-                w, "eng", "h", 1234, 1, "req-0"
-            )
+            fut = NixlBaseConnectorWorker._ensure_handshake(w, "eng", "h", 1234, 1)
+            assert fut is not None
+            fut.result(timeout=5)
 
         assert w._remote_agents["eng"] == {(0, 0): "agent-0", (1, 0): "agent-1"}
 
@@ -345,7 +354,7 @@ class TestUpstreamReachesTheHandshake:
 
         with _patched_socket(sock):
             fut = NixlBaseConnectorWorker._ensure_handshake(
-                w, "eng", "h", 1234, 1, 3, True
+                w, "eng", "h", 1234, 1, pp_size=3, notif_agents_only=True
             )
             with pytest.raises(RuntimeError, match="pipeline size 3, peer reports 2"):
                 fut.result()
@@ -362,7 +371,7 @@ class TestUpstreamReachesTheHandshake:
 
         with _patched_socket(sock):
             fut = NixlBaseConnectorWorker._ensure_handshake(
-                w, "eng", "h", 1234, 2, 2, True
+                w, "eng", "h", 1234, 2, pp_size=2, notif_agents_only=True
             )
             fut.result()
 
@@ -406,6 +415,37 @@ def test_peer_meta_block_length_mirrors_the_local_table():
             local = geo.xfer_tables(geo.kv_caches()).block_lens
             agent = decoder.decode(peer_meta(geo).agent_metadata_bytes)
         assert list(agent.block_lens) == list(local), geo
+
+
+def test_peer_meta_names_every_region_the_way_a_producer_does():
+    # A producer publishes the four region lists one entry per REGION, and
+    # `registered_layer_names` folds the names back to layers. At one chiplet
+    # area the per-layer and per-region forms read alike, which is what let the
+    # peer double drift to the per-layer one.
+    from vllm.config import set_current_vllm_config
+
+    from tests.vllm.distributed.kv_connector.utils import (
+        KvGeometry,
+        engine_config,
+        peer_meta,
+    )
+
+    decoder = msgspec.msgpack.Decoder(RblnNixlAgentMetadata)
+    geo = KvGeometry(areas=4, slices=4)
+
+    with set_current_vllm_config(engine_config(block_size=geo.block_size)):
+        agent = decoder.decode(peer_meta(geo).agent_metadata_bytes)
+
+    n_regions = len(agent.kv_caches_base_addr)
+    assert n_regions > len(geo.layers)  # or the two forms cannot be told apart
+    for field in (
+        "region_names",
+        "region_num_blocks",
+        "region_group_ids",
+        "region_mem_types",
+    ):
+        assert len(getattr(agent, field)) == n_regions, field
+    assert agent.registered_layer_names == list(geo.layers)
 
 
 def test_a_replicated_head_band_is_refused_rather_than_mismodelled():
@@ -582,7 +622,7 @@ class TestPpHandshakeFanout:
         w = _make_worker()
         w.local_seen_layer_names = ["layer.1", "layer.2"]
         w.num_regions = 2
-        w.add_remote_agent = lambda meta, rank, size: "agent"
+        w.add_remote_agent = lambda meta, rank, size, dcp: "agent"
         w._register_shard_xfer_state = lambda *a, **k: None
         _handshake(w, _FakeSock(pp_size=2, layers_per_stage=2))
         assert w._overlapping_ranks["eng"] == [0, 1]
@@ -616,7 +656,8 @@ class TestPpHandshakeFanout:
         meta = _agent_meta(
             kv_caches_base_addr=[0x10 * i for i in range(8)],
             block_lens=[10 * i for i in range(8)],
-            registered_layer_names=[f"layer.{i}" for i in range(4)],
+            # One name per REGION, so a layer with K and V appears twice.
+            region_names=[f"layer.{i}" for i in range(4) for _ in range(2)],
         )
         sliced = w._trim_agent_meta_to_layers(meta, [(2, 0)])
         assert list(sliced.kv_caches_base_addr) == [0x40, 0x50]
@@ -782,7 +823,9 @@ class TestPpHandshakeFanout:
             _patched_socket(_FakeSock(pp_size=2)),
             pytest.raises(RuntimeError, match="larger tensor-parallel size"),
         ):
-            w._nixl_handshake("h", 1234, 4, "eng", 2, True)
+            w._nixl_handshake(
+                "h", 1234, 4, "eng", remote_pp_size=2, notif_agents_only=True
+            )
 
     def test_both_sides_pipelined_is_allowed_on_the_pull_side(self):
         # The shape the push-side guard below must not take with it: reading,
@@ -809,7 +852,9 @@ class TestPpHandshakeFanout:
             _patched_socket(_FakeSock(pp_size=2)),
             pytest.raises(RuntimeError, match="pipelined consumer"),
         ):
-            w._nixl_handshake("h", 1234, 1, "eng", 2, True)
+            w._nixl_handshake(
+                "h", 1234, 1, "eng", remote_pp_size=2, notif_agents_only=True
+            )
 
     def test_a_pipelined_consumer_is_fine_when_the_producer_is_not(self):
         # The count is right whenever the producer has one stage: every rank of
@@ -819,7 +864,9 @@ class TestPpHandshakeFanout:
         w._add_notif_only_remote_agent = MagicMock(return_value="n0")
 
         with _patched_socket(_FakeSock(pp_size=1)):
-            agents, _ = w._nixl_handshake("h", 1234, 1, "eng", 1, True)
+            agents, _ = w._nixl_handshake(
+                "h", 1234, 1, "eng", remote_pp_size=1, notif_agents_only=True
+            )
 
         assert agents == {(0, 0): "n0"}
 
@@ -926,7 +973,7 @@ class TestPeerRegionView:
             kv_caches_base_addr=[base * (i + 1) for i in range(n)],
             block_lens=list(block_lens),
             num_blocks=num_blocks,
-            registered_layer_names=list(layer_names),
+            region_names=list(layer_names),
             pp_size=4,
         )
 
@@ -1227,7 +1274,7 @@ class TestShardLocalRegions:
         # every peer at this tp ratio shares (test_cleanup_keeps_a_borrowed_
         # handle_alive covers the other end).
         w = self._wired_worker()
-        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
 
@@ -1250,7 +1297,7 @@ class TestShardLocalRegions:
         # fan-out tests stub this function, so a swapped key order or a
         # wrong-length group-id tuple would go unnoticed on both sides.
         w = self._wired_worker()
-        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
 
@@ -1267,7 +1314,7 @@ class TestShardLocalRegions:
         # Two pieces and three copies: a product of six that neither factor
         # alone, and no pair of ones, can produce.
         w = self._wired_worker()
-        w.kv_cache_config = MagicMock(kv_cache_groups=[object()])
+        w.kv_cache_config = MagicMock(transfer_groups=[object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
         w._shard_descs_per_block = {}
@@ -1282,7 +1329,7 @@ class TestShardLocalRegions:
         # The single-group assumption is what makes the all-zero tuple above
         # right; more than one group has to fail rather than mislabel regions.
         w = self._wired_worker()
-        w.kv_cache_config = MagicMock(kv_cache_groups=[object(), object()])
+        w.kv_cache_config = MagicMock(transfer_groups=[object(), object()])
         w.src_xfer_handles_by_remote = {}
         w._shard_region_group_ids = {}
 
@@ -1296,17 +1343,32 @@ class TestBaseFanInHandle:
     # emitting descriptors that span every producer's head band.
 
     @staticmethod
-    def _worker(*, host_buffer=True, tp_ratio=-4):
+    def _worker(
+        *, host_buffer=True, tp_ratio=-4, use_mla=False, source_ranks=(0, 1, 2, 3)
+    ):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
         w.use_host_buffer = host_buffer
         w.block_size = 16
         w.num_regions = 4
+        # Read by upstream's `_needs_split_local_xfer_handles`, which decides
+        # whether a split was built at all.
+        w.use_mla = use_mla
         w.transfer_topo = MagicMock()
         w.transfer_topo.tp_ratio.return_value = tp_ratio
-        w.src_xfer_handles_by_tp_ratio = {-4: [70, 71, 72, 73]}
-        w.tp_mappings = {"eng": MagicMock(all_source_ranks=(0, 1, 2, 3))}
+        # Keyed as upstream keys it: one ratio can describe peers whose block
+        # sizes differ, so the block size is part of the key.
+        w.src_xfer_handles_by_tp_ratio = {(-4, 16): [70, 71, 72, 73]}
+        w.tp_mappings = {"eng": MagicMock(all_source_ranks=source_ranks)}
         return w
+
+    def test_a_replicated_mla_peer_has_no_split_to_borrow(self):
+        # Upstream builds the split for everything but a pure-MLA mapping, whose
+        # one source rank writes the whole region. Reading the map on the ratio
+        # alone indexes a key it never wrote.
+        w = self._worker(use_mla=True, source_ranks=(0,))
+
+        assert w._base_fan_in_handle("eng", 0, 16, [0, 1, 2, 3], 4) is None
 
     def test_picks_the_split_for_this_producer(self):
         w = self._worker()
@@ -1367,6 +1429,16 @@ class TestValidateRemoteAgentHandshake:
         w.num_regions = num_layers * 2 * areas
         w.block_len_per_layer = [64] * (num_layers * 2 * areas)
         w.dst_num_blocks = {"eng": dst_num_blocks}
+        # 0.30.0 keeps the peer's per-region block counts alongside its
+        # total; every region here holds the whole count.
+        w.dst_region_num_blocks = {"eng": [dst_num_blocks] * (num_layers * 2 * areas)}
+        w.region_group_ids = [0] * (num_layers * 2 * areas)
+        w.dst_region_group_ids = {"eng": [0] * (num_layers * 2 * areas)}
+        w.dst_uses_region_group_mapping = {"eng": False}
+        w._uses_region_group_mapping = False
+        w.nixl_memory_type = "VRAM"
+        w.region_mem_types = ["VRAM"] * (num_layers * 2 * areas)
+        w.dst_region_mem_types = {"eng": ["VRAM"] * (num_layers * 2 * areas)}
         w.vllm_config = MagicMock()
         w.vllm_config.parallel_config.pipeline_parallel_size = 1
         # add_remote_agent reads the cached copy __init__ makes of it.
@@ -1405,7 +1477,7 @@ class TestValidateRemoteAgentHandshake:
             kv_areas=kv_areas,
             kv_slices=kv_slices,
             kv_split_axis=kv_split_axis,
-            registered_layer_names=[f"l{i}" for i in range(n_layers)],
+            region_names=[f"l{i}" for i in range(n_layers)],
         )
 
     def test_a_peer_on_another_axis_is_refused_through_the_entry_point(self):
@@ -1506,7 +1578,7 @@ class TestValidateRemoteAgentHandshake:
                 w,
                 _agent_meta(
                     kv_caches_base_addr=[0] * 57,  # not a whole number per layer
-                    registered_layer_names=[f"l{i}" for i in range(28)],
+                    region_names=[f"l{i}" for i in range(28)],
                 ),
                 0,
                 1,
@@ -1538,7 +1610,7 @@ class TestValidateRemoteAgentHandshake:
             ) as base_val,
         ):
             w._validate_remote_agent_handshake(
-                _agent_meta(kv_caches_base_addr=[0] * 56, registered_layer_names=[]),
+                _agent_meta(kv_caches_base_addr=[0] * 56, region_names=[]),
                 remote_tp_size=1,
             )
         head_val.assert_called_once()
@@ -1564,7 +1636,7 @@ class TestValidateRemoteAgentHandshake:
                     pp_size=2,
                     kv_caches_base_addr=[0] * 28,
                     num_blocks=8,
-                    registered_layer_names=[f"l{i}" for i in range(14)],
+                    region_names=[f"l{i}" for i in range(14)],
                 ),
                 remote_tp_size=2,
             )
@@ -2424,6 +2496,226 @@ class TestShardRegionAreaFilter:
         assert w._shard_local_region_ids(("l1",), peer_areas=[2, 3]) == [10, 11, 14, 15]
 
 
+class TestADecodeContextParallelPeerIsRefused:
+    """The refusal has to see the peer's number, not the parameter default.
+
+    `_validate_remote_agent_handshake` takes `remote_dcp_size` with a default
+    of 1, so a caller that forgets it turns the guard off without changing a
+    line of it -- which reads as protection while refusing nothing.
+    """
+
+    @staticmethod
+    def _worker():
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._kv_per_block = 1
+        w._sw_ratio = None
+        w._remote_agents = {}
+        w.dst_num_blocks = {}
+        w.dst_region_num_blocks = {}
+        w.dst_region_group_ids = {}
+        w.dst_region_mem_types = {}
+        w.dst_uses_region_group_mapping = {}
+        w.region_group_ids = []
+        w.nixl_memory_type = "VRAM"
+        w.kv_caches_base_addr = defaultdict(dict)
+        w.dst_xfer_side_handles = defaultdict(dict)
+        w.nixl_wrapper = MagicMock()
+        w.transfer_topo = MagicMock(tp_size=1)
+        w._kv_areas = w._kv_slices = 1
+        w._is_head_matched_peer = MagicMock(return_value=True)
+        w._reject_uneven_region_slices = MagicMock()
+        w._register_remote_engine_prelude = MagicMock()
+        w._build_head_matched_remote = MagicMock(return_value=[(0, 0, 0)])
+        w._fan_in_peer_areas = MagicMock(return_value=None)
+        return w
+
+    def test_the_peers_size_reaches_the_refusal(self):
+        w = self._worker()
+        meta = _agent_meta(engine_id="peer", dcp_size=2)
+
+        with pytest.raises(RuntimeError, match="decode-context-parallel"):
+            w.add_remote_agent(meta, 0, 2, meta.dcp_size)
+
+    def test_a_plain_peer_still_pairs(self):
+        w = self._worker()
+        w._validate_remote_agent_handshake = MagicMock()
+        meta = _agent_meta(engine_id="peer")
+
+        w.add_remote_agent(meta, 0, 2, meta.dcp_size)
+
+        assert w._validate_remote_agent_handshake.call_args.args[2] == 1
+
+
+class TestARefusedPeerLeavesNothingBehind:
+    """The DCP refusal fires after the engine is registered with the topology.
+
+    Making the refusal reachable made its ordering matter: the prelude writes
+    an `EngineTransferInfo`, a TPMapping and the region ledger before the
+    check, and a raise there never reaches `_cleanup_remote_engine` -- upstream
+    swallows a handshake exception and only fails the request.
+    """
+
+    @staticmethod
+    def _worker():
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._kv_per_block = 1
+        w._sw_ratio = None
+        w._remote_agents = {}
+        w.dst_num_blocks = {}
+        w.dst_region_num_blocks = {}
+        w.dst_region_group_ids = {}
+        w.dst_region_mem_types = {}
+        w.dst_uses_region_group_mapping = {}
+        w.region_group_ids = []
+        w.nixl_memory_type = "VRAM"
+        w.kv_caches_base_addr = defaultdict(dict)
+        w.dst_xfer_side_handles = defaultdict(dict)
+        w.nixl_wrapper = MagicMock()
+        w.tp_mappings = {}
+        w._group_spec_types = []
+        w.transfer_topo = MagicMock(tp_size=1)
+        w._kv_areas = w._kv_slices = 1
+        w._is_head_matched_peer = MagicMock(return_value=True)
+        w._reject_uneven_region_slices = MagicMock()
+        w._build_head_matched_remote = MagicMock(return_value=[(0, 0, 0)])
+        w._fan_in_peer_areas = MagicMock(return_value=None)
+        return w
+
+    def test_the_topology_never_sees_a_peer_it_refuses(self):
+        w = self._worker()
+        meta = _agent_meta(engine_id="peer", dcp_size=2)
+
+        with pytest.raises(RuntimeError, match="decode-context-parallel"):
+            w.add_remote_agent(meta, 0, 2, meta.dcp_size)
+
+        w.transfer_topo.register_remote_engine.assert_not_called()
+        assert w.tp_mappings == {}
+        assert w.dst_num_blocks == {}
+        assert w.kv_caches_base_addr == {}
+        w.nixl_wrapper.add_remote_agent.assert_not_called()
+
+    def test_the_prelude_carries_the_peers_dcp_size(self):
+        # `EngineTransferInfo.remote_dcp_size` defaults to 1, so a prelude that
+        # does not pass it describes every peer as DCP-1 -- and upstream's own
+        # validation asserts the topology agrees with the argument.
+        w = self._worker()
+        w._validate_remote_agent_handshake = MagicMock()
+        meta = _agent_meta(engine_id="peer", dcp_size=1)
+
+        w.add_remote_agent(meta, 0, 2, meta.dcp_size)
+
+        info = w.transfer_topo.register_remote_engine.call_args.args[1]
+        assert info.remote_dcp_size == 1
+        assert (
+            w.transfer_topo.compute_tp_mapping.call_args is None
+            or "remote_dcp_size" in w.transfer_topo.compute_tp_mapping.call_args.kwargs
+        )
+
+
+class TestOnePermutationPerView:
+    """`_regions_viewed_as` reorders `block_len_per_layer` for the duration.
+
+    Its own docstring says the lengths are reordered "not just routed through
+    the accessor that used to own this translation" -- so inside the scope the
+    index IS the peer's position and the accessor must not translate again.
+    """
+
+    @staticmethod
+    def _worker():
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w.block_len_per_layer = [10, 20, 30]
+        w._viewed_region_ids = None
+        w._mamba_ssm_size = (0, 0)
+        w.transfer_topo = MagicMock(virtually_split_kv_in_blocks=False)
+        return w
+
+    def test_a_peer_position_reads_the_region_it_names(self):
+        w = self._worker()
+        # The peer's region 0 is our region 2, its 1 is our 0, its 2 is our 1.
+        with w._regions_viewed_as([2, 0, 1]):
+            got = [w.get_backend_aware_kv_block_len(i) for i in range(3)]
+        assert got == [30, 10, 20]
+
+    def test_outside_a_view_the_index_is_our_own(self):
+        w = self._worker()
+        assert [w.get_backend_aware_kv_block_len(i) for i in range(3)] == [10, 20, 30]
+
+
+class TestTheRemoteRegionLedger:
+    """vllm 0.30 put four per-engine region lists beside ``dst_num_blocks``.
+
+    Upstream writes all five the first time it pairs a peer, inside its own
+    ``add_remote_agent``. Two RBLN routes register a peer themselves and never
+    reach that body, while the transfer paths index the four with no guard
+    (``pull_worker`` for the mapping flag, ``push_worker`` for all three).
+    """
+
+    @staticmethod
+    def _worker(*, sw_ratio=None, region_group_ids=(0, 0)):
+        w = object.__new__(RblnNixlPullConnectorWorker)
+        w._remote_agents = defaultdict(dict)
+        w.dst_num_blocks = {}
+        w.dst_region_num_blocks = {}
+        w.dst_region_group_ids = {}
+        w.dst_uses_region_group_mapping = {}
+        w.dst_region_mem_types = {}
+        w.kv_caches_base_addr = defaultdict(dict)
+        w.dst_xfer_side_handles = defaultdict(dict)
+        w.region_group_ids = list(region_group_ids)
+        w.nixl_memory_type = "VRAM"
+        w.nixl_wrapper = MagicMock()
+        w._kv_areas = 1
+        w._kv_slices = 1
+        w._kv_per_block = 1
+        w._sw_ratio = sw_ratio
+        w.transfer_topo = MagicMock(tp_size=1)
+        w._reject_uneven_region_slices = MagicMock()
+        w._register_remote_engine_prelude = MagicMock()
+        w._validate_remote_agent_handshake = MagicMock()
+        w._build_head_matched_remote = MagicMock(return_value=[(0, 0, 0)])
+        w._fan_in_peer_areas = MagicMock(return_value=None)
+        return w
+
+    @staticmethod
+    def _meta():
+        return _agent_meta(
+            engine_id="peer", kv_caches_base_addr=[0x1000, 0x2000], num_blocks=4
+        )
+
+    def test_head_matched_registration_records_the_ledger(self):
+        w = self._worker()
+
+        w._add_remote_agent_head_matched(self._meta(), 0, 2)
+
+        # A peer that advertises none of them is described by its own block
+        # count over its own region count, which is what upstream falls back to.
+        assert w.dst_region_num_blocks["peer"] == [4, 4]
+        assert w.dst_region_group_ids["peer"] == [0, 0]
+        assert w.dst_uses_region_group_mapping["peer"] is False
+        assert w.dst_region_mem_types["peer"] == ["VRAM", "VRAM"]
+
+    def test_the_peers_own_lists_win(self):
+        # A peer that advertises them is not described by our geometry: it is
+        # the side whose regions these descriptors address.
+        w = self._worker()
+        meta = _agent_meta(
+            engine_id="peer",
+            kv_caches_base_addr=[0x1000, 0x2000],
+            num_blocks=4,
+            region_num_blocks=[7, 9],
+            region_group_ids=[0, 1],
+            region_mem_types=["DRAM", "DRAM"],
+        )
+
+        w._add_remote_agent_head_matched(meta, 0, 2)
+
+        assert w.dst_region_num_blocks["peer"] == [7, 9]
+        assert w.dst_region_group_ids["peer"] == [0, 1]
+        # Two distinct groups is exactly what turns the mapping on.
+        assert w.dst_uses_region_group_mapping["peer"] is True
+        assert w.dst_region_mem_types["peer"] == ["DRAM", "DRAM"]
+
+
 class TestD2DRegionPairing:
     """D2D publishes one region PER CHIPLET AREA and pairs local region i with
     remote region i positionally, so both sides must expand identically.
@@ -2467,7 +2759,7 @@ class TestD2DRegionPairing:
     def _meta(n_regions, n_layers=7):
         return _agent_meta(
             kv_caches_base_addr=[1000 * i for i in range(n_regions)],
-            registered_layer_names=[f"layer.{i}" for i in range(n_layers)],
+            region_names=[f"layer.{i}" for i in range(n_layers)],
         )
 
     def test_symmetric_tp_passes(self):
@@ -2546,6 +2838,8 @@ class TestCleanupRemoteEngine:
         w._remote_shard_layer_names = defaultdict(dict, {"eng": {0: ("l0",)}})
         w._overlapping_ranks = defaultdict(list, {"eng": [0]})
         w._remote_pp_size = {"eng": 1}
+        # The 0.30.0 sweep drops a stale engine's in-flight reads too.
+        w._recving_transfers = defaultdict(list)
 
         with patch.object(NixlBaseConnectorWorker, "_cleanup_remote_engine"):
             NixlBaseConnectorWorker._evict_stale_engines(w)
@@ -2623,7 +2917,7 @@ class TestHeadMatchedHandshakeChecks:
     # over host-bounce, so this branch is unreachable from them.
 
     @staticmethod
-    def _worker(*, local_len=128, block_size_ratio=1, layout="NHD", kv_heads=8):
+    def _worker(*, local_len=128, block_size_ratio=1, layout="LBNHC", kv_heads=8):
         # `local_len` and `kv_heads` take a list for one entry per logical region;
         # the transfer table repeats each across the 4 chiplet areas.
         w = object.__new__(RblnNixlPullConnectorWorker)
@@ -2645,7 +2939,7 @@ class TestHeadMatchedHandshakeChecks:
         return w
 
     @staticmethod
-    def _meta(*, remote_len, layout="NHD"):
+    def _meta(*, remote_len, layout="LBNHC"):
         # A TP1 peer keeps all 8 heads, cut into 4 slices -> 2 heads per area,
         # so its per-area block length must be twice ours for a head to cost the
         # same on both sides.
@@ -2681,7 +2975,7 @@ class TestHeadMatchedHandshakeChecks:
         w = self._worker()
         meta = _agent_meta(
             block_size=16,
-            kv_cache_layout="NHD",
+            kv_cache_layout="LBNHC",
             kv_areas=4,
             kv_slices=4,
             block_lens=[256],
@@ -2739,10 +3033,10 @@ class TestHeadMatchedHandshakeChecks:
             )
 
     def test_layout_mismatch_raises(self):
-        w = self._worker(layout="NHD")
+        w = self._worker(layout="LBNHC")
         with pytest.raises(RuntimeError, match="peer KV layout"):
             w._validate_head_matched_handshake(
-                self._meta(remote_len=256, layout="HND"), remote_tp_size=1
+                self._meta(remote_len=256, layout="LBHNC"), remote_tp_size=1
             )
 
 
@@ -2761,6 +3055,13 @@ class TestHeadMatchedAgentRegistration:
         w._kv_per_block = 1
         w._remote_agents = {}
         w.dst_num_blocks = {}
+        # Registering a peer now records its region ledger beside the block
+        # count, which the transfer paths read unguarded.
+        w.dst_region_num_blocks = {}
+        w.dst_region_group_ids = {}
+        w.dst_region_mem_types = {}
+        w.dst_uses_region_group_mapping = {}
+        w.region_group_ids = []
         w.kv_caches_base_addr = {"eng": {}}
         w.dst_xfer_side_handles = {"eng": {}}
         w.nixl_memory_type = "VRAM"
@@ -2799,8 +3100,8 @@ class TestHeadMatchedAgentRegistration:
         # This path returns before super(), so registering the peer engine and
         # running the geometry guards are its own. Both are stubbed above, which
         # makes these two assertions the only hold on those call sites.
-        assert prelude.call_args.args == (meta, 2)
-        assert validate.call_args.args == (meta, 2)
+        assert prelude.call_args.args == (meta, 2, 1)
+        assert validate.call_args.args == (meta, 2, 1)
 
     def test_a_shard_already_registered_is_not_registered_again(self):
         # Mirrors upstream's own cache check, which it keeps behind a TODO for
@@ -2887,7 +3188,7 @@ class TestHeadMatchedAgentRegistration:
         ):
             assert w.add_remote_agent(meta, 1, 2) == "head-matched"
 
-        assert head_matched.call_args.args == (meta, 1, 2)
+        assert head_matched.call_args.args == (meta, 1, 2, 1)
         base.assert_not_called()
 
 
@@ -2992,7 +3293,7 @@ class TestAddRemoteAgentSwa:
 
         # add_remote_agent has to reach _validate_remote_agent_handshake with the
         # peer's own metadata; it is stubbed here, so this is what says so.
-        assert validate.call_args.args == (meta, 1)
+        assert validate.call_args.args == (meta, 1, 1)
 
         # Prelude: remote engine registered with an EngineTransferInfo from meta.
         topo.register_remote_engine.assert_called_once()
@@ -3006,7 +3307,10 @@ class TestAddRemoteAgentSwa:
 
         # TPMapping built from the topology and stashed under the engine id.
         ctm.assert_called_once_with(
-            transfer_topology=topo, remote_tp_size=1, group_spec_types=()
+            transfer_topology=topo,
+            remote_tp_size=1,
+            group_spec_types=(),
+            remote_dcp_size=1,
         )
         assert worker.tp_mappings["remote-eng"] is mapping_sentinel
 
@@ -3293,7 +3597,9 @@ class TestAPackedBlockNeedsAnEqualPeerBlockSize:
         ) as upstream:
             worker._validate_remote_agent_handshake(meta, remote_tp_size=1)
 
-        upstream.assert_called_once_with(meta, 1)
+        # The DCP size travels with it: upstream 0.30 takes it as a third
+        # argument, and dropping it would validate against the default.
+        upstream.assert_called_once_with(meta, 1, 1)
 
 
 class TestKvRuns:
@@ -3342,8 +3648,7 @@ class TestADeadPeerIsReported:
         w.nixl_wrapper = MagicMock()
         w._recving_metadata = {}
         w._recving_transfers = collections.defaultdict(list)
-        w._invalid_block_ids = queue.Queue()
-        w._failed_recv_reqs = queue.Queue()
+        w._recv_failures = set()
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
         w._remote_agents = {"eng": {(0, 0): "agent0", (0, 1): "agent1"}}
@@ -3363,14 +3668,37 @@ class TestADeadPeerIsReported:
         return meta
 
     @staticmethod
-    def _heartbeat(req_ids=frozenset()):
+    def _heartbeat(req_ids=frozenset(), *, dcp_size=1, pp_size=1):
         metadata = MagicMock()
         metadata.heartbeat_by_engine = {
             "eng": MagicMock(
-                req_ids=set(req_ids), host="h", port=1, tp_size=1, pp_size=1
+                req_ids=set(req_ids),
+                host="h",
+                port=1,
+                tp_size=1,
+                dcp_size=dcp_size,
+                pp_size=pp_size,
             )
         }
         return metadata
+
+    def test_the_handshake_gets_the_arguments_upstream_names(self):
+        # This override mirrors upstream's body, and the call is positional, so
+        # a parameter added between the ones it passes lands every later
+        # argument one place left without raising. Bind against the real
+        # signature rather than a literal tuple: the point is the contract.
+        w = self._worker()
+
+        w._send_heartbeats(self._heartbeat(dcp_size=3, pp_size=2))
+
+        call = w._ensure_handshake.call_args
+        bound = inspect.signature(NixlBaseConnectorWorker._ensure_handshake).bind(
+            w, *call.args, **call.kwargs
+        )
+        bound.apply_defaults()
+        assert bound.arguments["dcp_size"] == 3
+        assert bound.arguments["pp_size"] == 2
+        assert bound.arguments["notif_agents_only"] is False
 
     def test_a_failing_heartbeat_fails_that_peers_reads(self):
         w = self._worker()
@@ -3380,8 +3708,7 @@ class TestADeadPeerIsReported:
 
         w._send_heartbeats(self._heartbeat({"r0"}))
 
-        assert list(w._failed_recv_reqs.queue) == ["r0"]
-        assert list(w._invalid_block_ids.queue) == [{1, 2}]
+        assert w._recv_failures == {"r0"}
         # The in-flight handle goes with it: left in place, _pop_done_transfers
         # would report r0 a second time with its metadata already gone.
         w.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
@@ -3422,10 +3749,9 @@ class TestAReadThatMovedNoBlock:
         w = TestADeadPeerIsReported._worker()
         w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
 
-        w._handle_failed_transfer("r0", None)
+        w._handle_failed_transfer("r0", None, w._recv_failures)
 
-        assert w._failed_recv_reqs.empty()
-        assert w._invalid_block_ids.empty()
+        assert not w._recv_failures
 
     def test_a_second_report_says_the_same(self):
         # The handshake done-callback runs on the executor thread, so it and
@@ -3434,10 +3760,10 @@ class TestAReadThatMovedNoBlock:
         w = TestADeadPeerIsReported._worker()
         w._recving_metadata = {"r0": TestADeadPeerIsReported._meta(local_ids=())}
 
-        w._handle_failed_transfer("r0", None)
-        w._handle_failed_transfer("r0", None)
+        w._handle_failed_transfer("r0", None, w._recv_failures)
+        w._handle_failed_transfer("r0", None, w._recv_failures)
 
-        assert w._failed_recv_reqs.empty()
+        assert not w._recv_failures
 
 
 class TestMetadataTakenMidSweep:
@@ -3469,4 +3795,4 @@ class TestMetadataTakenMidSweep:
 
         # Reading the live view would raise here; the sweep still covers every
         # read it set out to, including the one taken from under it.
-        assert list(w._failed_recv_reqs.queue) == ["r0", "r1", "r2"]
+        assert w._recv_failures == {"r0", "r1", "r2"}

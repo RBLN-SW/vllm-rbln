@@ -26,7 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineTransferInfo,
     TransferTopology,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 
 class RblnTransferTopology(TransferTopology):
@@ -81,11 +81,44 @@ class RblnTransferTopology(TransferTopology):
             self.tensor_shape is not None and len(self.tensor_shape) == len(shape) + 1
         )
 
+    # vllm 0.30.0 dropped these three from TransferTopology along with the
+    # cross-layer-block path they served. The RBLN registration path still
+    # turns on all three, so the subclass that computes
+    # `_cross_layers_blocks` owns them now.
+
+    @property
+    def cross_layers_blocks(self) -> bool:
+        return self._cross_layers_blocks
+
+    @property
+    def virtually_split_kv_in_blocks(self) -> bool:
+        """Whether a block splits into two separately indexable sub-regions.
+
+        K and V share an attention block, which transfers as one unit; only
+        Mamba needs its conv and ssm states indexed apart. A cross-layer block
+        interleaves per layer, so a half-split would not separate them.
+        """
+        return self.is_mamba and not self._cross_layers_blocks
+
+    def _shared_cache_regions(
+        self, cache: torch.Tensor, layer_spec: KVCacheSpec
+    ) -> list[torch.Tensor]:
+        """What upstream's own `get_transfer_cache_regions` returned."""
+        if isinstance(layer_spec, MambaSpec):
+            conv, _ssm = cache
+            return [conv]
+        if self.is_mamba and cache.shape[0] == 2:
+            # With Mamba present every backend is blocks-first so blocks can be
+            # shared with the attention layers, so this swaps [2 <-> num_blocks]
+            # to match `_update_hybrid_attention_mamba_layout`.
+            cache = cache.transpose(0, 1)
+        return [cache]
+
     def get_transfer_cache_regions(
         self, cache: torch.Tensor, layer_spec: KVCacheSpec
     ) -> list[torch.Tensor] | torch.Tensor:
         if self.is_mla or self.is_mamba or self._cross_layers_blocks:
-            return super().get_transfer_cache_regions(cache, layer_spec)
+            return self._shared_cache_regions(cache, layer_spec)
         if self._kv_shares_a_block:
             # Nothing to iterate: the block is the unit, and the descriptor
             # path cuts K and V out of it (`RblnNixlWorkerBase._kv_runs`).

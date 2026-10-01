@@ -30,6 +30,7 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -126,6 +127,18 @@ class RBLNFlashAttentionBackend(AttentionBackend):
         axis = attention_block_axis(get_rbln_config().use_custom_kernel)
         shape.insert(axis, num_blocks)
         return tuple(shape)
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # Layer-compact only: the runner allocates one layer at a time, sized by
+        # `layer_stride`. That is a layer's whole cache only while the layer
+        # dimension is outermost; a block-outermost layout scatters a layer
+        # across every block and the stride stops meaning one layer.
+        return (
+            KVCacheLayout.LBNHC,
+            KVCacheLayout.LBHNC,
+            KVCacheLayout.LHBNC,
+        )
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:

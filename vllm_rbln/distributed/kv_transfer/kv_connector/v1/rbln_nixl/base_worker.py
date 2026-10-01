@@ -20,13 +20,8 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
-    get_representative_spec_type,
-)
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 
 import vllm_rbln.envs as envs
@@ -64,27 +59,19 @@ class RblnNixlWorkerBase(
     def __init__(
         self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig"
     ) -> None:
-        # Upstream's PP>1 refusal reads "not FullAttentionSpec" as "the region
-        # count varies per layer", misjudging one merged group of full
-        # attention specs: uniform per layer, yet not a FullAttentionSpec.
-        # Mamba and sliding window merge the same way and do vary, so suppress
-        # for that shape alone. TODO: drop once upstream tests uniformity.
-        groups = kv_cache_config.kv_cache_groups
-        group_spec = groups[0].kv_cache_spec if len(groups) == 1 else None
-        suppress = isinstance(group_spec, UniformTypeKVCacheSpecs) and issubclass(
-            get_representative_spec_type(group_spec), FullAttentionSpec
-        )
-        scheduler_config = vllm_config.scheduler_config
-        hma_disabled = scheduler_config.disable_hybrid_kv_cache_manager
-        scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled or suppress
-        try:
-            super().__init__(vllm_config, engine_id, kv_cache_config)
-        finally:
-            scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
-        if suppress:
-            # What upstream would have computed: `any()` over the one group is
-            # True, since UniformTypeKVCacheSpecs is not a FullAttentionSpec.
-            self._is_hma_required = not hma_disabled
+        super().__init__(vllm_config, engine_id, kv_cache_config)
+
+        # The descriptor arithmetic addresses a rank's whole region, which is
+        # why a context-parallel peer is refused at the handshake; ours would be
+        # a slice for the same reason, and upstream swaps the TP rank and size
+        # for the PCP pair once both are sharded. Refusing here rather than
+        # advertising a size the topology built below does not carry.
+        if self.dcp_size != 1 or self.pcp_size != 1:
+            raise RuntimeError(
+                "RBLN NIXL does not support a context-parallel engine: this "
+                f"worker reports dcp_size={self.dcp_size}, "
+                f"pcp_size={self.pcp_size}."
+            )
 
         # nixl-rbln present -> RBLN backend (host-bounce DRAM_SEG / D2D VRAM_SEG);
         # absent -> upstream UCX/DRAM defaults, and D2D (kv_buffer_device="rbln")
@@ -185,7 +172,7 @@ class RblnNixlWorkerBase(
         # host copies stay Full; _sw_ratio is None collapses to upstream Full-only.
         # `register_local_xfer_handler` builds that second range and documents it.
         self._group_specs: list[Any] = [
-            g.kv_cache_spec for g in self.kv_cache_config.kv_cache_groups
+            g.kv_cache_spec for g in self.kv_cache_config.transfer_groups
         ]
         # Whether the model has a sliding window at all, which decides the model
         # parallelism guards; `_sw_ratio` is the view-opt's desc layout and only

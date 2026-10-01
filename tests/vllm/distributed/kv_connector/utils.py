@@ -65,8 +65,12 @@ def engine_config(
     same shape is free. The connector never mutates it.
     """
     from vllm.config import KVTransferConfig
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
     from tests.vllm.vllm_config import make_vllm_config
+    from vllm_rbln.v1.attention.backends.flash_attention import (
+        RBLNFlashAttentionBackend,
+    )
 
     extra: dict[str, Any] = {}
     if speculative_model is not None:
@@ -74,7 +78,7 @@ def engine_config(
             "model": speculative_model,
             "num_speculative_tokens": 2,
         }
-    return make_vllm_config(
+    config = make_vllm_config(
         model=MODEL,
         block_size=block_size,
         kv_transfer_config=KVTransferConfig(
@@ -87,6 +91,20 @@ def engine_config(
         ),
         **extra,
     )
+    # A NIXL worker reads the resolved layout in __init__, and the engine core
+    # is what resolves it -- which these tests skip by building the worker
+    # directly. Run the real resolver over the backend's own preference list
+    # rather than naming a layout here, so the tests see what production sees.
+    resolve_kv_cache_layout(
+        config,
+        [
+            [
+                layout.name
+                for layout in RBLNFlashAttentionBackend.supported_kv_cache_layouts()
+            ]
+        ],
+    )
+    return config
 
 
 def draft_model_dir(dest: Any, kv_heads: int) -> str:
@@ -216,9 +234,20 @@ class KvGeometry:
         return KVCacheConfig(
             num_blocks=self.num_blocks,
             kv_cache_tensors=[
+                # One group: its layers sit a page apart inside each block, and
+                # the pool spans the whole group.
                 KVCacheTensor(
-                    size=specs[name].page_size_bytes * self.num_blocks,
-                    shared_by=[name],
+                    size=sum(s.page_size_bytes for s in specs.values())
+                    * self.num_blocks,
+                    layers=[name],
+                    layer_stride=specs[name].page_size_bytes * self.num_blocks,
+                    block_stride=specs[name].page_size_bytes,
+                    offset=sum(
+                        specs[earlier].page_size_bytes * self.num_blocks
+                        for earlier in list(self.layers)[
+                            : list(self.layers).index(name)
+                        ]
+                    ),
                 )
                 for name in self.layers
             ],
@@ -528,14 +557,23 @@ def peer_meta(
         device_id=0,
         num_blocks=geometry.num_blocks,
         block_lens=block_lens,
+        block_strides=block_lens,
         attn_backend_name="RBLN_FLASH_ATTN",
-        kv_cache_layout="HND",
+        kv_cache_layout="LBHNC",
         block_size=geometry.block_size,
         ssm_sizes=(0, 0),
         physical_blocks_per_logical_kv_block=1,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        registered_layer_names=names,
+        # Region-major, area-minor and one entry per region, which is the order
+        # and the length a producer publishes; `registered_layer_names` folds it
+        # back to layers. Per-layer would read the same only at one area.
+        region_names=[
+            name for name in names for _ in range(regions_per_layer * geometry.areas)
+        ],
+        region_num_blocks=[geometry.num_blocks] * n_regions,
+        region_mem_types=["VRAM"] * n_regions,
+        region_group_ids=[0] * n_regions,
         kv_areas=geometry.areas,
         kv_slices=geometry.slices,
     )
@@ -644,17 +682,20 @@ def build_worker(
     num_blocks=128,
     block_size=64,
     specs=None,
+    non_transfer_specs=None,
     nixl_available=True,
     swa_view_opt=False,
     use_mla=False,
     pp_size=1,
-    hma_disabled=False,
+    dcp_size=1,
+    pcp_size=1,
     stripe_width=None,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
     import sys
     import types
+    from collections import defaultdict
     from unittest.mock import MagicMock
 
     from vllm.config import CacheConfig, SchedulerConfig
@@ -672,13 +713,6 @@ def build_worker(
     monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_SWA_VIEW_OPT", swa_view_opt)
 
     def fake_super_init(self, vllm_config, engine_id, kv_cache_config):
-        # Upstream reads `disable_hybrid_kv_cache_manager` once in its own
-        # __init__, for its PP refusal and for `_is_hma_required`. Record what
-        # it was shown rather than restating its condition here, and leave
-        # `_is_hma_required` unset so only the override can produce it.
-        self.hma_flag_seen_by_upstream_init = (
-            vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
-        )
         self.vllm_config = vllm_config
         self.engine_id = engine_id
         self.kv_cache_config = kv_cache_config
@@ -700,6 +734,19 @@ def build_worker(
         # positional pairing applies; 1 keeps these cases homogeneous.
         self.transfer_topo = MagicMock()
         self.transfer_topo.tp_ratio.return_value = 1
+        # State vllm 0.30.0 added to the real __init__ and the inherited entry
+        # points now read. The parallel sizes are the single-shard values these
+        # tests build against, so no rank ever offsets off them.
+        self.dcp_size = dcp_size
+        self.pcp_size = pcp_size
+        self.dcp_rank = 0
+        self.pcp_rank = 0
+        self.dst_region_num_blocks = {}
+        self.dst_region_group_ids = {}
+        self.dst_region_mem_types = {}
+        self.dst_uses_region_group_mapping = {}
+        self._recving_transfers = defaultdict(list)
+        self._engine_ttl = 0.0
 
     monkeypatch.setattr(NixlBaseConnectorWorker, "__init__", fake_super_init)
 
@@ -718,16 +765,19 @@ def build_worker(
     # _check_pp_constraints compares pipeline_parallel_size <= 1; a MagicMock
     # would raise TypeError there, so give it a real int.
     vllm_config.parallel_config.pipeline_parallel_size = pp_size
-    # Real, so that renaming the flag the override suppresses fails here rather
-    # than being absorbed. `VllmConfig.__post_init__` resolves it before a
-    # worker is built, so a bool is what production sees.
     vllm_config.scheduler_config = SchedulerConfig(
         is_encoder_decoder=False, max_model_len=128
     )
-    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = hma_disabled
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
-    kv_cache_config.kv_cache_groups = [
-        MagicMock(kv_cache_spec=spec) for spec in (specs or [])
-    ]
+    groups = [MagicMock(kv_cache_spec=spec) for spec in (specs or [])]
+    # Real `KVCacheConfig` derives the transfer view from `kv_cache_groups` by
+    # dropping the groups that opted out, and a MagicMock answers `len()` with
+    # 0 rather than raising -- so a connector reading the wrong view would see
+    # no groups at all. `non_transfer_specs` builds a config where the two
+    # genuinely differ, so a case that reads the wrong one can be seen to.
+    opted_out = [MagicMock(kv_cache_spec=spec) for spec in (non_transfer_specs or [])]
+    kv_cache_config.kv_cache_groups = groups + opted_out
+    kv_cache_config.transfer_groups = groups
+    kv_cache_config.transfer_group_ids = tuple(range(len(groups)))
     return RblnNixlPullConnectorWorker(vllm_config, "test-engine", kv_cache_config)

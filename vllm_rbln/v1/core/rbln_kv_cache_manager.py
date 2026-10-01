@@ -38,7 +38,6 @@ from vllm.v1.core.kv_cache_utils import (
     hash_block_tokens,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
-    need_extra_keys,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -48,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -83,9 +83,9 @@ class SubBlockHasher:
     """Computes chained sub-block hashes from token IDs.
 
     Uses the same ``hash_block_tokens`` as upstream, but at sub-block
-    granularity.  When a *request* is provided, per-sub-block
-    ``extra_keys`` (cache_salt, LoRA, multimodal, prompt_embeds) are
-    mixed in, mirroring upstream full-block hashing.
+    granularity.  Per-sub-block ``extra_keys`` (cache_salt, LoRA,
+    multimodal, prompt_embeds) are mixed in, mirroring upstream
+    full-block hashing.
     """
 
     def __init__(
@@ -99,23 +99,22 @@ class SubBlockHasher:
     def hash_tokens(
         self,
         token_ids: Sequence[int],
+        request: Request,
         *,
         parent_hash: BlockHash | None = None,
         num_hashed_tokens: int = 0,
-        request: Request | None = None,
         start_mm_idx: int = 0,
     ) -> tuple[list[BlockHash], list[tuple[Any, ...] | None], int]:
         """Return sub-block hashes for *full* sub-blocks in ``token_ids``.
 
         Args:
             token_ids: Full token sequence of the request.
+            request: Source of the extra hash keys (LoRA, cache_salt,
+                multimodal, prompt_embeds) mixed into each sub-block hash.
             parent_hash: Hash of the last sub-block before the range we
                 are hashing (``None`` for the very first sub-block).
             num_hashed_tokens: Number of tokens already hashed (i.e. the
                 start offset into ``token_ids``).
-            request: When provided and the request carries extra hash
-                keys (LoRA, cache_salt, multimodal, prompt_embeds),
-                those keys are mixed into each sub-block hash.
             start_mm_idx: Starting multimodal feature index for
                 incremental hashing with multimodal requests.
 
@@ -131,18 +130,15 @@ class SubBlockHasher:
         sbs = self.sub_block_size
         hashes: list[BlockHash] = []
         extra_keys_list: list[tuple[Any, ...] | None] = []
-        use_extra = request is not None and need_extra_keys(request)
         # NOTE: We can't simply use `mm_idx=-1`,
         # because it means the last mm input in the entire prompt,
         # which is meant to be used during decode phase.
         mm_idx = start_mm_idx
         start = num_hashed_tokens
         for i in range(start, len(token_ids) - sbs + 1, sbs):
-            extra_keys: tuple[Any, ...] | None = None
-            if use_extra:
-                extra_keys, mm_idx = generate_block_hash_extra_keys(
-                    request, i, i + sbs, mm_idx
-                )
+            extra_keys, mm_idx = generate_block_hash_extra_keys(
+                request, i, i + sbs, mm_idx
+            )
             parent_hash = hash_block_tokens(
                 self.hash_fn,
                 parent_hash,
@@ -311,6 +307,9 @@ class RBLNKVCacheManager(KVCacheManager):
             return False
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
+            # The shift kernel overwrites the prefix with the latest window.
+            if isinstance(spec, RBLNSlidingWindowSpec):
+                return False
             if not isinstance(spec, _SUB_BLOCK_ELIGIBLE_SPECS):
                 return False
             bs = spec.block_size
@@ -661,9 +660,9 @@ class RBLNKVCacheManager(KVCacheManager):
 
         new_hashes, new_extra_keys, new_mm_idx = self.sub_block_hasher.hash_tokens(
             request.all_token_ids,
+            request,
             parent_hash=parent_hash,
             num_hashed_tokens=num_hashed_tokens,
-            request=request,
             start_mm_idx=state.mm_idx,
         )
         if new_hashes:

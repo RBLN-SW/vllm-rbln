@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 import vllm_rbln.v1.worker.dynamic_kv_sizer as dks
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
@@ -68,16 +69,16 @@ def _program(placements, name="0/0", runtime=None, device=None, extent=4):
     )
 
 
-def _kv_cache_tensors_for(programs):
-    """One KVCacheTensor per KV input the grouping will charge; the sizer checks
-    the two counts agree."""
-    try:
-        groups = dks.select_kv_input_groups(list(programs))
-    except RuntimeError:
-        return []
+def _kv_cache_tensors(num_caches: int, stride: int = 1024):
+    """One KVCacheTensor listing the caches vllm allocated, as its builder
+    produces them; the sizer counts their extents against the compiled
+    programs. One layer per extent, so the count is the layer count."""
     return [
-        SimpleNamespace(shared_by=[f"layer.{i}"])
-        for i, _ in enumerate(s for g, _ in groups for s in g)
+        SimpleNamespace(
+            layers=[f"layer.{i}" for i in range(num_caches)],
+            layer_stride=stride,
+            offset=0,
+        )
     ]
 
 
@@ -93,6 +94,100 @@ def _bind_sizing(sizer) -> None:
     ):
         method = getattr(DynamicKvSizer, name)
         setattr(sizer, name, lambda *a, _m=method, **kw: _m(sizer, *a, **kw))
+
+
+def _full_spec(block_size=16384):
+    return FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+    )
+
+
+def _sliding_spec(block_size=16384, sliding_window=128):
+    return SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+    )
+
+
+def _group(spec):
+    return SimpleNamespace(kv_cache_spec=spec)
+
+
+class TestInt16BlockIdCap:
+    def test_full_attention_alone_caps_at_the_int16_max(self):
+        cfg = SimpleNamespace(kv_cache_groups=[_group(_full_spec())])
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384]) == (32767, 0, 1)
+
+    def test_the_group_with_the_most_kernel_blocks_per_block_decides(self):
+        cfg = SimpleNamespace(
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())]
+        )
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 128]) == (
+            255,
+            1,
+            128,
+        )
+
+    def test_a_sliding_window_kept_at_the_manager_block_is_not_split(self):
+        cfg = SimpleNamespace(
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())]
+        )
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, [16384, 16384]) == (
+            32767,
+            0,
+            1,
+        )
+
+    def test_no_attention_group_means_no_cap(self):
+        cfg = SimpleNamespace(kv_cache_groups=[])
+        assert dks.max_num_blocks_for_int16_block_ids(cfg, []) is None
+
+
+class TestCheckBlockIdsFitInt16:
+    @staticmethod
+    def _sizer(num_blocks, *, mode, shrunk=False, override=None):
+        return SimpleNamespace(
+            mode=mode,
+            cache_config=SimpleNamespace(num_gpu_blocks_override=override),
+            compiled_with_shrunk_cache=shrunk,
+            model_runner=SimpleNamespace(
+                kv_cache_config=SimpleNamespace(
+                    num_blocks=num_blocks,
+                    kv_cache_groups=[_group(_sliding_spec()), _group(_full_spec())],
+                ),
+                _kernel_block_sizes=[128, 16384],
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "mode",
+        [dks.DynamicKvMode.PINNED, dks.DynamicKvMode.DISABLED, dks.DynamicKvMode.INERT],
+    )
+    def test_an_override_past_the_cap_is_refused_with_the_limit(self, mode):
+        sizer = self._sizer(1670, mode=mode, override=1670)
+        with pytest.raises(ValueError) as exc:
+            DynamicKvSizer.check_block_ids_fit_int16(sizer)
+        assert (
+            "holds 1670 blocks (from --num-gpu-blocks-override=1670), but the "
+            "compiled attention ops can address at most 255" in str(exc.value)
+        )
+        assert sizer.model_runner.kv_cache_config.num_blocks == 1670
+
+    def test_the_estimate_past_the_cap_is_named_as_such(self):
+        sizer = self._sizer(428, mode=dks.DynamicKvMode.DISABLED)
+        with pytest.raises(ValueError, match=r"\(from vllm's estimate\)"):
+            DynamicKvSizer.check_block_ids_fit_int16(sizer)
+
+    def test_a_count_within_the_cap_passes(self):
+        sizer = self._sizer(255, mode=dks.DynamicKvMode.PINNED, override=255)
+        DynamicKvSizer.check_block_ids_fit_int16(sizer)
+
+    def test_the_shrunk_compile_is_left_to_the_resize(self):
+        sizer = self._sizer(1670, mode=dks.DynamicKvMode.ACTIVE, shrunk=True)
+        DynamicKvSizer.check_block_ids_fit_int16(sizer)
 
 
 class TestComputeDynamicKvNumBlocks:
@@ -116,7 +211,22 @@ class TestComputeDynamicKvNumBlocks:
         ):
             yield
 
-    def _sizer(self, *, programs, snapshot, tp_size=1, gmu=1.0):
+    def _sizer(
+        self,
+        *,
+        programs,
+        snapshot,
+        num_caches=None,
+        tp_size=1,
+        gmu=1.0,
+        kv_cache_groups=(),
+        kernel_block_sizes=(),
+    ):
+        if num_caches is None:
+            # Every program binds the same caches unless a test says otherwise.
+            num_caches = sum(
+                spec.physical_placement is not None for spec in programs[0].input_specs
+            )
         sizer = SimpleNamespace(
             rank=0,
             device=torch.device("cpu"),
@@ -130,8 +240,10 @@ class TestComputeDynamicKvNumBlocks:
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(
                     num_blocks=self.HINT,
-                    kv_cache_tensors=_kv_cache_tensors_for(programs),
-                )
+                    kv_cache_tensors=_kv_cache_tensors(num_caches),
+                    kv_cache_groups=list(kv_cache_groups),
+                ),
+                _kernel_block_sizes=list(kernel_block_sizes),
             ),
             programs=list(programs),
             memory_snapshot=lambda device: (snapshot, "stub"),
@@ -194,6 +306,40 @@ class TestComputeDynamicKvNumBlocks:
         assert full == 35 * 1024
         assert half == full // 2
 
+    def test_the_sliding_window_kernel_block_ids_cap_the_count(self, caplog):
+        programs = [_program([HEAD_SPLIT])]
+        groups = [_group(_full_spec()), _group(_sliding_spec())]
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=self._snapshot([0] * 4),
+            kv_cache_groups=groups,
+            kernel_block_sizes=[16384, 128],
+        )
+        with caplog.at_level("WARNING", logger=dks.logger.name):
+            n = DynamicKvSizer.compute_num_blocks(sizer)
+        # 35 * 1024 blocks fit the memory; 255 * 128 is the last id in int16.
+        assert n == 255
+        assert (
+            "capping 35840 blocks to 255: KV cache group 1 maps each block to 128 "
+            "kernel block ids" in caplog.text
+        )
+
+    def test_a_count_under_the_int16_cap_is_left_alone(self):
+        programs = [_program([HEAD_SPLIT])]
+        snapshot = self._snapshot([0] * 4)
+        uncapped = DynamicKvSizer.compute_num_blocks(
+            self._sizer(programs=programs, snapshot=snapshot, gmu=0.005)
+        )
+        sizer = self._sizer(
+            programs=programs,
+            snapshot=snapshot,
+            gmu=0.005,
+            kv_cache_groups=[_group(_full_spec()), _group(_sliding_spec())],
+            kernel_block_sizes=[16384, 128],
+        )
+        assert uncapped < 255
+        assert DynamicKvSizer.compute_num_blocks(sizer) == uncapped
+
     def test_the_snapshot_is_taken_on_the_program_s_device(self):
         seen = []
         programs = [_program([HEAD_SPLIT], device=torch.device("cpu", 3))]
@@ -245,11 +391,7 @@ class TestComputeDynamicKvNumBlocks:
         sizer = self._sizer(
             programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
         )
-        # Two programs, two groups, but vllm allocated two tensors, not four.
-        sizer.model_runner.kv_cache_config.kv_cache_tensors = [
-            SimpleNamespace(shared_by=["layer.0"]),
-            SimpleNamespace(shared_by=["layer.1"]),
-        ]
+        # Two programs, two groups, but vllm allocated two caches, not four.
         with caplog.at_level("INFO"):
             n = DynamicKvSizer.compute_num_blocks(sizer)
         assert "summed over 2 KV input(s) from 2 set(s)" in caplog.text
@@ -266,7 +408,7 @@ class TestComputeDynamicKvNumBlocks:
         with caplog.at_level("INFO"):
             DynamicKvSizer.compute_num_blocks(sizer)
         assert "summed over 2 KV input(s) from 1 set(s)" in caplog.text
-        assert "vllm allocated 2 KV cache tensor(s) for 2 layer(s)" in caplog.text
+        assert "vllm allocated 1 KV cache tensor(s) over 2 cache(s)" in caplog.text
 
     def test_a_count_that_matches_neither_reading_is_refused(self):
         programs = [
@@ -276,11 +418,7 @@ class TestComputeDynamicKvNumBlocks:
         sizer = self._sizer(
             programs=programs, snapshot=self._snapshot([30 * self.GIB] * 4)
         )
-        sizer.model_runner.kv_cache_config.kv_cache_tensors = [
-            SimpleNamespace(shared_by=["layer.0"]),
-            SimpleNamespace(shared_by=["layer.1"]),
-            SimpleNamespace(shared_by=["layer.2"]),
-        ]
+        sizer.model_runner.kv_cache_config.kv_cache_tensors = _kv_cache_tensors(3)
         with pytest.raises(RuntimeError, match="neither sum to nor"):
             DynamicKvSizer.compute_num_blocks(sizer)
 
@@ -518,8 +656,22 @@ class TestMaybeShrinkKvCacheForCompile:
         return SimpleNamespace(
             num_blocks=blocks,
             kv_cache_tensors=[
-                SimpleNamespace(size=blocks * cls.PAGE_SIZE, shared_by=["layer.0"]),
-                SimpleNamespace(size=blocks * cls.PAGE_SIZE, shared_by=["layer.1"]),
+                # Layer-compact placement: two single-layer groups overlaying
+                # the pool from byte 0. Rescaling moves everything but the page.
+                SimpleNamespace(
+                    size=blocks * cls.PAGE_SIZE,
+                    layers=["layer.0"],
+                    layer_stride=blocks * cls.PAGE_SIZE,
+                    block_stride=cls.PAGE_SIZE,
+                    offset=0,
+                ),
+                SimpleNamespace(
+                    size=blocks * cls.PAGE_SIZE,
+                    layers=["layer.1"],
+                    layer_stride=blocks * cls.PAGE_SIZE,
+                    block_stride=cls.PAGE_SIZE,
+                    offset=0,
+                ),
             ],
         )
 
@@ -656,7 +808,12 @@ class TestOnlyTheShrunkModeReplacesTheEstimate:
     def test_the_one_request_floor_is_only_for_the_shrunk_estimate(self, monkeypatch):
         """The floor exists because the shrink makes the estimate a placeholder.
         Every other mode serves this estimate, so raising it resizes the pool."""
-        spec = SimpleNamespace(max_memory_usage_bytes=lambda cfg: 4000)
+        spec = SimpleNamespace()
+        monkeypatch.setattr(dks, "get_kv_cache_groups", lambda cfg, spec: ["g"])
+        monkeypatch.setattr(
+            dks, "_max_memory_usage_bytes_from_groups", lambda cfg, groups: 8000
+        )
+        monkeypatch.setattr(dks, "_pool_bytes_per_block", lambda groups: 100)
         monkeypatch.setattr(dks, "estimate_available_memory", lambda **kw: 999)
 
         def sizer(mode):
@@ -677,7 +834,7 @@ class TestOnlyTheShrunkModeReplacesTheEstimate:
             active = DynamicKvSizer.pre_compile_estimate(
                 sizer(dks.DynamicKvMode.ACTIVE), {}
             )
-            assert active == 8000
+            assert active == 8100
             for mode in (dks.DynamicKvMode.PINNED, dks.DynamicKvMode.INERT):
                 assert DynamicKvSizer.pre_compile_estimate(sizer(mode), {}) == 999
 
@@ -714,7 +871,7 @@ class TestDynamicKvFailuresRaise:
             kv_blocks_before_shrink=211 if shrunk else None,
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(
-                    num_blocks=211, kv_cache_tensors=_kv_cache_tensors_for(programs)
+                    num_blocks=211, kv_cache_tensors=_kv_cache_tensors(2)
                 )
             ),
             programs=list(programs),
@@ -946,7 +1103,7 @@ class TestReleaseKvCacheTensors:
         )
         old_cfg = SimpleNamespace(
             num_blocks=4,
-            kv_cache_tensors=[SimpleNamespace(shared_by=["l0"], size=8)],
+            kv_cache_tensors=[SimpleNamespace(layers=["l0"], size=8)],
         )
         monkeypatch.setattr(dks, "empty_rbln_device_caches", lambda: False)
 
