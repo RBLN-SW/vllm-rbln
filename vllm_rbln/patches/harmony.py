@@ -13,28 +13,33 @@
 # limitations under the License.
 """Skip the tokens the Harmony parser rejects instead of failing the request.
 
-Backport of vllm-project/vllm#59254 (issue vllm-project/vllm#50690). A request
-that turns the stop tokens off -- ``ignore_eos`` -- keeps sampling after
-``<|return|>`` or ``<|call|>``, and the next token is not the ``<|start|>`` the
-parser expects. ``process_chunk`` let that ``HarmonyError`` escape, so a
-streaming chat completion on gpt-oss answered HTTP 500 and lost the whole
-response. Upstream now drops the offending token and carries on: the segments
-already parsed keep their content and reasoning, and ``usage`` still counts
-every generated token.
+Backport of vllm-project/vllm#59254 (issue vllm-project/vllm#50690). With
+``ignore_eos`` a request keeps sampling after ``<|return|>`` or ``<|call|>``,
+and the next token is not the ``<|start|>`` the parser expects.
+``process_chunk`` let that ``HarmonyError`` escape, and the chat completion
+answered HTTP 500. The body is upstream's, unchanged from v0.26.0 through
+v0.30.0, plus upstream's ``try``/``except`` around ``process``. It is kept
+identical so that this module is deleted, not merged.
 
-The body is upstream's, unchanged from v0.26.0 through v0.30.0, plus the
-``try``/``except`` around ``process``.
+Like every registry patch, it applies on the vllm model path only.
 
-TODO(vllm>=0.31.0): delete -- vllm-project/vllm#59254 merged to main after
-v0.30.0, so the first release that carries it removes the need.
+TODO(vllm>=0.31.0): delete this module, its test and the assert below.
 """
 
 from collections.abc import Sequence
+from importlib.metadata import version
 
 from openai_harmony import HarmonyError
+from packaging.version import Version
 from vllm.parser.harmony import ChunkResult, HarmonyParser, Segment
 
 from vllm_rbln.patches import register_patch
+
+assert Version(version("vllm")) < Version("0.31.0"), (
+    "vllm-project/vllm#59254 merged after v0.30.0. Once this vllm carries it, "
+    "delete vllm_rbln/patches/harmony.py, its import in "
+    "vllm_rbln/patches/__init__.py and tests/vllm/patches/test_harmony.py."
+)
 
 
 @register_patch(

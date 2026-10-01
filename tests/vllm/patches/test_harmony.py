@@ -46,7 +46,7 @@ def _deltas(result: ChunkResult) -> str:
 
 @pytest.fixture
 def harmony_parser() -> HarmonyParser:
-    # Only flush()'s recovery path reads the tokenizer, and nothing here flushes.
+    # Only flush()'s recovery path reads the tokenizer; no test here reaches it.
     return HarmonyParser(tokenizer=None)
 
 
@@ -88,3 +88,13 @@ def test_sampling_past_the_stop_token_keeps_what_was_parsed(
     assert _deltas(with_tail) == deltas
     assert len(with_tail.segments) == len(parsed)
     assert with_tail.reasoning_token_count == alone.reasoning_token_count
+
+
+def test_the_stream_ends_cleanly_after_the_skipped_tokens(harmony_parser):
+    # The end of a streamed response: flush() closes the parser without taking
+    # its raw-output recovery, so the skipped tail does not come back as text.
+    harmony_parser.process_chunk(_encode(_ANSWER + "\n\nand more text"))
+
+    flushed = harmony_parser.flush()
+
+    assert all(not segment.delta for segment in flushed)
