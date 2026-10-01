@@ -266,11 +266,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # when this rank first closes a chunk of it, dropped when the send is
         # over -- see _StreamedSend.
         self._streamed: dict[ReqId, _StreamedSend] = {}
-        # Requests a failed WRITE was seen for, drained under the sending
-        # lock. A set rather than a `_StreamedSend` field because the paths
-        # that see one do not all hold that lock -- a registration or
-        # handshake failure is reported from the thread that ran it.
-        self._send_failures: set[ReqId] = set()
 
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
@@ -290,8 +285,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # Replaces the plain queue upstream made, so its own drain is the only
         # one and nothing can reach it unstripped.
         self._pending_completion_notifs = _CoverageNotifQueue(self)
-
-        self._empty_receives: set[ReqId] = set()
 
     def start_load_kv(self, metadata: "NixlConnectorMetadata") -> None:
         """Hand this step's work to the writer, once the KV it names is settled.
@@ -315,28 +308,22 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         self._valid_tokens.update(metadata.valid_tokens)
         self._seal_at_handover(metadata)
         super().start_load_kv(metadata)
-        self._settle_empty_receives(metadata)
+        self._drop_empty_receives(metadata)
 
-    def _settle_empty_receives(self, metadata: "NixlConnectorMetadata") -> None:
-        """Finish a receive that has nothing to receive, on the step it arrives.
+    def _drop_empty_receives(self, metadata: "NixlConnectorMetadata") -> None:
+        """Forget a receive of no blocks: it is a request that was never ours.
 
-        NOTE(RBLN): the serving layer can turn a request away before it was
-        ever scheduled, and upstream registers a receive of no blocks for it so
-        the producer stops holding what it pinned. Nothing is ever written into
-        no blocks, so the completion notification that would settle the request
-        never comes: it sits in the receive metadata for the life of the
-        engine, and the one place that drops an entry is the report this
-        request never reaches.
-
-        Settled here rather than through upstream's transfer table, though an
-        empty entry there would pop as done: everything upstream does with a
-        completed receive reads the blocks it landed in, starting with the
-        engine they came from. A request turned away never handshook with a
-        producer, so that lookup finds nothing and takes the engine down.
+        The serving layer can turn a request away before it was ever scheduled,
+        and upstream registers a receive of no blocks for it. A scheduled one
+        cannot look like this -- the live registration sits behind upstream's
+        `num_external_tokens <= 0` return -- so this is only ever a request the
+        engine has already deleted. Reporting it would trip the scheduler's
+        `assert req_id in self.requests`, and nothing waits for the report: no
+        registration ever reached the producer, whose lease is what frees it.
         """
         for req_id, meta in metadata.reqs_to_recv.items():
             if not sum(len(group) for group in meta.local_block_ids):
-                self._empty_receives.add(req_id)
+                self._recving_metadata.pop(req_id, None)
 
     def _seal_at_handover(self, metadata: "RblnNixlConnectorMetadata") -> None:
         """Mark the handover, which is the last list the writer will see.
@@ -354,10 +341,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         see have landed, and this step's batch is not one of them.
         """
         with self._sending_transfers_lock:
-            # A request whose blocks are going back cannot also be handing
-            # them over, and the writer's guard is only complete while that
-            # holds: a handover for a request the engine has already forgotten
-            # carries no serial, and the guard lets an unstamped list through.
+            # Disjoint scheduler outcomes -- a preemption or a non-terminal
+            # finish on one side, the terminal one on the other -- and the
+            # writer's guard is only complete while they stay so: a handover
+            # for a request the engine has already forgotten carries no
+            # serial, and the guard lets an unstamped list through.
             assert not (
                 metadata.push_early_flush & metadata.push_finished_blocks.keys()
             ), sorted(metadata.push_early_flush & metadata.push_finished_blocks.keys())
@@ -384,9 +372,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         being written, silently -- the transfer reports no error. The event
         recorded here is what `release_early_offers` waits on before releasing.
 
-        Called from `wait_for_save` rather than `get_finished` so the host copy
+        Called from `wait_for_save` rather than the completion hook so the copy
         for the step is already done: speculative decoding on the last stage
-        defers `wait_for_save` past `get_finished`, which would reverse them.
+        defers `wait_for_save` past `get_transfer_results`, reversing them.
         """
         if not self._shape.streams_prefix:
             return
@@ -522,7 +510,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 )
                 break
             time.sleep(_EARLY_FLUSH_POLL_INTERVAL_S)
-        self.nixl_wrapper.release_xfer_handle(handle)
+        self._try_release_xfer_handle(req_id, handle)
 
     def shutdown(self) -> None:
         # A refusal in the base leaves upstream's `__init__` unrun, and the lock
@@ -530,10 +518,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         if getattr(self, "_sending_transfers_lock", None) is None:
             return
         with self._sending_transfers_lock:
-            for send in self._streamed.values():
+            for req_id, send in self._streamed.items():
                 for handles in send.transfers:
                     for handle in handles:
-                        self.nixl_wrapper.release_xfer_handle(handle)
+                        self._try_release_xfer_handle(req_id, handle)
             self._streamed.clear()
             self._valid_tokens.clear()
         super().shutdown()
@@ -624,6 +612,10 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         it already sent. Adding those up reaches the count with a hole still in
         the middle and settles a request whose KV is incomplete -- silently.
         """
+        # Nothing to cover. Answered ahead of the sweep, which reads a first
+        # range above zero as a gap and returns before any trailing check.
+        if total == 0:
+            return True
         reach = 0
         for lo, hi in sorted(spans):
             if lo > reach:
@@ -631,7 +623,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
             reach = max(reach, hi)
             if reach >= total:
                 return True
-        return total == 0
+        return False
 
     def _do_start_push_kv(
         self,
@@ -686,41 +678,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 return reg_data
         return None
 
-    def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
-        """Record a failed WRITE as a failed send, not as a failed receive.
-
-        NOTE(RBLN): upstream's handler is written for the read direction --
-        it invalidates the blocks the transfer was filling and queues the
-        request as a failed receive. The write path runs the same completion
-        check over its outbound handles, where neither holds: the blocks are
-        this producer's own, and upstream's `get_finished` asserts that every
-        request it reports as received carries receive metadata, which one we
-        were sending never does. So the queued failure kills the engine a step
-        later, on the assertion rather than on the failure.
-
-        The blocks stay held until the lease expires, which is already how a
-        push that never completes is unwound.
-        """
-        if req_id not in self._recving_metadata:
-            # A batch with no handle left in flight is counted done whatever
-            # state it came back in, so a failed one reads as sent. Only a
-            # send this side seals is covered.
-            # TODO(vllm-project/vllm#56104): delete once that lands and is
-            # released.
-            if req_id in self._streamed:
-                self._send_failures.add(req_id)
-            if handle is not None:
-                self.nixl_wrapper.release_xfer_handle(handle)
-            self.xfer_stats.record_failed_transfer()
-            return
-        super()._handle_failed_transfer(req_id, handle)
-
-    def get_finished(self) -> tuple[set[str], set[str]]:
-        done_sending, done_recving = super().get_finished()
-        while self._empty_receives:
-            req_id = self._empty_receives.pop()
-            self._recving_metadata.pop(req_id, None)
-            done_recving.add(req_id)
+    def get_transfer_results(self) -> "KVConnectorTransferResults":
+        results = super().get_transfer_results()
+        # Bound, not copied: what this method adds has to reach the object
+        # upstream handed back.
+        done_sending, done_recving = results.finished_sending, results.finished_recving
         # Both completion and failure land here, and a retried request must not
         # inherit a partial count.
         for req_id in done_recving:
@@ -743,8 +705,7 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # in a single transfer is reported here and nowhere else.
         for req_id in done_sending:
             self._valid_tokens.pop(req_id, None)
-            self._send_failures.discard(req_id)
-        return done_sending, done_recving
+        return results
 
     def _finish_sealed_requests(self) -> set[ReqId]:
         """Report a request written early once every batch of it has landed.
@@ -764,7 +725,14 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 still_going = []
                 for handles in send.transfers:
                     probe = {req_id: handles}
-                    if self._pop_done_transfers(probe):
+                    # vllm 0.30 splits the poll into (done, failed) and counts
+                    # a batch with nothing left in flight as done whatever
+                    # state it came back in, so the failed set is the only
+                    # thing that tells a lost write from a landed one. It is
+                    # kept on the record, which outlives this call.
+                    done, failed = self._pop_done_transfers(probe)
+                    send.failed = send.failed or req_id in failed
+                    if done:
                         send.done += 1
                     else:
                         still_going.append(probe[req_id])
@@ -775,9 +743,8 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                     continue
                 if send.done < send.issued:
                     continue
-                # A send that lost a write keeps its lease instead -- see
-                # `_handle_failed_transfer`.
-                if not send.failed and req_id not in self._send_failures:
+                # A send that lost a write keeps its lease instead.
+                if not send.failed:
                     finished.add(req_id)
                 self._forget_send(req_id)
 
@@ -791,7 +758,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         """Drop what this side tracked for a request it is done pushing."""
         self._streamed.pop(req_id, None)
         self._valid_tokens.pop(req_id, None)
-        self._send_failures.discard(req_id)
 
     def _xfer_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         """Write this request's blocks, one transfer per paired peer rank.
@@ -1209,8 +1175,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 )
                 # Outbound only: there is no local metadata to invalidate, so
                 # release this peer's handle and let the remaining peers go.
+                # Through upstream's helper, which absorbs a release that
+                # throws -- raising here would skip the accounting below and
+                # lose the handles this batch did issue.
                 if handle is not None:
-                    self.nixl_wrapper.release_xfer_handle(handle)
+                    self._try_release_xfer_handle(req_id, handle)
                 self.xfer_stats.record_failed_transfer()
 
         with self._sending_transfers_lock:

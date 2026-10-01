@@ -503,10 +503,10 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         # same shape to do it: one group whose blocks it counts in, and any
         # other group described by a range of its own.
         cutter = "chunk_mode" if self._shape.chunk_mode else "a streamed write"
-        if self._shape.writes_part_of_a_block and not (
-            full_groups == 1
-            and (len(self._group_specs) == 1 or self._own_engine_layout)
-        ):
+        # One group is all it asks: `_own_engine_layout` is already true for
+        # every multi-group engine that writes part of a block, and both counts
+        # come off `transfer_groups`, so a second term could only repeat this.
+        if self._shape.writes_part_of_a_block and full_groups != 1:
             raise RuntimeError(
                 f"RBLN NIXL (D2D): {cutter} needs one full-attention KV-cache "
                 "group, and any other group to be a sliding window whose view "

@@ -43,7 +43,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker imp
     RblnNixlWorkerBase,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
-    RblnNixlConnectorMetadata,
     transfer_shape,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
@@ -661,7 +660,9 @@ class TestEarlyOfferOnTheWritePath:
         # Only the side that produces KV has anything to offer.
         sched = self._push_scheduler()
         req = _Request("decode", num_prompt_tokens=256)
-        req.kv_transfer_params = {"do_remote_prefill": False}
+        # The key the gate reads. Set to the other one it passes because the
+        # gate's own is absent, which a real consumer's params never are.
+        req.kv_transfer_params = {"do_remote_decode": False}
 
         sched.update_state_after_alloc(req, MagicMock(), 0)
 
@@ -808,8 +809,12 @@ def _sw_spec(*, block_size, sliding_window):
     return spec
 
 
-def _kv_config(specs):
-    return MagicMock(kv_cache_groups=[MagicMock(kv_cache_spec=spec) for spec in specs])
+def _kv_config(specs, non_transfer_specs=()):
+    # The two views are the same list unless a group opts out, which is the
+    # only shape that tells a reader of the wrong one apart.
+    groups = [MagicMock(kv_cache_spec=spec) for spec in specs]
+    opted_out = [MagicMock(kv_cache_spec=spec) for spec in non_transfer_specs]
+    return MagicMock(kv_cache_groups=groups + opted_out, transfer_groups=groups)
 
 
 class TestEarlyPushGate:
@@ -833,7 +838,7 @@ class TestEarlyPushGate:
     ):
         def stub_init(self, cfg, _engine_id, kv_cache_config):
             self._shape = transfer_shape(
-                cfg, kv_cache_config.kv_cache_groups, writes_into_peer=True
+                cfg, kv_cache_config.transfer_groups, writes_into_peer=True
             )
 
         monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
@@ -854,7 +859,7 @@ class TestEarlyPushGate:
         # connector cuts on the context axis are both this shape.
         def stub_init(self, cfg, _engine_id, kv_cache_config):
             self._shape = transfer_shape(
-                cfg, kv_cache_config.kv_cache_groups, writes_into_peer=True
+                cfg, kv_cache_config.transfer_groups, writes_into_peer=True
             )
 
         monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
@@ -864,13 +869,35 @@ class TestEarlyPushGate:
 
         assert sched._shape.streams_prefix is True
 
+    def test_a_group_that_does_not_transfer_does_not_reach_the_shape(self, monkeypatch):
+        # The scheduler runs the same reduction the worker runs so the two
+        # cannot answer differently, and the worker's side is pinned. Reading
+        # every cache group here makes this side call the engine a hybrid on
+        # the strength of a window no descriptor addresses.
+        def stub_init(self, cfg, _engine_id, kv_cache_config):
+            pass
+
+        monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
+        config = mock_vllm_config(push_stream=True)
+
+        sched = RblnNixlPushConnectorScheduler(
+            config,
+            "eng",
+            _kv_config(
+                [MagicMock()],
+                non_transfer_specs=[_sw_spec(block_size=1024, sliding_window=128)],
+            ),
+        )
+
+        assert sched._shape.has_swa is False
+
     def test_a_hybrid_streams_where_its_window_can_be_viewed(self, monkeypatch):
         # The offer carries the full-attention group and the handover carries
         # the window's block; telling them apart on the wire needs the one
         # descriptor list that names two groups, which the view builds.
         def stub_init(self, cfg, _engine_id, kv_cache_config):
             self._shape = transfer_shape(
-                cfg, kv_cache_config.kv_cache_groups, writes_into_peer=True
+                cfg, kv_cache_config.transfer_groups, writes_into_peer=True
             )
 
         monkeypatch.setattr(NixlPushConnectorScheduler, "__init__", stub_init)
@@ -894,10 +921,13 @@ class TestEarlyPushGate:
         specs = [_sw_spec(block_size=1024, sliding_window=128)] if hybrid else []
 
         def stub_init(self, cfg, _engine_id, kv_cache_config):
-            # Both bases run the same reduction over the same arguments; stub
-            # them at the same depth so nothing but that is left to differ.
+            # Both bases run the same reduction over the same arguments, and
+            # each passes its own ClassVar into it -- which is the one input
+            # the two sides declare separately and so the one that can part.
             self._shape = transfer_shape(
-                cfg, kv_cache_config.kv_cache_groups, writes_into_peer=True
+                cfg,
+                kv_cache_config.transfer_groups,
+                writes_into_peer=self._writes_into_peer,
             )
             self._group_specs = specs
 

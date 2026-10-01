@@ -324,11 +324,12 @@ def transfer_shape(
     *,
     writes_into_peer: bool,
 ) -> TransferShape:
-    """Settle everything the knobs and the groups decide, and nothing else.
+    """Settle what the knobs, the groups and the direction together decide.
 
     Runs before upstream's `__init__` on the worker and beside it on the
-    scheduler, because none of its inputs is an attribute either of them sets.
-    That is what lets one function answer for both sides.
+    scheduler, because none of its inputs is an attribute either of them sets:
+    the direction comes in as an argument, off each side's own ClassVar. That
+    is what lets one function answer for both sides.
     """
     specs = [g.kv_cache_spec for g in kv_cache_groups]
     has_swa = any(isinstance(spec, SlidingWindowSpec) for spec in specs)
@@ -347,9 +348,9 @@ def transfer_shape(
     # (`owns_engine_lists`). Groups that are neither have no list to stream in.
     if streams_prefix and len(specs) > 1 and not has_swa:
         streams_prefix = False
-    window_ratio = None
-    if has_swa and wants_window:
-        window_ratio = sliding_window_ratio(specs)
+    # No `has_swa` term: the ratio is read off the sliding-window specs alone,
+    # so an engine without one answers None whether or not it is asked.
+    window_ratio = sliding_window_ratio(specs) if wants_window else None
 
     # A sliding-window group holds one block whatever the prompt length, so
     # summing the groups -- or taking the first -- describes no request. Being

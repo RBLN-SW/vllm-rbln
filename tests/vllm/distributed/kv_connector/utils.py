@@ -754,11 +754,13 @@ def patched_in_package(name: str, value: Any = None) -> Any:
 
 
 def shape(**over) -> TransferShape:
-    """A `TransferShape` with the fields a test means and the rest switched off.
+    """A `TransferShape` with the fields a test means, and `_couple`'s answer
+    for the ones they carry.
 
     Hand-built workers skip `__init__`, so they have to be handed the shape the
     reduction would have produced. Naming only the fields under test keeps a
-    case from asserting a value it never meant to pin.
+    case from asserting a value it never meant to pin; everything the named
+    ones do not reach is off.
     """
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
         TransferShape,
@@ -776,22 +778,34 @@ def shape(**over) -> TransferShape:
         use_host_buffer=False,
         writes_into_peer=False,
     )
-    # A ratio without a window is a shape the reduction cannot produce, and
-    # neither is a sliding window that is the engine's only group -- the one
-    # place a chunk range is sized in would then be the window's own.
+    _couple(fields, over)
+    return TransferShape(**fields)
+
+
+def _couple(fields: dict, over: dict) -> None:
+    """Carry a field's companions with it, so a case cannot ask for a shape
+    the reduction has no way to return. A ratio without a window is one, and so
+    is a sliding window that is the engine's only group -- the one place a
+    chunk range is sized in would then be the window's own. A prefix does not
+    stream unless the knob asked for it, this side writes into the peer and
+    the buffer is the device's: the reduction reads all three. A counted group
+    is an index into the groups, so it bounds how many there are, and the side
+    that writes into the peer is the worker's class, not a case's choice.
+    """
     if over.get("window_ratio") is not None:
         fields["has_swa"] = True
         fields["groups"] = 2
+        fields["wants_window"] = True
     if over.get("has_swa") and "groups" not in over:
         fields["groups"] = 2
-    # And a prefix does not stream unless the knob asked for it and this side
-    # writes into the peer: the reduction reads `wants_stream and
-    # writes_into_peer and not use_host_buffer`, so the three travel together.
+    counted = over.get("counted_group")
+    if counted:
+        fields["groups"] = max(fields["groups"], over.get("groups", counted + 1))
     if over.get("streams_prefix"):
         fields["wants_stream"] = True
         fields["writes_into_peer"] = True
+        fields["use_host_buffer"] = False
     fields.update(over)
-    return TransferShape(**fields)
 
 
 def set_shape(worker, **over) -> None:
@@ -804,9 +818,16 @@ def set_shape(worker, **over) -> None:
     """
     import dataclasses
 
-    worker._shape = dataclasses.replace(
-        getattr(worker, "_shape", None) or shape(), **over
+    current = getattr(worker, "_shape", None) or shape(
+        writes_into_peer=type(worker)._writes_into_peer
     )
+    fields = dataclasses.asdict(current)
+    over.setdefault("writes_into_peer", type(worker)._writes_into_peer)
+    # Through the same couplings `shape` applies: a change made here reaches
+    # the same object, so a route round them is a route to the same impossible
+    # shape.
+    _couple(fields, over)
+    worker._shape = dataclasses.replace(current, **fields)
 
 
 def sliding_window_spec(*, block_size, sliding_window):
@@ -830,6 +851,7 @@ def window_mode(worker: Any, ratio: int | None, *, runs: int = 1, **over) -> Non
 
     Extra keywords go to `shape`, for a case that means more than a window.
     """
+    over.setdefault("writes_into_peer", type(worker)._writes_into_peer)
     worker._shape = shape(window_ratio=ratio, **over)
     if ratio is None:
         worker._swa_kernel_blocks = set()
@@ -841,7 +863,13 @@ def window_mode(worker: Any, ratio: int | None, *, runs: int = 1, **over) -> Non
         if block_size is None
         else {block_size // ratio if runs == 1 else block_size}
     )
-    worker._window_grid_cut = (runs, ratio)
+    # Derived where the rule can answer, not restated: a helper spelling the
+    # answer out keeps agreeing with a rule that has moved. The other geometry
+    # is the one `_window_grid` reaches through `_block_runs`, which a
+    # hand-built worker has no bands for.
+    worker._window_grid_cut = (
+        worker._window_grid() if runs == 1 and block_size is not None else (runs, ratio)
+    )
 
 
 def build_worker(

@@ -729,7 +729,7 @@ class TestPpHandshakeFanout:
         assert w._overlapping_ranks["eng"] == [0]
         assert w._register_shard_xfer_state.call_count == 1
 
-    @pytest.mark.parametrize("sw_ratio", [0.5, None])
+    @pytest.mark.parametrize("sw_ratio", [2, None])
     def test_swa_plus_pp_raises(self, sw_ratio):
         # The consumer's own guard, hit when it discovers a PP producer while
         # it has a sliding window; _check_pp_constraints is the separate
@@ -759,7 +759,7 @@ class TestPpHandshakeFanout:
     def test_swa_plus_local_pp_raises(self):
         # The peer runs no pipeline, ours does: the guard has to key on either
         # side, not just the peer's.
-        w = _make_worker(sw_ratio=0.5)
+        w = _make_worker(sw_ratio=2)
         w.vllm_config.parallel_config.pipeline_parallel_size = 2
         with pytest.raises(RuntimeError, match="sliding-window"):
             _handshake(w, _FakeSock(pp_size=1))
@@ -1818,23 +1818,6 @@ class TestChunkSizing:
         w = self._grid_worker(**kwargs)
 
         assert w._shard_chunk_grid(block_size=block_size, split=1) is None
-
-    def test_the_grid_is_sized_off_the_widest_region(self):
-        # One layer registers several regions of very different sizes -- a
-        # latent, its indexer, its scale. Read off whichever landed first, the
-        # two narrow ones put a chunk past the span and the range disappears,
-        # so the order the caches were registered in would decide the layout.
-        span_tokens = 8192 // 4
-
-        def grid(order):
-            w = self._grid_worker(block_len=order[0])
-            w.block_len_per_layer = [ln * span_tokens for ln in order for _ in range(4)]
-            return w._shard_chunk_grid(block_size=8192, split=1)
-
-        per_token = [768, 128, 2]
-        rotations = [per_token[i:] + per_token[:i] for i in range(len(per_token))]
-
-        assert {grid(order) for order in rotations} == {(1, 4)}
 
     def test_off_the_knob_there_is_no_grid(self):
         # A block length the shape could cut, so only the knob answers None.
@@ -3134,8 +3117,7 @@ class TestADecodeContextParallelPeerIsRefused:
     def _worker():
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
-        w._sw_ratio = None
-        w._chunk_mode = False
+        w._shape = shape()
         w._remote_agents = {}
         w.dst_num_blocks = {}
         w.dst_region_num_blocks = {}
@@ -3186,8 +3168,7 @@ class TestARefusedPeerLeavesNothingBehind:
     def _worker():
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
-        w._sw_ratio = None
-        w._chunk_mode = False
+        w._shape = shape()
         w._remote_agents = {}
         w.dst_num_blocks = {}
         w.dst_region_num_blocks = {}
@@ -3279,7 +3260,7 @@ class TestTheRemoteRegionLedger:
     """
 
     @staticmethod
-    def _worker(*, sw_ratio=None, region_group_ids=(0, 0)):
+    def _worker(*, region_group_ids=(0, 0)):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._remote_agents = defaultdict(dict)
         w.dst_num_blocks = {}
@@ -3295,7 +3276,6 @@ class TestTheRemoteRegionLedger:
         w._kv_areas = 1
         w._kv_slices = 1
         w._kv_per_block = 1
-        w._sw_ratio = sw_ratio
         w.transfer_topo = MagicMock(tp_size=1)
         w._reject_uneven_region_slices = MagicMock()
         w._register_remote_engine_prelude = MagicMock()

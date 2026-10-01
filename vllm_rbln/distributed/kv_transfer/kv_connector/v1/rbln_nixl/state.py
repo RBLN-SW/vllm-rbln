@@ -158,8 +158,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         connector is handed repeats it -- a pool hands over its full-attention
         layer, and that view is the same shape either way. So read the runner's
         own binding, which keeps every layer. Over the transfer view, because
-        `_sw_ratio` is derived from it and a refusal sourced from a group that
-        addresses no descriptor would refuse a pairing nothing transfers.
+        the window ratio is derived from it and a refusal sourced from a group
+        that addresses no descriptor would refuse a pairing nothing transfers.
 
         A set, because a speculative draft brings its own groups and they need
         not agree; only a window range needs them to.

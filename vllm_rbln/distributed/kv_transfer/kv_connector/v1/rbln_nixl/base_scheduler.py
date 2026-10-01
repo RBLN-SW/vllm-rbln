@@ -54,7 +54,7 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
 
         self._shape = transfer_shape(
             vllm_config,
-            kv_cache_config.kv_cache_groups,
+            kv_cache_config.transfer_groups,
             writes_into_peer=self._writes_into_peer,
         )
         # NOTE(RBLN): the platform reports device_type "cpu" when device tensors

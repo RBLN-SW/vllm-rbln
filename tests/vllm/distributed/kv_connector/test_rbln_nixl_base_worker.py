@@ -226,7 +226,7 @@ class TestSwaWindowRatio:
             specs=[_full_attention_spec(block_size=64)],
             non_transfer_specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._has_swa is False
+        assert worker._shape.has_swa is False
 
     def test_chunk_mode_leaves_the_window_knob_alone(self, monkeypatch):
         # The two knobs name different ranges, and a hybrid owns its
@@ -908,11 +908,13 @@ class TestWindowModeNeedsAWindowThatMoves:
 
         assert worker._shape.window_ratio is None
 
-    def test_host_staging_asks_for_no_range_on_the_streaming_knob(self, monkeypatch):
-        # Streaming is refused host staging, so the knob that turns it on asks
-        # for no window range there -- the scheduler's `push_stream_enabled`
-        # answers the same, and a worker that disagreed would refuse a spec
-        # for a feature that is off.
+    def test_host_staging_does_not_refuse_the_reader_the_streaming_knob(
+        self, monkeypatch
+    ):
+        # The two sides are given the same config, and host staging refuses
+        # every knob that needs the direct path's lists. `push_stream` is the
+        # one the reader never acts on, so refusing it there would turn an
+        # engine away over a feature already inert in its own shape.
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="cpu",
@@ -920,7 +922,7 @@ class TestWindowModeNeedsAWindowThatMoves:
             push_stream=True,
         )
 
-        assert worker._shape.window_ratio is None
+        assert worker._shape.streams_prefix is False
 
     def test_a_window_that_moves_is_not(self, monkeypatch):
         # The control: the same geometry under the spec whose window slides.

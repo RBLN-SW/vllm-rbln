@@ -65,7 +65,7 @@ class RblnNixlWorkerBase(
         # scheduler run the same reduction and reach the same answer.
         self._shape = transfer_shape(
             vllm_config,
-            kv_cache_config.kv_cache_groups,
+            kv_cache_config.transfer_groups,
             writes_into_peer=self._writes_into_peer,
         )
 

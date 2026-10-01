@@ -428,6 +428,13 @@ class TestTheWindowsOwnGranules:
         # 64 tokens end a granule, so the last 32 are exactly the second one.
         assert self._ids(64, [3]) == [11]
 
+    def test_one_token_fewer_reaches_back_into_the_earlier_granule(self):
+        # 63 tokens put the window over 31..62, and token 31 is the last of the
+        # first granule -- so it is named, barely. `oldest` is what decides it,
+        # and no other count here moves when that expression gains or loses a
+        # token: the straddle cases all sit far enough from the boundary.
+        assert self._ids(63, [2, 3]) == [10, 11]
+
     def test_a_window_across_a_granule_boundary_names_both(self):
         # 48 tokens put the window over tokens 16..47, which is the back of the
         # first granule and the front of the second -- both inside the last
