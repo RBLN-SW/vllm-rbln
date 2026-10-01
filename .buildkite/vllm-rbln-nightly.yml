@@ -14,6 +14,20 @@ _secrets: &secrets
   HF_TOKEN: FSW_HF_TOKEN
   HF_HOME: FSW_HF_HOME
 
+_dshm: &dshm
+  - kubernetes:
+      podSpecPatch:
+        containers:
+          - name: container-0
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 4Gi
+
 _sync: &sync "echo '--- :package: uv sync' && uv sync --locked --python 3.12 --extra test --extra dev --extra runtime"
 
 _perf: &perf
@@ -35,6 +49,7 @@ steps:
         product: "RBLN-CR13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
+    plugins: *dshm
     timeout_in_minutes: 60
     command:
       - *sync
@@ -50,6 +65,7 @@ steps:
         product: "RBLN-CR13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
+    plugins: *dshm
     env:
       VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
       VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
@@ -72,6 +88,7 @@ steps:
         product: "RBLN-CR13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
+    plugins: *dshm
     timeout_in_minutes: 180
     artifact_paths:
       - "perf-results/**/*"
@@ -88,6 +105,7 @@ steps:
         product: "RBLN-CR13"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets: *secrets
+    plugins: *dshm
     timeout_in_minutes: 120
     artifact_paths:
       - "lm-eval-results/**/*"

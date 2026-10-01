@@ -93,11 +93,21 @@ def make_kv_cache_config(
             head_size=runner.model_config.get_head_size(),
             dtype=runner.kv_cache_dtype,
         )
-    tensor_size = spec.page_size_bytes * num_blocks
+    # Layer-compact layout, as upstream's builder produces it: groups overlay
+    # from byte 0 and the backing allocation is sized by the widest one, so
+    # every tensor reports the same total size.
+    page = spec.page_size_bytes
+    layer_stride = page * num_blocks
+    size = max(len(layer_names) for layer_names in groups) * layer_stride
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[
-            KVCacheTensor(size=tensor_size, shared_by=list(layer_names))
+            KVCacheTensor(
+                size=size,
+                layers=list(layer_names),
+                layer_stride=layer_stride,
+                block_stride=page,
+            )
             for layer_names in groups
         ],
         kv_cache_groups=[

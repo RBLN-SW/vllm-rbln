@@ -53,8 +53,7 @@ def scheduler():
 
 
 @pytest.fixture
-def limited_4blocks_scheduler(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_NPU_NUM_BLOCKS", "4")
+def limited_4blocks_scheduler():
     scheduler = create_scheduler(
         max_num_seqs=MAX_NUM_SEQ,
         max_num_batched_tokens=MAX_MODEL_LEN,
@@ -68,8 +67,7 @@ def limited_4blocks_scheduler(monkeypatch):
 
 
 @pytest.fixture
-def limited_6blocks_scheduler(monkeypatch):
-    monkeypatch.setenv("VLLM_RBLN_NPU_NUM_BLOCKS", "6")
+def limited_6blocks_scheduler():
     scheduler = create_scheduler(
         max_num_seqs=3,
         max_num_batched_tokens=MAX_MODEL_LEN,

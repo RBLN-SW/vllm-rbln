@@ -216,6 +216,8 @@ class RBLNScheduler(Scheduler):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        # Whether any scheduled request has a synchronous connector KV load.
+        has_sync_kv_loads = False
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -795,6 +797,9 @@ class RBLNScheduler(Scheduler):
                     continue
 
                 self.running.append(request)
+                if num_external_computed_tokens > 0:
+                    # load_kv_async is False here
+                    has_sync_kv_loads = True
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -986,6 +991,7 @@ class RBLNScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            has_sync_kv_loads=has_sync_kv_loads,
         )
 
         # Drain pending copy ops from the KV cache manager.
@@ -1024,12 +1030,12 @@ class RBLNScheduler(Scheduler):
         return scheduler_output
 
     def _preempt_request(
-        self, request: Request, timestamp: float
-    ) -> dict[str, Any] | None:
+        self, request: Request, timestamp: float, drop_stale_output: bool = False
+    ) -> None:
         # Preempted requests resume with full block tables, so pending deltas
         # from the previous running state are stale.
         self._pending_runner_block_deltas.pop(request.request_id, None)
-        return super()._preempt_request(request, timestamp)
+        super()._preempt_request(request, timestamp, drop_stale_output)
 
     def _make_cached_request_data(
         self,

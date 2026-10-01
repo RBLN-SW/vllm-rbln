@@ -28,7 +28,16 @@ import torch
 import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.core.kv_cache_utils import (
+    _max_memory_usage_bytes_from_groups,
+    _pool_bytes_per_block,
+    get_kv_cache_groups,
+)
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+)
 
 from vllm_rbln.compilation.backends import set_compile_stage
 from vllm_rbln.logger import init_logger
@@ -50,6 +59,7 @@ from vllm_rbln.v1.worker.utils import (
     compile_and_warmup_skip_reason,
     dynamic_kv_unsupported_reason,
     estimate_available_memory,
+    kv_cache_extents,
     rescale_kv_cache_config,
 )
 
@@ -108,6 +118,9 @@ COMPILE_KV_CACHE_NUM_BLOCKS = 4
 DYNAMIC_KV_ALLOCATOR_RESERVE_BYTES = 48 * 1024 * 1024
 # Per chiplet, for the copy command streams sub-block prefix caching uploads.
 DYNAMIC_KV_COPY_STREAM_RESERVE_BYTES = 64 * 1024 * 1024
+# The compiled attention ops take kernel block ids as int16.
+# TODO(rebel-compiler): drop once they take int32 block ids.
+MAX_KERNEL_BLOCK_ID = torch.iinfo(torch.int16).max
 
 
 def kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
@@ -116,6 +129,26 @@ def kv_cache_config_at(cfg: KVCacheConfig, num_blocks: int) -> KVCacheConfig:
     scaled.kv_cache_tensors = copy.deepcopy(cfg.kv_cache_tensors)
     rescale_kv_cache_config(scaled, num_blocks)
     return scaled
+
+
+def max_num_blocks_for_int16_block_ids(
+    kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+) -> tuple[int, int, int] | None:
+    """The largest pool whose kernel block ids stay within int16, the KV cache
+    group that sets it and that group's kernel blocks per block; None when no
+    attention group is bound."""
+    tightest = None
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        if not isinstance(spec, AttentionSpec) or group_id >= len(kernel_block_sizes):
+            continue
+        blocks_per_kv_block = spec.block_size // kernel_block_sizes[group_id]
+        cap = MAX_KERNEL_BLOCK_ID // blocks_per_kv_block
+        if tightest is None or cap < tightest[0]:
+            tightest = (cap, group_id, blocks_per_kv_block)
+    return tightest
 
 
 def empty_rbln_device_caches() -> bool:
@@ -206,6 +239,33 @@ class DynamicKvSizer:
             len(programs),
         )
 
+    def check_block_ids_fit_int16(self) -> None:
+        """Refuse a pool the resize will not cap once its kernel block ids
+        overflow int16; the count is the user's or vllm's, not changed here."""
+        if self.compiled_with_shrunk_cache:
+            return
+        kv_cache_config = self.model_runner.kv_cache_config
+        int16_cap = max_num_blocks_for_int16_block_ids(
+            kv_cache_config, self.model_runner._kernel_block_sizes
+        )
+        if int16_cap is None or kv_cache_config.num_blocks <= int16_cap[0]:
+            return
+        cap, group_id, blocks_per_kv_block = int16_cap
+        override = self.cache_config.num_gpu_blocks_override
+        source = (
+            f"--num-gpu-blocks-override={override}"
+            if override is not None
+            else "vllm's estimate"
+        )
+        raise ValueError(
+            f"The KV cache holds {kv_cache_config.num_blocks} blocks (from {source}), "
+            f"but the compiled attention ops can address at most {cap}: KV cache "
+            f"group {group_id} maps each block to {blocks_per_kv_block} kernel block "
+            f"ids, which must stay within int16 (max {MAX_KERNEL_BLOCK_ID}). Set "
+            f"--num-gpu-blocks-override to {cap} or less, or leave it unset with the "
+            "dynamic KV cache on so the pool is sized under this limit."
+        )
+
     def pre_compile_estimate(self, estimate_kwargs: dict[str, Any]) -> int:
         """The bytes vllm sizes the compile-time cache from: the estimate fed
         the per-chiplet snapshot on a real device, floored at one request when
@@ -228,15 +288,16 @@ class DynamicKvSizer:
             )
 
         estimate = estimate_available_memory(**estimate_kwargs)
-        one_request = sum(
-            spec.max_memory_usage_bytes(self.vllm_config)
-            for spec in self.model_runner.get_kv_cache_spec().values()
+        if self.mode is not DynamicKvMode.ACTIVE:
+            return estimate
+        groups = get_kv_cache_groups(
+            self.vllm_config, dict(self.model_runner.get_kv_cache_spec())
         )
-        if self.mode is DynamicKvMode.ACTIVE and estimate < one_request:
-            # vllm refuses a pool below one request against this estimate; the
-            # real count is sized from the device after warm-up. Only under the
-            # shrink: every other mode serves this estimate, so raising it here
-            # would change the pool instead of reporting on it.
+        # Mirrors vllm's capacity check, which holds back the null block.
+        one_request = _max_memory_usage_bytes_from_groups(self.vllm_config, groups)
+        if groups:
+            one_request += _pool_bytes_per_block(groups)
+        if estimate < one_request:
             logger.warning(
                 "[Dynamic KV] the pre-compile estimate (%.2f GiB) is short of one "
                 "max-length request (%.2f GiB); raising it to that so the compile "
@@ -428,15 +489,19 @@ class DynamicKvSizer:
                 hint_blocks,
                 format_placements(group_specs),
             )
-        tensors = self.model_runner.kv_cache_config.kv_cache_tensors
-        specs = self._specs_covering_tensors(groups, len(tensors))
+        cfg = self.model_runner.kv_cache_config
+        tensors = cfg.kv_cache_tensors
+        # A KV input is one allocated cache, and the layers on one extent share
+        # it, so the count is the extents rather than the layer total.
+        num_caches = len(set(kv_cache_extents(cfg).values()))
+        specs = self._specs_covering_tensors(groups, num_caches)
         logger.info(
             "[Dynamic KV] the slope is summed over %d KV input(s) from %d set(s); "
-            "vllm allocated %d KV cache tensor(s) for %d layer(s).",
+            "vllm allocated %d KV cache tensor(s) over %d cache(s).",
             len(specs),
             len(groups),
             len(tensors),
-            sum(len(t.shared_by) for t in tensors),
+            num_caches,
         )
         growth = kv_growth(specs, hint_blocks)
         program = groups[0][1]
@@ -445,30 +510,30 @@ class DynamicKvSizer:
 
     @staticmethod
     def _specs_covering_tensors(
-        groups: list[tuple[list[Any], Any]], num_tensors: int
+        groups: list[tuple[list[Any], Any]], num_caches: int
     ) -> list[Any]:
-        """The KV inputs the slope is summed over: every KV tensor once.
+        """The KV inputs the slope is summed over: every cache once.
 
         A group is one program's KV input set. Two programs binding the same
-        tensors (prefill and decode) form two groups, because dynamo names the
+        caches (prefill and decode) form two groups, because dynamo names the
         symbols and the arg positions differently; summing both would charge
-        every tensor twice. `InputSpec` carries no tensor identity, so the count
-        vllm allocated is what says which case this is.
+        every cache twice. `InputSpec` carries no identity, so the number of
+        caches vllm allocated is what says which case this is.
         """
         flat = [spec for group_specs, _ in groups for spec in group_specs]
-        if len(flat) == num_tensors:
+        if len(flat) == num_caches:
             # Disjoint sets (a target's and a drafter's): the sum is the answer.
             return flat
         sizes = {len(group_specs) for group_specs, _ in groups}
-        if sizes == {num_tensors}:
-            # Every group already covers every tensor, so one of them is it.
+        if sizes == {num_caches}:
+            # Every group already covers every cache, so one of them is it.
             return list(groups[0][0])
         raise RuntimeError(
             f"the compiled programs carry {len(flat)} KV input(s) across "
             f"{len(groups)} set(s) of {sorted(sizes)}, which neither sum to nor "
-            f"individually match the {num_tensors} KV cache tensor(s) vllm "
-            "allocated. The placement cannot be attributed to tensors, so the "
-            "block count would be wrong."
+            f"individually match the {num_caches} cache(s) vllm allocated. The "
+            "placement cannot be attributed to them, so the block count would "
+            "be wrong."
         )
 
     def _size_kv_from_snapshot(
@@ -512,6 +577,22 @@ class DynamicKvSizer:
             gmu,
             format_fits(fits),
         )
+        int16_cap = max_num_blocks_for_int16_block_ids(
+            self.model_runner.kv_cache_config, self.model_runner._kernel_block_sizes
+        )
+        if int16_cap is not None and num_blocks > int16_cap[0]:
+            cap, group_id, blocks_per_kv_block = int16_cap
+            logger.warning(
+                "[Dynamic KV] capping %d blocks to %d: KV cache group %d maps each "
+                "block to %d kernel block ids, which must stay within int16 "
+                "(max %d).",
+                num_blocks,
+                cap,
+                group_id,
+                blocks_per_kv_block,
+                MAX_KERNEL_BLOCK_ID,
+            )
+            num_blocks = cap
         if num_blocks <= 0:
             raise RuntimeError(
                 "[Dynamic KV] no KV block fits: on some chiplet the non-KV base "
@@ -675,7 +756,7 @@ class DynamicKvSizer:
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
         for layer_name in dict.fromkeys(
-            name for t in old_cfg.kv_cache_tensors for name in t.shared_by
+            name for t in old_cfg.kv_cache_tensors for name in t.layers
         ):
             layer = forward_context.get(layer_name)
             if layer is None:
@@ -693,7 +774,7 @@ class DynamicKvSizer:
         gc.collect()
 
         released = empty_rbln_device_caches()
-        logical_bytes = sum(t.size for t in old_cfg.kv_cache_tensors)
+        logical_bytes = max((t.size for t in old_cfg.kv_cache_tensors), default=0)
         logger.info(
             "[Dynamic KV] released the outgoing %d-block KV cache: "
             "outgoing_kv_logical_bytes=%d unbound_layers=%d kv_device_types=%s "

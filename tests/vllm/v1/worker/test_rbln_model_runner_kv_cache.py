@@ -56,12 +56,15 @@ class TestReshapeKVCacheTensors:
         assert caches["layer.0"].is_contiguous()
         assert infos["layer.0"].permute_order == identity
 
-        # The K/V split outermost instead of blocks.
+        # The K/V split outermost instead of blocks. vllm 0.30.0 dropped the
+        # base declaration, so only the RBLN backends that want an order define
+        # one; raising=False stands this backend up as one of them.
         order = (1, 0) + identity[2:]
         monkeypatch.setattr(
             runner.attn_groups[0][0].backend,
             "get_kv_cache_stride_order",
             staticmethod(lambda *args, **kwargs: order),
+            raising=False,
         )
         caches, bases, infos, _ = runner._reshape_kv_cache_tensors(
             config, raw, kernel_block_sizes
@@ -149,11 +152,15 @@ class TestRegisterKvCachesWithConnector:
         self, make_model_runner, monkeypatch
     ):
         registered = self._registrations(monkeypatch)
-        # One layer per group, so both survive the canonical-layer filter that
-        # keeps aliasing SWA views out of the registration.
+        # Both layers in one group, so each has its own buffer and both survive
+        # the canonical-layer filter; one group each would alias them.
         runner = make_model_runner(
             layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
             additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
         )
 
         runner.register_kv_caches_with_connector()
@@ -210,8 +217,8 @@ class TestBuildAttentionMetadata:
         assert set(attn_metadata) == {"layer.0", "layer.1"}
         assert attn_metadata["layer.0"] is attn_metadata["layer.1"]
 
-        # Compiled path: the per-layer cache list is dropped in favour of the
-        # deduplicated view recipes.
+        # Each layer owns its allocation, so there is nothing to deduplicate
+        # and the metadata carries the per-layer caches directly.
         metadata = attn_metadata["layer.0"]
-        assert metadata.kv_caches is None
-        assert metadata.kv_cache_view_infos is runner.kv_cache_view_infos
+        assert metadata.kv_caches is runner.kv_caches
+        assert metadata.kv_cache_view_infos is None

@@ -51,6 +51,21 @@ def test_defaults_when_nothing_is_passed(parser):
     assert _resolve(OptimumRBLNConfig, args.additional_config) == OptimumRBLNConfig()
 
 
+@pytest.mark.parametrize(
+    "model", ["Qwen/Qwen2-VL-7B-Instruct", "Qwen/Qwen2.5-VL-7B-Instruct"]
+)
+def test_multimodal_normalization_stays_in_the_processor(model):
+    config = AsyncEngineArgs(
+        model=model, model_impl="optimum", max_model_len=4096, block_size=4096
+    ).create_engine_config()
+
+    mm_config = config.model_config.multimodal_config
+    assert mm_config.mm_device_do_normalize is False
+    processor_kwargs = mm_config.merge_mm_processor_kwargs({})
+    assert processor_kwargs.get("do_normalize") is not False
+    assert processor_kwargs.get("do_rescale") is not False
+
+
 def test_an_optimum_field_reaches_the_config(parser):
     args = parser.parse_args(["--rbln-sub-block-size", "256"])
     config = _resolve(OptimumRBLNConfig, args.additional_config)

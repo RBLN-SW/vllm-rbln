@@ -47,9 +47,6 @@ class RBLNUnpackedwNa16LinearKernel(MPLinearKernel):
                 False,
                 f"Group quantization is not supported; got group_size={c.group_size}.",
             )
-        if c.has_g_idx:
-            return False, "Group/dynamic activation ordering is not supported."
-
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -80,7 +77,7 @@ class RBLNUnpackedwNa16LinearKernel(MPLinearKernel):
     ) -> torch.Tensor:
         in_features, out_features = self.config.full_weight_shape
 
-        w_q, w_s, _, _ = self._get_weight_params(layer)
+        w_q, w_s, _ = self._get_weight_params(layer)
         if self.config.group_size > 0:
             w_q = w_q.view(out_features, in_features // 64, 64)  # see transform_w_s
             w_fp = w_q.type(x.dtype) * w_s.unsqueeze(-1)

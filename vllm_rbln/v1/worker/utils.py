@@ -477,11 +477,36 @@ def dynamic_kv_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
+def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
+    """Each layer's `(start, length)` in the backing allocation.
+
+    Cache groups alias each other since vllm 0.29.0 (#51718), so layers that
+    land on one extent are one cache. Distinct extents never partly overlap:
+    that would need an allocation the layers index into, and a graph input
+    cannot carry a storage offset.
+    """
+    extents: dict[str, tuple[int, int]] = {}
+    for kv_tensor in cfg.kv_cache_tensors:
+        for position, layer_name in enumerate(kv_tensor.layers):
+            start = kv_tensor.offset + position * kv_tensor.layer_stride
+            extents[layer_name] = (start, kv_tensor.layer_stride)
+    bounds = sorted({(start, start + n) for start, n in extents.values()})
+    for (_, end), (start, _) in zip(bounds, bounds[1:]):
+        if end > start:
+            raise ValueError(
+                f"KV cache extents {bounds} overlap partially; the layout "
+                "cannot be realized as whole tensors"
+            )
+    return extents
+
+
 def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
     """Retarget `cfg` at `num_blocks`, in place.
 
-    `KVCacheTensor.size` is `num_blocks * page_size_bytes` and consumers read it
-    rather than recomputing, so it has to move with `num_blocks`.
+    The allocation reads `layer_stride` off `KVCacheTensor` rather than
+    recomputing it, so it has to move with `num_blocks`. `size` and `offset`
+    scale with it to keep the config self-consistent for anything else reading
+    the placement; `block_stride` is one page and does not scale.
     """
     old_num_blocks = cfg.num_blocks
     if old_num_blocks <= 0:
@@ -489,6 +514,8 @@ def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
     cfg.num_blocks = num_blocks
     for kv_tensor in cfg.kv_cache_tensors:
         kv_tensor.size = (kv_tensor.size * num_blocks) // old_num_blocks
+        kv_tensor.layer_stride = (kv_tensor.layer_stride * num_blocks) // old_num_blocks
+        kv_tensor.offset = (kv_tensor.offset * num_blocks) // old_num_blocks
 
 
 def chiplet_replication_factor(num_key_value_heads: int, rsd_size: int) -> float:

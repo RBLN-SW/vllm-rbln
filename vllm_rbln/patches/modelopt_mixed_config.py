@@ -14,10 +14,10 @@
 
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
+    LINEAR_METHOD_BUILDERS,
     ModelOptMixedPrecisionConfig,
 )
 
@@ -44,9 +44,6 @@ class RBLNModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
                 return RBLNModelOptNvFp4FusedMoE(
                     self.w4a16_nvfp4_config, layer.moe_config
                 )
-        elif isinstance(layer, LinearBase) and not self.is_layer_excluded(prefix):
-            if self._resolve_quant_algo(prefix) == "FP8":
-                return RBLNModelOptFp8LinearMethod(self.fp8_config)
         return super().get_quant_method(layer, prefix)
 
 
@@ -59,3 +56,19 @@ class RBLNModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
 )
 def register_rbln_modelopt_mixed_config() -> None:
     register_quantization_config("modelopt_mixed")(RBLNModelOptMixedPrecisionConfig)
+
+
+@add_registration(
+    reason=(
+        "Upstream's generic ModelOptLinearMethod requantises a fused layer's "
+        "halves to one max scale, which is lossy and needs an eager fp8 quant "
+        "this platform cannot run at load time. LINEAR_METHOD_BUILDERS is "
+        "upstream's hook for an algo whose create/process/apply lifecycle "
+        "differs; it is read by build_linear_method, which both the plain FP8 "
+        "config and the mixed-precision config dispatch through."
+    )
+)
+def register_rbln_modelopt_fp8_linear_method() -> None:
+    LINEAR_METHOD_BUILDERS["FP8"] = lambda config, prefix: (
+        RBLNModelOptFp8LinearMethod(config)
+    )

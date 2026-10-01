@@ -389,6 +389,7 @@ def make_request(
     lora_request: LoRARequest | None = None,
     prompt_logprobs: int | None = None,
     mm_features: Any = None,
+    prompt_embeds: torch.Tensor | None = None,
 ) -> Request:
     _ensure_none_hash()
     return Request(
@@ -401,6 +402,7 @@ def make_request(
         pooling_params=None,
         cache_salt=cache_salt,
         lora_request=lora_request,
+        prompt_embeds=prompt_embeds,
         block_hasher=get_request_block_hasher(block_size, sha256),
     )
 

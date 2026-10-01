@@ -119,15 +119,26 @@ class TestStorageKey:
 
 
 class TestBuildKvCacheBaseBindings:
-    def test_shared_storage_is_deduplicated(self):
-        # Two layers backed by views of one tensor -> a single base, both view
-        # infos pointing at index 0.
-        shared = torch.zeros(2, 4, 8)
-        bases = {_layer(0): shared[0], _layer(1): shared[1]}
+    def test_one_cache_behind_two_layers_is_deduplicated(self):
+        # What cross-layer KV sharing produces: one layer is handed another's
+        # tensor. A single base, both view infos pointing at index 0.
+        shared = torch.zeros(4, 8)
+        bases = {_layer(0): shared, _layer(1): shared}
         infos = {_layer(0): KVCacheViewInfo(), _layer(1): KVCacheViewInfo()}
         base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
         assert len(base_tensors) == 1
         assert [vi.base_index for vi in view_infos] == [0, 0]
+
+    def test_distinct_windows_of_one_pool_each_get_a_base(self):
+        # Every layer is a slice of the one KV pool, so sharing storage no
+        # longer means sharing a cache. Collapsing these would hand both
+        # layers the first slice's bytes, since nothing sets `select_index`.
+        pool = torch.zeros(2, 4, 8)
+        bases = {_layer(0): pool[0], _layer(1): pool[1]}
+        infos = {_layer(0): KVCacheViewInfo(), _layer(1): KVCacheViewInfo()}
+        base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
+        assert len(base_tensors) == 2
+        assert [vi.base_index for vi in view_infos] == [0, 1]
 
     def test_distinct_storage_gets_incrementing_indices(self):
         # Independent buffers each become their own base, indexed in order.
@@ -165,11 +176,11 @@ class TestBuildKvCacheBaseBindings:
         assert materialize_kv_cache_view([base], view_infos[0]).shape == (4, 8)
 
     def test_mixed_shared_and_distinct_storage(self):
-        # Two layers aliasing one base plus an independent third: guards the
+        # Two layers on one cache plus an independent third: guards the
         # dedup <-> index interaction the pure cases cannot.
-        shared = torch.zeros(2, 4, 8)
+        shared = torch.zeros(4, 8)
         other = torch.zeros(4, 8)
-        bases = {_layer(0): shared[0], _layer(1): shared[1], _layer(2): other}
+        bases = {_layer(0): shared, _layer(1): shared, _layer(2): other}
         infos = {name: KVCacheViewInfo() for name in bases}
         base_tensors, view_infos = build_kv_cache_base_bindings(bases, infos)
         assert len(base_tensors) == 2
