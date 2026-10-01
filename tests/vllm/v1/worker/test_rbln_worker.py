@@ -859,6 +859,8 @@ class TestInitializeFromConfig:
         worker.model_runner = SimpleNamespace(
             initialize_kv_cache=lambda cfg: init_calls.append(cfg),
             register_kv_caches_with_connector=lambda: None,
+            kv_cache_config=SimpleNamespace(num_blocks=0, kv_cache_groups=[]),
+            _kernel_block_sizes=[],
         )
         _attach_sizer(worker)
         worker.initialize_from_config(kv_cfg)
@@ -1287,6 +1289,7 @@ class TestKvRegistrationOrder:
             ),
             dynamic_kv=SimpleNamespace(
                 shrink_for_compile=lambda cfg: cfg,
+                check_block_ids_fit_int16=lambda: None,
                 apply_num_blocks=lambda n: calls.append("resize"),
                 defers_kv_registration=defers,
             ),
