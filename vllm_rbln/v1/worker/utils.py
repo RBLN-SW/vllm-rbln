@@ -38,7 +38,9 @@ from vllm.utils.cpu_resource_utils import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
+    KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -504,6 +506,27 @@ def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
                 "cannot be realized as whole tensors"
             )
     return extents
+
+
+def canonical_kv_layers(
+    cfg: KVCacheConfig, layer_specs: Mapping[str, KVCacheSpec]
+) -> set[str]:
+    """Pick one layer to stand for each KV cache buffer.
+
+    Layers on one extent (`kv_cache_extents`) alias one buffer. Prefer a
+    full-attention layer: its view counts blocks the way the scheduler does,
+    and a sliding-window view does not.
+    """
+    pools: defaultdict[tuple[int, int], list[str]] = defaultdict(list)
+    for layer_name, extent in kv_cache_extents(cfg).items():
+        pools[extent].append(layer_name)
+    return {
+        next(
+            (ln for ln in layers if isinstance(layer_specs.get(ln), FullAttentionSpec)),
+            layers[0],
+        )
+        for layers in pools.values()
+    }
 
 
 def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:
