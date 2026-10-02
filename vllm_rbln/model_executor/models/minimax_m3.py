@@ -12,30 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MiniMax-M3 (text backbone) for RBLN.
-
-Vendored from upstream ``vllm.models.minimax_m3`` (vLLM 0.24), which cannot
-run here: it binds FlashInfer Gemma norms, the fused CUDA
-``fused_minimax_m3_qknorm_rope_kv_insert`` and the SM100/Triton block-sparse
-attends at import. This copy keeps the module tree and weight names (so the
-NVFP4 checkpoint and the ModelOpt mixed-precision config resolve unchanged)
-and replaces the compute with RBLN-friendly code:
-
-* hidden states stay 3-D ``[B, L, H]`` end-to-end (RBLN convention);
-* Gemma RMSNorm and the per-head QK norms are plain torch;
-* the dense layers use the generic ``Attention`` (RBLN flash backend);
-* the sparse layers run the MSA lightning indexer and the block-sparse GQA
-  attention through ``rbln_custom_ops.sparse_attn_minimax_m3_indexer`` /
-  ``sparse_attn_minimax_m3_msa``, each reading its paged cache from the
-  attention metadata (a graph input) like the DSA path does;
-* MoE goes through the RBLN ``MoERunner`` (router callback) with the
-  routed-scaling factor and the shared expert applied here.
-
-The MTP head is not modeled; its weights are skipped. The vision tower is
-upstream's module tree, run through its own compiled graph (see
-``RBLNMiniMaxM3SparseForConditionalGeneration``).
-"""
-
 import importlib.util
 import math
 import sys
@@ -61,6 +37,7 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
@@ -123,27 +100,7 @@ from vllm_rbln.v1.worker.utils import (
 logger = init_logger(__name__)
 
 
-def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
-    """Layer ids whose attention runs the extra sparse "index" branch."""
-    cfg = getattr(config, "sparse_attention_config", None)
-    if not cfg:
-        return set()
-    freq = cfg.get("sparse_attention_freq")
-    if freq is None:
-        return set()
-    return {i for i, f in enumerate(freq) if f != 0}
-
-
-def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
-    moe_layer_freq = getattr(config, "moe_layer_freq", None)
-    if moe_layer_freq is None:
-        return True
-    return moe_layer_freq[layer_id] != 0
-
-
 def _layer_index_of(prefix: str) -> int:
-    """Pipeline-adjusted index of this layer's cache in the runner's compacted
-    KV cache list (``num_attn_module`` slots per decoder layer)."""
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
     num_attn_module = rbln_num_attn_module(
@@ -154,55 +111,12 @@ def _layer_index_of(prefix: str) -> int:
     )
 
 
-class RBLNGemmaRMSNorm(nn.Module):
-    """Gemma-style RMSNorm: ``x * rsqrt(mean(x^2) + eps) * (1 + w)``, in fp32.
-
-    With ``residual`` the pre-norm residual add is fused and the updated
-    ``(x, residual)`` pair is returned, like vLLM's RMSNorm.
-    """
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        xf = x.to(torch.float32)
-        variance = xf.pow(2).mean(dim=-1, keepdim=True)
-        xf = xf * torch.rsqrt(variance + self.variance_epsilon)
-        xf = xf * (1.0 + self.weight.to(torch.float32))
-        return xf.to(orig_dtype)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            return self._norm(x)
-        x = x + residual
-        return self._norm(x), x
-
-
 def _per_head_norm(
-    x: torch.Tensor, norm: RBLNGemmaRMSNorm, num_heads: int, head_dim: int
+    x: torch.Tensor, norm: GemmaRMSNorm, num_heads: int, head_dim: int
 ) -> torch.Tensor:
-    """Apply a head-dim norm to ``[B, L, num_heads * head_dim]``."""
     shape = x.shape
     x = x.view(*shape[:-1], num_heads, head_dim)
     return norm(x).view(shape)
-
-
-def _swiglu_oai(
-    x: torch.Tensor, alpha: float, beta: float, limit: float
-) -> torch.Tensor:
-    """``gate.clamp(max=limit) * sigmoid(alpha * gate) * (up.clamp(+-limit) + beta)``
-    over a ``[..., 2 * I]`` (gate | up) tensor."""
-    gate, up = x.chunk(2, dim=-1)
-    gate = gate.clamp(max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    return gate * torch.sigmoid(gate * alpha) * (up + beta)
 
 
 class RBLNMiniMaxM3MLP(nn.Module):
@@ -243,18 +157,16 @@ class RBLNMiniMaxM3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = _swiglu_oai(gate_up, self.swiglu_alpha, self.swiglu_beta, self.swiglu_limit)
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        x = gate * torch.sigmoid(gate * self.swiglu_alpha) * (up + self.swiglu_beta)
         x, _ = self.down_proj(x)
         return x
 
 
 class RBLNMiniMaxM3MoE(nn.Module):
-    """Sigmoid-routed MoE with a routing-bias correction and a shared expert.
-
-    The RBLN ``MoERunner`` takes the router as a callable (routing runs after
-    the DP multicast) and does not apply ``routed_scaling_factor`` nor the
-    shared expert, so both are applied here, as the DeepSeek-V2 RBLN patch does.
-    """
+    """Sigmoid-routed MoE with a routing-bias correction and a shared expert."""
 
     def __init__(
         self,
@@ -315,9 +227,6 @@ class RBLNMiniMaxM3MoE(nn.Module):
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
             renormalize=True,
-            # w13 is loaded packed ([all gates; all ups]), so the uninterleaved
-            # SwiGLU-OAI variant. The RBLN packed-FP4 MoE kernel reads this
-            # name and turns on its alpha / limit clamp (+1 up bias) path.
             activation="swigluoai_uninterleave",
             swiglu_limit=config.swiglu_limit,
             swiglu_alpha=config.swiglu_alpha,
@@ -394,8 +303,8 @@ class RBLNMiniMaxM3Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.q_norm = RBLNGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RBLNGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -415,9 +324,7 @@ class RBLNMiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
-        # Dense layers carry no index-key cache, but the runner binds
-        # `num_attn_module` caches per decoder layer, so give it one to keep the
-        # compacted cache list aligned (one 128-wide vector per token).
+
         self.indexer_cache = RBLNMiniMaxM3IndexerCache(
             head_dim=config.sparse_attention_config["sparse_index_dim"],
             prefix=f"{prefix}.attn.indexer",
@@ -440,11 +347,7 @@ class RBLNMiniMaxM3Attention(nn.Module):
 
 
 class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
-    """Key-only side cache of the lightning indexer (one index key per token).
-
-    Registers itself in the static forward context so the KV-cache manager
-    allocates it, like ``DeepseekV32IndexerCache``.
-    """
+    """Key-only side cache of the lightning indexer"""
 
     def __init__(
         self,
@@ -456,10 +359,6 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         vllm_config = get_current_vllm_config()
-        # KV8 follows the main cache: an fp8 kv_cache_dtype stores the index keys as
-        # fp8 too (uint8 container, per-tensor k_scale 1.0), as
-        # DeepseekV32IndexerCache does. The indexer kernel routes to its fp8 body off
-        # the uint8 cache.
         cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
         self.fp8_dtype = _fp8_cache_dtype(cache_dtype)
         self.dtype = (
@@ -491,13 +390,7 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
 
 
 class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
-    """Block-sparse attention layer with the lightning-indexer branch.
-
-    Owns the projections (fused [q | k | v | index_q | index_k]), the per-head
-    QK norms and RoPE, the main paged K/V cache (registered here under
-    ``{prefix}.attn``) and the indexer's key cache (``{prefix}.attn.indexer``).
-    ``index_{v,o}_proj`` never exist for M3 (``sparse_disable_index_value``).
-    """
+    """Block-sparse attention layer with the lightning-indexer"""
 
     def __init__(
         self,
@@ -566,8 +459,8 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.q_norm = RBLNGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RBLNGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=config.max_position_embeddings,
@@ -576,21 +469,17 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 "partial_rotary_factor": config.partial_rotary_factor,
             },
         )
-        self.index_q_norm = RBLNGemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
-        self.index_k_norm = RBLNGemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
+        self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
+        self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
         # index_dim == head_dim for M3, so the index branch shares the RoPE.
         assert self.idx_head_dim == self.head_dim
         self.index_rotary_emb = self.rotary_emb
 
-        # Attention-backend wiring (the main paged K/V cache).
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
         )
-        # KV8: the cache is a uint8 byte container of e4m3/e5m2 values, dequantized
-        # with per-tensor scales (1.0 unless a checkpoint provides them; the M3
-        # checkpoint has no KV quantization, like MiniMax-M2.7's KV8).
         self.kv_cache_fp8_dtype = _fp8_cache_dtype(self.kv_cache_dtype)
         if (
             self.kv_cache_dtype not in ("auto", "bfloat16")
@@ -651,7 +540,6 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.head_dim,
         )
 
-        # One fused projection: [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = qkv.split(
             [
@@ -682,8 +570,6 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         kv_cache = _resolve_kv_cache(main_metadata, self.layer_index)
         index_cache = _resolve_kv_cache(index_metadata, self.indexer_cache.layer_index)
 
-        # RBLN GQA layout: query [B, H_kv, G, L, D] with head h = kv * G + g,
-        # key / value [B, H_kv, 1, L, D]; index query [B, H_idx, L, 128].
         q5 = q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
         q5 = q5.view(batch, num_kv, groups, seq_len, head_dim)
         k5 = k.view(batch, seq_len, num_kv, head_dim).transpose(1, 2)
@@ -697,8 +583,6 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
         index_k3 = index_k.contiguous()
 
-        # Token positions of the top-k (+ local) blocks, per (batch, index head,
-        # query): ascending, -1 padded; the attend consumes them like DSA's top-k.
         topk_index = torch.ops.rbln_custom_ops.sparse_attn_minimax_m3_indexer(
             index_q4,
             index_k3,
@@ -752,7 +636,9 @@ class RBLNMiniMaxM3DecoderLayer(nn.Module):
         layer_id = int(prefix.split(sep=".")[-1])
         self.layer_id = layer_id
 
-        if layer_id in _sparse_attention_layer_ids(config):
+        sparse_cfg = getattr(config, "sparse_attention_config", None)
+        sparse_freq = sparse_cfg.get("sparse_attention_freq") if sparse_cfg else None
+        if sparse_freq and sparse_freq[layer_id] != 0:
             self.self_attn = RBLNMiniMaxM3SparseAttention(
                 config=config,
                 layer_id=layer_id,
@@ -769,9 +655,8 @@ class RBLNMiniMaxM3DecoderLayer(nn.Module):
                 cache_config=cache_config,
             )
 
-        # Dense layers store the FFN under `mlp`; MoE layers under
-        # `block_sparse_moe` -- the checkpoint's naming.
-        self.is_moe_layer = _is_moe_layer(config, layer_id)
+        moe_layer_freq = getattr(config, "moe_layer_freq", None)
+        self.is_moe_layer = moe_layer_freq is None or moe_layer_freq[layer_id] != 0
         if self.is_moe_layer:
             self.block_sparse_moe = RBLNMiniMaxM3MoE(
                 config=config,
@@ -787,10 +672,8 @@ class RBLNMiniMaxM3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = RBLNGemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = RBLNGemmaRMSNorm(
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -841,7 +724,7 @@ class RBLNMiniMaxM3Model(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = RBLNGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -890,9 +773,6 @@ class RBLNMiniMaxM3Model(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # q/k/v_proj -> fused qkv_proj (plus index_q/index_k_proj on sparse
-        # layers); gate_proj/up_proj -> fused gate_up_proj. Leading dots keep
-        # `q_proj` from matching `index_q_proj`.
         stacked_params_mapping: list[tuple[str, str, int | str]] = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
@@ -1057,19 +937,6 @@ MM_ENCODER_PATCH_BUCKET = 2304
 
 
 class _RBLNVisionEncoder(nn.Module):
-    """Fixed-length forward of upstream ``MiniMaxVLVisionModel`` for one image,
-    compiled for the device.
-
-    ``forward(pixel_values [N, C*T*P*P], cos [N, D], sin [N, D],
-    key_bias [1, 1, 1, N]) -> [N / merge^2, text_hidden]`` with ``N`` the bucket:
-    rows past the image's patches are padding, masked out as keys by
-    ``key_bias`` and dropped from the output by the caller. The tower is modeled
-    in fp32, which the device runs as dlfp16: the late layers grow a few
-    massive-activation tokens that every other token attends to, and bf16 loses
-    too much there. Weights are the tower's own (the patch embed as a reshaped
-    view).
-    """
-
     def __init__(self, tower: nn.Module):
         super().__init__()
         vm = tower.vision_model
@@ -1077,12 +944,8 @@ class _RBLNVisionEncoder(nn.Module):
         self.tower = tower
         self.num_heads = attn.num_heads_per_partition
         self.head_dim = attn.head_dim
-        # Conv3d with stride == kernel over one patch == a linear.
         w = vm.embeddings.patch_embedding.weight
         self.patch_weight = w.reshape(w.shape[0], -1)
-        # rotate_half of the first rot_dim dims as a matmul, so no last-dim slice
-        # at 39 / 78: (x @ rot)[j] = -x[j + half] for j < half, x[j - half] for
-        # half <= j < rot_dim, 0 beyond.
         half = (vm.t_dim + vm.h_dim + vm.w_dim) // 2
         rot = torch.zeros(self.head_dim, self.head_dim)
         for j in range(half):
@@ -1130,20 +993,6 @@ class _RBLNVisionEncoder(nn.Module):
 class RBLNMiniMaxM3SparseForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP
 ):
-    """Top-level (VL) entry point for the MiniMax M3 checkpoint.
-
-    Builds the text backbone from ``config.text_config`` under the
-    ``language_model`` prefix (the checkpoint's naming). The vision tower
-    (ViT + projector + patch merger) is upstream's module tree, run through its
-    own compiled graph, one image at a time padded to
-    ``MM_ENCODER_PATCH_BUCKET`` patches (see ``_RBLNVisionEncoder``). The
-    runner compiles and warms it up (``compile_mm_encoder`` /
-    ``warmup_mm_encoder``) and caches its outputs; they reach the language
-    model's graph as ``mm_embeds`` / ``mm_mask`` (see ``forward``).
-    ``--limit-mm-per-prompt '{"image": 0, "video": 0}'`` skips the tower and
-    gives the text-only model.
-    """
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1173,10 +1022,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         config = vllm_config.model_config.hf_config
         self.config = config
         self.quant_config = vllm_config.quant_config
-
-        # fp32 tower (dlfp16 on the device, see ``_RBLNVisionEncoder``); only
-        # the first pipeline stage encodes.
         self.vision_tower = None
+
         mm_config = vllm_config.model_config.multimodal_config
         if get_pp_group().is_first_rank and any(
             mm_config.get_limit_per_prompt(m) > 0 for m in ("image", "video")
@@ -1191,8 +1038,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "vision_tower"),
                 )
-        # Set by ``compile_mm_encoder``; kept out of the module tree (it shares
-        # the tower's parameters).
+
         object.__setattr__(self, "_mm_encoder", None)
 
         with self._mark_language_model(vllm_config):
@@ -1216,8 +1062,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
     @property
     def logits_processor(self) -> nn.Module:
-        # The RBLN runner fuses compute_logits into the compiled graph only when
-        # the top-level model exposes its logits processor.
         return self.language_model.logits_processor
 
     def compile_mm_encoder(self, compile_fn) -> None:
@@ -1247,7 +1091,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         if pixel_values is not None:
             padded[:num_patches] = pixel_values.to(dtype)
 
-        # Upstream's _get_3d_rope_embed on host copies of the frequencies.
         t, h, w = grid_thw
         merge = tower.spatial_merge_size
 
@@ -1326,10 +1169,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         mm_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
-        # ``mm_embeds`` [B, L, H] holds the vision embeddings at image / video
-        # placeholder tokens and zeros elsewhere; ``mm_mask`` [B, L, 1] is 1 at
-        # those tokens. Every prefill graph of a multimodal model takes them, so
-        # text-only and image chunks share one graph.
         if (
             mm_embeds is not None
             and inputs_embeds is None
@@ -1337,8 +1176,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         ):
             assert mm_mask is not None
             text_embeds = self.language_model.embed_input_ids(input_ids)
-            # Tensor-first: a scalar-first binary op (``1 - mm_mask``) lowers to a
-            # wrong device tensor-const.
             inputs_embeds = torch.where(mm_mask > 0.5, mm_embeds, text_embeds)
             input_ids = None
         return self.language_model(

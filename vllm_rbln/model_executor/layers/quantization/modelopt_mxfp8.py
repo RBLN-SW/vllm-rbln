@@ -30,19 +30,7 @@ _E8M0_BIAS = 127
 
 @register_weight_loader_v2_supported_method
 class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
-    """ModelOpt MXFP8 linear for RBLN.
-
-    Upstream's MIXED_PRECISION config leaves an MXFP8 layer unquantized, which
-    would load the e4m3 bytes into a bf16 parameter and drop the block scales.
-    Here the layer loads the fp8 weight and its ``[N, K/32]`` e8m0 scale (the
-    checkpoint's ``weight_scale_inv``, renamed by the model).
-
-    W8A16: the fp8 weight stays on the device and is dequantized in the graph,
-    per 32-wide group; the compiler packs that pattern into its fp8 group-32
-    dense (rblnTensor-pack-fp8-group-dense), so the weight costs half the DRAM
-    and half the fetch. The checkpoint's scale is raw e8m0 bytes, which the
-    block-FP8 methods (float scales) do not load, hence a method of its own.
-    """
+    """ModelOpt MXFP8 linear for RBLN."""
 
     def create_weights(
         self,
@@ -92,8 +80,6 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # e8m0 -> 2^(e - 127) exactly: a bf16 whose exponent field is e and
-        # mantissa zero IS that power of two.
         weight = layer.weight.data
         device = weight.device
         scale = (layer.weight_scale.data.to("cpu").to(torch.int16) << 7).view(
@@ -108,8 +94,6 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # The group-32 dequant the compiler packs: [N, K/32, 32] fp8 times a
-        # [N, K/32, 1] scale, flattened back to [N, K].
         out_features, in_features = layer.weight.shape
         weight = (
             layer.weight.view(
