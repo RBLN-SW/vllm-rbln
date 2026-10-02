@@ -31,7 +31,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.outputs import KVConnectorOutput, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -95,6 +95,58 @@ def _make_runner_stub(**attrs):
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
+
+
+@pytest.mark.parametrize("early_store", [False, True])
+def test_sample_tokens_collects_deferred_store_in_the_same_output(
+    monkeypatch, early_store
+):
+    from vllm.distributed.kv_events import BlockStored
+    from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
+        LMCacheKVEvents,
+    )
+
+    event = BlockStored([7], None, [1, 2], 2, None, "rds", None)
+    early = LMCacheKVEvents(num_workers=1)
+    early.add_events([event] if early_store else [])
+    late = LMCacheKVEvents(num_workers=1)
+    late.add_events([event])
+    order = []
+
+    def collect_events():
+        order.append("events")
+        return late
+
+    connector = SimpleNamespace(get_kv_connector_kv_cache_events=collect_events)
+    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
+    runner = _make_runner_stub(
+        execute_model_state=ExecuteModelState(
+            SimpleNamespace(total_num_scheduled_tokens=1),
+            None,
+            None,
+            SimpleNamespace(max_seq_len=1),
+            None,
+            None,
+            None,
+        ),
+        kv_connector_output=KVConnectorOutput(kv_cache_events=early),
+        speculative_config=SimpleNamespace(use_eagle=lambda: False),
+        use_async_scheduling=False,
+        _sample=lambda *a: SamplerOutput(torch.tensor([[7]]), None),
+        _bookkeeping_sync=lambda *a: (0, None, [], {}, [], {}, []),
+        finalize_kv_connector=lambda: order.append("save"),
+        propose_draft_token_ids=lambda *a: order.append("draft"),
+        input_batch=SimpleNamespace(sampling_metadata=None),
+        num_spec_tokens=1,
+        effective_drafter_max_model_len=100,
+    )
+    output = runner.sample_tokens(None)
+
+    assert order == ["draft", "save", "events"]
+    events = output.kv_connector_output.kv_cache_events
+    assert events.get_number_of_workers() == 1
+    assert events.aggregate().get_all_events() == [event]
 
 
 def _sampling_metadata(
