@@ -57,7 +57,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
+    FusedMoEFactory,
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
@@ -307,7 +307,7 @@ class RBLNMiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self.experts = FusedMoE(
+        self.experts = FusedMoEFactory(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
