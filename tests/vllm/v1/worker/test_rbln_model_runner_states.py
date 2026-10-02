@@ -283,7 +283,7 @@ class TestSampleTokensOnDrafterOverflow:
         scheduler_output = schedule_new("a")
         runner._update_states(scheduler_output)
         runner.is_strict_kv_producer = strict_kv_producer
-        # 10 + 3 <= 64, so the input fits and the role is the only thing left.
+        # 10 + 3 <= 64, so the input fits and the role decides the outcome.
         monkeypatch.setattr(runner, "effective_drafter_max_model_len", 64)
         runner.execute_model_state = mr.ExecuteModelState(
             scheduler_output=scheduler_output,
