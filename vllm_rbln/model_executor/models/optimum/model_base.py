@@ -14,6 +14,7 @@
 import json
 import math
 import os
+import shutil
 from dataclasses import replace
 from typing import Any
 
@@ -43,6 +44,30 @@ from .base import ModelInputForRBLN
 from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
+
+# A cache entry under construction: `<cached_model_path>.export`. The exporter
+# writes here and `_publish_compiled_model` renames it into place, so a reader
+# that finds `rbln_config.json` at the cache path finds a complete artifact.
+_EXPORT_SUFFIX = ".export"
+
+
+def _remove_tree(path: str) -> None:
+    if os.path.lexists(path):
+        shutil.rmtree(path, ignore_errors=False)
+
+
+def _publish_compiled_model(staging: str, cached_model_path: str) -> None:
+    """Move the exported artifact into the cache path atomically.
+
+    A cache miss may leave a partial directory from a run that died mid-export
+    (no `rbln_config.json`, so it was not a hit); it is replaced. Both paths
+    live under the same cache root, so the rename is a metadata operation.
+    """
+    if not is_compiled_dir(staging):
+        raise RuntimeError(f"optimum-rbln export left no compiled model in {staging!r}")
+    _remove_tree(cached_model_path)
+    os.replace(staging, cached_model_path)
+    logger.info("Compiled model cached at %s", cached_model_path)
 
 
 class KVCacheCopyError(RuntimeError):
@@ -264,13 +289,24 @@ class RBLNOptimumModelBase(nn.Module):
                     if text_config is hf_config
                     else {"text_config": layer_override}
                 )
+            # Export into a staging directory beside the cache entry and publish
+            # it with one rename. optimum's default is a TemporaryDirectory under
+            # $TMPDIR that `save_pretrained` then copies into the cache: the
+            # artifact exists twice on disk while serving starts (tens of GB for
+            # a 30B model, on whatever filesystem holds /tmp), and the copy is
+            # never removed when the server is stopped by a signal. Writing it
+            # once, on the cache's own filesystem, removes both.
+            staging = f"{cached_model_path}{_EXPORT_SUFFIX}"
+            _remove_tree(staging)
+            os.makedirs(os.path.dirname(cached_model_path) or ".", exist_ok=True)
             model = spec.model_cls.from_pretrained(
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
                 dtype=self.model_config.dtype,
+                model_save_dir=staging,
                 **config_override,
             )
-            model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
+            _publish_compiled_model(staging, cached_model_path)
             self.vllm_config.model_config.model = cached_model_path
 
         self.supports_transcription_only = (
