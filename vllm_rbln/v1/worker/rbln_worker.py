@@ -479,7 +479,9 @@ class RBLNWorker(WorkerBase):
         """RPC target of the engine's dynamic-KV patch; see
         `DynamicKvSizer.compute_num_blocks`."""
         with set_current_vllm_config(self.vllm_config, check_compile=False):
-            return self.dynamic_kv.compute_num_blocks()
+            n = self.dynamic_kv.compute_num_blocks()
+            self.model_runner._so_roundtrip_selftest("after_release")
+            return n
 
     def apply_dynamic_kv_num_blocks(self, n: int | None) -> int | None:
         """RPC target of the engine's dynamic-KV patch; see
@@ -493,6 +495,7 @@ class RBLNWorker(WorkerBase):
         # which these RPCs arrive outside of -- warm-up has already returned.
         with set_current_vllm_config(self.vllm_config, check_compile=False):
             applied = self.dynamic_kv.apply_num_blocks(n)
+            self.model_runner._so_roundtrip_selftest("after_apply")
             if self.dynamic_kv.defers_kv_registration and has_kv_transfer_group():
                 self.model_runner.register_kv_caches_with_connector()
                 finalize_kv_cache_registrations(get_kv_transfer_group())
@@ -516,6 +519,7 @@ class RBLNWorker(WorkerBase):
                     self.model_runner.warmup_model()
                 if programs is not None:
                     self.dynamic_kv.record_programs(programs)
+                self.model_runner._so_roundtrip_selftest("after_warmup")
 
                 # Connectors that defer KV-cache registration (RBLN NIXL D2D
                 # and LMCache) finalize it here: the KV cache physical views

@@ -1881,6 +1881,55 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_connector_output = kv_connector_output
         return None
 
+    def _so_roundtrip_selftest(self, tag: str) -> None:
+        """PROBE (do not merge): push synthetic logits through the structured-output round trip.
+
+        One row per target id: device bf16 -> fp32 host -> bf16 device -> compiled argmax, the same
+        hops `sample_tokens` takes for a guided request. Logs one line per call so the state of this
+        engine is known before any real request reaches it.
+        """
+        try:
+            vocab = int(self.model_config.get_vocab_size())
+            dtype = self.model_config.dtype
+            targets = (0, 2047, 2048, 4096, vocab // 2, vocab - 1)
+            rows = []
+            all_ok = True
+            for target in targets:
+                base = torch.full((1, vocab), -10.0, dtype=torch.float32)
+                base[0, :2048] = -5.0
+                base[0, target] = 20.0
+                dev0 = base.to(dtype).to(self.device)
+                host = dev0.to(torch.float32).to("cpu")
+                d2h_arg = int(host.argmax())
+                dev1 = host.to(dtype).to(self.device)
+                back = dev1.to(torch.float32).to("cpu")
+                h2d_arg = int(back.argmax())
+                hi_finite = int(torch.isfinite(back[0, 2048:]).sum())
+                hi_match = int((back[0, 2048:] == base[0, 2048:].to(dtype).to(torch.float32)).sum())
+                sampled_id = None
+                if hasattr(self.sampler, "greedy_sample"):
+                    out = self.sampler.greedy_sample(dev1)
+                    sampled_id = int(out.reshape(-1)[0].to("cpu"))
+                try:
+                    ptr = int(dev1.data_ptr())
+                except Exception:
+                    ptr = -1
+                ok = d2h_arg == target and h2d_arg == target and (sampled_id in (None, target))
+                all_ok = all_ok and ok
+                rows.append((target, d2h_arg, h2d_arg, sampled_id, hi_finite, hi_match, ptr % 4096, ok))
+            logger.warning(
+                "SO_SELFTEST tag=%s device=%s vocab=%d dtype=%s ok=%s "
+                "rows(target,d2h_argmax,h2d_argmax,sampled,hi_finite,hi_match,ptr_mod4k,ok)=%s",
+                tag,
+                self.device,
+                vocab,
+                dtype,
+                all_ok,
+                rows,
+            )
+        except Exception as exc:
+            logger.warning("SO_SELFTEST tag=%s error: %r", tag, exc)
+
     def _so_vocab_probe(
         self,
         dev0: torch.Tensor,
@@ -1939,7 +1988,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logger.warning(
                     "SO_VOCAB_PROBE step=%d req=%s n=%d shape=%s dtype=%s bitmask=%s "
                     "fwd_post(lo,hi,argmax)=%s d2h=%s masked=%s h2d_post=%s sampled=%s "
-                    "premature_diff=%d h2d_diff=%d anomaly=%s",
+                    "premature_diff=%d h2d_diff=%d anomaly=%s dev1_ptr=%s dev0_ptr=%s",
                     step,
                     req_id[-12:],
                     n,
@@ -1954,6 +2003,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     premature,
                     h2d_diff,
                     anomaly,
+                    hex(dev1.data_ptr()),
+                    hex(dev0.data_ptr()),
                 )
 
     @torch.inference_mode()
@@ -1999,6 +2050,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             origin_dtype, origin_device = logits.dtype, logits.device
             # PROBE (do not merge): keep every hop of the round trip so the
             # report after sampling can say where the vocab beyond 2048 went.
+            if not getattr(self, "_so_selftest_first_done", False):
+                self._so_selftest_first_done = True
+                self._so_roundtrip_selftest("first_guided_step")
             probe_dev0 = logits
             logits = logits.to(torch.float32).to("cpu")
             probe_raw = logits.clone()
