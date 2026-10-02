@@ -629,7 +629,7 @@ class RBLNDeepseekV4Attention(nn.Module):
     def finalize_wo_a(self) -> None:
         """wo_a as the [1, g, d, r] bf16 batched-matmul weight, dequantized once on the host after
         loading (as MLA's W_UV): an einsum lowers to a host op, and an in-graph fp8 dequant +
-        transpose in front of the matmul fails the fp8 weight-format annotation (ISSUES AR4)."""
+        transpose in front of the matmul fails the fp8 weight-format annotation."""
         weight = self.wo_a.weight.detach().to("cpu")
         method = self.wo_a.quant_method
         if hasattr(method, "dequantized_weight"):
