@@ -19,6 +19,7 @@ are passed as kwargs containing ``num_hidden_layers`` and, when available,
 NPU-dependent operations are replaced with test doubles.
 """
 
+import os
 import types
 
 import torch
@@ -27,6 +28,7 @@ from transformers import Gemma4Config
 from vllm_rbln.config import OptimumRBLNConfig
 from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
+from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
 
 
 def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
@@ -36,9 +38,12 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
         @classmethod
         def from_pretrained(cls, path, **kwargs):
             passed.update(kwargs)
-            return types.SimpleNamespace(
-                rbln_config=types.SimpleNamespace(), save_pretrained=lambda p: None
-            )
+            # An export writes the compiled model into `model_save_dir`; the
+            # cache publish below checks for it.
+            save_dir = kwargs["model_save_dir"]
+            os.makedirs(save_dir, exist_ok=True)
+            open(os.path.join(save_dir, RBLN_CONFIG_FILE), "w").close()
+            return types.SimpleNamespace(rbln_config=types.SimpleNamespace())
 
     monkeypatch.setattr(
         model_base.RBLNCompileSpec,
@@ -49,7 +54,6 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
             )
         ),
     )
-    monkeypatch.setattr(model_base, "is_compiled_dir", lambda path: False)
     monkeypatch.setattr(model_base, "get_attn_block_size", lambda cfg: 4096)
 
     obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
@@ -65,7 +69,7 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
     obj.vllm_config = types.SimpleNamespace(
         # What `check_and_update` leaves on the config, which is what
         # `init_model` reads its options off.
-        additional_config=OptimumRBLNConfig(cached_model_path=str(tmp_path)),
+        additional_config=OptimumRBLNConfig(cached_model_path=str(tmp_path / "cache")),
         model_config=obj.model_config,
         scheduler_config=obj.scheduler_config,
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),

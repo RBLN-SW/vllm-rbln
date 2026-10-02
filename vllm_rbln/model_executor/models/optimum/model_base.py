@@ -14,6 +14,8 @@
 import json
 import math
 import os
+import shutil
+import tempfile
 from dataclasses import replace
 from typing import Any
 
@@ -43,6 +45,35 @@ from .base import ModelInputForRBLN
 from .compilation import RBLNCompileSpec
 
 logger = init_logger(__name__)
+
+
+def _publish_compiled_model(staging: str, cached_model_path: str) -> None:
+    """Move an exported artifact into the cache path.
+
+    `rbln_config.json` at the cache path means a complete artifact, because
+    the directory only ever arrives there whole, by rename. A directory there
+    without it was left by an export that died and is replaced. When a
+    sibling process published first -- a data-parallel rank, or another server
+    sharing VLLM_CACHE_ROOT -- its artifact is the cache entry and ours is
+    discarded: the same cache key compiles to the same artifact.
+    """
+    if not is_compiled_dir(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError(f"optimum-rbln export left no compiled model in {staging!r}")
+    if is_compiled_dir(cached_model_path):
+        shutil.rmtree(staging, ignore_errors=True)
+        logger.info("Compiled model already cached at %s", cached_model_path)
+        return
+    if os.path.lexists(cached_model_path):
+        shutil.rmtree(cached_model_path)
+    try:
+        os.replace(staging, cached_model_path)
+    except OSError:
+        # A sibling renamed its export into place between the check and ours.
+        if not is_compiled_dir(cached_model_path):
+            raise
+        shutil.rmtree(staging, ignore_errors=True)
+    logger.info("Compiled model cached at %s", cached_model_path)
 
 
 class KVCacheCopyError(RuntimeError):
@@ -264,13 +295,27 @@ class RBLNOptimumModelBase(nn.Module):
                     if text_config is hf_config
                     else {"text_config": layer_override}
                 )
+            # Export beside the cache entry and publish by rename. optimum's
+            # default is a TemporaryDirectory under $TMPDIR that save_pretrained
+            # copies into the cache, so the artifact is held twice and the
+            # $TMPDIR copy outlives a server stopped by a signal. One staging
+            # directory per process: two that miss together must not share it.
+            if cached_model_path is None:
+                raise RuntimeError(
+                    "cache miss without a cache path: sync_vllm_and_optimum must "
+                    "stage `cached_model_path` before the model is loaded"
+                )
+            cache_root, name = os.path.split(os.path.abspath(cached_model_path))
+            os.makedirs(cache_root, exist_ok=True)
+            staging = tempfile.mkdtemp(prefix=f"{name}.export-", dir=cache_root)
             model = spec.model_cls.from_pretrained(
                 self.model_config.model,
                 rbln_config=spec.rbln_config,
                 dtype=self.model_config.dtype,
+                model_save_dir=staging,
                 **config_override,
             )
-            model.save_pretrained(cached_model_path)  # type: ignore[attr-defined]
+            _publish_compiled_model(staging, cached_model_path)
             self.vllm_config.model_config.model = cached_model_path
 
         self.supports_transcription_only = (
