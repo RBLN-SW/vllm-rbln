@@ -3475,7 +3475,7 @@ wheels = [
 [[package]]
 name = "vllm"
 version = "0.30.0+cpu"
-source = { registry = "https://wheels.vllm.ai/0.30.0/cpu" }
+source = { registry = "https://pypi.rebellions.in/simple/" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -3543,7 +3543,7 @@ dependencies = [
     { name = "xgrammar" },
 ]
 wheels = [
-    { url = "https://wheels.vllm.ai/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm-0.30.0%2Bcpu-cp38-abi3-manylinux_2_39_x86_64.whl" },
+    { url = "https://pypi.rebellions.in/api/package/vllm/vllm-0.30.0+cpu-cp38-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:ff560b3a73f0a38b7617fc10dff0d5b54d814135622b2daa1d025fc1c9479169" },
 ]
 
 [package.optional-dependencies]
@@ -3638,8 +3638,8 @@ requires-dist = [
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "vllm", specifier = "==0.30.0+cpu", index = "https://wheels.vllm.ai/0.30.0/cpu" },
-    { name = "vllm", extras = ["audio"], marker = "extra == 'audio'", index = "https://wheels.vllm.ai/0.30.0/cpu" },
+    { name = "vllm", specifier = "==0.30.0+cpu", index = "https://pypi.rebellions.in/simple/" },
+    { name = "vllm", extras = ["audio"], marker = "extra == 'audio'", index = "https://pypi.rebellions.in/simple/" },
 ]
 provides-extras = ["examples", "audio", "test", "build", "dev", "runtime", "kv-connectors"]
 

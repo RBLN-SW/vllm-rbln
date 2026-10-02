@@ -181,17 +181,30 @@ required-version = ">=0.11.25"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
-# pypi.rebellions.in is intentionally NOT registered: packages appear/disappear
-# there independently of dev/main, so a full lock refresh could pin versions that
-# must not be used. Install packages from it ad-hoc via --extra-index-url instead
-# (see DEVELOPMENT.md).
+# pypi.rebellions.in is registered for `vllm` and nothing else (explicit index,
+# single source mapping below): packages appear/disappear there independently of
+# dev/main, so letting a full lock refresh resolve from it could pin versions
+# that must not be used. Install anything else from it ad-hoc via
+# --extra-index-url instead (see DEVELOPMENT.md).
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
 
+# Parked while `vllm` comes from pypi.rebellions.in (see the source mapping
+# below): vLLM publishes the 0.30.0 CPU wheel only as manylinux_2_39, which no
+# glibc < 2.39 host can install. Map `vllm` back here once 0.31.0 ships a
+# 2_34-compatible wheel (vllm-project/vllm#58270).
 [[tool.uv.index]]
 name = "vllm-cpu"
 url = "https://wheels.vllm.ai/0.30.0/cpu"
+explicit = true
+
+# Carries the same 0.30.0+cpu build rebuilt as manylinux_2_34, so it installs on
+# the Ubuntu 22.04 / RHEL 9 dev servers too. Credentials come from
+# UV_INDEX_REBELLIONS_USERNAME / _PASSWORD, which CI already exports.
+[[tool.uv.index]]
+name = "rebellions"
+url = "https://pypi.rebellions.in/simple/"
 explicit = true
 
 [[tool.uv.index]]
@@ -213,7 +226,7 @@ url = "https://pypi.org/simple/"
 explicit = true
 
 [tool.uv.sources]
-vllm = { index = "vllm-cpu" }
+vllm = { index = "rebellions" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
