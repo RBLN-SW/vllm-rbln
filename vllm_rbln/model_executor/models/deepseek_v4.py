@@ -310,9 +310,10 @@ class RBLNDeepseekV4Rope(nn.Module):
     ``rope_theta`` without YaRN (the reference's ``original_seq_len = 0``).
 
     Written as ``x * cos + rotate_gptj(x) * sin`` over pair-duplicated cos / sin (as the RBLN
-    RotaryEmbedding patch) so the compiler lowers the rotation to its rotary primitive
-    (``LowerRotaryEmbeddingShuffle``); the nope channels pass around it (slice + concat). The
-    inverse rotation takes a negated sin table, keeping the same add-of-products form.
+    RotaryEmbedding patch) so the compiler can lower the rotation to its rotary primitive; the
+    nope channels pass around it (slice + concat). The inverse rotation (-theta) is
+    ``x * cos - rotate_gptj(x) * sin`` over the same tables: the subtract is the pattern the
+    compiler maps to the primitive's inverse rotation.
     """
 
     def __init__(self, config: PretrainedConfig, compress_ratio: int, max_pos: int) -> None:
@@ -339,7 +340,6 @@ class RBLNDeepseekV4Rope(nn.Module):
         sin = table[:, half:].repeat_interleave(2, dim=-1)
         self.register_buffer("cos_cache", cos, persistent=False)
         self.register_buffer("sin_cache", sin, persistent=False)
-        self.register_buffer("sin_inv_cache", -sin, persistent=False)
 
     def forward(
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool = False
@@ -347,13 +347,15 @@ class RBLNDeepseekV4Rope(nn.Module):
         """x [B, L, ..., D]; positions [B, L]. Rotates x[..., -rope_dim:]."""
         batch, seq_len = positions.shape[0], positions.shape[1]
         flat = positions.flatten()
-        sin_cache = self.sin_inv_cache if inverse else self.sin_cache
         cos = self.cos_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
-        sin = sin_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
+        sin = self.sin_cache.index_select(0, flat).view(batch, seq_len, -1).to(x.dtype)
         for _ in range(x.dim() - 3):
             cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
         nope, rope = x[..., : -self.rope_dim], x[..., -self.rope_dim :]
-        rot = rope * cos + rotate_gptj(rope) * sin
+        if inverse:
+            rot = rope * cos - rotate_gptj(rope) * sin
+        else:
+            rot = rope * cos + rotate_gptj(rope) * sin
         return torch.cat([nope, rot], dim=-1)
 
 
