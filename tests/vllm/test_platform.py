@@ -216,10 +216,11 @@ class TestRejectedConfigs:
 
     @pytest.mark.parametrize("method", ["eagle3", "dflash"])
     def test_a_draft_under_pp_needs_a_patched_target(self, reconfigure, method):
-        # The default model is a plain LlamaForCausalLM, whose forward still
-        # collects aux hidden states with a stage-local index. Asserting through
-        # the hook rather than on the validator directly is the point: it is what
-        # shows the guard is reached at all.
+        # The default model is a plain LlamaForCausalLM, which 0.30 made
+        # pipeline-aware but which packs a handoff key per tensor rather than the
+        # combined one this side reads. Asserting through the hook rather than on
+        # the validator directly is the point: it is what shows the guard is
+        # reached at all.
         with pytest.raises(ValueError, match="auxiliary hidden states"):
             reconfigure(_aux_draft_under_pp(method=method))
 
