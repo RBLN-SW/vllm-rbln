@@ -221,14 +221,26 @@ class TestRegisterKvCaches:
         worker.register_kv_caches({"layer0": "tensor"})
         assert worker._pending_kv_caches == {"layer0": "tensor"}
 
+    @pytest.mark.parametrize("kv_buffer_device", ["rbln", "cpu"])
+    @pytest.mark.parametrize(
+        "names, expected",
+        [
+            (("swa0", "full0", "full1"), ["full0", "full1"]),
+            (("full1", "swa0", "full0"), ["full1", "full0"]),
+        ],
+    )
     def test_a_buffer_is_registered_once_through_its_full_attention_layer(
-        self, monkeypatch
+        self, monkeypatch, kv_buffer_device, names, expected
     ):
         # The runner hands over every layer. A sliding-window layer whose view
         # aliases a full-attention layer's buffer counts blocks differently, so
         # the buffer is registered once, through the full-attention layer.
-        names = ("swa0", "full0", "full1")
-        worker = build_worker(monkeypatch, kv_buffer_device="rbln", layer_names=names)
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device=kv_buffer_device,
+            nixl_available=kv_buffer_device == "rbln",
+            layer_names=names,
+        )
         # Two tensors from byte 0: the layers at one position share a buffer.
         worker.kv_cache_config.kv_cache_tensors = [
             KVCacheTensor(size=0, layers=["swa0"], layer_stride=1, block_stride=1),
@@ -237,15 +249,32 @@ class TestRegisterKvCaches:
             ),
         ]
         worker._layer_specs = {
-            "swa0": MagicMock(spec=SlidingWindowSpec),
-            "full0": MagicMock(spec=FullAttentionSpec),
-            "full1": MagicMock(spec=FullAttentionSpec),
+            "swa0": MagicMock(
+                spec=SlidingWindowSpec, page_size_bytes=4096, num_kv_heads=8
+            ),
+            "full0": _impl_layer_spec(),
+            "full1": _impl_layer_spec(),
         }
+
+        def register_upstream(kv_caches):
+            worker.block_len_per_layer = [4096] * len(kv_caches)
+
+        upstream_register = MagicMock(side_effect=register_upstream)
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker, "register_kv_caches", upstream_register
+        )
 
         worker.register_kv_caches(dict.fromkeys(names, "tensor"))
 
-        assert list(worker._pending_kv_caches) == ["full0", "full1"]
-        assert worker.local_seen_layer_names == ["full0", "full1"]
+        if kv_buffer_device == "cpu":
+            upstream_register.assert_called_once()
+            registered = upstream_register.call_args.args[0]
+            assert worker._pending_kv_caches is None
+        else:
+            upstream_register.assert_not_called()
+            registered = worker._pending_kv_caches
+        assert list(registered) == expected
+        assert worker.local_seen_layer_names == expected
 
     def test_a_kv_sharing_layer_is_not_registered(self, monkeypatch):
         # A layer reading another's cache (kv_sharing_target_layer_name) owns no
