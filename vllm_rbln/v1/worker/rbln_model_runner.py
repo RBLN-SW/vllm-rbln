@@ -1881,6 +1881,81 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_connector_output = kv_connector_output
         return None
 
+    def _so_vocab_probe(
+        self,
+        dev0: torch.Tensor,
+        raw: torch.Tensor,
+        masked: torch.Tensor,
+        dev1: torch.Tensor,
+        bitmask_shape: tuple[int, ...],
+        sampler_output: SamplerOutput,
+    ) -> None:
+        """PROBE (do not merge): per structured-output step, where does the vocab beyond 2048 vanish.
+
+        dev0 is the forward output on device, raw the host copy read before the mask, masked the
+        host copy after xgrammar, dev1 the tensor handed to the sampler. Both device tensors are
+        read again here, after the sampler ran, so a read that was premature shows up as a
+        difference against the copy taken earlier.
+        """
+        self._so_probe_step = getattr(self, "_so_probe_step", 0) + 1
+        step = self._so_probe_step
+        per_req = getattr(self, "_so_probe_req_steps", None)
+        if per_req is None:
+            per_req = self._so_probe_req_steps = {}
+        num_reqs = self.input_batch.num_reqs
+        req_ids = list(self.input_batch.req_ids[:num_reqs])
+        post0 = dev0.to(torch.float32).to("cpu")
+        post1 = dev1.to(torch.float32).to("cpu")
+        masked_rt = masked.to(dev1.dtype).to(torch.float32)
+        sampled = sampler_output.sampled_token_ids
+        sampled = sampled[:, 0].to("cpu").tolist() if sampled.dim() == 2 else sampled.to("cpu").tolist()
+
+        def diff_count(a: torch.Tensor, b: torch.Tensor) -> int:
+            both_nan = a.isnan() & b.isnan()
+            return int(((a != b) & ~both_nan).sum())
+
+        for row, req_id in enumerate(req_ids):
+            n = per_req.get(req_id, 0) + 1
+            per_req[req_id] = n
+            hops = {}
+            for name, t in (("fwd_post", post0), ("d2h", raw), ("masked", masked), ("h2d_post", post1)):
+                r = t[row]
+                hops[name] = (
+                    int(torch.isfinite(r[:2048]).sum()),
+                    int(torch.isfinite(r[2048:]).sum()),
+                    int(r.argmax()),
+                )
+            premature = diff_count(post0[row], raw[row])
+            h2d_diff = diff_count(post1[row], masked_rt[row])
+            sid = sampled[row] if row < len(sampled) else None
+            anomaly = bool(
+                premature
+                or h2d_diff
+                or hops["d2h"][1] == 0
+                or hops["h2d_post"][1] == 0
+                or sid != hops["masked"][2]
+            )
+            if n <= 8 or anomaly or n % 200 == 0:
+                logger.warning(
+                    "SO_VOCAB_PROBE step=%d req=%s n=%d shape=%s dtype=%s bitmask=%s "
+                    "fwd_post(lo,hi,argmax)=%s d2h=%s masked=%s h2d_post=%s sampled=%s "
+                    "premature_diff=%d h2d_diff=%d anomaly=%s",
+                    step,
+                    req_id[-12:],
+                    n,
+                    tuple(dev0.shape),
+                    dev0.dtype,
+                    bitmask_shape,
+                    hops["fwd_post"],
+                    hops["d2h"],
+                    hops["masked"],
+                    hops["h2d_post"],
+                    sid,
+                    premature,
+                    h2d_diff,
+                    anomaly,
+                )
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -1917,18 +1992,39 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # advanced from real sampled tokens in update_from_output, and EngineCore
         # holds this call back until the previous step's tokens have gone through
         # it, so the mask is never built from a -1 placeholder.
+        probe_dev0 = None
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
             origin_dtype, origin_device = logits.dtype, logits.device
+            # PROBE (do not merge): keep every hop of the round trip so the
+            # report after sampling can say where the vocab beyond 2048 went.
+            probe_dev0 = logits
             logits = logits.to(torch.float32).to("cpu")
+            probe_raw = logits.clone()
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
+            probe_masked = logits
             logits = logits.to(origin_dtype).to(origin_device)
+            probe_dev1 = logits
+            probe_bitmask_shape = tuple(grammar_output.grammar_bitmask.shape)
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        if probe_dev0 is not None:
+            try:
+                self._so_vocab_probe(
+                    probe_dev0,
+                    probe_raw,
+                    probe_masked,
+                    probe_dev1,
+                    probe_bitmask_shape,
+                    sampler_output,
+                )
+            except Exception as exc:  # the probe must never take the step down
+                logger.warning("SO_VOCAB_PROBE error: %r", exc)
 
         self._draft_token_ids = None
 
