@@ -152,8 +152,6 @@ class TestRegisterKvCachesWithConnector:
         self, make_model_runner, monkeypatch
     ):
         registered = self._registrations(monkeypatch)
-        # Both layers in one group, so each has its own buffer and both survive
-        # the canonical-layer filter; one group each would alias them.
         runner = make_model_runner(
             layers=("layer.0", "layer.1"),
             init_kv_cache=False,
@@ -167,6 +165,32 @@ class TestRegisterKvCachesWithConnector:
 
         # In layer-index order: NIXL numbers its transfer regions by iteration
         # order, and the peer matches regions to layers by that same order.
+        assert list(registered[0]) == runner.kv_cache_names
+        assert [id(t) for t in registered[0].values()] == [
+            id(t) for t in runner.kv_caches
+        ]
+
+    def test_layers_that_share_a_buffer_are_each_registered(
+        self, make_model_runner, monkeypatch
+    ):
+        # One layer per group, so the groups overlay and both layers share one
+        # buffer. A token-level connector addresses each layer through its own
+        # view and group, so it needs both, not one per buffer.
+        registered = self._registrations(monkeypatch)
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        )
+        assert runner.kv_caches[0].untyped_storage().data_ptr() == (
+            runner.kv_caches[1].untyped_storage().data_ptr()
+        )
+
+        runner.register_kv_caches_with_connector()
+
         assert list(registered[0]) == runner.kv_cache_names
         assert [id(t) for t in registered[0].values()] == [
             id(t) for t in runner.kv_caches

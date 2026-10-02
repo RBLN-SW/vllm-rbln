@@ -690,6 +690,7 @@ def build_worker(
     dcp_size=1,
     pcp_size=1,
     stripe_width=None,
+    layer_names=("layer0",),
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent."""
@@ -702,6 +703,7 @@ def build_worker(
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
         NixlBaseConnectorWorker,
     )
+    from vllm.v1.kv_cache_interface import KVCacheTensor
 
     import vllm_rbln.envs as envs
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (  # noqa: E501
@@ -730,6 +732,9 @@ def build_worker(
         # Upstream's __init__ derives this from the group specs; the connector
         # refuses a Mamba/SSM group at registration, so the stub has to carry it.
         self._has_mamba = False
+        # Upstream's __init__ fills this from the group specs; tests that need
+        # a real spec set their own.
+        self._layer_specs = dict.fromkeys(layer_names)
         # add_remote_agent asks for tp_ratio before deciding whether upstream's
         # positional pairing applies; 1 keeps these cases homogeneous.
         self.transfer_topo = MagicMock()
@@ -770,6 +775,11 @@ def build_worker(
     )
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
+    # One tensor, one position per layer: every layer has a buffer of its own,
+    # so registration keeps each.
+    kv_cache_config.kv_cache_tensors = [
+        KVCacheTensor(size=0, layers=list(layer_names), layer_stride=1, block_stride=1)
+    ]
     groups = [MagicMock(kv_cache_spec=spec) for spec in (specs or [])]
     # Real `KVCacheConfig` derives the transfer view from `kv_cache_groups` by
     # dropping the groups that opted out, and a MagicMock answers `len()` with

@@ -36,8 +36,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -219,6 +221,71 @@ class TestRegisterKvCaches:
         worker.register_kv_caches({"layer0": "tensor"})
         assert worker._pending_kv_caches == {"layer0": "tensor"}
 
+    @pytest.mark.parametrize("kv_buffer_device", ["rbln", "cpu"])
+    @pytest.mark.parametrize(
+        "names, expected",
+        [
+            (("swa0", "full0", "full1"), ["full0", "full1"]),
+            (("full1", "swa0", "full0"), ["full1", "full0"]),
+        ],
+    )
+    def test_a_buffer_is_registered_once_through_its_full_attention_layer(
+        self, monkeypatch, kv_buffer_device, names, expected
+    ):
+        # The runner hands over every layer. A sliding-window layer whose view
+        # aliases a full-attention layer's buffer counts blocks differently, so
+        # the buffer is registered once, through the full-attention layer.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device=kv_buffer_device,
+            nixl_available=kv_buffer_device == "rbln",
+            layer_names=names,
+        )
+        # Two tensors from byte 0: the layers at one position share a buffer.
+        worker.kv_cache_config.kv_cache_tensors = [
+            KVCacheTensor(size=0, layers=["swa0"], layer_stride=1, block_stride=1),
+            KVCacheTensor(
+                size=0, layers=["full0", "full1"], layer_stride=1, block_stride=1
+            ),
+        ]
+        worker._layer_specs = {
+            "swa0": MagicMock(
+                spec=SlidingWindowSpec, page_size_bytes=4096, num_kv_heads=8
+            ),
+            "full0": _impl_layer_spec(),
+            "full1": _impl_layer_spec(),
+        }
+
+        def register_upstream(kv_caches):
+            worker.block_len_per_layer = [4096] * len(kv_caches)
+
+        upstream_register = MagicMock(side_effect=register_upstream)
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker, "register_kv_caches", upstream_register
+        )
+
+        worker.register_kv_caches(dict.fromkeys(names, "tensor"))
+
+        if kv_buffer_device == "cpu":
+            upstream_register.assert_called_once()
+            registered = upstream_register.call_args.args[0]
+            assert worker._pending_kv_caches is None
+        else:
+            upstream_register.assert_not_called()
+            registered = worker._pending_kv_caches
+        assert list(registered) == expected
+        assert worker.local_seen_layer_names == expected
+
+    def test_a_kv_sharing_layer_is_not_registered(self, monkeypatch):
+        # A layer reading another's cache (kv_sharing_target_layer_name) owns no
+        # buffer and has no spec in this connector's config, yet the runner
+        # hands it over with the rest.
+        worker = build_worker(monkeypatch, kv_buffer_device="rbln", layer_names=("l0",))
+
+        worker.register_kv_caches({"l0": "tensor", "l1_shared": "tensor"})
+
+        assert list(worker._pending_kv_caches) == ["l0"]
+
     def test_the_block_count_comes_from_the_allocation_not_the_estimate(
         self, monkeypatch
     ):
@@ -274,7 +341,12 @@ class TestRegisterKvCaches:
 
     def test_host_bounce_rejects_differing_per_layer_sizes(self, monkeypatch):
         # Pins the refusal at this path's own point rather than upstream's assert.
-        worker = build_worker(monkeypatch, kv_buffer_device="cpu", nixl_available=True)
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            nixl_available=True,
+            layer_names=("l0", "l1"),
+        )
         worker.nixl_wrapper = "wrapper"
         worker._layer_specs = {
             "l0": _impl_layer_spec(page_size_bytes=4096),
@@ -1395,6 +1467,13 @@ class TestPublishHandshakeMetadata:
         )
         w._publish_handshake_metadata = MagicMock()
         kv_caches = {"l0": MagicMock(), "l1": MagicMock()}
+        w.kv_cache_config = SimpleNamespace(
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=0, layers=list(kv_caches), layer_stride=1, block_stride=1
+                )
+            ]
+        )
         # Registration reads the layer specs and the transfer table upstream
         # fills, to record each region's head count.
         w._layer_specs = {
