@@ -1921,7 +1921,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
             origin_dtype, origin_device = logits.dtype, logits.device
-            logits = logits.to(torch.float32).to("cpu")
+            # PROBE: wait for the forward and the cast before the host reads them.
+            logits = logits.to(torch.float32)
+            if origin_device.type == "rbln":
+                torch.rbln.synchronize(origin_device)
+            logits = logits.to("cpu")
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
