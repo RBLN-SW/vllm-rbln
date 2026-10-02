@@ -1921,7 +1921,42 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
             origin_dtype, origin_device = logits.dtype, logits.device
-            logits = logits.to(torch.float32).to("cpu")
+            # PROBE: read the logits before and after a device sync; sample from the unsynced read.
+            logits_f32 = logits.to(torch.float32)
+            logits = logits_f32.to("cpu")
+            if origin_device.type == "rbln":
+                torch.rbln.synchronize(origin_device)
+                synced = logits_f32.to("cpu")
+                self._d2h_probe_steps = getattr(self, "_d2h_probe_steps", 0) + 1
+                both_nan = logits.isnan() & synced.isnan()
+                row_diff = ((logits != synced) & both_nan.logical_not()).any(dim=-1)
+                rows = int(row_diff.sum())
+                if rows:
+                    self._d2h_probe_bad = getattr(self, "_d2h_probe_bad", 0) + 1
+                    prev = getattr(self, "_d2h_probe_prev", None)
+                    stale = (
+                        prev is not None
+                        and prev.shape == logits.shape
+                        and torch.equal(logits[row_diff], prev[row_diff])
+                    )
+                    logger.warning(
+                        "D2H_PROBE mismatch step=%d rows=%d/%d argmax_changed=%d "
+                        "maxdiff=%.6g stale_prev=%s unsynced_all_zero=%s",
+                        self._d2h_probe_steps,
+                        rows,
+                        logits.shape[0],
+                        int((logits.argmax(-1) != synced.argmax(-1)).sum()),
+                        float((logits - synced).abs().nan_to_num().max()),
+                        stale,
+                        bool((logits[row_diff] == 0).all()),
+                    )
+                if self._d2h_probe_steps % 100 == 0:
+                    logger.warning(
+                        "D2H_PROBE summary steps=%d mismatched_steps=%d",
+                        self._d2h_probe_steps,
+                        getattr(self, "_d2h_probe_bad", 0),
+                    )
+                self._d2h_probe_prev = synced
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
