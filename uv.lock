@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -1221,9 +1221,20 @@ wheels = [
 ]
 
 [[package]]
+name = "intel-cmplr-lib-ur"
+version = "2024.2.1"
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+wheels = [
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-cmplr-lib-ur/2024.2.1/intel_cmplr_lib_ur-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:8b78d58ab501d6e5a582967be80fdbf7b03b33279135a303da36dbf11f481ed7" },
+]
+
+[[package]]
 name = "intel-openmp"
 version = "2024.2.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
+dependencies = [
+    { name = "intel-cmplr-lib-ur" },
+]
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-openmp/2024.2.1/intel_openmp-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:21892ea07a9c6e164707d2b44e6f396f9f2ab6cc7e108755011fad59b596182a" },
 ]
@@ -1764,7 +1775,7 @@ wheels = [
 
 [[package]]
 name = "nixl-rbln"
-version = "0.1.0.dev119+g7bbd9adca"
+version = "0.1.0.dev119+g782b58c90"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "nixl" },
@@ -1772,7 +1783,7 @@ dependencies = [
     { name = "torch-rbln" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-rbln/0.1.0.dev119+g7bbd9adca/nixl_rbln-0.1.0.dev119+g7bbd9adca-py3-none-manylinux_2_34_x86_64.whl", hash = "md5:b1b17a64dff5cfd9a33245a42e027f1e" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-rbln/0.1.0.dev119+g782b58c90/nixl_rbln-0.1.0.dev119+g782b58c90-py3-none-manylinux_2_34_x86_64.whl", hash = "md5:65d10dc65b985e590f64ff75a6c32817" },
 ]
 
 [[package]]
@@ -2022,7 +2033,7 @@ wheels = [
 
 [[package]]
 name = "optimum-rbln"
-version = "0.11.3a9"
+version = "0.12.1.dev0"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "accelerate" },
@@ -2036,9 +2047,9 @@ dependencies = [
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/26/675a90168656ec082bb37e7becd6951282b557b2b66f732b9333043457b1/optimum_rbln-0.11.3a9.tar.gz", hash = "sha256:87e981bf0c1567ed19f0a394d0c0987974b012cc5f0f200e8f60bf4115d78cae", size = 665222, upload-time = "2026-09-30T04:51:29.893Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/9a/3001063e714e1857e3d47327a729b6c926e5fd550c452b4006d8e0275ba6/optimum_rbln-0.12.1.dev0.tar.gz", hash = "sha256:d205279c8f1850e438a10821fa99a2ed58d74f8953bccffb6d7326b4998e95d5", size = 680388, upload-time = "2026-10-02T11:07:54.915Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/73/4f/35f0c08e0ab0256b4463745a3d3ca562ab98d5f8af16898fe3556a1a0af7/optimum_rbln-0.11.3a9-py3-none-any.whl", hash = "sha256:f3a04c8a78a4a13b879aa91d3ee63cf6a3dea0f774ae4c6446950390267aed16", size = 695848, upload-time = "2026-09-30T04:51:27.153Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/8c/aecc68528537768140484032f1778998d09ee64ee08acc270675ee070f21/optimum_rbln-0.12.1.dev0-py3-none-any.whl", hash = "sha256:1fb0b5e83302ecf4a241c6e8babd123b207b38ec5a9e2544d19f59f8e0c563aa", size = 720863, upload-time = "2026-10-02T11:07:52.974Z" },
 ]
 
 [[package]]
@@ -3618,7 +3629,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0.dev0,<0.12.1" },
     { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.1.0.dev0,<0.1.1" },
-    { name = "optimum-rbln", specifier = ">=0.11.3a9,<0.11.4", index = "https://pypi.org/simple/" },
+    { name = "optimum-rbln", specifier = ">=0.12.1.dev0,<0.12.2", index = "https://pypi.org/simple/" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
