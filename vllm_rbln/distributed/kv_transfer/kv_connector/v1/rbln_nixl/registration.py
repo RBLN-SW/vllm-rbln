@@ -51,6 +51,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_transfer_topology im
     RblnTransferTopology,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.worker.utils import canonical_kv_layers
 
 logger = init_logger(__name__)
 
@@ -612,6 +613,19 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "cannot describe. Mixed full and sliding-window attention is a "
                 "different thing and is supported."
             )
+        # One region per buffer: sliding-window views alias a full-attention
+        # layer's storage but count blocks differently, and KV-sharing layers
+        # own neither a buffer nor a spec. Inspect the transfer specs only.
+        canonical = canonical_kv_layers(
+            self.kv_cache_config,
+            {name: self._unwrapped_layer_spec(name) for name in self._layer_specs},
+        )
+        # The runner allocates from its own copy of the connector's config.
+        missing = canonical - kv_caches.keys()
+        assert not missing, f"Canonical layers missing from kv_caches: {missing}"
+        # Preserve the caller's layer order: iterating the canonical set varies
+        # with PYTHONHASHSEED and can mismatch the P/D region-to-layer mapping.
+        kv_caches = {name: kv for name, kv in kv_caches.items() if name in canonical}
         # `__init__` copied the count vllm estimated before the compile. A
         # dynamic-KV resize settles the real one after warm-up and registers
         # only then, so take what the worker last allocated for.
