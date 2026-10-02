@@ -40,6 +40,7 @@ from . import (
     kv_connector_utils,
     metrics,
     minimax_m2,
+    minimax_m3,
     mla,
     modelopt_mixed_config,
     models_utils,
