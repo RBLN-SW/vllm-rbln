@@ -29,11 +29,10 @@ from vllm.distributed import get_pp_group
 from vllm.sequence import IntermediateTensors
 
 # Target architectures whose `forward` this plugin has patched to carry the aux
-# hidden states across the split. Upstream's own forward indexes the capture with
-# a stage-local `enumerate` and then drops the list on every non-last stage, so an
-# architecture absent from here harvests the wrong layers and comes up short at
-# the drafter. `RblnPlatform.check_and_update_config` rejects the combination
-# rather than letting it fail mid-compile.
+# hidden states across the split as one combined key. One absent from here either
+# drops the capture on a non-last stage, or -- where upstream has converted it --
+# packs a key per tensor, which this side does not read. The startup hook in
+# `platform/vllm_impl.py` refuses it rather than letting it fail mid-compile.
 AUX_PP_TARGET_ARCHS = frozenset({"MiniMaxM2ForCausalLM", "AXK2ForCausalLM"})
 
 # One handoff tensor carries every aux hidden state, concatenated on the feature
