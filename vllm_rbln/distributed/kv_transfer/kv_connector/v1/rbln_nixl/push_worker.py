@@ -768,6 +768,12 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         block the batch does not have. The scheduler sends the total with every
         offer for exactly this. A batch that is the whole list answers for
         itself -- the handover, and every write of an unstreamed request.
+
+        Both are the scheduler's blocks. `in_batch` would be the kernel's where
+        upstream splits a logical block, but `__init__` pins the ratio back to
+        1 and the block size to the manager's, so this side counts one frame
+        throughout. Whoever lifts that pin is changing the frame of every
+        length here, not just this one.
         """
         return streamed.total if streamed and streamed.total else in_batch
 
