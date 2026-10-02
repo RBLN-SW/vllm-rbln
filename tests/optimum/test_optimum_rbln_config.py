@@ -54,7 +54,11 @@ def test_defaults_when_nothing_is_passed(parser):
 @pytest.mark.parametrize(
     "model", ["Qwen/Qwen2-VL-7B-Instruct", "Qwen/Qwen2.5-VL-7B-Instruct"]
 )
-def test_multimodal_normalization_stays_in_the_processor(model):
+def test_multimodal_normalization_stays_in_the_processor(model, monkeypatch):
+    # Building the config asks the NPU for its family, and this lane has none.
+    from vllm_rbln import platform
+
+    monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25")
     config = AsyncEngineArgs(
         model=model, model_impl="optimum", max_model_len=4096, block_size=4096
     ).create_engine_config()
