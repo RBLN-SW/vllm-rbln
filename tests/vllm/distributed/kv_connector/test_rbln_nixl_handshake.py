@@ -46,6 +46,8 @@ from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
     mock_vllm_config,
     patched_in_package,
+    set_shape,
+    shape,
     window_mode,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker import (
@@ -241,10 +243,10 @@ def _make_worker(
     w.vllm_config.speculative_config = None
     w.compat_hash = compat
     w.enforce_compat_hash = True
-    window_mode(w, sw_ratio)
-    w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
-    # Off, as the connector option is; the trim tests turn it on.
-    w._chunk_mode = False
+    window_mode(
+        w, sw_ratio, has_swa=(sw_ratio is not None) if has_swa is None else has_swa
+    )
+    set_shape(w, chunk_mode=False)
     w._remote_shard_layer_names = defaultdict(dict)
     w._remote_pp_size = {}
     w._overlapping_ranks = defaultdict(list)
@@ -700,19 +702,34 @@ class TestPpHandshakeFanout:
         assert w._overlapping_ranks["eng"] == []
         assert w._register_shard_xfer_state.call_count == 0
 
-    def test_a_side_that_trims_a_last_block_asks_even_a_matching_peer(self):
-        # Same peer again, and the same reason in a different shape: the trim
-        # narrows a block rather than a peer, and only the per-shard ids can
-        # leave part of one out.
+    def test_a_side_that_moves_part_of_a_request_asks_even_a_matching_peer(
+        self, monkeypatch
+    ):
+        # The same peer as above. Nothing is narrowed, so the only reason to
+        # build per-shard state is that a transfer covering part of a request
+        # needs a notification saying which part -- which upstream's
+        # whole-engine handle has no room for.
         w = _make_worker()
-        w._chunk_mode = True
+        set_shape(w, streams_prefix=True)
 
         _handshake(w, _FakeSock(pp_size=1))
 
         assert w._overlapping_ranks["eng"] == [0]
         assert w._register_shard_xfer_state.call_count == 1
 
-    @pytest.mark.parametrize("sw_ratio", [0.5, None])
+    def test_a_side_that_trims_a_last_block_asks_even_a_matching_peer(self):
+        # Same peer again, and the same reason in a different shape: the trim
+        # narrows a block rather than a peer, and only the per-shard ids can
+        # leave part of one out.
+        w = _make_worker()
+        set_shape(w, chunk_mode=True)
+
+        _handshake(w, _FakeSock(pp_size=1))
+
+        assert w._overlapping_ranks["eng"] == [0]
+        assert w._register_shard_xfer_state.call_count == 1
+
+    @pytest.mark.parametrize("sw_ratio", [2, None])
     def test_swa_plus_pp_raises(self, sw_ratio):
         # The consumer's own guard, hit when it discovers a PP producer while
         # it has a sliding window; _check_pp_constraints is the separate
@@ -742,7 +759,7 @@ class TestPpHandshakeFanout:
     def test_swa_plus_local_pp_raises(self):
         # The peer runs no pipeline, ours does: the guard has to key on either
         # side, not just the peer's.
-        w = _make_worker(sw_ratio=0.5)
+        w = _make_worker(sw_ratio=2)
         w.vllm_config.parallel_config.pipeline_parallel_size = 2
         with pytest.raises(RuntimeError, match="sliding-window"):
             _handshake(w, _FakeSock(pp_size=1))
@@ -967,6 +984,7 @@ class TestPeerRegionView:
     @classmethod
     def _consumer(cls, *, mla_tail=0, uniform_lens=False):
         w = object.__new__(RblnNixlPullConnectorWorker)
+        w._shape = shape()
         w._kv_per_block = 1
         w.local_seen_layer_names = [f"l{i}" for i in range(cls.N_LAYERS)]
         w.num_regions = cls.N_LAYERS * cls.RPL
@@ -975,7 +993,7 @@ class TestPeerRegionView:
             w.block_len_per_layer[-cls.RPL :] = [cls.DRAFT_LEN] * cls.RPL
         w._region_is_mla = [False] * (w.num_regions - mla_tail) + [True] * mla_tail
         w._kv_areas = 1
-        w._chunk_mode = False
+        set_shape(w, chunk_mode=False)
         w.device_id = 0
         w.transfer_topo = MagicMock()
         w.transfer_topo.virtually_split_kv_in_blocks = False
@@ -1243,7 +1261,7 @@ class TestShardLocalRegions:
         w._kv_per_block = 1
         w.local_seen_layer_names = list(local_names)
         w.num_regions = num_regions
-        w._chunk_mode = False
+        set_shape(w, chunk_mode=False)
         return w
 
     def test_regions_per_layer(self):
@@ -1289,7 +1307,6 @@ class TestShardLocalRegions:
         w.get_backend_aware_kv_block_len = MagicMock(return_value=64)
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.prep_xfer_dlist.return_value = 42
-        # shard registration goes through the SWA dispatch
         window_mode(w, None)
         w.use_host_buffer = False  # D2D: narrowing comes from chiplet areas
         w._shard_descs_per_block = {}
@@ -1440,9 +1457,8 @@ class TestShardLocalRegions:
         # pair that can name two KV groups -- so the chunk range has to follow
         # the window's range there. The per-shard builder never sees it.
         w = self._wired_worker()
-        window_mode(w, 2)
-        w._has_swa = True
-        w._chunk_mode = True
+        window_mode(w, 2, has_swa=True)
+        set_shape(w, chunk_mode=True)
         runs, chunks = 1, 2
 
         with patch.object(
@@ -1454,12 +1470,12 @@ class TestShardLocalRegions:
 
         whole = w.num_regions * w.num_blocks
         # Whole blocks, then the granules that tile them, then the chunk range.
-        window_end = whole * (1 + w._sw_ratio)
+        window_end = whole * (1 + w._shape.window_ratio)
         assert len(blocks) == window_end + whole * runs * chunks
         full_len = w.block_len_per_layer[0]
         assert {ln for _, ln, _ in blocks[:whole]} == {full_len}
         assert {ln for _, ln, _ in blocks[whole:window_end]} == {
-            full_len // w._sw_ratio
+            full_len // w._shape.window_ratio
         }
         assert {ln for _, ln, _ in blocks[window_end:]} == {full_len // (runs * chunks)}
 
@@ -1468,8 +1484,7 @@ class TestShardLocalRegions:
         # it and a stage registers the whole model's regions, so the descriptor
         # math addresses layers it does not own.
         w = self._wired_worker()
-        window_mode(w, None)
-        w._has_swa = False
+        window_mode(w, None, has_swa=False)
 
         with patch.object(
             RblnNixlPullConnectorWorker, "_register_shard_local_xfer_handler"
@@ -1559,8 +1574,24 @@ class TestShardLocalRegions:
         self, sw_ratio, needs_own
     ):
         w = self._wired_worker()
-        w._chunk_mode = True
-        window_mode(w, sw_ratio)
+        window_mode(w, sw_ratio, chunk_mode=True)
+
+        assert (
+            w._needs_own_descriptors(
+                pp_size=1, partial=False, fan_in=False, split=1, fanout=1, kv_runs=1
+            )
+            is needs_own
+        )
+
+    @pytest.mark.parametrize("sw_ratio, needs_own", [(8, False), (None, True)])
+    def test_a_streamed_engine_asks_for_its_own_descriptors_unless_windowed(
+        self, sw_ratio, needs_own
+    ):
+        # Streaming asks for per-shard ids so a batch can be named on the
+        # wire, and gives way to a window for the same reason chunk mode
+        # does: a hybrid's two groups fit on no other list.
+        w = self._wired_worker()
+        w._shape = shape(chunk_mode=False, window_ratio=sw_ratio, streams_prefix=True)
 
         assert (
             w._needs_own_descriptors(
@@ -1624,7 +1655,7 @@ class TestShardLocalRegions:
         w._shard_descs_per_block = {}
         # The geometry the grid is read off: 8 heads over 4 areas is 2 a
         # region, and 512B over a 16-token block is 16B a token.
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._kv_split_axis = KVSplitAxis.HEAD
         w._kv_areas = 4
         w._kv_slices = 4
@@ -1653,7 +1684,7 @@ class TestShardLocalRegions:
         # naming a span, which a head cut does not do -- every region there
         # holds every token of its own heads.
         w = self._wired_worker()
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._kv_split_axis = KVSplitAxis.HEAD
         w._kv_areas = 2
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
@@ -1687,7 +1718,7 @@ class TestShardLocalRegions:
         # (see `_register_shard_xfer_state`), which is why one assertion covers
         # them together.
         w = self._wired_worker()
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         w._kv_areas = 2
         w.kv_cache_config = MagicMock(transfer_groups=[object()])
@@ -1748,15 +1779,20 @@ class TestChunkSizing:
             self._sized(span_tokens=2048, tokens=256)
 
     @staticmethod
-    def _grid_worker(*, block_len, areas=4, prefill=512):
-        w = object.__new__(RblnNixlPullConnectorWorker)
-        w._chunk_mode = True
+    def _grid_worker(*, block_len, areas=4, prefill=512, cls=None):
+        w = object.__new__(cls or RblnNixlPullConnectorWorker)
+        w._shape = shape()
+        set_shape(w, chunk_mode=True)
         w._kv_areas = areas
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         w._kv_per_block = 1
         w.block_len_per_layer = [block_len] * 8
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
+        # __init__ never ran, so the state a push worker's shutdown()
+        # reaches through __del__ is absent; silence it rather than leak
+        # an unraisable at GC.
+        w.shutdown = lambda: None
         return w
 
     def test_a_context_cut_spreads_a_chunk_over_one_run(self, monkeypatch):
@@ -1786,9 +1822,17 @@ class TestChunkSizing:
     def test_off_the_knob_there_is_no_grid(self):
         # A block length the shape could cut, so only the knob answers None.
         w = self._grid_worker(block_len=2048 * 256)
-        w._chunk_mode = False
+        set_shape(w, chunk_mode=False)
 
         assert w._shard_chunk_grid(block_size=8192, split=1) is None
+
+    def test_a_side_that_writes_in_pieces_gets_a_grid_without_the_knob(self):
+        # Streaming names a range of a block whether or not the knob is on, so
+        # it asks for the same grid the knob would have built.
+        w = self._grid_worker(block_len=2048 * 256, cls=RblnNixlPushConnectorWorker)
+        w._shape = shape(chunk_mode=False, streams_prefix=True)
+
+        assert w._shard_chunk_grid(block_size=8192, split=1) == (1, 4)
 
 
 class TestBaseFanInHandle:
@@ -1901,9 +1945,7 @@ class TestValidateRemoteAgentHandshake:
         w._kv_areas = 1
         w._kv_slices = 1
         w._kv_split_axis = KVSplitAxis.HEAD
-        w._chunk_mode = False
-        window_mode(w, None)
-        w._has_swa = False
+        window_mode(w, None, chunk_mode=False, has_swa=False)
         topo = MagicMock()
         topo.get_engine_info.return_value = MagicMock(remote_tp_size=1)
         topo.block_size_ratio.return_value = 1
@@ -2168,6 +2210,7 @@ class TestHeadBandMatching:
         # `block_len` and `kv_heads` take a list to give each logical region its
         # own geometry; a scalar applies to every region.
         w = object.__new__(RblnNixlPullConnectorWorker)
+        w._shape = shape()
         w._kv_per_block = 1
         w.tp_rank = tp_rank
         w._kv_areas = areas
@@ -2186,7 +2229,7 @@ class TestHeadBandMatching:
         w.get_backend_aware_kv_block_len = lambda layer_idx, **_: w.block_len_per_layer[
             layer_idx
         ]
-        w._chunk_mode = False  # the grid tests turn it on
+        set_shape(w, chunk_mode=False)  # the grid tests turn it on
         return w
 
     @staticmethod
@@ -2322,7 +2365,7 @@ class TestHeadBandMatching:
             tp_rank=0, tp_size=4, areas=4, slices=2, n_logical=1, block_len=256
         )
         w._kv_per_block = 2
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._kv_split_axis = KVSplitAxis.HEAD
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = 8
@@ -2346,7 +2389,7 @@ class TestHeadBandMatching:
         )
         # A 16-token block whose 2-head region costs 16B a token, so a 128B
         # descriptor target is 8 tokens: two chunks of a block.
-        w._chunk_mode = True
+        set_shape(w, chunk_mode=True)
         w._kv_split_axis = KVSplitAxis.HEAD
         w.vllm_config = mock_vllm_config()
         w.vllm_config.scheduler_config.max_num_batched_tokens = prefill
@@ -2664,8 +2707,7 @@ class TestHeadBandMatching:
             block_len=256,
         )
         w.use_host_buffer = False
-        window_mode(w, None)
-        w._has_swa = False
+        window_mode(w, None, has_swa=False)
         w.transfer_topo.tp_ratio.return_value = tp_ratio
         meta = self._meta(areas=peer[0], slices=peer[1], n_logical=1, block_len=256)
         assert w._peer_head_split(meta, remote_tp_size) == expected
@@ -3075,8 +3117,7 @@ class TestADecodeContextParallelPeerIsRefused:
     def _worker():
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
-        w._sw_ratio = None
-        w._chunk_mode = False
+        w._shape = shape()
         w._remote_agents = {}
         w.dst_num_blocks = {}
         w.dst_region_num_blocks = {}
@@ -3127,8 +3168,7 @@ class TestARefusedPeerLeavesNothingBehind:
     def _worker():
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
-        w._sw_ratio = None
-        w._chunk_mode = False
+        w._shape = shape()
         w._remote_agents = {}
         w.dst_num_blocks = {}
         w.dst_region_num_blocks = {}
@@ -3220,7 +3260,7 @@ class TestTheRemoteRegionLedger:
     """
 
     @staticmethod
-    def _worker(*, sw_ratio=None, region_group_ids=(0, 0)):
+    def _worker(*, region_group_ids=(0, 0)):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._remote_agents = defaultdict(dict)
         w.dst_num_blocks = {}
@@ -3236,7 +3276,6 @@ class TestTheRemoteRegionLedger:
         w._kv_areas = 1
         w._kv_slices = 1
         w._kv_per_block = 1
-        w._sw_ratio = sw_ratio
         w.transfer_topo = MagicMock(tp_size=1)
         w._reject_uneven_region_slices = MagicMock()
         w._register_remote_engine_prelude = MagicMock()
@@ -3314,8 +3353,9 @@ class TestD2DRegionPairing:
         # The check compares regions PER LAYER, so it needs both figures.
         w.num_regions = n_local
         w.local_seen_layer_names = [f"layer.{i}" for i in range(n_layers)]
-        window_mode(w, sw_ratio)
-        w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
+        window_mode(
+            w, sw_ratio, has_swa=(sw_ratio is not None) if has_swa is None else has_swa
+        )
         topo = MagicMock()
         topo.tp_ratio.return_value = tp_ratio
         topo.tp_size = tp_size
@@ -3353,7 +3393,7 @@ class TestD2DRegionPairing:
     def test_heterogeneous_tp_with_swa_raises(self, sw_ratio):
         # A sliding window is refused with model parallelism whether or not the
         # window mode is on: `sw_ratio=None` is the model with it off, which
-        # keys on `_has_swa` alone.
+        # keys on `has_swa` alone.
         w = self._worker(
             host_buffer=False,
             tp_ratio=2,
@@ -3749,9 +3789,7 @@ class TestHeadMatchedAgentRegistration:
         # is the wrong key, so upstream's add_remote_agent must not be reached.
         w = object.__new__(RblnNixlPullConnectorWorker)
         w._kv_per_block = 1
-        window_mode(w, None)
-        w._has_swa = False
-        w._chunk_mode = False
+        window_mode(w, None, has_swa=False)
         w.use_host_buffer = False
         w.transfer_topo = MagicMock()
         w.transfer_topo.tp_ratio.return_value = 2
@@ -3778,15 +3816,29 @@ class TestSplitAxisConstraints:
 
     @staticmethod
     def _worker(
-        *, axis, tp_ratio=1, host_buffer=False, trim=False, block_size=16, sw_ratio=None
+        *,
+        axis,
+        tp_ratio=1,
+        host_buffer=False,
+        trim=False,
+        block_size=16,
+        sw_ratio=None,
+        cls=RblnNixlPullConnectorWorker,
+        stream=False,
     ):
-        w = object.__new__(RblnNixlPullConnectorWorker)
+        w = object.__new__(cls)
         w._kv_per_block = 1
         w.use_host_buffer = host_buffer
         w._kv_split_axis = axis
-        w._chunk_mode = trim
         w.block_size = block_size
-        window_mode(w, sw_ratio)
+        window_mode(
+            w,
+            sw_ratio,
+            chunk_mode=trim,
+            streams_prefix=stream,
+            wants_stream=stream,
+            writes_into_peer=stream,
+        )
         topo = MagicMock()
         topo.tp_size = 2
         topo.tp_ratio.return_value = tp_ratio
@@ -3826,13 +3878,29 @@ class TestSplitAxisConstraints:
             w._check_split_axis_constraints(meta, 2)
 
     def test_a_windowed_peer_must_size_its_block_the_same(self):
-        # The window range divides the peer's block by OUR `_sw_ratio`, so an
+        # The window range divides the peer's block by OUR `window_ratio`, so an
         # unequal block size names a length that is not the peer's window --
         # and the descriptor counts match either way, so nothing reports it.
         w = self._worker(axis=KVSplitAxis.HEAD, sw_ratio=4, block_size=16)
         meta = _agent_meta(block_size=32)
         with pytest.raises(RuntimeError, match="cut one the same way"):
             w._check_split_axis_constraints(meta, 1)
+
+    def test_a_streaming_peer_must_size_its_block_the_same(self):
+        # Streaming names part of the block a prefill is filling, by the same
+        # grid the knob cuts a last block with -- so it needs the peer to hold
+        # the same count, whether or not that knob is on.
+        w = self._worker(
+            axis=KVSplitAxis.NON_HEAD,
+            stream=True,
+            block_size=16,
+            cls=RblnNixlPushConnectorWorker,
+        )
+        meta = _agent_meta(
+            kv_areas=4, kv_slices=4, kv_split_axis=KVSplitAxis.NON_HEAD, block_size=32
+        )
+        with pytest.raises(RuntimeError, match="cut one the same way"):
+            w._check_split_axis_constraints(meta, 2)
 
     def test_a_matching_block_size_passes_while_trimming(self):
         w = self._worker(axis=KVSplitAxis.NON_HEAD, trim=True, block_size=16)
@@ -3996,7 +4064,7 @@ class TestAddRemoteAgentSwa:
             return [(addr - base, ln) for addr, ln, _ in descs[whole : whole + 4]]
 
         # 2 regions x 8 blocks whole, then sw_ratio granules of each.
-        window_end = 2 * 8 * (1 + worker._sw_ratio)
+        window_end = 2 * 8 * (1 + worker._shape.window_ratio)
         # Non-empty, or the comparison is two empty lists agreeing.
         assert (
             cut(remote, window_end, 0x5000)
@@ -4028,7 +4096,7 @@ class TestAddRemoteAgentSwa:
         blocks_data = worker.nixl_wrapper.get_xfer_descs.call_args[0][0]
         # 2 regions x 8 blocks, whole then sw_ratio granules of each, and last
         # 2 regions x 8 blocks x 2 runs x 2 chunks.
-        assert len(blocks_data) == 16 * (1 + worker._sw_ratio) + 64
+        assert len(blocks_data) == 16 * (1 + worker._shape.window_ratio) + 64
         assert blocks_data[48:52] == [
             (0x5000, 64, 1),
             (0x5040, 64, 1),
@@ -4212,10 +4280,7 @@ class TestTwoLayoutsNeverPair:
     def _worker(kv_per_block):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.use_host_buffer = False
-        w._has_swa = False
-        w._chunk_mode = False
-        w._window_grid_cut = None
-        w._swa_kernel_blocks = set()
+        window_mode(w, None, has_swa=False)
         w._kv_per_block = kv_per_block
         w.block_len_per_layer = [64]
         w.num_regions = 1
@@ -4266,8 +4331,7 @@ class TestTwoKernelGeometriesNeverPair:
     def _worker(swa_kernel_block, *, windowed=True):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.use_host_buffer = False
-        w._has_swa = True
-        w._chunk_mode = False
+        window_mode(w, 8, has_swa=True)
         w._swa_kernel_blocks = {swa_kernel_block} if swa_kernel_block else set()
         w._window_grid_cut = (1, 8) if windowed else None
         w._kv_per_block = 1

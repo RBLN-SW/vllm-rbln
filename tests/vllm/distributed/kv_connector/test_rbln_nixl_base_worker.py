@@ -40,6 +40,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (
     RblnNixlPullConnectorWorker,
 )
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
+    RblnNixlPushConnectorWorker,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     _as_descs,
 )
@@ -208,10 +211,10 @@ class TestSwaWindowRatio:
             swa_window_mode=False,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
         # The window is still detected -- it gates the model parallelism guards
         # whether or not window mode is on.
-        assert worker._has_swa
+        assert worker._shape.has_swa
 
     def test_a_group_that_does_not_transfer_is_not_a_window(self, monkeypatch):
         # The specs this worker reasons about are the ones taking part in a
@@ -223,7 +226,7 @@ class TestSwaWindowRatio:
             specs=[_full_attention_spec(block_size=64)],
             non_transfer_specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._has_swa is False
+        assert worker._shape.has_swa is False
 
     def test_chunk_mode_leaves_the_window_knob_alone(self, monkeypatch):
         # The two knobs name different ranges, and a hybrid owns its
@@ -236,7 +239,7 @@ class TestSwaWindowRatio:
             chunk_mode=True,
             specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
 
     def test_chunk_mode_invents_no_ratio_without_a_window(self, monkeypatch):
         # The override rides on the window, not on the knob: an engine with no
@@ -248,17 +251,18 @@ class TestSwaWindowRatio:
             chunk_mode=True,
             specs=[MagicMock()],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
 
-    def test_pure_full_attention_keeps_ratio_none(self, monkeypatch):
-        # A non-sliding-window group contributes no ratio.
+    def test_pure_full_attention_keeps_the_window_knob_inert(self, monkeypatch):
+        # A non-sliding-window group contributes no ratio, so the range the
+        # knob asks for has nothing to be cut by. The engine still starts.
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="rbln",  # window mode is the direct path's
             swa_window_mode=True,
             specs=[MagicMock()],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
 
     def test_a_window_as_wide_as_its_block_says_the_knob_did_nothing(
         self, monkeypatch, caplog
@@ -274,36 +278,12 @@ class TestSwaWindowRatio:
                 specs=[sliding_window_spec(block_size=64, sliding_window=64)],
             )
 
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio is None
         assert [
             r.getMessage()
             for r in caplog.records
             if "registered no window range" in r.getMessage()
         ]
-
-    def test_sliding_window_derives_block_over_window_ratio(self, monkeypatch):
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            swa_window_mode=True,
-            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-        )
-        assert worker._sw_ratio == 4
-
-    def test_a_hybrid_in_chunk_mode_owns_its_lists_without_a_window(self, monkeypatch):
-        # A shard list names one KV group, so a hybrid's chunk range has
-        # nowhere but the whole-engine lists -- and it reaches them without a
-        # window range beside it.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            swa_window_mode=False,
-            chunk_mode=True,
-            specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
-        )
-        worker._chunk_mode = True  # registration reads the knob, not __init__
-        assert worker._sw_ratio is None
-        assert worker._own_engine_layout
 
     def test_chunk_mode_on_one_group_stays_off_the_whole_engine_lists(
         self, monkeypatch
@@ -317,18 +297,72 @@ class TestSwaWindowRatio:
             chunk_mode=True,
             specs=[MagicMock()],
         )
-        worker._chunk_mode = True
+
         assert not worker._own_engine_layout
 
-    def test_window_equal_to_block_collapses_to_none(self, monkeypatch):
-        # ratio 1 means the window equals the full block -> no trimming.
+    def test_the_mla_invariant_is_checked(self, monkeypatch):
+        # `patches/attention.py` refuses this while the engine is built, so
+        # production cannot reach the assert -- but a stub reaches it, and the
+        # two desc ranges and a key-only latent are still uncombined.
+        with pytest.raises(AssertionError, match="sliding-window MLA"):
+            build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                swa_window_mode=True,
+                use_mla=True,
+                specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+            )
+
+    def test_two_full_groups_are_refused_the_streaming_knob(self, monkeypatch):
+        # Two full-attention groups: no per-shard list names two, and nothing
+        # puts the whole-engine lists in this engine's hands, so nothing on the
+        # wire can say which group a batch filled. Refused rather than turned
+        # off behind the operator's back.
+        with pytest.raises(RuntimeError, match="two with neither sliding"):
+            build_worker(
+                monkeypatch,
+                kv_buffer_device="rbln",
+                push_stream=True,
+                specs=[MagicMock(), MagicMock()],
+                cls=RblnNixlPushConnectorWorker,
+            )
+
+    def test_the_read_path_is_untouched(self, monkeypatch):
+        # `_writes_into_peer` separates the pull connector from the push one,
+        # not P from D -- both ends of a push pair run the push class. So what
+        # this pins is that the knob stays inert on the READ path, where no
+        # prefix ever leaves early and the refusal above has nothing to say.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            push_stream=True,
+            specs=[MagicMock(), MagicMock()],
+        )
+
+        assert worker._shape.streams_prefix is False
+
+    def test_sliding_window_derives_block_over_window_ratio(self, monkeypatch):
         worker = build_worker(
             monkeypatch,
             kv_buffer_device="rbln",
             swa_window_mode=True,
-            specs=[sliding_window_spec(block_size=64, sliding_window=64)],
+            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio is None
+        assert worker._shape.window_ratio == 4
+
+    def test_a_hybrid_in_chunk_mode_owns_its_lists_without_a_window(self, monkeypatch):
+        # What the coupling above used to buy. A shard list names one KV group,
+        # so a hybrid's chunk range has nowhere but the whole-engine lists --
+        # and it reaches them without a window range beside it.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="rbln",
+            swa_window_mode=False,
+            chunk_mode=True,
+            specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
+        )
+        assert worker._shape.window_ratio is None
+        assert worker._own_engine_layout
 
     def test_full_attention_groups_are_skipped(self, monkeypatch):
         # The hybrid shape: a model interleaves full-attention and sliding-window
@@ -339,7 +373,7 @@ class TestSwaWindowRatio:
             swa_window_mode=True,
             specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
         )
-        assert worker._sw_ratio == 4
+        assert worker._shape.window_ratio == 4
 
     def test_consistent_ratio_across_groups(self, monkeypatch):
         worker = build_worker(
@@ -351,7 +385,7 @@ class TestSwaWindowRatio:
                 sliding_window_spec(block_size=64, sliding_window=16),
             ],
         )
-        assert worker._sw_ratio == 4
+        assert worker._shape.window_ratio == 4
 
     def test_mismatched_ratios_are_rejected(self, monkeypatch):
         with pytest.raises(RuntimeError, match="same number of kernel blocks"):
@@ -402,24 +436,12 @@ class TestSwaWindowRatio:
                 ],
             )
 
-    def test_mla_with_window_mode_is_rejected_at_startup(self, monkeypatch):
-        # The dual desc range and a key-only latent have not been combined,
-        # so fail at construction rather than at the first handshake.
-        with pytest.raises(RuntimeError, match="sliding-window MLA"):
-            build_worker(
-                monkeypatch,
-                kv_buffer_device="rbln",
-                swa_window_mode=True,
-                use_mla=True,
-                specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-            )
-
 
 class TestSwaWindowDelegation:
-    # Both collapse to the upstream Full-only implementation when _sw_ratio is
+    # Both collapse to the upstream Full-only implementation when window_ratio is
     # None; the SWA dual-range paths are exercised in the Swa classes below.
     def test_register_local_xfer_handler_delegates_when_no_swa(self, monkeypatch):
-        worker = build_worker(monkeypatch)  # _sw_ratio is None
+        worker = build_worker(monkeypatch)  # window_ratio is None
         calls: list = []
 
         def super_handler(self, block_size):
@@ -435,7 +457,7 @@ class TestSwaWindowDelegation:
     def test_a_fanned_out_peer_does_not_take_the_whole_engine_path(self, monkeypatch):
         # One handle covers every region once, which cannot express a slice the
         # peer holds on several of its chiplets.
-        worker = build_worker(monkeypatch)  # _sw_ratio is None
+        worker = build_worker(monkeypatch)  # window_ratio is None
 
         monkeypatch.setattr(
             NixlBaseConnectorWorker,
@@ -451,7 +473,7 @@ class TestSwaWindowDelegation:
         assert worker.register_local_xfer_handler(64, replica_fanout=2) == "shard"
 
     def test_add_remote_agent_delegates_when_no_swa(self, monkeypatch):
-        worker = build_worker(monkeypatch)  # _sw_ratio is None
+        worker = build_worker(monkeypatch)  # window_ratio is None
         calls: list = []
 
         # Defaults mirror upstream's own signature, so what the delegation
@@ -512,15 +534,14 @@ class TestRegisterLocalXferHandlerSwa:
             swa_kernel_block=kernel_block,
         )
         w = make_worker(kv_cache=geo, swa_window_mode=True)
-        assert (w._has_swa, w._sw_ratio) == (True, 2)
-        assert w._window_grid_cut == (runs, 2)
+        assert (w._shape.has_swa, w._shape.window_ratio) == (True, 2)
 
         blocks_data = w.src_blocks_data
         full_len = w.block_len_per_layer[0]
         # A whole block is one descriptor whatever it packs; the window range
         # cuts that same block into the pieces that tile it.
         whole_descs = w.num_regions * w.num_blocks
-        pieces = runs * w._sw_ratio
+        pieces = runs * w._shape.window_ratio
         assert len(blocks_data) == whole_descs * (1 + pieces)
         full, swa = blocks_data[:whole_descs], blocks_data[whole_descs:]
         # The order is a contract, not a detail: a transfer turns (region, block)
@@ -667,7 +688,6 @@ class TestTheWindowRangeTilesABlock:
         w.block_size = 64
         window_mode(w, self.SW_RATIO, runs=self.RUNS)
         w._has_mamba = False
-        w._chunk_mode = False
         w._kv_per_block = kv_per_block
         w.engine_id = "local"
         w.tp_rank = 0
@@ -727,7 +747,6 @@ class TestASlidingWindowOnThePeerSide(TestTheWindowRangeTilesABlock):
 
     def _descs(self, kv_per_block):
         w = self._worker(kv_per_block)
-        w._has_swa = True
         w._remote_agents = {}
         w.dst_num_blocks = {}
         # The peer's region ledger, which registering it now records beside the
@@ -787,7 +806,7 @@ class TestAWindowRangeNeedsAGeometryItCanCut:
     def _worker(blocks, *, axis=KVSplitAxis.HEAD, areas=1):
         w = object.__new__(RblnNixlPullConnectorWorker)
         w.block_size = 64
-        w._sw_ratio = 4
+        window_mode(w, 4)
         w._swa_kernel_blocks = blocks
         w._kv_split_axis = axis
         w._kv_areas, w._kv_slices = areas, areas
@@ -849,6 +868,38 @@ class TestWindowModeNeedsAWindowThatMoves:
                 swa_window_mode=True,
             )
 
+    def test_a_window_as_wide_as_its_block_is_not_refused(self, monkeypatch):
+        # Such a window never moves through its block, so the refusal above
+        # has nothing to protect: the engine keeps no range and starts. It is
+        # the ratio that says so, and the ratio is settled before the spec is.
+        spec = MagicMock(spec=RBLNSlidingWindowSpec)
+        spec.block_size, spec.sliding_window = 64, 64
+
+        worker = build_worker(
+            monkeypatch,
+            specs=[spec],
+            kv_buffer_device="rbln",
+            swa_window_mode=True,
+        )
+
+        assert worker._shape.window_ratio is None
+
+    def test_host_staging_does_not_refuse_the_reader_the_streaming_knob(
+        self, monkeypatch
+    ):
+        # The two sides are given the same config, and host staging refuses
+        # every knob that needs the direct path's lists. `push_stream` is the
+        # one the reader never acts on, so refusing it there would turn an
+        # engine away over a feature already inert in its own shape.
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            specs=[sliding_window_spec(block_size=64, sliding_window=32)],
+            push_stream=True,
+        )
+
+        assert worker._shape.streams_prefix is False
+
     def test_a_window_that_moves_is_not(self, monkeypatch):
         # The control: the same geometry under the spec whose window slides.
         worker = build_worker(
@@ -858,4 +909,4 @@ class TestWindowModeNeedsAWindowThatMoves:
             swa_window_mode=True,
         )
 
-        assert worker._sw_ratio == 2
+        assert worker._shape.window_ratio == 2

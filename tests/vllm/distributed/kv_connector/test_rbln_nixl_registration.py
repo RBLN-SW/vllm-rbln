@@ -49,6 +49,7 @@ from tests.vllm.distributed.kv_connector.utils import (
     mock_vllm_config,
     patch_in_package,
     patched_in_package,
+    set_shape,
     sliding_window_spec,
     window_mode,
 )
@@ -184,6 +185,8 @@ def _prep_impl_worker(
     specs=None,
     chunk_mode=False,
     chunk_tokens=0,
+    push_stream=False,
+    cls=None,
 ):
     # A D2D worker back-filled with the attributes upstream __init__ would set.
     worker = build_worker(
@@ -195,6 +198,8 @@ def _prep_impl_worker(
         specs=specs,
         chunk_mode=chunk_mode,
         chunk_tokens=chunk_tokens,
+        push_stream=push_stream,
+        cls=cls,
     )
     worker.tp_rank = 0
     worker.world_size = 1
@@ -1298,8 +1303,9 @@ class TestPpConstraints:
         w.transfer_topo = MagicMock()
         w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
-        window_mode(w, sw_ratio)
-        w._has_swa = (sw_ratio is not None) if has_swa is None else has_swa
+        window_mode(
+            w, sw_ratio, has_swa=(sw_ratio is not None) if has_swa is None else has_swa
+        )
         w.use_mla = use_mla
         return w
 
@@ -1329,7 +1335,7 @@ class TestPpConstraints:
     @pytest.mark.parametrize("sw_ratio", [2, None])
     def test_swa_pp_raises(self, sw_ratio):
         # `sw_ratio=None` is the model with window mode off: a sliding window
-        # bars pipelining on its own, which is what `_has_swa` exists for.
+        # bars pipelining on its own, which is what `has_swa` exists for.
         with pytest.raises(RuntimeError, match="sliding-window attention"):
             self._worker(
                 pp_size=2, sw_ratio=sw_ratio, has_swa=True
@@ -1393,8 +1399,7 @@ class TestPublishHandshakeMetadata:
         w.transfer_topo = MagicMock()
         w.transfer_topo.cross_layers_blocks = cross_layers
         w._has_mamba = has_mamba
-        window_mode(w, None)
-        w._has_swa = False
+        window_mode(w, None, has_swa=False)
         w._swa_kernel_blocks = set(swa_kernel_blocks)
         w.use_mla = False
         # Chiplet geometry travels with the metadata so a consumer with a
@@ -1754,7 +1759,7 @@ class TestTheLayoutReachesTheDescriptors:
         w._kv_slices = kv_slices
         w._kv_per_block = kv_per_block
         # The chunk grid asks for the head bands before it asks anything else.
-        w._chunk_mode = False
+        set_shape(w, chunk_mode=False)
         w._logical_region_kv_heads = [8]
         topo = MagicMock()
         topo.tp_size = tp_size
@@ -1854,7 +1859,7 @@ class TestTailBlockTrim:
     def test_a_context_cut_into_whole_areas_enables_the_trim(self, monkeypatch):
         worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=True)
         assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
-        assert worker._chunk_mode is True
+        assert worker._shape.chunk_mode is True
 
     def test_registration_leaves_the_grid_a_transfer_reads_back(self, monkeypatch):
         # A transfer picks its range by this, and nothing else sets it: left
@@ -1894,7 +1899,7 @@ class TestTailBlockTrim:
         # Same cut, opposite answer: nothing about the geometry turns this on.
         worker = self._register(monkeypatch, areas=4, slices=4, chunk_mode=False)
         assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
-        assert worker._chunk_mode is False
+        assert worker._shape.chunk_mode is False
 
     def test_a_head_cut_is_taken_as_well(self, monkeypatch):
         # 8 heads over 4 slices is head tiling: an area holds every token of
@@ -1904,7 +1909,7 @@ class TestTailBlockTrim:
             monkeypatch, areas=4, slices=4, num_kv_heads=8, chunk_mode=True
         )
         assert worker._kv_split_axis is KVSplitAxis.HEAD
-        assert worker._chunk_mode is True
+        assert worker._shape.chunk_mode is True
 
     def test_replicated_areas_are_refused_on_a_context_cut(self, monkeypatch):
         # Two areas per slice: the position no longer names one token range.
@@ -1915,6 +1920,21 @@ class TestTailBlockTrim:
         # 64 tokens over 5 areas: no area is a whole number of them.
         with pytest.raises(RuntimeError, match="context-cut"):
             self._register(monkeypatch, areas=5, slices=5, chunk_mode=True)
+
+    def test_a_streamed_write_is_refused_on_the_same_geometry(self, monkeypatch):
+        # The grid is built for a side that writes a request in pieces as well
+        # as for the knob, so the position arithmetic it feeds has to hold for
+        # both. Without the knob nothing here says `chunk_mode`, and the
+        # refusal that names it would let this through.
+        with pytest.raises(RuntimeError, match="context-cut"):
+            self._register(
+                monkeypatch,
+                areas=4,
+                slices=2,
+                chunk_mode=False,
+                push_stream=True,
+                cls=RblnNixlPushConnectorWorker,
+            )
 
     def test_host_staging_is_refused_before_anything_registers(self, monkeypatch):
         # Host staging keeps one full-shape buffer per layer, so the flag would
@@ -1928,6 +1948,28 @@ class TestTailBlockTrim:
         with pytest.raises(RuntimeError, match="host staging"):
             build_worker(monkeypatch, kv_buffer_device="cpu", swa_window_mode=True)
 
+    def test_host_staging_refuses_streaming_on_the_side_that_would_do_it(
+        self, monkeypatch
+    ):
+        # A prefix offer is named in per-shard descriptors, which host staging
+        # has none of. It used to be dropped in silence, leaving an operator
+        # who asked for it with an engine that never streamed.
+        with pytest.raises(RuntimeError, match="host staging"):
+            build_worker(
+                monkeypatch,
+                kv_buffer_device="cpu",
+                push_stream=True,
+                cls=RblnNixlPushConnectorWorker,
+            )
+
+    def test_host_staging_leaves_the_reading_side_alone(self, monkeypatch):
+        # One `--kv-transfer-config` reaches both ends, and the knob names
+        # something only the writer does. Refusing it here would refuse the
+        # consumer of a pair whose producer legitimately asked.
+        worker = build_worker(monkeypatch, kv_buffer_device="cpu", push_stream=True)
+
+        assert worker._shape.streams_prefix is False
+
 
 class TestChunkModeWithASlidingWindow:
     """A hybrid engine is let into chunk mode because it owns the whole-engine
@@ -1938,8 +1980,16 @@ class TestChunkModeWithASlidingWindow:
     admission."""
 
     @staticmethod
-    def _register(monkeypatch, *, specs, chunk_mode=True, axis=None):
-        worker = _prep_impl_worker(monkeypatch, specs=specs, chunk_mode=chunk_mode)
+    def _register(
+        monkeypatch, *, specs, chunk_mode=True, axis=None, push_stream=False, cls=None
+    ):
+        worker = _prep_impl_worker(
+            monkeypatch,
+            specs=specs,
+            chunk_mode=chunk_mode,
+            push_stream=push_stream,
+            cls=cls,
+        )
         # A context cut is one head per region over more than one slice; a head
         # cut is the default 8 heads over one. The axis is derived from that
         # pair, so asking for it here means building the geometry that makes it.
@@ -2001,8 +2051,8 @@ class TestChunkModeWithASlidingWindow:
         # whole-engine lists on its own.
         worker = self._register(monkeypatch, specs=self._hybrid_specs())
 
-        assert worker._sw_ratio is None
-        assert worker._chunk_mode is True
+        assert worker._shape.window_ratio is None
+        assert worker._shape.chunk_mode is True
         assert worker._own_engine_layout
 
     def test_two_groups_without_a_window_are_still_refused(self, monkeypatch):
@@ -2024,6 +2074,21 @@ class TestChunkModeWithASlidingWindow:
                 axis=KVSplitAxis.NON_HEAD,
             )
 
+    def test_a_streamed_hybrid_on_a_context_cut_is_refused(self, monkeypatch):
+        # A hybrid stays on the whole-engine lists whichever asked for the
+        # chunks, and those lists name every region's chunks with no way to say
+        # which span holds the last token. Streaming reaches them without the
+        # knob, so the refusal cannot be the knob's alone.
+        with pytest.raises(RuntimeError, match="needs a head cut"):
+            self._register(
+                monkeypatch,
+                specs=self._hybrid_specs(),
+                chunk_mode=False,
+                push_stream=True,
+                axis=KVSplitAxis.NON_HEAD,
+                cls=RblnNixlPushConnectorWorker,
+            )
+
     def test_a_window_with_no_full_group_to_trim_is_refused(self, monkeypatch):
         # The view alone is not the point: a chunk cuts full-attention blocks,
         # and an engine with none of them would register a range it never uses.
@@ -2031,4 +2096,17 @@ class TestChunkModeWithASlidingWindow:
             self._register(
                 monkeypatch,
                 specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+            )
+
+    def test_a_streamed_engine_with_no_full_group_is_refused(self, monkeypatch):
+        # Streaming names part of a block without the knob, so the refusal
+        # cannot be the knob's: this engine registers, and the write path's
+        # asserts then name a group it has none of, mid-transfer.
+        with pytest.raises(RuntimeError, match="one full-attention"):
+            self._register(
+                monkeypatch,
+                specs=[sliding_window_spec(block_size=64, sliding_window=16)],
+                chunk_mode=False,
+                push_stream=True,
+                cls=RblnNixlPushConnectorWorker,
             )
