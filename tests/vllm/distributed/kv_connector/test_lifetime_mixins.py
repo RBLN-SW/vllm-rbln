@@ -34,6 +34,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import pathlib
 import pkgutil
 import textwrap
 
@@ -89,6 +90,61 @@ def _collisions(base: type, mixins: list[type]) -> list[str]:
         for name in sorted(_own_callables(cls) & shared)
     ]
     return sorted(found)
+
+
+def _sw_ratio_asked_as_a_question(sources: dict[str, str] | None = None) -> list[str]:
+    """Where the package reads `_sw_ratio` for yes/no rather than for its value.
+
+    Two questions ride on the ratio and neither may be asked off it again.
+    `_own_engine_layout` is "do the whole-engine lists carry a range upstream
+    has no room for", which chunk mode also answers yes; `_window_grid` is "is
+    there a window range, and how is it cut". Asking either off the ratio ties
+    it back to one knob, which is what the connector spent a round untangling.
+
+    The two that answer are skipped by name, and `base_worker.py` whole: the
+    ratio is derived there, and the reads around that derivation are about
+    whether there is one to derive.
+
+    Args:
+        sources: filename -> source, for the test that feeds this a known
+            offender. Reads the package when absent.
+    """
+    if sources is None:
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import rbln_nixl
+
+        root = pathlib.Path(rbln_nixl.__file__).parent
+        sources = {p.name: p.read_text() for p in sorted(root.glob("*.py"))}
+    found: list[str] = []
+    for name, source in sorted(sources.items()):
+        if name == "base_worker.py":
+            continue
+        tree = ast.parse(source)
+        answers = {
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("_own_engine_layout", "_window_grid")
+        }
+        skip = {id(sub) for node in answers for sub in ast.walk(node)}
+        for node in ast.walk(tree):
+            if id(node) in skip:
+                continue
+            if isinstance(node, (ast.If, ast.IfExp, ast.While, ast.Assert)):
+                tests = [node.test]
+            elif isinstance(node, ast.BoolOp):
+                tests = node.values
+            else:
+                continue
+            for test in tests:
+                for sub in ast.walk(test):
+                    if (
+                        isinstance(sub, ast.Attribute)
+                        and sub.attr == "_sw_ratio"
+                        and isinstance(sub.value, ast.Name)
+                        and sub.value.id == "self"
+                    ):
+                        found.append(f"{name}:{sub.lineno}")
+    return sorted(set(found))
 
 
 def _self_reads(cls: type) -> set[str]:
@@ -222,3 +278,33 @@ def test_the_check_sees_a_read_across_two_lifetimes():
     # Nobody owns `owned_by_one` now, and a lifetime reading its own member
     # is what the rule permits -- both must come back clean.
     assert _cross_reads(CrossBase, [CrossSibling]) == []
+
+
+def test_the_layout_question_is_asked_in_one_place():
+    # `_own_engine_layout` is what every builder, peer mirror and index
+    # arithmetic dispatches on. Reading the ratio for yes/no instead binds the
+    # descriptor layout to whichever feature happens to set the ratio.
+    assert _sw_ratio_asked_as_a_question() == []
+
+
+def test_the_check_sees_a_ratio_asked_as_a_question():
+    # Without this the test above passes on a rule that matches nothing, and
+    # re-walking the tree here would pass on a rule of its own -- so this feeds
+    # the check an offender and asks what IT found.
+    assert _sw_ratio_asked_as_a_question(
+        {"made_up.py": "if self._sw_ratio is None:\n    pass\n"}
+    ) == ["made_up.py:1"]
+
+    # And the two exemptions are exemptions, not blind spots: the same read
+    # inside the functions that answer, and anywhere in the file that derives
+    # the ratio, is not a finding.
+    assert (
+        _sw_ratio_asked_as_a_question(
+            {
+                "made_up.py": "def _window_grid(self):\n"
+                "    if self._sw_ratio is None:\n        pass\n",
+                "base_worker.py": "if self._sw_ratio is None:\n    pass\n",
+            }
+        )
+        == []
+    )
