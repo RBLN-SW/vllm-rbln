@@ -226,8 +226,8 @@ def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
         f"{vllm_config.parallel_config.pipeline_parallel_size} is supported on "
         f"RBLN only for target architectures {sorted(AUX_PP_TARGET_ARCHS)}, but "
         f"got {list(architectures)}. Run this target with "
-        "pipeline_parallel_size=1, or with a draft that does not consume the "
-        "target's auxiliary hidden states."
+        "pipeline_parallel_size=1, or with a draft method that does not "
+        "consume the target's auxiliary hidden states."
     )
 
 
