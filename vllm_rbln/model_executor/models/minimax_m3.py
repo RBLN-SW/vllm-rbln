@@ -932,8 +932,8 @@ _mm_preprocess = _load_upstream_common("mm_preprocess")
 _vision_tower = _load_upstream_common("vision_tower")
 
 
-# Patches per image the compiled vision encoder takes (48 x 48 grid, 672 x 672 px).
-MM_ENCODER_PATCH_BUCKET = 2304
+# (72 x 72 grid, 1008 x 1008 px = max_image_resolution 1008 / patch_size 14).
+MM_ENCODER_PATCH_BUCKET = 5184
 
 
 class _RBLNVisionEncoder(nn.Module):
