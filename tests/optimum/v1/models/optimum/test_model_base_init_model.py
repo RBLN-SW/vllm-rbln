@@ -16,80 +16,26 @@
 Configs defined in transformers are passed directly as objects. Other configs
 are passed as kwargs containing ``num_hidden_layers`` and, when available,
 ``layer_types``, nested under ``text_config`` for composite models.
-NPU-dependent operations are replaced with test doubles.
 """
 
-import os
-import types
-
-import torch
-from transformers import Gemma4Config
-
-from vllm_rbln.config import OptimumRBLNConfig
-from vllm_rbln.model_executor.models.optimum import model_base
-from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
+from transformers import Gemma4Config, PretrainedConfig
+from vllm.transformers_utils.configs import Qwen3ASRConfig
 
 
-def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
-    passed = {}
+class FlatConfig(PretrainedConfig):
+    """A decoder config defined outside transformers, with no sub-configs."""
 
-    class FakeRBLNModel:
-        @classmethod
-        def from_pretrained(cls, path, **kwargs):
-            passed.update(kwargs)
-            # An export writes the compiled model into `model_save_dir`; the
-            # cache publish below checks for it.
-            save_dir = kwargs["model_save_dir"]
-            os.makedirs(save_dir, exist_ok=True)
-            open(os.path.join(save_dir, RBLN_CONFIG_FILE), "w").close()
-            return types.SimpleNamespace(rbln_config=types.SimpleNamespace())
-
-    monkeypatch.setattr(
-        model_base.RBLNCompileSpec,
-        "for_architecture",
-        classmethod(
-            lambda cls, *a, **k: types.SimpleNamespace(
-                model_cls=FakeRBLNModel, rbln_config={}
-            )
-        ),
-    )
-    monkeypatch.setattr(model_base, "get_attn_block_size", lambda cfg: 4096)
-
-    obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
-    obj.model_config = types.SimpleNamespace(
-        hf_config=hf_config,
-        model="repo",
-        max_model_len=4096,
-        dtype=torch.float16,
-    )
-    obj.scheduler_config = types.SimpleNamespace(
-        max_num_seqs=1, max_num_batched_tokens=128
-    )
-    obj.vllm_config = types.SimpleNamespace(
-        # What `check_and_update` leaves on the config, which is what
-        # `init_model` reads its options off.
-        additional_config=OptimumRBLNConfig(cached_model_path=str(tmp_path / "cache")),
-        model_config=obj.model_config,
-        scheduler_config=obj.scheduler_config,
-        cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
-        ec_transfer_config=None,
-    )
-    obj.init_model()
-    return passed
+    model_type = "flat_decoder_for_test"
 
 
-def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_path):
-    # For a flat non-transformers config, pass layer settings as top-level
-    # kwargs rather than passing the config object.
-    hf_config = types.SimpleNamespace(
+def test_flat_config_passes_layer_count_as_top_level_kwargs(export_kwargs):
+    hf_config = FlatConfig(
         architectures=["Qwen3ForCausalLM"],
         num_hidden_layers=2,
         layer_types=["full_attention", "full_attention"],
     )
-    hf_config.get_text_config = lambda: hf_config
 
-    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+    passed = export_kwargs(hf_config)
 
     assert "config" not in passed
     assert passed["num_hidden_layers"] == 2
@@ -97,29 +43,26 @@ def test_flat_config_passes_layer_count_as_top_level_kwargs(monkeypatch, tmp_pat
     assert "text_config" not in passed
 
 
-def test_composite_config_nests_layer_count_under_text_config(monkeypatch, tmp_path):
-    # For a composite non-transformers config, nest the layer override under
-    # text_config rather than passing it as a top-level kwarg.
-    text_config = types.SimpleNamespace(num_hidden_layers=2)
-    hf_config = types.SimpleNamespace(
+def test_composite_config_nests_layer_count_under_text_config(export_kwargs):
+    # vLLM defines Qwen3-ASR's config, so the object itself does not go through.
+    hf_config = Qwen3ASRConfig(
         architectures=["Qwen3ASRForConditionalGeneration"],
-        get_text_config=lambda: text_config,
+        text_config={"num_hidden_layers": 2},
     )
 
-    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+    passed = export_kwargs(hf_config)
 
     assert "config" not in passed
     assert passed["text_config"] == {"num_hidden_layers": 2}
     assert "num_hidden_layers" not in passed
 
 
-def test_transformers_config_is_forwarded_as_the_config_object(monkeypatch, tmp_path):
+def test_transformers_config_is_forwarded_as_the_config_object(export_kwargs):
     # gemma4's config carries per-layer state that the kwargs cannot reproduce,
     # and transformers defines the class, so the object itself goes through.
-    hf_config = Gemma4Config()
-    hf_config.architectures = ["Gemma4ForConditionalGeneration"]
+    hf_config = Gemma4Config(architectures=["Gemma4ForConditionalGeneration"])
 
-    passed = _init_model_with(monkeypatch, tmp_path, hf_config)
+    passed = export_kwargs(hf_config)
 
     assert passed["config"] is hf_config
     assert "text_config" not in passed

@@ -14,167 +14,99 @@
 """On a cache miss the compiled model is exported into a staging directory
 beside the cache entry and published by one rename.
 
-The alternative -- optimum's default ``TemporaryDirectory`` under ``$TMPDIR``
-followed by ``save_pretrained`` into the cache -- holds the artifact twice on
-disk and leaks the ``$TMPDIR`` copy whenever the server is stopped by a signal.
-Every worker process that misses the cache compiles, so the staging directory
-is per process and a publish that finds a sibling's artifact keeps it.
+optimum's default, a `TemporaryDirectory` under `$TMPDIR` copied into the
+cache by `save_pretrained`, holds the artifact twice and leaks the `$TMPDIR`
+copy when the server is stopped by a signal. Every process that misses the
+cache compiles, so the staging directory is per process and a publish that
+finds a sibling's artifact keeps it.
 """
 
-import os
-import types
-from typing import Any
+import tempfile
+from pathlib import Path
 
 import pytest
-import torch
-from transformers import LlamaConfig
+from vllm.config import VllmConfig
 
-from vllm_rbln.config import OptimumRBLNConfig
-from vllm_rbln.model_executor.models.optimum import model_base
 from vllm_rbln.model_executor.models.optimum.model_base import RBLNOptimumModelBase
-from vllm_rbln.utils.optimum.paths import RBLN_CONFIG_FILE
+from vllm_rbln.utils.optimum.paths import is_compiled_dir
+
+from .conftest import write_compiled_dir
 
 
-def _write_compiled_dir(path: str, marker: str = "prefill.rbln") -> None:
-    os.makedirs(path, exist_ok=True)
-    with open(os.path.join(path, RBLN_CONFIG_FILE), "w") as f:
-        f.write("{}")
-    with open(os.path.join(path, marker), "wb") as fb:
-        fb.write(b"rbln")
+@pytest.fixture
+def cache(vllm_config: VllmConfig) -> Path:
+    """The cache entry the config build staged for this miss."""
+    return Path(vllm_config.additional_config.cached_model_path)
 
 
-def _fake_export(passed: dict[str, Any], *, write_config=True, on_export=None):
-    """A model class whose export writes into ``model_save_dir`` like optimum
-    does. ``save_pretrained`` must not be reached: the export is published by
-    rename, not copied. ``on_export`` runs after the files are written, before
-    the publish -- where a sibling process can interleave."""
+def test_export_lands_in_the_cache_without_a_temp_copy(vllm_config, fake_export, cache):
+    RBLNOptimumModelBase(vllm_config)
 
-    class FakeRBLNModel:
-        @classmethod
-        def from_pretrained(cls, path, **kwargs):
-            passed.update(kwargs)
-            save_dir = kwargs["model_save_dir"]
-            if write_config:
-                _write_compiled_dir(save_dir)
-            if on_export is not None:
-                on_export()
-
-            def save_pretrained(_path):
-                raise AssertionError("the export is published by rename, not copied")
-
-            return types.SimpleNamespace(
-                rbln_config=types.SimpleNamespace(),
-                save_pretrained=save_pretrained,
-            )
-
-    return FakeRBLNModel
-
-
-def _init_model(monkeypatch, cached_model_path, model_cls) -> types.SimpleNamespace:
-    monkeypatch.setattr(
-        model_base.RBLNCompileSpec,
-        "for_architecture",
-        classmethod(
-            lambda cls, *a, **k: types.SimpleNamespace(
-                model_cls=model_cls, rbln_config={}
-            )
-        ),
-    )
-    monkeypatch.setattr(model_base, "get_attn_block_size", lambda cfg: 4096)
-
-    hf_config = LlamaConfig(num_hidden_layers=2)
-    hf_config.architectures = ["LlamaForCausalLM"]
-    obj = RBLNOptimumModelBase.__new__(RBLNOptimumModelBase)
-    obj.model_config = types.SimpleNamespace(
-        hf_config=hf_config, model="repo", max_model_len=4096, dtype=torch.float16
-    )
-    obj.scheduler_config = types.SimpleNamespace(
-        max_num_seqs=1, max_num_batched_tokens=128
-    )
-    obj.vllm_config = types.SimpleNamespace(
-        additional_config=OptimumRBLNConfig(cached_model_path=cached_model_path),
-        model_config=obj.model_config,
-        scheduler_config=obj.scheduler_config,
-        cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
-        ec_transfer_config=None,
-    )
-    obj.init_model()
-    return obj
-
-
-def _entries(root: str) -> list[str]:
-    return sorted(os.listdir(root))
-
-
-def test_export_lands_in_the_cache_without_a_temp_copy(monkeypatch, tmp_path):
-    cache_root = tmp_path / "compiled_models"
-    cache = str(cache_root / "repo_abcd")
-    passed: dict[str, Any] = {}
-
-    obj = _init_model(monkeypatch, cache, _fake_export(passed))
-
-    # optimum was told where to write: a fresh directory beside the cache entry,
-    # on the same filesystem, never $TMPDIR.
-    staging = passed["model_save_dir"]
-    assert os.path.dirname(staging) == str(cache_root)
-    assert os.path.basename(staging).startswith("repo_abcd.export-")
+    (kwargs,) = fake_export.calls
+    staging = Path(kwargs["model_save_dir"])
+    # optimum was told to write beside the cache entry, never under $TMPDIR.
+    assert staging.parent == cache.parent
+    assert staging.name.startswith(f"{cache.name}.export-")
     # The staging directory became the cache entry and nothing else remains.
-    assert model_base.is_compiled_dir(cache)
-    assert _entries(str(cache_root)) == ["repo_abcd"]
-    assert obj.vllm_config.model_config.model == cache
+    assert is_compiled_dir(str(cache))
+    assert list(cache.parent.iterdir()) == [cache]
+    assert vllm_config.model_config.model == str(cache)
 
 
-def test_two_exports_get_two_staging_dirs(monkeypatch, tmp_path):
-    # Data-parallel ranks miss the cache together; their exports must not share
-    # a directory.
-    cache = str(tmp_path / "repo_abcd")
-    first: dict[str, Any] = {}
-    second: dict[str, Any] = {}
-    _init_model(monkeypatch, cache, _fake_export(first))
-    os.rename(cache, cache + ".first")  # make the second call miss again
-    _init_model(monkeypatch, cache, _fake_export(second))
+def test_a_sibling_export_in_progress_is_left_alone(vllm_config, fake_export, cache):
+    def sibling_starts_exporting() -> None:
+        tempfile.mkdtemp(prefix=f"{cache.name}.export-", dir=cache.parent)
 
-    assert first["model_save_dir"] != second["model_save_dir"]
+    fake_export.after_export = staticmethod(sibling_starts_exporting)
+    RBLNOptimumModelBase(vllm_config)
 
-
-def test_a_sibling_that_published_first_keeps_its_artifact(monkeypatch, tmp_path):
-    cache = str(tmp_path / "repo_abcd")
-
-    def sibling_publishes():
-        _write_compiled_dir(cache, marker="sibling.rbln")
-
-    _init_model(monkeypatch, cache, _fake_export({}, on_export=sibling_publishes))
-
-    # The sibling's directory is untouched and our staging dir is gone.
-    assert os.path.exists(os.path.join(cache, "sibling.rbln"))
-    assert not os.path.exists(os.path.join(cache, "prefill.rbln"))
-    assert _entries(str(tmp_path)) == ["repo_abcd"]
+    assert is_compiled_dir(str(cache))
+    others = [p for p in cache.parent.iterdir() if p != cache]
+    assert len(others) == 1 and others[0].name.startswith(f"{cache.name}.export-")
 
 
-def test_a_partial_cache_entry_from_a_dead_export_is_replaced(monkeypatch, tmp_path):
-    cache = str(tmp_path / "repo_abcd")
+def test_a_sibling_that_published_first_keeps_its_artifact(
+    vllm_config, fake_export, cache
+):
+    fake_export.after_export = staticmethod(
+        lambda: write_compiled_dir(cache, marker="sibling.rbln")
+    )
+    RBLNOptimumModelBase(vllm_config)
+
+    # The sibling's directory is untouched and our staging directory is gone.
+    assert (cache / "sibling.rbln").exists()
+    assert not (cache / "prefill.rbln").exists()
+    assert list(cache.parent.iterdir()) == [cache]
+
+
+def test_a_partial_cache_entry_from_a_dead_export_is_replaced(
+    vllm_config, fake_export, cache
+):
     # A previous run died mid-export: the cache path exists but is not a
-    # compiled dir (no rbln_config.json).
-    os.makedirs(cache)
-    open(os.path.join(cache, "half.rbln"), "wb").close()
+    # compiled directory (no rbln_config.json).
+    cache.mkdir(parents=True)
+    (cache / "half.rbln").touch()
 
-    _init_model(monkeypatch, cache, _fake_export({}))
+    RBLNOptimumModelBase(vllm_config)
 
-    assert model_base.is_compiled_dir(cache)
-    assert not os.path.exists(os.path.join(cache, "half.rbln"))
-    assert _entries(str(tmp_path)) == ["repo_abcd"]
+    assert is_compiled_dir(str(cache))
+    assert not (cache / "half.rbln").exists()
+    assert list(cache.parent.iterdir()) == [cache]
 
 
-def test_an_export_that_wrote_no_compiled_model_is_not_published(monkeypatch, tmp_path):
-    cache = str(tmp_path / "repo_abcd")
+def test_an_export_that_wrote_no_compiled_model_is_not_published(
+    vllm_config, fake_export, cache
+):
+    fake_export.writes_compiled_dir = False
 
     with pytest.raises(RuntimeError, match="left no compiled model"):
-        _init_model(monkeypatch, cache, _fake_export({}, write_config=False))
+        RBLNOptimumModelBase(vllm_config)
 
-    assert not model_base.is_compiled_dir(cache)
-    assert _entries(str(tmp_path)) == []
+    assert not cache.parent.exists() or list(cache.parent.iterdir()) == []
 
 
-def test_a_cache_miss_without_a_cache_path_is_an_error(monkeypatch, tmp_path):
+def test_a_cache_miss_without_a_cache_path_is_an_error(vllm_config, fake_export):
+    vllm_config.additional_config.cached_model_path = None
+
     with pytest.raises(RuntimeError, match="cache miss without a cache path"):
-        _init_model(monkeypatch, None, _fake_export({}))
+        RBLNOptimumModelBase(vllm_config)
