@@ -1963,10 +1963,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
             elif not self.is_strict_kv_producer:
-                # A draft-model proposer still runs its first pass on a producer,
-                # to write the KV the consumer's drafter reads. The others hold
-                # no KV, so on a producer they would only build drafts nobody
-                # verifies.
+                # The proposers here hold no KV of their own, so on a producer
+                # they would only build drafts nobody verifies. The draft-model
+                # ones took the branch above, where the first pass still runs to
+                # write the KV the consumer's drafter reads.
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
             if not input_fits_in_drafter:
@@ -3645,7 +3645,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.run_model_graphs()
 
             # A strict producer admits one request per step, since every step it
-            # runs is a prefill, so that is the only width it samples at.
+            # runs is a prefill, so warm-up samples at that width.
             batch_buckets = (
                 [1]
                 if self.is_strict_kv_producer

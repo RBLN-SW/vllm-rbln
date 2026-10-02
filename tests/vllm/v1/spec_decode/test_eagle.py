@@ -434,9 +434,9 @@ class TestPropose:
     def test_a_strict_producer_runs_one_pass_and_drafts_nothing(
         self, draft_has_moe, monkeypatch
     ):
-        # A producer hands its KV off and never verifies a draft, so the first
-        # pass (which writes the KV the consumer's drafter reads) is the only
-        # one worth running. Unlike the chunk case there is no MoE carve-out:
+        # A producer hands its KV off and never verifies a draft. The first
+        # pass writes the KV the consumer's drafter reads, so it stays and the
+        # drafting loop goes. Unlike the chunk case there is no MoE carve-out:
         # every rank of a producer prefills, so no peer is inside a collective.
         _neutralize(monkeypatch)
         proposer = make_eagle_proposer(method="eagle", num_speculative_tokens=3)

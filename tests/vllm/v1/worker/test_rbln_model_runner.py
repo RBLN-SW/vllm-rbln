@@ -2122,8 +2122,8 @@ class TestDecodeGraphShapes:
         assert shapes[-1] == (4, 1, 4 * 4)
 
     def test_a_strict_producer_compiles_no_decode_graph(self):
-        # Every step a producer runs is a prefill step, so warm-up issues the
-        # prefill dummy and nothing else.
+        # Every step a producer runs is a prefill step, so the decode set it
+        # warms is empty -- which is what the assertion below reads.
         runner = self._runner(buckets=[1, 2, 4], specialized=True, num_spec=3)
         runner.is_strict_kv_producer = True
         assert mr.RBLNModelRunner.decode_graph_shapes(runner) == []
