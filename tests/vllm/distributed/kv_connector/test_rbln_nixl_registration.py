@@ -247,6 +247,16 @@ class TestRegisterKvCaches:
         assert list(worker._pending_kv_caches) == ["full0", "full1"]
         assert worker.local_seen_layer_names == ["full0", "full1"]
 
+    def test_a_kv_sharing_layer_is_not_registered(self, monkeypatch):
+        # A layer reading another's cache (kv_sharing_target_layer_name) owns no
+        # buffer and has no spec in this connector's config, yet the runner
+        # hands it over with the rest.
+        worker = build_worker(monkeypatch, kv_buffer_device="rbln", layer_names=("l0",))
+
+        worker.register_kv_caches({"l0": "tensor", "l1_shared": "tensor"})
+
+        assert list(worker._pending_kv_caches) == ["l0"]
+
     def test_the_block_count_comes_from_the_allocation_not_the_estimate(
         self, monkeypatch
     ):

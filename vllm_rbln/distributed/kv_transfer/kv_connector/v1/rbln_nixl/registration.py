@@ -614,11 +614,12 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 "different thing and is supported."
             )
         # One region per buffer: sliding-window views alias a full-attention
-        # layer's storage but count blocks differently. Kept in layer-index
-        # order, since NIXL numbers regions in iteration order.
+        # layer's storage but count blocks differently, and KV-sharing layers
+        # own none. Kept in layer-index order, since NIXL numbers regions in
+        # iteration order.
         canonical = canonical_kv_layers(
             self.kv_cache_config,
-            {name: self._unwrapped_layer_spec(name) for name in kv_caches},
+            {name: self._unwrapped_layer_spec(name) for name in self._layer_specs},
         )
         missing = canonical - kv_caches.keys()
         assert not missing, f"Canonical layers missing from kv_caches: {missing}"
