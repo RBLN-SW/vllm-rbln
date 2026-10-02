@@ -3248,7 +3248,7 @@ wheels = [
 
 [[package]]
 name = "torch-rbln"
-version = "0.5.0rc4"
+version = "0.12.0rc1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "libcst" },
@@ -3259,11 +3259,11 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:3f082c86fe605d76f48df3ec28d20adc" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:c49bb8fd0f496d83affdc3946f419d1d" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:b73c9d5a0c3686a62be562a285626b23" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:d41e4bb818dcc59e8f2081f5cf3dd5d7" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.5.0rc4/torch_rbln-0.5.0rc4-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:32c98dfd6dddb8a7beba2523bd21cf34" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.0rc1/torch_rbln-0.12.0rc1-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:13c4ec59e7df4034fed3e2065bf5d793" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.0rc1/torch_rbln-0.12.0rc1-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:6bd6337ec571027295b916ac08b706f2" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.0rc1/torch_rbln-0.12.0rc1-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:c8cee978c3670d7babb932fd5a0c4ec6" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.0rc1/torch_rbln-0.12.0rc1-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:91f111b8d827c38e1f706109a1e86248" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/torch-rbln/0.12.0rc1/torch_rbln-0.12.0rc1-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:fca0a473df93fe81a29f6a699ca322d8" },
 ]
 
 [[package]]
@@ -3645,7 +3645,7 @@ requires-dist = [
     { name = "setuptools-scm", marker = "extra == 'build'" },
     { name = "simphile", marker = "extra == 'dev'" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = ">=0.5.0rc4,<0.5.1" },
+    { name = "torch-rbln", marker = "platform_machine == 'x86_64'", specifier = ">=0.12.0rc1,<0.12.1" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchcodec", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
