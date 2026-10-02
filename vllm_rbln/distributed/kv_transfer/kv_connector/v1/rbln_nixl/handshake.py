@@ -179,7 +179,11 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             "same regions in the same order, but this peer narrows ours to "
             f"{region_ids} of {self.num_regions}"
         )
-        assert len(handles) == len(plan.all_source_ranks)
+        assert len(handles) == len(plan.all_source_ranks), (
+            f"RBLN NIXL: {len(handles)} handle(s) for "
+            f"{len(plan.all_source_ranks)} source rank(s); the plan pairs "
+            "them by position"
+        )
         # A pipeline-parallel peer cannot reach here (rejected during the
         # handshake), so the rank we hold is the peer's TP rank as planned.
         return handles[plan.all_source_ranks.index(global_rank)]
@@ -349,7 +353,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         if self.use_host_buffer:
             return
         tp_ratio = self.topo.tp_ratio(remote_tp_size)
-        if tp_ratio != 1 and self._has_swa:
+        if tp_ratio != 1 and self._shape.has_swa:
             raise RuntimeError(
                 "RBLN NIXL D2D: sliding-window attention is not supported with "
                 f"heterogeneous tensor parallelism (tp_ratio={tp_ratio})."
@@ -463,7 +467,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # `_window_grid` -- and both lists are cut by that one number. A peer whose
         # block holds a different count is then cut into pieces that are not its
         # own, while every byte count still fits.
-        if (self._chunk_mode or self._own_engine_layout) and (
+        if (self._shape.writes_part_of_a_block or self._own_engine_layout) and (
             nixl_agent_meta.block_size != self.block_size
         ):
             raise RuntimeError(
@@ -788,8 +792,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         """Whether this peer is served by ``_build_head_matched_remote``.
 
         Any unequal TP degree, in either direction, on D2D where this engine
-        does not own the whole-engine lists. ``_own_engine_layout`` reads a knob
-        registration settles, so this answers only from then on.
+        does not own the whole-engine lists.
         """
         if self.use_host_buffer or self._own_engine_layout:
             return False
@@ -872,7 +875,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             # runs none in the reverse shape, where ours is the finer one.
             local_pp = self.vllm_config.parallel_config.pipeline_parallel_size
             if pp_size > 1 or local_pp > 1:
-                if self._has_swa:
+                if self._shape.has_swa:
                     raise RuntimeError(
                         "RBLN NIXL: sliding-window attention combined with "
                         "pipeline-parallel P/D is not supported."
@@ -1256,10 +1259,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         where upstream names a block once and our list names it per range.
         """
         # Trimming narrows a block rather than a peer, and the per-shard ids
-        # are what can leave part of one out -- except where a sliding window
-        # already gave the whole-engine list a second range, which is the one
-        # list that can carry a third and the only one that can name two KV
-        # groups.
+        # are what can leave part of one out. Streaming narrows neither: its
+        # own descriptors are what give a notification room to say which blocks
+        # a write filled. Both give way to a sliding window, whose view leaves
+        # the whole-engine list the only place such a range can sit.
         return (
             pp_size > 1
             or partial
@@ -1267,7 +1270,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             or split > 1
             or fanout > 1
             or kv_runs > 1
-            or (self._chunk_mode and not self._own_engine_layout)
+            or (self._shape.writes_part_of_a_block and not self._own_engine_layout)
         )
 
     def _register_shard_xfer_state(
@@ -1288,12 +1291,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # descriptors on one block. A head cut names no span with a position,
         # so none of that applies to it.
         assert (
-            not self._chunk_mode
+            not self._shape.writes_part_of_a_block
             or self._spans_per_block == 1
             or (peer_areas is None and split == 1 and replica_fanout == 1)
         )
         # Compute the local region ids once and reuse them for the handler
-        # (PP context is always the shard path: SWA + PP is rejected earlier).
+        # (SWA never reaches a pipelined peer: it is rejected earlier).
         region_ids = self._shard_local_region_ids(
             registered_layer_names, peer_areas=peer_areas
         )
@@ -1569,7 +1572,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
 
         remote_engine_id = nixl_agent_meta.engine_id
         remote_info = self.topo.get_engine_info(remote_engine_id)
-        assert remote_info.remote_tp_size == remote_tp_size
+        assert remote_info.remote_tp_size == remote_tp_size, (
+            f"RBLN NIXL: {remote_engine_id} is registered at TP "
+            f"{remote_info.remote_tp_size} and handshaking at {remote_tp_size}"
+        )
         # A producer with FEWER TP ranks is matched per head band; the other
         # direction never reaches here, rejected during the handshake.
         pp_tp_ratio = self.topo.tp_ratio(remote_tp_size)
@@ -1586,7 +1592,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         assert self.topo.block_size_ratio(nixl_agent_meta.block_size) == 1, (
             "PP over NIXL P/D requires equal P/D block sizes."
         )
-        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
+        assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks, (
+            f"RBLN NIXL: {remote_engine_id} advertised "
+            f"{nixl_agent_meta.num_blocks} block(s) after registering "
+            f"{self.dst_num_blocks[remote_engine_id]}; a descriptor id is "
+            "region * blocks + block"
+        )
         rpl = self._regions_per_layer()
         n_remote = len(nixl_agent_meta.kv_caches_base_addr)
         assert (

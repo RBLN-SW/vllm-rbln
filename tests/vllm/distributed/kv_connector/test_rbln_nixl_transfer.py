@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from tests.vllm.distributed.kv_connector.utils import (
     build_worker,
+    set_shape,
     sliding_window_spec,
     window_mode,
 )
@@ -39,7 +40,7 @@ class TestComputeDescIds:
     # Routes block ids into the Full range (offset 0) or the SWA range (offset
     # num_full_descs) by group spec, expanded across regions.
     def test_none_ratio_delegates_to_super(self, monkeypatch):
-        worker = build_worker(monkeypatch)  # _sw_ratio is None
+        worker = build_worker(monkeypatch)  # window_ratio is None
         captured = []
 
         # 0.30.0 added three per-region keywords; the delegation has to carry
@@ -122,11 +123,13 @@ class TestComputeDescIds:
         worker = build_worker(monkeypatch, block_size=64)
         window_mode(worker, 2)
         worker.num_regions = 2
-        worker._chunk_mode = True
+        set_shape(worker, chunk_mode=True)
         worker._kv_areas = 1
         worker._kv_split_axis = KVSplitAxis.HEAD
         worker._chunk_grid = grid
-        worker._request_tail = tail
+        # A whole-request write names no pieces of its own, so the third
+        # field is empty here; the streamed path is what fills it.
+        worker._request_tail = None if tail is None else (*tail, ())
         worker._group_specs = [
             MagicMock(),  # full attention
             sliding_window_spec(block_size=64, sliding_window=32),
@@ -156,7 +159,21 @@ class TestComputeDescIds:
 
         whole = worker.num_regions * 4
         assert list(out)[-2:] == [12, 20]
-        assert all(whole <= i < whole * (1 + worker._sw_ratio) for i in out[-2:])
+        assert all(
+            whole <= i < whole * (1 + worker._shape.window_ratio) for i in out[-2:]
+        )
+
+    def test_a_write_owing_only_the_window_asks_for_no_chunks(self, monkeypatch):
+        # A prefill ending on a chunk boundary leaves the full-attention group
+        # empty on the write that still owes the window. There is no last block
+        # to cut there, and reaching for one raised inside the writer loop --
+        # which swallows it, so the write vanished and the request never
+        # settled.
+        worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
+
+        out = worker._compute_desc_ids([[], [2]], 4, None, 1)
+
+        assert list(out) == [12, 20]
 
     def test_a_last_block_needing_every_chunk_is_left_whole(self, monkeypatch):
         # The benefit test: the same bytes in more descriptors is a loss, so
@@ -182,8 +199,7 @@ class TestComputeDescIds:
         # -- right after the whole-block range, not after a window range that
         # was never built.
         worker = self._hybrid_worker(monkeypatch, tail=(65, 2))
-        window_mode(worker, None)
-        worker._has_swa = True
+        window_mode(worker, None, chunk_mode=True, has_swa=True)
 
         out = worker._compute_desc_ids([[0, 1], [2]], 4, None, 1)
 
@@ -269,9 +285,10 @@ class TestWhichGroupTheCountDescribes:
 
     @staticmethod
     def _worker(monkeypatch, specs):
-        w = build_worker(monkeypatch, block_size=64)
-        w._group_specs = specs
-        return w
+        # Through `build_worker`, so the reduction picks the counted group off
+        # the same spec list the worker gets. Set afterwards, the shape would
+        # still answer for the groups the worker was built without.
+        return build_worker(monkeypatch, block_size=64, specs=specs)
 
     def test_a_window_group_ahead_of_the_full_one_is_skipped(self, monkeypatch):
         # gpt-oss' order: the sliding window is group 0 and holds two clipped
@@ -305,7 +322,7 @@ class TestTailChunks:
         w = build_worker(monkeypatch, block_size=64)
         w._kv_areas = 4
         w._kv_split_axis = axis
-        w._chunk_mode = chunked
+        set_shape(w, chunk_mode=chunked)
         return w
 
     @pytest.mark.parametrize(
@@ -394,7 +411,9 @@ class TestTheWindowsOwnGranules:
         w.block_size = 64
         w.num_regions = 1
         w._chunk_grid = None
-        w._request_tail = (valid_tokens, None)
+        # The third member is the chunk ranges a streamed batch names; a whole
+        # request names none.
+        w._request_tail = (valid_tokens, None, ())
         w._group_specs = [MagicMock(spec=SlidingWindowSpec)]
         return list(
             w._compute_desc_ids(
@@ -410,11 +429,10 @@ class TestTheWindowsOwnGranules:
         assert self._ids(64, [3]) == [11]
 
     def test_one_token_fewer_reaches_back_into_the_earlier_granule(self):
-        # The pair to the case above: 63 tokens put the window over 31..62, and
-        # token 31 is the last of the first granule -- so it is named, barely.
-        # The arithmetic that decides this is `(valid - sw) // sw`, whose answer
-        # only moves at this input; every other count here reads the same under
-        # an off-by-one in it.
+        # 63 tokens put the window over 31..62, and token 31 is the last of the
+        # first granule -- so it is named, barely. `oldest` is what decides it,
+        # and no other count here moves when that expression gains or loses a
+        # token: the straddle cases all sit far enough from the boundary.
         assert self._ids(63, [2, 3]) == [10, 11]
 
     def test_a_window_across_a_granule_boundary_names_both(self):
