@@ -12,18 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MiniMax-M3 sparse attention (MSA) backends for RBLN.
-
-Two caches per sparse layer, mirroring the DSA (DeepSeek-V3.2) layout:
-
-* the main paged GQA K/V cache, read by the block-sparse attention kernel
-  (``rbln_custom_ops.sparse_attn_minimax_m3_msa``), and
-* the lightning-indexer's key-only side cache (one 128-wide vector per token),
-  read by ``rbln_custom_ops.sparse_attn_minimax_m3_indexer``.
-
-Both reuse ``RBLNFlashAttentionMetadataBuilder``: the kernels take the same
-``seq_lens`` (cache position) / ``block_tables`` the flash kernels take.
-"""
+"""MiniMax-M3 sparse attention (MSA) backends for RBLN."""
 
 from typing import ClassVar
 
@@ -36,17 +25,11 @@ from .flash_attention import RBLNFlashAttentionMetadataBuilder
 
 logger = init_logger(__name__)
 
-# The sparse block the indexer scores and picks. Fixed by the kernels.
 MSA_SPARSE_BLOCK_SIZE = 128
 
 
 class RBLNMiniMaxM3SparseBackend(AttentionBackend):
-    """Main GQA K/V cache of a MiniMax-M3 sparse attention layer.
-
-    The kernel expects the combined cache as ``[num_blocks, 2, H, 1, block, D]``
-    (block-major so one paged block holds K then V of every kv head), unlike the
-    flash backend's ``[2, num_blocks, H, 1, block, D]``.
-    """
+    """Main GQA K/V cache of a MiniMax-M3 sparse attention layer."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     supported_kv_cache_dtypes: ClassVar[list[str]] = [
@@ -63,9 +46,6 @@ class RBLNMiniMaxM3SparseBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # The indexer scores 128-token blocks and CP shards the block 4-way
-        # into 64-row chunks: a partition must hold whole sparse blocks on
-        # every chiplet.
         return [MultipleOf(4 * MSA_SPARSE_BLOCK_SIZE)]
 
     @classmethod
