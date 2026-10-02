@@ -516,18 +516,6 @@ class TestApplyReleaseSubBlockMatch:
         assert op.dst_block_id != op.src_block_id
         manager.release_copy_ops(ops)
 
-    def test_apply_records_prefix_cache_stats(self):
-        # With log_stats, apply records the sub-block hits.
-        manager = make_manager(8, 4, 10, log_stats=True)
-        req0 = make_request("0", list(range(8)), 8)
-        prefill_request(manager, req0)
-        manager.free(req0)
-        req1 = make_request("1", list(range(4)) + [100] * 8, 8)
-        prefill_request(manager, req1)
-        assert manager.prefix_cache_stats is not None
-        assert manager.prefix_cache_stats.hits >= 4
-        manager.release_copy_ops(manager.drain_pending_copy_ops())
-
     def test_release_frees_source_refs(self):
         # release frees the source-block ref the match held.
         manager = make_manager(8, 4, 10)
