@@ -1764,7 +1764,7 @@ wheels = [
 
 [[package]]
 name = "nixl-rbln"
-version = "0.1.0.dev119+g7bbd9adca"
+version = "0.1.0.dev119+g782b58c90"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "nixl" },
@@ -1772,7 +1772,7 @@ dependencies = [
     { name = "torch-rbln" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-rbln/0.1.0.dev119+g7bbd9adca/nixl_rbln-0.1.0.dev119+g7bbd9adca-py3-none-manylinux_2_34_x86_64.whl", hash = "md5:b1b17a64dff5cfd9a33245a42e027f1e" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-rbln/0.1.0.dev119+g782b58c90/nixl_rbln-0.1.0.dev119+g782b58c90-py3-none-manylinux_2_34_x86_64.whl", hash = "md5:65d10dc65b985e590f64ff75a6c32817" },
 ]
 
 [[package]]
