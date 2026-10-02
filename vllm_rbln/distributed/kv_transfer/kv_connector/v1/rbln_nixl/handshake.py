@@ -205,6 +205,8 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # rather than inside it, which is the order the local list takes --
         # a prepared transfer pairs the two by position.
         runs, chunks = grid
+        # `.tolist()` first: this arithmetic runs once per chunk descriptor, and
+        # plain Python ints carry it better than numpy scalars do.
         chunk_rows = [
             (
                 addr + r * (length // runs) + c * (length // runs // chunks),
