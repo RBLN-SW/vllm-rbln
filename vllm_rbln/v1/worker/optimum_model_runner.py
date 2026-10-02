@@ -1565,12 +1565,13 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         topk_topp_configs = len(WARM_UP_CONFIGS) - greedy_configs
         busiest_fn_configs = max(greedy_configs, topk_topp_configs)
 
+        # Each bucket can use both mask-free and masked sampler graphs.
         torch._dynamo.config.recompile_limit = max(
-            torch._dynamo.config.recompile_limit, busiest_fn_configs * num_buckets
+            torch._dynamo.config.recompile_limit, 2 * busiest_fn_configs * num_buckets
         )
         torch._dynamo.config.accumulated_recompile_limit = max(
             torch._dynamo.config.accumulated_recompile_limit,
-            len(WARM_UP_CONFIGS) * num_buckets,
+            2 * len(WARM_UP_CONFIGS) * num_buckets,
         )
 
     @torch.inference_mode

@@ -29,6 +29,11 @@ from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
+from vllm_rbln.v1.sample.rbln_logits_processor import (
+    RBLNLogitBiasLogitsProcessor,
+    RBLNMinPLogitsProcessor,
+    RBLNMinTokensLogitsProcessor,
+)
 
 logger = init_logger(__name__)
 
@@ -65,14 +70,16 @@ def rbln_top_k_top_p_sample(
     temperature: torch.Tensor,
     k: torch.Tensor | None,
     p: torch.Tensor | None,
+    min_tokens_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Implementation of RBLN top-k top-p sampling with temperature scaling.
+    Implementation of RBLN top-k top-p sampling with min_tokens and temperature scaling.
     To avoid self parameter issues when torch.compile is used,
     we define this as a static method.
     """
     # Apply temperature.
     logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
+    logits = RBLNMinTokensLogitsProcessor.apply_mask(logits, min_tokens_mask)
 
     # Apply top-k top-p sampling using RBLN custom op.
     # It requires softmax prior to calling the op.
@@ -81,13 +88,16 @@ def rbln_top_k_top_p_sample(
     return sampled
 
 
-def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+def rbln_greedy_sample(
+    logits: torch.Tensor,
+    min_tokens_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Implementation of RBLN greedy sampling.
 
-    To avoid self parameter issues when torch.compile is used,
-    we define this as a static method.
+    Applies min_tokens masking and returns the argmax of the logits.
     """
     # NOTE(RBLN): argmax op is registered in the compiler
+    logits = RBLNMinTokensLogitsProcessor.apply_mask(logits, min_tokens_mask)
     return torch.ops.rbln.argmax(logits)
 
 
@@ -146,10 +156,12 @@ class RBLNTopKTopPSampler(nn.Module):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
         staging_owner: Any = None,
+        min_tokens_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling.
 
         Unlike upstream `TopKTopPSampler`, `temperature` is applied here.
+        Optional min_tokens masking follows temperature scaling.
         """
         if generators:
             logger.debug_once(
@@ -157,7 +169,9 @@ class RBLNTopKTopPSampler(nn.Module):
                 "per-request generators. Ignoring generators."
             )
 
-        out = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
+        out = self._compiled_rbln_topk_topp_sampler(
+            logits, temperature, k, p, min_tokens_mask
+        )
         if staging_owner is not None:
             out = _stage_into(staging_owner, out)
         return out, None
@@ -206,15 +220,22 @@ class RBLNSampler(VLLMSampler):
         sampling_metadata: SamplingMetadata,
         logprobs_mode_override: LogprobsMode | None = None,
         staging_owner: Any = None,
+        min_tokens_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sample logits based on sampling metadata.
 
         The various logits processing functions called in this method
         may update the logits tensor in-place.
+        A supplied min_tokens mask is applied inside compiled sampling.
         """
 
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
+        if min_tokens_mask is not None and sampling_metadata.all_greedy:
+            tokens = self._compiled_greedy_sample(logits, min_tokens_mask)
+            if staging_owner is not None:
+                tokens = _stage_into(staging_owner, tokens)
+            return tokens, None
         if sampling_metadata.all_greedy:
             # Upstream vLLM keeps this result to merge with the random one via
             # `torch.where`. vLLM RBLN has no merge step: a mixed batch sends its
@@ -240,7 +261,9 @@ class RBLNSampler(VLLMSampler):
         argmax_invariant = sampling_metadata.logitsprocs.argmax_invariant
         # if argmax_invariant processors are active, apply temperature scaling
         # before applying them.
-        if any(getattr(p, "min_p_count", 1) for p in argmax_invariant):
+        if min_tokens_mask is None and any(
+            getattr(p, "min_p_count", 1) for p in argmax_invariant
+        ):
             # Divide in place, as upstream does: allocating a second logits-sized
             # tensor here costs more than the division itself. Rows past num_reqs of
             # the padded buffer must therefore carry temperature 1.0 -- see
@@ -250,8 +273,9 @@ class RBLNSampler(VLLMSampler):
 
         # Apply logits processors that only apply to random sampling
         # (argmax invariant)
-        for processor in argmax_invariant:
-            logits = processor.apply(logits)
+        if min_tokens_mask is None:
+            for processor in argmax_invariant:
+                logits = processor.apply(logits)
 
         k, p = build_op_top_k_top_p(
             sampling_metadata,
@@ -267,6 +291,11 @@ class RBLNSampler(VLLMSampler):
             k,
             p,
             staging_owner,
+            **(
+                {"min_tokens_mask": min_tokens_mask}
+                if min_tokens_mask is not None
+                else {}
+            ),
         )
 
         return random_sampled, processed_logprobs
@@ -279,6 +308,7 @@ class RBLNSampler(VLLMSampler):
         logprobs_mode_override: LogprobsMode | None = None,
         staging_owner: Any = None,
     ) -> SamplerOutput:
+        """Process logits and sample tokens with compiled min_tokens when eligible."""
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
@@ -299,12 +329,19 @@ class RBLNSampler(VLLMSampler):
         # Use float32 for the logits.
         # logits = logits.to(torch.float32)
 
-        logits = self.apply_logits_processors(
-            logits, sampling_metadata, predict_bonus_token
-        )
-        # Sample the next token.
+        min_tokens_mask = None
+        processor = self._get_min_tokens_processor(sampling_metadata)
+        if processor is not None:
+            min_tokens_mask = processor.prepare_mask(logits.shape[0], logits.shape[-1])
+        else:
+            logits = self.apply_logits_processors(
+                logits, sampling_metadata, predict_bonus_token
+            )
         sampled, processed_logprobs = self.sample(
-            logits, sampling_metadata, staging_owner=staging_owner
+            logits,
+            sampling_metadata,
+            staging_owner=staging_owner,
+            min_tokens_mask=min_tokens_mask,
         )
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
@@ -388,9 +425,49 @@ class RBLNSampler(VLLMSampler):
 
         return LogprobsTensors(indices, logprobs, token_ranks)
 
+    def _get_min_tokens_processor(
+        self, metadata: SamplingMetadata
+    ) -> RBLNMinTokensLogitsProcessor | None:
+        """Return min_tokens processor if other processing and logprobs are absent."""
+        if not metadata.no_penalties:
+            return None
+        if metadata.max_num_logprobs is not None or metadata.logprob_token_ids:
+            return None
+        if metadata.allowed_token_ids_mask is not None or metadata.bad_words_token_ids:
+            return None
+        if not metadata.all_greedy and self.logprobs_mode in (
+            "processed_logits",
+            "processed_logprobs",
+        ):
+            return None
+        holder = metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return None
+        min_tokens_processor = None
+        for processor in metadata.logitsprocs.all:
+            if type(processor) is RBLNMinTokensLogitsProcessor:
+                if min_tokens_processor is not None:
+                    return None
+                # Structured outputs may require upstream stop-token restoration.
+                if any(state[3] for state in processor.min_toks.values()):
+                    return None
+                min_tokens_processor = processor
+            elif type(processor) is RBLNLogitBiasLogitsProcessor:
+                if processor.biases:
+                    return None
+            elif type(processor) is RBLNMinPLogitsProcessor:
+                if processor.min_p_count and not metadata.all_greedy:
+                    return None
+            else:
+                return None
+        return (
+            min_tokens_processor
+            if min_tokens_processor is not None and min_tokens_processor.min_toks
+            else None
+        )
 
-# Each config is designed to trigger exactly one dynamo specialization, so the
-# number of compiled sampler graphs per batch size equals len(WARM_UP_CONFIGS).
+
+# Each config below triggers exactly one mask-free dynamo specialization.
 # `dynamic=False` makes dynamo specialize on whether `k` and `p` are None, so
 # each row below is its own graph:
 #

@@ -32,6 +32,8 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TOP_K,
     build_op_top_k_top_p,
 )
+from vllm_rbln.v1.sample.rbln_logits_processor import RBLNMinTokensLogitsProcessor
+from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -92,7 +94,8 @@ class RBLNRejectionSampler(RejectionSampler):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> SamplerOutput:
-        """
+        """Sample speculative tokens with eager processing or compiled min_tokens.
+
         Args:
             metadata:
                 Metadata for spec decoding.
@@ -127,6 +130,13 @@ class RBLNRejectionSampler(RejectionSampler):
 
         output_logprobs_requested = sampling_metadata.max_num_logprobs is not None
         bonus_token_ids = None
+        processor = (
+            self.sampler._get_min_tokens_processor(sampling_metadata)
+            if isinstance(self.sampler, RBLNSampler)
+            and isinstance(self.impl, RBLNRejectionSamplerImpl)
+            else None
+        )
+        bonus_min_tokens_mask = None
 
         bonus_in_graph = (
             isinstance(self.impl, RBLNRejectionSamplerImpl)
@@ -141,9 +151,14 @@ class RBLNRejectionSampler(RejectionSampler):
             )
         )
         if bonus_in_graph:
-            bonus_logits = self.sampler.apply_logits_processors(
-                bonus_logits, sampling_metadata, predict_bonus_token=True
-            )
+            if processor is not None:
+                bonus_min_tokens_mask = processor.prepare_mask(
+                    bonus_logits.shape[0], bonus_logits.shape[-1]
+                )
+            else:
+                bonus_logits = self.sampler.apply_logits_processors(
+                    bonus_logits, sampling_metadata, predict_bonus_token=True
+                )
         else:
             bonus_sampler_output = self.sampler(
                 logits=bonus_logits,
@@ -163,10 +178,22 @@ class RBLNRejectionSampler(RejectionSampler):
             bonus_logits = None
 
         # [num_tokens, vocab_size]
-        target_logits = self.apply_logits_processors(
-            raw_target_logits, sampling_metadata, metadata
+        target_logits = (
+            raw_target_logits
+            if processor is not None
+            else self.apply_logits_processors(
+                raw_target_logits, sampling_metadata, metadata
+            )
         )
 
+        target_min_tokens_mask = None
+        if processor is not None:
+            assert isinstance(self.impl, RBLNRejectionSamplerImpl)
+            target_min_tokens_mask = processor.prepare_mask(
+                len(metadata.num_draft_tokens) * self.impl.num_spec_tokens,
+                raw_target_logits.shape[-1],
+                metadata.num_draft_tokens,
+            )
         output_token_ids = self.impl.rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -179,6 +206,8 @@ class RBLNRejectionSampler(RejectionSampler):
             synthetic_mode=self.synthetic_mode,
             synthetic_conditional_rates=self.synthetic_conditional_rates,
             bonus_logits=bonus_logits,
+            target_min_tokens_mask=target_min_tokens_mask,
+            bonus_min_tokens_mask=bonus_min_tokens_mask,
         )
 
         logprobs_tensors = None
@@ -216,6 +245,8 @@ class RejectionSamplerImpl:
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
+        target_min_tokens_mask: torch.Tensor | None = None,
+        bonus_min_tokens_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -244,7 +275,10 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
+        target_min_tokens_mask: torch.Tensor | None = None,
+        bonus_min_tokens_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Apply Torch rejection sampling; min_tokens mask arguments are unused."""
         assert bonus_token_ids is not None
         draft_token_ids = draft_token_ids.to(target_logits.device)
         target_logits = self.apply_sampling_constraints(
@@ -377,6 +411,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
         synthetic_mode: bool = False,
         synthetic_conditional_rates: torch.Tensor | None = None,
         bonus_logits: torch.Tensor | None = None,
+        target_min_tokens_mask: torch.Tensor | None = None,
+        bonus_min_tokens_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         target_logits = self.apply_sampling_constraints(
             target_logits,
@@ -550,6 +586,8 @@ class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
             bonus_logits,
             bonus_temperature,
             synthetic_num_accepted,
+            target_min_tokens_mask,
+            bonus_min_tokens_mask,
         )
 
     def apply_sampling_constraints(
@@ -581,12 +619,14 @@ def rbln_rejection_sample(
     bonus_logits: torch.Tensor | None = None,
     bonus_temperature: torch.Tensor | None = None,
     synthetic_num_accepted: torch.Tensor | None = None,
+    target_min_tokens_mask: torch.Tensor | None = None,
+    bonus_min_tokens_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample, then build the output token ids.
 
     Args:
         draft_token_ids: Packed-then-padded. Shape is [B*K], int32.
-        target_logits: Raw -- temperature and the softmax are applied here.
+        target_logits: Logits before temperature scaling and softmax.
             Shape is [B*K, vocab_size].
         cu_num_draft_tokens: Shape is [B].
         top_k: Shape is [B], int32.
@@ -607,12 +647,17 @@ def rbln_rejection_sample(
             measured -- and only its count is replaced. The boundary token stays
             the one it drew, so it is real but drawn for its own position.
             Shape is [B], int32.
+        target_min_tokens_mask: Optional int8 mask, shape [B*K, vocab_size].
+        bonus_min_tokens_mask: Optional int8 mask, shape [B, vocab_size].
 
     Returns:
         The sampled token ids, `PLACEHOLDER_TOKEN_ID` in unfilled slots. Shape
         is [B, K+1], int32.
     """
     target_logits = target_logits / temperature.unsqueeze(-1)
+    target_logits = RBLNMinTokensLogitsProcessor.apply_mask(
+        target_logits, target_min_tokens_mask
+    )
     target_probs = target_logits.softmax(dim=-1)
 
     # ------------------------------------------------------------------
@@ -641,11 +686,16 @@ def rbln_rejection_sample(
     num_accepted = num_accepted.reshape(batch_size)
 
     if bonus_logits is not None and bonus_temperature is not None:
-        bonus_probs = torch.softmax(
-            bonus_logits / bonus_temperature.unsqueeze(1), dim=-1
+        bonus_logits = bonus_logits / bonus_temperature.unsqueeze(1)
+        bonus_logits = RBLNMinTokensLogitsProcessor.apply_mask(
+            bonus_logits, bonus_min_tokens_mask
         )
+        bonus_probs = torch.softmax(bonus_logits, dim=-1)
         bonus = torch.ops.rbln.top_k_top_p(bonus_probs, top_k, top_p).reshape(-1, 1)
     elif bonus_logits is not None:
+        bonus_logits = RBLNMinTokensLogitsProcessor.apply_mask(
+            bonus_logits, bonus_min_tokens_mask
+        )
         # `rbln::argmax` returns [B]; `bonus_token_ids` already comes as [B, 1].
         bonus = torch.ops.rbln.argmax(bonus_logits).unsqueeze(1)
     else:

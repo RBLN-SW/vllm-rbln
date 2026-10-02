@@ -35,6 +35,8 @@ logger = init_logger(__name__)
 
 
 class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
+    """Support eager and compiled min_tokens masking."""
+
     # index_put_ requires the value dtype to exactly match the logits
     # dtype, and two dtypes reach one instance within a single spec-decode
     # step: apply() sees model-dtype logits from the RBLN sampler, while
@@ -48,6 +50,54 @@ class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
     ):
         super().__init__(vllm_config, device, is_pin_memory)
         self._neg_inf_tensors = {self.neg_inf_tensor.dtype: self.neg_inf_tensor}
+        self._is_pin_memory = is_pin_memory
+        self._mask_buffers: dict[
+            tuple[int, int, bool], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+
+    def prepare_mask(
+        self,
+        rows: int,
+        vocab_size: int,
+        num_draft_tokens: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Build an int8 stop-token mask for request rows or packed draft rows.
+
+        Buffer allocations are reused; mask contents are rebuilt per call.
+        """
+        # Target preparation must not overwrite the bonus mask of the same shape.
+        key = (rows, vocab_size, num_draft_tokens is not None)
+        if key not in self._mask_buffers:
+            cpu = torch.zeros(
+                rows, vocab_size, dtype=torch.int8, pin_memory=self._is_pin_memory
+            )
+            self._mask_buffers[key] = (cpu, cpu.to(self.device))
+        cpu, mask = self._mask_buffers[key]
+        cpu.zero_()
+        offsets = [0]
+        if num_draft_tokens is not None:
+            for count in num_draft_tokens:
+                offsets.append(offsets[-1] + count)
+        for row, (threshold, outputs, stops, _) in self.min_toks.items():
+            remaining = max(threshold - len(outputs), 0)
+            if num_draft_tokens is None:
+                if remaining:
+                    cpu[row, list(stops)] = True
+            else:
+                start = offsets[row]
+                count = min(remaining, num_draft_tokens[row])
+                cpu[start : start + count, list(stops)] = True
+        if mask.device.type != "cpu":
+            mask.copy_(cpu, non_blocking=True)
+        return mask
+
+    @staticmethod
+    def apply_mask(logits: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        """Apply finite-minimum masking; None leaves logits unchanged."""
+        if mask is None:
+            return logits
+        # The compiler cannot bind reused boolean graph inputs as rtosa.var.
+        return logits.masked_fill(mask != 0, torch.finfo(logits.dtype).min)
 
     def _sync_neg_inf_dtype(self, dtype: torch.dtype):
         tensor = self._neg_inf_tensors.get(dtype)
