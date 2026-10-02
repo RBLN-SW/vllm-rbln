@@ -92,9 +92,6 @@ class RBLNConfig(RBLNConfigBase):
     enforce_model_fp32: bool = False
     """Force the model dtype to fp32 instead of model_config.dtype."""
 
-    use_flash_causal_attn: bool = True
-    """Use flash attention for causal attention."""
-
     use_batch_attn_opt: bool = False
     """Use the batch attention optimization for paged attention."""
 
@@ -261,7 +258,6 @@ def _fields_of(cls: type[RBLNConfigBase]) -> tuple["DataclassField[Any]", ...]:
 # The envs.py attribute a renamed field reads. Goes away with the env vars.
 _ENV_NAME: dict[str, str] = {
     "use_custom_sampler": "VLLM_RBLN_SAMPLER",
-    "use_flash_causal_attn": "VLLM_RBLN_FLASH_CAUSAL_ATTN",
     "use_batch_attn_opt": "VLLM_RBLN_BATCH_ATTN_OPT",
     "use_all2all_dispatch": "VLLM_RBLN_DISPATCH_ALL2ALL",
     "use_all2all_combine": "VLLM_RBLN_COMBINE_ALL2ALL",
