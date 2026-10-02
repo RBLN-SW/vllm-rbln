@@ -191,18 +191,18 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
 
 def _validate_aux_hidden_states_pp_config(vllm_config: "VllmConfig") -> None:
-    """Reject a target whose aux hidden state collection is not pipeline-aware.
+    """Reject a target whose aux hidden states this plugin cannot carry.
 
-    Called only when `pipeline_parallel_size > 1`. Upstream's model `forward`
-    indexes the aux capture with a stage-local `enumerate` and drops the list
-    on every non-last stage, so a target outside `AUX_PP_TARGET_ARCHS` harvests
-    the wrong layers and reaches the drafter short. That surfaces as a shape
-    mismatch mid-compile, or -- where the counts happen to line up -- not at
-    all, as a silently worse draft.
+    Called only when `pipeline_parallel_size > 1`. A target outside
+    `AUX_PP_TARGET_ARCHS` either drops the capture on a non-last stage, or --
+    where upstream has converted it -- packs one handoff key per tensor while
+    this side carries them combined into one. Either way the drafter is reached
+    short: a shape mismatch mid-compile, or a silently worse draft where the
+    counts happen to line up.
 
-    TODO: delete once upstream's capture is pipeline-aware for these targets.
-    vllm-project/vllm#50514 converted llama, qwen2 and mimo in 0.30.0 and left
-    the rest, so the allowlist is now the set it did not reach.
+    TODO: delete once one side adopts the other's handoff layout. Upstream
+    converting more targets does not reach it on its own -- the two conventions
+    disagree on the key count, not on which layers are captured.
     """
     from vllm_rbln.v1.spec_decode.eagle3_pp import (
         AUX_PP_TARGET_ARCHS,
