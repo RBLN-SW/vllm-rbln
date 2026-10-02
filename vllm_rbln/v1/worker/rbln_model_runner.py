@@ -2276,7 +2276,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if self.model_config.enforce_eager:
             self.model_executable = model_wrapper
-            self.compute_logits = self.model.compute_logits
         else:
             process_group_dict = build_process_group_dict()
             self.model_executable = compile(
@@ -2294,22 +2293,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # output buffer can be reused across steps even under async scheduling.
                 use_static_output=True,
                 use_direct_dispatch=True,
-                dtype=self.rbln_config.compile_dtype,
-            )
-            # NOTE(RBLN): We compile compute_logits separately to cover cases when
-            # `self.use_wrapped_compute_logits` is `False`
-            self.compute_logits = compile(
-                self.model.compute_logits,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.compile_context,
-                num_devices=self.rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=process_group_dict,
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_static_output=True,
                 dtype=self.rbln_config.compile_dtype,
             )
 
@@ -3613,16 +3596,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             self.run_model_graphs()
-
-            # 3. compute_logits
-            if not self.use_wrapped_compute_logits:
-                for size in self.bucketing_manager.batch_buckets:
-                    hidden_states = torch.randn(
-                        (size, self.model_config.get_hidden_size()),
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                    _ = self.compute_logits(hidden_states)
 
             # NOTE(RBLN): the sampler and the rejection sampler are built on the
             # last PP rank only, so no other rank has anything to warm up here.
