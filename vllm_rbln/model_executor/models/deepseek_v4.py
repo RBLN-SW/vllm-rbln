@@ -580,6 +580,14 @@ class RBLNDeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wo_a",
         )
+        self.register_buffer(  # filled by finalize_wo_a() after loading
+            "wo_a_t",
+            torch.empty(
+                1, self.n_local_groups, self.n_heads * self.head_dim // self.n_groups,
+                self.o_lora_rank, dtype=torch.bfloat16,
+            ),
+            persistent=False,
+        )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             config.hidden_size,
@@ -616,16 +624,36 @@ class RBLNDeepseekV4Attention(nn.Module):
                 )
         self.scale_tensor = torch.tensor(self.head_dim**-0.5, dtype=torch.float32)
 
-    def _wo_a(self, o: torch.Tensor) -> torch.Tensor:
-        """o [B, L, g, H * D / g] -> [B, L, g * o_lora] through the per-group wo_a."""
+    def finalize_wo_a(self) -> None:
+        """wo_a as the [1, g, d, r] bf16 batched-matmul weight, dequantized once on the host after
+        loading (as MLA's W_UV): an einsum lowers to a host op, and an in-graph fp8 dequant +
+        transpose in front of the matmul fails the fp8 weight-format annotation (ISSUES AR4)."""
+        weight = self.wo_a.weight.detach().to("cpu")
         method = self.wo_a.quant_method
         if hasattr(method, "dequantized_weight"):
-            weight = method.dequantized_weight(self.wo_a, o.dtype)
-        else:
-            weight = self.wo_a.weight.to(o.dtype)
-        weight = weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        out = torch.einsum("blgd,grd->blgr", o, weight)
-        return out.flatten(2)
+            block_n, block_k = (int(v) for v in method.weight_block_size)
+            n, k = weight.shape
+            if hasattr(self.wo_a, "weight_scale"):  # folded already: [N, K / 128]
+                scale = self.wo_a.weight_scale.detach().to("cpu", torch.float32)
+            else:  # load_weights runs before the fold: the checkpoint's [N / 128, K / 128]
+                from vllm_rbln.model_executor.layers.quantization.deepseek_v4 import e8m0_to_bf16
+
+                inv = self.wo_a.weight_scale_inv.detach().to("cpu")
+                if inv.dtype in (torch.float8_e8m0fnu, torch.uint8):
+                    inv = e8m0_to_bf16(inv)
+                scale = inv.to(torch.float32).repeat_interleave(block_n, dim=0)[:n]
+            # bf16 product, the same rounding as the in-graph dequantized_weight it replaces
+            bf = torch.bfloat16
+            weight = (
+                weight.view(n, k // block_k, block_k).to(bf) * scale.to(bf)[:, :, None]
+            ).view(n, k)
+        weight = weight.to(torch.bfloat16).view(self.n_local_groups, self.o_lora_rank, -1)
+        self.wo_a_t = weight.transpose(1, 2).unsqueeze(0).contiguous().to(self.wo_a.weight.device)
+
+    def _wo_a(self, o: torch.Tensor) -> torch.Tensor:
+        """o [B, L, g, H * D / g] -> [B, L, g * o_lora]: [B, g, L, d] @ [1, g, d, r] -> [B, g, L, r]."""
+        out = torch.matmul(o.transpose(1, 2), self.wo_a_t.to(o.dtype))
+        return out.transpose(1, 2).flatten(2)
 
     def forward(self, positions: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape
@@ -999,6 +1027,8 @@ class RBLNDeepseekV4Model(nn.Module):
         for layer in self.layers:
             if hasattr(layer, "finalize_hc_scales"):
                 layer.finalize_hc_scales()
+            if hasattr(layer, "attn"):
+                layer.attn.finalize_wo_a()
         return loaded_params
 
 
