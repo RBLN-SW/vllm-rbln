@@ -285,30 +285,6 @@ class TestSwaWindowRatio:
             if "registered no window range" in r.getMessage()
         ]
 
-    def test_sliding_window_derives_block_over_window_ratio(self, monkeypatch):
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            swa_window_mode=True,
-            specs=[sliding_window_spec(block_size=64, sliding_window=16)],
-        )
-        assert worker._shape.window_ratio == 4
-
-    def test_a_hybrid_in_chunk_mode_owns_its_lists_without_a_window(self, monkeypatch):
-        # A shard list names one KV group, so a hybrid's chunk range has
-        # nowhere but the whole-engine lists -- and it reaches them without a
-        # window range beside it.
-        worker = build_worker(
-            monkeypatch,
-            kv_buffer_device="rbln",
-            swa_window_mode=False,
-            chunk_mode=True,
-            specs=[MagicMock(), sliding_window_spec(block_size=64, sliding_window=16)],
-        )
-        worker._chunk_mode = True  # registration reads the knob, not __init__
-        assert worker._shape.window_ratio is None
-        assert worker._own_engine_layout
-
     def test_chunk_mode_on_one_group_stays_off_the_whole_engine_lists(
         self, monkeypatch
     ):

@@ -759,6 +759,18 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         self._streamed.pop(req_id, None)
         self._valid_tokens.pop(req_id, None)
 
+    @staticmethod
+    def _blocks_in_request(streamed: "_StreamedSend | None", in_batch: int) -> int:
+        """How many blocks the REQUEST holds, which is what locates its last one.
+
+        A streamed offer is a prefix, so its own length puts the last block
+        somewhere it is not, and the count paired with it then describes a
+        block the batch does not have. The scheduler sends the total with every
+        offer for exactly this. A batch that is the whole list answers for
+        itself -- the handover, and every write of an unstreamed request.
+        """
+        return streamed.total if streamed and streamed.total else in_batch
+
     def _xfer_blocks_for_req(self, req_id: str, meta: "ReqMeta") -> None:
         """Write this request's blocks, one transfer per paired peer rank.
 
@@ -881,7 +893,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         # are handed; the window needs it too, to stop a block it writes in
         # pieces at the same place.
         needed = self._tail_chunks(
-            n_prompt_blocks, self._valid_tokens.get(req_id), chunks_per_span=cps
+            self._blocks_in_request(streamed, n_prompt_blocks),
+            self._valid_tokens.get(req_id),
+            chunks_per_span=cps,
         )
         window = self._stream_window(
             req_id,
@@ -1031,7 +1045,9 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
         cps = 1 if self._chunk_grid is None else self._chunk_grid[1]
         cpb = self._chunks_per_block(self._chunk_grid)
         needed = self._tail_chunks(
-            n_prompt_blocks, self._valid_tokens.get(req_id), chunks_per_span=cps
+            self._blocks_in_request(streamed, n_prompt_blocks),
+            self._valid_tokens.get(req_id),
+            chunks_per_span=cps,
         )
         offered_tokens = getattr(meta.local_block_ids, "offered_tokens", 0)
         window = self._stream_window(

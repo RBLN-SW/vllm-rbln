@@ -380,6 +380,29 @@ class TestPerShardWrite:
         w._valid_tokens = {"r0": 17}
         return w
 
+    @pytest.mark.parametrize("chunk_mode", [False, True])
+    def test_an_offer_locates_the_last_block_by_the_request_not_its_prefix(
+        self, chunk_mode
+    ):
+        # A released offer is a PREFIX of the request's blocks. Where the
+        # request's last block sits is read off how many blocks the REQUEST
+        # holds, and taking the prefix's length instead puts it one block
+        # early: the request's token count then overshoots the list and the
+        # tail reader refuses it, which costs the write.
+        #
+        # Both knobs open this path, so both ask the question -- streaming on
+        # its own is the shape the defect was found in.
+        worker = self._trimming_worker()
+        set_shape(worker, streams_prefix=True, chunk_mode=chunk_mode)
+        # The request spans two blocks; the offer carries only the first.
+        worker._streamed["r0"] = pw._StreamedSend(released=True, serial=1, total=2)
+        meta = self._meta(([1],), ([3, 4],))
+        meta.local_block_ids = pw.OfferedBlocks(([1],), 16, 1)
+
+        worker._xfer_blocks_for_req("r0", meta)
+
+        assert worker.nixl_wrapper.make_prepped_xfer.called
+
     def test_the_handover_leaves_the_empty_area_of_the_last_block_out(self):
         # 17 tokens over two blocks: the second holds one, which is area 0's.
         worker = self._trimming_worker()
