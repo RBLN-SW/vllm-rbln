@@ -36,8 +36,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -219,6 +221,32 @@ class TestRegisterKvCaches:
         worker.register_kv_caches({"layer0": "tensor"})
         assert worker._pending_kv_caches == {"layer0": "tensor"}
 
+    def test_a_buffer_is_registered_once_through_its_full_attention_layer(
+        self, monkeypatch
+    ):
+        # The runner hands over every layer. A sliding-window layer whose view
+        # aliases a full-attention layer's buffer counts blocks differently, so
+        # the buffer is registered once, through the full-attention layer.
+        names = ("swa0", "full0", "full1")
+        worker = build_worker(monkeypatch, kv_buffer_device="rbln", layer_names=names)
+        # Two tensors from byte 0: the layers at one position share a buffer.
+        worker.kv_cache_config.kv_cache_tensors = [
+            KVCacheTensor(size=0, layers=["swa0"], layer_stride=1, block_stride=1),
+            KVCacheTensor(
+                size=0, layers=["full0", "full1"], layer_stride=1, block_stride=1
+            ),
+        ]
+        worker._layer_specs = {
+            "swa0": MagicMock(spec=SlidingWindowSpec),
+            "full0": MagicMock(spec=FullAttentionSpec),
+            "full1": MagicMock(spec=FullAttentionSpec),
+        }
+
+        worker.register_kv_caches(dict.fromkeys(names, "tensor"))
+
+        assert list(worker._pending_kv_caches) == ["full0", "full1"]
+        assert worker.local_seen_layer_names == ["full0", "full1"]
+
     def test_the_block_count_comes_from_the_allocation_not_the_estimate(
         self, monkeypatch
     ):
@@ -274,7 +302,12 @@ class TestRegisterKvCaches:
 
     def test_host_bounce_rejects_differing_per_layer_sizes(self, monkeypatch):
         # Pins the refusal at this path's own point rather than upstream's assert.
-        worker = build_worker(monkeypatch, kv_buffer_device="cpu", nixl_available=True)
+        worker = build_worker(
+            monkeypatch,
+            kv_buffer_device="cpu",
+            nixl_available=True,
+            layer_names=("l0", "l1"),
+        )
         worker.nixl_wrapper = "wrapper"
         worker._layer_specs = {
             "l0": _impl_layer_spec(page_size_bytes=4096),
@@ -1395,6 +1428,13 @@ class TestPublishHandshakeMetadata:
         )
         w._publish_handshake_metadata = MagicMock()
         kv_caches = {"l0": MagicMock(), "l1": MagicMock()}
+        w.kv_cache_config = SimpleNamespace(
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=0, layers=list(kv_caches), layer_stride=1, block_stride=1
+                )
+            ]
+        )
         # Registration reads the layer specs and the transfer table upstream
         # fills, to record each region's head count.
         w._layer_specs = {

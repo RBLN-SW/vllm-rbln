@@ -64,7 +64,6 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -166,6 +165,7 @@ from vllm_rbln.v1.worker.dp_utils import (
 )
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
+    canonical_kv_layers,
     copy_host_device_kv_blocks,
     dynamic_kv_enabled,
     get_kv_cache_names,
@@ -2910,31 +2910,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """Pick one layer to stand for each KV cache buffer.
 
         Layers that share a buffer (`kv_cache_extents`) must be named once
-        for `mark_static_address`. A `KVCacheTensor` is
-        not a buffer: it lists many layers, each with its own. Prefer a
-        full-attention layer: its view counts blocks the way the scheduler
-        does, and a sliding-window view does not.
+        for `mark_static_address`. A `KVCacheTensor` is not a buffer: it
+        lists many layers, each with its own.
         """
         layer_to_spec: dict[str, KVCacheSpec] = {
             layer_name: attn_group.kv_cache_spec
             for attn_group in self._kv_cache_spec_attn_group_iterator()
             for layer_name in attn_group.layer_names
         }
-        pools: defaultdict[tuple[int, int], list[str]] = defaultdict(list)
-        for layer_name, extent in kv_cache_extents(kv_cache_config).items():
-            pools[extent].append(layer_name)
-        chosen: set[str] = set()
-        for pool_layers in pools.values():
-            full_layer = next(
-                (
-                    ln
-                    for ln in pool_layers
-                    if isinstance(layer_to_spec.get(ln), FullAttentionSpec)
-                ),
-                None,
-            )
-            chosen.add(full_layer or pool_layers[0])
-        return chosen
+        return canonical_kv_layers(kv_cache_config, layer_to_spec)
 
     def _reshape_kv_cache_tensors(
         self,
@@ -3254,10 +3238,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.cross_layers_kv_cache, self.cross_layers_attn_backend
             )
         else:
-            # Every layer, in layer-index order. A token-level connector
-            # addresses each layer through its own view and group. Cache groups
-            # overlay one another, so one layer per buffer would drop every
-            # sliding-window layer that shares a full-attention layer's buffer.
+            # Every layer, in layer-index order, as upstream hands them over:
+            # a token-level connector (LMCache) addresses each layer through its
+            # own view. RBLN NIXL registers storage and picks one layer per
+            # buffer itself.
             kv_transfer_group.register_kv_caches(
                 dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
             )
