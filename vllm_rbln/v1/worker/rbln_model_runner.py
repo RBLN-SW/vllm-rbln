@@ -1946,6 +1946,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         dev1: torch.Tensor,
         bitmask_shape: tuple[int, ...],
         sampler_output: SamplerOutput,
+        direct: torch.Tensor | None = None,
     ) -> None:
         """PROBE (do not merge): per structured-output step, where does the vocab beyond 2048 vanish.
 
@@ -1996,6 +1997,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # puts the loss on the D2H read of this buffer rather than on the forward itself.
             dev_arg = int(dev_ids[row]) if dev_ids is not None and row < len(dev_ids) else None
             clone_arg = int(clone_host[row].argmax())
+            direct_arg = int(direct[row].argmax()) if direct is not None else None
             anomaly = bool(
                 premature
                 or h2d_diff
@@ -2004,13 +2006,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 or sid != hops["masked"][2]
                 or (dev_arg is not None and dev_arg != hops["d2h"][2])
                 or clone_arg != hops["d2h"][2]
+                or (direct_arg is not None and dev_arg is not None and direct_arg != dev_arg)
             )
             if n <= 8 or anomaly or n % 200 == 0:
                 logger.warning(
                     "SO_VOCAB_PROBE step=%d req=%s n=%d shape=%s dtype=%s bitmask=%s "
                     "fwd_post(lo,hi,argmax)=%s d2h=%s masked=%s h2d_post=%s sampled=%s "
                     "premature_diff=%d h2d_diff=%d anomaly=%s dev1_ptr=%s dev0_ptr=%s "
-                    "dev_argmax=%s clone_argmax=%s",
+                    "dev_argmax=%s clone_argmax=%s direct_argmax=%s",
                     step,
                     req_id[-12:],
                     n,
@@ -2029,6 +2032,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     hex(dev0.data_ptr()),
                     dev_arg,
                     clone_arg,
+                    direct_arg,
                 )
 
     def _so_d2h_check(self, model_logits: torch.Tensor, tag: str) -> None:
@@ -2112,7 +2116,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # PROBE arm (do not merge): read the forward output through a device-side clone.
             # On the faulty engine the direct D2H of this buffer returned the current step's
             # values only for ids below 2048, while a clone read back correctly (run 37099965953).
+            probe_direct = None
             if envs_so_clone_d2h():
+                # Keep measuring the original hop: a direct read whose argmax disagrees with the
+                # device while the clone agrees shows the fault was present and bypassed.
+                probe_direct = logits.to(torch.float32).to("cpu")
                 logits = logits.clone()
             logits = logits.to(torch.float32).to("cpu")
             probe_raw = logits.clone()
@@ -2149,6 +2157,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     probe_dev1,
                     probe_bitmask_shape,
                     sampler_output,
+                    probe_direct,
                 )
             except Exception as exc:  # the probe must never take the step down
                 logger.warning("SO_VOCAB_PROBE error: %r", exc)
