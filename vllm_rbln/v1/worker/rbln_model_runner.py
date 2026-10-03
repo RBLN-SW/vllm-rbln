@@ -113,6 +113,13 @@ from vllm_rbln.compilation import (
     set_compile_stage,
 )
 from vllm_rbln.compilation.backends import RUNTIME_COMPILES
+
+
+def envs_so_clone_d2h() -> bool:
+    """PROBE arm (do not merge): SO_PROBE_CLONE_D2H=1 reads guided logits through a device clone."""
+    import os
+
+    return os.environ.get("SO_PROBE_CLONE_D2H", "0") == "1"
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     flush_deferred_loads,
@@ -2102,6 +2109,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self._so_selftest_first_done = True
                 self._so_roundtrip_selftest("first_guided_step")
             probe_dev0 = logits
+            # PROBE arm (do not merge): read the forward output through a device-side clone.
+            # On the faulty engine the direct D2H of this buffer returned the current step's
+            # values only for ids below 2048, while a clone read back correctly (run 37099965953).
+            if envs_so_clone_d2h():
+                logits = logits.clone()
             logits = logits.to(torch.float32).to("cpu")
             probe_raw = logits.clone()
             apply_grammar_bitmask(
