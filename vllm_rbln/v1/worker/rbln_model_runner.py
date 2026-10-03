@@ -112,6 +112,7 @@ from vllm_rbln.compilation import (
     create_compile_context,
     set_compile_stage,
 )
+from vllm_rbln.compilation.backends import RUNTIME_COMPILES
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     flush_deferred_loads,
@@ -2066,6 +2067,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        # PROBE (do not merge): a sampler graph compiled at runtime loads a new program into the
+        # engine's shared context. Re-run the round trip on this engine right after that load.
+        seen = getattr(self, "_so_runtime_compiles_seen", 0)
+        if len(RUNTIME_COMPILES) > seen:
+            self._so_runtime_compiles_seen = len(RUNTIME_COMPILES)
+            for compile_id, _callsite in RUNTIME_COMPILES[seen:]:
+                self._so_roundtrip_selftest(f"after_runtime_compile_{compile_id}")
 
         if probe_dev0 is not None:
             try:

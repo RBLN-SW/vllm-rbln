@@ -28,6 +28,8 @@ from vllm_rbln.logger import init_logger
 logger = init_logger(__name__)
 
 _compile_counter = itertools.count(1)
+# PROBE (do not merge): every runtime compile, so the model runner can self-test right after one.
+RUNTIME_COMPILES: list[tuple[int, str]] = []
 _current_stage = ContextVar("rbln_backend_current_stage", default="runtime")
 _SELF_FILE = Path(__file__).resolve()
 
@@ -125,12 +127,15 @@ def _rbln_backend(
         parts.append(fmt_input(name, x))
 
     stage = current_stage()
+    callsite = _find_rbln_callsite()
+    if stage == "runtime":
+        RUNTIME_COMPILES.append((compile_id, callsite))
     log_fn = logger.warning if stage == "runtime" else logger.debug
     log_fn(
         "rbln_backend: stage=%s #%d caller=%s graph inputs=%s",
         stage,
         compile_id,
-        _find_rbln_callsite(),
+        callsite,
         "; ".join(parts),
     )
     return rbln_torch_compile_backend(graph, example_inputs, **kwargs)
