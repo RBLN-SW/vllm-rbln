@@ -2000,6 +2000,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # model forward so the draft model can also save its KV cache.
         if spec_config is not None:
             self.finalize_kv_connector()
+            if has_kv_transfer_group():
+                late_events = get_kv_transfer_group().get_kv_connector_kv_cache_events()
+                assert self.kv_connector_output is not None
+                if late_events is not None:
+                    early_events = self.kv_connector_output.kv_cache_events
+                    if early_events is not None:
+                        # Both collections belong to this rank and this step.
+                        # Preserve early removals without counting stores twice.
+                        events = list(
+                            dict.fromkeys(
+                                early_events.get_all_events()
+                                + late_events.get_all_events()
+                            )
+                        )
+                        late_events.clear_events()
+                        late_events.add_events(events)
+                    self.kv_connector_output.kv_cache_events = late_events
 
         # self.kv_connector_output may be modified during drafting.
         kv_connector_output = self.kv_connector_output
