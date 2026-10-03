@@ -1957,6 +1957,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         post0 = dev0.to(torch.float32).to("cpu")
         post1 = dev1.to(torch.float32).to("cpu")
         masked_rt = masked.to(dev1.dtype).to(torch.float32)
+        clone_host = dev0.clone().to(torch.float32).to("cpu")
+        dev_ids = None
+        if hasattr(self.sampler, "greedy_sample"):
+            try:
+                dev_ids = self.sampler.greedy_sample(dev0).reshape(-1).to("cpu").tolist()
+            except Exception as exc:  # the probe must never take the step down
+                logger.warning("SO_VOCAB_PROBE device argmax error: %r", exc)
         sampled = sampler_output.sampled_token_ids
         sampled = sampled[:, 0].to("cpu").tolist() if sampled.dim() == 2 else sampled.to("cpu").tolist()
 
@@ -1978,18 +1985,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             premature = diff_count(post0[row], raw[row])
             h2d_diff = diff_count(post1[row], masked_rt[row])
             sid = sampled[row] if row < len(sampled) else None
+            # Device-side argmax of the forward output versus the host copy: a disagreement
+            # puts the loss on the D2H read of this buffer rather than on the forward itself.
+            dev_arg = int(dev_ids[row]) if dev_ids is not None and row < len(dev_ids) else None
+            clone_arg = int(clone_host[row].argmax())
             anomaly = bool(
                 premature
                 or h2d_diff
                 or hops["d2h"][1] == 0
                 or hops["h2d_post"][1] == 0
                 or sid != hops["masked"][2]
+                or (dev_arg is not None and dev_arg != hops["d2h"][2])
+                or clone_arg != hops["d2h"][2]
             )
             if n <= 8 or anomaly or n % 200 == 0:
                 logger.warning(
                     "SO_VOCAB_PROBE step=%d req=%s n=%d shape=%s dtype=%s bitmask=%s "
                     "fwd_post(lo,hi,argmax)=%s d2h=%s masked=%s h2d_post=%s sampled=%s "
-                    "premature_diff=%d h2d_diff=%d anomaly=%s dev1_ptr=%s dev0_ptr=%s",
+                    "premature_diff=%d h2d_diff=%d anomaly=%s dev1_ptr=%s dev0_ptr=%s "
+                    "dev_argmax=%s clone_argmax=%s",
                     step,
                     req_id[-12:],
                     n,
@@ -2006,7 +2020,39 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     anomaly,
                     hex(dev1.data_ptr()),
                     hex(dev0.data_ptr()),
+                    dev_arg,
+                    clone_arg,
                 )
+
+    def _so_d2h_check(self, model_logits: torch.Tensor, tag: str) -> None:
+        """PROBE (do not merge): compare the forward output's device argmax with its host copy.
+
+        Runs on the sampling steps that follow a runtime compile, guided or not, so the D2H read
+        of the forward output buffer is measured on ordinary traffic as well.
+        """
+        try:
+            num_reqs = self.input_batch.num_reqs
+            host = model_logits.to(torch.float32).to("cpu")
+            clone_host = model_logits.clone().to(torch.float32).to("cpu")
+            dev_ids = self.sampler.greedy_sample(model_logits).reshape(-1).to("cpu").tolist()
+            rows = []
+            for row in range(min(num_reqs, host.shape[0])):
+                h = int(host[row].argmax())
+                c = int(clone_host[row].argmax())
+                d = int(dev_ids[row]) if row < len(dev_ids) else None
+                hi = int(torch.isfinite(host[row, 2048:]).sum())
+                rows.append((row, d, h, c, hi, d == h == c))
+            logger.warning(
+                "SO_D2H_CHECK tag=%s shape=%s dtype=%s ptr=%s ok=%s rows(row,dev_argmax,host_argmax,clone_argmax,hi_finite,ok)=%s",
+                tag,
+                tuple(model_logits.shape),
+                model_logits.dtype,
+                hex(model_logits.data_ptr()),
+                all(r[-1] for r in rows),
+                rows,
+            )
+        except Exception as exc:
+            logger.warning("SO_D2H_CHECK tag=%s error: %r", tag, exc)
 
     @torch.inference_mode()
     def sample_tokens(
@@ -2045,6 +2091,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # holds this call back until the previous step's tokens have gone through
         # it, so the mask is never built from a -1 placeholder.
         probe_dev0 = None
+        model_logits = logits
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
@@ -2075,6 +2122,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self._so_runtime_compiles_seen = len(RUNTIME_COMPILES)
             for compile_id, _callsite in RUNTIME_COMPILES[seen:]:
                 self._so_roundtrip_selftest(f"after_runtime_compile_{compile_id}")
+            self._so_d2h_steps_left = 24
+            self._so_d2h_tag = f"after_runtime_compile_{RUNTIME_COMPILES[-1][0]}"
+        if getattr(self, "_so_d2h_steps_left", 0) > 0:
+            self._so_d2h_steps_left -= 1
+            self._so_d2h_check(model_logits, self._so_d2h_tag)
 
         if probe_dev0 is not None:
             try:
