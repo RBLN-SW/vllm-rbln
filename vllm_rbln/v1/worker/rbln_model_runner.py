@@ -1882,6 +1882,37 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         return None
 
     @torch.inference_mode()
+    def _so_step_probe(self, logits: torch.Tensor) -> None:
+        """PROBE (do not merge): on every sampling step, read the forward logits to the host the
+        way the guided path does and compare each row's argmax with the device-side argmax."""
+        import os
+
+        if os.environ.get("SO_PROBE_EVERY_STEP", "0") != "1":
+            return
+        try:
+            num_reqs = self.input_batch.num_reqs
+            host = logits.to(torch.float32).to("cpu")
+            dev = self.sampler.greedy_sample(logits).reshape(-1).to("cpu").tolist()
+            step = self._so_step_count = getattr(self, "_so_step_count", 0) + 1
+            rows = min(num_reqs, host.shape[0], len(dev))
+            host_arg = [int(host[r].argmax()) for r in range(rows)]
+            dev_arg = [int(dev[r]) for r in range(rows)]
+            mismatch = sum(1 for r in range(rows) if host_arg[r] != dev_arg[r])
+            hi = sum(1 for r in range(rows) if dev_arg[r] >= 2048)
+            logger.warning(
+                "SO_STEP_D2H step=%d n=%d shape=%s ptr=%s dev_ge_2048=%d mismatch=%d dev=%s host=%s",
+                step,
+                rows,
+                tuple(logits.shape),
+                hex(logits.data_ptr()),
+                hi,
+                mismatch,
+                dev_arg,
+                host_arg,
+            )
+        except Exception as exc:  # the probe must never take the step down
+            logger.warning("SO_STEP_D2H error: %r", exc)
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1907,6 +1938,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             combined_hidden_states,
         ) = self.execute_model_state
         self.execute_model_state = None  # Clear ephemeral state
+
+        # PROBE (do not merge): measure the direct D2H of the forward output before anything
+        # else touches it.
+        self._so_step_probe(logits)
 
         # Nothing waits for the forward here. Its device work and the sampler's
         # are queued in order on the same device, so the sampler cannot start on
