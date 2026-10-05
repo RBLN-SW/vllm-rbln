@@ -1910,8 +1910,70 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dev_arg,
                 host_arg,
             )
+            if os.environ.get("SO_PROBE_MULTI_READ", "0") == "1":
+                self._so_multi_read(logits, rows, dev_arg, host, step, mismatch)
         except Exception as exc:  # the probe must never take the step down
             logger.warning("SO_STEP_D2H error: %r", exc)
+
+    def _so_multi_read(self, logits, rows, dev_arg, host, step, mismatch) -> None:
+        """PROBE (do not merge): every step, read the buffer once more through a device clone and
+        log the tail (id >= 2048) fingerprints of the direct copy and the clone; on a mismatched
+        step, read the same buffer six more ways and compare each row's argmax with the device."""
+        import hashlib
+        import time
+
+        try:
+            ref = logits.clone().to("cpu").to(torch.float32)
+            ref_arg = [int(ref[r].argmax()) for r in range(rows)]
+            rmax, rarg = ref[:rows, 2048:].max(dim=-1)
+            hmax, harg = host[:rows, 2048:].max(dim=-1)
+            rtail = [(round(m, 3), a + 2048) for m, a in zip(rmax.tolist(), rarg.tolist())]
+            htail = [(round(m, 3), a + 2048) for m, a in zip(hmax.tolist(), harg.tolist())]
+            hhash = hashlib.blake2b(host[0, 2048:].contiguous().numpy().tobytes(), digest_size=6)
+            rhash = hashlib.blake2b(ref[0, 2048:].contiguous().numpy().tobytes(), digest_size=6)
+            ref_mismatch = sum(1 for r in range(rows) if ref_arg[r] != dev_arg[r])
+            logger.warning(
+                "SO_TAIL step=%d ref_mismatch=%d rtail=%s htail=%s rhash=%s hhash=%s",
+                step,
+                ref_mismatch,
+                rtail,
+                htail,
+                rhash.hexdigest(),
+                hhash.hexdigest(),
+            )
+            if not mismatch:
+                return
+
+            def arg(t):
+                return [int(t[r].argmax()) for r in range(rows)]
+
+            reads = {}
+            reads["raw"] = arg(logits.to("cpu"))
+            reads["f32b"] = arg(logits.to(torch.float32).to("cpu"))
+            sync = getattr(getattr(torch, "rbln", None), "synchronize", None)
+            if sync is not None:
+                sync()
+            else:
+                logits.amax().item()
+            reads["sync"] = arg(logits.to("cpu"))
+            time.sleep(0.01)
+            reads["wait"] = arg(logits.to("cpu"))
+            reads["clone"] = ref_arg
+            slice0 = int(logits[0, 2048:].to("cpu").argmax()) + 2048
+            match = {k: sum(1 for r in range(rows) if v[r] == dev_arg[r]) for k, v in reads.items()}
+            match["slice0"] = int(slice0 == rtail[0][1])
+            logger.warning(
+                "SO_MULTI step=%d n=%d dev=%s sync_api=%s match=%s reads=%s slice0=%d",
+                step,
+                rows,
+                dev_arg,
+                sync is not None,
+                match,
+                reads,
+                slice0,
+            )
+        except Exception as exc:
+            logger.warning("SO_MULTI error: %r", exc)
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
