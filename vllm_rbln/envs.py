@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=True
     # ====================================================================
     # --- COMPILE / RUNTIME ---
-    VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
+    VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
@@ -237,7 +237,7 @@ environment_variables = {
     # If true, will compile models using strict mode.
     "VLLM_RBLN_COMPILE_STRICT_MODE": (
         lambda: (
-            os.environ.get("VLLM_RBLN_COMPILE_STRICT_MODE", "False").lower()
+            os.environ.get("VLLM_RBLN_COMPILE_STRICT_MODE", "True").lower()
             in ("true", "1")
         )
     ),
