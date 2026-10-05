@@ -3663,7 +3663,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # last PP rank only, so no other rank has anything to warm up here.
             if get_pp_group().is_last_rank:
                 # 4-1. sampler
-                if not self.is_pooling_model:
+                # PROBE (do not merge): with SO_PROBE_SKIP_SAMPLER_WARMUP=1 the sampler graphs
+                # are not warmed, so the first request of each variant compiles at runtime.
+                import os
+
+                skip_sampler = os.environ.get("SO_PROBE_SKIP_SAMPLER_WARMUP", "0") == "1"
+                if skip_sampler:
+                    logger.warning("SO_PROBE: skipping the sampler warm-up")
+                if not self.is_pooling_model and not skip_sampler:
                     for size in self.bucketing_manager.batch_buckets:
                         self._dummy_sampler_run(size)
 
