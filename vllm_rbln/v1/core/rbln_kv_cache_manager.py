@@ -487,14 +487,6 @@ class RBLNKVCacheManager(KVCacheManager):
                 )
             )
 
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.record(
-                num_tokens=0,  # already counted in get_computed_blocks
-                num_hits=match.num_tokens,
-                preempted=request.num_preemptions > 0,
-            )
-
     def release_sub_block_match(self, match: SubBlockMatch) -> None:
         """Release source-block references held by a sub-block match.
 
