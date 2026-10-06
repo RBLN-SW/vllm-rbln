@@ -1556,8 +1556,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     )
                 )
         else:
-            # The sampled tokens and the logprobs stay on device; the D2H is
-            # deferred to AsyncRBLNModelRunnerOutput.get_output().
+            # The sampled tokens and the logprobs stay on device;
+            # AsyncRBLNModelRunnerOutput copies them to the host.
             if logprobs_tensors is not None:
                 logger.warning_once(
                     "Requesting logprobs adds host CPU work to every decode "
