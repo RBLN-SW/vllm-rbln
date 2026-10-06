@@ -116,6 +116,7 @@ def _push_worker():
     window_mode(w, None, streams_prefix=False)
     w._streamed = {}
     w._recving_transfers = {}
+    w._engines_to_rehandshake = set()
     # Off, as the connector option is; the trim tests turn it on.
     set_shape(w, chunk_mode=False)
     # The geometry `__init__` leaves until registration reports one, which is
