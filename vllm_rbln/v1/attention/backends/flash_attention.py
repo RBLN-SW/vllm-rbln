@@ -210,10 +210,7 @@ class RBLNFlashAttentionMetadataBuilder(
         # attention under its own config, and upstream sets `use_non_causal` on
         # the draft config only, so a non-causal drafter and a causal target
         # coexist in one process.
-        self.is_causal = (
-            rbln_config.use_flash_causal_attn
-            and not vllm_config.attention_config.use_non_causal
-        )
+        self.is_causal = not vllm_config.attention_config.use_non_causal
 
         self.swa_appends = isinstance(
             kv_cache_spec, SlidingWindowSpec
@@ -449,10 +446,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if len(self.sinks.size()) == 1:
                 self.sinks = self.sinks[:, None]
 
-        self.is_causal = (
-            rbln_config.use_flash_causal_attn
-            and not vllm_config.attention_config.use_non_causal
-        )
+        self.is_causal = not vllm_config.attention_config.use_non_causal
         self.is_batch_attention_opt = rbln_config.use_batch_attn_opt
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
@@ -475,7 +469,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if self.sliding_window is not None or not self.is_causal or self.is_normal:
                 raise NotImplementedError(
                     "fp8 KV cache is only supported by the flash causal "
-                    "attention path (--rbln-use-flash-causal-attn, "
+                    "attention path (causal attention, "
                     "block_size != max_model_len, no sliding window); got "
                     f"sliding_window={self.sliding_window}, "
                     f"is_causal={self.is_causal}, is_normal={self.is_normal}."
