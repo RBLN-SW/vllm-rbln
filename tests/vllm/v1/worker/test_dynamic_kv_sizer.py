@@ -530,7 +530,6 @@ class TestModeResolution:
             additional_config=SimpleNamespace(
                 compile_model=True,
                 use_custom_kernel=False,
-                use_flash_causal_attn=True,
                 use_dynamic_kv_cache=False,
             ),
             speculative_config=None,

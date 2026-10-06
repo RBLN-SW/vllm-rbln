@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=True
     # ====================================================================
     # --- COMPILE / RUNTIME ---
-    VLLM_RBLN_COMPILE_STRICT_MODE: bool = False
+    VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
@@ -61,7 +61,6 @@ if TYPE_CHECKING:
     # --- DYNAMIC KV CACHE ---
     VLLM_RBLN_USE_DYNAMIC_KV_CACHE: bool = True
     # --- ATTENTION ---
-    VLLM_RBLN_FLASH_CAUSAL_ATTN: bool = True
     VLLM_RBLN_BATCH_ATTN_OPT: bool = False
     VLLM_RBLN_USE_CUSTOM_KERNEL: bool = False
     # --- MODEL INPUT / SCHEDULING ---
@@ -78,8 +77,6 @@ if TYPE_CHECKING:
     VLLM_RBLN_DECODE_BATCH_BUCKET_STEP: int = 2
     VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT: int = 1
     VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS: list[int] = []
-    # --- KV CONNECTOR ---
-    VLLM_RBLN_NIXL_SWA_VIEW_OPT: bool = False
     # --- QUANTIZATION ---
     VLLM_RBLN_USE_W8A8: bool = False
 
@@ -239,7 +236,7 @@ environment_variables = {
     # If true, will compile models using strict mode.
     "VLLM_RBLN_COMPILE_STRICT_MODE": (
         lambda: (
-            os.environ.get("VLLM_RBLN_COMPILE_STRICT_MODE", "False").lower()
+            os.environ.get("VLLM_RBLN_COMPILE_STRICT_MODE", "True").lower()
             in ("true", "1")
         )
     ),
@@ -306,13 +303,6 @@ environment_variables = {
         )
     ),
     # --- ATTENTION ---
-    # Use flash attention for causal attention
-    "VLLM_RBLN_FLASH_CAUSAL_ATTN": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_FLASH_CAUSAL_ATTN", "True").lower()
-            in ("true", "1")
-        )
-    ),
     # Use batch attention optimization for paged attention
     "VLLM_RBLN_BATCH_ATTN_OPT": (
         lambda: (
@@ -380,17 +370,6 @@ environment_variables = {
     ),
     # Decode batch bucket manual buckets
     "VLLM_RBLN_DECODE_BATCH_BUCKET_MANUAL_BUCKETS": get_decode_batch_bucket_manual_buckets,  # noqa E501
-    # --- KV CONNECTOR ---
-    # Publish a second SWA-sized descriptor range alongside the Full-sized
-    # range at the same NIXL base addresses, so SWA groups transfer only
-    # `sliding_window` bytes per block over RDMA. Host-side h2d/d2h still
-    # moves the full block — only the remote RDMA payload is trimmed.
-    "VLLM_RBLN_NIXL_SWA_VIEW_OPT": (
-        lambda: (
-            os.environ.get("VLLM_RBLN_NIXL_SWA_VIEW_OPT", "False").lower()
-            in ("true", "1")
-        )
-    ),
     # --- QUANTIZATION ---
     # W8A16 runs on every RBLN NPU, W8A8 only on the ones whose kernels take an
     # fp8 activation, so W8A8 is opted into rather than derived from the device.
@@ -428,11 +407,9 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_AUTO_PORT",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
         "VLLM_RBLN_SUB_BLOCK_SIZE",
-        "VLLM_RBLN_NIXL_SWA_VIEW_OPT",
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",
-        "VLLM_RBLN_FLASH_CAUSAL_ATTN",
         "VLLM_RBLN_BATCH_ATTN_OPT",
         "VLLM_RBLN_USE_CUSTOM_KERNEL",
         "VLLM_RBLN_USE_DYNAMIC_KV_CACHE",

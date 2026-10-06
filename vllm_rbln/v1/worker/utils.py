@@ -38,7 +38,9 @@ from vllm.utils.cpu_resource_utils import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
+    KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -419,11 +421,6 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
             "RBLN_USE_CUSTOM_KERNEL is on, and the rbln_triton_ops kernels take "
             "no dynamic KV input"
         )
-    if not rbln_config.use_flash_causal_attn:
-        return (
-            "flash causal attention is off, so the model dispatches to an "
-            "attention kernel that does not accept a dynamic KV input"
-        )
     speculative = vllm_config.speculative_config
     if speculative is not None and speculative.method == "dflash":
         # `use_non_causal` lives on the draft config only; the RBLN drafter is
@@ -498,6 +495,27 @@ def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
                 "cannot be realized as whole tensors"
             )
     return extents
+
+
+def canonical_kv_layers(
+    cfg: KVCacheConfig, layer_specs: Mapping[str, KVCacheSpec]
+) -> set[str]:
+    """Pick one layer to stand for each KV cache buffer.
+
+    Layers on one extent (`kv_cache_extents`) alias one buffer. Prefer a
+    full-attention layer: its view counts blocks the way the scheduler does,
+    and a sliding-window view does not.
+    """
+    pools: defaultdict[tuple[int, int], list[str]] = defaultdict(list)
+    for layer_name, extent in kv_cache_extents(cfg).items():
+        pools[extent].append(layer_name)
+    return {
+        next(
+            (ln for ln in layers if isinstance(layer_specs.get(ln), FullAttentionSpec)),
+            layers[0],
+        )
+        for layers in pools.values()
+    }
 
 
 def rescale_kv_cache_config(cfg: KVCacheConfig, num_blocks: int) -> None:

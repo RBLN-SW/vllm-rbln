@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
@@ -266,6 +267,53 @@ class TestIsPrefill:
 
 
 class TestScheduleBasic:
+    @pytest.mark.usefixtures("cr13")
+    @pytest.mark.parametrize("sub_block", [False, True])
+    @pytest.mark.parametrize("preempted", [False, True])
+    def test_prefix_cache_stats_recorded_once_at_admission(
+        self, monkeypatch, sub_block, preempted
+    ):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            sub_block_size=8 if sub_block else None,
+            additional_config={"enable_sub_block_cache": sub_block},
+        )
+        seed = make_request("seed", list(range(32)), 16, max_tokens=1)
+        sched.add_request(seed)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        assert seed.is_finished()
+        manager = sched.kv_cache_manager
+        manager.make_prefix_cache_stats()
+
+        query = make_request("query", list(range(24)) + [100] * 16, 16)
+        if preempted:
+            query.status = RequestStatus.PREEMPTED
+            query.num_preemptions = 1
+        sched.add_request(query)
+        with monkeypatch.context() as patch:
+            patch.setattr(manager, "allocate_slots", lambda *args, **kwargs: None)
+            assert not sched.schedule().num_scheduled_tokens
+            assert manager.make_prefix_cache_stats() == PrefixCacheStats()
+
+        out = sched.schedule()
+        assert query.request_id in out.num_scheduled_tokens
+        hits = 24 if sub_block else 16
+        if preempted:
+            expected = PrefixCacheStats(
+                preempted_requests=1,
+                preempted_queries=query.num_tokens,
+                preempted_hits=hits,
+            )
+        else:
+            expected = PrefixCacheStats(requests=1, queries=query.num_tokens, hits=hits)
+        assert manager.make_prefix_cache_stats() == expected
+
     def test_admits_and_counts_tokens(self):
         # add -> schedule returns RBLNSchedulerOutput scheduling one prefill with
         # the exact prompt length (also smokes the ported schedule() on 0.22.0).
