@@ -29,6 +29,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.v1.request import RequestStatus
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
+from tests.vllm.distributed.kv_connector.utils import (
+    mock_vllm_config,
+)
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler import (
     RblnNixlPullConnectorScheduler,
 )
@@ -88,7 +91,7 @@ def _sched_output(req_id, block_ids, num_scheduled_tokens, *, is_new=True):
 
 def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched = object.__new__(cls)
-    sched.vllm_config = MagicMock()
+    sched.vllm_config = mock_vllm_config()
     sched.vllm_config.parallel_config.tensor_parallel_size = 1
     sched.block_size = 16
     sched.engine_id = "test-engine"
@@ -108,6 +111,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched._kv_lease_duration = 30
     sched._reqs_need_recv = {}
     sched._reqs_need_save = {}
+    sched._valid_tokens = {}
     sched._reqs_need_send = {}
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
@@ -409,6 +413,7 @@ class TestSchedulerCleanupReachesBothDirections:
         monkeypatch.setattr(direction_cls, "request_finished", record)
         scheduler = object.__new__(scheduler_cls)
         scheduler._block_ids_need_save = {"r0": ([1, 2],)}
+        scheduler._valid_tokens = {}
 
         # A real Request always carries the field, even when it is None.
         scheduler.request_finished(
@@ -456,3 +461,96 @@ class TestRejectedBeforeScheduling:
 
         assert "rejected" in meta.reqs_to_recv
         assert meta.reqs_to_recv["rejected"].remote.block_ids == ()
+
+
+class TestTailTokenCountOnTheWritePath:
+    """The producer takes its own count where it hands the blocks over."""
+
+    @staticmethod
+    def _finish(monkeypatch, delay_free_blocks, trim=True, window=False):
+        monkeypatch.setattr(
+            NixlPushConnectorScheduler,
+            "request_finished",
+            lambda self, request, block_ids: (delay_free_blocks, None),
+        )
+        sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
+        sched.vllm_config = mock_vllm_config(chunk_mode=trim, swa_window_mode=window)
+        sched.request_finished(
+            # Apart, so taking the prompt length instead of what was computed
+            # is a different answer.
+            _Request("r0", num_prompt_tokens=41, num_computed_tokens=33),
+            ([1, 2],),
+        )
+        return sched
+
+    def test_the_scheduler_builds_the_map_the_handover_writes_into(self, monkeypatch):
+        # Every case here hands the map in already made, so none of them would
+        # notice it going missing -- and production reaches this line before
+        # any request finishes.
+        monkeypatch.setattr(
+            NixlPushConnectorScheduler,
+            "__init__",
+            lambda self, *a, **k: None,
+        )
+        monkeypatch.setattr(
+            NixlPushConnectorScheduler,
+            "request_finished",
+            lambda self, request, block_ids: (True, None),
+        )
+        sched = RblnNixlPushConnectorScheduler(
+            mock_vllm_config(chunk_mode=True), "eng", MagicMock()
+        )
+        sched.vllm_config = mock_vllm_config(chunk_mode=True)
+
+        sched.request_finished(
+            # Apart, so taking the prompt length instead of what was computed
+            # is a different answer.
+            _Request("r0", num_prompt_tokens=41, num_computed_tokens=33),
+            ([1, 2],),
+        )
+
+        assert sched._valid_tokens == {"r0": 33}
+
+    def test_the_count_is_taken_where_the_lease_takes_the_blocks(self, monkeypatch):
+        assert self._finish(monkeypatch, True)._valid_tokens == {"r0": 33}
+
+    def test_blocks_going_straight_back_leave_no_count(self, monkeypatch):
+        # Nothing is handed over, so there is no write to size.
+        assert self._finish(monkeypatch, False)._valid_tokens == {}
+
+    def test_both_flags_off_collect_nothing(self, monkeypatch):
+        # Same handover, and nothing kept: the worker would not read it.
+        assert self._finish(monkeypatch, True, trim=False)._valid_tokens == {}
+
+    def test_window_mode_alone_collects_the_count(self, monkeypatch):
+        # As on the read path: the granule a window sits in is read off this
+        # count, so a chunk range is not the only thing that asks for it.
+        sched = self._finish(monkeypatch, True, trim=False, window=True)
+
+        assert sched._valid_tokens == {"r0": 33}
+
+    def test_the_handover_carries_the_count_to_the_worker(self):
+        # The positive direction of the case below: the count the scheduler
+        # took at handover has to reach the worker in the same step's metadata,
+        # and leave the scheduler's map so a later step does not resend it.
+        sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
+        sched._valid_tokens = {"r0": 33, "r1": 64}
+        sched._newly_finished_push_blocks = {"r0": ([1, 2],)}
+
+        meta = sched.build_connector_meta(_sched_output("other", ([9],), 16))
+
+        assert meta.valid_tokens == {"r0": 33}
+        # r1 has not been handed over, so its count waits for the step that has.
+        assert sched._valid_tokens == {"r1": 64}
+
+    def test_a_streamed_offer_does_not_carry_the_count(self):
+        # Only the handover reaches the request's last block; a mid-stream
+        # offer is a closed prefix, and the count must wait for the batch that
+        # can use it.
+        sched = _scheduler(cls=RblnNixlPushConnectorScheduler)
+        sched._valid_tokens = {"r0": 33}
+
+        meta = sched.build_connector_meta(_sched_output("other", ([9],), 16))
+
+        assert meta.valid_tokens == {}
+        assert sched._valid_tokens == {"r0": 33}

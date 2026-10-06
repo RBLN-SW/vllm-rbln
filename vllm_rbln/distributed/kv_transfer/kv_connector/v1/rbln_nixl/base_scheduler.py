@@ -28,6 +28,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import (
+    connector_option,
+)
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
@@ -56,6 +59,19 @@ class RblnNixlSchedulerBase(NixlBaseConnectorScheduler):
 
         # Blocks collected so far for a prefill that is still being chunked.
         self._block_ids_need_save: dict[ReqId, BlockIds] = {}
+
+    @property
+    def _sends_token_count(self) -> bool:
+        """Whether the worker needs a request's token count in the metadata.
+
+        Chunk mode sizes the last block's chunks by it; window mode picks which
+        granules of a block the window sits in. Block ids say neither. Asked of
+        the knobs rather than of the cache, since the worker is where the two
+        combine and an unused count costs an int a request.
+        """
+        return connector_option(
+            self.vllm_config, "chunk_mode", False
+        ) or connector_option(self.vllm_config, "swa_window_mode", False)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
