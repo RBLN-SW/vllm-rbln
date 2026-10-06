@@ -127,8 +127,7 @@ class TestCompileOptions:
         assert captured_compile["options"]["mode"] == ["foo", "compile_only"]
 
     def test_compile_only_appended_to_empty_mode(self, captured_compile, monkeypatch):
-        # Every call site passes "" unless VLLM_RBLN_COMPILE_STRICT_MODE is on,
-        # so this is the configuration compile-only actually runs in.
+        # Call sites pass "" when VLLM_RBLN_COMPILE_STRICT_MODE is turned off.
         monkeypatch.setattr(compiler.envs, "VLLM_RBLN_COMPILE_ONLY", True)
         compile(object(), mode="")
         assert captured_compile["options"]["mode"] == ["compile_only"]
