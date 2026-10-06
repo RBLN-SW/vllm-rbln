@@ -968,6 +968,16 @@ class TestPpHandshakeFanout:
         with pytest.raises(RuntimeError, match="engine ID"):
             _handshake(w, sock, engine_id="eng")
 
+    def test_a_peer_with_every_link_down_refuses_the_handshake(self, monkeypatch):
+        # The refusal is an empty frame; it must not read as a version mismatch.
+        w = _make_worker()
+        sock = _FakeSock(pp_size=1)
+        monkeypatch.setattr(
+            sock, "recv_multipart", lambda: (b"", msgspec.msgpack.encode(0.0))
+        )
+        with pytest.raises(RuntimeError, match="every RDMA link down"):
+            _handshake(w, sock)
+
 
 class TestPeerRegionView:
     # Runs the real upstream loop, so a release that stops reading a region length
@@ -4487,6 +4497,7 @@ class TestADeadPeerIsReported:
         w._recv_failures = set()
         w._is_hma_required = False
         w.xfer_stats = MagicMock()
+        w._engines_to_rehandshake = set()
         w._remote_agents = {"eng": {(0, 0): "agent0", (0, 1): "agent1"}}
         w._hb_handshake_notif_only = False
         # Handshake already done for every engine a heartbeat names.
@@ -4549,6 +4560,7 @@ class TestADeadPeerIsReported:
         # would report r0 a second time with its metadata already gone.
         w.nixl_wrapper.release_xfer_handle.assert_called_once_with(7)
         assert "r0" not in w._recving_transfers
+        assert w._engines_to_rehandshake == set()
 
     def test_a_failing_heartbeat_drops_the_handshake_state(self):
         # _ensure_handshake skips the reconnect while the entry is there, so
