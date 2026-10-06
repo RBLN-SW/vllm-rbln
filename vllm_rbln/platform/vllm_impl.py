@@ -337,6 +337,18 @@ def _wire(vllm_config: "VllmConfig") -> None:
         )
         scheduler_config.async_scheduling = False
 
+    # FIXME(RBLN): remove this warning when async scheduling on uni backend
+    # is fixed.
+    if (
+        scheduler_config.async_scheduling
+        and parallel_config.distributed_executor_backend == "uni"
+    ):
+        logger.warning(
+            "Asynchronous scheduling with the 'uni' distributed executor "
+            "backend is not stable yet on RBLN. Use "
+            "--distributed-executor-backend mp instead."
+        )
+
     if scheduler_config.async_scheduling:
         # Only RBLNAsyncScheduler bumps num_output_placeholders at
         # schedule time, which is what lets the batch_queue fill.
