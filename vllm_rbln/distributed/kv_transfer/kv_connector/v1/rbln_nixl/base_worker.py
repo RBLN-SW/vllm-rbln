@@ -140,6 +140,7 @@ class RblnNixlWorkerBase(
         self._stripe_width = connector_option(
             vllm_config, "stripe_width", None, takes=int
         )
+        self._listen_ip = connector_option(vllm_config, "listen_ip", None, takes=str)
 
         self._pending_kv_caches: dict[str, torch.Tensor] | None = None
 

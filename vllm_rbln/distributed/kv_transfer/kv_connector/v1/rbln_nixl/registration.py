@@ -71,6 +71,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
     _pending_kv_caches: dict[str, torch.Tensor] | None
     #: None where nobody named one, which is not the same as a width of 0.
     _stripe_width: int | None
+    _listen_ip: str | None
 
     @property
     def _backend_extra(self) -> dict[str, int]:
@@ -756,9 +757,11 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         if self._use_rbln_nixl_backend:
             import nixl_rbln
 
-            nixl_rbln.ensure_rbln_backend(
-                self.nixl_wrapper, device_id=0, **self._backend_extra
-            )
+            # Only backend bringup takes it; `register_kv_regions` does not.
+            bringup: dict[str, object] = dict(self._backend_extra)
+            if self._listen_ip is not None:
+                bringup["listen_ip"] = self._listen_ip
+            nixl_rbln.ensure_rbln_backend(self.nixl_wrapper, device_id=0, **bringup)
         page_sizes = self._layer_page_sizes(kv_caches)
         if len(page_sizes) > 1:
             # TODO(RBLN): lift once the head bands below are read per region.
