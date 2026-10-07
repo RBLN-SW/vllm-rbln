@@ -129,6 +129,30 @@ class TestKVCacheBaseBindings:
 
 
 class TestHostBufferCopyOp:
+    def test_lmcache_registers_each_layer_view_of_a_shared_pool(
+        self, make_model_runner, monkeypatch
+    ):
+        captured: dict[str, torch.Tensor] = {}
+        monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(
+            mr,
+            "get_kv_transfer_group",
+            lambda: SimpleNamespace(
+                register_kv_caches=captured.update,
+                set_host_xfer_buffer_ops=lambda op: None,
+            ),
+        )
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        runner.vllm_config.kv_transfer_config = SimpleNamespace(
+            kv_connector="RBLNLMCacheConnectorV1"
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        )
+        assert list(captured) == runner.kv_cache_names
+        for name, cache in zip(runner.kv_cache_names, runner.kv_caches, strict=True):
+            assert captured[name] is cache
+
     def test_the_registered_op_reads_the_axes_at_call_time(
         self, make_model_runner, monkeypatch
     ):

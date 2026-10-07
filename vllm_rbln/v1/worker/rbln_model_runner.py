@@ -3254,6 +3254,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 kv_transfer_group.register_cross_layers_kv_cache(
                     self.cross_layers_kv_cache, self.cross_layers_attn_backend
                 )
+            elif (
+                self.vllm_config.kv_transfer_config is not None
+                and self.vllm_config.kv_transfer_config.kv_connector
+                == "RBLNLMCacheConnectorV1"
+            ):
+                # LMCache transfers logical layer views using each group's
+                # block table, including SWA views that share a full-layer pool.
+                kv_transfer_group.register_kv_caches(
+                    {name: kv_caches[name] for name in self.kv_cache_names}
+                )
             else:
                 # Filter to one Full-preferred canonical layer per pool so
                 # upstream NIXL sees `cache.shape[0] == num_blocks` (logical).
