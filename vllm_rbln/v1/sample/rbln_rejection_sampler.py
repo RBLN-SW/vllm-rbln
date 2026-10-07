@@ -30,6 +30,7 @@ from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TEMPERATURE,
     GREEDY_TOP_K,
+    TOP_P_CLAMP,
     build_op_top_k_top_p,
 )
 
@@ -614,6 +615,8 @@ def rbln_rejection_sample(
     """
     target_logits = target_logits / temperature.unsqueeze(-1)
     target_probs = target_logits.softmax(dim=-1)
+    if top_p is not None:
+        top_p = top_p.clamp(max=TOP_P_CLAMP)
 
     # ------------------------------------------------------------------
     # rbln::rejection_sample Returns:
