@@ -12,15 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import os
 from collections.abc import Callable
 from typing import Any, TypeVar, cast
 
-import rebel
 import torch
-from rebel import CompileContext
-from vllm.distributed import get_dp_group, get_pp_group, get_tp_group
 
 from vllm_rbln import envs
 from vllm_rbln.compilation.backends import rbln_backend
@@ -37,45 +33,9 @@ def _ensure_torch_dynamo_configured() -> None:
     if _DYNAMO_CONFIGURED:
         return
 
-    # To prevent nn.modules parameters to be modmel input, set false.
-    # If this flag is set, nn.modules parameters are treated as model input.
-    torch._dynamo.config.inline_inbuilt_nn_modules = False
     torch._dynamo.config.cache_size_limit = 64
 
     _DYNAMO_CONFIGURED = True
-
-
-def check_dtype_option_supported() -> None:
-    # Remove once the rebel-compiler pin guarantees the `dtype` option.
-    if "dtype" not in inspect.signature(rebel.compile).parameters:
-        raise ValueError(
-            "compile_dtype needs a rebel-compiler that takes `dtype` as a compile "
-            f"option; installed {rebel.__version__} does not."
-        )
-
-
-def create_compile_context(
-    use_weight_sharing: bool = False, use_global_ctx: bool = False
-) -> CompileContext:
-    return CompileContext(
-        use_weight_sharing=use_weight_sharing, use_global_ctx=use_global_ctx
-    )
-
-
-def build_process_group_dict() -> dict[str, list[int]]:
-    """Build process group metadata consumed by the RBLN torch.compile backend."""
-    tp = get_tp_group()
-    pp = get_pp_group()
-    dp = get_dp_group()
-
-    return {
-        tp.device_group.group_name: tp.ranks,
-        tp.cpu_group.group_name: tp.ranks,
-        pp.device_group.group_name: pp.ranks,
-        pp.cpu_group.group_name: pp.ranks,
-        dp.device_group.group_name: dp.ranks,
-        dp.cpu_group.group_name: dp.ranks,
-    }
 
 
 def compile(
@@ -84,20 +44,11 @@ def compile(
     backend: str | Callable = rbln_backend,
     dynamic: bool = False,
     fullgraph: bool = False,
-    compile_context: CompileContext | None = None,
     num_devices: int | None = None,
-    model_trace_method: str = "",
-    process_group_dict: dict[str, list[int]] | None = None,
     guard_filter_fn: Callable | None = None,
-    runtime_holder: list | None = None,
-    mode: str | list[str] = "",
-    use_global_ctx: bool | None = None,
-    global_device_id: int | None = None,
     use_cache: bool = True,
     cache_dir: str = "",
-    use_static_output: bool = False,
     use_direct_dispatch: bool = False,
-    dtype: str = "",
 ) -> CompiledTarget:
     if use_direct_dispatch and not fullgraph:
         # A dispatched call runs one code object, so whatever Dynamo leaves
@@ -109,31 +60,15 @@ def compile(
 
     _ensure_torch_dynamo_configured()
 
-    options = {}
-
-    def set_option(key: str, value: Any) -> None:
-        if value is None or value == "":
-            return
-        options[key] = value
-
-    set_option("compile_context", compile_context)
-    set_option("num_devices", num_devices)
-    set_option("model_trace_method", model_trace_method)
-    set_option("process_group_dict", process_group_dict)
-    set_option("guard_filter_fn", guard_filter_fn)
-    set_option("_runtime_holder", runtime_holder)
-    if isinstance(mode, str):
-        mode = [mode] if mode else []
+    options: dict[str, Any] = {}
+    if num_devices is not None:
+        options["devices"] = num_devices
+    if guard_filter_fn is not None:
+        options["guard_filter_fn"] = guard_filter_fn
     if envs.VLLM_RBLN_COMPILE_ONLY:
-        mode.append("compile_only")
-    set_option("mode", mode)
-    set_option("use_global_ctx", use_global_ctx)
-    set_option("global_device_id", global_device_id)
-    set_option("use_static_output", use_static_output)
-    set_option("dtype", dtype)
+        options["mode"] = "compile_only"
     if use_cache and not envs.VLLM_DISABLE_COMPILE_CACHE:
-        set_option("cache_dir", cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln"))
-        set_option("mega_cache_only", True)
+        options["cache_dir"] = cache_dir or os.path.join(envs.VLLM_CACHE_ROOT, "rbln")
 
     compiled = torch.compile(
         target,

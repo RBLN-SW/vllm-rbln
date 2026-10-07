@@ -21,31 +21,22 @@ import pytest
 import torch
 
 from vllm_rbln.distributed.ec_transfer.ec_connector.rbln_ec_nixl_connector import (
-    _DTYPE_SIZES,
     ECNixlMetadata,
     RblnECNixlConnectorWorker,
-    _dtype_size,
+    _dtype_of,
 )
 
 
-def test_dtype_size_known_dtypes():
-    assert _dtype_size("torch.float16") == 2
-    assert _dtype_size("torch.bfloat16") == 2
-    assert _dtype_size("torch.float32") == 4
-    assert _dtype_size("torch.int64") == 8
-    assert _dtype_size("torch.int32") == 4
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.int64, torch.int32]
+)
+def test_a_dtype_is_read_back_from_its_name(dtype):
+    assert _dtype_of(str(dtype)) is dtype
 
 
-def test_dtype_size_covers_registered_table():
-    # Keep _DTYPE_SIZES and _dtype_size in lockstep — if a new dtype is
-    # added to the table, this test forces the lookup to stay wired up.
-    for dtype_str, expected in _DTYPE_SIZES.items():
-        assert _dtype_size(dtype_str) == expected
-
-
-def test_dtype_size_unknown_raises():
+def test_an_unknown_dtype_raises():
     with pytest.raises(ValueError, match="Unsupported dtype"):
-        _dtype_size("torch.float64")
+        _dtype_of("torch.float64")
 
 
 class _FakeNixlAgent:
@@ -135,12 +126,13 @@ def _consumer(agent):
     return w
 
 
-def test_pull_delivers_the_cached_tensor_as_is():
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_pull_delivers_the_cached_tensor_as_is(dtype):
     # The runner caches one tensor per mm_hash; the consumer must find the
     # same tensor (shape, dtype, values) in its encoder cache, not a wrapper.
     agent = _FakeNixlAgent()
     producer, consumer = _producer(agent), _consumer(agent)
-    embeds = torch.arange(12, dtype=torch.float16).reshape(3, 4)
+    embeds = torch.arange(12, dtype=dtype).reshape(3, 4)
 
     producer.save_caches({"img": embeds}, "img")
 
@@ -148,7 +140,7 @@ def test_pull_delivers_the_cached_tensor_as_is():
     meta = msgspec.msgpack.Decoder(ECNixlMetadata).decode(pushed)
     assert meta.mm_hash == "img"
     assert meta.tensor.shape == [3, 4]
-    assert meta.tensor.dtype_str == "torch.float16"
+    assert meta.tensor.dtype_str == str(dtype)
 
     consumer._incoming_metadata.put(meta)
     assert consumer._process_pending_metadata() == {"img"}

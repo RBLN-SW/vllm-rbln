@@ -20,23 +20,22 @@ The worker marks the KV cache's
 compile-time cache, and after warm-up sizes the real cache from two measurements:
 
 - **Growth** -- how many bytes one more block costs on each chiplet. Every
-  compiled program reports the device placement of its dynamic-shape inputs
-  (`torch.rbln.capture_programs()` -> `CompiledProgram.input_specs[i].physical_placement`):
-  the physical shape, dtype and one shard per `(node, chiplet)`, with the dynamic
-  dim left symbolic. The KV caches are the only dynamic inputs, so summing the
-  shards' extents gives the per-chiplet slope exactly. A layer's dynamic dim is
-  its *kernel* block count -- a sliding-window layer splits each manager block
-  into `block_size / sliding_window` kernel blocks -- so each input's symbol is
-  scaled by its compiled extent over the compile hint. Programs that bind a
-  different set of KV tensors (a speculative drafter's) contribute their own
-  slope on top of the target's. The fit counts the shards at what the runtime's
-  caching allocator reserves for them, replayed the way it allocates: requests
-  are rounded to 4 KiB and served best-fit from free blocks, a miss maps a
-  2 MiB segment (request up to 1 MiB), a 20 MiB segment (up to 10 MiB) or the
-  request rounded up to 2 MiB, and a split block's remainder serves later
-  requests of the same pool. A model with many mid-size shards therefore packs
-  several of them into one segment, and the rounding costs at most a few blocks
-  below the linear answer.
+  compiled program reports how the device holds its inputs
+  (`torch.rbln.capture_programs()` -> `CompiledProgram.input_specs[i].arg`, an
+  `rebel.v2.Arg`): one shard per `(node, chiplet)`, each with the bytes it takes at
+  the least extent of the input's dynamic axis (`min_nbytes`) and the bytes every
+  further index of that axis adds (`step_nbytes`). The KV caches are the only
+  dynamic inputs, so summing the shards' steps gives the per-chiplet slope
+  exactly. A layer's dynamic axis is its *kernel* block count -- a sliding-window
+  layer splits each manager block into `block_size / sliding_window` kernel
+  blocks -- so each input's steps are scaled by its traced extent over the
+  compile hint. Programs that bind a different set of KV tensors (a speculative
+  drafter's) contribute their own slope on top of the target's. The fit counts
+  the shards at what torch-rbln's caching allocator reserves for them, replayed
+  the way it allocates: a request up to 1 MiB is rounded to 512 B and carved
+  best-fit out of 2 MiB segments, whose remainders serve later small requests,
+  and a larger one maps a segment of its own, rounded up to 2 MiB. The rounding
+  therefore costs at most a few blocks below the linear answer.
 - **Base** -- how many bytes are already spoken for on each chiplet. A per-chiplet
   memory snapshot is taken after the compile-time cache is released, so what
   the runtime does not hand back is measured as base rather than assumed away:
@@ -71,9 +70,9 @@ actual post-resize tensors and does not cache a block count. Nothing is register
 early, so nothing has to be unregistered. Every other mode keeps the start-up
 order.
 
-> The dynamic path needs `--model-impl vllm` and `VLLM_RBLN_USE_DEVICE_TENSOR=1`,
-> and turns itself off without them. Only `DynamoRuntime` applies adaptive buffer
-> sizes; the other runtimes ignore them silently.
+> The dynamic path needs `--model-impl vllm`, and is absent without it. The compiled
+> programs do not depend on the KV extent, so the cache reallocated after warm-up
+> binds to them as it is, with no recompile.
 
 Key components:
 
@@ -95,7 +94,6 @@ Key components:
 | `--rbln-use-dynamic-kv-cache` (`additional_config={"use_dynamic_kv_cache": ...}`) | unset | Size the KV cache from the compiled placement and the device. `--no-rbln-use-dynamic-kv-cache` goes back to the pre-compile estimate. Unset, a configuration the path cannot size turns it off on its own; set, such a configuration is refused at start-up. `VLLM_RBLN_USE_DYNAMIC_KV_CACHE` still sets it, with a deprecation warning, until 0.14.0. |
 
 ```bash
-export VLLM_RBLN_USE_DEVICE_TENSOR=1
 export VLLM_CACHE_ROOT=<a fresh directory>
 ```
 
@@ -105,10 +103,6 @@ the compile is a module constant
 from the environment. It is a trace hint for the dynamic dimension, not a
 capacity: the count that ends up in service comes from the placement and the
 snapshot.
-
-The mega-cache bundle key includes the resolved dynamic-KV decision, not only
-the environment flag. A configuration that turns the feature off therefore
-cannot replay a dynamic artifact, or vice versa.
 
 When the pre-compile estimate falls short of one max-length request, it is
 raised to exactly that with a warning instead of letting vllm refuse the compile:
@@ -133,7 +127,6 @@ feature is absent there rather than disabled.
 
 | Configuration | Why |
 | --- | --- |
-| `VLLM_RBLN_USE_DEVICE_TENSOR=0` | The artifact carries no dynamic KV dimension. |
 | `RBLN_USE_CUSTOM_KERNEL=1` | The `rbln_triton_ops` kernels go through the compiler's triton converter, so the KV input never reaches a whitelisted `paged_*` custom op. |
 | A DFlash drafter (`--speculative-config '{"method": "dflash", ...}'`) | The drafter is non-causal on RBLN, and its attention kernel does not accept a dynamic KV input. `use_non_causal` lives on the draft config only, so the method is the signal. |
 | `block_size == max_model_len` | This selects the normal-attention kernels, which do not accept a dynamic KV input. |
@@ -153,8 +146,8 @@ would serve from the pre-compile estimate this feature exists to replace.
 - **No compiled program carries a dynamic-shape KV input.** Usually a
   `VLLM_CACHE_ROOT` replaying a static build. Use a fresh directory.
 - **Compiled programs disagree on the KV placement.** Two programs bind KV
-  inputs of the same shapes and dtypes with different shard layouts, i.e. the
-  same tensors placed two ways; the runtime would re-place the cache on every
+  inputs of the same shapes and dtypes laid out differently, i.e. the same
+  tensors placed two ways; the runtime would re-place the cache on every
   switch.
 - **The count cannot hold one request.** After the resize the pool must hold
   `1 + one max_model_len request` blocks, the 1 being the null block, summed

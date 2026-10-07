@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 import torch.fx as fx
-from rebel.core.torch_compile import rbln_backend as rbln_torch_compile_backend
+from rebel.v2.api.torch_backend import rbln_backend as rbln_torch_compile_backend
 
 from vllm_rbln.logger import init_logger
 

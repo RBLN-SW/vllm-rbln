@@ -29,7 +29,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlPushConnector,
 )
 
-import vllm_rbln.envs as envs
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_scheduler import (
     RblnNixlSchedulerBase,
 )
@@ -79,7 +78,7 @@ class RblnNixlConnectorBase(NixlBaseConnector, SupportsKVCacheRegistrationFinali
 
     Both paths use the same RBLN backend / RDMA NICs; the only
     difference is which memory segment (DRAM_SEG vs VRAM_SEG) is
-    registered. Both require `VLLM_RBLN_USE_DEVICE_TENSOR=1`.
+    registered.
 
     A direction subclass builds the scheduler or worker for its role; this
     class leaves both unset."""
@@ -103,9 +102,6 @@ class RblnNixlConnectorBase(NixlBaseConnector, SupportsKVCacheRegistrationFinali
         assert kv_buffer_device in ("cpu", "rbln"), (
             f"{type(self).__name__} requires kv_buffer_device in "
             f"{{'cpu', 'rbln'}}; got {kv_buffer_device!r}."
-        )
-        assert envs.VLLM_RBLN_USE_DEVICE_TENSOR, (
-            f"{type(self).__name__} requires VLLM_RBLN_USE_DEVICE_TENSOR=1."
         )
         self.kv_cache_config = kv_cache_config
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id

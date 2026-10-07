@@ -31,7 +31,7 @@ from tests.vllm.v1.worker.utils import (
     schedule_new,
 )
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 def _decode_ready(

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -52,7 +51,7 @@ def make_sampling_metadata(
 @pytest.fixture
 def sampler(monkeypatch) -> RBLNSampler:
     monkeypatch.setattr(module, "compile", lambda target, **kwargs: target)
-    return RBLNSampler(compile_context=Mock())
+    return RBLNSampler()
 
 
 @pytest.fixture

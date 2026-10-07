@@ -24,7 +24,7 @@ import torch
 import vllm_rbln.v1.spec_decode.medusa as medusa_module
 from tests.vllm.v1.spec_decode.utils import make_medusa_proposer
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 class TestInit:
@@ -34,28 +34,6 @@ class TestInit:
             proposer.max_num_seqs,
             proposer.hidden_size,
         )
-
-    def test_no_compile_context_when_device_tensors_on(self, monkeypatch):
-        # With device tensors the model runs on-device, so no compile context.
-        monkeypatch.setattr(medusa_module, "USE_DEVICE_TENSOR", True)
-        proposer = make_medusa_proposer(compile_context=object())
-        assert proposer.compile_context is None
-
-    def test_uses_injected_compile_context_when_device_tensors_off(self, monkeypatch):
-        monkeypatch.setattr(medusa_module, "USE_DEVICE_TENSOR", False)
-        sentinel = object()
-        proposer = make_medusa_proposer(compile_context=sentinel)
-        assert proposer.compile_context is sentinel
-
-    def test_creates_compile_context_when_absent(self, monkeypatch):
-        # Without device tensors and no injected context, one is created.
-        monkeypatch.setattr(medusa_module, "USE_DEVICE_TENSOR", False)
-        marker = object()
-        monkeypatch.setattr(
-            medusa_module, "create_compile_context", lambda **kwargs: marker
-        )
-        proposer = make_medusa_proposer(compile_context=None)
-        assert proposer.compile_context is marker
 
 
 class TestLoadModel:
@@ -85,7 +63,6 @@ class TestLoadModel:
         monkeypatch.setattr(
             medusa_module, "compile", lambda fn, **kw: captured.update(kw) or sentinel
         )
-        monkeypatch.setattr(medusa_module, "build_process_group_dict", lambda: {})
         proposer = make_medusa_proposer()
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", False
@@ -93,7 +70,7 @@ class TestLoadModel:
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
         assert captured["fullgraph"] is True
-        assert "compile_context" in captured
+        assert captured["use_direct_dispatch"] is True
 
     def test_eager_wrapper_composes_forward(self, monkeypatch):
         # The eager wrapper runs the draft model then returns its compute_logits.

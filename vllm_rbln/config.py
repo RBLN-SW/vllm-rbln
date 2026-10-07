@@ -145,15 +145,14 @@ class RBLNConfig(RBLNConfigBase):
     def compute_hash(self) -> str:
         """Hash of the fields that change the compiled artifact.
 
-        `VllmConfig.compute_hash()` calls this and `mega_cache` uses that for
-        its bundle key, so changing a field listed below keeps the compiled
-        graphs.
+        `VllmConfig.compute_hash()` calls this, so changing a field listed
+        below keeps the compiled graphs.
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 
         ignored_factors = {
-            # Sampler graphs compile with use_cache=False, so they never enter
-            # the bundle. Sub-block caching changes what runs, not what is built.
+            # Sampler graphs compile with use_cache=False, so they are never
+            # cached. Sub-block caching changes what runs, not what is built.
             "use_custom_sampler",
             "enable_sub_block_cache",
             "sub_block_size",
@@ -218,7 +217,7 @@ class OptimumRBLNConfig(RBLNConfigBase):
         """Hash of the fields that change the compiled artifact.
 
         `VllmConfig.compute_hash()` requires this of an `additional_config` that
-        is not a dict, and `mega_cache` keys its bundle on the result.
+        is not a dict.
         """
         from vllm.config.utils import get_hash_factors, hash_factors
 

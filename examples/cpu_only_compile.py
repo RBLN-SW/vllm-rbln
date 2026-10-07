@@ -34,7 +34,7 @@ torch.compile pipeline). Three things follow from that:
   (the optimum-rbln path) makes ``VLLM_RBLN_COMPILE_ONLY=1`` raise an error.
 * The compile cache must stay enabled (this is where the artifacts land), so
   ``VLLM_DISABLE_COMPILE_CACHE=1`` is rejected in this mode.
-* Without an NPU, ``rebel.get_npu_name()`` returns ``None`` and the target NPU
+* Without an NPU, ``rebel.v2.npu_name()`` returns ``None`` and the target NPU
   can no longer be auto-detected, so you must set ``RBLN_FORCE_NPU_NAME`` (e.g.
   ``RBLN-CA25``) to tell the compiler what to target.
 

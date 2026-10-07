@@ -16,7 +16,6 @@ import collections
 import dataclasses
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
-from contextlib import nullcontext
 from copy import copy, deepcopy
 from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
@@ -105,19 +104,13 @@ from vllm.v1.worker.utils import (
 )
 
 from vllm_rbln import envs
-from vllm_rbln.compilation import (
-    build_process_group_dict,
-    compile,
-    create_compile_context,
-    set_compile_stage,
-)
+from vllm_rbln.compilation import compile, set_compile_stage
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     flush_deferred_loads,
 )
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -149,7 +142,6 @@ from vllm_rbln.v1.spec_decode.eagle3_pp import (
     install_aux_handoff_slots,
 )
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
-from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.async_output import (
     AsyncRBLNModelRunnerOutput,
     PendingTokenWriteback,
@@ -165,7 +157,6 @@ from vllm_rbln.v1.worker.dp_utils import (
 )
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
-    canonical_kv_layers,
     copy_host_device_kv_blocks,
     dynamic_kv_enabled,
     get_kv_cache_names,
@@ -288,22 +279,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # TODO(RBLN): Multi-modal data support
 
-        # NOTE(RBLN): Compilation context for marking the KV cache address as static.
-        self.compile_context = (
-            create_compile_context(use_weight_sharing=True, use_global_ctx=True)
-            if not USE_DEVICE_TENSOR
-            else None
-        )
-        self.runtime_holder: list = []
-
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
         if self.rbln_config.use_custom_sampler:
-            self.sampler = RBLNSampler(
-                logprobs_mode=self.model_config.logprobs_mode,
-                compile_context=self.compile_context,
-            )
+            self.sampler = RBLNSampler(logprobs_mode=self.model_config.logprobs_mode)
             logger.info("Using RBLN sampler.")
         else:
             self.sampler = Sampler(self.model_config.logprobs_mode)
@@ -371,7 +351,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 )
             self.rejection_sampler = RBLNRejectionSampler(
                 self.sampler,
-                self.compile_context,
                 self.speculative_config,
                 self.device,
                 use_rbln_sampler=self.rbln_config.use_custom_sampler,
@@ -515,10 +494,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             max_num_tokens=self.max_num_tokens,
             specialized_moe_decode=self.specialized_moe_decode,
         )
-
-        self.offload_context = nullcontext
-        if USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
-            self.offload_context = torch.rbln.offload
 
         # What this step's ranks reported. The draft decides its own shapes from
         # it rather than reducing a second time.
@@ -2168,10 +2143,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         model_loader = get_model_loader(self.load_config)
-        with self.offload_context():
-            self.model = model_loader.load_model(
-                vllm_config=self.vllm_config, model_config=self.model_config
-            )
+        self.model = model_loader.load_model(
+            vllm_config=self.vllm_config, model_config=self.model_config
+        )
 
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
@@ -2275,23 +2249,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model_executable = model_wrapper
             self.compute_logits = self.model.compute_logits
         else:
-            process_group_dict = build_process_group_dict()
             self.model_executable = compile(
                 model_wrapper,
                 dynamic=False,
                 fullgraph=True,
-                compile_context=self.compile_context,
                 num_devices=self.rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                # Logits are consumed by sampling within the same step, so the
-                # output buffer can be reused across steps even under async scheduling.
-                use_static_output=True,
                 use_direct_dispatch=True,
-                dtype=self.rbln_config.compile_dtype,
             )
             # NOTE(RBLN): We compile compute_logits separately to cover cases when
             # `self.use_wrapped_compute_logits` is `False`
@@ -2299,15 +2263,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.model.compute_logits,
                 dynamic=False,
                 fullgraph=True,
-                compile_context=self.compile_context,
                 num_devices=self.rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_static_output=True,
-                dtype=self.rbln_config.compile_dtype,
             )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
@@ -2874,7 +2831,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # One buffer per extent, so the layers that alias one cache get one
         # tensor and the rest get their own. Not one pool the layers slice: a
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
-        device = self.device if USE_DEVICE_TENSOR else "meta"
+        device = self.device
         extent_of = kv_cache_extents(kv_cache_config)
         buffers = {
             extent: torch.zeros(extent[1], dtype=torch.int8, device=device)
@@ -2900,22 +2857,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             return
         for attn_groups in self.attn_groups:
             yield from attn_groups
-
-    def _select_canonical_kv_layers_per_pool(
-        self, kv_cache_config: KVCacheConfig
-    ) -> set[str]:
-        """Pick one layer to stand for each KV cache buffer.
-
-        Layers that share a buffer (`kv_cache_extents`) must be named once
-        for `mark_static_address`. A `KVCacheTensor` is not a buffer: it
-        lists many layers, each with its own.
-        """
-        layer_to_spec: dict[str, KVCacheSpec] = {
-            layer_name: attn_group.kv_cache_spec
-            for attn_group in self._kv_cache_spec_attn_group_iterator()
-            for layer_name in attn_group.layer_names
-        }
-        return canonical_kv_layers(kv_cache_config, layer_to_spec)
 
     def _reshape_kv_cache_tensors(
         self,
@@ -3128,19 +3069,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
-
-        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
-            # `mark_static_address` is last-write-wins on storage->name. Pin to
-            # one canonical layer per pool so the runtime, the connector's host
-            # buffers, and the runtime copy path address the same name (and the
-            # same logical block_id space).
-            layers_to_register = self._select_canonical_kv_layers_per_pool(
-                kv_cache_config
-            )
-            for name, kv_cache in kv_caches.items():
-                if name not in layers_to_register:
-                    continue
-                self.compile_context.mark_static_address(kv_cache, name)
 
         return kv_caches
 
@@ -3606,9 +3534,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # the model directly, bypassing the connector lifecycle entirely.
         logger.info("Compile and warming up model.")
 
-        sig = mega_cache.config_signature(self.vllm_config)
-        mega_cache.load(self.model_config.model, sig)
-        with set_compile_stage("warmup"), self.offload_context():
+        with set_compile_stage("warmup"):
             self.run_model_graphs()
 
             # 3. compute_logits
@@ -3636,8 +3562,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             if isinstance(self.drafter, RBLNMedusaProposer):
                 self.drafter.dummy_run()
 
-        mega_cache.save(self.model_config.model, sig)
-
     def _copy_host_device_kv_blocks(
         self,
         src_kv_caches: dict[str, torch.Tensor],
@@ -3662,14 +3586,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
-            # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
-            # in this path (--model-impl vllm).
-            for op in copy_ops:
-                runtime = self.runtime_holder[0]
-                runtime._copy_kv_cache(op.src_block_id, op.dst_block_id, op.num_tokens)
-            return
-
         dsts: list[torch.Tensor] = []
         srcs: list[torch.Tensor] = []
         for op in copy_ops:

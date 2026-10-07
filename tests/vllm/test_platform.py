@@ -53,22 +53,6 @@ _ENGINE_ARGS = dict(
     enable_chunked_prefill=True,
 )
 
-# Modules that bind platform.USE_DEVICE_TENSOR into their own namespace at
-# import. _apply_model_impl cannot reach them, so none may be imported before
-# the model path is resolved.
-_DEVICE_FLAG_COPIERS = frozenset(
-    {
-        "vllm_rbln.patches.deepseek_mtp",
-        "vllm_rbln.platform.vllm_impl",
-        "vllm_rbln.v1.sample.rbln_rejection_sampler",
-        "vllm_rbln.v1.sample.rbln_sampler",
-        "vllm_rbln.v1.spec_decode.dflash",
-        "vllm_rbln.v1.spec_decode.eagle",
-        "vllm_rbln.v1.spec_decode.medusa",
-        "vllm_rbln.v1.worker.rbln_model_runner",
-    }
-)
-
 _STANDALONE = "RBLN_CTX_STANDALONE"
 # Means "the platform did not touch it". Set rather than deleted so monkeypatch
 # has recorded the key and can roll back the platform's direct os.environ write.
@@ -127,16 +111,10 @@ class TestPlatformIdentity:
             RblnPlatform.device_type,
             RblnPlatform.dist_backend,
         )
-        if platform.USE_DEVICE_TENSOR:
-            assert triple == ("rbln", "rbln", "rbln-ccl")
-        else:
-            assert triple == ("cpu", "cpu", "")
+        assert triple in (("rbln", "rbln", "rbln-ccl"), ("cpu", "cpu", ""))
 
-    def test_device_tensor_needs_both_switches(self):
-        assert platform.USE_DEVICE_TENSOR is (
-            platform.envs.model_impl_from_env() == "vllm"
-            and platform.envs.VLLM_RBLN_USE_DEVICE_TENSOR
-        )
+    def test_the_vllm_path_runs_on_the_device(self):
+        assert (RblnPlatform.device_type == "rbln") is (platform._MODEL_IMPL == "vllm")
 
     @pytest.mark.parametrize(
         ("attribute", "expected"),
@@ -345,21 +323,13 @@ class TestCompileDtype:
             config.additional_config, compile_dtype="float16"
         )
 
-    @pytest.fixture
-    def older_rebel(self, monkeypatch):
-        import vllm_rbln.compilation.compiler as compiler
-
-        def legacy_compile(model, *, npu=None):
-            pass
-
-        monkeypatch.setattr(compiler.rebel, "compile", legacy_compile)
-
-    def test_empty_dtype_skips_the_probe(self, reconfigure, older_rebel):
+    def test_an_empty_dtype_is_accepted(self, reconfigure):
         config = reconfigure(lambda config: None)
         assert config.additional_config.compile_dtype == ""
 
-    def test_refused_at_startup_on_an_older_rebel(self, reconfigure, older_rebel):
-        with pytest.raises(ValueError, match="dtype"):
+    def test_a_compile_dtype_is_refused_at_startup(self, reconfigure):
+        # Graphs run in the dtype the NPU computes floats in.
+        with pytest.raises(ValueError, match="compile_dtype"):
             reconfigure(self._with_dtype)
 
 
@@ -396,11 +366,10 @@ class TestWorkerAndScheduler:
 
     def test_a_plain_build_lands_on_the_async_scheduler(self, monkeypatch):
         # Nobody passes --async-scheduling here: vLLM resolves the unset flag to
-        # True before this platform hook, and with both carriers on nothing
+        # True before this platform hook, and with the device sampler on nothing
         # refuses it, so the vllm model path selects the async scheduler. This is
         # what the async support changed, and it went unasserted.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         config = _build()
         assert config.scheduler_config.async_scheduling is True
         assert (
@@ -434,33 +403,20 @@ class TestSchedulerOverrides:
     def test_async_scheduling_is_honored(self, monkeypatch):
         # The platform used to force this off unconditionally. It now follows
         # vLLM's --async-scheduling, as long as the device-side token path is
-        # available (see below). Both carriers are pinned on because
-        # --device-tensor 0 switches the first one off for the whole session,
-        # which would land this on the negative case below.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
+        # available (see below).
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
         assert _build(async_scheduling=True).scheduler_config.async_scheduling is True
 
-    @pytest.mark.parametrize(
-        "switched_off", ["VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"]
-    )
-    def test_async_scheduling_needs_the_device_token_carriers(
-        self, monkeypatch, switched_off
-    ):
-        """Either env var off means async has no way to carry its in-flight tokens.
+    def test_async_scheduling_needs_the_device_sampler(self, monkeypatch):
+        """Without the device sampler async has no way to carry its in-flight
+        tokens.
 
-        VLLM_RBLN_USE_DEVICE_TENSOR gates the feedback scatter that replaces the
-        scheduler's -1 placeholders; VLLM_RBLN_SAMPLER gates the ring the output
-        thread reads. Without them the runner decodes from a token that was never
-        sampled and returns wrong text with no error raised, so the platform
-        downgrades to sync rather than run the combination.
+        VLLM_RBLN_SAMPLER gates the ring the output thread reads. Without it the
+        runner decodes from a token that was never sampled and returns wrong
+        text with no error raised, so the platform downgrades to sync rather
+        than run the combination.
         """
-        # Both are set before one is switched off: the gate refuses on either,
-        # so leaving the other to the lane lets --device-tensor 0 satisfy this
-        # case with the sampler still on, and the parametrization proves nothing.
-        for name in ("VLLM_RBLN_USE_DEVICE_TENSOR", "VLLM_RBLN_SAMPLER"):
-            monkeypatch.setenv(name, "1")
-        monkeypatch.setenv(switched_off, "0")
+        monkeypatch.setenv("VLLM_RBLN_SAMPLER", "0")
         config = _build(async_scheduling=True)
         assert config.scheduler_config.async_scheduling is False
         assert config.scheduler_config.scheduler_cls.endswith("RBLNScheduler")
@@ -531,16 +487,11 @@ class TestCacheOverrides:
 
 
 class TestEnforceEager:
-    def test_outcome_follows_the_device_lane(self, reconfigure):
+    def test_eager_runs_in_fp16(self, reconfigure):
         mutate = lambda config: setattr(  # noqa: E731
             config.model_config, "enforce_eager", True
         )
-        if platform.USE_DEVICE_TENSOR:
-            # Eager needs real device tensors; dtype is forced to fp16 there.
-            assert reconfigure(mutate).model_config.dtype == torch.float16
-        else:
-            with pytest.raises(ValueError, match="VLLM_RBLN_USE_DEVICE_TENSOR"):
-                reconfigure(mutate)
+        assert reconfigure(mutate).model_config.dtype == torch.float16
 
 
 def _selector(*, use_mla: bool = False, use_sparse: bool = False) -> SimpleNamespace:
@@ -603,17 +554,17 @@ class TestDeviceName:
 
     def test_the_driver_answer_wins(self, monkeypatch):
         monkeypatch.setenv("RBLN_FORCE_NPU_NAME", "RBLN-FROM-ENV")
-        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: "RBLN-CR03")
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a: "RBLN-CR03")
         assert RblnPlatform.get_device_name() == "RBLN-CR03"
 
     @pytest.mark.parametrize("env", ["RBLN_FORCE_NPU_NAME", "RBLN_TARGET_SOC"])
     def test_env_fallbacks_when_no_npu_is_mounted(self, monkeypatch, env):
-        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: None)
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a: None)
         monkeypatch.setenv(env, "RBLN-CA25")
         assert RblnPlatform.get_device_name() == "RBLN-CA25"
 
     def test_no_npu_and_no_override_raises(self, monkeypatch):
-        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: None)
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a: None)
         with pytest.raises(RuntimeError, match="RBLN_FORCE_NPU_NAME"):
             RblnPlatform.get_device_name()
 
@@ -627,7 +578,7 @@ class TestDeviceName:
         ],
     )
     def test_is_cr13_matches_the_exact_soc_name(self, monkeypatch, name, expected):
-        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a: name)
         assert RblnPlatform.is_cr13() is expected
 
     @pytest.mark.parametrize(
@@ -642,7 +593,7 @@ class TestDeviceName:
     )
     def test_is_ca_matches_the_soc_name_prefix(self, monkeypatch, name, expected):
         """A family, not one part: a new RBLN-CA* needs no code change here."""
-        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a: name)
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a: name)
         assert RblnPlatform.is_ca() is expected
 
 
@@ -925,7 +876,6 @@ class TestModelImpl:
 
         assert isinstance(config.additional_config, RBLNConfig)
         assert RblnPlatform.device_type == "rbln"
-        assert platform.USE_DEVICE_TENSOR is True
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == "vllm"
 
     def test_auto_reads_the_model_off_the_engine_args(self, monkeypatch):
@@ -1069,9 +1019,7 @@ class TestModelImpl:
         """The wrapper resolves the path, so a disabled one fails here."""
         from vllm.engine.arg_utils import EngineArgs
 
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
-        )
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CA25")
         monkeypatch.setattr(
             EngineArgs, "create_engine_config", lambda self, *a, **k: None
         )
@@ -1089,13 +1037,9 @@ class TestModelImpl:
             )
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == _UNTOUCHED
 
-    def test_the_modules_that_copy_the_device_flag_import_late(self):
-        """They bind USE_DEVICE_TENSOR at their own import.
-
-        That is only correct while none of them is imported before the path is
-        resolved, so the platform module is the only one _apply_model_impl has
-        to reach. A new early import here would silently pin a stale value.
-        """
+    def test_registering_applies_no_patch_before_the_path_is_resolved(self):
+        """The patches are the vllm path's, so registering the plugin applies
+        none of them before something resolves the path."""
         import subprocess
         import sys
 
@@ -1106,10 +1050,7 @@ class TestModelImpl:
             "vllm_rbln.register_model();"
             "vllm_rbln.register_ops();"
             "applied = sys.modules.get('vllm_rbln.patches.registry');"
-            "print(applied and applied._applied_patch_keys,"
-            " [m for m in sys.modules if m in COPIERS])".replace(
-                "COPIERS", repr(_DEVICE_FLAG_COPIERS)
-            )
+            "print(applied and applied._applied_patch_keys)"
         )
         out = subprocess.run(
             [sys.executable, "-c", probe],
@@ -1123,6 +1064,5 @@ class TestModelImpl:
             },
         )
         assert out.returncode == 0, out.stderr[-2000:]
-        # "None []": the registry was never imported, so nothing was applied and
-        # no module bound a stale USE_DEVICE_TENSOR.
-        assert out.stdout.strip().endswith("None []"), out.stdout
+        # The registry was never imported, so nothing was applied.
+        assert out.stdout.strip().endswith("None"), out.stdout

@@ -113,12 +113,11 @@ def _assert_parity(build, activation):
     dev = current_platform.device_type
     # 1. CPU eager oracle.
     ref = build()(activation)
-    # 2. rbln-compiled, on whichever tensors the lane selects.
+    # 2. rbln-compiled, on the device tensors the vllm path runs on.
     dev_activation = activation.to(dev)
     assert _agrees(rbln_compile(build().to(dev), fullgraph=True)(dev_activation), ref)
-    # 3. device eager, only when device tensors are on (--device-tensor 1).
-    if dev == "rbln":
-        assert _agrees(build().to(dev)(dev_activation), ref)
+    # 3. device eager.
+    assert _agrees(build().to(dev)(dev_activation), ref)
 
 
 def _quantized_weight():

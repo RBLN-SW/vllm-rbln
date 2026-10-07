@@ -45,6 +45,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
+from ..ops import define_triton_kernels
 from ..ops.attention_naive import (
     attention_naive_decode,
     attention_naive_prefill,
@@ -474,6 +475,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     f"sliding_window={self.sliding_window}, "
                     f"is_causal={self.is_causal}, is_normal={self.is_normal}."
                 )
+        if self.use_custom_kernel:
+            define_triton_kernels()
 
     def forward(
         self,

@@ -153,11 +153,11 @@ def test_a_name_nothing_binds_leaves_no_earlier_patch_applied():
         patch_in_package,
     )
 
-    holder = next(m for m in _package_modules() if hasattr(m, "rebel"))
-    before = holder.rebel
+    holder = next(m for m in _package_modules() if hasattr(m, "v2"))
+    before = holder.v2
     with pytest.raises(AssertionError, match="nothing binds"):
-        patch_in_package(rebel="SUBSTITUTE", no_such_symbol_at_all=1)
-    assert holder.rebel is before
+        patch_in_package(v2="SUBSTITUTE", no_such_symbol_at_all=1)
+    assert holder.v2 is before
 
 
 def test_the_check_sees_a_module_target(tmp_path):
@@ -172,9 +172,9 @@ def test_the_check_sees_a_module_target(tmp_path):
         "import metadata as md\n"
         "\n"
         "def f(monkeypatch):\n"
-        "    patch.object(wm, 'rebel')\n"
+        "    patch.object(wm, 'v2')\n"
         "    monkeypatch.setattr(md, 'KVSplitAxis', None)\n"
-        f"    patch('{dotted}.registration.rebel')\n"
+        f"    patch('{dotted}.registration.v2')\n"
         f"    mock.patch('{dotted}.metadata.KVSplitAxis')\n"
         "    patch.object(wm.SomeClass, 'method')\n"
         "    monkeypatch.setattr(pw.threading, 'Thread', None)\n"
@@ -186,5 +186,5 @@ def test_the_check_sees_a_module_target(tmp_path):
     assert len(offences) == 4, offences
     assert "patch.object(wm, ...)" in offences[0]
     assert "monkeypatch.setattr(md, ...)" in offences[1]
-    assert "patch(" in offences[2] and "registration.rebel" in offences[2]
+    assert "patch(" in offences[2] and "registration.v2" in offences[2]
     assert "mock.patch(" in offences[3]

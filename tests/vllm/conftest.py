@@ -54,13 +54,7 @@ def _intra_nodeid(nodeid: str) -> str:
 def _needs_spawn(item) -> bool:
     """Whether ``item`` must run in a fresh process rather than in this one."""
     kw = item.keywords
-    if "model_compile" in kw or "use_device" in kw:
-        return True
-    if "maybe_use_device" in kw:
-        from vllm.platforms import current_platform
-
-        return current_platform.device_type != "cpu"
-    return False
+    return "model_compile" in kw or "use_device" in kw
 
 
 def _will_be_skipped(item) -> bool:
@@ -114,20 +108,6 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="run tests that compile a whole model on the NPU (minutes each)",
-    )
-    parser.addoption(
-        "--device-tensor",
-        choices=["0", "1"],
-        default=None,
-        help=(
-            "VLLM_RBLN_USE_DEVICE_TENSOR for the whole session. "
-            "platform/__init__.py resolves it at module scope into "
-            "RblnPlatform.device_type and friends, and eight modules copy "
-            "USE_DEVICE_TENSOR into their own namespace, so it cannot be "
-            "parametrized per test -- run the suite once per value instead. "
-            "Left unset by default so the source's own default is what gets "
-            "exercised."
-        ),
     )
     parser.addoption(
         "--num-hidden-layers",
@@ -281,7 +261,6 @@ def _spawn_for(item) -> ModuleSpawn:
     spawn = start_module_in_spawned_process(
         nodeids or [item.nodeid],
         nodeid_prefix=item.nodeid.split("::", 1)[0],
-        device_tensor=config.getoption("--device-tensor"),
         model_compile=config.getoption("--model-compile"),
         num_hidden_layers=_session_layers(config),
         tb_style=config.getoption("tbstyle", None),
@@ -322,9 +301,7 @@ def pytest_runtest_protocol(item, nextitem):
     the whole session), and one spawn per file amortizes the interpreter + plugin
     + device init over all its tests.
 
-    @model_compile and @use_device always spawn -- they compile/run on the NPU
-    regardless of --device-tensor. @maybe_use_device spawns only when device
-    tensors are on (--device-tensor 1); under 0 its ops stay on CPU.
+    @model_compile and @use_device spawn -- they compile/run on the NPU.
 
     Taking over the whole protocol (rather than just the call phase) is what
     makes a batched test indistinguishable from a plain one: the child's own
@@ -382,12 +359,6 @@ def pytest_configure(config):
     _scrubbed = scrub_env()
     os.environ.update(VLLM_RBLN_ENV)
 
-    # Must land before the import below: platform/__init__.py reads this at
-    # module scope.
-    device_tensor = config.getoption("--device-tensor")
-    if device_tensor is not None:
-        os.environ["VLLM_RBLN_USE_DEVICE_TENSOR"] = device_tensor
-
     # Also before the import below: the get_pp_indices patch conditions on this.
     os.environ["VLLM_RBLN_NUM_HIDDEN_LAYERS"] = str(_session_layers(config))
 
@@ -421,8 +392,8 @@ def pytest_configure(config):
     envs.INHERITED_MODEL_IMPL = "vllm"
     _apply_model_impl("vllm")
 
-    # Imported only now: it copies USE_DEVICE_TENSOR into its own namespace, as
-    # seven other modules do, and the call above is what settles that value.
+    # Imported only now: the call above is what makes the patches the vllm
+    # path's.
     from vllm_rbln.platform import vllm_impl
 
     vllm_impl.patch_upstream()
@@ -449,10 +420,9 @@ def pytest_report_header(config):
     # than the request, since that is the lane the whole session runs in.
     from vllm_rbln.platform import RblnPlatform
 
-    origin = "explicit" if config.getoption("--device-tensor") else "source default"
     header = [
         f"vllm-rbln: env {', '.join(f'{k}={v}' for k, v in VLLM_RBLN_ENV.items())}",
-        f"vllm-rbln: device_type={RblnPlatform.device_type} ({origin})",
+        f"vllm-rbln: device_type={RblnPlatform.device_type}",
     ]
     num_hidden_layers = _session_layers(config)
     pinnable = (
@@ -511,7 +481,7 @@ def cr13(monkeypatch):
     """
     from vllm_rbln import platform
 
-    monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13")
+    monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CR13")
 
 
 @pytest.fixture(autouse=True)

@@ -25,7 +25,7 @@ from vllm_rbln.v1.spec_decode.utils import (
     eagle_prepare_next_token_padded,
 )
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 def _t(data, dtype=torch.int64) -> torch.Tensor:

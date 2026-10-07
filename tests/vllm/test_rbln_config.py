@@ -270,15 +270,15 @@ def test_no_field_is_read_from_the_environment():
 def test_the_model_path_keys_the_compile_cache():
     """A different model implementation is a different artifact.
 
-    The path is not a field any more, so what keeps the two apart in the
-    mega-cache bundle key is that each path hashes a class of its own. Handing a
-    run the other path's artifact is what this prevents.
+    The path is not a field any more, so what keeps the two apart in the hash
+    VllmConfig keys its caches by is that each path hashes a class of its own.
+    Handing a run the other path's artifact is what this prevents.
     """
     assert RBLNConfig().compute_hash() != OptimumRBLNConfig().compute_hash()
 
 
 def test_only_compile_fields_change_the_hash():
-    """`mega_cache` uses this for its bundle key, via VllmConfig.
+    """VllmConfig folds this into the hash it keys its caches by.
 
     A str and a list among the values, since they have to survive
     normalize_value() to reach the key at all.
@@ -422,9 +422,7 @@ class TestResolveModelImpl:
         """
         from vllm_rbln import platform
 
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: device_name
-        )
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: device_name)
         if refused:
             with pytest.raises(ValueError, match=device_name.strip()):
                 resolve_model_impl(model_impl=model_impl)
@@ -455,9 +453,7 @@ class TestResolveModelImpl:
         """
         from vllm_rbln import platform
 
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
-        )
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CA25")
         with pytest.raises(ValueError, match=re.escape(remedy)):
             resolve_model_impl(**kwargs)
 
@@ -465,9 +461,7 @@ class TestResolveModelImpl:
         # TODO(vllm-rbln>=0.14.0): delete with VLLM_RBLN_USE_VLLM_MODEL itself.
         from vllm_rbln import platform
 
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
-        )
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CA25")
         monkeypatch.setattr(envs, "INHERITED_MODEL_IMPL", None)
         monkeypatch.setenv("VLLM_RBLN_USE_VLLM_MODEL", "1")
         with pytest.raises(
@@ -481,7 +475,7 @@ class TestResolveModelImpl:
         """A compile-only worker names its target later, so nothing is refused."""
         from vllm_rbln import platform
 
-        monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: None)
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: None)
         monkeypatch.delenv("RBLN_FORCE_NPU_NAME", raising=False)
         monkeypatch.delenv("RBLN_TARGET_SOC", raising=False)
         assert resolve_model_impl(model_impl="vllm") == "vllm"
@@ -600,9 +594,7 @@ class TestAutoReadsTheModel:
         """
         from vllm_rbln import platform
 
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
-        )
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CA25")
         (tmp_path / "config.json").write_text("not json")
 
         with pytest.raises(ValueError, match="Make the config readable"):
@@ -659,9 +651,7 @@ class TestAutoReadsTheModel:
         """
         from vllm_rbln import platform
 
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25"
-        )
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CA25")
         model = _model_dir(
             tmp_path, model_type="mixtral", architectures=["MixtralForCausalLM"]
         )

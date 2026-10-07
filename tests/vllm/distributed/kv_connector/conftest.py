@@ -113,14 +113,12 @@ def make_worker(monkeypatch, tmp_path_factory):
             up_worker, "get_tensor_model_parallel_world_size", lambda: 1
         )
         # The other device-identity probe (see KvGeometry.kv_caches): the D2D
-        # path asks rebel for the tensor's context pointer, which it hands
-        # straight to the adapter. `aligned_tensor` is a separate name and
-        # stays real, so the host-staging path still allocates for real.
+        # path asks rebel.v2 for the driver context of the tensor's device, which
+        # it hands straight to the adapter. The host-staging path allocates
+        # its pinned buffers for real.
         stack.enter_context(
             patch_in_package(
-                rebel=SimpleNamespace(
-                    context_of=lambda t: SimpleNamespace(rbln_ctx_ptr=0)
-                )
+                v2=SimpleNamespace(Device=lambda n: SimpleNamespace(driver_context=0))
             )
         )
 

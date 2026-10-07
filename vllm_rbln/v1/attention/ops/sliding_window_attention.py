@@ -14,8 +14,6 @@
 
 import torch
 
-from ..ops import triton_sliding_window_attention_naive  # noqa: F401
-
 
 def sliding_window_attention_naive_prefill(
     q: torch.Tensor,

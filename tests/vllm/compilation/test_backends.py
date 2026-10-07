@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Tests for vllm_rbln.compilation.backends: the conformance surface (it wraps
-rebel's torch.compile backend, so a drift in that dependency must surface here).
+rbln's torch.compile backend, so a drift in that dependency must surface here).
 The log/format helpers and the actual NPU compile are not unit-tested."""
 
 import vllm_rbln.compilation.backends as backends
@@ -21,12 +21,12 @@ from vllm_rbln.compilation import rbln_backend
 
 
 class TestBackendConformance:
-    def test_rebel_backend_importable_and_callable(self):
-        # backends.py imports this at module load; the drift alarm if rebel
+    def test_rbln_torch_backend_importable_and_callable(self):
+        # backends.py imports this at module load; the drift alarm if rbln
         # moves or renames its torch.compile backend.
-        from rebel.core.torch_compile import rbln_backend as rebel_backend
+        from rebel.v2.api.torch_backend import rbln_backend as native_backend
 
-        assert callable(rebel_backend)
+        assert callable(native_backend)
 
     def test_rbln_backend_exposed_and_callable(self):
         # The package re-exports backends.rbln_backend as the Dynamo backend.

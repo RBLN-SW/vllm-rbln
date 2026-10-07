@@ -14,8 +14,6 @@
 
 import torch
 
-from . import triton_flash_causal_attention  # noqa: F401
-
 
 def flash_causal_attention_naive_prefill(
     q: torch.Tensor,

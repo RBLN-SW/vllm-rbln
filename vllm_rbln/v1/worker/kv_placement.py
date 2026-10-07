@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Size the KV cache from the compiled programs' device placement: the per-block
-cost per chiplet comes from each dynamic input's `PhysicalPlacement`, the bytes
-already spoken for from a per-chiplet memory snapshot."""
+cost per chiplet comes from the shards of each dynamic input's `rebel.v2.Arg`, the
+bytes already spoken for from a per-chiplet memory snapshot."""
 
 from __future__ import annotations
 
 import bisect
-import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,27 +27,19 @@ from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-# `(node_id, chiplet_id)`: the granularity of the device memory pools.
+# `(node, chiplet)`: the granularity of the device memory pools.
 Unit = tuple[int, int]
-# rebel runtime caching_allocator.h constants; `allocator_reserved` replays its
-# best-fit + split behaviour, under which several requests share a segment.
-_ALLOC_MIN_BLOCK = 4096
-_ALLOC_SMALL_MAX = 1 << 20
-_ALLOC_SMALL_BLOCK = 2 << 20
-_ALLOC_MEDIUM_MAX = 10 << 20
-_ALLOC_MEDIUM_BLOCK = 20 << 20
+# torch-rbln RBLNCachingAllocator.h constants; `allocator_reserved` replays its
+# best-fit + split behaviour, under which small requests share a segment.
+_ALLOC_SMALL_SIZE = 1 << 20
+_ALLOC_SMALL_ROUND = 512
+_ALLOC_SMALL_SEGMENT = 2 << 20
 _ALLOC_LARGE_ROUND = 2 << 20
 
 
-def allocation_size(nbytes: int) -> int:
-    """Segment the caching allocator maps for a request no free block serves."""
-    if nbytes <= 0:
-        return 0
-    if nbytes <= _ALLOC_SMALL_MAX:
-        return _ALLOC_SMALL_BLOCK
-    if nbytes <= _ALLOC_MEDIUM_MAX:
-        return _ALLOC_MEDIUM_BLOCK
-    return -(-nbytes // _ALLOC_LARGE_ROUND) * _ALLOC_LARGE_ROUND
+def _rounded(nbytes: int) -> int:
+    unit = _ALLOC_SMALL_ROUND if nbytes <= _ALLOC_SMALL_SIZE else _ALLOC_LARGE_ROUND
+    return -(-nbytes // unit) * unit
 
 
 def allocator_reserved(requests: Iterable[int]) -> int:
@@ -59,76 +50,49 @@ def allocator_reserved(requests: Iterable[int]) -> int:
     for nbytes in requests:
         if nbytes <= 0:
             continue
-        size = -(-nbytes // _ALLOC_MIN_BLOCK) * _ALLOC_MIN_BLOCK
-        small = size <= _ALLOC_SMALL_MAX
+        size = _rounded(nbytes)
+        small = size <= _ALLOC_SMALL_SIZE
         pool = free[small]
         at = bisect.bisect_left(pool, size)
         if at < len(pool):
             block = pool.pop(at)
         else:
-            block = allocation_size(size)
+            block = _ALLOC_SMALL_SEGMENT if small else size
             reserved += block
         remainder = block - size
-        splits = (
-            remainder >= _ALLOC_MIN_BLOCK if small else remainder > _ALLOC_SMALL_MAX
-        )
-        if splits:
+        if remainder >= (_ALLOC_SMALL_ROUND if small else _ALLOC_LARGE_ROUND):
             bisect.insort(pool, remainder)
     return reserved
 
 
 _KEY_RE = re.compile(r"^npu\.(\d+)\.chiplet\.(\d+)\.(.+)$")
-_TRAILING_BITS_RE = re.compile(r"(\d+)$")
 
 
-def eval_placement_dim(dim: Any, num_blocks: int) -> int:
-    """Evaluate one `PlacementDim` with every symbol bound to `num_blocks`, the
-    only dim ever marked dynamic."""
-    if isinstance(dim, bool):
-        raise ValueError(f"placement dim cannot be a bool: {dim!r}")
-    if isinstance(dim, int):
-        return dim
-    if isinstance(dim, tuple) and dim:
-        kind, *operands = dim
-        if kind == "symbol":
-            return num_blocks
-        if kind == "prod":
-            return math.prod(eval_placement_dim(x, num_blocks) for x in operands)
-        if kind == "sum":
-            return sum(eval_placement_dim(x, num_blocks) for x in operands)
-    raise ValueError(f"unrecognised placement dim expression: {dim!r}")
+def is_kv_input(spec: Any) -> bool:
+    """Whether `spec` is an input the program takes of any extent: a KV cache,
+    the only input ever marked dynamic."""
+    return spec.arg is not None and bool(spec.arg.logical.dynamic_axes)
 
 
-def placement_itemsize(dtype: str) -> int:
-    """Bytes per element of a physical placement dtype ("dlfloat16", "float16",
-    "bfloat16", "e4m3_float8", "int8", ...)."""
-    name = dtype.strip().lower()
-    if name == "bool":
-        return 1
-    match = _TRAILING_BITS_RE.search(name)
-    if match is None:
-        raise ValueError(f"cannot derive an element size from dtype {dtype!r}")
-    bits = int(match.group(1))
-    if bits <= 0:
-        raise ValueError(f"cannot derive an element size from dtype {dtype!r}")
-    return -(-bits // 8)
+def _dynamic_axis(spec: Any) -> Any:
+    (axis,) = spec.arg.logical.dynamic_axes
+    return axis
 
 
 def _tensor_fingerprint(spec: Any) -> tuple:
-    """What a KV input looks like regardless of how it is sharded."""
-    placement = spec.physical_placement
-    return (tuple(spec.shape), tuple(placement.shape), str(placement.dtype))
+    """What a KV input looks like regardless of how the device holds it."""
+    return (tuple(spec.shape), str(spec.dtype))
 
 
 def _input_key(spec: Any) -> tuple:
     """Order-independent identity of a KV input, for comparing programs."""
-    placement = spec.physical_placement
     return (
         *_tensor_fingerprint(spec),
+        spec.arg.type_id,
         tuple(
             sorted(
-                (int(s.node_id), int(s.chiplet_id), tuple(s.slice_shape))
-                for s in placement.shards
+                (s["node"], s["chiplet"], s["min_nbytes"], s["step_nbytes"])
+                for s in spec.arg.shards
             )
         ),
     )
@@ -137,14 +101,12 @@ def _input_key(spec: Any) -> tuple:
 def select_kv_input_groups(programs: Sequence[Any]) -> list[tuple[list[Any], Any]]:
     """The distinct sets of KV inputs the programs bind (the target's, a
     drafter's), one `(specs, program)` each, in first-seen order. Inputs matching
-    in shape and dtype but not in shards are the same tensors placed two ways,
-    and refuse."""
+    in shape and dtype but not in how the device holds them are the same tensors
+    placed two ways, and refuse."""
     groups: dict[tuple, tuple[list[Any], Any]] = {}
     fingerprints: dict[tuple, tuple] = {}
     for program in programs:
-        specs = [
-            spec for spec in program.input_specs if spec.physical_placement is not None
-        ]
+        specs = [spec for spec in program.input_specs if is_kv_input(spec)]
         if not specs:
             continue
         key = tuple(sorted(_input_key(spec) for spec in specs))
@@ -156,7 +118,7 @@ def select_kv_input_groups(programs: Sequence[Any]) -> list[tuple[list[Any], Any
             raise RuntimeError(
                 "compiled programs disagree on the KV cache placement: "
                 f"{_program_name(other)} and {_program_name(program)} bind the "
-                f"same {len(specs)} KV input(s) with different shard layouts. A KV "
+                f"same {len(specs)} KV input(s) laid out differently. A KV "
                 "tensor can only hold one placement at a time."
             )
         groups[key] = (specs, program)
@@ -175,39 +137,32 @@ def _program_name(program: Any) -> str:
 
 
 def dynamic_extent(spec: Any) -> int:
-    """The compiled extent of `spec`'s dynamic dim: the kernel block count the
+    """The traced extent of `spec`'s dynamic axis: the kernel block count the
     program was traced with."""
-    for index, dim in enumerate(spec.physical_placement.shape):
-        if not isinstance(dim, int):
-            return int(spec.shape[index])
-    raise ValueError(f"input {spec.name!r} has a placement but no dynamic dim")
+    return int(spec.shape[_dynamic_axis(spec).axis])
 
 
 def kv_requests_per_unit(
     specs: Iterable[Any], num_blocks: int, hint_blocks: int
 ) -> dict[Unit, list[int]]:
     """Bytes of each KV shard on each (node, chiplet) at `num_blocks`, in
-    allocation order. A dynamic dim counts kernel blocks, so its symbol is bound
-    to `num_blocks * dynamic_extent / hint_blocks`."""
+    allocation order. A dynamic axis counts kernel blocks, so it is set to
+    `num_blocks * dynamic_extent / hint_blocks`."""
     if hint_blocks <= 0:
         raise ValueError(f"hint_blocks must be positive, got {hint_blocks}")
     requests: dict[Unit, list[int]] = {}
     for spec in specs:
-        placement = spec.physical_placement
         extent = dynamic_extent(spec)
         if extent % hint_blocks:
             raise RuntimeError(
-                f"input {spec.name!r} was compiled with a dynamic extent of {extent}, "
+                f"input {spec.name!r} was traced with a dynamic extent of {extent}, "
                 f"not a multiple of the {hint_blocks}-block compile hint."
             )
-        symbol = (extent // hint_blocks) * num_blocks
-        itemsize = placement_itemsize(placement.dtype)
-        for shard in placement.shards:
-            elems = math.prod(
-                eval_placement_dim(dim, symbol) for dim in shard.slice_shape
-            )
-            unit = (int(shard.node_id), int(shard.chiplet_id))
-            requests.setdefault(unit, []).append(elems * itemsize)
+        steps = (extent // hint_blocks) * num_blocks - _dynamic_axis(spec).min
+        for shard in spec.arg.shards:
+            nbytes = shard["min_nbytes"] + shard["step_nbytes"] * steps
+            unit = (int(shard["node"]), int(shard["chiplet"]))
+            requests.setdefault(unit, []).append(nbytes)
     return requests
 
 
@@ -246,7 +201,7 @@ class KvGrowth:
 
 def kv_growth(specs: Sequence[Any], hint_blocks: int) -> KvGrowth:
     """Per-block growth per unit, checked to be linear through the origin (the
-    compiler does not pad or transform a dynamic dim)."""
+    compiler does not pad or transform a dynamic axis)."""
     at_zero = kv_bytes_per_unit(specs, 0, hint_blocks)
     at_one = kv_bytes_per_unit(specs, 1, hint_blocks)
     per_block = {
@@ -257,7 +212,7 @@ def kv_growth(specs: Sequence[Any], hint_blocks: int) -> KvGrowth:
     if not per_block:
         raise RuntimeError(
             "the KV placements have no per-block growth on any chiplet, i.e. the "
-            "artifacts were not compiled with a dynamic KV dim."
+            "artifacts were not compiled with a dynamic KV axis."
         )
     offsets = {unit: b for unit, b in at_zero.items() if b}
     at_hint = {
@@ -387,8 +342,7 @@ def max_num_blocks(
         allocated = growth.allocated_at(n)
         return all(allocated[unit] <= room[unit] for unit in room)
 
-    # Not monotone in n: a shard crossing 10 MiB drops from a 20 MiB segment to
-    # 2 MiB rounding, so a count can fit while smaller ones do not. Scan down
+    # The allocator's rounding makes the fit a step function of n; scan down
     # from the linear bound, which is an upper bound on the answer.
     num_blocks = min(linear.values())
     while num_blocks > 0 and not fits_all(num_blocks):
@@ -424,13 +378,12 @@ def format_placements(specs: Iterable[Any]) -> str:
     """One line per KV input; the only record of the per-shard extents."""
     lines = []
     for spec in specs:
-        placement = spec.physical_placement
         shards = ", ".join(
-            f"({int(s.node_id)},{int(s.chiplet_id)})={tuple(s.slice_shape)}"
-            for s in placement.shards
+            f"({s['node']},{s['chiplet']})={s['min_nbytes']}+{s['step_nbytes']}/step"
+            for s in spec.arg.shards
         )
         lines.append(
-            f"{spec.name or '?'} compiled={tuple(spec.shape)} "
-            f"shape={tuple(placement.shape)} dtype={placement.dtype} shards=[{shards}]"
+            f"{spec.name or '?'} traced={tuple(spec.shape)} "
+            f"physical={spec.arg.physical} shards=[{shards}]"
         )
     return "; ".join(lines)

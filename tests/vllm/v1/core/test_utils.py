@@ -177,9 +177,7 @@ class TestSubBlockSizeInUse:
         # The runner's own card would otherwise decide the decoupled cases.
         from vllm_rbln import platform
 
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR03"
-        )
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CR03")
 
     def _call(self, **kw):
         args = dict(
@@ -248,7 +246,5 @@ class TestSubBlockSizeInUse:
         eligible(True)
         with pytest.raises(ValueError, match="REBEL CR13"):
             self._call(sub_block_size=128)
-        monkeypatch.setattr(
-            platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CR13"
-        )
+        monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CR13")
         assert self._call(sub_block_size=128) == 128

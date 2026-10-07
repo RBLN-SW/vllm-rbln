@@ -166,9 +166,7 @@ def connector_option(
     """One of this connector's knobs, from ``--kv-transfer-config``.
 
     They live in ``kv_connector_extra_config`` rather than the environment
-    because that is where vLLM puts a connector's own options, and because the
-    environment is read for the mega-cache bundle key -- a transfer knob
-    changes no compiled graph and has no business partitioning it.
+    because that is where vLLM puts a connector's own options.
 
     The type follows the default. That config arrives as JSON, so a bool and an
     int come through as themselves; anything else is a mistake worth naming

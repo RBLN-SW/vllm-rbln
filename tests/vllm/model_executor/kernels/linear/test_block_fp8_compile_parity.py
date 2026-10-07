@@ -87,12 +87,11 @@ def _assert_parity(build, *cpu_args):
     dev = current_platform.device_type
     # 1. CPU eager oracle.
     ref = build()(*cpu_args)
-    # 2. rbln-compiled, on whichever tensors the lane selects.
+    # 2. rbln-compiled, on the device tensors the vllm path runs on.
     dev_args = _to_session_device(cpu_args)
     assert _agrees(rbln_compile(build().to(dev), fullgraph=True)(*dev_args), ref)
-    # 3. device eager, only when device tensors are on (--device-tensor 1).
-    if dev == "rbln":
-        assert _agrees(build().to(dev)(*dev_args), ref)
+    # 3. device eager.
+    assert _agrees(build().to(dev)(*dev_args), ref)
 
 
 def _fp8_weight(out_features, in_features):

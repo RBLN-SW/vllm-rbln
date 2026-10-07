@@ -37,12 +37,10 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer
 
-import vllm_rbln.envs as envs
 import vllm_rbln.utils as rbln_utils
-from vllm_rbln.compilation import build_process_group_dict, compile
+from vllm_rbln.compilation import compile
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
-from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     attention_block_axis,
@@ -82,14 +80,6 @@ class RBLNDFlashProposer(DFlashProposer):
                 "The DFlash drafter cannot run eager on RBLN: its context K/V "
                 "write goes through an attention op that only exists as a "
                 "compiled kernel."
-            )
-        if not USE_DEVICE_TENSOR:
-            # The cache is allocated on the meta device then, and the context
-            # write is a host copy -- which meta accepts and discards.
-            raise NotImplementedError(
-                "The DFlash drafter requires VLLM_RBLN_USE_DEVICE_TENSOR=1 on "
-                "RBLN: without it the KV cache has no host-visible storage and "
-                "the drafter's context K/V write is silently dropped."
             )
         super().__init__(vllm_config=vllm_config, device=device, runner=runner)
         if self.dflash_causal:
@@ -295,15 +285,8 @@ class RBLNDFlashProposer(DFlashProposer):
         compile_kwargs = dict(
             dynamic=False,
             fullgraph=True,
-            compile_context=self.runner.compile_context,
             num_devices=rbln_config.num_devices_per_local_rank,
-            model_trace_method="export" if USE_DEVICE_TENSOR else "",
-            process_group_dict=build_process_group_dict(),
             guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-            runtime_holder=self.runner.runtime_holder,
-            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-            use_static_output=True,
-            dtype=rbln_config.compile_dtype,
         )
         self.model_executable = compile(model_wrapper, **compile_kwargs)
         self._project_context_kv = compile(project_context_kv, **compile_kwargs)

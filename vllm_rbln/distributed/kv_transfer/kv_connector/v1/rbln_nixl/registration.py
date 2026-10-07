@@ -16,9 +16,8 @@ from collections.abc import Iterable
 from typing import Any
 
 import msgspec
-import rebel
 import torch
-from rebel.kv_cache import aligned_tensor
+from rebel import v2
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
 )
@@ -232,8 +231,8 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         sample_kv_cache = next(iter(kv_caches.values()))
         device_id = sample_kv_cache.get_device()
         assert device_id >= 0, (
-            "RBLN NIXL (D2D): KV cache is not an 'rbln' "
-            "device tensor (is VLLM_RBLN_USE_DEVICE_TENSOR=1 set?)."
+            "RBLN NIXL (D2D): KV cache is not an 'rbln' device tensor; only "
+            "the vllm model path keeps it on the device."
         )
 
         # Direct path never stages through a host buffer.
@@ -371,7 +370,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                     else None
                 )
 
-        rbln_ctx_ptr = rebel.context_of(sample_kv_cache).rbln_ctx_ptr
+        rbln_ctx_ptr = v2.Device(device_id).driver_context
 
         # Delegate sharding and MR registration to nixl-rbln. It registers
         # one whole-entry MR per shard and returns the transfer tables
@@ -648,7 +647,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
         self._register_kv_caches_impl(pending)
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Allocate one rebel-aligned host buffer per layer."""
+        """Allocate one pinned host buffer per layer."""
         # MLA has no head axis to order, which is why upstream advertises no
         # required layout for it and the resolved value is meaningless here.
         # The allocator below is shape-agnostic either way.
@@ -673,21 +672,13 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             )
         xfer_buffers: dict[str, torch.Tensor] = {}
 
-        def _aligned_like(kv_cache: torch.Tensor) -> torch.Tensor:
-            """Page-aligned host buffer with `kv_cache`'s shape and dtype.
-            `aligned_tensor` only knows fp16 (numpy has no bfloat16), so
-            we size by byte count and view-cast to the target dtype."""
-            bytes_needed = kv_cache.numel() * kv_cache.element_size()
-            assert bytes_needed % 2 == 0, (
-                "kv_cache byte footprint must be a multiple of 2 "
-                f"(aligned_tensor backing dtype), got {bytes_needed}"
-            )
-            raw_fp16 = aligned_tensor(bytes_needed // 2)
-            return raw_fp16.view(kv_cache.dtype).view(kv_cache.shape)
-
         try:
             for layer_name, kv_cache in kv_caches.items():
-                xfer_buffers[layer_name] = _aligned_like(kv_cache)
+                # Pinned host memory is page aligned and locked, as the NIC
+                # registers it.
+                xfer_buffers[layer_name] = torch.empty(
+                    kv_cache.shape, dtype=kv_cache.dtype, pin_memory=True
+                )
         except MemoryError as e:
             logger.error("RBLN NIXL: %s", e)
             raise
@@ -701,7 +692,7 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             keys_preview,
         )
 
-        self.host_xfer_buffers = xfer_buffers
+        self.host_xfer_buffers: dict[str, torch.Tensor] = xfer_buffers
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Wire KV caches into NIXL.

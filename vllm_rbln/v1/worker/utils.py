@@ -408,11 +408,6 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
     is a hard failure in `DynamicKvSizer`. The optimum path is not among them --
     it installs neither the engine patch nor a worker that carries a sizer.
     """
-    if not envs.VLLM_RBLN_USE_DEVICE_TENSOR:
-        return (
-            "VLLM_RBLN_USE_DEVICE_TENSOR is off, so the artifact carries no "
-            "dynamic KV dimension"
-        )
     rbln_config: RBLNConfig = vllm_config.additional_config
     if rbln_config.use_custom_kernel:
         # rbln_triton_ops goes through the compiler's triton converter, so the
@@ -1273,10 +1268,10 @@ def copy_host_device_kv_blocks(
 ) -> None:
     """Copy KV blocks between the host xfer buffer and the device KV cache.
 
-    Requires VLLM_RBLN_USE_DEVICE_TENSOR=1. `block_axes` says which axis of a
-    layer's cache a block id indexes: dim 0 for MLA and SSM/conv, and for the
-    attention cache the rbln_custom_ops kernels read, but dim 1 for the
-    K/V-first one rbln_triton_ops reads, where dim 0 would select a K/V half.
+    `block_axes` says which axis of a layer's cache a block id indexes: dim 0
+    for MLA and SSM/conv, and for the attention cache the rbln_custom_ops
+    kernels read, but dim 1 for the K/V-first one rbln_triton_ops reads, where
+    dim 0 would select a K/V half.
     """
     if not src_kv_caches or not dst_kv_caches or not src_block_ids or not dst_block_ids:
         return

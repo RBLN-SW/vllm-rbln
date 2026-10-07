@@ -77,7 +77,7 @@ class TestStagedModelInputs:
         }
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestStage:
     def test_copies_into_top_left_and_pads_rest(self):
         stager = _stager()
@@ -129,7 +129,7 @@ class TestStage:
         assert staged.positions.device.type == current_platform.device_type
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestBufferReuse:
     def test_same_layout_and_dtype_reuses_buffer(self):
         stager = _stager()
@@ -210,7 +210,7 @@ class TestBufferReuse:
         assert s2.positions.dtype == torch.int32
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestTokenIndices:
     @staticmethod
     def _base_kwargs():
@@ -280,7 +280,7 @@ class TestTokenIndices:
         assert s1.token_indices is not s2.token_indices
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestHiddenStates:
     # The eagle3 drafter's third input, staged into the same padded layout.
     @staticmethod
@@ -313,7 +313,7 @@ class TestHiddenStates:
         assert torch.equal(s2.hidden_states.cpu(), expected)
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestPassthrough:
     def test_intermediate_and_embeds_passed_through(self):
         stager = _stager()

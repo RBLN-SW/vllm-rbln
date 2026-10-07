@@ -365,18 +365,6 @@ class DynamicKvSizer:
             )
         return capture()
 
-    def collect_runtimes(self) -> list[Any]:
-        """Every rbln runtime warm-up built, deduplicated across programs."""
-        runtimes: list[Any] = []
-        seen: set[int] = set()
-        for program in self.programs:
-            runtime = program.runtime
-            if id(runtime) in seen:
-                continue
-            seen.add(id(runtime))
-            runtimes.append(runtime)
-        return runtimes
-
     def memory_snapshot(
         self, device: torch.device
     ) -> tuple[dict[Unit, ChipletMemory], str]:
@@ -514,11 +502,11 @@ class DynamicKvSizer:
     ) -> list[Any]:
         """The KV inputs the slope is summed over: every cache once.
 
-        A group is one program's KV input set. Two programs binding the same
-        caches (prefill and decode) form two groups, because dynamo names the
-        symbols and the arg positions differently; summing both would charge
-        every cache twice. `InputSpec` carries no identity, so the number of
-        caches vllm allocated is what says which case this is.
+        A group is one KV input set the programs bind. Two groups are either
+        disjoint caches (a target's and a drafter's), to be summed, or the same
+        caches traced otherwise, which summing would charge twice. `InputSpec`
+        carries no identity, so the number of caches vllm allocated is what says
+        which case this is.
         """
         flat = [spec for group_specs, _ in groups for spec in group_specs]
         if len(flat) == num_caches:
@@ -734,7 +722,7 @@ class DynamicKvSizer:
 
     def materialize(self) -> None:
         """Every model graph once, so the resize's cost lands at boot."""
-        with set_compile_stage("warmup"), self.model_runner.offload_context():
+        with set_compile_stage("warmup"):
             self.model_runner.run_model_graphs()
 
     def release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
@@ -835,13 +823,3 @@ class DynamicKvSizer:
         if mr.kv_caches:
             self.release_kv_cache_tensors(old_cfg)
         mr.initialize_kv_cache_tensors(new_cfg, mr._kernel_block_sizes)
-
-        # Warm-up latched the adaptive buffer sizes at the old num_blocks;
-        # without this the next forward raises "variable dim changed".
-        runtimes = self.collect_runtimes()
-        for runtime in runtimes:
-            runtime.reset_adaptive_buffers()
-        logger.info(
-            "[Dynamic KV] reset_adaptive_buffers() on %d runtime(s).",
-            len(runtimes),
-        )

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
 import logging
 import time
 from collections.abc import Sequence
@@ -19,7 +18,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
-import rebel
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -419,14 +417,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
 
         with record_function_or_nullcontext("rbln_model_runner: forward"):
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
             model_start_time = time.perf_counter()
-            with capture_ctx as model_reports:
-                hidden_states = self.model(model_input)
+            hidden_states = self.model(model_input)
             if not model_input.is_prompt:
                 # The decode graph returns every row of the padded batch;
                 # keep the running requests' rows in running order.
@@ -437,7 +429,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     model_input.is_prompt,
                     start_time=model_start_time,
                     end_time=time.perf_counter(),
-                    reports=model_reports,
+                    reports=None,
                     token_count=0,
                     # the performance of sampler doesn't depend on token count
                 )
@@ -1615,20 +1607,14 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             else:
                 padded_logits = logits
             sampler_start_time = time.perf_counter()
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
-            with capture_ctx as sampler_reports:
-                sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
+            sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
             if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
                 collect_metrics(
                     self.sampler_performance_tracker,
                     is_prompt,
                     start_time=sampler_start_time,
                     end_time=time.perf_counter(),
-                    reports=sampler_reports,
+                    reports=None,
                     token_count=0,
                     # the performance of sampler doesn't depend on token count
                 )

@@ -16,9 +16,10 @@
 
 ``conftest.py::make_worker`` runs the worker's real ``__init__`` on a real
 VllmConfig and KVCacheConfig over real KV tensors, faking what it cannot reach
-here: the NIXL agent and its config, the ``nixl_rbln`` adapter, ``rebel``'s
-context lookup, ``get_device``, the TP-rank accessors and the window-mode env
-flag. ``build_worker`` below goes further and replaces upstream's ``__init__``.
+here: the NIXL agent and its config, the ``nixl_rbln`` adapter, ``rebel.v2``'s
+driver context lookup, ``get_device``, the TP-rank accessors and the window-mode
+env flag. ``build_worker`` below goes further and replaces upstream's
+``__init__``.
 
 ``KvGeometry`` is why that is affordable. One object produces all three views of
 a geometry -- the KVCacheConfig the worker is built with, the tensors it

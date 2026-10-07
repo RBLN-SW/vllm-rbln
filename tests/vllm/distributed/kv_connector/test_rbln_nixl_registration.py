@@ -482,15 +482,16 @@ class TestInitializeHostXferBuffer:
         )
         assert worker.host_xfer_buffers["l0"].shape == (4, 64, 576)
 
-    def test_rejects_odd_byte_footprint(self, monkeypatch):
-        # The page-aligned host buffer is backed by an fp16 (2-byte) allocation,
-        # so a cache whose byte footprint is odd cannot be tiled.
-        worker = build_worker(monkeypatch, kv_buffer_device="cpu")
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.uint8])
+    def test_the_buffer_is_pinned_in_the_cache_s_dtype(self, monkeypatch, dtype):
+        # The NIC registers page-aligned, locked host memory; a 1-byte fp8
+        # container and bf16 are held as they are.
+        worker = build_worker(monkeypatch, kv_buffer_device="cpu", num_blocks=4)
         worker.kv_cache_layout = "LBHNC"
-        with pytest.raises(AssertionError, match="multiple of 2"):
-            worker.initialize_host_xfer_buffer(
-                {"l0": torch.zeros(1, dtype=torch.uint8)}  # 1 byte
-            )
+        worker.initialize_host_xfer_buffer({"l0": torch.zeros(4, 2, 8, dtype=dtype)})
+        buffer = worker.host_xfer_buffers["l0"]
+        assert buffer.dtype == dtype and buffer.is_pinned()
+        assert buffer.data_ptr() % 4096 == 0
 
 
 class TestSetHostXferBufferOps:
@@ -539,14 +540,14 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(
                 worker,
                 "register_local_xfer_handler",
                 return_value=("local-handle", [(0x0, 0, 0)]),
             ),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
             call = registration.compute_nixl_compatibility_hash.call_args
 
@@ -578,14 +579,14 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(
                 worker,
                 "register_local_xfer_handler",
                 return_value=("local-handle", [(0x0, 0, 0)]),
             ),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
         assert worker.region_group_ids == [0, 0, 0, 0]
@@ -618,18 +619,20 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(
                 worker,
                 "register_local_xfer_handler",
                 return_value=("local-handle", [(0x0, 0, 0)]),
             ),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
-        # rbln_ctx_ptr comes from rebel.context_of(kv_tensor), not a runtime handle.
-        mock_rebel.context_of.assert_called_once_with(next(iter(kv_caches.values())))
+        # rbln_ctx_ptr is the driver context of the KV cache's device.
+        mock_v2.Device.assert_called_once_with(
+            next(iter(kv_caches.values())).get_device()
+        )
 
         # nixl-rbln invoked once, with the D2D VRAM segment + resolved ctx ptr.
         fake.register_kv_regions.assert_called_once()
@@ -687,10 +690,10 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
         assert worker.num_regions == 8  # 4 base addrs x 2 (blocks-first)
@@ -730,10 +733,10 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
         assert len(fake.register_kv_regions.call_args.args[1]) == 2  # logical regions
@@ -774,11 +777,11 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
             pytest.raises(AssertionError, match="transfer region"),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
     def test_constructs_transfer_topology_with_expected_kwargs(self, monkeypatch):
@@ -809,10 +812,10 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo, topology_cls=topology_cls),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
             topology_cls.assert_called_once_with(
                 tp_rank=0,
@@ -848,7 +851,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo, uniform_spec=UniformTypeKVCacheSpecs),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -888,7 +891,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -926,7 +929,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -971,7 +974,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -1003,7 +1006,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -1035,7 +1038,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             pytest.raises(AssertionError, match="is not 128 blocks of 2048B"),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -1058,7 +1061,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             pytest.raises(RuntimeError, match="mix MLA and non-MLA"),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -1090,7 +1093,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             pytest.raises(RuntimeError, match="cross-layer blocks require one page"),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -1116,7 +1119,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -1152,7 +1155,7 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo, mamba_spec=MambaSpec),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel"),
+            patched_in_package("v2"),
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
             worker._register_kv_caches_impl(kv_caches)
@@ -1192,10 +1195,10 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
         assert worker._kv_split_axis is KVSplitAxis.NON_HEAD
@@ -1233,10 +1236,10 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
         assert worker._kv_split_axis is KVSplitAxis.HEAD
@@ -1274,11 +1277,11 @@ class TestRegisterKvCachesImpl:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
             pytest.raises(RuntimeError, match="not all cut on the same axis"),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
 
 
@@ -1849,10 +1852,10 @@ class TestTailBlockTrim:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(worker, "register_local_xfer_handler", return_value=("h", [])),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
         return worker
 
@@ -2026,14 +2029,14 @@ class TestChunkModeWithASlidingWindow:
         with (
             _patch_worker_nixl_symbols(topo),
             patch.dict(sys.modules, {"nixl_rbln": fake}),
-            patched_in_package("rebel") as mock_rebel,
+            patched_in_package("v2") as mock_v2,
             patch.object(
                 worker,
                 "register_local_xfer_handler",
                 return_value=("local-handle", [(0x0, 0, 0)]),
             ),
         ):
-            mock_rebel.context_of.return_value.rbln_ctx_ptr = 0x1000
+            mock_v2.Device.return_value.driver_context = 0x1000
             worker._register_kv_caches_impl(kv_caches)
         return worker
 

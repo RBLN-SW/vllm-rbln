@@ -25,15 +25,10 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-import vllm_rbln.envs as envs
-from vllm_rbln.compilation import (
-    build_process_group_dict,
-    compile,
-)
+from vllm_rbln.compilation import compile
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -454,16 +449,9 @@ class RBLNEagleProposer(EagleProposer):
                 model_wrapper,
                 dynamic=False,
                 fullgraph=True,
-                compile_context=self.runner.compile_context,
                 num_devices=rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runner.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_static_output=True,
                 use_direct_dispatch=True,
-                dtype=rbln_config.compile_dtype,
             )
 
     def _build_dummy_attn_metadata(

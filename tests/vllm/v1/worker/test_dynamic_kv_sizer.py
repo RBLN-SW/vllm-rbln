@@ -16,7 +16,7 @@
 SimpleNamespace stand-ins that carry only the state each path reads."""
 
 import sys
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -27,46 +27,47 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 import vllm_rbln.v1.worker.dynamic_kv_sizer as dks
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 
-S0 = ("symbol", "s0")
+MIB = 2**20
 
 
-def _shard(node, chiplet, shape):
-    return SimpleNamespace(node_id=node, chiplet_id=chiplet, slice_shape=tuple(shape))
+def _shard(node, chiplet, step):
+    """A shard taking `step` bytes per block, from Dynamo's least extent of 2."""
+    return {
+        "node": node,
+        "chiplet": chiplet,
+        "min_nbytes": 2 * step,
+        "step_nbytes": step,
+        "pool": None,
+    }
 
 
-def _placement(shards):
+def _placement(shards, symbol="s0", type_id="held"):
+    """A [n, 2, 8, 1, 1024, 128] cache held in `shards`."""
+    axis = SimpleNamespace(name=symbol, axis=0, min=2, max=0)
     return SimpleNamespace(
-        shape=(2, S0, 8, 1, 1024, 128), dtype="dlfloat16", shards=shards
+        logical=SimpleNamespace(dynamic_axes=[axis]),
+        physical="float16[?,2,8,1,1024,128]",
+        type_id=type_id,
+        shards=tuple(shards),
     )
 
 
-HEAD_SPLIT = _placement(tuple(_shard(0, c, (2, S0, 2, 1, 1024, 128)) for c in range(4)))
+# Two KV heads per chiplet: 2 * 2 * 1024 * 128 * 2 B = 1 MiB per block.
+HEAD_SPLIT = _placement(tuple(_shard(0, c, MIB) for c in range(4)))
 
-# The same tensor as HEAD_SPLIT, bound by a second program: dynamo names the
-# symbol differently, which is what splits one tensor set into two groups.
-S1 = ("symbol", "s40")
-HEAD_SPLIT_S1 = SimpleNamespace(
-    shape=(2, S1, 8, 1, 1024, 128),
-    dtype="dlfloat16",
-    shards=tuple(_shard(0, c, (2, S1, 2, 1, 1024, 128)) for c in range(4)),
-)
+# The same tensor as HEAD_SPLIT, bound by a second program, where dynamo names
+# the size it leaves open differently.
+HEAD_SPLIT_S1 = _placement(tuple(_shard(0, c, MIB) for c in range(4)), symbol="s40")
 
 
-def _program(placements, name="0/0", runtime=None, device=None, extent=4):
-    specs = (SimpleNamespace(name="ids", shape=(1,), physical_placement=None),) + tuple(
+def _program(placements, name="0/0", device=None, extent=4):
+    specs = (SimpleNamespace(name="ids", shape=(1,), dtype="int32", arg=None),) + tuple(
         SimpleNamespace(
-            name=f"kv.{i}",
-            shape=tuple(extent if not isinstance(d, int) else d for d in p.shape),
-            physical_placement=p,
+            name=f"kv.{i}", shape=(extent, 2, 8, 1, 1024, 128), dtype="float16", arg=p
         )
         for i, p in enumerate(placements)
     )
-    return SimpleNamespace(
-        name=name,
-        input_specs=specs,
-        runtime=runtime if runtime is not None else object(),
-        device=device,
-    )
+    return SimpleNamespace(name=name, input_specs=specs, device=device)
 
 
 def _kv_cache_tensors(num_caches: int, stride: int = 1024):
@@ -224,9 +225,7 @@ class TestComputeDynamicKvNumBlocks:
     ):
         if num_caches is None:
             # Every program binds the same caches unless a test says otherwise.
-            num_caches = sum(
-                spec.physical_placement is not None for spec in programs[0].input_specs
-            )
+            num_caches = sum(spec.arg is not None for spec in programs[0].input_specs)
         sizer = SimpleNamespace(
             rank=0,
             device=torch.device("cpu"),
@@ -381,9 +380,9 @@ class TestComputeDynamicKvNumBlocks:
         assert "RBLN_DUMMY_DEVICE" in caplog.text
 
     def test_the_same_tensors_seen_twice_are_counted_once(self, caplog):
-        """Prefill and decode bind the same KV tensors, but dynamo names their
-        symbols differently, so they form two groups. Summing both would double
-        the slope and halve the count."""
+        """Prefill and decode bind the same KV tensors, whatever dynamo names
+        the sizes it leaves open. Summing both would double the slope and halve
+        the count."""
         programs = [
             _program([HEAD_SPLIT, HEAD_SPLIT], name="0/0"),
             _program([HEAD_SPLIT_S1, HEAD_SPLIT_S1], name="0/1"),
@@ -394,7 +393,7 @@ class TestComputeDynamicKvNumBlocks:
         # Two programs, two groups, but vllm allocated two caches, not four.
         with caplog.at_level("INFO"):
             n = DynamicKvSizer.compute_num_blocks(sizer)
-        assert "summed over 2 KV input(s) from 2 set(s)" in caplog.text
+        assert "summed over 2 KV input(s) from 1 set(s)" in caplog.text
         # 2 MiB per block, not 4: (35 - 30) GiB / 2 MiB.
         assert n == 5 * 512
 
@@ -423,7 +422,7 @@ class TestComputeDynamicKvNumBlocks:
             DynamicKvSizer.compute_num_blocks(sizer)
 
     def test_programs_that_disagree_on_the_layout_are_refused(self):
-        other = _placement((_shard(0, 0, (2, S0, 8, 1, 1024, 128)),))
+        other = _placement((_shard(0, 0, 4 * MIB),), type_id="whole")
         programs = [_program([HEAD_SPLIT]), _program([other], name="0/1")]
         with pytest.raises(RuntimeError, match="disagree"):
             DynamicKvSizer.compute_num_blocks(
@@ -517,7 +516,6 @@ class TestModeResolution:
     the sizer branches on the mode instead of re-reading them."""
 
     def test_explicit_off_is_silent_in_the_worker(self, monkeypatch, caplog):
-        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
         config = SimpleNamespace(
             cache_config=SimpleNamespace(
                 num_gpu_blocks_override=None,
@@ -627,17 +625,6 @@ class TestWarmupCapturesPrograms:
             DynamicKvSizer.capture_programs(
                 SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE)
             )
-
-    def test_runtimes_are_deduped_across_programs(self):
-        shared = object()
-        sizer = SimpleNamespace(
-            programs=[
-                _program([HEAD_SPLIT], runtime=shared),
-                _program([HEAD_SPLIT], runtime=shared),
-                _program([], runtime=object()),
-            ]
-        )
-        assert len(DynamicKvSizer.collect_runtimes(sizer)) == 2
 
 
 class TestMaybeShrinkKvCacheForCompile:
@@ -1076,7 +1063,6 @@ class TestApplyResizesThenMaterializes:
         sizer = SimpleNamespace(
             mode=dks.DynamicKvMode.ACTIVE,
             model_runner=SimpleNamespace(
-                offload_context=nullcontext,
                 run_model_graphs=lambda: ran.append("graphs"),
             ),
         )

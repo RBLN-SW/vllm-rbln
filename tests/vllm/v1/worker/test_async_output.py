@@ -36,7 +36,7 @@ from vllm_rbln.v1.worker.async_output import (
     PendingTokenWriteback,
 )
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 def _output(req_ids):

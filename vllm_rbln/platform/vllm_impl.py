@@ -21,7 +21,6 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_rbln import envs
-from vllm_rbln.platform import USE_DEVICE_TENSOR
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -76,9 +75,10 @@ def _validate(vllm_config: "VllmConfig") -> None:
         raise ValueError("LoRA is not supported on RBLN.")
 
     if rbln_config.compile_dtype:
-        from vllm_rbln.compilation import check_dtype_option_supported
-
-        check_dtype_option_supported()
+        raise ValueError(
+            "compile_dtype is not supported on RBLN: graphs run in the dtype the "
+            "NPU computes floats in; set the model's dtype instead."
+        )
 
     if not scheduler_config.enable_chunked_prefill:
         raise ValueError(
@@ -176,14 +176,6 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
     # FIXME(jiwoo.park) This is a temporary workaround.
     if model_config.enforce_eager:
-        if not USE_DEVICE_TENSOR:
-            raise ValueError(
-                "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
-                "Eager mode bypasses torch.compile, so ops must dispatch "
-                "to a real device='rbln' rather than the compile-backend "
-                "fake-CPU tensors used by the default vLLM model path."
-            )
-
         hf_config = model_config.hf_config
         assert not hasattr(hf_config, "sliding_window") or not getattr(
             hf_config, "use_sliding_window", True
@@ -302,17 +294,12 @@ def _wire(vllm_config: "VllmConfig") -> None:
 
     # The async refusals have to precede the scheduler_cls assignment below,
     # which reads the flag they clear.
-    if scheduler_config.async_scheduling and not (
-        envs.VLLM_RBLN_USE_DEVICE_TENSOR and rbln_config.use_custom_sampler
-    ):
+    if scheduler_config.async_scheduling and not rbln_config.use_custom_sampler:
         logger.warning(
             "Disabling asynchronous scheduling: it requires "
-            "VLLM_RBLN_USE_DEVICE_TENSOR=1 (got %s), which carries the "
-            "in-flight sampled tokens, and --rbln-use-custom-sampler (got %s), "
-            "which puts the sampler on the device so those tokens never "
-            "reach the host mid-step. Running synchronously.",
-            int(envs.VLLM_RBLN_USE_DEVICE_TENSOR),
-            int(rbln_config.use_custom_sampler),
+            "--rbln-use-custom-sampler, which puts the sampler on the device so "
+            "the in-flight sampled tokens never reach the host mid-step. "
+            "Running synchronously."
         )
         scheduler_config.async_scheduling = False
 

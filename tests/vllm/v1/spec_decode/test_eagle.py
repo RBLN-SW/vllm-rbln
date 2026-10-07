@@ -35,7 +35,7 @@ import vllm_rbln.v1.spec_decode.eagle as eagle_module
 from tests.vllm.v1.spec_decode.utils import make_cad, make_eagle_proposer
 from vllm_rbln.v1.worker.dp_utils import DPStatus, ShapeConfig
 
-pytestmark = pytest.mark.maybe_use_device
+pytestmark = pytest.mark.use_device
 
 
 def _shape_config(*, specialized=False, max_num_tokens=64):
@@ -652,19 +652,14 @@ class TestLoadModel:
         monkeypatch.setattr(
             eagle_module, "compile", lambda fn, **kw: captured.update(kw) or sentinel
         )
-        monkeypatch.setattr(eagle_module, "build_process_group_dict", lambda: {})
         proposer = make_eagle_proposer(num_speculative_tokens=1)
         monkeypatch.setattr(
             proposer.vllm_config.speculative_config, "enforce_eager", False
-        )
-        proposer.runner = SimpleNamespace(
-            compile_context=object(), runtime_holder=[None]
         )
 
         proposer.load_model(target_model=object())
         assert proposer.model_executable is sentinel
         assert captured["fullgraph"] is True
-        assert "compile_context" in captured
 
     def test_eager_wrapper_composes_model_forward(self, monkeypatch):
         # The eager wrapper runs the draft model, reshapes the hidden states,

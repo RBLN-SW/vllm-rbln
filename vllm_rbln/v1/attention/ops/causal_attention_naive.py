@@ -14,8 +14,6 @@
 
 import torch
 
-from ..ops import triton_causal_attention_naive  # noqa: F401
-
 
 def causal_attention_naive_prefill(
     q: torch.Tensor,

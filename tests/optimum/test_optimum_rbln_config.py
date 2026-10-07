@@ -58,7 +58,7 @@ def test_multimodal_normalization_stays_in_the_processor(model, monkeypatch):
     # Building the config asks the NPU for its family, and this lane has none.
     from vllm_rbln import platform
 
-    monkeypatch.setattr(platform.rebel, "get_npu_name", lambda *a, **kw: "RBLN-CA25")
+    monkeypatch.setattr(platform.v2, "npu_name", lambda *a, **kw: "RBLN-CA25")
     config = AsyncEngineArgs(
         model=model, model_impl="optimum", max_model_len=4096, block_size=4096
     ).create_engine_config()

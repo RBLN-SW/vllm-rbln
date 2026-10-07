@@ -580,10 +580,6 @@ def _params():
 
 
 class TestDetermineAvailableMemory:
-    @pytest.fixture(autouse=True)
-    def _device_tensor_on(self, monkeypatch):
-        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
-
     # Isolates the worker's own arithmetic by capturing the kwargs it hands to
     # the already-tested estimate_available_memory. Golden values are _params().
     @staticmethod
@@ -844,10 +840,6 @@ class TestDetermineAvailableMemory:
 
 
 class TestInitializeFromConfig:
-    @pytest.fixture(autouse=True)
-    def _device_tensor_on(self, monkeypatch):
-        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
-
     @staticmethod
     def _init(make_worker, monkeypatch, kv_cfg, *, dynamic=True):
         worker = make_worker()
@@ -1323,19 +1315,25 @@ class TestKvRegistrationOrder:
         assert calls == ["initialize_kv_cache", "register", "resize"]
 
 
+def _record_activities(monkeypatch, calls: list) -> None:
+    def end_activities():
+        calls.append("end")
+        return [], []
+
+    runtime = wm.v2.runtime
+    monkeypatch.setattr(runtime, "begin_activities", lambda: calls.append("begin"))
+    monkeypatch.setattr(runtime, "end_activities", end_activities)
+    monkeypatch.setattr(
+        runtime, "write_trace", lambda path, *_: calls.append(("trace", path))
+    )
+
+
 class TestProfile:
     def test_torch_profiler_keeps_the_rbln_session_to_itself(
         self, make_worker, monkeypatch, tmp_path
     ):
-        calls: list[str] = []
-        monkeypatch.setattr(
-            wm,
-            "rbln_profiler",
-            SimpleNamespace(
-                start=lambda: calls.append("start"),
-                done=lambda: calls.append("done"),
-            ),
-        )
+        calls: list = []
+        _record_activities(monkeypatch, calls)
         vllm_config = _make_vllm_config()
         vllm_config.profiler_config = ProfilerConfig(
             profiler="torch",
@@ -1349,17 +1347,10 @@ class TestProfile:
 
         assert calls == []
 
-    def test_rbln_profiler_starts_and_flushes_at_stop(self, make_worker, monkeypatch):
-        calls: list[str] = []
+    def test_rbln_profiler_writes_a_trace_at_stop(self, make_worker, monkeypatch):
+        calls: list = []
         monkeypatch.setenv("RBLN_PROFILER", "1")
-        monkeypatch.setattr(
-            wm,
-            "rbln_profiler",
-            SimpleNamespace(
-                start=lambda: calls.append("start"),
-                done=lambda: calls.append("done"),
-            ),
-        )
+        _record_activities(monkeypatch, calls)
         vllm_config = _make_vllm_config()
         vllm_config.profiler_config = ProfilerConfig()
         worker = make_worker(vllm_config=vllm_config)
@@ -1367,5 +1358,8 @@ class TestProfile:
         worker.profile(is_start=True)
         worker.profile(is_start=False)
 
-        assert calls == ["start", "done"]
+        assert calls[:2] == ["begin", "end"] and len(calls) == 3
+        _, path = calls[2]
+        assert os.path.basename(path).startswith("rbln_trace_")
+        assert path.endswith(".json")
         assert isinstance(worker.profiler, wm.RblnProfilerWrapper)

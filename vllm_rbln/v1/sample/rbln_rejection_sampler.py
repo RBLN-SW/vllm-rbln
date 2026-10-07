@@ -23,10 +23,8 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler, generate_uniform_
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from vllm_rbln import envs
-from vllm_rbln.compilation import compile, create_compile_context
+from vllm_rbln.compilation import compile
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TEMPERATURE,
     GREEDY_TOP_K,
@@ -34,7 +32,6 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
 )
 
 if TYPE_CHECKING:
-    from rebel import CompileContext
     from vllm.config import SpeculativeConfig
 
 
@@ -56,7 +53,6 @@ class RBLNRejectionSampler(RejectionSampler):
     def __init__(
         self,
         sampler: Sampler,
-        compile_context: "CompileContext | None" = None,
         spec_config: "SpeculativeConfig | None" = None,
         device: torch.device | None = None,
         *,
@@ -78,7 +74,7 @@ class RBLNRejectionSampler(RejectionSampler):
             assert self.synthetic_conditional_rates.shape[0] == num_spec_tokens
             self.synthetic_conditional_rates = self.synthetic_conditional_rates.cpu()
         self.impl = (
-            RBLNRejectionSamplerImpl(compile_context, num_spec_tokens)
+            RBLNRejectionSamplerImpl(num_spec_tokens)
             if use_rbln_sampler
             else TorchRejectionSamplerImpl()
         )
@@ -332,30 +328,15 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
 class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
     max_spec_len = 32
 
-    def __init__(
-        self,
-        compile_context: "CompileContext | None" = None,
-        num_spec_tokens: int = 0,
-    ):
+    def __init__(self, num_spec_tokens: int = 0):
         super().__init__()
         self.num_spec_tokens = num_spec_tokens or self.max_spec_len
-
-        compile_context = (
-            compile_context or create_compile_context(use_global_ctx=True)
-            if not USE_DEVICE_TENSOR
-            else None
-        )
 
         self._compiled_rejection_sample = compile(
             rbln_rejection_sample,
             dynamic=False,
             fullgraph=True,
-            compile_context=compile_context,
-            num_devices=1 if USE_DEVICE_TENSOR else None,
-            model_trace_method="export" if USE_DEVICE_TENSOR else "",
-            mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-            use_global_ctx=True if not USE_DEVICE_TENSOR else None,
-            global_device_id=0 if not USE_DEVICE_TENSOR else None,
+            num_devices=1,
             # Built only under --rbln-use-custom-sampler, so a bundle saved
             # with the sampler off misses this op and forces a partial compile.
             use_cache=False,

@@ -131,7 +131,7 @@ class TestMlaImplStubs:
         assert impl.process_weights_after_loading(torch.float16) is None
 
 
-@pytest.mark.maybe_use_device
+@pytest.mark.use_device
 class TestMlaImplInit:
     # __init__ validation guards. Valid args (head_size 576, all-None) construct;
     # each override trips one guard.

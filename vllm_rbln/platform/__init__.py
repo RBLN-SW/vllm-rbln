@@ -27,7 +27,8 @@ if TYPE_CHECKING:
 else:
     VllmConfig = None
 
-import rebel
+import rebel.v2.ops  # noqa: F401  -- defines torch.ops.rbln_custom_ops
+from rebel import v2
 from torch._dynamo import register_backend
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
@@ -40,11 +41,6 @@ logger = init_logger(__name__)
 # any engine code reads a variable.
 envs.publish_to_vllm_envs()
 
-# Assigned by `_apply_model_impl`, which this module calls once at the bottom
-# and `register_ops` calls again once the arguments name the model path. Eight
-# modules copy this name into their own namespace, and every one of them imports
-# after both.
-USE_DEVICE_TENSOR: bool = False
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
 # RBLN default for gpu_memory_utilization (upstream vLLM defaults to 0.92).
@@ -137,15 +133,16 @@ class RblnPlatform(Platform):
     def get_device_name(cls, device_id: int = 0) -> str:
         # No NPU mounted (e.g., CPU-only compile worker): fall back to the env var
         # the compiler CI sets - RBLN_FORCE_NPU_NAME (RBLN_TARGET_SOC = legacy).
+        mounted = v2.Device.available() and device_id < v2.device_count()
         device_name = (
-            rebel.get_npu_name(device_id)
+            (v2.npu_name(device_id) if mounted else None)
             or os.environ.get("RBLN_FORCE_NPU_NAME")
             or os.environ.get("RBLN_TARGET_SOC")
         )
         if not device_name:
             raise RuntimeError(
                 "Could not determine the RBLN NPU name "
-                f"(rebel.get_npu_name({device_id}) returned None). On a host "
+                f"(no NPU {device_id} is mounted). On a host "
                 "without an NPU mounted (e.g., a CPU-only compile worker running "
                 "with VLLM_RBLN_COMPILE_ONLY=1), set RBLN_FORCE_NPU_NAME to the "
                 "target NPU (e.g., RBLN-CA25) so compilation can target it."
@@ -166,7 +163,7 @@ class RblnPlatform(Platform):
 
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
-        rebel.manual_seed(seed)
+        v2.manual_seed(seed)
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
@@ -379,8 +376,7 @@ class RblnPlatform(Platform):
         # kv_buffer_device "cpu" is the host-bounce path; "rbln" is the D2D
         # path (upstream NixlConnectorWorker.__init__ rejects kv_buffer_device
         # values not listed here). Listed under both device_types because
-        # device_type is "rbln" only on the vllm model path, and only
-        # with VLLM_RBLN_USE_DEVICE_TENSOR set.
+        # device_type is "rbln" only on the vllm model path.
         return {
             "cpu": ("cpu", "rbln"),
             "rbln": ("rbln", "cpu"),
@@ -421,15 +417,15 @@ def _apply_model_impl(model_impl: "ModelImpl", *, publish: bool = True) -> None:
     a guess while the deprecated variable still selects the path, and
     `register_ops` reads the variable as proof that someone resolved it.
     """
-    global USE_DEVICE_TENSOR, _MODEL_IMPL
+    global _MODEL_IMPL
 
     _MODEL_IMPL = model_impl
     if publish:
         os.environ[envs.RESOLVED_MODEL_IMPL_ENV] = model_impl
-    USE_DEVICE_TENSOR = model_impl == "vllm" and envs.VLLM_RBLN_USE_DEVICE_TENSOR
-    RblnPlatform.device_name = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    RblnPlatform.device_type = "rbln" if USE_DEVICE_TENSOR else "cpu"
-    RblnPlatform.dist_backend = "rbln-ccl" if USE_DEVICE_TENSOR else ""
+    on_device = model_impl == "vllm"
+    RblnPlatform.device_name = "rbln" if on_device else "cpu"
+    RblnPlatform.device_type = "rbln" if on_device else "cpu"
+    RblnPlatform.dist_backend = "rbln-ccl" if on_device else ""
 
 
 _apply_model_impl(envs.model_impl_from_env(), publish=False)  # type: ignore[arg-type]

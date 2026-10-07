@@ -14,8 +14,6 @@
 
 import torch
 
-from . import triton_flash_attention_naive  # noqa: F401
-
 
 def flash_attention_naive_prefill(
     q: torch.Tensor,

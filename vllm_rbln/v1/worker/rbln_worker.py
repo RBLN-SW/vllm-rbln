@@ -22,8 +22,7 @@ import numba
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from rebel import flags as rbln_flags
-from rebel import profiler as rbln_profiler
+from rebel import v2
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import (
     VllmConfig,
@@ -87,13 +86,18 @@ if TYPE_CHECKING:
 
 
 class RblnProfilerWrapper(WorkerProfiler):
-    """Write the RBLN profiler trace at stop_profile."""
+    """Record what runs on the NPUs, and write it as a Chrome trace at
+    stop_profile."""
+
+    def __init__(self, profiler_config, trace_path: str) -> None:
+        super().__init__(profiler_config)
+        self._trace_path = trace_path
 
     def _start(self) -> None:
-        rbln_profiler.start()
+        v2.runtime.begin_activities()
 
     def _stop(self) -> None:
-        rbln_profiler.done()
+        v2.runtime.write_trace(self._trace_path, *v2.runtime.end_activities())
 
 
 class RBLNWorker(WorkerBase):
@@ -643,7 +647,7 @@ class RBLNWorker(WorkerBase):
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
         if self.profiler_config is None or (
-            self.profiler_config.profiler is None and not rbln_flags.RBLN_PROFILER
+            self.profiler_config.profiler is None and not v2.flags.RBLN_PROFILER
         ):
             raise RuntimeError(
                 "Profiling is not enabled. Please set --profiler-config to enable "
@@ -682,8 +686,11 @@ class RBLNWorker(WorkerBase):
                     logger.debug(
                         "Starting torch profiler with tarce name: %s", trace_name
                     )
-                elif profiler_type is None and rbln_flags.RBLN_PROFILER:
-                    self.profiler = RblnProfilerWrapper(self.profiler_config)
+                elif profiler_type is None and v2.flags.RBLN_PROFILER:
+                    self.profiler = RblnProfilerWrapper(
+                        self.profiler_config,
+                        os.path.abspath(f"rbln_trace_{trace_name}.json"),
+                    )
                     logger.debug("Starting RBLN profiler on %s", rank_suffix)
                 else:
                     raise ValueError(
@@ -724,8 +731,6 @@ class RBLNWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
-        self._release_offload_temp_storage()
-
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
@@ -736,17 +741,6 @@ class RBLNWorker(WorkerBase):
         reset_fn = getattr(self.model_runner, "reset_encoder_cache", None)
         if callable(reset_fn):
             reset_fn()
-
-    def _release_offload_temp_storage(self) -> None:
-        # The runtime drops the offload dir on teardown, but that runs last and vLLM
-        # SIGKILLs a worker seconds after asking it to stop, so reclaim up front.
-        try:
-            num_removed = torch.rbln.release_offload_temp_storage()
-        except Exception:
-            logger.exception("Failed to release RBLN offload temp storage")
-            return
-        if num_removed:
-            logger.info("Released %d RBLN offload temp file(s)", num_removed)
 
     def _ensure_rbln_host_threads_before_compile(self) -> None:
         """Set OpenMP / torch / numba threads before ``warm_up_model()`` without

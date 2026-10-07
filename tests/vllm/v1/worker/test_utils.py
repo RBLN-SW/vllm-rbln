@@ -1626,18 +1626,8 @@ class TestDynamicKvUnsupportedReason:
             kv_connector=kv_connector, kv_connector_extra_config=extra
         )
 
-    @pytest.fixture(autouse=True)
-    def _device_tensor_on(self, monkeypatch):
-        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "1")
-
     def test_a_clean_config_is_supported(self):
         assert dynamic_kv_unsupported_reason(self._cfg()) is None
-
-    def test_device_tensor_off_is_unsupported(self, monkeypatch):
-        monkeypatch.setenv("VLLM_RBLN_USE_DEVICE_TENSOR", "0")
-        assert "VLLM_RBLN_USE_DEVICE_TENSOR" in dynamic_kv_unsupported_reason(
-            self._cfg()
-        )
 
     def test_the_triton_kernels_are_unsupported(self):
         reason = dynamic_kv_unsupported_reason(self._cfg(use_custom_kernel=True))

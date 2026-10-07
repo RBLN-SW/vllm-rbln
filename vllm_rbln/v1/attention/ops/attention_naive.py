@@ -14,8 +14,6 @@
 
 import torch
 
-from ..ops import triton_attention_naive  # noqa: F401
-
 
 def attention_naive_prefill(
     q: torch.Tensor,

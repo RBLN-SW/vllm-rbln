@@ -421,7 +421,7 @@ def collect_metrics(
     is_prefill: bool,
     start_time: float,
     end_time: float,
-    reports: list[dict],
+    reports: list[dict] | None,
     token_count: int,
 ) -> None:
     performance_tracker.record(

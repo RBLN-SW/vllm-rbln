@@ -125,6 +125,8 @@ class TestDeviceInventory:
     def test_visible_list_wins_over_the_nodes(self, monkeypatch, name):
         # The deprecated name counts too: this helper runs in the parent pytest
         # process, before the platform plugin folds one name into the other.
+        for other in ("RBLN_VISIBLE_DEVICES", "RBLN_DEVICES"):
+            monkeypatch.delenv(other, raising=False)
         monkeypatch.setenv(name, "3,4")
         assert rbln_device_count() == 2
 

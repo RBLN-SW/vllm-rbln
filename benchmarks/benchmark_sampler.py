@@ -13,11 +13,9 @@
 # limitations under the License.
 
 import argparse
-import contextlib
 import time
 
 import numpy as np
-import rebel
 import torch
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -211,19 +209,14 @@ def run_benchmark(
 
     for _ in range(benchmark_iters):
         logits.copy_(reference_logits)
-        if hasattr(rebel, "capture_reports"):
-            capture_ctx = rebel.capture_reports()
-        else:
-            capture_ctx = contextlib.nullcontext()
         start_time = time.perf_counter()
-        with capture_ctx as model_reports:
-            sampler(logits, sampling_metadata)
+        sampler(logits, sampling_metadata)
         collect_metrics(
             sampler_performance_tracker,
             is_prefill=False,
             start_time=start_time,
             end_time=time.perf_counter(),
-            reports=model_reports,
+            reports=None,
             token_count=0,
         )
     sampler_performance_tracker.print_final_stats()

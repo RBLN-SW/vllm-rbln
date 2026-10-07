@@ -384,9 +384,7 @@ class RBLNOptimumDecoderMixin(VllmModelForTextGeneration):
             zip(cached_block_tables, dst_blocks)
         ):
             try:
-                prefill_decoder.runtime._copy_kv_cache(
-                    src_block, dst_block, cached_lengths[block_idx]
-                )
+                prefill_decoder.runtime.copy_kv_cache(src_block, dst_block)
                 logger.debug(
                     "Successfully copied KV cache from block %d to block %d",
                     src_block,

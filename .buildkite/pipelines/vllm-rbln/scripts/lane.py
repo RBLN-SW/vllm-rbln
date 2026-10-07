@@ -43,9 +43,9 @@ def host_chip() -> str | None:
     if forced:
         return forced.strip().upper()
     try:
-        import rebel
+        from rebel import v2
 
-        return str(rebel.get_npu_name(0)).strip().upper()
+        return str(v2.npu_name(0)).strip().upper()
     except Exception:
         return None
 

@@ -101,7 +101,6 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import torch
 import zmq
-from rebel.kv_cache import aligned_tensor
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
@@ -903,8 +902,9 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
         engine_id, tinfo = self._tensor_registry[mm_hash]
         remote_agent_name = self._remote_agents[engine_id]
 
-        numel = tinfo.nbytes // _dtype_size(tinfo.dtype_str)
-        local_buf = aligned_tensor(numel).reshape(tinfo.shape)
+        local_buf = torch.empty(
+            tinfo.shape, dtype=_dtype_of(tinfo.dtype_str), pin_memory=True
+        )
         local_reg_data = [(local_buf.data_ptr(), tinfo.nbytes, 0, "")]
         local_xfer_data = [(local_buf.data_ptr(), tinfo.nbytes, 0)]
         remote_xfer_data = [(tinfo.base_addr, tinfo.nbytes, tinfo.device_id)]
@@ -961,7 +961,8 @@ class RblnECNixlConnectorWorker(ECConnectorBase):
             return
 
         t = encoder_cache[mm_hash].detach().cpu()
-        buf = aligned_tensor(t.numel()).reshape(t.shape)
+        # Pinned host memory is page aligned and locked, as the NIC registers it.
+        buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
         buf.copy_(t)
         nbytes = buf.numel() * buf.element_size()
         tensor_info = ECNixlTensorInfo(
@@ -1250,17 +1251,20 @@ class RblnECNixlConnector(ECConnectorBase):
 # Helpers
 # ---------------------------------------------------------------------------
 
-_DTYPE_SIZES = {
-    "torch.float16": 2,
-    "torch.bfloat16": 2,
-    "torch.float32": 4,
-    "torch.int64": 8,
-    "torch.int32": 4,
+_DTYPES = {
+    str(dtype): dtype
+    for dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int64,
+        torch.int32,
+    )
 }
 
 
-def _dtype_size(dtype_str: str) -> int:
-    size = _DTYPE_SIZES.get(dtype_str)
-    if size is None:
+def _dtype_of(dtype_str: str) -> torch.dtype:
+    dtype = _DTYPES.get(dtype_str)
+    if dtype is None:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
-    return size
+    return dtype

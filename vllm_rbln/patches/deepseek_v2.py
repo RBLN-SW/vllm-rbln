@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import rebel.v2.ops  # noqa: F401  -- defines torch.ops.rbln_custom_ops
 import torch
-from rebel.ops.torch_custom_ops import attn as _rbln_attn_ops  # noqa: F401
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import (
