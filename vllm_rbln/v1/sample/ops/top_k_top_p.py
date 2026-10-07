@@ -47,6 +47,16 @@ def build_op_top_k_top_p(
     In the mixed rows, `a / b` reads: `a` at greedy rows, `b` at random rows.
     `top_k` is never `None` there, because a greedy row is encoded as
     `top_k == 1`.
+
+    Until rbln::top_k_top_p is revised (FIXME above), these rows are patched:
+
+    batch      | filters (random rows)    | top_p
+    -----------+--------------------------+-------------------------------
+    all random | none (pure multinomial)  | tensor of TOP_P_CLAMP
+               | top-k only               | tensor of TOP_P_CLAMP
+    mixed      | none (pure multinomial)  | tensor of TOP_P_CLAMP
+               | top-k only               | tensor of TOP_P_CLAMP
+
     """
     # Reached only from the rejection sampler: spec decode has no separate
     # greedy op, while the normal sampler answers all_greedy with rbln::argmax.
