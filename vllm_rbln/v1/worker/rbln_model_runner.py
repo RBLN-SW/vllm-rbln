@@ -1353,11 +1353,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if self.use_async_scheduling and isinstance(self.sampler, RBLNSampler)
                 else {}
             )
+            probe = getattr(self.sampler, "topk_topp_sampler", None)  # PROBE
+            if probe is not None:  # PROBE
+                probe.probe_num_reqs = num_reqs  # PROBE
             out = self.sampler(
                 logits=logits,
                 sampling_metadata=_pad_sampling_metadata(sampling_metadata, bucket),
                 **staging,
             )
+            if probe is not None:  # PROBE
+                probe.probe_num_reqs = None  # PROBE
         else:
             if self.rbln_config.use_custom_sampler:
                 bucket = self.bucketing_manager.max_batch_size

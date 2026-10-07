@@ -76,9 +76,9 @@ def rbln_top_k_top_p_sample(
 
     # Apply top-k top-p sampling using RBLN custom op.
     # It requires softmax prior to calling the op.
-    probs = torch.nn.functional.softmax(logits, dim=-1)
+    probs = torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
     sampled = torch.ops.rbln.top_k_top_p(probs, k, p)
-    return sampled
+    return sampled, probs
 
 
 def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
@@ -157,7 +157,23 @@ class RBLNTopKTopPSampler(nn.Module):
                 "per-request generators. Ignoring generators."
             )
 
-        out = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
+        out, probs = self._compiled_rbln_topk_topp_sampler(logits, temperature, k, p)
+        
+        probs_cpu = probs.to(torch.float32).cpu()
+        num_reqs = getattr(self, "probe_num_reqs", None)  # PROBE
+        if num_reqs is not None:  # PROBE
+            probs_sum = probs_cpu[:num_reqs].sum(dim=-1)
+            print(f"PROBS_SUM tokens={out[:num_reqs].tolist()} sum={probs_sum.tolist()}", flush=True)
+            p0 = probs_cpu[:num_reqs, 0]  # PROBE
+            pmax = probs_cpu[:num_reqs].max(dim=-1).values  # PROBE
+            bad = (out[:num_reqs].cpu() == 0) & (probs_sum < 1) & (pmax > p0)  # PROBE
+            if bad.any():  # PROBE
+                raise RuntimeError(
+                    f"token 0 sampled with sum(probs) < 1 and a likelier token: "
+                    f"rows={bad.nonzero().flatten().tolist()} p0={p0[bad].tolist()} "
+                    f"pmax={pmax[bad].tolist()} sum={probs_sum[bad].tolist()}"
+                )
+
         if staging_owner is not None:
             out = _stage_into(staging_owner, out)
         return out, None
