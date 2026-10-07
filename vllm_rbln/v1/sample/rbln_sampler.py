@@ -28,7 +28,7 @@ import vllm_rbln.envs as envs
 from vllm_rbln.compilation import compile, create_compile_context
 from vllm_rbln.logger import init_logger
 from vllm_rbln.platform import USE_DEVICE_TENSOR
-from vllm_rbln.v1.sample.ops.top_k_top_p import build_op_top_k_top_p
+from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP, build_op_top_k_top_p
 
 logger = init_logger(__name__)
 
@@ -77,6 +77,9 @@ def rbln_top_k_top_p_sample(
     # Apply top-k top-p sampling using RBLN custom op.
     # It requires softmax prior to calling the op.
     probs = torch.nn.functional.softmax(logits, dim=-1)
+    # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+    if p is not None:
+        p = p.clamp(max=TOP_P_CLAMP)
     sampled = torch.ops.rbln.top_k_top_p(probs, k, p)
     return sampled
 
