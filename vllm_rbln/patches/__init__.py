@@ -44,6 +44,7 @@ from . import (
     modelopt_mixed_config,
     models_utils,
     multiproc_executor,
+    nan_logprobs,
     oot,
     profiler,
     qwen2_moe,
