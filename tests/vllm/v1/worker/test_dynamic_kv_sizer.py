@@ -16,7 +16,6 @@
 SimpleNamespace stand-ins that carry only the state each path reads."""
 
 import sys
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -243,11 +242,11 @@ class TestComputeDynamicKvNumBlocks:
                     kv_cache_groups=list(kv_cache_groups),
                 ),
                 _kernel_block_sizes=list(kernel_block_sizes),
+                release_kv_cache_tensors=lambda cfg: None,
             ),
             programs=list(programs),
             memory_snapshot=lambda device: (snapshot, "stub"),
             copy_stream_reserve_bytes=lambda: 0,
-            release_kv_cache_tensors=lambda cfg: None,
         )
         _bind_sizing(sizer)
         return sizer
@@ -268,7 +267,9 @@ class TestComputeDynamicKvNumBlocks:
         used = [5 * self.GIB, 30 * self.GIB, 1 * self.GIB, 0]
         order: list = []
         sizer = self._sizer(programs=programs, snapshot=self._snapshot(used))
-        sizer.release_kv_cache_tensors = lambda cfg: order.append("release")
+        sizer.model_runner.release_kv_cache_tensors = lambda cfg: order.append(
+            "release"
+        )
         snapshot = sizer.memory_snapshot
 
         def recording_snapshot(device):
@@ -587,44 +588,19 @@ class TestModeResolution:
         assert self._mode() == (dks.DynamicKvMode.ACTIVE, None)
 
 
-class TestWarmupCapturesPrograms:
-    """The programs warm-up builds are the only handle on the KV-holding
-    runtimes, so the capture has to wrap exactly the warm-up."""
+class TestRecordPrograms:
+    """Only the resize reads the captured programs, so a sizer that is off keeps
+    none."""
 
-    def test_off_means_no_capture(self):
-        sizer = SimpleNamespace(mode=dks.DynamicKvMode.DISABLED)
-        with DynamicKvSizer.capture_programs(sizer) as programs:
-            pass
-        assert programs is None
+    def test_off_keeps_none(self):
+        sizer = SimpleNamespace(mode=dks.DynamicKvMode.DISABLED, programs=[])
+        DynamicKvSizer.record_programs(sizer, ["p0"])
+        assert sizer.programs == []
 
-    def test_on_opens_torch_rbln_s_scope(self):
-        recorded = ["p0", "p1"]
-
-        @contextmanager
-        def fake_capture():
-            yield recorded
-
-        sizer = SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE)
-        with (
-            patch.object(
-                dks.torch,
-                "rbln",
-                SimpleNamespace(capture_programs=fake_capture),
-                create=True,
-            ),
-            DynamicKvSizer.capture_programs(sizer) as programs,
-        ):
-            pass
-        assert programs is recorded
-
-    def test_on_without_capture_programs_refuses(self):
-        with (
-            patch.object(dks.torch, "rbln", SimpleNamespace(), create=True),
-            pytest.raises(RuntimeError, match="capture_programs"),
-        ):
-            DynamicKvSizer.capture_programs(
-                SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE)
-            )
+    def test_on_keeps_them_in_build_order(self):
+        sizer = SimpleNamespace(mode=dks.DynamicKvMode.ACTIVE, programs=["p0"])
+        DynamicKvSizer.record_programs(sizer, ["p1", "p2"])
+        assert sizer.programs == ["p0", "p1", "p2"]
 
 
 class TestMaybeShrinkKvCacheForCompile:
@@ -858,10 +834,10 @@ class TestDynamicKvFailuresRaise:
             model_runner=SimpleNamespace(
                 kv_cache_config=SimpleNamespace(
                     num_blocks=211, kv_cache_tensors=_kv_cache_tensors(2)
-                )
+                ),
+                release_kv_cache_tensors=lambda cfg: None,
             ),
             programs=list(programs),
-            release_kv_cache_tensors=lambda cfg: None,
         )
         _bind_sizing(sizer)
         return sizer
@@ -1068,34 +1044,3 @@ class TestApplyResizesThenMaterializes:
         )
         DynamicKvSizer.materialize(sizer)
         assert ran == ["graphs"]
-
-
-class TestReleaseKvCacheTensors:
-    def test_it_clears_every_piece_of_the_rebound_state(self, monkeypatch):
-        # The rebind reassigns these together from one ordered name list, so a
-        # piece left behind describes a cache that no longer exists.
-        layer = SimpleNamespace(kv_cache=torch.zeros(1))
-        model_runner = SimpleNamespace(
-            kv_caches=[torch.zeros(1)],
-            kv_cache_bases=[torch.zeros(1)],
-            kv_cache_names=["l0"],
-            kv_cache_block_axes={"l0": 1},
-            compilation_config=SimpleNamespace(static_forward_context={"l0": layer}),
-        )
-        sizer = SimpleNamespace(
-            model_runner=model_runner,
-            allocator_state_per_chiplet=lambda: "stub",
-        )
-        old_cfg = SimpleNamespace(
-            num_blocks=4,
-            kv_cache_tensors=[SimpleNamespace(layers=["l0"], size=8)],
-        )
-        monkeypatch.setattr(dks, "empty_rbln_device_caches", lambda: False)
-
-        DynamicKvSizer.release_kv_cache_tensors(sizer, old_cfg)
-
-        assert model_runner.kv_caches == []
-        assert model_runner.kv_cache_bases == []
-        assert model_runner.kv_cache_names == []
-        assert model_runner.kv_cache_block_axes == {}
-        assert layer.kv_cache is None

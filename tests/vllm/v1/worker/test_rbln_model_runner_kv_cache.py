@@ -37,7 +37,7 @@ def _one_group_two_layers(make_model_runner):
     return runner
 
 
-class TestReshapeKVCacheTensors:
+class TestAllocateKVCacheTensors:
     # Technique from upstream's test_kv_cache_stride_order: drive the real
     # backend rather than a fake, so the assertions hold for the backend in use.
     def test_backend_stride_order_permutes_base_but_not_the_view(
@@ -45,11 +45,10 @@ class TestReshapeKVCacheTensors:
     ):
         runner = make_model_runner()
         config = runner.kv_cache_config
-        raw = runner._allocate_kv_cache_tensors(config)
         kernel_block_sizes = runner._kernel_block_sizes
 
-        caches, _, infos, _ = runner._reshape_kv_cache_tensors(
-            config, raw, kernel_block_sizes
+        caches, _, infos, _ = runner._allocate_kv_cache_tensors(
+            config, kernel_block_sizes
         )
         semantic_shape = tuple(caches["layer.0"].shape)
         identity = tuple(range(len(semantic_shape)))
@@ -66,8 +65,8 @@ class TestReshapeKVCacheTensors:
             staticmethod(lambda *args, **kwargs: order),
             raising=False,
         )
-        caches, bases, infos, _ = runner._reshape_kv_cache_tensors(
-            config, raw, kernel_block_sizes
+        caches, bases, infos, _ = runner._allocate_kv_cache_tensors(
+            config, kernel_block_sizes
         )
 
         permuted_shape = tuple(semantic_shape[i] for i in order)
@@ -130,8 +129,10 @@ class TestHostBufferCopyOp:
 class TestRegisterKvCachesWithConnector:
     """The connector is handed whatever the runner holds when it is called.
 
-    The worker calls it after `initialize_kv_cache` on a run that keeps that
-    cache, and again after a dynamic-KV resize has rebuilt every tensor.
+    The worker calls it once the caches that serve exist: after
+    `initialize_kv_cache` on a run that compiles nothing, after warm-up has made
+    them anew in the types of the compiled programs' args, or after a dynamic-KV
+    resize has rebuilt every tensor.
     """
 
     @staticmethod
@@ -216,6 +217,97 @@ class TestRegisterKvCachesWithConnector:
             for before, after in zip(first.values(), second.values(), strict=True)
         )
         assert [id(t) for t in second.values()] == [id(t) for t in runner.kv_caches]
+
+
+class TestTypeKvCaches:
+    """Warm-up compiles the graphs against the caches allocated first, then
+    makes each cache a program takes anew in the type of that arg, which every
+    program binds in place."""
+
+    @staticmethod
+    def _zeros_typed(monkeypatch) -> list:
+        made: list = []
+
+        def zeros_typed(arg, *, device, shape):
+            made.append((arg.name, tuple(shape)))
+            return torch.zeros(shape, dtype=arg.dtype, device=device)
+
+        monkeypatch.setattr(torch.rbln, "zeros_typed", zeros_typed)
+        return made
+
+    @staticmethod
+    def _program(*caches: torch.Tensor, type_id: str = "kv") -> SimpleNamespace:
+        return SimpleNamespace(
+            input_specs=[
+                SimpleNamespace(
+                    data_ptr=cache.untyped_storage().data_ptr(),
+                    arg=SimpleNamespace(
+                        name=f"kv_cache_{i}", type_id=type_id, dtype=cache.dtype
+                    ),
+                )
+                for i, cache in enumerate(caches)
+            ]
+        )
+
+    def test_a_cache_a_program_takes_is_made_in_its_arg_s_type(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        made = self._zeros_typed(monkeypatch)
+        before = runner.kv_caches[0]
+        program = self._program(before)
+        shape = tuple(before.shape)
+        del before
+
+        runner.type_kv_caches([program])
+
+        assert made == [("kv_cache_0", shape)]
+        assert runner.kv_cache_args == {"layer.0": program.input_specs[0].arg}
+        forward_context = runner.compilation_config.static_forward_context
+        assert forward_context["layer.0"].kv_cache is runner.kv_caches[0]
+
+    def test_a_reallocation_keeps_the_type(self, make_model_runner, monkeypatch):
+        runner = make_model_runner()
+        made = self._zeros_typed(monkeypatch)
+        runner.type_kv_caches([self._program(runner.kv_caches[0])])
+
+        runner.release_kv_cache_tensors(runner.kv_cache_config)
+        runner.initialize_kv_cache_tensors(
+            runner.kv_cache_config, runner._kernel_block_sizes
+        )
+
+        assert [name for name, _ in made] == ["kv_cache_0", "kv_cache_0"]
+
+    def test_a_cache_no_program_takes_stays_as_torch_holds_it(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        )
+        made = self._zeros_typed(monkeypatch)
+        forward_context = runner.compilation_config.static_forward_context
+
+        runner.type_kv_caches([self._program(forward_context["layer.0"].kv_cache)])
+
+        assert set(runner.kv_cache_args) == {"layer.0"}
+        assert len(made) == 1
+
+    def test_programs_taking_one_cache_in_two_types_refuse(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        self._zeros_typed(monkeypatch)
+        cache = runner.kv_caches[0]
+        programs = [self._program(cache), self._program(cache, type_id="other")]
+        del cache
+
+        with pytest.raises(RuntimeError, match="in two types"):
+            runner.type_kv_caches(programs)
 
 
 class TestBuildAttentionMetadata:

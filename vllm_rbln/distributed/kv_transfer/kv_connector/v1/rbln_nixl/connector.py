@@ -110,8 +110,8 @@ class RblnNixlConnectorBase(NixlBaseConnector, SupportsKVCacheRegistrationFinali
         self.connector_worker = None
 
     def finalize_kv_cache_registration(self) -> None:
-        """Run the worker's deferred NIXL registration after warm-up
-        materializes the KV cache backing memory. No-op on host-bounce."""
+        """Run the worker's deferred NIXL registration once the KV caches
+        that serve exist. No-op on host-bounce."""
         if self.connector_worker is not None:
             self.connector_worker.finalize_kv_cache_registration()
 

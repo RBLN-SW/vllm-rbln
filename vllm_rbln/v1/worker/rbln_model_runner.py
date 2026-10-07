@@ -14,6 +14,7 @@
 
 import collections
 import dataclasses
+import gc
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from copy import copy, deepcopy
@@ -157,9 +158,12 @@ from vllm_rbln.v1.worker.dp_utils import (
 )
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedModelInputs
 from vllm_rbln.v1.worker.utils import (
+    allocator_state_per_chiplet,
     copy_host_device_kv_blocks,
     dynamic_kv_enabled,
+    empty_rbln_device_caches,
     get_kv_cache_names,
+    kv_cache_args,
     kv_cache_extents,
     prepare_kernel_block_sizes,
     reorder_input_batch,
@@ -308,6 +312,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # KV cache layer names in layer-index order; the deterministic
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
+        # Layer name -> the arg of a compiled program its cache is allocated in
+        # the type of; set in type_kv_caches.
+        self.kv_cache_args: dict[str, Any] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -2815,53 +2822,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
         )
 
-    def _allocate_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig
-    ) -> dict[str, torch.Tensor]:
-        """
-        Initializes the KV cache buffer with the correct size. The buffer needs
-        to be reshaped to the desired shape before being used by the models.
-
-        Args:
-            kv_cache_config: The KV cache config
-        Returns:
-            dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
-        """
-        # One buffer per extent, so the layers that alias one cache get one
-        # tensor and the rest get their own. Not one pool the layers slice: a
-        # graph input is a whole tensor, and dynamo refuses a slice's offset.
-        device = self.device
-        extent_of = kv_cache_extents(kv_cache_config)
-        buffers = {
-            extent: torch.zeros(extent[1], dtype=torch.int8, device=device)
-            for extent in set(extent_of.values())
-        }
-        kv_cache_raw_tensors = {
-            layer_name: buffers[extent] for layer_name, extent in extent_of.items()
-        }
-
-        layer_names = set()
-        for group in kv_cache_config.kv_cache_groups:
-            for layer_name in group.layer_names:
-                if layer_name in self.runner_only_attn_layers:
-                    continue
-                layer_names.add(layer_name)
-        assert layer_names == set(kv_cache_raw_tensors.keys()), (
-            "Some layers are not correctly initialized"
-        )
-        return kv_cache_raw_tensors
-
     def _kv_cache_spec_attn_group_iterator(self) -> Iterator[AttentionGroup]:
         if not self.kv_cache_config.kv_cache_groups:
             return
         for attn_groups in self.attn_groups:
             yield from attn_groups
 
-    def _reshape_kv_cache_tensors(
+    def _allocate_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
         kernel_block_sizes: list[int],
     ) -> tuple[
         dict[str, torch.Tensor],
@@ -2870,12 +2839,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         dict[str, int],
     ]:
         """
-        Reshape the KV cache tensors to the desired shape and dtype.
+        Allocate the KV cache of every layer, in the shape and dtype its
+        attention backend lays it out in.
 
         Args:
             kv_cache_config: The KV cache config
-            kv_cache_raw_tensors: The KV cache buffer of each layer, with
-                correct size but uninitialized shape.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         Returns:
             Tuple of (kv_caches, kv_cache_base_tensors, kv_cache_view_infos,
@@ -2885,6 +2853,26 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             - kv_cache_view_infos: layer name -> view transformation metadata
             - kv_cache_block_axes: layer name -> axis of the view a block indexes
         """
+        # One allocation per extent, so the layers that alias one cache get one
+        # tensor and the rest get their own. Not one pool the layers slice: a
+        # graph input is a whole tensor, and dynamo refuses a slice's offset.
+        extent_of = kv_cache_extents(kv_cache_config)
+        layer_names = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+            if layer_name not in self.runner_only_attn_layers
+        }
+        assert layer_names == set(extent_of), (
+            "Some layers are not correctly initialized"
+        )
+        arg_at = {
+            extent_of[name]: arg
+            for name, arg in self.kv_cache_args.items()
+            if name in extent_of
+        }
+        buffers: dict[tuple[int, int], torch.Tensor] = {}
+
         kv_caches: dict[str, torch.Tensor] = {}
         kv_cache_base_tensors: dict[str, torch.Tensor] = {}
         kv_cache_view_infos: dict[str, KVCacheViewInfo] = {}
@@ -2900,9 +2888,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
-                raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                extent = extent_of[layer_name]
+                assert extent[1] % kv_cache_spec.page_size_bytes == 0
+                num_blocks = extent[1] // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
@@ -2953,10 +2941,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         view_dynamic_axis = None
                     # Keep the deduped base in a backend-native multidimensional
                     # shape so export/Relay never sees a giant flat dimension.
-                    typed_base = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
+                    typed_base = self._kv_cache_base(
+                        buffers, extent, arg_at.get(extent), dtype, kv_cache_shape
                     )
                     kv_caches[layer_name] = typed_base.permute(*inv_order)
                     if view_dynamic_axis is not None:
@@ -2993,6 +2979,33 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_cache_block_axes,
         )
 
+    def _kv_cache_base(
+        self,
+        buffers: dict[tuple[int, int], torch.Tensor],
+        extent: tuple[int, int],
+        arg: Any,
+        dtype: torch.dtype,
+        shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        """One layer's cache over `extent`, allocating the extent on its first
+        layer: in the type of `arg` when a compiled program takes it, which
+        every layer on it then shares, or as bytes each layer views its own
+        way."""
+        buffer = buffers.get(extent)
+        if buffer is None:
+            if arg is None:
+                buffer = torch.zeros(extent[1], dtype=torch.int8, device=self.device)
+            else:
+                buffer = torch.rbln.zeros_typed(arg, device=self.device, shape=shape)
+            buffers[extent] = buffer
+        if arg is not None and (buffer.dtype, tuple(buffer.shape)) != (dtype, shape):
+            raise RuntimeError(
+                f"the layers on one KV cache lay it out as {tuple(buffer.shape)} "
+                f"{buffer.dtype} and as {shape} {dtype}, but a program holds the "
+                f"cache in the type of its arg {arg.name}, which takes one layout"
+            )
+        return buffer.view(dtype).view(shape)
+
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
@@ -3009,16 +3022,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """
         # TODO(RBLN): add uniform kv cache case for kv connector
 
-        # General case
-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
-
-        # Change the memory buffer to the desired shape
         kv_caches, kv_cache_bases_by_layer, kv_cache_view_infos, block_axes = (
-            self._reshape_kv_cache_tensors(
-                kv_cache_config,
-                kv_cache_raw_tensors,
-                kernel_block_sizes,
-            )
+            self._allocate_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
         )
 
         # Set up cross-layer KV cache sharing
@@ -3071,6 +3076,77 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             forward_context[layer_name].kv_cache = kv_cache
 
         return kv_caches
+
+    def type_kv_caches(self, programs: Sequence[Any]) -> None:
+        """Make the KV caches anew in the types of the args the compiled
+        `programs` take them as, which every program binds in place (see
+        `torch.rbln.empty_typed`); a later reallocation keeps those types.
+
+        The caches the programs were compiled against are freed first, contents
+        and all. A cache no program takes stays as torch holds it.
+        """
+        cfg = self.kv_cache_config
+        forward_context = self.compilation_config.static_forward_context
+        self.kv_cache_args = kv_cache_args(
+            programs,
+            {name: forward_context[name].kv_cache for name in kv_cache_extents(cfg)},
+        )
+        logger.info(
+            "Making %d KV cache layer(s) anew in the types the compiled programs "
+            "take them in.",
+            len(self.kv_cache_args),
+        )
+        self.release_kv_cache_tensors(cfg)
+        self.initialize_kv_cache_tensors(cfg, self._kernel_block_sizes)
+
+    def release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
+        """Drop every reference to the outgoing KV cache and free its device DRAM
+        before the replacement is allocated, or the peak is base + old + new."""
+        kv_device_types = {kv_cache.device.type for kv_cache in self.kv_caches}
+        was_device_resident = bool(kv_device_types - {"meta", "cpu"})
+
+        # The rebind reassigns every one of these from one ordered name list.
+        self.kv_caches = []
+        self.kv_cache_bases = []
+        self.kv_cache_names = []
+        self.kv_cache_block_axes = {}
+
+        # Each layer's view is parked on its Attention module; the next bind
+        # overwrites it only after the new tensors exist.
+        forward_context = self.compilation_config.static_forward_context
+        unbound = 0
+        for layer_name in dict.fromkeys(
+            name for t in old_cfg.kv_cache_tensors for name in t.layers
+        ):
+            layer = forward_context.get(layer_name)
+            if layer is None:
+                logger.warning(
+                    "layer %s has a KV cache tensor but no entry in the static "
+                    "forward context; its binding cannot be dropped before the "
+                    "reallocation.",
+                    layer_name,
+                )
+                continue
+            layer.kv_cache = None
+            unbound += 1
+
+        # A reference cycle would defer the free past the new allocation.
+        gc.collect()
+
+        released = empty_rbln_device_caches()
+        logical_bytes = max((t.size for t in old_cfg.kv_cache_tensors), default=0)
+        logger.info(
+            "released the outgoing %d-block KV cache: "
+            "outgoing_kv_logical_bytes=%d unbound_layers=%d kv_device_types=%s "
+            "allocator_cache_emptied=%s device_resident=%s allocator_after=%s",
+            old_cfg.num_blocks,
+            logical_bytes,
+            unbound,
+            sorted(kv_device_types),
+            released,
+            was_device_resident,
+            allocator_state_per_chiplet(self.device),
+        )
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig

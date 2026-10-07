@@ -15,11 +15,8 @@
 the state machine; `kv_placement` holds the arithmetic."""
 
 import copy
-import gc
 import os
-import re
 from collections.abc import Mapping
-from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -151,36 +148,6 @@ def max_num_blocks_for_int16_block_ids(
     return tightest
 
 
-def empty_rbln_device_caches() -> bool:
-    """Return every *free* block the rbln caching allocator holds to the driver."""
-    # The allocator otherwise releases cached blocks only after a failed
-    # allocation, so freed bytes keep counting in `dram_used`. Never raises.
-    try:
-        # NOTE(RBLN): is_available() raises on a malformed RBLN_* config.
-        if not torch.rbln.is_available():
-            return False
-        device_count = torch.rbln.device_count()
-    except Exception as exc:
-        logger.warning(
-            "could not query the rbln devices to empty their allocator caches: "
-            "%s. Freed KV bytes stay reserved and keep counting per chiplet.",
-            exc,
-        )
-        return False
-
-    for index in range(device_count):
-        try:
-            torch.rbln.empty_cache(index)
-        except Exception as exc:
-            logger.warning(
-                "torch.rbln.empty_cache(%d) failed: %s. Freed KV blocks stay "
-                "reserved and keep counting per chiplet.",
-                index,
-                exc,
-            )
-    return device_count > 0
-
-
 class DynamicKvSizer:
     """The worker's dynamic-KV state machine: shrink -> capture -> snapshot ->
     size -> release -> reallocate -> materialize -> check."""
@@ -226,13 +193,15 @@ class DynamicKvSizer:
     def defers_kv_registration(self) -> bool:
         """Whether a KV connector has to wait for `apply_num_blocks`.
 
-        ACTIVE is the one mode that replaces the KV cache tensors after
-        warm-up. A connector registering before that would pin addresses the
-        reallocation frees, at a block count the resize then changes.
+        ACTIVE is the one mode that replaces the KV cache tensors once more
+        after warm-up. A connector registering before that would pin addresses
+        the reallocation frees, at a block count the resize then changes.
         """
         return self.mode is DynamicKvMode.ACTIVE
 
     def record_programs(self, programs: list[Any]) -> None:
+        if self.mode is DynamicKvMode.DISABLED:
+            return
         self.programs.extend(programs)
         logger.info(
             "[Dynamic KV] captured %d compiled program(s) during warm-up.",
@@ -352,18 +321,6 @@ class DynamicKvSizer:
             kv_cache_config.num_blocks,
         )
         return shrunk
-
-    def capture_programs(self):
-        """Scope that records the programs warm-up builds, when the flag is on."""
-        if self.mode is DynamicKvMode.DISABLED:
-            return nullcontext(None)
-        capture = getattr(torch.rbln, "capture_programs", None)
-        if capture is None:
-            raise RuntimeError(
-                "The dynamic KV cache needs torch_rbln's capture_programs(); "
-                "this torch_rbln does not carry it."
-            )
-        return capture()
 
     def memory_snapshot(
         self, device: torch.device
@@ -606,7 +563,7 @@ class DynamicKvSizer:
         actually handed back; no KV cache is bound until `apply_num_blocks`."""
         growth, hint_blocks, device = self._kv_growth_from_programs()
         before, _ = self.memory_snapshot(device)
-        self.release_kv_cache_tensors(self.model_runner.kv_cache_config)
+        self.model_runner.release_kv_cache_tensors(self.model_runner.kv_cache_config)
         num_blocks, fits, after, _ = self._size_kv_from_snapshot(
             growth, device, kv_resident={}
         )
@@ -725,80 +682,6 @@ class DynamicKvSizer:
         with set_compile_stage("warmup"):
             self.model_runner.run_model_graphs()
 
-    def release_kv_cache_tensors(self, old_cfg: KVCacheConfig) -> None:
-        """Drop every reference to the outgoing KV cache and free its device DRAM
-        before the replacement is allocated, or the peak is base + old + new."""
-        mr = self.model_runner
-
-        kv_device_types = {kv_cache.device.type for kv_cache in mr.kv_caches}
-        was_device_resident = bool(kv_device_types - {"meta", "cpu"})
-
-        # The rebind reassigns every one of these from one ordered name list.
-        mr.kv_caches = []
-        mr.kv_cache_bases = []
-        mr.kv_cache_names = []
-        mr.kv_cache_block_axes = {}
-
-        # Each layer's view is parked on its Attention module; the next bind
-        # overwrites it only after the new tensors exist.
-        forward_context = mr.compilation_config.static_forward_context
-        unbound = 0
-        for layer_name in dict.fromkeys(
-            name for t in old_cfg.kv_cache_tensors for name in t.layers
-        ):
-            layer = forward_context.get(layer_name)
-            if layer is None:
-                logger.warning(
-                    "[Dynamic KV] layer %s has a KV cache tensor but no entry in "
-                    "the static forward context; its binding cannot be dropped "
-                    "before the reallocation.",
-                    layer_name,
-                )
-                continue
-            layer.kv_cache = None
-            unbound += 1
-
-        # A reference cycle would defer the free past the new allocation.
-        gc.collect()
-
-        released = empty_rbln_device_caches()
-        logical_bytes = max((t.size for t in old_cfg.kv_cache_tensors), default=0)
-        logger.info(
-            "[Dynamic KV] released the outgoing %d-block KV cache: "
-            "outgoing_kv_logical_bytes=%d unbound_layers=%d kv_device_types=%s "
-            "allocator_cache_emptied=%s device_resident=%s allocator_after=%s",
-            old_cfg.num_blocks,
-            logical_bytes,
-            unbound,
-            sorted(kv_device_types),
-            released,
-            was_device_resident,
-            self.allocator_state_per_chiplet(),
-        )
-
-    def allocator_state_per_chiplet(self) -> str:
-        """`allocated/reserved` per chiplet from this process's allocator, or
-        why it could not be read."""
-        stats_fn = getattr(torch.rbln, "memory_stats_per_chiplet", None)
-        if stats_fn is None or torch.rbln.is_dummy_device():
-            return "unavailable"
-        try:
-            stats = stats_fn(self.device)
-        except RuntimeError as exc:
-            return f"unavailable ({exc})"
-        per_unit: dict[str, list[str]] = {}
-        for key, value in sorted(stats.items()):
-            match = re.match(
-                r"^npu\.(\d+)\.chiplet\.(\d+)\.(allocated|reserved)\.current$", key
-            )
-            if match:
-                per_unit.setdefault(f"{match.group(1)}:{match.group(2)}", []).append(
-                    f"{match.group(3)}={value}"
-                )
-        return " ".join(f"{u}({' '.join(v)})" for u, v in per_unit.items()) or repr(
-            stats
-        )
-
     def reallocate(self, new_num_blocks: int) -> None:
         """Rebuild only the KV cache tensors at `new_num_blocks`; the dim is
         `mark_dynamic`'d, so nothing recompiles."""
@@ -821,5 +704,5 @@ class DynamicKvSizer:
         # Release before allocating (see `release_kv_cache_tensors`); the
         # sizing has usually done it already.
         if mr.kv_caches:
-            self.release_kv_cache_tensors(old_cfg)
+            mr.release_kv_cache_tensors(old_cfg)
         mr.initialize_kv_cache_tensors(new_cfg, mr._kernel_block_sizes)

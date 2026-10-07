@@ -331,9 +331,6 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 if isinstance(layer_spec, MambaSpec)
                 else self.num_blocks
             )
-            # Materialize the backing memory of kv_cache.
-            cache_or_caches.zero_()
-
             # Collect this entry's logical K/V regions.
             entry_base_addr = cache_or_caches.data_ptr()
             for cache in cache_list:
@@ -697,8 +694,8 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Wire KV caches into NIXL.
 
-        D2D defers: its backing memory is not materialized until warm-up, so
-        the real registration runs from `finalize_kv_cache_registration`.
+        D2D defers to `finalize_kv_cache_registration`, which the worker runs
+        once warm-up or a dynamic-KV resize has left the caches that serve.
         Host-bounce buffers are plain DRAM and register now; where nixl-rbln
         is installed the RBLN backend only has to exist first, so that
         upstream's `register_memory(..., backends=["RBLN"])` resolves.

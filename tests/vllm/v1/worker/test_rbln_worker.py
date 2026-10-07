@@ -31,6 +31,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from torch._dynamo.exc import BackendCompilerFailed
+from torch_rbln import programs
 from vllm.config import ProfilerConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.tracing import otel
@@ -918,7 +919,8 @@ class TestCompileOrWarmUpModel:
         calls = []
 
         def warmup():
-            calls.append("warmup")
+            # The first pass compiles the graphs and runs none of them.
+            calls.append("compile" if programs.is_compiling_only() else "warmup")
             if warmup_side_effect is not None:
                 raise warmup_side_effect
 
@@ -929,10 +931,54 @@ class TestCompileOrWarmUpModel:
 
         worker.model_runner = SimpleNamespace(
             warmup_model=warmup,
+            type_kv_caches=lambda captured: calls.append("type"),
+            register_kv_caches_with_connector=lambda: calls.append("register"),
             kv_cache_config=SimpleNamespace(num_blocks=10),
         )
         _attach_sizer(worker)
         return worker, calls
+
+    def test_the_caches_are_made_anew_between_the_compile_and_the_run(
+        self, make_worker, monkeypatch
+    ):
+        # The graphs compile against the caches allocated at startup; those are
+        # replaced by caches in the types the graphs take them in, which the
+        # graphs then bind in place from their first run.
+        worker, calls = self._worker(make_worker, monkeypatch)
+        compile_pass = worker.model_runner.warmup_model
+        typed: list = []
+
+        def warmup():
+            if programs.is_compiling_only():
+                programs.submit_program("program")
+            compile_pass()
+
+        worker.model_runner.warmup_model = warmup
+        worker.model_runner.type_kv_caches = lambda captured: (
+            typed.append(list(captured)),
+            calls.append("type"),
+        )
+
+        worker.compile_or_warm_up_model()
+
+        assert calls == ["compile", "type", "warmup"]
+        assert typed == [["program"]]
+
+    def test_the_caches_are_made_anew_with_the_vllm_config_set(
+        self, make_worker, monkeypatch
+    ):
+        # The allocation asks the attention backend for the KV shape, which
+        # reads the RBLN config through `get_current_vllm_config()`; warm-up
+        # runs after the executor's scope has closed.
+        worker, _ = self._worker(make_worker, monkeypatch)
+        seen: list = []
+        worker.model_runner.type_kv_caches = lambda captured: seen.append(
+            get_current_vllm_config()
+        )
+
+        worker.compile_or_warm_up_model()
+
+        assert seen == [worker.vllm_config]
 
     def test_deferred_kv_registration_runs_with_the_vllm_config_set(
         self, make_worker, monkeypatch
@@ -947,23 +993,29 @@ class TestCompileOrWarmUpModel:
         # start-up order so this case reads the warm-up site.
         monkeypatch.setattr(dks.DynamicKvSizer, "defers_kv_registration", False)
         seen: list = []
+        worker.model_runner.register_kv_caches_with_connector = lambda: seen.append(
+            ("register", get_current_vllm_config())
+        )
         monkeypatch.setattr(
             wm,
             "finalize_kv_cache_registrations",
-            lambda g: seen.append(get_current_vllm_config()),
+            lambda g: seen.append(("finalize", get_current_vllm_config())),
         )
 
         worker.compile_or_warm_up_model()
 
         # Identity, not just "something was set": an outer scope holding a
         # different config would satisfy a bare call.
-        assert seen == [worker.vllm_config]
+        assert seen == [
+            ("register", worker.vllm_config),
+            ("finalize", worker.vllm_config),
+        ]
 
-    def test_a_pending_resize_holds_the_finalize(self, make_worker, monkeypatch):
+    def test_a_pending_resize_holds_the_registration(self, make_worker, monkeypatch):
         # The dynamic-KV resize frees this cache and allocates again right
         # after warm-up returns; `apply_dynamic_kv_num_blocks` registers what
         # it allocated instead.
-        worker, _ = self._worker(make_worker, monkeypatch)
+        worker, calls = self._worker(make_worker, monkeypatch)
         monkeypatch.setattr(wm, "has_kv_transfer_group", lambda: True)
         monkeypatch.setattr(wm, "get_kv_transfer_group", lambda: "group")
         monkeypatch.setattr(dks.DynamicKvSizer, "defers_kv_registration", True)
@@ -973,6 +1025,7 @@ class TestCompileOrWarmUpModel:
         worker.compile_or_warm_up_model()
 
         assert seen == []
+        assert "register" not in calls
 
     def test_skips_when_enforce_eager(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch, enforce_eager=True)
@@ -987,7 +1040,7 @@ class TestCompileOrWarmUpModel:
     def test_warmup_called_on_normal_path(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch)
         result = worker.compile_or_warm_up_model()
-        assert calls == ["warmup"]
+        assert calls == ["compile", "type", "warmup"]
         assert isinstance(result, CompilationTimes)
 
     def test_dp_ranks_rendezvous_after_warmup(self, make_worker, monkeypatch):
@@ -996,12 +1049,12 @@ class TestCompileOrWarmUpModel:
         # first request's prefill latency.
         worker, calls = self._worker(make_worker, monkeypatch, data_parallel_size=4)
         worker.compile_or_warm_up_model()
-        assert calls == ["warmup", "barrier:dp"]
+        assert calls == ["compile", "type", "warmup", "barrier:dp"]
 
     def test_no_rendezvous_without_dp_peers(self, make_worker, monkeypatch):
         worker, calls = self._worker(make_worker, monkeypatch, data_parallel_size=1)
         worker.compile_or_warm_up_model()
-        assert calls == ["warmup"]
+        assert calls == ["compile", "type", "warmup"]
 
     def test_no_rendezvous_when_warmup_skipped(self, make_worker, monkeypatch):
         # Nothing compiled, so there is no skew to absorb -- and every skip
@@ -1264,9 +1317,11 @@ class TestDynamicKvBlockCountRpcs:
 class TestKvRegistrationOrder:
     """When the KV caches reach the connector.
 
-    A connector holds the addresses it was handed. The dynamic-KV resize frees
-    them after warm-up and allocates again, so that mode registers once the
-    resize is done; every other mode keeps the startup order.
+    A connector holds the addresses it was handed. Warm-up makes the caches
+    anew in the types the compiled graphs take them in, and the dynamic-KV
+    resize frees those and allocates again, so a run that compiles registers
+    after warm-up or once the resize is done. A run that compiles nothing keeps
+    its startup caches and registers them at startup.
     """
 
     @staticmethod
@@ -1305,7 +1360,20 @@ class TestKvRegistrationOrder:
         # connector must not see it -- and the resize must come first.
         assert calls == ["initialize_kv_cache", "resize", "register"]
 
-    def test_a_cache_nothing_replaces_registers_at_startup(self, _connector):
+    def test_a_compiled_run_registers_nothing_at_startup(self, _connector):
+        calls: list[str] = []
+        worker = self._worker(calls, defers=False)
+
+        RBLNWorker.initialize_from_config(worker, SimpleNamespace(num_blocks=123))
+
+        assert calls == ["initialize_kv_cache"]
+
+    def test_a_cache_nothing_replaces_registers_at_startup(
+        self, _connector, monkeypatch
+    ):
+        monkeypatch.setattr(
+            wm, "compile_and_warmup_skip_reason", lambda _: "enforce_eager is set"
+        )
         calls: list[str] = []
         worker = self._worker(calls, defers=False)
 

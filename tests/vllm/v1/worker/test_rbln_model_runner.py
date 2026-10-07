@@ -1320,9 +1320,7 @@ class TestUsesFixedDecodeWindow:
         assert runner.uses_fixed_decode_window is False
 
 
-class TestAllocateKvCacheTensors:
-    # The buffers go on self.device; the mapping/validation logic is exercised
-    # on CPU.
+class TestKvCacheExtents:
     LAYER_STRIDE = 32
 
     @classmethod
@@ -1347,40 +1345,120 @@ class TestAllocateKvCacheTensors:
                     offset=0,
                 ),
             ],
-            kv_cache_groups=[
-                SimpleNamespace(layer_names=["l0", "l1"]),
-                SimpleNamespace(layer_names=["l2"]),
-            ],
         )
-
-    def _runner(self):
-        return _make_runner_stub(
-            device=torch.device("cpu"), runner_only_attn_layers=set()
-        )
-
-    def test_buffers_are_on_the_runner_s_device(self):
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert set(raw) == {"l0", "l1", "l2"}
-        assert raw["l0"].device.type == "cpu"  # self.device is cpu here
 
     def test_each_layer_gets_one_layers_worth(self):
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert all(t.numel() == self.LAYER_STRIDE for t in raw.values())
+        extents = worker_utils.kv_cache_extents(self._cfg())
+        assert set(extents) == {"l0", "l1", "l2"}
+        assert all(length == self.LAYER_STRIDE for _, length in extents.values())
 
-    def test_groups_share_the_buffer_at_a_layer_position(self):
+    def test_groups_share_the_extent_at_a_layer_position(self):
         # A block costs the widest group, not the sum of them. l0 and l2 are
         # the first layer of their group, so they overlay.
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert raw["l0"].data_ptr() == raw["l2"].data_ptr()
+        extents = worker_utils.kv_cache_extents(self._cfg())
+        assert extents["l0"] == extents["l2"]
 
     def test_layer_positions_do_not_share(self):
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert raw["l0"].data_ptr() != raw["l1"].data_ptr()
+        extents = worker_utils.kv_cache_extents(self._cfg())
+        assert extents["l0"] != extents["l1"]
+
+
+class TestKvCacheBase:
+    # One allocation per extent, which every layer on it views. The buffers go
+    # on self.device; the logic is exercised on CPU.
+    EXTENT = (0, 32)
+    OTHER = (32, 32)
+
+    @staticmethod
+    def _runner():
+        return _make_runner_stub(device=torch.device("cpu"))
+
+    @staticmethod
+    def _typed(monkeypatch, made):
+        def zeros_typed(arg, *, device, shape):
+            made.append((arg.name, shape))
+            return torch.zeros(shape, dtype=torch.float16, device=device)
+
+        monkeypatch.setattr(
+            mr.torch, "rbln", SimpleNamespace(zeros_typed=zeros_typed), raising=False
+        )
+
+    def test_an_extent_is_allocated_on_the_runner_s_device(self):
+        base = self._runner()._kv_cache_base({}, self.EXTENT, None, torch.int8, (32,))
+        assert base.device.type == "cpu"
+        assert base.numel() == 32
+
+    def test_layers_on_one_extent_view_one_allocation(self):
+        runner, buffers = self._runner(), {}
+        first = runner._kv_cache_base(buffers, self.EXTENT, None, torch.float16, (4, 4))
+        second = runner._kv_cache_base(buffers, self.EXTENT, None, torch.int8, (32,))
+        assert first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
+
+    def test_extents_do_not_share(self):
+        runner, buffers = self._runner(), {}
+        first = runner._kv_cache_base(buffers, self.EXTENT, None, torch.int8, (32,))
+        second = runner._kv_cache_base(buffers, self.OTHER, None, torch.int8, (32,))
+        assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
 
     def test_every_layer_starts_at_byte_zero(self):
         # The compiler refuses a graph input that carries a storage offset.
-        raw = self._runner()._allocate_kv_cache_tensors(self._cfg())
-        assert all(t.storage_offset() == 0 for t in raw.values())
+        runner, buffers = self._runner(), {}
+        bases = [
+            runner._kv_cache_base(buffers, extent, None, torch.int8, (32,))
+            for extent in (self.EXTENT, self.OTHER, self.EXTENT)
+        ]
+        assert all(base.storage_offset() == 0 for base in bases)
+
+    def test_an_extent_a_program_takes_is_allocated_in_its_arg_s_type(
+        self, monkeypatch
+    ):
+        made: list = []
+        self._typed(monkeypatch, made)
+        runner, buffers = self._runner(), {}
+        arg = SimpleNamespace(name="kv_cache")
+        first = runner._kv_cache_base(buffers, self.EXTENT, arg, torch.float16, (2, 8))
+        second = runner._kv_cache_base(buffers, self.EXTENT, arg, torch.float16, (2, 8))
+        assert made == [("kv_cache", (2, 8))]
+        assert first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
+
+    def test_the_layers_on_a_typed_extent_share_one_layout(self, monkeypatch):
+        # A typed allocation holds its bytes as the arg lays them out, which
+        # another view of them would misread.
+        self._typed(monkeypatch, [])
+        runner, buffers = self._runner(), {}
+        arg = SimpleNamespace(name="kv_cache")
+        runner._kv_cache_base(buffers, self.EXTENT, arg, torch.float16, (2, 8))
+        with pytest.raises(RuntimeError, match="takes one layout"):
+            runner._kv_cache_base(buffers, self.EXTENT, arg, torch.float16, (4, 4))
+
+
+class TestReleaseKvCacheTensors:
+    def test_it_clears_every_piece_of_the_rebound_state(self, monkeypatch):
+        # The rebind reassigns these together from one ordered name list, so a
+        # piece left behind describes a cache that no longer exists.
+        layer = SimpleNamespace(kv_cache=torch.zeros(1))
+        runner = _make_runner_stub(
+            device=torch.device("cpu"),
+            kv_caches=[torch.zeros(1)],
+            kv_cache_bases=[torch.zeros(1)],
+            kv_cache_names=["l0"],
+            kv_cache_block_axes={"l0": 1},
+            compilation_config=SimpleNamespace(static_forward_context={"l0": layer}),
+        )
+        old_cfg = SimpleNamespace(
+            num_blocks=4,
+            kv_cache_tensors=[SimpleNamespace(layers=["l0"], size=8)],
+        )
+        monkeypatch.setattr(mr, "empty_rbln_device_caches", lambda: False)
+        monkeypatch.setattr(mr, "allocator_state_per_chiplet", lambda device: "stub")
+
+        runner.release_kv_cache_tensors(old_cfg)
+
+        assert runner.kv_caches == []
+        assert runner.kv_cache_bases == []
+        assert runner.kv_cache_names == []
+        assert runner.kv_cache_block_axes == {}
+        assert layer.kv_cache is None
 
 
 class TestRepairStagedInputIds:

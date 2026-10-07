@@ -22,6 +22,7 @@ import numba
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.rbln  # noqa: F401  # a hard dependency; see pyproject.
 from rebel import v2
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import (
@@ -476,7 +477,9 @@ class RBLNWorker(WorkerBase):
             self.dynamic_kv.shrink_for_compile(kv_cache_config)
         )
         self.dynamic_kv.check_block_ids_fit_int16()
-        if not self.dynamic_kv.defers_kv_registration:
+        if compile_and_warmup_skip_reason(self.vllm_config) is not None:
+            # Nothing compiles, so these are the caches that serve; otherwise
+            # warm-up makes them anew and registers those.
             self.model_runner.register_kv_caches_with_connector()
 
     def compute_dynamic_kv_num_blocks(self) -> int | None:
@@ -514,19 +517,31 @@ class RBLNWorker(WorkerBase):
 
         try:
             if (skip := compile_and_warmup_skip_reason(self.vllm_config)) is not None:
-                logger.info("Skipping compile_or_warm_up_model (%s).", skip)
+                logger.info(
+                    "Skipping compile_or_warm_up_model (%s); the KV caches stay as "
+                    "torch holds them, so a graph or op whose arg the device holds "
+                    "otherwise takes them through the host.",
+                    skip,
+                )
             else:
-                with self.dynamic_kv.capture_programs() as programs:
+                # The graphs compile against the caches allocated so far, and
+                # run on caches made anew in the types they take them in.
+                with (
+                    torch.rbln.capture_programs() as programs,
+                    torch.rbln.compile_only(),
+                ):
                     self.model_runner.warmup_model()
-                if programs is not None:
-                    self.dynamic_kv.record_programs(programs)
+                self.dynamic_kv.record_programs(programs)
+                # The allocation reads the KV layout off the config, which
+                # warm-up runs outside of; see `apply_dynamic_kv_num_blocks`.
+                with set_current_vllm_config(self.vllm_config, check_compile=False):
+                    self.model_runner.type_kv_caches(programs)
+                self.model_runner.warmup_model()
 
-                # Connectors that defer KV-cache registration (RBLN NIXL D2D
-                # and LMCache) finalize it here: the KV cache physical views
-                # only exist once warm-up has run the compiled model. Walk the
-                # connector tree (incl. MultiConnector children) so the hook
-                # still runs when combined with other connectors. Only on a
-                # successful warm-up — not on the skipped or failed path.
+                # Walk the connector tree (incl. MultiConnector children) so
+                # the finalize hook still runs when combined with other
+                # connectors. Only on a successful warm-up — not on the skipped
+                # or failed path.
                 if has_kv_transfer_group() and not (
                     self.dynamic_kv.defers_kv_registration
                 ):
@@ -535,6 +550,7 @@ class RBLNWorker(WorkerBase):
                     # `apply_dynamic_kv_num_blocks` describes; warm-up is
                     # already past the scope the executor opened.
                     with set_current_vllm_config(self.vllm_config, check_compile=False):
+                        self.model_runner.register_kv_caches_with_connector()
                         finalize_kv_cache_registrations(get_kv_transfer_group())
 
                 # NOTE(RBLN): the sampler warm-up and the deferred KV-cache

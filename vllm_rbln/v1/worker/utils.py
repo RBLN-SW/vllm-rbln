@@ -18,10 +18,11 @@ import json
 import math
 import os
 import platform
+import re
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
@@ -490,6 +491,89 @@ def kv_cache_extents(cfg: KVCacheConfig) -> dict[str, tuple[int, int]]:
                 "cannot be realized as whole tensors"
             )
     return extents
+
+
+def kv_cache_args(
+    programs: Iterable[Any], kv_caches: Mapping[str, torch.Tensor]
+) -> dict[str, Any]:
+    """The `rebel.v2.Arg` each layer's KV cache is to the compiled `programs`:
+    that of an input whose traced tensor lay in the cache's storage. A layer no
+    program takes has none.
+
+    One cache is one allocation, which holds one type, so the programs taking a
+    cache must take it in one type.
+    """
+    layers_at: dict[int, list[str]] = {}
+    for name, cache in kv_caches.items():
+        layers_at.setdefault(cache.untyped_storage().data_ptr(), []).append(name)
+    args: dict[str, Any] = {}
+    for program in programs:
+        for spec in program.input_specs:
+            layers = layers_at.get(spec.data_ptr)
+            if layers is None or spec.arg is None:
+                continue
+            taken = args.get(layers[0])
+            if taken is not None and taken.type_id != spec.arg.type_id:
+                raise RuntimeError(
+                    f"the compiled programs take the KV cache of {layers[0]} in two "
+                    f"types, {taken.type_id} and {spec.arg.type_id}; one cache "
+                    "holds one type"
+                )
+            for layer in layers:
+                args.setdefault(layer, spec.arg)
+    return args
+
+
+def empty_rbln_device_caches() -> bool:
+    """Return every *free* block the rbln caching allocator holds to the driver."""
+    # The allocator otherwise releases cached blocks only after a failed
+    # allocation, so freed bytes keep counting in `dram_used`. Never raises.
+    try:
+        # NOTE(RBLN): is_available() raises on a malformed RBLN_* config.
+        if not torch.rbln.is_available():
+            return False
+        device_count = torch.rbln.device_count()
+    except Exception as exc:
+        logger.warning(
+            "could not query the rbln devices to empty their allocator caches: "
+            "%s. Freed KV bytes stay reserved and keep counting per chiplet.",
+            exc,
+        )
+        return False
+
+    for index in range(device_count):
+        try:
+            torch.rbln.empty_cache(index)
+        except Exception as exc:
+            logger.warning(
+                "torch.rbln.empty_cache(%d) failed: %s. Freed KV blocks stay "
+                "reserved and keep counting per chiplet.",
+                index,
+                exc,
+            )
+    return device_count > 0
+
+
+def allocator_state_per_chiplet(device: torch.device) -> str:
+    """`allocated/reserved` per chiplet from this process's allocator, or why it
+    could not be read."""
+    stats_fn = getattr(torch.rbln, "memory_stats_per_chiplet", None)
+    if stats_fn is None or torch.rbln.is_dummy_device():
+        return "unavailable"
+    try:
+        stats = stats_fn(device)
+    except RuntimeError as exc:
+        return f"unavailable ({exc})"
+    per_unit: dict[str, list[str]] = {}
+    for key, value in sorted(stats.items()):
+        match = re.match(
+            r"^npu\.(\d+)\.chiplet\.(\d+)\.(allocated|reserved)\.current$", key
+        )
+        if match:
+            per_unit.setdefault(f"{match.group(1)}:{match.group(2)}", []).append(
+                f"{match.group(3)}={value}"
+            )
+    return " ".join(f"{u}({' '.join(v)})" for u, v in per_unit.items()) or repr(stats)
 
 
 def canonical_kv_layers(
