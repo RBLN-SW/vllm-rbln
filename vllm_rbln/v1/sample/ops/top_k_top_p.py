@@ -19,6 +19,9 @@ GREEDY_TEMPERATURE = 0
 GREEDY_TOP_K = 1
 GREEDY_TOP_P = 1.0
 
+# FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+TOP_P_CLAMP = 0.995
+
 
 def build_op_top_k_top_p(
     sampling_metadata: SamplingMetadata,
@@ -57,6 +60,12 @@ def build_op_top_k_top_p(
     top_p = sampling_metadata.top_p
     assert top_k is None or top_k.shape == (batch_size,)
     assert top_p is None or top_p.shape == (batch_size,)
+
+    # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+    if top_p is None:
+        top_p = torch.full(
+            (batch_size,), TOP_P_CLAMP, dtype=torch.float32, device=device
+        )
 
     if sampling_metadata.all_random:
         return top_k, top_p
