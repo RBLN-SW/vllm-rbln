@@ -1329,7 +1329,7 @@ class TestProfile:
     ):
         calls: list[str] = []
         monkeypatch.setattr(
-            wm,
+            worker_utils,
             "rbln_profiler",
             SimpleNamespace(
                 start=lambda: calls.append("start"),
@@ -1353,7 +1353,7 @@ class TestProfile:
         calls: list[str] = []
         monkeypatch.setenv("RBLN_PROFILER", "1")
         monkeypatch.setattr(
-            wm,
+            worker_utils,
             "rbln_profiler",
             SimpleNamespace(
                 start=lambda: calls.append("start"),
@@ -1368,4 +1368,4 @@ class TestProfile:
         worker.profile(is_start=False)
 
         assert calls == ["start", "done"]
-        assert isinstance(worker.profiler, wm.RblnProfilerWrapper)
+        assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)
