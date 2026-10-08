@@ -1350,6 +1350,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             else self.bucketing_manager.max_batch_size
         )
         if (
+            sampling_metadata.allowed_token_ids_mask is not None
+            and USE_DEVICE_TENSOR
+            and isinstance(self.sampler, RBLNSampler)
+        ):
+            # NOTE(RBLN): InputBatch's mask rows have applied a finished request's
+            # mask to a later request, so only rows of requests with one are kept.
+            rows = [
+                row
+                for row, req_id in enumerate(self.input_batch.req_ids)
+                if self.requests[req_id].sampling_params.allowed_token_ids
+            ]
+            mask = self.input_batch.allowed_token_ids_mask_cpu_tensor
+            blocked = torch.zeros(bucket, logits.shape[1], dtype=torch.bfloat16)
+            blocked[rows] = mask[rows].to(torch.bfloat16)
+            sampling_metadata = dataclasses.replace(
+                sampling_metadata, allowed_token_ids_mask=blocked.to(logits.device)
+            )
+        if (
             not sampling_metadata.no_penalties
             and USE_DEVICE_TENSOR
             and isinstance(self.sampler, RBLNSampler)

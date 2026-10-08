@@ -34,8 +34,10 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.rbln_sampler import (
     compile_sampler,
+    pad_rows_into,
     rbln_add_logit_bias,
     rbln_apply_min_p,
+    rbln_apply_min_tokens,
 )
 
 logger = init_logger(__name__)
@@ -55,6 +57,13 @@ class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
     ):
         super().__init__(vllm_config, device, is_pin_memory)
         self._neg_inf_tensors = {self.neg_inf_tensor.dtype: self.neg_inf_tensor}
+        if USE_DEVICE_TENSOR:
+            spec = vllm_config.speculative_config
+            self._num_spec_tokens = spec.num_speculative_tokens if spec else 0
+            self._draft_logits: dict[tuple, torch.Tensor] = {}
+            self._compiled_apply_min_tokens = compile_sampler(
+                rbln_apply_min_tokens, None
+            )
 
     def _sync_neg_inf_dtype(self, dtype: torch.dtype):
         tensor = self._neg_inf_tensors.get(dtype)
@@ -63,6 +72,11 @@ class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
         self.neg_inf_tensor = tensor
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.min_toks and USE_DEVICE_TENSOR:
+            blocks = torch.zeros(logits.shape, dtype=torch.bfloat16)
+            for row, (_, _, stop_ids, uses_so) in self.min_toks.items():
+                blocks[row, list(stop_ids)] = 2 if uses_so else 1
+            return self._compiled_apply_min_tokens(logits, blocks.to(logits.device))
         if self.min_toks:
             self._sync_neg_inf_dtype(logits.dtype)
         return super().apply(logits)
@@ -70,6 +84,19 @@ class RBLNMinTokensLogitsProcessor(MinTokensLogitsProcessor):
     def apply_with_spec_decode(
         self, logits: torch.Tensor, num_draft_tokens: list[int]
     ) -> torch.Tensor:
+        if self.min_toks and USE_DEVICE_TENSOR:
+            # NOTE(RBLN): Draft rows are padded to [B*K] to keep the graph's shape.
+            rows = len(num_draft_tokens) * self._num_spec_tokens
+            blocks = torch.zeros(rows, logits.shape[1], dtype=torch.bfloat16)
+            starts = [0, *itertools.accumulate(num_draft_tokens)]
+            for req, (min_toks, out_ids, stop_ids, uses_so) in self.min_toks.items():
+                masked = min(max(min_toks - len(out_ids), 0), num_draft_tokens[req])
+                for row in range(starts[req], starts[req] + masked):
+                    blocks[row, list(stop_ids)] = 2 if uses_so else 1
+            draft_logits = pad_rows_into(self._draft_logits, logits, rows)
+            return self._compiled_apply_min_tokens(
+                draft_logits, blocks.to(logits.device)
+            )[: logits.shape[0]]
         if self.min_toks:
             self._sync_neg_inf_dtype(logits.dtype)
         return super().apply_with_spec_decode(logits, num_draft_tokens)

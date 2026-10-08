@@ -35,7 +35,9 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
 )
 from vllm_rbln.v1.sample.rbln_sampler import (
     compile_sampler,
+    pad_rows_into,
     rbln_apply_draft_penalties,
+    rbln_block_draft_tokens,
 )
 
 if TYPE_CHECKING:
@@ -91,7 +93,46 @@ class RBLNRejectionSampler(RejectionSampler):
             self._compiled_apply_draft_penalties = compile_sampler(
                 rbln_apply_draft_penalties, compile_context
             )
+            self._compiled_block_draft_tokens = compile_sampler(
+                rbln_block_draft_tokens, compile_context
+            )
             self._draft_logits: dict[tuple, torch.Tensor] = {}
+
+    def _pad_draft_rows(
+        self, logits: torch.Tensor, metadata: SpecDecodeMetadata
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pad the draft rows to [B*K], the fixed shape the graphs compile for.
+
+        Returns the padded logits and each row's request index.
+        """
+        assert isinstance(self.impl, RBLNRejectionSamplerImpl)
+        num_draft_tokens = metadata.num_draft_tokens
+        rows = len(num_draft_tokens) * self.impl.num_spec_tokens
+        draft_logits = pad_rows_into(self._draft_logits, logits, rows)
+        requests = torch.zeros(rows, dtype=torch.int64)
+        requests[: logits.shape[0]] = torch.arange(
+            len(num_draft_tokens)
+        ).repeat_interleave(torch.tensor(num_draft_tokens))
+        return draft_logits, requests.to(logits.device)
+
+    def apply_logits_processors(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        metadata: SpecDecodeMetadata,
+    ) -> torch.Tensor:
+        blocked = sampling_metadata.allowed_token_ids_mask
+        if (
+            blocked is not None
+            and USE_DEVICE_TENSOR
+            and isinstance(self.impl, RBLNRejectionSamplerImpl)
+        ):
+            draft_logits, requests = self._pad_draft_rows(logits, metadata)
+            logits = self._compiled_block_draft_tokens(draft_logits, requests, blocked)[
+                : logits.shape[0]
+            ]
+            sampling_metadata = replace(sampling_metadata, allowed_token_ids_mask=None)
+        return super().apply_logits_processors(logits, sampling_metadata, metadata)
 
     def apply_penalties(
         self,
@@ -109,26 +150,18 @@ class RBLNRejectionSampler(RejectionSampler):
             return super().apply_penalties(
                 logits, sampling_metadata, metadata, repeat_indices, output_token_ids
             )
-        # NOTE(RBLN): Draft rows are padded to [B*K] to keep the graph's shape.
         num_tokens, vocab = logits.shape
-        num_draft_tokens = metadata.num_draft_tokens
-        rows = len(num_draft_tokens) * self.impl.num_spec_tokens
-        key = (rows, vocab, logits.dtype)
-        if (draft_logits := self._draft_logits.get(key)) is None:
-            draft_logits = self._draft_logits[key] = logits.new_zeros(rows, vocab)
-        draft_logits[:num_tokens] = logits
-        requests = torch.zeros(rows, dtype=torch.int64)
-        requests[:num_tokens] = torch.arange(len(num_draft_tokens)).repeat_interleave(
-            torch.tensor(num_draft_tokens)
-        )
+        draft_logits, requests = self._pad_draft_rows(logits, metadata)
         prompt_token_ids = sampling_metadata.prompt_token_ids
-        output = torch.full((rows, prompt_token_ids.shape[1]), vocab, dtype=torch.int64)
+        output = torch.full(
+            (draft_logits.shape[0], prompt_token_ids.shape[1]), vocab, dtype=torch.int64
+        )
         for row, ids in enumerate(output_token_ids):
             output[row, : len(ids)] = torch.tensor(ids, dtype=torch.int64)
         output.masked_fill_(output == -1, vocab)
         return self._compiled_apply_draft_penalties(
             draft_logits,
-            requests.to(logits.device),
+            requests,
             prompt_token_ids,
             output.to(logits.device),
             sampling_metadata.presence_penalties,

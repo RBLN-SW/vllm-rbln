@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 from collections.abc import Callable
 from typing import Any
 
@@ -172,6 +173,44 @@ def rbln_apply_min_p(logits: torch.Tensor, log_min_p: torch.Tensor) -> torch.Ten
     return torch.where(shifted < 0, torch.full_like(logits, float("-inf")), logits)
 
 
+def rbln_block_tokens(logits: torch.Tensor, blocked: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN token blocking."""
+    return torch.where(blocked > 0, torch.full_like(logits, float("-inf")), logits)
+
+
+def rbln_block_draft_tokens(
+    logits: torch.Tensor, request_indices: torch.Tensor, blocked: torch.Tensor
+) -> torch.Tensor:
+    """Implementation of RBLN token blocking on speculative decoding's draft rows."""
+    return rbln_block_tokens(logits, blocked[request_indices])
+
+
+def rbln_apply_min_tokens(logits: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN min-tokens stop-token blocking.
+
+    `blocks` is 1 for a blocked token and 2 for one restored when blocking would
+    leave its row without a finite logit.
+    """
+    masked = torch.where(blocks > 0, torch.full_like(logits, float("-inf")), logits)
+    # NOTE(RBLN): A row max over -inf is not -inf on the device, so blocked tokens
+    # enter the max as a finite floor.
+    floor = torch.where(blocks > 0, torch.full_like(logits, -1e4), logits)
+    row_max = floor.amax(dim=-1, keepdim=True) + torch.zeros_like(logits)
+    restore = torch.where(row_max < -1e3, blocks, torch.zeros_like(blocks))
+    return torch.where(restore == 2, logits, masked)
+
+
+def pad_rows_into(
+    buffers: dict[tuple, torch.Tensor], logits: torch.Tensor, rows: int
+) -> torch.Tensor:
+    """Copy `logits` into a persistent `[rows, vocab]` buffer of a fixed shape."""
+    key = (rows, logits.shape[1], logits.dtype)
+    if (buffer := buffers.get(key)) is None:
+        buffer = buffers[key] = logits.new_zeros(rows, logits.shape[1])
+    buffer[: logits.shape[0]] = logits
+    return buffer
+
+
 def compile_sampler(
     op: Callable[..., torch.Tensor],
     compile_context: rebel.CompileContext | None,
@@ -283,6 +322,9 @@ class RBLNSampler(VLLMSampler):
             )
             self._compiled_apply_penalties = compile_sampler(
                 rbln_apply_penalties, compile_context
+            )
+            self._compiled_block_tokens = compile_sampler(
+                rbln_block_tokens, compile_context
             )
 
     def apply_token_mask(
@@ -442,6 +484,22 @@ class RBLNSampler(VLLMSampler):
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output
+
+    def apply_logits_processors(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        predict_bonus_token: bool,
+    ) -> torch.Tensor:
+        blocked = sampling_metadata.allowed_token_ids_mask
+        if USE_DEVICE_TENSOR and blocked is not None:
+            logits = self._compiled_block_tokens(logits, blocked)
+            sampling_metadata = dataclasses.replace(
+                sampling_metadata, allowed_token_ids_mask=None
+            )
+        return super().apply_logits_processors(
+            logits, sampling_metadata, predict_bonus_token
+        )
 
     def apply_penalties(
         self,
