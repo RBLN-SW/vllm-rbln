@@ -86,6 +86,24 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "Please enable chunked prefill by yourself."
         )
 
+    block_size = vllm_config.cache_config.block_size
+    max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+    max_block_size = 16384
+
+    if max_num_batched_tokens > max_block_size:
+        raise ValueError(
+            f"{max_num_batched_tokens=} exceeds the RBLN block size limit of "
+            f"{max_block_size}. Set --max-num-batched-tokens to at most "
+            f"{max_block_size}."
+        )
+
+    if not max_num_batched_tokens <= block_size <= max_block_size:
+        raise ValueError(
+            "RBLN requires max_num_batched_tokens <= block_size <= max_block_size, "
+            f"got {max_num_batched_tokens=}, {block_size=}, {max_block_size=}. "
+            "Set --block-size within this range."
+        )
+
     if envs.VLLM_RBLN_COMPILE_ONLY and envs.VLLM_DISABLE_COMPILE_CACHE:
         # Compile-only compiles each graph and writes the .rbln artifact to
         # the compile cache (the runtime is built on a dummy device so no

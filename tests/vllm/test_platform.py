@@ -182,6 +182,32 @@ class TestPlatformIdentity:
 
 
 class TestRejectedConfigs:
+    @pytest.mark.parametrize(
+        ("block_size", "max_num_batched_tokens", "invalid_block_size"),
+        [(128, 128, 127), (16384, 128, 16385), (16384, 16384, 16385), (128, 128, None)],
+    )
+    def test_block_size_range(
+        self, block_size, max_num_batched_tokens, invalid_block_size
+    ):
+        _build(block_size=block_size, max_num_batched_tokens=max_num_batched_tokens)
+        with pytest.raises(
+            ValidationError,
+            match=(
+                "RBLN requires max_num_batched_tokens <= block_size <= max_block_size"
+            ),
+        ):
+            _build(
+                block_size=invalid_block_size,
+                max_num_batched_tokens=max_num_batched_tokens,
+            )
+
+    def test_token_budget_exceeds_block_size_limit(self):
+        with pytest.raises(
+            ValidationError,
+            match="max_num_batched_tokens=16385.*--max-num-batched-tokens",
+        ):
+            _build(block_size=16384, max_num_batched_tokens=16385)
+
     def test_v2_model_runner(self, monkeypatch, reconfigure):
         # The refusal reads VllmConfig.use_v2_model_runner, and how upstream
         # resolves that from the env or from a feature that forces V2 is its

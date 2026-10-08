@@ -100,7 +100,7 @@ def cfg_noncausal():
 @pytest.fixture(scope="module")
 def cfg_square():
     # block_size == max_model_len, so is_normal can be True.
-    return make_vllm_config(max_model_len=64, block_size=64)
+    return make_vllm_config(max_model_len=64, block_size=64, max_num_batched_tokens=64)
 
 
 class TestFlashAttentionBackendStatic:

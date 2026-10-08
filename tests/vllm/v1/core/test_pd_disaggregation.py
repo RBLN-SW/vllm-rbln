@@ -35,7 +35,7 @@ def _scheduler(matched_tokens: int, *, is_async: bool = True, **kwargs):
     return create_rbln_scheduler(
         block_size=BLOCK_SIZE,
         num_blocks=100,
-        max_num_batched_tokens=MAX_LEN,
+        max_num_batched_tokens=BLOCK_SIZE,
         max_model_len=MAX_LEN,
         enable_prefix_caching=True,
         use_kv_connector=MockKVConfig(matched_tokens=matched_tokens, is_async=is_async),
