@@ -448,6 +448,11 @@ class RBLNSampler(VLLMSampler):
             sampling_metadata.repetition_penalties,
         )
 
+    def compute_logprobs(self, logits: torch.Tensor) -> torch.Tensor:
+        # NOTE(RBLN): A host read of the forward's output buffer has returned a
+        # partial copy, so the float32 log_softmax reads a device-side clone.
+        return super().compute_logprobs(logits.clone() if USE_DEVICE_TENSOR else logits)
+
     @staticmethod
     def gather_logprobs(
         logprobs: torch.Tensor,
