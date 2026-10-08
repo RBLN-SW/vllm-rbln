@@ -94,6 +94,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import (
     kv_cache_dtype_str_to_dtype,
@@ -105,6 +106,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+from vllm_rbln.config import get_rbln_config
 from vllm_rbln.logger import init_logger
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
@@ -533,6 +535,13 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
         self.topk_blocks = int(sparse_cfg["sparse_topk_blocks"])
+        # The runner sorts the batch longest first under the same condition
+        # (RBLNModelRunner.sort_batch_by_length); the MSA indexer stops its
+        # partition loop at batch 0's last partition, so it requires the order
+        # for a batch of more than one row.
+        self.is_prompt_sorted = (
+            current_platform.is_cr13() or get_rbln_config().use_batch_attn_opt
+        )
         if int(sparse_cfg.get("sparse_block_size", MSA_SPARSE_BLOCK_SIZE)) != (
             MSA_SPARSE_BLOCK_SIZE
         ):
@@ -712,6 +721,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 if self.indexer_cache.fp8_dtype is not None
                 else ()
             ),
+            is_prompt_sorted=self.is_prompt_sorted,
         )
         attn_output = torch.ops.rbln_custom_ops.sparse_attn_minimax_m3_msa(
             q5,
@@ -727,6 +737,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 if self.kv_cache_fp8_dtype is not None
                 else ()
             ),
+            is_prompt_sorted=self.is_prompt_sorted,
         )
         # [B, H_kv, G, L, D] -> [B, L, H * D]
         attn_output = attn_output.view(batch, num_heads, seq_len, head_dim).transpose(
