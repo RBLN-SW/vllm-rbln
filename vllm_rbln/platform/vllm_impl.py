@@ -86,6 +86,9 @@ def _validate(vllm_config: "VllmConfig") -> None:
             "Please enable chunked prefill by yourself."
         )
 
+    if not vllm_config.cache_config.user_specified_block_size:
+        raise ValueError("RBLN requires an explicit block_size. Set --block-size.")
+
     block_size = vllm_config.cache_config.block_size
     max_num_batched_tokens = scheduler_config.max_num_batched_tokens
     max_block_size = 16384
