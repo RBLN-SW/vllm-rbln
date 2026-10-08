@@ -195,8 +195,8 @@ def rbln_apply_min_tokens(logits: torch.Tensor, blocks: torch.Tensor) -> torch.T
     # NOTE(RBLN): A row max over -inf is not -inf on the device, so blocked tokens
     # enter the max as a finite floor.
     floor = torch.where(blocks > 0, torch.full_like(logits, -1e4), logits)
-    row_max = floor.amax(dim=-1, keepdim=True) + torch.zeros_like(logits)
-    restore = torch.where(row_max < -1e3, blocks, torch.zeros_like(blocks))
+    needs_restore = (floor.amax(dim=-1, keepdim=True) < -1e3).to(blocks.dtype)
+    restore = blocks * needs_restore
     return torch.where(restore == 2, logits, masked)
 
 
