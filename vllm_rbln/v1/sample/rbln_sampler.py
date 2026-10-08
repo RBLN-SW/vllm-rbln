@@ -200,6 +200,26 @@ def rbln_apply_min_tokens(logits: torch.Tensor, blocks: torch.Tensor) -> torch.T
     return torch.where(restore == 2, logits, masked)
 
 
+def rbln_force_tokens(logits: torch.Tensor, forced: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN forced tokens, as the thinking budget forces its end."""
+    return torch.where(forced > 0, torch.full_like(logits, 1e9), logits)
+
+
+def thinking_budget_forced_tokens(
+    holder: Any, rows: int, vocab: int, **kwargs: Any
+) -> torch.Tensor | None:
+    """Run the thinking-budget holder on a zero host copy and return its writes.
+
+    The holder's own index_put_ on device logits bounces them through the
+    host; on a host copy its 1e9 writes mark the forced tokens instead. This
+    relies on the holder only writing into the logits it is given.
+    """
+    forced = holder.apply_to_logits(
+        torch.zeros(rows, vocab, dtype=torch.bfloat16), **kwargs
+    )
+    return forced if bool(forced.any()) else None
+
+
 def pad_rows_into(
     buffers: dict[tuple, torch.Tensor], logits: torch.Tensor, rows: int
 ) -> torch.Tensor:
@@ -325,6 +345,9 @@ class RBLNSampler(VLLMSampler):
             )
             self._compiled_block_tokens = compile_sampler(
                 rbln_block_tokens, compile_context
+            )
+            self._compiled_force_tokens = compile_sampler(
+                rbln_force_tokens, compile_context
             )
 
     def apply_token_mask(
@@ -491,15 +514,40 @@ class RBLNSampler(VLLMSampler):
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool,
     ) -> torch.Tensor:
+        if not USE_DEVICE_TENSOR:
+            return super().apply_logits_processors(
+                logits, sampling_metadata, predict_bonus_token
+            )
         blocked = sampling_metadata.allowed_token_ids_mask
-        if USE_DEVICE_TENSOR and blocked is not None:
+        if blocked is not None:
             logits = self._compiled_block_tokens(logits, blocked)
             sampling_metadata = dataclasses.replace(
                 sampling_metadata, allowed_token_ids_mask=None
             )
-        return super().apply_logits_processors(
-            logits, sampling_metadata, predict_bonus_token
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is None or not holder.has_tracked_requests():
+            return super().apply_logits_processors(
+                logits, sampling_metadata, predict_bonus_token
+            )
+        logits = super().apply_logits_processors(
+            logits,
+            dataclasses.replace(sampling_metadata, thinking_budget_state_holder=None),
+            predict_bonus_token,
         )
+        holder.update_state(
+            sampling_metadata.output_token_ids,
+            sampling_metadata.spec_token_ids,
+            repeat_indices=None,
+        )
+        forced = thinking_budget_forced_tokens(
+            holder,
+            *logits.shape,
+            predict_bonus_token=predict_bonus_token,
+            spec_token_ids=sampling_metadata.spec_token_ids,
+        )
+        if forced is None:
+            return logits
+        return self._compiled_force_tokens(logits, forced.to(logits.device))
 
     def apply_penalties(
         self,

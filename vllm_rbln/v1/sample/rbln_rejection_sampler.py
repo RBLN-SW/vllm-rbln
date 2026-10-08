@@ -38,6 +38,8 @@ from vllm_rbln.v1.sample.rbln_sampler import (
     pad_rows_into,
     rbln_apply_draft_penalties,
     rbln_block_draft_tokens,
+    rbln_force_tokens,
+    thinking_budget_forced_tokens,
 )
 
 if TYPE_CHECKING:
@@ -96,6 +98,9 @@ class RBLNRejectionSampler(RejectionSampler):
             self._compiled_block_draft_tokens = compile_sampler(
                 rbln_block_draft_tokens, compile_context
             )
+            self._compiled_force_tokens = compile_sampler(
+                rbln_force_tokens, compile_context
+            )
             self._draft_logits: dict[tuple, torch.Tensor] = {}
 
     def _pad_draft_rows(
@@ -121,18 +126,37 @@ class RBLNRejectionSampler(RejectionSampler):
         sampling_metadata: SamplingMetadata,
         metadata: SpecDecodeMetadata,
     ) -> torch.Tensor:
+        if not USE_DEVICE_TENSOR or not isinstance(self.impl, RBLNRejectionSamplerImpl):
+            return super().apply_logits_processors(logits, sampling_metadata, metadata)
         blocked = sampling_metadata.allowed_token_ids_mask
-        if (
-            blocked is not None
-            and USE_DEVICE_TENSOR
-            and isinstance(self.impl, RBLNRejectionSamplerImpl)
-        ):
+        if blocked is not None:
             draft_logits, requests = self._pad_draft_rows(logits, metadata)
             logits = self._compiled_block_draft_tokens(draft_logits, requests, blocked)[
                 : logits.shape[0]
             ]
             sampling_metadata = replace(sampling_metadata, allowed_token_ids_mask=None)
-        return super().apply_logits_processors(logits, sampling_metadata, metadata)
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is None or not holder.has_tracked_requests():
+            return super().apply_logits_processors(logits, sampling_metadata, metadata)
+        logits = super().apply_logits_processors(
+            logits,
+            replace(sampling_metadata, thinking_budget_state_holder=None),
+            metadata,
+        )
+        forced = thinking_budget_forced_tokens(
+            holder,
+            *logits.shape,
+            predict_bonus_token=False,
+            spec_token_ids=sampling_metadata.spec_token_ids,
+        )
+        if forced is None:
+            return logits
+        draft_logits, _ = self._pad_draft_rows(logits, metadata)
+        draft_forced = torch.zeros(draft_logits.shape, dtype=torch.bfloat16)
+        draft_forced[: logits.shape[0]] = forced
+        return self._compiled_force_tokens(
+            draft_logits, draft_forced.to(logits.device)
+        )[: logits.shape[0]]
 
     def apply_penalties(
         self,

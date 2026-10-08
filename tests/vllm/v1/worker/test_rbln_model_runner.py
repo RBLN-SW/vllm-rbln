@@ -294,6 +294,36 @@ class TestPadDepad:
             )
 
 
+def test_rebuilt_input_batch_keeps_the_reasoning_config(monkeypatch):
+    # Without it InputBatch builds no thinking-budget holder, and
+    # thinking_token_budget is accepted but never enforced.
+    built = MagicMock()
+    monkeypatch.setattr(mr, "InputBatch", built)
+    reasoning_config = object()
+    runner = _make_runner_stub(
+        max_model_len=64,
+        max_num_reqs=4,
+        max_num_tokens=64,
+        device=torch.device("cpu"),
+        model_config=SimpleNamespace(get_vocab_size=lambda: 10),
+        num_spec_tokens=0,
+        input_batch=SimpleNamespace(
+            logitsprocs=None, logitsprocs_need_output_token_ids=False
+        ),
+        is_pooling_model=False,
+        vllm_config=SimpleNamespace(reasoning_config=reasoning_config),
+        _init_block_sizes=[8],
+        _init_kernel_block_sizes=[8],
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    )
+
+    runner.may_reinitialize_input_batch(kv_cache_config, [16])
+
+    assert built.call_args.kwargs["reasoning_config"] is reasoning_config
+
+
 class TestSamplePadding:
     @staticmethod
     def _runner(rejection_output: SamplerOutput, *, sampler: bool):
