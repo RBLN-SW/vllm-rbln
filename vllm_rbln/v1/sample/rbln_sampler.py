@@ -99,6 +99,24 @@ def rbln_apply_token_mask(logits: torch.Tensor, allowed: torch.Tensor) -> torch.
     return torch.where(allowed, logits, torch.full_like(logits, float("-inf")))
 
 
+# NOTE(RBLN): With device tensors, an eager op on the logits bounces them through
+# the host, and that read has returned a partial copy. The ops below keep each
+# edit of the logits inside a compiled graph.
+def rbln_apply_temperature(
+    logits: torch.Tensor, temperature: torch.Tensor
+) -> torch.Tensor:
+    """Implementation of RBLN temperature scaling."""
+    divisor = temperature.to(logits.dtype).float().unsqueeze(dim=1)
+    return (logits.float() / divisor).to(logits.dtype)
+
+
+def rbln_apply_min_p(logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN min-p filtering."""
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    threshold = probs.amax(dim=-1, keepdim=True) * min_p.to(logits.dtype)
+    return logits.masked_fill(probs < threshold, float("-inf"))
+
+
 def compile_sampler(
     op: Callable[..., torch.Tensor],
     compile_context: rebel.CompileContext | None,
@@ -204,6 +222,10 @@ class RBLNSampler(VLLMSampler):
         self._compiled_apply_token_mask = compile_sampler(
             rbln_apply_token_mask, compile_context
         )
+        if USE_DEVICE_TENSOR:
+            self._compiled_apply_temperature = compile_sampler(
+                rbln_apply_temperature, compile_context
+            )
 
     def apply_token_mask(
         self, logits: torch.Tensor, allowed: torch.Tensor
@@ -261,7 +283,10 @@ class RBLNSampler(VLLMSampler):
             # tensor here costs more than the division itself. Rows past num_reqs of
             # the padded buffer must therefore carry temperature 1.0 -- see
             # RBLNInputBatch._make_sampling_metadata_rbln.
-            logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
+            if USE_DEVICE_TENSOR:
+                logits = self._compiled_apply_temperature(logits, temperature)
+            else:
+                logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
             temperature = torch.ones_like(temperature)
 
         # Apply logits processors that only apply to random sampling

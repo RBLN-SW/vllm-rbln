@@ -31,6 +31,9 @@ from vllm.v1.sample.logits_processor.builtin import (
 )
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 
+from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.v1.sample.rbln_sampler import compile_sampler, rbln_apply_min_p
+
 logger = init_logger(__name__)
 
 
@@ -86,9 +89,21 @@ class RBLNMinPLogitsProcessor(MinPLogitsProcessor):
     # to the incoming logits dtype on each apply() call.
     min_p: torch.Tensor
 
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
+    ):
+        super().__init__(vllm_config, device, is_pin_memory)
+        if USE_DEVICE_TENSOR:
+            self._compiled_apply_min_p = compile_sampler(rbln_apply_min_p, None)
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.min_p_count:
             return logits
+        if USE_DEVICE_TENSOR:
+            size = self.min_p.shape[0]
+            min_p = torch.zeros(logits.shape[0], 1)
+            min_p[:size, 0] = self.min_p_cpu_tensor[:size]
+            return self._compiled_apply_min_p(logits, min_p.to(logits.device))
 
         # update_state sizes min_p to the live request count, but on decode the
         # vllm runner hands the sampler logits padded to the batch bucket.
