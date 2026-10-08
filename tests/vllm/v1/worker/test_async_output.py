@@ -52,13 +52,19 @@ def _output(req_ids):
 
 
 def _async_output(
-    tokens, *, invalid_req_indices=(), fail_fast=False, rank=None, dp_rank=None
+    tokens,
+    *,
+    invalid_req_indices=(),
+    fail_fast=False,
+    rank=None,
+    dp_rank=None,
+    device="cpu",
 ):
     req_ids = [f"r{i}" for i in range(len(tokens))]
     queue: PendingTokenWriteback = deque()
     async_out = AsyncRBLNModelRunnerOutput(
         model_runner_output=_output(req_ids),
-        sampled_token_ids=torch.tensor(tokens, dtype=torch.int32),
+        sampled_token_ids=torch.tensor(tokens, dtype=torch.int32).to(device),
         invalid_req_indices=list(invalid_req_indices),
         pending_token_writeback=queue,
         req_ids=req_ids,
@@ -171,6 +177,14 @@ class TestGetOutput:
 
     def test_returns_the_sampled_tokens(self):
         async_out, _ = _async_output([[7], [8]])
+        assert async_out.get_output().sampled_token_ids == [[7], [8]]
+
+    @pytest.mark.use_device
+    def test_device_tokens_are_copied_behind_the_sampler(self):
+        async_out, _ = _async_output([[7], [8]], device="rbln")
+        # The D2H starts at construction; get_output() only waits on it.
+        assert async_out._copy_ready_event is not None
+        assert async_out._sampled_token_ids_cpu.is_pinned()
         assert async_out.get_output().sampled_token_ids == [[7], [8]]
 
     def test_clears_the_rows_the_sampler_discarded(self):
