@@ -163,11 +163,13 @@ def rbln_apply_draft_penalties(
     )
 
 
-def rbln_apply_min_p(logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
-    """Implementation of RBLN min-p filtering."""
-    probs = torch.nn.functional.softmax(logits, dim=-1)
-    threshold = probs.amax(dim=-1, keepdim=True) * min_p.to(logits.dtype)
-    return logits.masked_fill(probs < threshold, float("-inf"))
+def rbln_apply_min_p(logits: torch.Tensor, log_min_p: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN min-p filtering, in logit space."""
+    # NOTE(RBLN): Comparing against a per-row tensor runs the graph on the host,
+    # so the threshold is folded in and the compare is against a scalar.
+    lmax = logits.amax(dim=-1, keepdim=True)
+    shifted = logits.float() - (lmax.float() + log_min_p)
+    return torch.where(shifted < 0, torch.full_like(logits, float("-inf")), logits)
 
 
 def compile_sampler(

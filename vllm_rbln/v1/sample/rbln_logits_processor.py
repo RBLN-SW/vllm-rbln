@@ -119,7 +119,7 @@ class RBLNMinPLogitsProcessor(MinPLogitsProcessor):
             size = self.min_p.shape[0]
             min_p = torch.zeros(logits.shape[0], 1)
             min_p[:size, 0] = self.min_p_cpu_tensor[:size]
-            return self._compiled_apply_min_p(logits, min_p.to(logits.device))
+            return self._compiled_apply_min_p(logits, min_p.log().to(logits.device))
 
         # update_state sizes min_p to the live request count, but on decode the
         # vllm runner hands the sampler logits padded to the batch bucket.
