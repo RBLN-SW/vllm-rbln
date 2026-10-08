@@ -1914,7 +1914,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # advanced from real sampled tokens in update_from_output, and EngineCore
         # holds this call back until the previous step's tokens have gone through
         # it, so the mask is never built from a -1 placeholder.
-        if grammar_output is not None and isinstance(self.sampler, RBLNSampler):
+        if (
+            grammar_output is not None
+            and USE_DEVICE_TENSOR
+            and isinstance(self.sampler, RBLNSampler)
+        ):
             # NOTE(RBLN): A host round trip of the logits has returned a partial copy.
             mask = torch.zeros(logits.shape, dtype=torch.float32)
             apply_grammar_bitmask(
