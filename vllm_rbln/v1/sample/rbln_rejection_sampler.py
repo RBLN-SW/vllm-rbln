@@ -33,6 +33,10 @@ from vllm_rbln.v1.sample.ops.top_k_top_p import (
     TOP_P_CLAMP,
     build_op_top_k_top_p,
 )
+from vllm_rbln.v1.sample.rbln_sampler import (
+    compile_sampler,
+    rbln_apply_draft_penalties,
+)
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -83,6 +87,54 @@ class RBLNRejectionSampler(RejectionSampler):
             if use_rbln_sampler
             else TorchRejectionSamplerImpl()
         )
+        if use_rbln_sampler and USE_DEVICE_TENSOR:
+            self._compiled_apply_draft_penalties = compile_sampler(
+                rbln_apply_draft_penalties, compile_context
+            )
+            self._draft_logits: dict[tuple, torch.Tensor] = {}
+
+    def apply_penalties(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        metadata: SpecDecodeMetadata,
+        repeat_indices: torch.Tensor,
+        output_token_ids: list[list[int]],
+    ) -> torch.Tensor:
+        if (
+            sampling_metadata.no_penalties
+            or not USE_DEVICE_TENSOR
+            or not isinstance(self.impl, RBLNRejectionSamplerImpl)
+        ):
+            return super().apply_penalties(
+                logits, sampling_metadata, metadata, repeat_indices, output_token_ids
+            )
+        # NOTE(RBLN): Draft rows are padded to [B*K] to keep the graph's shape.
+        num_tokens, vocab = logits.shape
+        num_draft_tokens = metadata.num_draft_tokens
+        rows = len(num_draft_tokens) * self.impl.num_spec_tokens
+        key = (rows, vocab, logits.dtype)
+        if (draft_logits := self._draft_logits.get(key)) is None:
+            draft_logits = self._draft_logits[key] = logits.new_zeros(rows, vocab)
+        draft_logits[:num_tokens] = logits
+        requests = torch.zeros(rows, dtype=torch.int64)
+        requests[:num_tokens] = torch.arange(len(num_draft_tokens)).repeat_interleave(
+            torch.tensor(num_draft_tokens)
+        )
+        prompt_token_ids = sampling_metadata.prompt_token_ids
+        output = torch.full((rows, prompt_token_ids.shape[1]), vocab, dtype=torch.int64)
+        for row, ids in enumerate(output_token_ids):
+            output[row, : len(ids)] = torch.tensor(ids, dtype=torch.int64)
+        output.masked_fill_(output == -1, vocab)
+        return self._compiled_apply_draft_penalties(
+            draft_logits,
+            requests.to(logits.device),
+            prompt_token_ids,
+            output.to(logits.device),
+            sampling_metadata.presence_penalties,
+            sampling_metadata.frequency_penalties,
+            sampling_metadata.repetition_penalties,
+        )[:num_tokens]
 
     def forward(
         self,

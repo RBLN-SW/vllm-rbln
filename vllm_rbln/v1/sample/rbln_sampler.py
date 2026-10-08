@@ -143,6 +143,26 @@ def rbln_apply_penalties(
     return (logits.float() - presence).to(logits.dtype)
 
 
+def rbln_apply_draft_penalties(
+    logits: torch.Tensor,
+    request_indices: torch.Tensor,
+    prompt_token_ids: torch.Tensor,
+    output_token_ids: torch.Tensor,
+    presence_penalties: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+    repetition_penalties: torch.Tensor,
+) -> torch.Tensor:
+    """Implementation of RBLN penalties on speculative decoding's draft rows."""
+    return rbln_apply_penalties(
+        logits,
+        prompt_token_ids[request_indices],
+        output_token_ids,
+        presence_penalties[request_indices],
+        frequency_penalties[request_indices],
+        repetition_penalties[request_indices],
+    )
+
+
 def rbln_apply_min_p(logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
     """Implementation of RBLN min-p filtering."""
     probs = torch.nn.functional.softmax(logits, dim=-1)
@@ -428,11 +448,7 @@ class RBLNSampler(VLLMSampler):
         output_token_ids: list[list[int]],
     ) -> torch.Tensor:
         prompt_token_ids = sampling_metadata.prompt_token_ids
-        if (
-            not USE_DEVICE_TENSOR
-            or sampling_metadata.no_penalties
-            or prompt_token_ids.shape[0] != logits.shape[0]
-        ):
+        if not USE_DEVICE_TENSOR or sampling_metadata.no_penalties:
             return super().apply_penalties(logits, sampling_metadata, output_token_ids)
         vocab = logits.shape[1]
         output = torch.full(prompt_token_ids.shape, vocab, dtype=torch.int64)
