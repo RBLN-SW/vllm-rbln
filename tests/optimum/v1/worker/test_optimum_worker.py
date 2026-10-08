@@ -15,7 +15,6 @@
 from types import SimpleNamespace
 
 import pytest
-import vllm.profiler.wrapper as profiler_wrapper
 from vllm.config import ProfilerConfig
 from vllm.v1.worker.worker_base import WorkerBase
 
@@ -49,75 +48,68 @@ def make_worker(monkeypatch):
     return _make
 
 
-class _TorchWrapperStub:
-    """Stands in for TorchProfilerWrapper: a real one starts kineto, and with
-    torch-rbln loaded that reaches into the NPU from this process."""
-
-    def __init__(self, profiler_config, *, worker_name, local_rank, activities):
-        self.activities = activities
-
-
 @pytest.fixture
 def rbln_calls(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
-        worker_utils.rbln_profiler, "start", lambda: calls.append("start")
-    )
-    monkeypatch.setattr(
-        worker_utils.rbln_profiler, "done", lambda: calls.append("done")
+        worker_utils,
+        "rbln_profiler",
+        SimpleNamespace(
+            start=lambda: calls.append("start"),
+            done=lambda: calls.append("done"),
+        ),
     )
     return calls
 
 
-@pytest.mark.parametrize(
-    ("torch_on", "rbln_on", "expected"),
-    [
-        (False, False, None),
-        (True, False, _TorchWrapperStub),
-        (False, True, worker_utils.RblnProfilerWrapper),
-        # kineto's RBLN bridge opens and flushes the session itself while a
-        # torch profile runs, so the RBLN wrapper stays out of it.
-        (True, True, _TorchWrapperStub),
-    ],
-)
-def test_each_profiler_combination_picks_its_wrapper(
-    make_worker, monkeypatch, tmp_path, torch_on, rbln_on, expected
+# These two assert what tests/vllm/v1/worker/test_rbln_worker.py::TestProfile
+# asserts for the vllm model path: both workers promise the same behaviour. With
+# RBLN_PROFILER on, kineto's bridge opens and flushes the RBLN session for the
+# torch profile, so the RBLN wrapper has to stay out of it. The flag is patched on
+# the worker, not exported: a unit test must not switch the device profiler on.
+@pytest.mark.parametrize("rbln_profiler", [False, True])
+def test_torch_profiler_keeps_the_rbln_session_to_itself(
+    make_worker, monkeypatch, rbln_calls, tmp_path, rbln_profiler
 ):
-    monkeypatch.setattr(profiler_wrapper, "TorchProfilerWrapper", _TorchWrapperStub)
-    if rbln_on:
-        monkeypatch.setenv("RBLN_PROFILER", "1")
-    else:
-        monkeypatch.delenv("RBLN_PROFILER", raising=False)
-    config = (
-        ProfilerConfig(profiler="torch", torch_profiler_dir=str(tmp_path))
-        if torch_on
-        else ProfilerConfig()
+    monkeypatch.setattr(
+        "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
+        SimpleNamespace(RBLN_PROFILER=rbln_profiler),
+    )
+    worker = make_worker(
+        ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=str(tmp_path),
+            torch_profiler_dump_cuda_time_total=False,
+        )
     )
 
-    worker = make_worker(config)
+    worker.profile(is_start=True)
+    worker.profile(is_start=False)
 
-    if expected is None:
-        assert worker.profiler is None
-        with pytest.raises(RuntimeError, match="not enabled"):
-            worker.profile(is_start=True)
-    else:
-        assert type(worker.profiler) is expected
+    assert rbln_calls == []
 
 
-def test_the_rbln_profiler_alone_flushes_at_stop(make_worker, monkeypatch, rbln_calls):
-    monkeypatch.setenv("RBLN_PROFILER", "1")
+def test_rbln_profiler_starts_and_flushes_at_stop(make_worker, monkeypatch, rbln_calls):
+    monkeypatch.setattr(
+        "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
+        SimpleNamespace(RBLN_PROFILER=True),
+    )
     worker = make_worker(ProfilerConfig())
 
     worker.profile(is_start=True)
     worker.profile(is_start=False)
 
     assert rbln_calls == ["start", "done"]
+    assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)
 
 
 def test_shutdown_flushes_a_profile_that_was_never_stopped(
     make_worker, monkeypatch, rbln_calls
 ):
-    monkeypatch.setenv("RBLN_PROFILER", "1")
+    monkeypatch.setattr(
+        "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
+        SimpleNamespace(RBLN_PROFILER=True),
+    )
     worker = make_worker(ProfilerConfig())
     worker.model_runner = SimpleNamespace()  # shutdown reads it for metrics only
     monkeypatch.setattr(
@@ -128,3 +120,21 @@ def test_shutdown_flushes_a_profile_that_was_never_stopped(
     worker.shutdown()
 
     assert rbln_calls == ["start", "done"]
+
+
+def _scheduler_output() -> SimpleNamespace:
+    return SimpleNamespace(
+        scheduled_new_reqs=[object()],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[object(), object()]),
+    )
+
+
+def test_a_profiled_step_is_annotated_through_the_wrapper(make_worker, tmp_path):
+    # The worker used to hold a bare torch.profiler.profile, which has no
+    # annotate_context_manager, so the first profiled step raised.
+    worker = make_worker(
+        ProfilerConfig(profiler="torch", torch_profiler_dir=str(tmp_path))
+    )
+
+    with worker.annotate_profile(_scheduler_output()):
+        pass

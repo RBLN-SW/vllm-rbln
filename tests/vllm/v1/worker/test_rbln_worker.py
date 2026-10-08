@@ -1324,9 +1324,17 @@ class TestKvRegistrationOrder:
 
 
 class TestProfile:
+    # With RBLN_PROFILER on, kineto's bridge opens and flushes the RBLN session for
+    # the torch profile, so the RBLN wrapper has to stay out of it. The flag is
+    # patched on the worker, not exported: a unit test must not switch the device
+    # profiler on.
+    @pytest.mark.parametrize("rbln_profiler", [False, True])
     def test_torch_profiler_keeps_the_rbln_session_to_itself(
-        self, make_worker, monkeypatch, tmp_path
+        self, make_worker, monkeypatch, tmp_path, rbln_profiler
     ):
+        monkeypatch.setattr(
+            wm, "rbln_flags", SimpleNamespace(RBLN_PROFILER=rbln_profiler)
+        )
         calls: list[str] = []
         monkeypatch.setattr(
             worker_utils,
@@ -1351,7 +1359,7 @@ class TestProfile:
 
     def test_rbln_profiler_starts_and_flushes_at_stop(self, make_worker, monkeypatch):
         calls: list[str] = []
-        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setattr(wm, "rbln_flags", SimpleNamespace(RBLN_PROFILER=True))
         monkeypatch.setattr(
             worker_utils,
             "rbln_profiler",
