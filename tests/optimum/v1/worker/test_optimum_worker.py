@@ -103,6 +103,16 @@ def test_rbln_profiler_starts_and_flushes_at_stop(make_worker, monkeypatch, rbln
     assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)
 
 
+def test_rbln_profiler_does_not_stand_in_for_another_profiler(make_worker, monkeypatch):
+    monkeypatch.setattr(
+        "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
+        SimpleNamespace(RBLN_PROFILER=True),
+    )
+    worker = make_worker(ProfilerConfig(profiler="cuda"))
+
+    assert worker.profiler is None
+
+
 def test_shutdown_flushes_a_profile_that_was_never_stopped(
     make_worker, monkeypatch, rbln_calls
 ):

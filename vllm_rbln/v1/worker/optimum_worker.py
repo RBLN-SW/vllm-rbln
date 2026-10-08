@@ -90,7 +90,7 @@ class RBLNOptimumWorker(WorkerBase):
                 local_rank=self.local_rank,
                 activities=["CPU"],
             )
-        elif rbln_flags.RBLN_PROFILER:
+        elif profiler_config.profiler is None and rbln_flags.RBLN_PROFILER:
             self.profiler = RblnProfilerWrapper(profiler_config)
         else:
             self.profiler = None
