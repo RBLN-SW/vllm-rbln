@@ -115,6 +115,34 @@ def rbln_add_logit_bias(logits: torch.Tensor, bias: torch.Tensor) -> torch.Tenso
     return logits + bias
 
 
+def rbln_apply_penalties(
+    logits: torch.Tensor,
+    prompt_token_ids: torch.Tensor,
+    output_token_ids: torch.Tensor,
+    presence_penalties: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+    repetition_penalties: torch.Tensor,
+) -> torch.Tensor:
+    """Implementation of RBLN presence, frequency and repetition penalties."""
+    rows, vocab = logits.shape
+
+    def bin_counts(token_ids: torch.Tensor) -> torch.Tensor:
+        counts = torch.zeros(rows, vocab + 1, dtype=torch.int64, device=logits.device)
+        counts.scatter_add_(1, token_ids, torch.ones_like(token_ids))
+        return counts[:, :vocab].float()
+
+    output_counts = bin_counts(output_token_ids)
+    # NOTE(RBLN): Summed, not OR-ed: the compiler has no lowering for a bool OR.
+    seen = (bin_counts(prompt_token_ids) + output_counts) > 0
+    penalties = torch.where(seen, repetition_penalties.unsqueeze(1), 1.0)
+    scaling = torch.where(logits > 0, 1.0 / penalties, penalties)
+    logits = (logits.float() * scaling).to(logits.dtype)
+    frequency = frequency_penalties.unsqueeze(1) * output_counts
+    logits = (logits.float() - frequency).to(logits.dtype)
+    presence = presence_penalties.unsqueeze(1) * (output_counts > 0)
+    return (logits.float() - presence).to(logits.dtype)
+
+
 def rbln_apply_min_p(logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
     """Implementation of RBLN min-p filtering."""
     probs = torch.nn.functional.softmax(logits, dim=-1)
@@ -230,6 +258,9 @@ class RBLNSampler(VLLMSampler):
         if USE_DEVICE_TENSOR:
             self._compiled_apply_temperature = compile_sampler(
                 rbln_apply_temperature, compile_context
+            )
+            self._compiled_apply_penalties = compile_sampler(
+                rbln_apply_penalties, compile_context
             )
 
     def apply_token_mask(
@@ -389,6 +420,33 @@ class RBLNSampler(VLLMSampler):
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output
+
+    def apply_penalties(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        output_token_ids: list[list[int]],
+    ) -> torch.Tensor:
+        prompt_token_ids = sampling_metadata.prompt_token_ids
+        if (
+            not USE_DEVICE_TENSOR
+            or sampling_metadata.no_penalties
+            or prompt_token_ids.shape[0] != logits.shape[0]
+        ):
+            return super().apply_penalties(logits, sampling_metadata, output_token_ids)
+        vocab = logits.shape[1]
+        output = torch.full(prompt_token_ids.shape, vocab, dtype=torch.int64)
+        for row, ids in enumerate(output_token_ids):
+            output[row, : len(ids)] = torch.tensor(ids, dtype=torch.int64)
+        output.masked_fill_(output == -1, vocab)
+        return self._compiled_apply_penalties(
+            logits,
+            prompt_token_ids,
+            output.to(logits.device),
+            sampling_metadata.presence_penalties,
+            sampling_metadata.frequency_penalties,
+            sampling_metadata.repetition_penalties,
+        )
 
     @staticmethod
     def gather_logprobs(

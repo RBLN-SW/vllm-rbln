@@ -1353,6 +1353,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if self.use_async_scheduling and isinstance(self.sampler, RBLNSampler)
                 else {}
             )
+            if (
+                not sampling_metadata.no_penalties
+                and USE_DEVICE_TENSOR
+                and isinstance(self.sampler, RBLNSampler)
+            ):
+                # NOTE(RBLN): A power-of-two width that also fits the outputs keeps
+                # the compiled penalties graph from recompiling as outputs grow.
+                prompt_lens = self.input_batch.num_prompt_tokens[:num_reqs]
+                lengths = [*prompt_lens, *map(len, sampling_metadata.output_token_ids)]
+                width = 1 << (int(max(lengths)) - 1).bit_length()
+                prompt = np.full((bucket, width), self.input_batch.vocab_size, np.int64)
+                for row, length in enumerate(prompt_lens):
+                    prompt[row, :length] = self.input_batch.token_ids_cpu[row, :length]
+                sampling_metadata = dataclasses.replace(
+                    sampling_metadata,
+                    prompt_token_ids=torch.from_numpy(prompt).to(logits.device),
+                )
             out = self.sampler(
                 logits=logits,
                 sampling_metadata=_pad_sampling_metadata(sampling_metadata, bucket),
