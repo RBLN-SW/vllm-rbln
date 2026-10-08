@@ -431,6 +431,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         # Persistent buffers
+        self._grammar_logits_cpu = torch.empty(
+            (
+                self.max_num_reqs * (self.num_spec_tokens + 1),
+                model_config.get_vocab_size(),
+            ),
+            dtype=torch.float32,
+            device="cpu",
+        )
         self.input_ids = torch.zeros(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int64)
         self.query_start_loc = torch.zeros(self.max_num_reqs + 1, dtype=torch.int32)
@@ -1917,12 +1925,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
-            origin_dtype, origin_device = logits.dtype, logits.device
-            logits = logits.to(torch.float32).to("cpu")
+            grammar_logits = self._grammar_logits_cpu[: logits.shape[0]]
+            grammar_logits.copy_(logits)
             apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
+                scheduler_output, grammar_output, self.input_batch, grammar_logits
             )
-            logits = logits.to(origin_dtype).to(origin_device)
+            logits.copy_(grammar_logits)
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
