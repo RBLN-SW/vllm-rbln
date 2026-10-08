@@ -120,16 +120,19 @@ def test_shutdown_flushes_a_profile_that_was_never_stopped(
         "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
         SimpleNamespace(RBLN_PROFILER=True),
     )
+    monkeypatch.setenv("VLLM_RBLN_METRICS", "1")
     worker = make_worker(ProfilerConfig())
-    worker.model_runner = SimpleNamespace()  # shutdown reads it for metrics only
-    monkeypatch.setattr(
-        "vllm_rbln.v1.worker.optimum_worker.envs.VLLM_RBLN_METRICS", False
+    worker.model_runner = SimpleNamespace(
+        model_performance_tracker=SimpleNamespace(
+            print_final_stats=lambda: rbln_calls.append("stats")
+        ),
+        sampler_performance_tracker=None,
     )
 
     worker.profile(is_start=True)
     worker.shutdown()
 
-    assert rbln_calls == ["start", "done"]
+    assert rbln_calls == ["start", "stats", "done"]
 
 
 def _scheduler_output() -> SimpleNamespace:
