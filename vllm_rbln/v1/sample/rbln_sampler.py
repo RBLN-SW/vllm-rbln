@@ -94,6 +94,11 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return torch.ops.rbln.argmax(logits)
 
 
+def rbln_apply_token_mask(logits: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN structured-output masking."""
+    return torch.where(allowed, logits, torch.full_like(logits, float("-inf")))
+
+
 def compile_sampler(
     op: Callable[..., torch.Tensor],
     compile_context: rebel.CompileContext | None,
@@ -196,6 +201,14 @@ class RBLNSampler(VLLMSampler):
         self._compiled_greedy_sample = compile_sampler(
             rbln_greedy_sample, compile_context
         )
+        self._compiled_apply_token_mask = compile_sampler(
+            rbln_apply_token_mask, compile_context
+        )
+
+    def apply_token_mask(
+        self, logits: torch.Tensor, allowed: torch.Tensor
+    ) -> torch.Tensor:
+        return self._compiled_apply_token_mask(logits, allowed)
 
     def greedy_sample(
         self, logits: torch.Tensor, staging_owner: Any = None
