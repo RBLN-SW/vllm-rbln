@@ -341,6 +341,30 @@ class TestSamplePadding:
         assert rejection_sampler.call_args.args[3] is sampling_metadata
 
 
+def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
+    cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
+    monkeypatch.setattr(mr, "mega_cache", cache)
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    runner = _make_runner_stub(
+        vllm_config=None,
+        model_config=SimpleNamespace(model="pooling", get_hidden_size=lambda: 8),
+        is_pooling_model=True,
+        run_model_graphs=Mock(),
+        offload_context=nullcontext,
+        compute_logits=Mock(side_effect=AssertionError("Pooling has no LM head")),
+        bucketing_manager=SimpleNamespace(batch_buckets=[1]),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        speculative_config=None,
+        drafter=None,
+    )
+
+    runner.warmup_model()
+
+    runner.run_model_graphs.assert_called_once_with()
+    cache.save.assert_called_once_with("pooling", cache.config_signature.return_value)
+
+
 def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
     """Synthetic mode feeds the graph one more input and dynamo specializes on
     it, so a warm-up forced to `synthetic_mode=False` would compile a variant the
