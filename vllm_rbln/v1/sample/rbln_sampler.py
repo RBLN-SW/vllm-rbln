@@ -110,6 +110,11 @@ def rbln_apply_temperature(
     return (logits.float() / divisor).to(logits.dtype)
 
 
+def rbln_add_logit_bias(logits: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN logit bias."""
+    return logits + bias
+
+
 def rbln_apply_min_p(logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
     """Implementation of RBLN min-p filtering."""
     probs = torch.nn.functional.softmax(logits, dim=-1)

@@ -32,7 +32,11 @@ from vllm.v1.sample.logits_processor.builtin import (
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 
 from vllm_rbln.platform import USE_DEVICE_TENSOR
-from vllm_rbln.v1.sample.rbln_sampler import compile_sampler, rbln_apply_min_p
+from vllm_rbln.v1.sample.rbln_sampler import (
+    compile_sampler,
+    rbln_add_logit_bias,
+    rbln_apply_min_p,
+)
 
 logger = init_logger(__name__)
 
@@ -77,7 +81,19 @@ class RBLNLogitBiasLogitsProcessor(LogitBiasLogitsProcessor):
     # apply() call.
     bias_tensor: torch.Tensor
 
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
+    ):
+        super().__init__(vllm_config, device, is_pin_memory)
+        if USE_DEVICE_TENSOR:
+            self._compiled_add_logit_bias = compile_sampler(rbln_add_logit_bias, None)
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.biases and USE_DEVICE_TENSOR:
+            bias = torch.zeros(logits.shape, dtype=logits.dtype)
+            for req, lb in self.biases.items():
+                bias[req, list(lb)] = torch.tensor(list(lb.values())).to(logits.dtype)
+            return self._compiled_add_logit_bias(logits, bias.to(logits.device))
         if self.biases and self.bias_tensor.dtype != logits.dtype:
             self.bias_tensor = self.bias_tensor.to(logits.dtype)
         return super().apply(logits)
