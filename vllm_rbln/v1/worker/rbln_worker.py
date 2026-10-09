@@ -23,7 +23,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from rebel import flags as rbln_flags
-from rebel import profiler as rbln_profiler
 from torch._dynamo.exc import BackendCompilerFailed
 from vllm.config import (
     VllmConfig,
@@ -45,7 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import TorchProfilerWrapper, WorkerProfiler
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
@@ -70,6 +69,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
+    RblnProfilerWrapper,
     compile_and_warmup_skip_reason,
     dynamic_kv_enabled,
     estimate_model_kernel_size,
@@ -84,16 +84,6 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-
-
-class RblnProfilerWrapper(WorkerProfiler):
-    """Write the RBLN profiler trace at stop_profile."""
-
-    def _start(self) -> None:
-        rbln_profiler.start()
-
-    def _stop(self) -> None:
-        rbln_profiler.done()
 
 
 class RBLNWorker(WorkerBase):

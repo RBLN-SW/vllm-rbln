@@ -21,6 +21,7 @@ import numba
 import torch
 import torch.distributed
 import torch.nn as nn
+from rebel import flags as rbln_flags
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -40,7 +41,7 @@ from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.converter import RBLNParams, update_num_blocks
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
-from vllm_rbln.v1.worker.utils import set_omp_num_threads
+from vllm_rbln.v1.worker.utils import RblnProfilerWrapper, set_omp_num_threads
 
 logger = init_logger(__name__)
 
@@ -89,6 +90,8 @@ class RBLNOptimumWorker(WorkerBase):
                 local_rank=self.local_rank,
                 activities=["CPU"],
             )
+        elif profiler_config.profiler is None and rbln_flags.RBLN_PROFILER:
+            self.profiler = RblnProfilerWrapper(profiler_config)
         else:
             self.profiler = None
 
@@ -333,6 +336,8 @@ class RBLNOptimumWorker(WorkerBase):
                 self.model_runner.model_performance_tracker.print_final_stats()
             if self.model_runner.sampler_performance_tracker:
                 self.model_runner.sampler_performance_tracker.print_final_stats()
+        if self.profiler is not None:
+            self.profiler.shutdown()
 
 
 def init_worker_distributed_environment(
