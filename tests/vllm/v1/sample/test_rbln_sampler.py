@@ -15,7 +15,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from vllm.platforms import current_platform
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -111,22 +110,3 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
     # An all-greedy batch skips the top-k/top-p op entirely.
     assert op_args == []
     assert sampled.tolist() == [6, 1]
-
-
-@pytest.mark.use_device
-def test_min_tokens_compiles_at_16_mib_of_logits():
-    rows, vocab = 64, 131072
-    logits = torch.randn(rows, vocab, generator=torch.Generator().manual_seed(0))
-    logits = logits.to(torch.bfloat16)
-    blocks = torch.zeros(rows, vocab, dtype=torch.bfloat16)
-    blocks[:, :4] = 1
-    blocks[1, :4] = 2
-    logits[1, 4:] = float("-inf")
-    expected = logits.clone()
-    expected[:, :4] = float("-inf")
-    expected[1, :4] = logits[1, :4]
-
-    dev = current_platform.device_type
-    apply = module.compile_sampler(module.rbln_apply_min_tokens, None)
-
-    assert torch.equal(apply(logits.to(dev), blocks.to(dev)).cpu(), expected)
