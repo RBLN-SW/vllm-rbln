@@ -1078,6 +1078,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     is_prefill=self.is_prefill,
                     batch_pad=num_reqs_padded,
                     back_pad=back_pad,
+                    is_prompt_sorted=self.sort_batch_by_length,
                 )
 
                 for layer_name in attn_group.layer_names:

@@ -271,5 +271,6 @@ def rbln_indexer_forward(
         attn_metadata.block_tables,
         self.topk_tokens,
         scale_cache,
+        is_prompt_sorted=attn_metadata.is_prompt_sorted,
     )
     return topk_index
