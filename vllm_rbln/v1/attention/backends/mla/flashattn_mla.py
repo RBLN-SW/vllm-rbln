@@ -247,6 +247,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
                 attn_metadata.seq_lens.to(torch.int32),
                 attn_metadata.block_tables,
                 topk_indices,
+                is_prompt_sorted=attn_metadata.is_prompt_sorted,
             )
             return self._v_up_proj(attn_output, layer.W_UV)
 
@@ -264,6 +265,7 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
             attn_metadata.seq_lens,
             attn_metadata.block_tables,
             self.scale_tensor,
+            is_prompt_sorted=attn_metadata.is_prompt_sorted,
         )
 
         # attn_output: [B, H, S, kv_lora_rank] → V-up projection → [B, S, H*v_head_dim]

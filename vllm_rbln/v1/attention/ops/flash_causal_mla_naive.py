@@ -27,6 +27,8 @@ def paged_flash_causal_mla_naive_prefill(
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     return torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_prefill(
         q,
@@ -36,6 +38,7 @@ def paged_flash_causal_mla_naive_prefill(
         seq_idx,
         block_tables,
         scale,
+        is_prompt_sorted=is_prompt_sorted,
     )
 
 
@@ -47,6 +50,8 @@ def paged_flash_causal_mla_naive_decode(
     seq_idx: torch.Tensor,
     block_tables: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     return torch.ops.rbln_custom_ops.paged_flash_causal_mla_naive_decode(
         q,
@@ -56,4 +61,5 @@ def paged_flash_causal_mla_naive_decode(
         seq_idx,
         block_tables,
         scale,
+        is_prompt_sorted=is_prompt_sorted,
     )
