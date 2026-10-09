@@ -294,6 +294,36 @@ class TestPadDepad:
             )
 
 
+def test_rebuilt_input_batch_keeps_the_reasoning_config(monkeypatch):
+    # Without it InputBatch builds no thinking-budget holder, and
+    # thinking_token_budget is accepted but never enforced.
+    built = MagicMock()
+    monkeypatch.setattr(mr, "InputBatch", built)
+    reasoning_config = object()
+    runner = _make_runner_stub(
+        max_model_len=64,
+        max_num_reqs=4,
+        max_num_tokens=64,
+        device=torch.device("cpu"),
+        model_config=SimpleNamespace(get_vocab_size=lambda: 10),
+        num_spec_tokens=0,
+        input_batch=SimpleNamespace(
+            logitsprocs=None, logitsprocs_need_output_token_ids=False
+        ),
+        is_pooling_model=False,
+        vllm_config=SimpleNamespace(reasoning_config=reasoning_config),
+        _init_block_sizes=[8],
+        _init_kernel_block_sizes=[8],
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    )
+
+    runner.may_reinitialize_input_batch(kv_cache_config, [16])
+
+    assert built.call_args.kwargs["reasoning_config"] is reasoning_config
+
+
 class TestSamplePadding:
     @staticmethod
     def _runner(rejection_output: SamplerOutput, *, sampler: bool):
@@ -325,6 +355,37 @@ class TestSamplePadding:
 
         padded_metadata = rejection_sampler.call_args.args[0]
         assert len(padded_metadata.num_draft_tokens) == 4
+
+    def test_allowed_token_ids_mask_clears_requests_without_one(self, monkeypatch):
+        monkeypatch.setattr(mr, "USE_DEVICE_TENSOR", True)
+        output = SamplerOutput(
+            sampled_token_ids=torch.zeros((4, 3), dtype=torch.int32),
+            logprobs_tensors=None,
+        )
+        runner, rejection_sampler = self._runner(output, sampler=True)
+        runner.sampler = MagicMock(spec=mr.RBLNSampler)
+        runner.requests = {
+            "a": SimpleNamespace(
+                sampling_params=SamplingParams(allowed_token_ids=[1, 2])
+            ),
+            "b": SimpleNamespace(sampling_params=SamplingParams()),
+        }
+        runner.input_batch.req_ids = ["a", "b"]
+        # Row 0 is request a's mask; row 1 is stale, left by a moved request.
+        mask = torch.ones((8, 10), dtype=torch.bool)
+        mask[0, [1, 2]] = False
+        runner.input_batch.allowed_token_ids_mask_cpu_tensor = mask
+        runner.input_batch.sampling_metadata = _sampling_metadata(
+            2, spec_token_ids=[[], []], allowed_token_ids_mask=mask[:2]
+        )
+
+        runner._sample(torch.zeros((4, 10)), _spec_decode_metadata([1, 1]))
+
+        blocked = rejection_sampler.call_args.args[3].allowed_token_ids_mask
+        expected = torch.zeros((4, 10))
+        expected[0] = 1
+        expected[0, [1, 2]] = 0
+        assert torch.equal(blocked.float(), expected)
 
     def test_torch_rejection_sampler_keeps_live_batch_metadata(self):
         output = SamplerOutput(
