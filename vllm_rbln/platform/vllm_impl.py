@@ -56,6 +56,12 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
     _wire(vllm_config)
     _setup_runtime_env(vllm_config)
 
+    # TODO(RBLN): delete together with the override in RBLNModelRunner.
+    logger.warning(
+        "Random sampling is disabled on RBLN for now: every request is sampled "
+        "greedily, whatever temperature, top_p, top_k, min_p, or seed it sets."
+    )
+
 
 def _uses_model_parallel(parallel_config) -> bool:
     return (

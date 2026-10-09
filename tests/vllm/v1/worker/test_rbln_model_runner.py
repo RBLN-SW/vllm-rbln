@@ -29,7 +29,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.platforms import current_platform
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -679,6 +679,26 @@ class TestResolveBatchDescriptor:
         )._determine_batch_execution_and_padding(3, 30)
         assert batch_desc.num_tokens_padded is None
         assert across is None
+
+
+@pytest.mark.maybe_use_device
+def test_update_states_samples_every_request_greedily(make_model_runner, monkeypatch):
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    runner = make_model_runner()
+    runner._update_states(
+        schedule_new(
+            "a",
+            "b",
+            sampling_params=[
+                SamplingParams(temperature=0.7, top_p=0.9, top_k=5),
+                SamplingParams(temperature=1.0, seed=3),
+            ],
+        )
+    )
+    for req_id in ("a", "b"):
+        sampling_type = runner.requests[req_id].sampling_params.sampling_type
+        assert sampling_type == SamplingType.GREEDY
+    assert runner.input_batch.all_greedy
 
 
 @pytest.mark.maybe_use_device

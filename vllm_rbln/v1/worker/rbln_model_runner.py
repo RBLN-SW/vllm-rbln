@@ -20,6 +20,7 @@ from contextlib import nullcontext
 from copy import copy, deepcopy
 from typing import Any, Literal, NamedTuple, TypeAlias, cast
 
+import msgspec
 import numpy as np
 import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -634,6 +635,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            # TODO(RBLN): delete once random sampling is fixed. Temperature
+            # alone decides `sampling_type`, which caches its first answer in
+            # the struct, so a fresh struct rather than a write to this one.
+            if new_req_data.sampling_params is not None:
+                new_req_data.sampling_params = msgspec.structs.replace(
+                    new_req_data.sampling_params, temperature=0.0
+                )
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
