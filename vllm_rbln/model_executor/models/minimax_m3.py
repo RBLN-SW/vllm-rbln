@@ -16,6 +16,7 @@ import importlib.util
 import math
 import sys
 from collections.abc import Iterable
+from itertools import islice
 from pathlib import Path
 from types import ModuleType
 
@@ -763,7 +764,10 @@ class RBLNMiniMaxM3Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        # islice, not a slice: on torch >= 2.12 Dynamo lifts the parameters of a
+        # sliced ModuleList into graph inputs, and the compiler then sees no
+        # constant weights (an MXFP8 dense cannot pack).
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
