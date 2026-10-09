@@ -136,7 +136,7 @@ def create_rbln_scheduler(
     *,
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,
-    max_num_batched_tokens: int = 8192,
+    max_num_batched_tokens: int = 16,
     enable_chunked_prefill: bool = True,
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
