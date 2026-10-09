@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 from collections.abc import Callable
 from typing import Any
 
@@ -97,6 +98,137 @@ def rbln_greedy_sample(logits: torch.Tensor) -> torch.Tensor:
 def rbln_apply_token_mask(logits: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
     """Implementation of RBLN structured-output masking."""
     return torch.where(allowed, logits, torch.full_like(logits, float("-inf")))
+
+
+# NOTE(RBLN): With device tensors, an eager op on the logits bounces them through
+# the host, and that read has returned a partial copy. The ops below keep each
+# edit of the logits inside a compiled graph.
+def rbln_apply_temperature(
+    logits: torch.Tensor, temperature: torch.Tensor
+) -> torch.Tensor:
+    """Implementation of RBLN temperature scaling."""
+    divisor = temperature.to(logits.dtype).float().unsqueeze(dim=1)
+    return (logits.float() / divisor).to(logits.dtype)
+
+
+def rbln_add_logit_bias(logits: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN logit bias."""
+    return logits + bias
+
+
+def rbln_apply_penalties(
+    logits: torch.Tensor,
+    prompt_token_ids: torch.Tensor,
+    output_token_ids: torch.Tensor,
+    presence_penalties: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+    repetition_penalties: torch.Tensor,
+) -> torch.Tensor:
+    """Implementation of RBLN presence, frequency and repetition penalties."""
+    rows, vocab = logits.shape
+
+    def bin_counts(token_ids: torch.Tensor) -> torch.Tensor:
+        counts = torch.zeros(rows, vocab + 1, dtype=torch.int64, device=logits.device)
+        counts.scatter_add_(1, token_ids, torch.ones_like(token_ids))
+        return counts[:, :vocab].float()
+
+    output_counts = bin_counts(output_token_ids)
+    # NOTE(RBLN): Summed, not OR-ed: the compiler has no lowering for a bool OR.
+    seen = (bin_counts(prompt_token_ids) + output_counts) > 0
+    penalties = torch.where(seen, repetition_penalties.unsqueeze(1), 1.0)
+    scaling = torch.where(logits > 0, 1.0 / penalties, penalties)
+    logits = (logits.float() * scaling).to(logits.dtype)
+    frequency = frequency_penalties.unsqueeze(1) * output_counts
+    logits = (logits.float() - frequency).to(logits.dtype)
+    presence = presence_penalties.unsqueeze(1) * (output_counts > 0)
+    return (logits.float() - presence).to(logits.dtype)
+
+
+def rbln_apply_draft_penalties(
+    logits: torch.Tensor,
+    request_indices: torch.Tensor,
+    prompt_token_ids: torch.Tensor,
+    output_token_ids: torch.Tensor,
+    presence_penalties: torch.Tensor,
+    frequency_penalties: torch.Tensor,
+    repetition_penalties: torch.Tensor,
+) -> torch.Tensor:
+    """Implementation of RBLN penalties on speculative decoding's draft rows."""
+    return rbln_apply_penalties(
+        logits,
+        prompt_token_ids[request_indices],
+        output_token_ids,
+        presence_penalties[request_indices],
+        frequency_penalties[request_indices],
+        repetition_penalties[request_indices],
+    )
+
+
+def rbln_apply_min_p(logits: torch.Tensor, log_min_p: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN min-p filtering, in logit space."""
+    # NOTE(RBLN): Comparing against a per-row tensor runs the graph on the host,
+    # so the threshold is folded in and the compare is against a scalar.
+    lmax = logits.amax(dim=-1, keepdim=True)
+    shifted = logits.float() - (lmax.float() + log_min_p)
+    return torch.where(shifted < 0, torch.full_like(logits, float("-inf")), logits)
+
+
+def rbln_block_tokens(logits: torch.Tensor, blocked: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN token blocking."""
+    return torch.where(blocked > 0, torch.full_like(logits, float("-inf")), logits)
+
+
+def rbln_block_draft_tokens(
+    logits: torch.Tensor, request_indices: torch.Tensor, blocked: torch.Tensor
+) -> torch.Tensor:
+    """Implementation of RBLN token blocking on speculative decoding's draft rows."""
+    return rbln_block_tokens(logits, blocked[request_indices])
+
+
+def rbln_apply_min_tokens(logits: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN min-tokens stop-token blocking.
+
+    `blocks` is 1 for a blocked token and 2 for one restored when blocking would
+    leave its row without a finite logit.
+    """
+    masked = torch.where(blocks > 0, torch.full_like(logits, float("-inf")), logits)
+    # NOTE(RBLN): A row max over -inf is not -inf on the device, so blocked tokens
+    # enter the max as a finite floor.
+    floor = torch.where(blocks > 0, torch.full_like(logits, -1e4), logits)
+    row_max = floor.amax(dim=-1, keepdim=True) + torch.zeros_like(logits)
+    restore = torch.where(row_max < -1e3, blocks, torch.zeros_like(blocks))
+    return torch.where(restore == 2, logits, masked)
+
+
+def rbln_force_tokens(logits: torch.Tensor, forced: torch.Tensor) -> torch.Tensor:
+    """Implementation of RBLN forced tokens, as the thinking budget forces its end."""
+    return torch.where(forced > 0, torch.full_like(logits, 1e9), logits)
+
+
+def thinking_budget_forced_tokens(
+    holder: Any, rows: int, vocab: int, **kwargs: Any
+) -> torch.Tensor | None:
+    """Run the thinking-budget holder on a zero host copy and return its writes.
+
+    The holder's own index_put_ on device logits bounces them through the
+    host; on a host copy its 1e9 writes mark the forced tokens instead. This
+    relies on the holder only writing into the logits it is given.
+    """
+    forced = holder.apply_to_logits(
+        torch.zeros(rows, vocab, dtype=torch.bfloat16), **kwargs
+    )
+    return forced if bool(forced.any()) else None
+
+
+def pad_rows_into(
+    buffers: dict[tuple, torch.Tensor], logits: torch.Tensor, rows: int
+) -> torch.Tensor:
+    """Copy `logits` into a persistent `[rows, vocab]` buffer of a fixed shape."""
+    key = (rows, logits.shape[1], logits.dtype)
+    if (buffer := buffers.get(key)) is None:
+        buffer = buffers[key] = logits.new_zeros(rows, logits.shape[1])
+    buffer[: logits.shape[0]] = logits
+    return buffer
 
 
 def compile_sampler(
@@ -204,6 +336,19 @@ class RBLNSampler(VLLMSampler):
         self._compiled_apply_token_mask = compile_sampler(
             rbln_apply_token_mask, compile_context
         )
+        if USE_DEVICE_TENSOR:
+            self._compiled_apply_temperature = compile_sampler(
+                rbln_apply_temperature, compile_context
+            )
+            self._compiled_apply_penalties = compile_sampler(
+                rbln_apply_penalties, compile_context
+            )
+            self._compiled_block_tokens = compile_sampler(
+                rbln_block_tokens, compile_context
+            )
+            self._compiled_force_tokens = compile_sampler(
+                rbln_force_tokens, compile_context
+            )
 
     def apply_token_mask(
         self, logits: torch.Tensor, allowed: torch.Tensor
@@ -261,7 +406,10 @@ class RBLNSampler(VLLMSampler):
             # tensor here costs more than the division itself. Rows past num_reqs of
             # the padded buffer must therefore carry temperature 1.0 -- see
             # RBLNInputBatch._make_sampling_metadata_rbln.
-            logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
+            if USE_DEVICE_TENSOR:
+                logits = self._compiled_apply_temperature(logits, temperature)
+            else:
+                logits = logits.div_(temperature.to(logits.dtype).unsqueeze(dim=1))
             temperature = torch.ones_like(temperature)
 
         # Apply logits processors that only apply to random sampling
@@ -359,6 +507,75 @@ class RBLNSampler(VLLMSampler):
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output
+
+    def apply_logits_processors(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        predict_bonus_token: bool,
+    ) -> torch.Tensor:
+        if not USE_DEVICE_TENSOR:
+            return super().apply_logits_processors(
+                logits, sampling_metadata, predict_bonus_token
+            )
+        blocked = sampling_metadata.allowed_token_ids_mask
+        if blocked is not None:
+            logits = self._compiled_block_tokens(logits, blocked)
+            sampling_metadata = dataclasses.replace(
+                sampling_metadata, allowed_token_ids_mask=None
+            )
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is None or not holder.has_tracked_requests():
+            return super().apply_logits_processors(
+                logits, sampling_metadata, predict_bonus_token
+            )
+        logits = super().apply_logits_processors(
+            logits,
+            dataclasses.replace(sampling_metadata, thinking_budget_state_holder=None),
+            predict_bonus_token,
+        )
+        holder.update_state(
+            sampling_metadata.output_token_ids,
+            sampling_metadata.spec_token_ids,
+            repeat_indices=None,
+        )
+        forced = thinking_budget_forced_tokens(
+            holder,
+            *logits.shape,
+            predict_bonus_token=predict_bonus_token,
+            spec_token_ids=sampling_metadata.spec_token_ids,
+        )
+        if forced is None:
+            return logits
+        return self._compiled_force_tokens(logits, forced.to(logits.device))
+
+    def apply_penalties(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        output_token_ids: list[list[int]],
+    ) -> torch.Tensor:
+        prompt_token_ids = sampling_metadata.prompt_token_ids
+        if not USE_DEVICE_TENSOR or sampling_metadata.no_penalties:
+            return super().apply_penalties(logits, sampling_metadata, output_token_ids)
+        vocab = logits.shape[1]
+        output = torch.full(prompt_token_ids.shape, vocab, dtype=torch.int64)
+        for row, ids in enumerate(output_token_ids):
+            output[row, : len(ids)] = torch.tensor(ids, dtype=torch.int64)
+        output.masked_fill_(output == -1, vocab)
+        return self._compiled_apply_penalties(
+            logits,
+            prompt_token_ids,
+            output.to(logits.device),
+            sampling_metadata.presence_penalties,
+            sampling_metadata.frequency_penalties,
+            sampling_metadata.repetition_penalties,
+        )
+
+    def compute_logprobs(self, logits: torch.Tensor) -> torch.Tensor:
+        # NOTE(RBLN): A host read of the forward's output buffer has returned a
+        # partial copy, so the float32 log_softmax reads a device-side clone.
+        return super().compute_logprobs(logits.clone() if USE_DEVICE_TENSOR else logits)
 
     @staticmethod
     def gather_logprobs(
