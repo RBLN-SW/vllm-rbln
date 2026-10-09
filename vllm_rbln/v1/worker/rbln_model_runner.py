@@ -145,7 +145,7 @@ from vllm_rbln.v1.spec_decode import DRAFT_MODEL_PROPOSERS
 from vllm_rbln.v1.spec_decode.dflash import RBLNDFlashProposer
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.eagle3_pp import (
-    eagle3_aux_hidden_states_enabled,
+    aux_hidden_states_enabled,
     install_aux_handoff_slots,
 )
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
@@ -345,7 +345,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             | RBLNDFlashProposer
             | None
         ) = None
-        self.use_aux_hidden_state_outputs = eagle3_aux_hidden_states_enabled(
+        self.use_aux_hidden_state_outputs = aux_hidden_states_enabled(
             self.speculative_config
         )
 
@@ -358,10 +358,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter = RBLNMedusaProposer(self.vllm_config, self.device)
             elif self.speculative_config.method == "dflash":
                 self.drafter = RBLNDFlashProposer(self.vllm_config, self.device, self)
-                # Upstream turns this on unconditionally for DFlash: the
-                # drafter reduces the target's aux states through its own
-                # projection, as eagle3 does.
-                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_eagle():
                 self.drafter = RBLNEagleProposer(self.vllm_config, self.device, self)
             else:
