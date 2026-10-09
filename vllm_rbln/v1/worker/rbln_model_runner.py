@@ -33,6 +33,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces import (
+    SupportsMultiModal,
     supports_eagle3,
     supports_realtime,
     supports_transcription,
@@ -42,6 +43,9 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalKwargsItem
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
@@ -102,6 +106,7 @@ from vllm.v1.worker.utils import (
     KVCacheGroupSpec,
     KVCacheSpec,
     add_kv_sharing_layers_to_kv_cache_groups,
+    sanity_check_mm_encoder_outputs,
 )
 
 from vllm_rbln import envs
@@ -285,8 +290,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Model-related.
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
+        self.supports_mm_inputs = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
+            model_config
+        )
+        assert not (self.supports_mm_inputs and model_config.uses_mrope), (
+            "M-RoPE multimodal models are not supported on the vLLM path"
+        )
 
-        # TODO(RBLN): Multi-modal data support
+        self.encoder_cache: dict[str, torch.Tensor] = {}
 
         # NOTE(RBLN): Compilation context for marking the KV cache address as static.
         self.compile_context = (
@@ -616,6 +627,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+
+        for mm_hash in scheduler_output.free_encoder_mm_hashes:
+            self.encoder_cache.pop(mm_hash, None)
 
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
@@ -1276,6 +1290,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         num_input_tokens: int,
         logits_indices: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
+        scheduler_output: RBLNSchedulerOutput | None = None,
     ) -> tuple[
         StagedModelInputs,
         dict[str, Any],
@@ -1318,10 +1333,115 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             **self._init_model_kwargs(),
         }
 
+        if self.supports_mm_inputs and is_prefill and get_pp_group().is_first_rank:
+            assert scheduler_output is not None
+            self._execute_mm_encoder(scheduler_output)
+            mm_embeds, mm_mask = self._gather_mm_embeddings(
+                scheduler_output, num_input_tokens
+            )
+            model_kwargs["mm_embeds"], model_kwargs["mm_mask"] = (
+                self.input_stager.stage_mm_embeds(
+                    mm_embeds.view(num_reqs, -1, mm_embeds.shape[-1]),
+                    mm_mask.view(num_reqs, -1, 1),
+                    layout,
+                )
+            )
+
         return (
             staged_model_inputs,
             model_kwargs,
         )
+
+    def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
+        """Encode this step's scheduled multimodal items on the host into
+        ``self.encoder_cache``."""
+        mm_hashes: list[str] = []
+        mm_kwargs: list[tuple[str, MultiModalKwargsItem]] = []
+        for (
+            req_id,
+            encoder_input_ids,
+        ) in scheduler_output.scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+            for mm_input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[mm_input_id]
+                if mm_feature.data is None:
+                    continue
+                mm_hashes.append(mm_feature.identifier)
+                mm_kwargs.append((mm_feature.modality, mm_feature.data))
+        if not mm_kwargs:
+            return
+
+        model = cast(SupportsMultiModal, self.model)
+        encoder_outputs: list[torch.Tensor] = []
+
+        for _modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs, device="cpu"
+        ):
+            outputs = model.embed_multimodal(**mm_kwargs_batch)
+            sanity_check_mm_encoder_outputs(outputs, expected_num_items=num_items)
+            encoder_outputs.extend(outputs)
+
+        for mm_hash, output in zip(mm_hashes, encoder_outputs):
+            self.encoder_cache[mm_hash] = output
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: RBLNSchedulerOutput,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scatter the cached encoder outputs over this step's flat tokens."""
+
+        hidden_size = self.model_config.get_hidden_size()
+        mm_embeds = torch.zeros(num_tokens, hidden_size, dtype=self.dtype)
+        is_mm = torch.zeros(num_tokens, dtype=torch.bool)
+
+        req_start_idx = 0
+        for req_id in self.input_batch.req_ids:
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens
+
+            for mm_feature in req_state.mm_features:
+                pos_info = mm_feature.mm_position
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+
+                if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                    break
+                if start_pos + num_encoder_tokens <= num_computed_tokens:
+                    continue
+
+                # [start_idx, end_idx) of the placeholder that this step covers.
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens,
+                )
+                embeds_start, embeds_end = pos_info.get_embeds_indices_in_range(
+                    start_idx, end_idx
+                )
+                if embeds_start == embeds_end:
+                    continue
+
+                encoder_output = self.encoder_cache.get(mm_feature.identifier)
+                assert encoder_output is not None, (
+                    f"Encoder cache miss for {mm_feature.identifier}."
+                )
+
+                dst_start = req_start_idx + start_pos - num_computed_tokens
+                dst = slice(dst_start + start_idx, dst_start + end_idx)
+                if pos_info.is_embed is None:
+                    rows = torch.ones(end_idx - start_idx, dtype=torch.bool)
+                else:
+                    rows = pos_info.is_embed[start_idx:end_idx]
+                mm_embeds[dst][rows] = encoder_output[embeds_start:embeds_end].to(
+                    self.dtype
+                )
+                is_mm[dst] |= rows
+
+            req_start_idx += num_scheduled_tokens
+
+        return mm_embeds, is_mm.to(self.dtype).unsqueeze(-1)
 
     def _sample(
         self,
@@ -1837,6 +1957,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 num_query_tokens,
                 logits_indices,
                 intermediate_tensors,
+                scheduler_output,
             )
 
             if self.use_async_scheduling:
@@ -2363,6 +2484,21 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 use_static_output=True,
                 dtype=self.rbln_config.compile_dtype,
             )
+            if self.supports_mm_inputs and hasattr(self.model, "compile_mm_encoder"):
+                self.model.compile_mm_encoder(
+                    lambda encoder: compile(
+                        encoder,
+                        dynamic=False,
+                        fullgraph=True,
+                        compile_context=self.compile_context,
+                        num_devices=self.rbln_config.num_devices_per_local_rank,
+                        model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                        process_group_dict=process_group_dict,
+                        guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
+                        runtime_holder=self.runtime_holder,
+                        mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
+                    )
+                )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -2638,6 +2774,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 batch_desc.num_reqs_padded, target_query_len
             )
 
+        layout = InputLayout(
+            num_reqs=num_reqs,
+            num_reqs_padded=batch_desc.num_reqs_padded,
+            query_len=target_query_len,
+            query_len_padded=target_query_len,
+        )
         # NOTE(RBLN): Clone tensors to make tensors non-view tensors.
         staged_model_input = self.input_stager.stage(
             input_ids=input_ids.view(num_reqs, target_query_len),
@@ -2645,12 +2787,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             token_indices=token_indices,
-            layout=InputLayout(
-                num_reqs=num_reqs,
-                num_reqs_padded=batch_desc.num_reqs_padded,
-                query_len=target_query_len,
-                query_len_padded=target_query_len,
-            ),
+            layout=layout,
         )
 
         with set_forward_context(
@@ -2661,7 +2798,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_padded_tokens=batch_desc.num_tokens_padded,
             **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
         ):
-            _ = self.model_executable(**staged_model_input.as_kwargs())
+            _ = self.model_executable(
+                **staged_model_input.as_kwargs(), **self._dummy_mm_kwargs(layout)
+            )
             # The submission a step with no forward of its own was waiting for.
             if not warmup and has_kv_transfer_group():
                 flush_deferred_loads(get_kv_transfer_group())
@@ -2685,6 +2824,20 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.drafter.dummy_run(num_reqs, draft_query_len, False)
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
+
+    def _dummy_mm_kwargs(self, layout: InputLayout) -> dict[str, torch.Tensor]:
+        """All-text ``mm_embeds`` / ``mm_mask`` for a dummy prefill"""
+        if not (
+            self.supports_mm_inputs and self.is_prefill and get_pp_group().is_first_rank
+        ):
+            return {}
+        shape = (layout.num_reqs, layout.query_len)
+        mm_embeds, mm_mask = self.input_stager.stage_mm_embeds(
+            torch.zeros(*shape, self.model_config.get_hidden_size(), dtype=self.dtype),
+            torch.zeros(*shape, 1, dtype=self.dtype),
+            layout,
+        )
+        return {"mm_embeds": mm_embeds, "mm_mask": mm_mask}
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, num_reqs: int) -> None:
@@ -3690,6 +3843,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # 5. specdec (medusa)
             if isinstance(self.drafter, RBLNMedusaProposer):
                 self.drafter.dummy_run()
+
+            # 6. multimodal encoder
+            if self.supports_mm_inputs and hasattr(self.model, "warmup_mm_encoder"):
+                self.model.warmup_mm_encoder()
 
         mega_cache.save(self.model_config.model, sig)
 
