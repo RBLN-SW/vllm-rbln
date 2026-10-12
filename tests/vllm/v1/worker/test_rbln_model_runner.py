@@ -117,7 +117,11 @@ def test_sample_tokens_collects_deferred_store_in_the_same_output(
         order.append("events")
         return late
 
-    connector = SimpleNamespace(get_kv_connector_kv_cache_events=collect_events)
+    connector = SimpleNamespace(
+        wait_for_save=lambda: order.append("save"),
+        get_kv_connector_kv_cache_events=collect_events,
+        clear_connector_metadata=lambda: order.append("clear"),
+    )
     monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
     monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
     runner = _make_runner_stub(
@@ -135,7 +139,6 @@ def test_sample_tokens_collects_deferred_store_in_the_same_output(
         use_async_scheduling=False,
         _sample=lambda *a: SamplerOutput(torch.tensor([[7]]), None),
         _bookkeeping_sync=lambda *a: (0, None, [], {}, [], {}, []),
-        finalize_kv_connector=lambda: order.append("save"),
         propose_draft_token_ids=lambda *a: order.append("draft"),
         input_batch=SimpleNamespace(sampling_metadata=None),
         num_spec_tokens=1,
@@ -143,7 +146,7 @@ def test_sample_tokens_collects_deferred_store_in_the_same_output(
     )
     output = runner.sample_tokens(None)
 
-    assert order == ["draft", "save", "events"]
+    assert order == ["draft", "save", "events", "clear"]
     events = output.kv_connector_output.kv_cache_events
     assert events.get_number_of_workers() == 1
     assert events.aggregate().get_all_events() == [event]
