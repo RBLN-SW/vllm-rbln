@@ -2058,7 +2058,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     early_events = self.kv_connector_output.kv_cache_events
                     if early_events is not None:
                         # Both collections belong to this rank and this step.
-                        # Preserve early removals without counting stores twice.
+                        # Each occurrence counts as a rank vote, so replace the
+                        # batch with the deduplicated union, keeping early
+                        # removals; clear_events() keeps it one worker's vote.
                         events = list(
                             dict.fromkeys(
                                 early_events.get_all_events()
