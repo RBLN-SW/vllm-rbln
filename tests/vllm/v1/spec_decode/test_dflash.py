@@ -237,7 +237,9 @@ class TestSpanningBlockAllocation:
                 SimpleNamespace(num_reqs_padded=num_reqs),
                 None,
             ),
-            runner=SimpleNamespace(dp_status=None, kv_cache_bases=None),
+            runner=SimpleNamespace(
+                dp_status=None, kv_cache_bases=None, is_strict_kv_producer=False
+            ),
             dp_rank=0,
             max_num_tokens=n * QUERY_LEN,
             parallel_drafting_token_id=0,
@@ -366,6 +368,7 @@ class TestQueryPassBatch:
         max_tokens=None,
         specialized_moe_decode=False,
         dp_rank=0,
+        strict_kv_producer=False,
     ):
         max_tokens = self.MAX_TOKENS if max_tokens is None else max_tokens
         proposer = RBLNDFlashProposer.__new__(RBLNDFlashProposer)
@@ -378,6 +381,7 @@ class TestQueryPassBatch:
             ),
             dp_status=dp_status,
             kv_cache_bases=None,
+            is_strict_kv_producer=strict_kv_producer,
             input_batch=SimpleNamespace(num_reqs=num_reqs),
         )
         proposer.vllm_config = SimpleNamespace(
@@ -589,3 +593,67 @@ class TestQueryPassBatch:
             expected_bucket * NUM_SPEC,
         )
         assert calls.context["num_padded_tokens"] == expected_bucket * QUERY_LEN
+
+
+class TestStrictProducer:
+    """A producer writes the draft's context KV for the consumer to read and
+    drafts nothing, since nobody here verifies it."""
+
+    NUM_SPEC = 3
+    MAX_TOKENS = 64
+
+    def _proposer(self, *, strict_kv_producer):
+        proposer = RBLNDFlashProposer.__new__(RBLNDFlashProposer)
+        proposer.runner = SimpleNamespace(is_strict_kv_producer=strict_kv_producer)
+        proposer.num_speculative_tokens = self.NUM_SPEC
+        proposer.max_num_tokens = self.MAX_TOKENS
+        proposer.device = torch.device("cpu")
+        proposer.dp_rank = 0
+        proposer._proj_buckets = (1 + self.NUM_SPEC, self.MAX_TOKENS)
+        proposer._proj_states = torch.zeros(self.MAX_TOKENS, 4)
+        proposer._proj_positions = torch.zeros(1, self.MAX_TOKENS, dtype=torch.int64)
+        return proposer
+
+    def test_warm_up_binds_the_draft_kv_on_a_producer(self):
+        # The worker reserves draft runtimes off the declaration, so it has to
+        # agree with what warm-up does here.
+        proposer = self._proposer(strict_kv_producer=True)
+        proposer.runner.dp_status = None
+        proposer._project_context_kv = lambda *a, **k: None
+        proposer._build_dummy_attn_metadata = lambda *a, **k: "CAD"
+        decode_shaped: list[str] = []
+        proposer._run_query_pass = lambda *a, **k: decode_shaped.append("query")
+
+        proposer.dummy_run(num_reqs=2, num_tokens_per_req=4)
+
+        assert decode_shaped == ["query"]
+        assert proposer.warms_up_decode_graphs_on_a_producer is bool(decode_shaped)
+
+    def test_propose_writes_the_context_and_returns_no_drafts(self):
+        proposer = self._proposer(strict_kv_producer=True)
+        wrote: list[bool] = []
+        proposer._fill_first_pass_inputs = lambda *a, **k: (
+            0,
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        )
+        proposer._write_context_kv = lambda *a, **k: wrote.append(True)
+        proposer._run_query_pass = lambda *a, **k: pytest.fail(
+            "a producer must not run the query pass"
+        )
+        proposer.supports_mm_inputs = False
+        proposer.hidden_size = 4
+        proposer.runner.input_batch = SimpleNamespace(num_reqs=2)
+
+        drafts = proposer.propose(
+            target_token_ids=None,
+            target_positions=None,
+            target_hidden_states=torch.zeros(2, 4),
+            next_token_ids=None,
+            token_indices_to_sample=None,
+            common_attn_metadata=None,
+        )
+
+        assert wrote == [True]
+        assert drafts.shape == (2, self.NUM_SPEC)
+        assert not drafts.any()
