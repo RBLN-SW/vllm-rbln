@@ -96,8 +96,8 @@ def test_greedy_row_of_a_mixed_batch_samples_its_argmax(sampler):
         assert sampled[0].item() == 6
 
 
-def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
-    """The reference for the test above: `rbln::argmax` must answer the same."""
+def test_all_greedy_batch_takes_the_argmax(sampler, op_args):
+    """The reference for the test above: an all-greedy batch takes each row's argmax."""
     metadata = make_sampling_metadata(
         temperature=None,
         all_greedy=True,
@@ -108,4 +108,20 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
 
     # An all-greedy batch skips the top-k/top-p op entirely.
     assert op_args == []
+    assert sampled.tolist() == [6, 1]
+
+
+def test_host_logits_are_argmaxed_on_the_host(sampler):
+    """Logits on the host never reach the compiled argmax op, which would move
+    them to the NPU and the tokens back."""
+
+    def refuse(logits):
+        raise AssertionError("the compiled argmax ran on host logits")
+
+    sampler._compiled_greedy_sample = refuse
+    metadata = make_sampling_metadata(temperature=None, all_greedy=True, all_random=False)
+
+    sampled, _ = sampler.sample(near_tied_logits(), metadata)
+
+    assert sampled.dtype == torch.int32
     assert sampled.tolist() == [6, 1]

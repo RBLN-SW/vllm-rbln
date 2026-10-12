@@ -162,6 +162,10 @@ class RBLNSampler(VLLMSampler):
     def greedy_sample(
         self, logits: torch.Tensor, staging_owner: Any = None
     ) -> torch.Tensor:
+        # Logits the model returned to the host are reduced there: the compiled
+        # op would send them to the NPU and the tokens back for one argmax.
+        if logits.device.type == "cpu":
+            return torch.argmax(logits, dim=-1).to(torch.int32)
         out = self._compiled_greedy_sample(logits)
         return out if staging_owner is None else _stage_into(staging_owner, out)
 
