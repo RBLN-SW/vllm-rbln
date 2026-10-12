@@ -79,6 +79,7 @@ def _encode_payload(
     layer_names=None,
     kv_slices=1,
     regions_per_layer=1,
+    region_mem_types=None,
 ):
     if layer_names is None:
         layer_names = [
@@ -102,6 +103,7 @@ def _encode_payload(
         pp_size=pp_size,
         region_names=list(layer_names),
         kv_slices=kv_slices,
+        region_mem_types=region_mem_types,
     )
     payload = NixlHandshakePayload(
         compatibility_hash=compat,
@@ -162,6 +164,7 @@ class _FakeSock:
         peer_stamps=None,
         kv_slices=1,
         regions_per_layer=1,
+        region_mem_types=None,
     ):
         self.pp_size = pp_size
         self.tp_size = tp_size
@@ -177,6 +180,7 @@ class _FakeSock:
         # pp_rank, since layer ownership is a function of the stage alone.
         self.stage_layers = stage_layers
         self.kv_slices = kv_slices
+        self.region_mem_types = region_mem_types
         self.queried = []
         self._last = None
 
@@ -202,6 +206,7 @@ class _FakeSock:
             ),
             kv_slices=self.kv_slices,
             regions_per_layer=self.regions_per_layer,
+            region_mem_types=self.region_mem_types,
         )
         stamp = (
             self.peer_stamps.pop(0)
@@ -230,6 +235,7 @@ def _make_worker(
     # Host staging closes the D2D-only paths -- head matching and fan-in -- so
     # it is the default and a D2D shape has to ask for the device buffer.
     w.use_host_buffer = host_buffer
+    w.nixl_memory_type = "DRAM" if host_buffer else "VRAM"
     w.device_id = 0
     w.transfer_topo = MagicMock()
     w.transfer_topo.handshake_target_ranks.return_value = list(tp_target_ranks)
@@ -935,6 +941,38 @@ class TestPpHandshakeFanout:
 
         with pytest.raises(RuntimeError, match="per layer"):
             _handshake(w, sock, remote_tp_size=1)
+
+    @pytest.mark.parametrize("notif_only", [False, True], ids=["full", "notif_only"])
+    @pytest.mark.parametrize(
+        "host_buffer, peer_mem_type",
+        [
+            pytest.param(False, "DRAM", id="we_d2d_they_host"),
+            pytest.param(True, "VRAM", id="we_host_they_d2d"),
+        ],
+    )
+    def test_a_peer_on_the_other_buffer_device_is_refused_on_arrival(
+        self, host_buffer, peer_mem_type, notif_only
+    ):
+        # The peer publishes one region per layer against our two, so in the
+        # D2D case the pairing check refuses it under another name if this runs
+        # too late. A notif-only handshake builds nothing a later check sees.
+        w = _make_worker(tp_ratio=1, host_buffer=host_buffer)
+        w.local_seen_layer_names = ["layer.0"]
+        w.num_regions = 2
+        w._add_notif_only_remote_agent = MagicMock(return_value="n0")
+
+        with (
+            _patched_socket(_FakeSock(pp_size=1, region_mem_types=[peer_mem_type])),
+            pytest.raises(RuntimeError, match="same kv_buffer_device"),
+        ):
+            w._nixl_handshake("h", 1234, 1, "eng", notif_agents_only=notif_only)
+
+    def test_a_host_staging_peer_advertising_its_type_pairs(self):
+        w = _make_worker(tp_ratio=1, host_buffer=True)
+
+        agents, _ = _handshake(w, _FakeSock(pp_size=1, region_mem_types=["DRAM"]))
+
+        assert agents == {(0, 0): "agent-0"}
 
     def test_a_fanned_out_peer_alone_forces_the_per_shard_path(self):
         # Third companion: nothing narrows and no region is split, but the peer
