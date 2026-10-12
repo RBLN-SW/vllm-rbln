@@ -64,7 +64,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker imp
     RblnNixlPushConnectorWorker,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
-    _as_descs,
     kv_chunk_tokens,
 )
 
@@ -1143,7 +1142,26 @@ class TestPeerRegionView:
         addr, span, dev = (int(x) for x in plain[0])
         assert np.array_equal(
             both[len(plain) : len(plain) + 2],
-            _as_descs([(addr, span // 2, dev), (addr + span // 2, span // 2, dev)]),
+            [(addr, span // 2, dev), (addr + span // 2, span // 2, dev)],
+        )
+
+    def test_each_row_is_cut_at_its_own_length(self):
+        # The draft's regions are longer than the target's, so a chunk range
+        # cut at one length for every row is wrong for one of the two.
+        w = self._consumer()
+        peer = self._peer(
+            layer_names=["l5", "l6"],
+            block_lens=[self.TARGET_LEN] * 2 + [self.DRAFT_LEN] * 2,
+        )
+
+        plain = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
+        with patch.object(
+            RblnNixlPullConnectorWorker, "_shard_chunk_grid", return_value=(1, 2)
+        ):
+            both = w._build_fa_remote(self._plan(), peer, block_size_ratio=1)
+
+        assert [int(ln) for _, ln, _ in both[len(plain) :]] == (
+            [self.TARGET_LEN // 2] * 8 + [self.DRAFT_LEN // 2] * 8
         )
 
     def test_more_than_one_run_walks_the_piece(self):
@@ -1166,14 +1184,12 @@ class TestPeerRegionView:
         # run 0's two chunks, then run 1's -- the second run starts halfway.
         assert np.array_equal(
             both[len(plain) : len(plain) + 4],
-            _as_descs(
-                [
-                    (addr, quarter, dev),
-                    (addr + quarter, quarter, dev),
-                    (addr + 2 * quarter, quarter, dev),
-                    (addr + 3 * quarter, quarter, dev),
-                ]
-            ),
+            [
+                (addr, quarter, dev),
+                (addr + quarter, quarter, dev),
+                (addr + 2 * quarter, quarter, dev),
+                (addr + 3 * quarter, quarter, dev),
+            ],
         )
 
     def test_a_stage_starting_at_our_first_layer_needs_no_translation(self):
@@ -1529,6 +1545,30 @@ class TestShardLocalRegions:
             full_len // w._shape.window_ratio
         }
         assert {ln for _, ln, _ in blocks[window_end:]} == {full_len // (runs * chunks)}
+
+    def test_each_region_keeps_its_own_length_and_device_in_the_chunk_range(
+        self,
+    ):
+        # Two regions that differ in base, length, stride and device, so a row
+        # cannot take another region's length or device.
+        w = self._worker([], num_regions=0)
+        pieces = [(1000, 64, 128, 0), (5000, 32, 64, 1)]
+
+        descs = w._chunk_range_descs(pieces, num_blocks=2, grid=(1, 2))
+
+        assert np.array_equal(
+            descs,
+            [
+                (1000, 32, 0),
+                (1032, 32, 0),
+                (1128, 32, 0),
+                (1160, 32, 0),
+                (5000, 16, 1),
+                (5016, 16, 1),
+                (5064, 16, 1),
+                (5080, 16, 1),
+            ],
+        )
 
     def test_register_local_xfer_handler_routes_to_the_shard_path(self):
         # Dispatch to the shard path: no SWA window mode, layer names present. Miss
@@ -2507,7 +2547,7 @@ class TestHeadBandMatching:
         # Derived here rather than handed in, from the split this list used.
         assert grid.call_args.kwargs["split"] == 1
 
-        assert both[: len(plain)] == plain
+        assert np.array_equal(both[: len(plain)], plain)
         assert len(both) == len(plain) * 5
         start, span, _ = plain[0]
         assert [(a - start, ln) for a, ln, _ in both[len(plain) : len(plain) + 4]] == [
@@ -2960,6 +3000,18 @@ class TestDescriptorOrderContract:
             ((0, 1, 1), (2, 1, 0)),
             ((0, 1, 1), (3, 1, 0)),
         }
+
+    def test_k_and_v_nest_inside_each_peer_copy(self):
+        # The remote list names each copy in K and then V. At one copy or one
+        # half the two loops cannot be told apart, so both are two here.
+        w = self._worker()
+        _, local = w._register_shard_local_xfer_handler(
+            w.block_size, ("l0",), peer_areas=[0], replica_fanout=2, kv_runs=2
+        )
+
+        k, v, k_again, v_again = (int(a) for a, _, _ in local[:4])
+        assert k == k_again and v == v_again
+        assert v - k == int(local[0][1])
 
     def test_two_layers_pair_within_their_own_layer(self):
         # Two layers, so the layer axis can be reordered at all: reversing
@@ -4148,12 +4200,15 @@ class TestAddRemoteAgentSwa:
         # 2 regions x 8 blocks, whole then sw_ratio granules of each, and last
         # 2 regions x 8 blocks x 2 runs x 2 chunks.
         assert len(blocks_data) == 16 * (1 + worker._shape.window_ratio) + 64
-        assert blocks_data[48:52] == [
-            (0x5000, 64, 1),
-            (0x5040, 64, 1),
-            (0x5080, 64, 1),
-            (0x50C0, 64, 1),
-        ]
+        assert np.array_equal(
+            blocks_data[48:52],
+            [
+                (0x5000, 64, 1),
+                (0x5040, 64, 1),
+                (0x5080, 64, 1),
+                (0x50C0, 64, 1),
+            ],
+        )
 
     def test_a_smaller_remote_block_shortens_descs_and_adds_a_local_handle(
         self, monkeypatch
@@ -4274,6 +4329,30 @@ class TestDescriptorsNameTheRightElement:
             (0, 1, self.WANTED_HEAD),
             (1, 0, self.WANTED_HEAD),
             (1, 1, self.WANTED_HEAD),
+        ]
+
+    def test_each_piece_is_named_in_k_and_v_before_the_next(self):
+        # `_register_shard_local_xfer_handler` nests K/V inside the piece, and
+        # the two lists pair by position.
+        descs = self._worker(self.LOCAL_PAGE)._head_matched_desc(
+            region_id=0,
+            logical_r=0,
+            area_l=0,
+            geom=(self.WANTED_HEAD, 2, 1),
+            peer=(0, self.PEER_HEADS, 1, 2),
+            areas_r=2,
+            remote_bases=[self.PEER_BASE, 2000],
+            remote_lens=[self.PEER_PAGE, self.PEER_PAGE],
+            device_id=0,
+            num_blocks=1,
+            split=2,
+            kv_runs=2,
+        )
+        assert [self._decode(a, 2) for a, _, _ in descs] == [
+            (0, 0, self.WANTED_HEAD),
+            (0, 1, self.WANTED_HEAD),
+            (0, 0, self.WANTED_HEAD + 1),
+            (0, 1, self.WANTED_HEAD + 1),
         ]
 
     def test_a_packed_block_read_as_one_range_names_the_wrong_element(self):
