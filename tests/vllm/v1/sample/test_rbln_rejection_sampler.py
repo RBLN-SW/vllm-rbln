@@ -25,6 +25,7 @@ from vllm_rbln.v1.sample import rbln_rejection_sampler as module
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TOP_K,
     GREEDY_TOP_P,
+    TOP_P_CLAMP,
     build_op_top_k_top_p,
 )
 from vllm_rbln.v1.sample.rbln_rejection_sampler import (
@@ -103,9 +104,9 @@ def test_all_random_pure_multinomial():
 
     top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
 
-    # Pure multinomial: the compiler fills both with scalar neutrals.
+    # Pure multinomial: the compiler fills top_k with a scalar neutral.
     assert top_k is None
-    assert top_p is None
+    assert torch.equal(top_p, torch.full((2,), TOP_P_CLAMP))
 
 
 def test_all_random_top_k_only():
@@ -119,7 +120,7 @@ def test_all_random_top_k_only():
     top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
 
     assert top_k is metadata.top_k
-    assert top_p is None
+    assert torch.equal(top_p, torch.full((2,), TOP_P_CLAMP))
 
 
 def test_all_random_top_p_only():
@@ -163,7 +164,7 @@ def test_mixed_pure_multinomial():
     assert torch.equal(
         top_k, torch.tensor([VOCAB_SIZE, GREEDY_TOP_K], dtype=torch.int32)
     )
-    assert top_p is None
+    assert torch.equal(top_p, torch.full((2,), TOP_P_CLAMP))
 
 
 def test_mixed_top_k_only():
@@ -177,7 +178,7 @@ def test_mixed_top_k_only():
     top_k, top_p = build_op_top_k_top_p(metadata, 2, VOCAB_SIZE, DEVICE)
 
     assert torch.equal(top_k, torch.tensor([GREEDY_TOP_K, 3], dtype=torch.int32))
-    assert top_p is None
+    assert torch.equal(top_p, torch.full((2,), TOP_P_CLAMP))
 
 
 def test_mixed_top_p_only():

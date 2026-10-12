@@ -175,6 +175,17 @@ class RblnNixlWorkerBase(
         # engine_id -> the producer stages (flat global ranks) whose layers this
         # rank owns; the per-shard transfer path walks exactly these.
         self._overlapping_ranks: defaultdict[str, list[int]] = defaultdict(list)
+        self._engines_to_rehandshake: set[str] = set()
+        self._link_down_since = None
+        self._link_down_exit_s = connector_option(vllm_config, "link_down_exit_s", 0)
+        if (
+            self._link_down_exit_s > 0
+            and vllm_config.kv_transfer_config.kv_role != "kv_producer"
+        ):
+            raise RuntimeError(
+                "link_down_exit_s recycles a KV producer whose links died; a "
+                "consumer keeps its running requests and is recycled from outside."
+            )
         # Per producer shard, a local xfer dlist scoped to that shard's local
         # region subset, keyed by (engine_id, global_rank, block_size); and the
         # shard's per-region KV-group ids, keyed by (engine_id, global_rank).

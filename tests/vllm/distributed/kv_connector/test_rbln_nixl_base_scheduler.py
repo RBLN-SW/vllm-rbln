@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+    NixlBaseConnectorScheduler,
     NixlPullConnectorScheduler,
     NixlPushConnectorScheduler,
 )
@@ -31,8 +32,10 @@ from vllm.v1.request import RequestStatus
 
 import vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_scheduler as sm
 from tests.vllm.distributed.kv_connector.utils import (
+    fake_sysfs_net,
     mock_vllm_config,
     set_shape,
+    setattr_in_package,
     shape,
     sliding_window_spec,
 )
@@ -157,6 +160,7 @@ def _scheduler(*, use_host_buffer=False, cls=RblnNixlPullConnectorScheduler):
     sched._reqs_in_batch = set()
     sched._reqs_not_processed = set()
     sched._block_ids_need_save = {}
+    sched._exit_on_link_down = False
     # Upstream state the inherited entry points read.
     sched._heartbeat_by_engine = {}
     sched._heartbeat_req_engine = {}
@@ -1072,3 +1076,53 @@ class TestTailTokenCountOnTheWritePath:
 
         assert meta.valid_tokens == {}
         assert sched._valid_tokens == {"r0": 33}
+
+
+class TestLinkDownKeepsTheEngineStepping:
+    # The worker's exit runs on a step, so an idle producer with every link down
+    # must report pending work.
+
+    def test_all_links_down_is_pending_work(self, monkeypatch, tmp_path):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="down")
+        )
+        sched = _scheduler()
+        sched._exit_on_link_down = True
+        assert sched.has_pending_push_work()
+
+    def test_the_links_are_read_once_per_poll(self, monkeypatch, tmp_path):
+        sysfs = fake_sysfs_net(tmp_path, ens1="down")
+        setattr_in_package(monkeypatch, _SYS_CLASS_NET=sysfs)
+        sched = _scheduler()
+        sched._exit_on_link_down = True
+        assert sched.has_pending_push_work()
+        (sysfs / "ens1" / "operstate").write_text("up\n")
+        assert sched.has_pending_push_work()
+
+
+class TestLinkDownRefusesTheHandshake:
+    # An empty frame fails the peer's handshake at once instead of after the CM
+    # timeout of a dial that cannot succeed.
+
+    @staticmethod
+    def _served(monkeypatch):
+        served = []
+        monkeypatch.setattr(
+            NixlBaseConnectorScheduler,
+            "_nixl_handshake_listener",
+            staticmethod(lambda encoded, *_: served.append(encoded[(0, 0)])),
+        )
+        _scheduler()._nixl_handshake_listener({(0, 0): b"meta"})
+        return served
+
+    def test_all_links_down_answers_an_empty_frame(self, monkeypatch, tmp_path):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="down")
+        )
+        assert self._served(monkeypatch) == [b""]
+
+    def test_a_live_link_answers_the_metadata(self, monkeypatch, tmp_path):
+        setattr_in_package(
+            monkeypatch, _SYS_CLASS_NET=fake_sysfs_net(tmp_path, ens1="down", ens2="up")
+        )
+        assert self._served(monkeypatch) == [b"meta"]

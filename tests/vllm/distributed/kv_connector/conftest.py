@@ -29,6 +29,18 @@ from typing import Any
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_host_links(monkeypatch, tmp_path_factory):
+    """No test reads this host's links, or a reading another test cached."""
+    from tests.vllm.distributed.kv_connector.utils import setattr_in_package
+
+    setattr_in_package(
+        monkeypatch,
+        _SYS_CLASS_NET=tmp_path_factory.mktemp("sys_class_net"),
+        _link_poll=(-1.0, False),
+    )
+
+
 @pytest.fixture
 def make_worker(monkeypatch, tmp_path_factory):
     """Build a real RblnNixl*ConnectorWorker; call it from the test body."""
