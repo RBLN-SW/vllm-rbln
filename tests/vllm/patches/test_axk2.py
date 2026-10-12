@@ -243,6 +243,23 @@ def test_config_unpickles_where_vllm_rbln_has_not_been_imported(tmp_path):
     assert child.returncode == 0, child.stderr
 
 
+def test_model_loads_where_triton_is_not_installed():
+    # The SKT copy defines a CUDA-only Triton kernel at module level. RBLN images
+    # need not ship triton, so loading the model must not depend on it.
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.modules['triton'] = None; "
+            "import vllm_rbln.patches.axk2.model",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert child.returncode == 0, child.stderr
+
+
 def test_axk2_is_mla_once_the_registry_has_been_applied():
     """The MLA patch has to outlive our own ModelRegistry registration.
 
