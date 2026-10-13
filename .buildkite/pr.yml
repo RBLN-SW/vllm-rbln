@@ -41,6 +41,7 @@ steps:
           python -m pytest \
             tests/test_packaging_bounds.py \
             tests/test_python_support.py \
+            tests/test_os_support.py \
             -q
 
   # All gates must pass before the heavy test pipelines are even uploaded.
