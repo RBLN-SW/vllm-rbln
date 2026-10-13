@@ -30,10 +30,19 @@ from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.sample.ops.top_k_top_p import (
     GREEDY_TEMPERATURE,
     GREEDY_TOP_K,
+    TOP_P_CLAMP,
     build_op_top_k_top_p,
 )
 from vllm_rbln.v1.sample.rbln_logits_processor import RBLNMinTokensLogitsProcessor
-from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
+from vllm_rbln.v1.sample.rbln_sampler import (
+    RBLNSampler,
+    compile_sampler,
+    pad_rows_into,
+    rbln_apply_draft_penalties,
+    rbln_block_draft_tokens,
+    rbln_force_tokens,
+    thinking_budget_forced_tokens,
+)
 
 if TYPE_CHECKING:
     from rebel import CompileContext
@@ -84,6 +93,107 @@ class RBLNRejectionSampler(RejectionSampler):
             if use_rbln_sampler
             else TorchRejectionSamplerImpl()
         )
+        if use_rbln_sampler and USE_DEVICE_TENSOR:
+            self._compiled_apply_draft_penalties = compile_sampler(
+                rbln_apply_draft_penalties, compile_context
+            )
+            self._compiled_block_draft_tokens = compile_sampler(
+                rbln_block_draft_tokens, compile_context
+            )
+            self._compiled_force_tokens = compile_sampler(
+                rbln_force_tokens, compile_context
+            )
+            self._draft_logits: dict[tuple, torch.Tensor] = {}
+
+    def _pad_draft_rows(
+        self, logits: torch.Tensor, metadata: SpecDecodeMetadata
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pad the draft rows to [B*K], the fixed shape the graphs compile for.
+
+        Returns the padded logits and each row's request index.
+        """
+        assert isinstance(self.impl, RBLNRejectionSamplerImpl)
+        num_draft_tokens = metadata.num_draft_tokens
+        rows = len(num_draft_tokens) * self.impl.num_spec_tokens
+        draft_logits = pad_rows_into(self._draft_logits, logits, rows)
+        requests = torch.zeros(rows, dtype=torch.int64)
+        requests[: logits.shape[0]] = torch.arange(
+            len(num_draft_tokens)
+        ).repeat_interleave(torch.tensor(num_draft_tokens))
+        return draft_logits, requests.to(logits.device)
+
+    def apply_logits_processors(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        metadata: SpecDecodeMetadata,
+    ) -> torch.Tensor:
+        if not USE_DEVICE_TENSOR or not isinstance(self.impl, RBLNRejectionSamplerImpl):
+            return super().apply_logits_processors(logits, sampling_metadata, metadata)
+        blocked = sampling_metadata.allowed_token_ids_mask
+        if blocked is not None:
+            draft_logits, requests = self._pad_draft_rows(logits, metadata)
+            logits = self._compiled_block_draft_tokens(draft_logits, requests, blocked)[
+                : logits.shape[0]
+            ]
+            sampling_metadata = replace(sampling_metadata, allowed_token_ids_mask=None)
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is None or not holder.has_tracked_requests():
+            return super().apply_logits_processors(logits, sampling_metadata, metadata)
+        logits = super().apply_logits_processors(
+            logits,
+            replace(sampling_metadata, thinking_budget_state_holder=None),
+            metadata,
+        )
+        forced = thinking_budget_forced_tokens(
+            holder,
+            *logits.shape,
+            predict_bonus_token=False,
+            spec_token_ids=sampling_metadata.spec_token_ids,
+        )
+        if forced is None:
+            return logits
+        draft_logits, _ = self._pad_draft_rows(logits, metadata)
+        draft_forced = torch.zeros(draft_logits.shape, dtype=torch.bfloat16)
+        draft_forced[: logits.shape[0]] = forced
+        return self._compiled_force_tokens(
+            draft_logits, draft_forced.to(logits.device)
+        )[: logits.shape[0]]
+
+    def apply_penalties(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        metadata: SpecDecodeMetadata,
+        repeat_indices: torch.Tensor,
+        output_token_ids: list[list[int]],
+    ) -> torch.Tensor:
+        if (
+            sampling_metadata.no_penalties
+            or not USE_DEVICE_TENSOR
+            or not isinstance(self.impl, RBLNRejectionSamplerImpl)
+        ):
+            return super().apply_penalties(
+                logits, sampling_metadata, metadata, repeat_indices, output_token_ids
+            )
+        num_tokens, vocab = logits.shape
+        draft_logits, requests = self._pad_draft_rows(logits, metadata)
+        prompt_token_ids = sampling_metadata.prompt_token_ids
+        output = torch.full(
+            (draft_logits.shape[0], prompt_token_ids.shape[1]), vocab, dtype=torch.int64
+        )
+        for row, ids in enumerate(output_token_ids):
+            output[row, : len(ids)] = torch.tensor(ids, dtype=torch.int64)
+        output.masked_fill_(output == -1, vocab)
+        return self._compiled_apply_draft_penalties(
+            draft_logits,
+            requests,
+            prompt_token_ids,
+            output.to(logits.device),
+            sampling_metadata.presence_penalties,
+            sampling_metadata.frequency_penalties,
+            sampling_metadata.repetition_penalties,
+        )[:num_tokens]
 
     def forward(
         self,
@@ -659,6 +769,8 @@ def rbln_rejection_sample(
         target_logits, target_min_tokens_mask
     )
     target_probs = target_logits.softmax(dim=-1)
+    if top_p is not None:
+        top_p = top_p.clamp(max=TOP_P_CLAMP)
 
     # ------------------------------------------------------------------
     # rbln::rejection_sample Returns:

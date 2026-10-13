@@ -1597,7 +1597,6 @@ class TestDynamicKvUnsupportedReason:
     @staticmethod
     def _cfg(
         use_custom_kernel=False,
-        use_flash_causal_attn=True,
         use_dynamic_kv_cache=None,
         speculative_method=None,
         block_size=16,
@@ -1607,7 +1606,6 @@ class TestDynamicKvUnsupportedReason:
         return SimpleNamespace(
             additional_config=RBLNConfig(
                 use_custom_kernel=use_custom_kernel,
-                use_flash_causal_attn=use_flash_causal_attn,
                 use_dynamic_kv_cache=use_dynamic_kv_cache,
             ),
             speculative_config=(
@@ -1649,10 +1647,9 @@ class TestDynamicKvUnsupportedReason:
         ("config_overrides", "expected"),
         [
             ({"block_size": 32}, "block_size == max_model_len"),
-            ({"use_flash_causal_attn": False}, "flash causal attention is off"),
             ({"speculative_method": "dflash"}, "DFlash drafter is non-causal"),
         ],
-        ids=["normal-attention", "flash-causal-off", "dflash-drafter"],
+        ids=["normal-attention", "dflash-drafter"],
     )
     def test_non_paged_attention_is_unsupported(self, config_overrides, expected):
         reason = dynamic_kv_unsupported_reason(self._cfg(**config_overrides))

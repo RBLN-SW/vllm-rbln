@@ -853,7 +853,7 @@ def test_min_tokens_masks_stop_tokens(rejection_sampler):
     # Build through the RBLN builder, as the model runner does; with
     # speculative decoding enabled it creates only the MinTokens processor.
     logitsprocs = build_rbln_logitsprocs(
-        SimpleNamespace(speculative_config=Mock()),
+        SimpleNamespace(speculative_config=Mock(num_speculative_tokens=2)),
         torch.device(DEVICE),
         is_pin_memory=False,
         is_pooling_model=False,

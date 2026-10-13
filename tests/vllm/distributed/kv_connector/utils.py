@@ -893,6 +893,8 @@ def build_worker(
     push_stream=False,
     cls=None,
     swa_kernel_block=None,
+    kv_role="kv_both",
+    link_down_exit_s=0,
 ):
     """The worker via its real __init__, with upstream's stubbed to set only what
     the RBLN overrides read and `nixl_rbln` faked present or absent.
@@ -970,6 +972,7 @@ def build_worker(
         swa_window_mode=swa_window_mode,
         stripe_width=stripe_width,
         push_stream=push_stream,
+        link_down_exit_s=link_down_exit_s,
     )
     vllm_config.cache_config = CacheConfig(block_size=block_size)
     # What the worker sets before it builds the connector; `register_kv_caches`
@@ -991,6 +994,7 @@ def build_worker(
         # names so replacing the mocked config here does not resize a chunk.
         max_num_batched_tokens=128,
     )
+    vllm_config.kv_transfer_config.kv_role = kv_role
     kv_cache_config = MagicMock()
     kv_cache_config.num_blocks = num_blocks
     # The pool lists exactly the layers the groups carry: `canonical_kv_layers`
@@ -1028,3 +1032,14 @@ def build_worker(
     vllm_config.compilation_config.static_forward_context = ctx
     worker_cls = cls or RblnNixlPullConnectorWorker
     return worker_cls(vllm_config, "test-engine", kv_cache_config)
+
+
+def fake_sysfs_net(tmp_path, **operstate: str):
+    """A `/sys/class/net` with a veth and the given physical links."""
+    (tmp_path / "eth0").mkdir()
+    (tmp_path / "eth0" / "operstate").write_text("up\n")
+    for name, state in operstate.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "device").touch()
+        (tmp_path / name / "operstate").write_text(f"{state}\n")
+    return tmp_path

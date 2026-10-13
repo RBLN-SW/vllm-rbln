@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import numpy as np
@@ -82,6 +84,32 @@ def kv_chunk_tokens(
         for size in range(min(want, span_tokens), span_tokens + 1)
         if span_tokens % size == 0
     )
+
+
+_SYS_CLASS_NET = Path("/sys/class/net")
+_LINK_POLL_S = 1.0
+# (read at, every link down), shared by every caller in the process.
+_link_poll: tuple[float, bool] = (-_LINK_POLL_S, False)
+
+
+def every_local_link_down() -> bool:
+    """Every physical link in this namespace is down; a veth has no `device`."""
+    global _link_poll
+    now = time.monotonic()
+    read_at, all_down = _link_poll
+    if now - read_at < _LINK_POLL_S:
+        return all_down
+    states = []
+    for dev in _SYS_CLASS_NET.iterdir():
+        if not (dev / "device").exists():
+            continue
+        try:
+            states.append((dev / "operstate").read_text().strip())
+        except FileNotFoundError:  # unregistered since the listing
+            continue
+    all_down = bool(states) and all(s == "down" for s in states)
+    _link_poll = (now, all_down)
+    return all_down
 
 
 def _as_descs(blocks_data: list[tuple[int, int, int]]) -> np.ndarray:
@@ -210,6 +238,10 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         """
         return self._spans_per_block * (1 if chunk_grid is None else chunk_grid[1])
 
+    _engines_to_rehandshake: set[str]
+    _link_down_since: float | None
+    _link_down_exit_s: int
+
     @property
     def topo(self) -> RblnTransferTopology:
         """The transfer topology, which registration produces.
@@ -248,6 +280,8 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         if meta is not None and not meta.local_block_ids:
             assert handle is None
             return True
+        if meta is not None and meta.remote is not None:
+            self._engines_to_rehandshake.add(meta.remote.engine_id)
         return super()._handle_failed_transfer(req_id, handle, failed_req_ids)
 
     def _layer_overlap(

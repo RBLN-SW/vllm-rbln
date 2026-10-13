@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,9 @@ import numpy as np
 import zmq
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineTransferInfo,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlAgentMetadata,
@@ -45,6 +49,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     RblnNixlWorkerState,
     _as_descs,
+    every_local_link_down,
 )
 from vllm_rbln.logger import init_logger
 
@@ -546,6 +551,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 exc_info=True,
             )
             self._remote_agents.pop(engine_id, None)
+        self._engines_to_rehandshake.discard(engine_id)
 
     def _send_heartbeats(self, metadata: "NixlConnectorMetadata") -> None:
         """Upstream's heartbeat, treating a send failure as the peer being gone.
@@ -588,6 +594,49 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     # and the teardown drops them all.
                     self._handle_dead_engine(engine_id, error=e)
                     break
+
+    def _ensure_handshake(self, *args: Any, **kwargs: Any) -> Future | None:
+        # A dial from a dead local link leaves nixl a half-loaded remote that
+        # fails every later handshake, so nothing is dialled until it is back.
+        if self._link_down_since is None:
+            return super()._ensure_handshake(*args, **kwargs)
+        failed: Future = Future()
+        failed.set_exception(RuntimeError("every local RDMA link is down"))
+        return failed
+
+    def get_transfer_results(self) -> KVConnectorTransferResults:
+        now = time.monotonic()
+        if not every_local_link_down():
+            self._link_down_since = None
+        elif self._link_down_since is None:
+            self._link_down_since = now
+            logger.warning("Every local RDMA link is down; KV transfers fail.")
+        elif 0 < self._link_down_exit_s <= now - self._link_down_since:
+            raise RuntimeError(
+                f"Every local RDMA link down for {self._link_down_exit_s}s; "
+                "exiting so this KV producer is recycled."
+            )
+        results = super().get_transfer_results()
+        # A dead peer stays known -- every read refreshes its TTL on the way to
+        # failing -- so upstream never re-dials it. Drop it once no handle of
+        # its is in flight; a handle whose request is gone has no known owner.
+        if self._engines_to_rehandshake:
+            busy = {
+                meta.remote.engine_id
+                if (meta := self._recving_metadata.get(req_id)) and meta.remote
+                else None
+                for req_id, handles in self._recving_transfers.items()
+                if handles
+            }
+            if None not in busy:
+                for engine_id in self._engines_to_rehandshake - busy:
+                    if engine_id in self._remote_agents:
+                        logger.warning(
+                            "Re-handshaking unreachable engine %s.", engine_id
+                        )
+                        self._handle_dead_engine(engine_id)
+                self._engines_to_rehandshake &= busy
+        return results
 
     def _fan_in_peer_areas(
         self, remote_tp_rank: int, remote_tp_size: int
@@ -1112,6 +1161,10 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         )
         payload_bytes, perf_bytes = sock.recv_multipart()
         recv_time = time.perf_counter()
+        if not payload_bytes:
+            raise RuntimeError(
+                f"engine {expected_engine_id} reports every RDMA link down"
+            )
         try:
             handshake_payload = msgspec.msgpack.Decoder(NixlHandshakePayload).decode(
                 payload_bytes
