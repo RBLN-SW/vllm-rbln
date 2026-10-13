@@ -2952,7 +2952,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         device = self.device if USE_DEVICE_TENSOR else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
         buffers = {
-            extent: torch.zeros(extent[1], dtype=torch.int8, device=device)
+            extent: torch.empty(extent[1], dtype=torch.int8, device=device)
             for extent in set(extent_of.values())
         }
         kv_cache_raw_tensors = {
