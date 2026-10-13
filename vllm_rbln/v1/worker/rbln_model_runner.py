@@ -138,6 +138,7 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -795,6 +796,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
+            # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+            if self.rbln_config.use_custom_sampler and (
+                sampling_params := request.sampling_params
+            ):
+                sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
