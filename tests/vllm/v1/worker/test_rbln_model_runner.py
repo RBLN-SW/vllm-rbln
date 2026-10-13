@@ -1175,6 +1175,7 @@ class TestUpdateStates:
             is_pooling_model=False,
             sort_batch_by_length=False,
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            rbln_config=RBLNConfig(),
         )
 
     def test_new_request_added(self, monkeypatch):
