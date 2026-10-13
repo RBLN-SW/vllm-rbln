@@ -57,7 +57,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
 )
@@ -707,7 +709,7 @@ class RBLNMiniMaxM3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class RBLNMiniMaxM3Model(nn.Module):
+class RBLNMiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -767,14 +769,24 @@ class RBLNMiniMaxM3Model(nn.Module):
         # islice, not a slice: on torch >= 2.12 Dynamo lifts the parameters of a
         # sliced ModuleList into graph inputs, and the compiler then sees no
         # constant weights (an MXFP8 dense cannot pack).
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, residual
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        # EAGLE3 drafts off the aux states (layers from the draft config, else
+        # upstream's default (2, L // 2, L - 3)).
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -870,7 +882,7 @@ class RBLNMiniMaxM3Model(nn.Module):
         return loaded_params
 
 
-class RBLNMiniMaxM3SparseForCausalLM(nn.Module, SupportsPP):
+class RBLNMiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
 
     packed_modules_mapping = {
@@ -1006,7 +1018,7 @@ class _RBLNVisionEncoder(nn.Module):
     dummy_inputs=_mm_preprocess.MiniMaxM3VLDummyInputsBuilder,
 )
 class RBLNMiniMaxM3SparseForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3
 ):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
