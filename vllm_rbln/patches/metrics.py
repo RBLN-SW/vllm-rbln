@@ -100,6 +100,9 @@ class _Metrics:
             "call_count": self.call_count,
             "mean_latency_ms": self.mean_latency_ms(),
             "latency_percentiles_ms": self.latency_percentiles_ms(),
+            # Per pass, in execution order: the aggregates above cannot tell one
+            # slow pass from a drift or a bimodal split.
+            "latencies_ms": [round(t * 1000.0, 3) for t in self.latencies],
         }
 
 

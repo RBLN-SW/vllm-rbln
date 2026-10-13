@@ -118,14 +118,18 @@ class TestMetrics:
         assert set(pct) == {"p50", "p90", "p99"}
         assert pct["p50"] == 20.0  # median of [10,20,30] ms
 
-    def test_to_dict_carries_count_and_latencies_only(self):
+    def test_to_dict_carries_aggregates_and_per_pass_ms(self):
         m = pm._Metrics()
         m.record(0.01)
-        assert set(m.to_dict()) == {
+        m.record(0.0201234)
+        d = m.to_dict()
+        assert set(d) == {
             "call_count",
             "mean_latency_ms",
             "latency_percentiles_ms",
+            "latencies_ms",
         }
+        assert d["latencies_ms"] == [10.0, 20.123]
 
 
 class TestPassAccounting:
@@ -256,6 +260,7 @@ class TestWriteMetricsJson:
         data = json.loads((tmp_path / "metrics.json").read_text())
         assert data["name"] == "runner" and data["rank"] == ""
         assert data["sections"]["E2E (DECODE)"]["call_count"] == 1
+        assert data["sections"]["E2E (DECODE)"]["latencies_ms"] == [10.0]
 
     def test_rank_tag_lowercased_into_filename_suffix(self, monkeypatch, tmp_path):
         monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
