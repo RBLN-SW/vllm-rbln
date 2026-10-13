@@ -665,3 +665,177 @@ class TestDescriptors:
         for descriptor in ours:
             owner, attr = registry._resolve_patch_target_owner(descriptor.target)
             assert hasattr(owner, attr), descriptor.target
+
+
+class TestTimeline:
+    def _names(self, entry):
+        return [name for name, _ in entry["marks"]]
+
+    def test_recorded_pass_gets_bounded_monotonic_marks(self, ctx, clock):
+        ctx.start_pass()
+        ctx.mark("probe")
+        ctx.mark_phase(pm._Phase.DECODE)
+        ctx.add_graph_time(1 * MS)
+        ctx.end_pass()
+
+        (entry,) = ctx._timeline
+        assert self._names(entry) == ["pass_start", "probe", "pass_end"]
+        stamps = [t for _, t in entry["marks"]]
+        assert stamps == sorted(stamps) and all(isinstance(t, int) for t in stamps)
+        assert entry["phase"] == "DECODE" and entry["index"] == 0
+        assert entry["wall_start_ns"] > 0 and entry["thread_cpu_ns"] >= 0
+
+    def test_index_follows_the_phase_latencies(self, ctx, clock):
+        run_pass(ctx, clock, phase=pm._Phase.PREFILL, model=1 * MS)
+        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=1 * MS)
+        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=1 * MS)
+        assert [(e["phase"], e["index"]) for e in ctx._timeline] == [
+            ("PREFILL", 0),
+            ("DECODE", 0),
+            ("DECODE", 1),
+        ]
+
+    def test_dropped_pass_leaves_no_timeline_entry(self, ctx, clock):
+        # Dropped together with the latencies, so (phase, index) stays aligned.
+        ctx.start_pass()
+        ctx.mark("probe")
+        ctx.end_pass()  # no phase, no graph time
+        assert ctx._timeline == []
+
+    def test_marks_outside_a_pass_are_ignored(self, ctx, clock):
+        ctx.mark("stray")
+        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=1 * MS)
+        assert "stray" not in self._names(ctx._timeline[0])
+
+    def test_wrappers_stamp_a_full_decode_pass_in_order(self, monkeypatch, clock):
+        monkeypatch.setattr(
+            pm,
+            "_determine_batch_execution_and_padding",
+            lambda self, *a, **k: (_desc(4), None, None),
+        )
+
+        def fake_load_model(self, *a, **k):
+            self.model_executable = lambda **kw: "logits"
+
+        def fake_execute_model(self, *a, **k):
+            with pm.timed_region("rbln_model_runner: preprocess"):
+                pm.determine_batch_execution_and_padding(self, 1, 1)
+            self.model_executable(step=1)
+            with pm.timed_region("rbln_model_runner: postprocess"):
+                pass
+            return None
+
+        def fake_sample_tokens(self, *a, **k):
+            pm.sample(self)
+            pm.bookkeeping_sync(self)
+            return "output"
+
+        monkeypatch.setattr(pm, "_load_model", fake_load_model)
+        monkeypatch.setattr(pm, "_execute_model", fake_execute_model)
+        monkeypatch.setattr(pm, "_sample_tokens", fake_sample_tokens)
+        monkeypatch.setattr(pm, "_sample", lambda self, *a, **k: "sampled")
+        monkeypatch.setattr(pm, "_bookkeeping_sync", lambda self, *a, **k: "kept")
+        monkeypatch.setattr(pm, "_rank_tag", lambda: "")
+        runner = _Runner()
+        pm.load_model(runner)
+
+        assert pm.execute_model(runner) is None
+        assert pm.sample_tokens(runner) == "output"
+
+        (entry,) = pm._ctx(runner)._timeline
+        assert self._names(entry) == [
+            "pass_start",
+            "preprocess.enter",
+            "dp_padding.enter",
+            "dp_padding.exit",
+            "preprocess.exit",
+            "model_executable.enter",
+            "model_executable.exit",
+            "postprocess.enter",
+            "postprocess.exit",
+            "execute_model.return",
+            "sample_tokens.enter",
+            "sample.enter",
+            "sample.exit",
+            "bookkeep.enter",
+            "bookkeep.exit",
+            "pass_end",
+        ]
+        assert entry["phase"] == "DECODE"
+
+    def test_only_the_graph_region_adds_graph_time(self, ctx, clock, monkeypatch):
+        monkeypatch.setattr(pm, "_ACTIVE_CTX", ctx)
+        ctx.start_pass()
+        with pm.timed_region("rbln_model_runner: preprocess"):
+            clock.advance(3 * MS)
+        assert ctx._graph_latency is None
+        assert ctx._marks is not None
+        assert [n for n, _ in ctx._marks][-2:] == [
+            "preprocess.enter",
+            "preprocess.exit",
+        ]
+
+
+class TestWriteTimelineJson:
+    def _entry(self):
+        return {"phase": "DECODE", "index": 0, "marks": [["pass_start", 1]]}
+
+    def test_no_metrics_dir_skips_write(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", "")
+        pm._write_timeline_json("runner", "", [self._entry()])  # must not raise
+        assert list(tmp_path.iterdir()) == []
+
+    def test_empty_timeline_skips_write(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        pm._write_timeline_json("runner", "DP0 EP0", [])
+        assert list(tmp_path.iterdir()) == []
+
+    def test_writes_its_own_compact_file_per_rank(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        pm._write_timeline_json("runner", "DP0 EP0", [self._entry()])
+        path = tmp_path / "timeline_dp0_ep0.json"
+        text = path.read_text()
+        assert "\n" not in text
+        data = json.loads(text)
+        assert data["rank"] == "DP0 EP0" and data["passes"] == [self._entry()]
+        assert "clock" in data["schema"]
+
+    def test_print_stats_leaves_the_metrics_json_shape_alone(
+        self, ctx, clock, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
+        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=1 * MS, sample=1 * MS)
+        ctx.print_stats()
+
+        metrics = json.loads((tmp_path / "metrics.json").read_text())
+        assert set(metrics) == {"name", "rank", "sections"}
+        assert set(metrics["sections"]["E2E (DECODE)"]) == {
+            "call_count",
+            "mean_latency_ms",
+            "latency_percentiles_ms",
+            "latencies_ms",
+        }
+        timeline = json.loads((tmp_path / "timeline.json").read_text())
+        assert len(timeline["passes"]) == 1
+
+
+class TestExecutorStepLatencyPull:
+    """vllm-rbln-executor's measure (suites/vllm_decoderonly/step_latencies.py)
+    pulls the per-pass latencies over collective_rpc by reading the context's
+    private fields. Pin exactly what it reads, so the timeline cannot break it."""
+
+    def test_the_fields_the_executor_reads_are_unchanged(self, monkeypatch, clock):
+        monkeypatch.setattr(pm, "_rank_tag", lambda: "DP0 EP0")
+        runner = _Runner()
+        ctx = pm._ctx(runner)
+        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=2 * MS, sample=1 * MS)
+
+        pulled = getattr(runner, "_metrics_ctx", None)
+        assert pulled is ctx and pulled.rank_tag == "DP0 EP0"
+        sections = {}
+        for label, attr in (("MODEL + SAMPLE", "_graph"), ("E2E", "_e2e")):
+            for phase, metrics in getattr(pulled, attr, {}).items():
+                sections[f"{label} ({phase.value})"] = [
+                    round(t * 1000.0, 3) for t in metrics.latencies
+                ]
+        assert sections == {"MODEL + SAMPLE (DECODE)": [3.0], "E2E (DECODE)": [3.0]}
