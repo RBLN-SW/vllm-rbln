@@ -23,6 +23,7 @@ import pytest
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.metrics.stats import PrefixCacheStats
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
@@ -205,6 +206,124 @@ class TestUpdateFromOutput:
         out = sched.schedule()
         sched.update_from_output(out, make_model_runner_output(out, 1))
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
+
+
+@pytest.mark.usefixtures("cr13")
+class TestSubBlockIndexAfterSpecDecodeStop:
+    # A request whose last decode step lands num_computed_tokens on a block
+    # boundary frees its last block without the synthetic hash, while the index
+    # still lists the sub-blocks recorded during decode.
+    _BS = 16
+    _SUB = 4
+    _PROMPT = list(range(1000, 1024))  # one full block and 8 tokens
+    _PROBE = list(range(2000, 2009))  # two sub-blocks and one token
+    _FILLER = list(range(4000, 4009))
+
+    def _scheduler(self):
+        return create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=self._BS,
+            max_num_batched_tokens=self._BS,
+            sub_block_size=self._SUB,
+            max_model_len=128,
+            num_blocks=20,
+            num_speculative_tokens=3,
+        )
+
+    @staticmethod
+    def _step(sched, sampled=None, spec=None):
+        for req_id, ids in (spec or {}).items():
+            sched.requests[req_id].spec_token_ids = list(ids)
+        out = sched.schedule()
+        req_ids = list(out.num_scheduled_tokens)
+        sched.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                sampled_token_ids=[list((sampled or {}).get(r, [])) for r in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return out
+
+    def _run_long_request(self, sched, *, last_step_spec):
+        # Prefill in two chunks, then one decode step with 3 drafts all accepted
+        # (computed 28, 3 sub-blocks of block 1 indexed), then the last step.
+        req = make_request("long", self._PROMPT, self._BS, max_tokens=6)
+        sched.add_request(req)
+        self._step(sched)
+        self._step(sched, sampled={"long": [7]})
+        self._step(sched, sampled={"long": [7] * 4}, spec={"long": [7] * 3})
+        block1 = sched.kv_cache_manager.coordinator.get_blocks("long")[0][1]
+        n = len(last_step_spec)
+        self._step(
+            sched, sampled={"long": [7] * (n + 1)}, spec={"long": last_step_spec}
+        )
+        assert req.is_finished()
+        return req, block1
+
+    def _run_probe(self, sched, req_id, tokens=None):
+        tokens = self._PROBE if tokens is None else tokens
+        sched.add_request(make_request(req_id, tokens, self._BS, max_tokens=1))
+        out = self._step(sched, sampled={req_id: [7]})
+        return out.scheduled_new_reqs[0].block_ids[0][0]
+
+    def test_reusing_a_hashless_block_removes_its_sub_block_index(self):
+        sched = self._scheduler()
+        req, block1 = self._run_long_request(sched, last_step_spec=[7] * 3)
+        # max_tokens stopped the request after one of the four sampled tokens,
+        # but num_computed_tokens kept all four.
+        assert req.num_computed_tokens == 32 > req.num_tokens - 1
+        manager = sched.kv_cache_manager
+        idx = manager._group_infos[0].sub_block_index
+        assert block1.block_hash is None
+        assert idx.contains(block1.block_id)
+        pool = manager.block_pool
+        reused = pool.get_new_blocks(pool.get_num_free_blocks())
+        assert block1 in reused
+        assert not idx.contains(block1.block_id)
+        pool.free_blocks(reused)
+
+    def test_probe_after_the_long_request_matches(self):
+        sched = self._scheduler()
+        self._run_long_request(sched, last_step_spec=[7] * 3)
+        # The block past the boundary went back to the queue head after block 1.
+        self._run_probe(sched, "filler", self._FILLER)
+        self._run_probe(sched, "probe")
+        repeat = make_request("repeat", self._PROBE, self._BS, max_tokens=1)
+        match = sched.kv_cache_manager.get_computed_blocks_sub_block(repeat, 0)
+        assert match is not None and match.num_tokens == 2 * self._SUB
+        sched.kv_cache_manager.release_sub_block_match(match)
+
+    def test_old_prefix_does_not_match_a_block_overwritten_by_the_probe(self):
+        sched = self._scheduler()
+        self._run_long_request(sched, last_step_spec=[7] * 3)
+        self._run_probe(sched, "filler", self._FILLER)
+        probe_block = self._run_probe(sched, "probe")
+        query = make_request("old", self._PROMPT[: 16 + 12] + [3000] * 4, self._BS)
+        m = sched.kv_cache_manager
+        _, num_computed, _ = m.get_computed_blocks(query)
+        match = m.get_computed_blocks_sub_block(query, num_computed)
+        if match is not None:
+            src = match.group_matches[0].src_block.block_id
+            m.release_sub_block_match(match)
+            assert src != probe_block, "matched KV the probe overwrote"
+
+    def test_without_overshoot_the_probe_matches(self):
+        # Control: the last step schedules no drafts, so num_computed_tokens stops
+        # inside block 1 and free gives it the synthetic hash.
+        sched = self._scheduler()
+        req, _ = self._run_long_request(sched, last_step_spec=[])
+        assert req.num_computed_tokens == req.num_tokens - 1
+        self._run_probe(sched, "filler", self._FILLER)
+        self._run_probe(sched, "probe")
+        repeat = make_request("repeat", self._PROBE, self._BS, max_tokens=1)
+        match = sched.kv_cache_manager.get_computed_blocks_sub_block(repeat, 0)
+        assert match is not None and match.num_tokens == 2 * self._SUB
+        sched.kv_cache_manager.release_sub_block_match(match)
 
 
 @pytest.mark.usefixtures("cr13")
