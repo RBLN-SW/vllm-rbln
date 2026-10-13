@@ -138,6 +138,7 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -428,7 +429,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,
-            reasoning_config=self.vllm_config.reasoning_config,
         )
 
         # Persistent buffers
@@ -796,6 +796,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
+            # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+            if self.rbln_config.use_custom_sampler and (
+                sampling_params := request.sampling_params
+            ):
+                sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
@@ -1345,49 +1350,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         num_reqs = self.input_batch.num_reqs
-        bucket = (
-            logits.shape[0]
-            if spec_decode_metadata is None
-            else self.bucketing_manager.max_batch_size
-        )
-        if (
-            sampling_metadata.allowed_token_ids_mask is not None
-            and USE_DEVICE_TENSOR
-            and isinstance(self.sampler, RBLNSampler)
-        ):
-            # NOTE(RBLN): InputBatch's mask rows have applied a finished request's
-            # mask to a later request, so only rows of requests with one are kept.
-            rows = [
-                row
-                for row, req_id in enumerate(self.input_batch.req_ids)
-                if self.requests[req_id].sampling_params.allowed_token_ids
-            ]
-            mask = self.input_batch.allowed_token_ids_mask_cpu_tensor
-            blocked = torch.zeros(bucket, logits.shape[1], dtype=torch.bfloat16)
-            blocked[rows] = mask[rows].to(torch.bfloat16)
-            sampling_metadata = dataclasses.replace(
-                sampling_metadata, allowed_token_ids_mask=blocked.to(logits.device)
-            )
-        if (
-            not sampling_metadata.no_penalties
-            and USE_DEVICE_TENSOR
-            and isinstance(self.sampler, RBLNSampler)
-        ):
-            # NOTE(RBLN): A power-of-two width that also fits the outputs and drafts
-            # keeps the compiled penalties graphs from recompiling as outputs grow.
-            prompt_lens = self.input_batch.num_prompt_tokens[:num_reqs]
-            spec_lens = map(len, sampling_metadata.spec_token_ids or [[]] * num_reqs)
-            output_lens = map(len, sampling_metadata.output_token_ids)
-            lengths = [*prompt_lens, *map(sum, zip(output_lens, spec_lens))]
-            width = 1 << (int(max(lengths)) - 1).bit_length()
-            prompt = np.full((bucket, width), self.input_batch.vocab_size, np.int64)
-            for row, length in enumerate(prompt_lens):
-                prompt[row, :length] = self.input_batch.token_ids_cpu[row, :length]
-            sampling_metadata = dataclasses.replace(
-                sampling_metadata,
-                prompt_token_ids=torch.from_numpy(prompt).to(logits.device),
-            )
         if spec_decode_metadata is None:
+            bucket = logits.shape[0]
             # Keyed off the installed sampler: only RBLNSampler takes the kwarg,
             # and the executor's golden validation swaps self.sampler after __init__.
             staging = (
@@ -1402,6 +1366,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             )
         else:
             if self.rbln_config.use_custom_sampler:
+                bucket = self.bucketing_manager.max_batch_size
                 spec_decode_metadata = _pad_spec_decode_metadata(
                     spec_decode_metadata, bucket
                 )
@@ -1955,20 +1920,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # advanced from real sampled tokens in update_from_output, and EngineCore
         # holds this call back until the previous step's tokens have gone through
         # it, so the mask is never built from a -1 placeholder.
-        if (
-            grammar_output is not None
-            and USE_DEVICE_TENSOR
-            and isinstance(self.sampler, RBLNSampler)
-        ):
-            # NOTE(RBLN): A host round trip of the logits has returned a partial copy.
-            mask = torch.zeros(logits.shape, dtype=torch.float32)
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, mask
-            )
-            logits = self.sampler.apply_token_mask(
-                logits, (mask == 0).to(logits.device)
-            )
-        elif grammar_output is not None:
+        if grammar_output is not None:
             # NOTE(RBLN): `xgr.apply_token_bitmask_inplace` requires logits
             # to be float32 dtype for CPU tensors
             origin_dtype, origin_device = logits.dtype, logits.device
@@ -2921,7 +2873,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
-                reasoning_config=self.vllm_config.reasoning_config,
             )
 
         assert self._init_block_sizes == block_sizes, (

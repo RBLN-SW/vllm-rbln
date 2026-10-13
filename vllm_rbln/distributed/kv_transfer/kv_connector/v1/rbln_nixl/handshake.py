@@ -1202,6 +1202,20 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                 "Remote NIXL agent engine ID mismatch. "
                 f"Expected {expected_engine_id}, received {metadata.engine_id}."
             )
+        # Ahead of the geometry checks, so the refusal names the cause.
+        peer_mem_types = set(metadata.region_mem_types or [self.nixl_memory_type])
+        if peer_mem_types != {self.nixl_memory_type}:
+            peer_devices = "/".join(
+                sorted({"rbln" if mem == "VRAM" else "cpu" for mem in peer_mem_types})
+            )
+            raise RuntimeError(
+                f"RBLN NIXL: the peer runs kv_buffer_device={peer_devices!r} and "
+                f"this worker {self.kv_buffer_device!r} (it registered "
+                f"{sorted(peer_mem_types)} against our {self.nixl_memory_type!r}). "
+                "P and D must use the same one: 'rbln' registers device memory "
+                "per chiplet area and 'cpu' a host staging buffer per layer, and "
+                "the two region lists cannot be paired."
+            )
         # Refused on arrival, not where it is first divided by.
         if metadata.kv_slices <= 0:
             raise RuntimeError(
