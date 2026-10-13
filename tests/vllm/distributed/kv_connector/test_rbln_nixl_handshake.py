@@ -235,6 +235,7 @@ def _make_worker(
     # Host staging closes the D2D-only paths -- head matching and fan-in -- so
     # it is the default and a D2D shape has to ask for the device buffer.
     w.use_host_buffer = host_buffer
+    w.kv_buffer_device = "cpu" if host_buffer else "rbln"
     w.nixl_memory_type = "DRAM" if host_buffer else "VRAM"
     w.device_id = 0
     w.transfer_topo = MagicMock()
@@ -944,14 +945,14 @@ class TestPpHandshakeFanout:
 
     @pytest.mark.parametrize("notif_only", [False, True], ids=["full", "notif_only"])
     @pytest.mark.parametrize(
-        "host_buffer, peer_mem_type",
+        "host_buffer, peer_mem_type, peer_device",
         [
-            pytest.param(False, "DRAM", id="we_d2d_they_host"),
-            pytest.param(True, "VRAM", id="we_host_they_d2d"),
+            pytest.param(False, "DRAM", "cpu", id="we_d2d_they_host"),
+            pytest.param(True, "VRAM", "rbln", id="we_host_they_d2d"),
         ],
     )
     def test_a_peer_on_the_other_buffer_device_is_refused_on_arrival(
-        self, host_buffer, peer_mem_type, notif_only
+        self, host_buffer, peer_mem_type, peer_device, notif_only
     ):
         # The peer publishes one region per layer against our two, so in the
         # D2D case the pairing check refuses it under another name if this runs
@@ -963,7 +964,9 @@ class TestPpHandshakeFanout:
 
         with (
             _patched_socket(_FakeSock(pp_size=1, region_mem_types=[peer_mem_type])),
-            pytest.raises(RuntimeError, match="same kv_buffer_device"),
+            pytest.raises(
+                RuntimeError, match=f"the peer runs kv_buffer_device='{peer_device}'"
+            ),
         ):
             w._nixl_handshake("h", 1234, 1, "eng", notif_agents_only=notif_only)
 
