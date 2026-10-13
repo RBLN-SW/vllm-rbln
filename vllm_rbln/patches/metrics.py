@@ -33,6 +33,14 @@ folded: MODEL + SAMPLE stays the main-graph number, and the drafter's time -- un
 EAGLE/MTP a draft-model forward, plus any sampler wait its first read absorbs --
 shows up in the E2E residual.
 
+Each recorded pass also gets a timeline: absolute CLOCK_MONOTONIC stamps at every
+wrapped boundary (the DP padding exchange, the model call, the sampler, the
+bookkeeping read, the hand-off and the runner's profiler regions), plus the pass's
+thread CPU time and context switches. Durations alone cannot line ranks up or tell a
+descheduled host thread from a device wait; the stamps can, because every rank on a
+host reads the same clock. It goes to timeline_<rank>.json next to the metrics JSON,
+whose shape is left untouched.
+
 The whole feature lives in this module so the runner carries no metrics code at all. A
 range that is not a whole method -- the model call sits mid-way through execute_model --
 is reached by wrapping the callable the runner holds, and the phase, which is a local of
@@ -43,6 +51,8 @@ import contextlib
 import functools
 import json
 import os
+import resource
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -61,6 +71,14 @@ from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
 logger = init_logger(__name__)
 
 _CTX_ATTR = "_metrics_ctx"
+
+# The timeline's clocks, bound here rather than read through ``time`` so the
+# latency tests, which swap ``time`` for a fake perf_counter, leave them alone.
+# perf_counter_ns is CLOCK_MONOTONIC on Linux: one clock for every process on
+# the host, so the DP/EP ranks of one node line up without any offset.
+_mono_ns = time.perf_counter_ns
+_wall_ns = time.time_ns
+_thread_cpu_ns = time.thread_time_ns
 
 
 class _Phase(Enum):
@@ -117,6 +135,10 @@ class _PerformanceContext:
         self._start: float | None = None
         self._phase: _Phase | None = None
         self._graph_latency: float | None = None
+        # One entry per recorded pass, in execution order; see _close_timeline.
+        self._timeline: list[dict] = []
+        self._marks: list[tuple[str, int]] | None = None
+        self._pass_meta: dict | None = None
 
     @property
     def in_pass(self) -> bool:
@@ -126,6 +148,7 @@ class _PerformanceContext:
         self._start = time.perf_counter()
         self._phase = None
         self._graph_latency = None
+        self._open_timeline()
 
     def end_pass(self) -> None:
         end = time.perf_counter()
@@ -135,9 +158,11 @@ class _PerformanceContext:
         if start is None or phase is None or graph is None:
             # No pass was open, or it never reached the forward: an empty batch, KV
             # send/recv with no forward work, or a pass that raised.
+            self._close_timeline(None)
             return
         self._e2e[phase].record(end - start)
         self._graph[phase].record(graph)
+        self._close_timeline(phase)
 
     def mark_phase(self, phase: _Phase) -> None:
         if self._start is not None:
@@ -146,6 +171,47 @@ class _PerformanceContext:
     def add_graph_time(self, latency: float) -> None:
         if self._start is not None:
             self._graph_latency = (self._graph_latency or 0.0) + latency
+
+    def mark(self, name: str) -> None:
+        """Stamp ``name`` on the open pass's timeline; a no-op outside a pass."""
+        if self._marks is not None:
+            self._marks.append((name, _mono_ns()))
+
+    def _open_timeline(self) -> None:
+        self._pass_meta = {
+            "wall_start_ns": _wall_ns(),
+            "thread_cpu_ns": _thread_cpu_ns(),
+            "rusage": _thread_rusage(),
+            "tid": threading.get_native_id(),
+        }
+        self._marks = [("pass_start", _mono_ns())]
+
+    def _close_timeline(self, phase: _Phase | None) -> None:
+        marks, self._marks = self._marks, None
+        meta, self._pass_meta = self._pass_meta, None
+        if phase is None or marks is None or meta is None:
+            # Dropped exactly when the latencies drop the pass, so entry i of a
+            # phase's timeline is entry i of that phase's latencies_ms.
+            return
+        marks.append(("pass_end", _mono_ns()))
+        tid = threading.get_native_id()
+        entry: dict = {
+            "phase": phase.value,
+            "index": self._e2e[phase].call_count - 1,
+            "wall_start_ns": meta["wall_start_ns"],
+            "marks": [[name, t] for name, t in marks],
+            # Thread CPU time well below the pass's wall means the thread was
+            # off-CPU: blocked on the device, or descheduled.
+            "thread_cpu_ns": _thread_cpu_ns() - meta["thread_cpu_ns"],
+            # A pass that opens and closes on different threads makes the
+            # per-thread counters meaningless; the tids show when that happened.
+            "tid": meta["tid"] if tid == meta["tid"] else [meta["tid"], tid],
+        }
+        before, after = meta["rusage"], _thread_rusage()
+        if before is not None and after is not None:
+            entry["nvcsw"] = after[0] - before[0]
+            entry["nivcsw"] = after[1] - before[1]
+        self._timeline.append(entry)
 
     def print_stats(self) -> None:
         sections: dict[str, _Metrics] = {}
@@ -156,6 +222,17 @@ class _PerformanceContext:
         name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
         logger.info("%s", "\n".join(_render_metrics_report(name, sections)))
         _write_metrics_json(self.name, self.rank_tag, sections)
+        _write_timeline_json(self.name, self.rank_tag, self._timeline)
+
+
+def _thread_rusage() -> tuple[int, int] | None:
+    """(voluntary, involuntary) context switches of the calling thread so far."""
+    try:
+        ru = resource.getrusage(resource.RUSAGE_THREAD)
+    except (AttributeError, OSError, ValueError):
+        # RUSAGE_THREAD is Linux-only.
+        return None
+    return ru.ru_nvcsw, ru.ru_nivcsw
 
 
 def _rank_tag() -> str:
@@ -251,6 +328,54 @@ def _write_metrics_json(
         logger.warning("Failed to write metrics JSON to %s: %s", path, e)
 
 
+# Describes the timeline file for whoever opens it without this module at hand.
+_TIMELINE_SCHEMA = {
+    "clock": "time.perf_counter_ns (CLOCK_MONOTONIC): absolute, shared by every "
+    "process on the host, so ranks of one node compare directly",
+    "passes": "recorded passes in execution order; (phase, index) is the position "
+    "in that phase's latencies_ms of the metrics JSON",
+    "marks": "[name, t_ns] in the order stamped; pass_start / pass_end bound the "
+    "E2E latency, <region>.enter / .exit are the runner's profiler regions",
+    "wall_start_ns": "time.time_ns at pass_start, to match node logs",
+    "thread_cpu_ns": "CPU time of the pass's thread over the pass",
+    "nvcsw / nivcsw": "voluntary / involuntary context switches of that thread "
+    "over the pass (Linux only)",
+}
+
+
+def _write_timeline_json(name: str | None, rank_tag: str, timeline: list[dict]) -> None:
+    """Write the per-pass timeline next to the metrics JSON, as its own file.
+
+    Kept out of the metrics JSON so that file's shape stays what its readers
+    expect; compact, since it is a few dozen marks per pass.
+    """
+    if not envs.VLLM_RBLN_METRICS_DIR or not timeline:
+        return
+
+    suffix = rank_tag.replace(" ", "_").lower()
+    filename = f"timeline_{suffix}.json" if suffix else "timeline.json"
+    path = os.path.join(envs.VLLM_RBLN_METRICS_DIR, filename)
+    payload = {
+        "name": name,
+        "rank": rank_tag,
+        "schema": _TIMELINE_SCHEMA,
+        "passes": timeline,
+    }
+
+    try:
+        payload_str = json.dumps(payload, separators=(",", ":"))
+    except (TypeError, ValueError) as e:
+        logger.warning("Failed to serialize timeline JSON: %s", e)
+        return
+
+    try:
+        os.makedirs(envs.VLLM_RBLN_METRICS_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload_str)
+    except OSError as e:
+        logger.warning("Failed to write timeline JSON to %s: %s", path, e)
+
+
 def _metrics_enabled() -> bool:
     return envs.VLLM_RBLN_METRICS
 
@@ -286,6 +411,7 @@ def execute_model(self, *args, **kwargs):
     _ACTIVE_CTX = ctx
     ctx.start_pass()
     output = _execute_model(self, *args, **kwargs)
+    ctx.mark("execute_model.return")
     # A None pass is closed by sample_tokens, an IntermediateTensors pass by
     # send_handoff below; anything else nobody would end.
     if output is not None and not isinstance(output, IntermediateTensors):
@@ -295,18 +421,24 @@ def execute_model(self, *args, **kwargs):
 
 @functools.wraps(_sample_tokens)
 def sample_tokens(self, *args, **kwargs):
+    ctx = _ctx(self)
+    # The gap from execute_model.return is the engine's, between the two calls.
+    ctx.mark("sample_tokens.enter")
     output = _sample_tokens(self, *args, **kwargs)
-    _ctx(self).end_pass()
+    ctx.end_pass()
     return output
 
 
 @functools.wraps(_bookkeeping_sync)
 def bookkeeping_sync(self, *args, **kwargs):
+    ctx = _ctx(self)
+    ctx.mark("bookkeep.enter")
     start = time.perf_counter()
     try:
         return _bookkeeping_sync(self, *args, **kwargs)
     finally:
-        _ctx(self).add_graph_time(time.perf_counter() - start)
+        ctx.add_graph_time(time.perf_counter() - start)
+        ctx.mark("bookkeep.exit")
 
 
 @functools.wraps(_sample)
@@ -315,9 +447,12 @@ def sample(self, *args, **kwargs):
         # Returns a placeholder without running the sampler, so there is no sampler
         # time to attribute -- only the cost of building that placeholder.
         return _sample(self, *args, **kwargs)
+    ctx = _ctx(self)
+    ctx.mark("sample.enter")
     start = time.perf_counter()
     output = _sample(self, *args, **kwargs)
-    _ctx(self).add_graph_time(time.perf_counter() - start)
+    ctx.add_graph_time(time.perf_counter() - start)
+    ctx.mark("sample.exit")
     return output
 
 
@@ -331,9 +466,13 @@ def load_model(self, *args, **kwargs):
         if not ctx.in_pass:
             # Warm-up and dummy runs: skip the clock reads as well as the record.
             return executable(*call_args, **call_kwargs)
+        ctx.mark("model_executable.enter")
         start = time.perf_counter()
         output = executable(*call_args, **call_kwargs)
         ctx.add_graph_time(time.perf_counter() - start)
+        # Dispatch returns before the device finishes; the wait lands in the
+        # first blocking read after it (bookkeep, or the spec postprocess).
+        ctx.mark("model_executable.exit")
         return output
 
     self.model_executable = timed_executable
@@ -341,7 +480,12 @@ def load_model(self, *args, **kwargs):
 
 @functools.wraps(_determine_batch_execution_and_padding)
 def determine_batch_execution_and_padding(self, *args, **kwargs):
+    # Holds coordinate_batch_across_dp, the host-side DP exchange: a rank that
+    # arrives late makes the others wait here, outside the graph sum.
+    ctx = _ctx(self)
+    ctx.mark("dp_padding.enter")
     result = _determine_batch_execution_and_padding(self, *args, **kwargs)
+    ctx.mark("dp_padding.exit")
     batch_desc, _route, _num_tokens_across_dp = result
     if batch_desc is None:
         # A drained group runs nothing, so no pass opens and there is no phase to
@@ -359,7 +503,7 @@ def determine_batch_execution_and_padding(self, *args, **kwargs):
     else:
         phase = _Phase.DECODE
     # A no-op on the dummy run, which reaches this with no pass open.
-    _ctx(self).mark_phase(phase)
+    ctx.mark_phase(phase)
     return result
 
 
@@ -371,9 +515,11 @@ def send_handoff(self, *args, **kwargs):
     # The send waits on this stage's compute, so its wall carries the stage's time.
     # No try/finally: a raising hand-off leaves the pass open, like any raising pass.
     ctx = _ctx(self.model_runner)
+    ctx.mark("handoff.enter")
     start = time.perf_counter()
     output = _send_handoff(self, *args, **kwargs)
     ctx.add_graph_time(time.perf_counter() - start)
+    ctx.mark("handoff.exit")
     ctx.end_pass()
     return output
 
@@ -396,19 +542,28 @@ _ACTIVE_CTX: _PerformanceContext | None = None
 _GRAPH_REGION = "rbln_model_runner: postprocess"
 
 
+_REGION_PREFIX = "rbln_model_runner: "
+
+
 @contextlib.contextmanager
 def timed_region(name: str):
     ctx = _ACTIVE_CTX
-    if name != _GRAPH_REGION or ctx is None or not ctx.in_pass:
+    if ctx is None or not ctx.in_pass:
         with record_function_or_nullcontext(name):
             yield
         return
+    # Every region is stamped on the timeline; only the graph region is folded
+    # into the graph sum.
+    label = name.removeprefix(_REGION_PREFIX)
+    ctx.mark(f"{label}.enter")
     start = time.perf_counter()
     try:
         with record_function_or_nullcontext(name):
             yield
     finally:
-        ctx.add_graph_time(time.perf_counter() - start)
+        if name == _GRAPH_REGION:
+            ctx.add_graph_time(time.perf_counter() - start)
+        ctx.mark(f"{label}.exit")
 
 
 _RUNNER = "vllm_rbln.v1.worker.rbln_model_runner.RBLNModelRunner"
