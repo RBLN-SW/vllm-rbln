@@ -51,6 +51,7 @@ from vllm_rbln.v1.worker.kv_placement import ChipletMemory
 from vllm_rbln.v1.worker.utils import (
     REBEL_DRAM_NBYTES,
     chiplet_replication_factor,
+    choose_wait_policy,
     compute_rbln_local_omp_cpuid,
     copy_host_device_kv_blocks,
     divide_by_chiplet_replication,
@@ -393,6 +394,28 @@ def _full_attn(block_size):
     return FullAttentionSpec(
         block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.float16
     )
+
+
+class TestChooseWaitPolicy:
+    @pytest.fixture
+    def chosen(self, monkeypatch):
+        picks: list[str] = []
+        monkeypatch.setattr(worker_utils.v2, "set_wait_policy", picks.append)
+        monkeypatch.delenv("RBLN_WAIT_POLICY", raising=False)
+        return picks
+
+    def test_a_single_process_has_the_driver_poll(self, chosen):
+        choose_wait_policy(SimpleNamespace(world_size_across_dp=1))
+        assert chosen == ["spin"]
+
+    def test_ranks_in_processes_of_their_own_keep_blocking(self, chosen):
+        choose_wait_policy(SimpleNamespace(world_size_across_dp=4))
+        assert chosen == []
+
+    def test_the_variable_decides_when_set(self, chosen, monkeypatch):
+        monkeypatch.setenv("RBLN_WAIT_POLICY", "blocking")
+        choose_wait_policy(SimpleNamespace(world_size_across_dp=1))
+        assert chosen == []
 
 
 class TestEstimateModelKernelSize:

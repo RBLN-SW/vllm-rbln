@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
+from rebel import v2
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.cpu_resource_utils import (
@@ -191,6 +192,17 @@ RBLN_DEV_DIR = "/dev"
 
 # 144 GiB of quad-chiplet DRAM minus the 4 GiB system region
 REBEL_DRAM_NBYTES = 144 * 2**30 - 4 * 2**30
+
+
+def choose_wait_policy(parallel_config: ParallelConfig) -> None:
+    """Has the driver poll for the jobs of the devices the worker opens from
+    now on, which keeps the waiting core busy and so at full clock for the host
+    work between runs, unless ranks run in processes of their own: a polling
+    rank slows their collectives. RBLN_WAIT_POLICY, when set, decides instead.
+    """
+    if "RBLN_WAIT_POLICY" in os.environ or parallel_config.world_size_across_dp > 1:
+        return
+    v2.set_wait_policy("spin")
 
 
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:

@@ -40,7 +40,7 @@ from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.converter import RBLNParams, update_num_blocks
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
-from vllm_rbln.v1.worker.utils import set_omp_num_threads
+from vllm_rbln.v1.worker.utils import choose_wait_policy, set_omp_num_threads
 
 logger = init_logger(__name__)
 
@@ -99,6 +99,7 @@ class RBLNOptimumWorker(WorkerBase):
             self.profiler = None
 
     def init_device(self) -> None:
+        choose_wait_policy(self.parallel_config)
         allocated_cpus = len(os.sched_getaffinity(0))
         reported_cpus = os.cpu_count() or allocated_cpus
 

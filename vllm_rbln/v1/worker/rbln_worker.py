@@ -70,6 +70,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
+    choose_wait_policy,
     compile_and_warmup_skip_reason,
     dynamic_kv_enabled,
     estimate_model_kernel_size,
@@ -180,6 +181,7 @@ class RBLNWorker(WorkerBase):
     @worker_fail_fast
     @instrument(span_name="Init device")
     def init_device(self) -> None:
+        choose_wait_policy(self.parallel_config)
         self.device = self.device_config.device
 
         # Before the CCL backend comes up, so nothing of ours counts as foreign;
