@@ -1200,6 +1200,35 @@ class TestFullRunInvariants:
 class TestRunningQueueCapacity:
     # Borrowed from upstream test_async_scheduler.test_running_queue: how
     # concurrency is capped over a run. RBLN caps running at max_num_seqs // pp.
+    @pytest.mark.parametrize(
+        ("active_cap", "paused_streaming"), [(1, False), (2, False), (2, True)]
+    )
+    def test_capacity_limited_by_max_num_active_seqs(
+        self, active_cap, paused_streaming
+    ):
+        sched = create_rbln_scheduler(max_num_seqs=4, max_num_active_seqs=active_cap)
+        if paused_streaming:
+            session = create_requests(1, max_tokens=1, req_ids=["paused"])[0]
+            session.resumable = True
+            advance_to_decode(sched, session)
+            assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+
+        reqs = create_requests(3, num_tokens=10, max_tokens=6)
+        for request in reqs:
+            sched.add_request(request)
+        peak = 0
+
+        def check(out):
+            nonlocal peak
+            active = len(sched.running) + sched.num_waiting_for_streaming_input
+            assert active <= active_cap
+            peak = max(peak, active)
+
+        _drain(sched, per_step=check)
+        assert peak == active_cap
+        assert all(request.is_finished() for request in reqs)
+        assert sched.max_num_running_reqs == 4
+
     def test_capacity_limited_by_max_num_seqs(self):
         sched = create_rbln_scheduler(max_num_seqs=2, block_size=16, num_blocks=10000)
         reqs = create_requests(5, num_tokens=10, max_tokens=6)
