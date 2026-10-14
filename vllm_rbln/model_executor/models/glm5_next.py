@@ -775,9 +775,12 @@ class RBLNGlm5DecoderLayer(nn.Module):
         """(z_pre, z_post, comb) of a sublayer, from the RMS-scaled stream mix."""
         batch, n, tokens, hidden = streams.shape
         flat = streams.transpose(1, 2).reshape(batch, tokens, n * hidden).float()
-        mixes = F.linear(flat, fn) * torch.rsqrt(
-            flat.square().mean(-1, keepdim=True) + self.rms_eps
-        )
+        # Normalize the streams first, then mix (the reference's weightless RMSNorm,
+        # then the linear). Scaling the 24 mix lanes by a per-token rsqrt instead left a
+        # [B, T, 1] rsqrt and its repeat to 24 lanes on the host between every two
+        # sublayers; the [B, T, n * hidden] form stays on the device.
+        flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
+        mixes = F.linear(flat, fn)
         # The mHC ops take bf16 operands (they compute in fp32).
         z = (mixes * scale + base).to(streams.dtype)
         z_pre, z_post = z[..., :n], z[..., n : 2 * n]
