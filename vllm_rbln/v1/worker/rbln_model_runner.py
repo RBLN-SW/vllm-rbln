@@ -3104,13 +3104,19 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
         device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
-        buffers = {
-            extent: torch.empty(extent[1], dtype=torch.int8, device=device)
-            for extent in set(extent_of.values())
-        }
-        kv_cache_raw_tensors = {
-            layer_name: buffers[extent] for layer_name, extent in extent_of.items()
-        }
+        if self._kv_layers_own_storage():
+            kv_cache_raw_tensors = {
+                layer_name: torch.empty(extent[1], dtype=torch.int8, device=device)
+                for layer_name, extent in extent_of.items()
+            }
+        else:
+            buffers = {
+                extent: torch.empty(extent[1], dtype=torch.int8, device=device)
+                for extent in set(extent_of.values())
+            }
+            kv_cache_raw_tensors = {
+                layer_name: buffers[extent] for layer_name, extent in extent_of.items()
+            }
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -3129,6 +3135,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for attn_groups in self.attn_groups:
             yield from attn_groups
 
+    def _kv_layers_own_storage(self) -> bool:
+        """Whether every KV layer gets a buffer of its own instead of its extent's.
+
+        GLM-5.3's caches on one extent differ in dtype (bf16 states, fp8 index keys, f16
+        scales), and a view to another dtype does not survive compilation, so each takes
+        its own buffer: one extent's size a layer. A workaround until the KV tensor
+        refactor; the block count has to be sized for it (num_gpu_blocks_override).
+        """
+        text_config = self.model_config.hf_text_config
+        return getattr(text_config, "model_type", None) == "glm5_next_text"
+
     def _select_canonical_kv_layers_per_pool(
         self, kv_cache_config: KVCacheConfig
     ) -> set[str]:
@@ -3143,6 +3160,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for attn_group in self._kv_cache_spec_attn_group_iterator()
             for layer_name in attn_group.layer_names
         }
+        if self._kv_layers_own_storage():
+            return set(layer_to_spec)
         return canonical_kv_layers(kv_cache_config, layer_to_spec)
 
     def _reshape_kv_cache_tensors(
@@ -3255,6 +3274,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         marked_layers.append((layer_name, view_dynamic_axis))
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
+                        # Layers of different groups alias one extent and may differ
+                        # in dtype; the deduped base keeps the first layer's.
+                        view_dtype=dtype,
                         view_shape=kv_cache_shape,
                         permute_order=tuple(inv_order),
                         dynamic_axis=base_dynamic_axis,
