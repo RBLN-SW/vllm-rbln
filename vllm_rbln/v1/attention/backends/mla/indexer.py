@@ -11,6 +11,7 @@ from typing import ClassVar
 
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_rbln.logger import init_logger
 
@@ -31,7 +32,9 @@ class RBLNDeepseekV32IndexerBackend(AttentionBackend):
         return "RBLN_DEEPSEEK_V32_INDEXER"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
         return [MultipleOf(64)]
 
     @classmethod
