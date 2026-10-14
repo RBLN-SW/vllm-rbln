@@ -42,11 +42,6 @@ from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
-@pytest.fixture(autouse=True)
-def _use_v1_model_runner(monkeypatch):
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
-
-
 class TestSchedulerInit:
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):

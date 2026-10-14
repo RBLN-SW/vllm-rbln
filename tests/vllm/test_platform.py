@@ -182,13 +182,36 @@ class TestPlatformIdentity:
 
 
 class TestRejectedConfigs:
-    def test_v2_model_runner(self, monkeypatch, reconfigure):
-        # The refusal reads VllmConfig.use_v2_model_runner, and how upstream
-        # resolves that from the env or from a feature that forces V2 is its
-        # own business. Set the property it reads, not the env behind it.
-        monkeypatch.setattr(VllmConfig, "use_v2_model_runner", True)
-        with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
-            reconfigure(lambda config: None)
+    @pytest.mark.parametrize(
+        ("block_size", "max_num_batched_tokens", "invalid_block_size"),
+        [(128, 128, 127), (16384, 128, 16385), (16384, 16384, 16385)],
+    )
+    def test_block_size_range(
+        self, block_size, max_num_batched_tokens, invalid_block_size
+    ):
+        _build(block_size=block_size, max_num_batched_tokens=max_num_batched_tokens)
+        with pytest.raises(
+            ValidationError,
+            match=(
+                "RBLN requires max_num_batched_tokens <= block_size <= max_block_size"
+            ),
+        ):
+            _build(
+                block_size=invalid_block_size,
+                max_num_batched_tokens=max_num_batched_tokens,
+            )
+
+    @pytest.mark.parametrize("max_num_batched_tokens", [16, 128, None])
+    def test_block_size_must_be_explicit(self, max_num_batched_tokens):
+        with pytest.raises(ValidationError, match="requires an explicit block_size"):
+            _build(block_size=None, max_num_batched_tokens=max_num_batched_tokens)
+
+    def test_token_budget_exceeds_block_size_limit(self):
+        with pytest.raises(
+            ValidationError,
+            match="max_num_batched_tokens=16385.*--max-num-batched-tokens",
+        ):
+            _build(block_size=16384, max_num_batched_tokens=16385)
 
     def test_an_explicit_dynamic_kv_on_an_unsizable_config(self, reconfigure):
         def custom_kernel(dynamic):
@@ -364,6 +387,38 @@ class TestCompileDtype:
 
 
 class TestWorkerAndScheduler:
+    @pytest.mark.parametrize("selection", [None, "0", "1"])
+    def test_runner_selection_ignores_upstream_env(self, monkeypatch, selection):
+        import vllm.config.vllm as upstream_config
+
+        monkeypatch.setattr(upstream_config, "HAS_TRITON", True)
+        if selection is None:
+            monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", selection)
+        with patch.object(platform.logger, "warning_once") as warning:
+            config = _build()
+            assert config.use_v2_model_runner is False
+        assert config.parallel_config.worker_cls == (
+            "vllm_rbln.v1.worker.rbln_worker.RBLNWorker"
+        )
+        assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == selection
+        assert warning.called is (selection != "0")
+        if warning.called:
+            assert "V2 selection is ignored" in warning.call_args.args[0]
+
+    def test_v2_scoring_is_rejected(self, monkeypatch):
+        from vllm.exceptions import VLLMValidationError
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.engine.input_processor import InputProcessor
+
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        processor = InputProcessor(_build())
+        with pytest.raises(VLLMValidationError, match="requires the V2 model runner"):
+            processor._validate_params(
+                SamplingParams(prompt_logprob_token_ids=[1]), ("generate",)
+            )
+
     def test_auto_worker_becomes_the_rbln_worker(self, configured):
         assert (
             configured.parallel_config.worker_cls
