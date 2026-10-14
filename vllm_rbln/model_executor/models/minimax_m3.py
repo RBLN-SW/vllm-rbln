@@ -740,8 +740,10 @@ class RBLNMiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states)
+        if self.is_moe_layer:
+            hidden_states = self.block_sparse_moe(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
