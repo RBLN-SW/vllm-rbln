@@ -373,6 +373,14 @@ class TestConformance:
     def test_extends_worker_base(self):
         assert issubclass(RBLNWorker, WorkerBase)
 
+    def test_selective_discard_is_rejected(self, make_worker):
+        worker = make_worker()
+
+        with pytest.raises(
+            RuntimeError, match="Selective discard is not supported on RBLN"
+        ):
+            worker.discard(("kv_cache",))
+
     def test_key_override_signatures_match_base(self):
         # The overrides stay call-compatible with WorkerBase so the engine can
         # drive RBLNWorker like any other. load_model is excluded (see below).
