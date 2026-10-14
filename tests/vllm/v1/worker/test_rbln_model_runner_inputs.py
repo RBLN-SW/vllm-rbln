@@ -21,6 +21,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalFieldConfig,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
@@ -32,6 +38,79 @@ from tests.vllm.v1.worker.utils import (
 )
 
 pytestmark = pytest.mark.maybe_use_device
+
+
+class TestGatherMultimodalEmbeddings:
+    def test_scheduled_images_are_encoded_and_cached_by_hash(self, make_model_runner):
+        runner = make_model_runner()
+        step = schedule_new("images")
+        pixels = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+        elems = MultiModalFieldConfig.batched("image").build_elems(
+            "pixel_values", pixels
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem({"pixel_values": elem}),
+                modality="image",
+                identifier=f"image-{i}",
+                mm_position=PlaceholderRange(offset=i, length=1),
+            )
+            for i, elem in enumerate(elems)
+        ]
+        step.scheduled_encoder_inputs = {"images": [1, 0]}
+        runner._update_states(step)
+        calls = []
+
+        def embed_multimodal(*, pixel_values):
+            calls.append(pixel_values.clone())
+            return tuple(pixel_values + 10)
+
+        runner.model = SimpleNamespace(embed_multimodal=embed_multimodal)
+        runner._execute_mm_encoder(step)
+
+        assert len(calls) == 1
+        torch.testing.assert_close(calls[0], pixels.flip(0))
+        torch.testing.assert_close(runner.encoder_cache["image-0"], pixels[0] + 10)
+        torch.testing.assert_close(runner.encoder_cache["image-1"], pixels[1] + 10)
+
+    @pytest.mark.parametrize(
+        "computed, values",
+        [(0, [0, 0, 11]), (3, [0, 22, 33]), (6, [0, 0, 0])],
+    )
+    def test_chunk_boundaries_preserve_text_holes_and_request_order(
+        self, make_model_runner, computed, values
+    ):
+        runner = make_model_runner()
+        step = schedule_new(
+            "image",
+            "text",
+            prompt_token_ids=[[1] * 12, [1] * 12],
+            num_computed_tokens=[computed, 0],
+            num_scheduled_tokens=[3, 3],
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image-hash",
+                mm_position=PlaceholderRange(
+                    offset=2,
+                    length=5,
+                    is_embed=torch.tensor([True, False, True, True, False]),
+                ),
+            )
+        ]
+        runner._update_states(step)
+        hidden = runner.model_config.get_hidden_size()
+        runner.encoder_cache["image-hash"] = (
+            torch.tensor([11.0, 22.0, 33.0]).unsqueeze(1).expand(-1, hidden)
+        )
+
+        embeds, mask = runner._gather_mm_embeddings(step, num_tokens=6)
+
+        expected = torch.tensor(values + [0, 0, 0], dtype=runner.dtype)
+        torch.testing.assert_close(embeds, expected[:, None].expand(-1, hidden))
+        torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
 
 
 def _decode_ready(

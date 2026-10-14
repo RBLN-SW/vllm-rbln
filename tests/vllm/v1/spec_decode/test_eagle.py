@@ -277,15 +277,14 @@ class TestPrepareNextTokenIdsPadded:
 
 
 class TestInitGuards:
-    def test_rejects_multimodal_inputs(self, monkeypatch):
-        # Multimodal targets are unsupported; the guard trips at construction.
+    def test_defers_multimodal_support_check_until_draft_load(self, monkeypatch):
         from vllm.multimodal import MULTIMODAL_REGISTRY
 
         monkeypatch.setattr(
             MULTIMODAL_REGISTRY, "supports_multimodal_inputs", lambda cfg: True
         )
-        with pytest.raises(NotImplementedError):
-            make_eagle_proposer()
+        proposer = make_eagle_proposer()
+        assert proposer.supports_mm_inputs
 
     def test_rejects_extra_input_slots(self, monkeypatch):
         # Parallel drafting / draft-model spec decode needs input slots the
@@ -557,7 +556,75 @@ class TestPropose:
         assert out.cpu().tolist() == [[3, 5], [8, 12]]
 
 
+@pytest.mark.parametrize("aux_layers", [(), (0, 2)])
+def test_minimax_m3_target_returns_requested_aux_states(monkeypatch, aux_layers):
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+
+    class Decoder(torch.nn.Module):
+        def forward(self, positions, hidden_states, residual):
+            return hidden_states + 1, torch.full_like(hidden_states, 10)
+
+    backbone = m3.RBLNMiniMaxM3Model.__new__(m3.RBLNMiniMaxM3Model)
+    torch.nn.Module.__init__(backbone)
+    backbone.layers = torch.nn.ModuleList([Decoder(), Decoder()])
+    backbone.start_layer, backbone.end_layer = 0, 2
+    backbone.norm = lambda hidden, residual: (hidden + residual, None)
+    target = m3.RBLNMiniMaxM3SparseForCausalLM.__new__(
+        m3.RBLNMiniMaxM3SparseForCausalLM
+    )
+    torch.nn.Module.__init__(target)
+    target.model = backbone
+    target.set_aux_hidden_state_layers(aux_layers)
+    monkeypatch.setattr(
+        m3,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    inputs = torch.zeros(1, 2, 4)
+
+    result = target(
+        input_ids=None, positions=torch.tensor([[0, 1]]), inputs_embeds=inputs
+    )
+
+    if aux_layers:
+        hidden, aux = result
+        assert len(aux) == 2
+        torch.testing.assert_close(aux[0], inputs)
+        torch.testing.assert_close(aux[1], torch.full_like(inputs, 12))
+    else:
+        hidden = result
+    torch.testing.assert_close(hidden, torch.full_like(inputs, 12))
+
+
 class TestLoadModel:
+    @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
+    def test_multimodal_guard_uses_loaded_draft_capability(
+        self, monkeypatch, draft_needs_mm_inputs
+    ):
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+        from vllm.v1.spec_decode.eagle import EagleProposer
+
+        monkeypatch.setattr(
+            MULTIMODAL_REGISTRY, "supports_multimodal_inputs", lambda cfg: True
+        )
+        proposer = make_eagle_proposer()
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+
+        def load_draft(self, target_model):
+            assert self.supports_mm_inputs
+            self.supports_mm_inputs = draft_needs_mm_inputs
+            self.model = torch.nn.Identity()
+
+        monkeypatch.setattr(EagleProposer, "load_model", load_draft)
+        if draft_needs_mm_inputs:
+            with pytest.raises(NotImplementedError, match="multimodal embeddings"):
+                proposer.load_model(target_model=object())
+        else:
+            proposer.load_model(target_model=object())
+            assert callable(proposer.model_executable)
+
     class _FakeMappedDraft(Eagle3LlamaForCausalLM):
         """An EAGLE3 draft head whose output stays in draft-vocab space: it
         carries a d2t mapping and a logits_processor. compute_logits only counts

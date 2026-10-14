@@ -22,6 +22,9 @@ import torch
 from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
+from vllm_rbln.model_executor.layers.quantization.modelopt_mxfp8 import (
+    RBLNModelOptMxFp8LinearMethod,
+)
 
 IN_FEATURES = 4
 PARTITIONS = [2, 3]
@@ -171,3 +174,54 @@ class TestRegistration:
             SimpleNamespace(is_checkpoint_fp8_serialized=True), "FP8", "model.layer"
         )
         assert isinstance(built, RBLNModelOptFp8LinearMethod)
+
+
+class TestModelOptMxFp8:
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_loaded_block_scales_and_bias_determine_output(self, dtype):
+        from vllm.model_executor.layers.quantization.modelopt import build_linear_method
+        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+        method = build_linear_method(SimpleNamespace(), "MXFP8", "model.layer")
+        assert isinstance(method, RBLNModelOptMxFp8LinearMethod)
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=64,
+            output_partition_sizes=[1, 1],
+            input_size=64,
+            output_size=2,
+            params_dtype=dtype,
+            weight_loader=default_weight_loader,
+        )
+        layer.weight.weight_loader(
+            layer.weight,
+            torch.tensor([[1.0] * 64, [2.0] * 64]).to(torch.float8_e4m3fn),
+        )
+        layer.weight_scale.weight_loader(
+            layer.weight_scale,
+            torch.tensor([[126, 129], [128, 127]], dtype=torch.uint8),
+        )
+        method.process_weights_after_loading(layer)
+
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        torch.testing.assert_close(
+            layer.weight_scale,
+            torch.tensor([[0.5, 4.0], [2.0, 1.0]], dtype=torch.bfloat16),
+        )
+        x = torch.tensor([[1.0] * 64, [-1.0] * 64], dtype=dtype)
+        output = method.apply(layer, x, bias=torch.tensor([1.0, -2.0], dtype=dtype))
+        torch.testing.assert_close(
+            output, torch.tensor([[145.0, 190.0], [-143.0, -194.0]], dtype=dtype)
+        )
+
+    def test_rejects_partial_scale_groups(self):
+        with pytest.raises(ValueError, match="multiple of the group size"):
+            RBLNModelOptMxFp8LinearMethod().create_weights(
+                torch.nn.Module(),
+                input_size_per_partition=33,
+                output_partition_sizes=[2],
+                input_size=33,
+                output_size=2,
+                params_dtype=torch.bfloat16,
+            )

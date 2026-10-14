@@ -110,6 +110,20 @@ class TestBlockTableMaintenance:
             assert block_table_matches_state(runner, req_id)
 
 
+class TestEncoderCache:
+    def test_only_scheduler_released_images_are_evicted(self, make_model_runner):
+        runner = make_model_runner()
+        retained = torch.ones(2, 4)
+        runner.encoder_cache.update(released=torch.zeros(2, 4), retained=retained)
+        step = make_scheduler_output()
+        step.free_encoder_mm_hashes = ["released"]
+
+        runner._update_states(step)
+
+        assert list(runner.encoder_cache) == ["retained"]
+        assert runner.encoder_cache["retained"] is retained
+
+
 class TestOutputTokenAlignment:
     def test_discarded_output_tokens_are_truncated(
         self, make_model_runner, monkeypatch
