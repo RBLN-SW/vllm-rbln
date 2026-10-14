@@ -150,12 +150,24 @@ class RBLNGlm5RingCache(_RBLNGlm5Cache):
     """One ``[rows, width]`` slot per request. ``RBLNSlidingWindowSpec`` budgets K + V, so
     it is declared with half the row width."""
 
-    def __init__(self, prefix: str, rows: int, width: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        prefix: str,
+        rows: int,
+        width: int,
+        dtype: torch.dtype,
+        *,
+        page_rows: bool = True,
+    ) -> None:
         super().__init__(prefix)
         assert width % 2 == 0
         self.rows = rows
         self.width = width
         self.dtype = dtype
+        # The op takes the whole page as one block, [pages, k * rows, width], and uses
+        # its first rows; else (the KDA state, which sets the page size) a page is one
+        # slot.
+        self.page_rows = page_rows
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return RBLNSlidingWindowSpec(
@@ -170,16 +182,23 @@ class RBLNGlm5RingCache(_RBLNGlm5Cache):
         return RBLNGlm5RingBackend
 
     def inputs(self) -> tuple[torch.Tensor, torch.Tensor, RBLNFlashAttentionMetadata]:
-        """(ring [slots, rows, width], slot [B, 1], metadata). Read only the metadata
-        fields an op takes: a graph input nothing uses is pruned from the compiled
-        module, and the runtime then binds the inputs out of step."""
+        """(ring, slot [B, 1], metadata). Read only the metadata fields an op takes:
+        a graph input nothing uses is pruned from the compiled module, and the runtime
+        then binds the inputs out of step."""
         metadata = _metadata(self.prefix)
         ring = _resolve_kv_cache(metadata, self.layer_index)
-        # The hybrid allocator unifies page sizes by growing a smaller spec's block size,
-        # so a page may hold k slots; the request's is the first.
+        # The hybrid allocator unifies page sizes by growing a smaller spec's block
+        # size, so a page may hold k slots; the request's is the first. The op addresses
+        # the page itself ([pages, k * rows, width], the ring its first rows): the slot
+        # is the page id, inside the kernels' i16 index however many slots a page holds
+        # (a page id times k overflowed it past 32 pages for the 2 KiB tail ring).
         per_page = ring.numel() // (ring.shape[0] * self.rows * self.width)
-        ring = ring.view(ring.shape[0] * per_page, self.rows, self.width)
-        slot = metadata.local_block_tables.reshape(-1, 1).to(torch.int32) * per_page
+        slot = metadata.local_block_tables.reshape(-1, 1).to(torch.int32)
+        if self.page_rows:
+            ring = ring.view(ring.shape[0], per_page * self.rows, self.width)
+        else:
+            assert per_page == 1, f"{self.prefix}: {per_page} slots a page"
+            ring = ring.view(ring.shape[0], self.rows, self.width)
         return ring, slot, metadata
 
 
@@ -404,7 +423,11 @@ class RBLNGlm5KDA(nn.Module):
 
         dtype = get_current_vllm_config().model_config.dtype
         self.state = RBLNGlm5RingCache(
-            f"{prefix}.attn.{SLOT_KDA_STATE}", proj, self.head_dim, dtype
+            f"{prefix}.attn.{SLOT_KDA_STATE}",
+            proj,
+            self.head_dim,
+            dtype,
+            page_rows=False,
         )
         conv_rows = proj * KDA_CONV_RING // 64
         self.conv_q, self.conv_k, self.conv_v = (

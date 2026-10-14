@@ -79,6 +79,11 @@ class RBLNGlm5RingBackend(_RBLNGlm5CacheBackend):
     """A ``[rows, width]`` slot per request, declared as an ``RBLNSlidingWindowSpec`` of
     ``head_size = width / 2`` (the spec budgets K + V)."""
 
+    # The ops take a whole manager block (a page the hybrid allocator may have grown to
+    # k rings) and use its first rows, so the runner does not split it into k kernel
+    # blocks: block ids stay page ids.
+    kernel_block_is_manager_block: ClassVar[bool] = True
+
     @staticmethod
     def get_name() -> str:
         return "RBLN_GLM5_RING"

@@ -1129,7 +1129,15 @@ def prepare_kernel_block_sizes(
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
         if isinstance(kv_cache_spec, SlidingWindowSpec):
-            if sub_block_size is None or isinstance(
+            if any(
+                getattr(g.backend, "kernel_block_is_manager_block", False)
+                for g in attn_groups[kv_cache_gid]
+            ):
+                # The op addresses the whole manager block (GLM-5.3's ring caches take
+                # [blocks, k * rows, width] and use the first rows): the block id stays
+                # the page id, not page * k, inside the kernels' int16 block index.
+                kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
+            elif sub_block_size is None or isinstance(
                 kv_cache_spec, RBLNSlidingWindowSpec
             ):
                 # The shift kernel holds one window per block; the append kernel
