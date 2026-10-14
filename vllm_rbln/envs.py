@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     # ====================================================================
     # --- COMPILE / RUNTIME ---
     VLLM_RBLN_COMPILE_ONLY: bool = False
+    VLLM_RBLN_NESTED_COMPILE_REGION: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_DISABLE_WORKER_FAIL_FAST: bool = False
     VLLM_RBLN_AUTO_PORT: bool = True
@@ -225,6 +226,14 @@ environment_variables = {
     "VLLM_RBLN_COMPILE_ONLY": (
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
+        )
+    ),
+    # Experimental decoder boundaries for MiniMax-M2 and GPT-OSS.
+    # Requires nested-region support in rebel-compiler; this does not emit loops.
+    "VLLM_RBLN_NESTED_COMPILE_REGION": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
+            in ("true", "1")
         )
     ),
     # Build only the first N decoder layers and leave the rest as

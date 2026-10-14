@@ -88,7 +88,6 @@ def _impl_kv_caches(num_blocks=128, base_ptr=0x10000, names=("l0", "l1")):
         t.shape = (2, num_blocks, 8, 1, 64, 64)
         t.data_ptr.return_value = base_ptr + i * 0x10000
         t.get_device.return_value = 0
-        t.zero_ = MagicMock()
         kv[name] = t
     return kv
 
@@ -104,7 +103,6 @@ def _mla_kv_caches(num_blocks=128, base_ptr=0x10000, page_size_bytes=4096):
         t.element_size.return_value = 1
         t.data_ptr.return_value = base_ptr + i * 0x10000
         t.get_device.return_value = 0
-        t.zero_ = MagicMock()
         kv[name] = t
     return kv
 

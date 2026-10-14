@@ -132,6 +132,7 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -777,6 +778,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
+            # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+            if self.rbln_config.use_custom_sampler and (
+                sampling_params := request.sampling_params
+            ):
+                sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
@@ -1974,11 +1980,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if propose_drafts_after_bookkeeping:
             propose_draft_token_ids(valid_sampled_token_ids)
 
-        # Finalize the KV connector (wait_for_save + clear metadata) after the
-        # draft model runs. With spec decode, this was deferred from the target
-        # model forward so the draft model can also save its KV cache.
-        if spec_config is not None:
-            self.finalize_kv_connector()
+        # Finalize the KV connector after the draft model runs. With spec decode,
+        # this was deferred from the target model forward so the draft model can
+        # also save its KV cache. Unlike finalize_kv_connector(), collect events
+        # between wait_for_save and clear_connector_metadata, as upstream does.
+        if spec_config is not None and has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            kv_connector.wait_for_save()
+            late_events = kv_connector.get_kv_connector_kv_cache_events()
+            assert self.kv_connector_output is not None
+            if late_events is not None:
+                early_events = self.kv_connector_output.kv_cache_events
+                if early_events is not None:
+                    # Both collections belong to this rank and this step.
+                    # Each occurrence counts as a rank vote, so replace the
+                    # batch with the deduplicated union, keeping early
+                    # removals; clear_events() keeps it one worker's vote.
+                    events = list(
+                        dict.fromkeys(
+                            early_events.get_all_events() + late_events.get_all_events()
+                        )
+                    )
+                    late_events.clear_events()
+                    late_events.add_events(events)
+                self.kv_connector_output.kv_cache_events = late_events
+            kv_connector.clear_connector_metadata()
 
         # self.kv_connector_output may be modified during drafting.
         kv_connector_output = self.kv_connector_output

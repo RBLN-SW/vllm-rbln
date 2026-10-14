@@ -21,6 +21,7 @@ import numba
 import torch
 import torch.distributed
 import torch.nn as nn
+from rebel import v2
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -40,7 +41,11 @@ from vllm_rbln import envs
 from vllm_rbln.logger import init_logger
 from vllm_rbln.utils.optimum.converter import RBLNParams, update_num_blocks
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
-from vllm_rbln.v1.worker.utils import choose_wait_policy, set_omp_num_threads
+from vllm_rbln.v1.worker.utils import (
+    RblnProfilerWrapper,
+    choose_wait_policy,
+    set_omp_num_threads,
+)
 
 logger = init_logger(__name__)
 
@@ -81,18 +86,19 @@ class RBLNOptimumWorker(WorkerBase):
                 profiler_config.torch_profiler_with_flops,
                 profiler_config.torch_profiler_use_gzip,
             )
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                ],
-                record_shapes=profiler_config.torch_profiler_record_shapes,
-                profile_memory=profiler_config.torch_profiler_with_memory,
-                with_stack=profiler_config.torch_profiler_with_stack,
-                with_flops=profiler_config.torch_profiler_with_flops,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir,
-                    worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
-                    use_gzip=profiler_config.torch_profiler_use_gzip,
+            from vllm.profiler.wrapper import TorchProfilerWrapper
+
+            self.profiler = TorchProfilerWrapper(
+                profiler_config,
+                worker_name=f"{vllm_config.instance_id}-rank-{self.rank}",
+                local_rank=self.local_rank,
+                activities=["CPU"],
+            )
+        elif profiler_config.profiler is None and v2.flags.RBLN_PROFILER:
+            self.profiler = RblnProfilerWrapper(
+                profiler_config,
+                os.path.abspath(
+                    f"rbln_trace_{vllm_config.instance_id}-rank-{self.rank}.json"
                 ),
             )
         else:
@@ -255,11 +261,6 @@ class RBLNOptimumWorker(WorkerBase):
             self.profiler.start()
         else:
             self.profiler.stop()
-            # only print profiler results on rank 0
-            if self.local_rank == 0:
-                print(
-                    self.profiler.key_averages().table(sort_by="self_cuda_time_total")
-                )
 
     def load_model(self, *, load_dummy_weights: bool = False):
         self.model_runner.load_model()
@@ -345,6 +346,8 @@ class RBLNOptimumWorker(WorkerBase):
                 self.model_runner.model_performance_tracker.print_final_stats()
             if self.model_runner.sampler_performance_tracker:
                 self.model_runner.sampler_performance_tracker.print_final_stats()
+        if self.profiler is not None:
+            self.profiler.shutdown()
 
 
 def init_worker_distributed_environment(

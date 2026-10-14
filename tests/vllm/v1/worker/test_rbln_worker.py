@@ -1397,9 +1397,15 @@ def _record_activities(monkeypatch, calls: list) -> None:
 
 
 class TestProfile:
+    # With RBLN_PROFILER on, kineto's bridge opens and flushes the RBLN session for
+    # the torch profile, so the RBLN wrapper has to stay out of it. The flag is
+    # patched on the worker, not exported: a unit test must not switch the device
+    # profiler on.
+    @pytest.mark.parametrize("rbln_profiler", [False, True])
     def test_torch_profiler_keeps_the_rbln_session_to_itself(
-        self, make_worker, monkeypatch, tmp_path
+        self, make_worker, monkeypatch, tmp_path, rbln_profiler
     ):
+        monkeypatch.setattr(wm.v2.flags, "RBLN_PROFILER", rbln_profiler, raising=False)
         calls: list = []
         _record_activities(monkeypatch, calls)
         vllm_config = _make_vllm_config()
@@ -1417,7 +1423,7 @@ class TestProfile:
 
     def test_rbln_profiler_writes_a_trace_at_stop(self, make_worker, monkeypatch):
         calls: list = []
-        monkeypatch.setenv("RBLN_PROFILER", "1")
+        monkeypatch.setattr(wm.v2.flags, "RBLN_PROFILER", True, raising=False)
         _record_activities(monkeypatch, calls)
         vllm_config = _make_vllm_config()
         vllm_config.profiler_config = ProfilerConfig()
@@ -1430,4 +1436,4 @@ class TestProfile:
         _, path = calls[2]
         assert os.path.basename(path).startswith("rbln_trace_")
         assert path.endswith(".json")
-        assert isinstance(worker.profiler, wm.RblnProfilerWrapper)
+        assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)

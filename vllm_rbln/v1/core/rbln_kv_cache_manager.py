@@ -768,16 +768,15 @@ class RBLNKVCacheManager(KVCacheManager):
             self._emit_block_removed(fully_removed, gi)
 
     def _install_eviction_hook(self) -> None:
-        # Monkey-patch the block pool's eviction method to also clean up the
-        # sub-block index. We can't simply override evict_blocks because we
-        # need to know if eviction actually happened.
+        # Running partial blocks are indexed before they have an upstream hash.
+        # Reuse and explicit invalidation must clear their sub-block index even
+        # when upstream has no cached hash to evict.
         original_evict = self.block_pool._maybe_evict_cached_block
 
         def evict_with_index_cleanup(block: KVCacheBlock) -> bool:
             block_id = block.block_id
             result = original_evict(block)
-            if result:
-                self._on_block_evicted(block_id)
+            self._on_block_evicted(block_id)
             return result
 
         self.block_pool._maybe_evict_cached_block = evict_with_index_cleanup

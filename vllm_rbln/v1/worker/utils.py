@@ -32,6 +32,7 @@ import torch
 from rebel import v2
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.profiler.wrapper import WorkerProfiler
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
     get_allowed_cpu_list,
@@ -183,6 +184,21 @@ def worker_fail_fast(function: _F) -> _F:
             raise
 
     return guarded  # type: ignore[return-value]
+
+
+class RblnProfilerWrapper(WorkerProfiler):
+    """Record what runs on the NPUs, and write it as a Chrome trace at
+    stop_profile."""
+
+    def __init__(self, profiler_config, trace_path: str) -> None:
+        super().__init__(profiler_config)
+        self._trace_path = trace_path
+
+    def _start(self) -> None:
+        v2.runtime.begin_activities()
+
+    def _stop(self) -> None:
+        v2.runtime.write_trace(self._trace_path, *v2.runtime.end_activities())
 
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"

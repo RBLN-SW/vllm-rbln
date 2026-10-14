@@ -45,7 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import TorchProfilerWrapper, WorkerProfiler
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
@@ -70,6 +70,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
+    RblnProfilerWrapper,
     choose_wait_policy,
     compile_and_warmup_skip_reason,
     dynamic_kv_enabled,
@@ -85,21 +86,6 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-
-
-class RblnProfilerWrapper(WorkerProfiler):
-    """Record what runs on the NPUs, and write it as a Chrome trace at
-    stop_profile."""
-
-    def __init__(self, profiler_config, trace_path: str) -> None:
-        super().__init__(profiler_config)
-        self._trace_path = trace_path
-
-    def _start(self) -> None:
-        v2.runtime.begin_activities()
-
-    def _stop(self) -> None:
-        v2.runtime.write_trace(self._trace_path, *v2.runtime.end_activities())
 
 
 class RBLNWorker(WorkerBase):
