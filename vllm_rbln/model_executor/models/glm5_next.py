@@ -39,7 +39,8 @@ from rebel.ops.torch_custom_ops import sparse_attn_glm5 as _rbln_glm5_ops
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import utils as dist_utils
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
@@ -81,15 +82,13 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5RingBackend,
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
-from vllm_rbln.v1.worker.utils import (
-    num_attn_module as rbln_num_attn_module,
-)
-from vllm_rbln.v1.worker.utils import (
-    pipeline_adjusted_layer_index,
-)
 
 # The four caches of a decoder layer, by the slot in its cache names.
 SLOT_KDA_STATE, SLOT_KDA_CONV_Q, SLOT_KDA_CONV_K, SLOT_KDA_CONV_V = range(4)
+# MTP: the KDA draft buffer (kda_verify), a fifth cache of a KDA layer.
+SLOT_KDA_DRAFT = 4
+# Caches a decoder layer may own, for the layer-index stride (num_attn_module).
+CACHES_PER_LAYER = 5
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4
 )
@@ -112,14 +111,34 @@ def _set_from_host(dst: torch.Tensor, value: torch.Tensor) -> None:
 
 
 def _layer_index_of(prefix: str) -> int:
+    """The cache's position in the runner's KV cache list, which holds the caches
+    of this rank's layers in name order (then the MTP layers'), compacted: a KDA
+    layer owns 4 caches (5 with the MTP draft buffer), a DSA layer 4, so the
+    `layer * CACHES_PER_LAYER + slot` index of `pipeline_adjusted_layer_index`
+    only holds while every layer owns the stride."""
     vllm_config = get_current_vllm_config()
-    model_config = vllm_config.model_config
-    num_attn_module = rbln_num_attn_module(
-        model_config, vllm_config.cache_config.cache_dtype
+    config = vllm_config.model_config.hf_text_config
+    spec = vllm_config.speculative_config
+    kda_caches = 5 if spec is not None and spec.num_speculative_tokens else 4
+
+    def caches(layer: int) -> int:
+        return kda_caches if config.layer_types[layer] == "linear_attention" else 4
+
+    ints = [int(name) for name in prefix.split(".") if name.isdigit()]
+    layer, slot = ints[0], ints[-1]
+    num_layers = config.num_hidden_layers
+    # Looked up per call: vllm-rbln patches it (VLLM_RBLN_NUM_HIDDEN_LAYERS).
+    start, end = dist_utils.get_pp_indices(
+        num_layers,
+        get_pp_group().rank_in_group,
+        vllm_config.parallel_config.pipeline_parallel_size,
     )
-    return pipeline_adjusted_layer_index(
-        prefix, model_config, vllm_config.parallel_config, num_attn_module
-    )
+    if layer >= num_layers:  # MTP layers (DSA), after this rank's layers
+        return (
+            sum(caches(i) for i in range(start, end)) + 4 * (layer - num_layers) + slot
+        )
+    assert start <= layer < end, f"{prefix} is not on this PP rank [{start}, {end})"
+    return sum(caches(i) for i in range(start, layer)) + slot
 
 
 def _metadata(prefix: str) -> RBLNFlashAttentionMetadata:
@@ -158,6 +177,7 @@ class RBLNGlm5RingCache(_RBLNGlm5Cache):
         dtype: torch.dtype,
         *,
         page_rows: bool = True,
+        slot_shape: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__(prefix)
         assert width % 2 == 0
@@ -168,6 +188,9 @@ class RBLNGlm5RingCache(_RBLNGlm5Cache):
         # its first rows; else (the KDA state, which sets the page size) a page is one
         # slot.
         self.page_rows = page_rows
+        # A kernel that loads a whole [*slot_shape] block (kda_verify's draft buffer):
+        # the page is seen as k such slots and the request's is slot page * k.
+        self.slot_shape = slot_shape
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return RBLNSlidingWindowSpec(
@@ -194,6 +217,9 @@ class RBLNGlm5RingCache(_RBLNGlm5Cache):
         # (a page id times k overflowed it past 32 pages for the 2 KiB tail ring).
         per_page = ring.numel() // (ring.shape[0] * self.rows * self.width)
         slot = metadata.local_block_tables.reshape(-1, 1).to(torch.int32)
+        if self.slot_shape is not None:
+            ring = ring.view(ring.shape[0] * per_page, *self.slot_shape)
+            return ring, slot * per_page, metadata
         if self.page_rows:
             ring = ring.view(ring.shape[0], per_page * self.rows, self.width)
         else:
@@ -434,6 +460,26 @@ class RBLNGlm5KDA(nn.Module):
             RBLNGlm5RingCache(f"{prefix}.attn.{slot}", conv_rows, 64, dtype)
             for slot in (SLOT_KDA_CONV_Q, SLOT_KDA_CONV_K, SLOT_KDA_CONV_V)
         )
+        # MTP: a verify step (1 + K tokens) keeps the state after token 0 and the K
+        # drafts' (k, v, exp(g), beta) in this buffer; the next step replays the
+        # accepted ones (kda_verify, design README 2.5 method 2).
+        spec = get_current_vllm_config().speculative_config
+        self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
+        self.draft = None
+        if self.num_drafts:
+            # The conv ring indexes by position: it must hold the 3 taps before a
+            # verify step's tokens.
+            assert self.num_drafts <= KDA_CONV_RING - 3, (
+                f"KDA conv ring {KDA_CONV_RING} holds {KDA_CONV_RING - 3} draft(s)"
+            )
+            slot_shape = (self.num_heads, self.num_drafts, 4, self.head_dim)
+            self.draft = RBLNGlm5RingCache(
+                f"{prefix}.attn.{SLOT_KDA_DRAFT}",
+                self.num_heads * self.num_drafts * 4,
+                self.head_dim,
+                dtype,
+                slot_shape=slot_shape,
+            )
 
     @torch.no_grad()
     def fuse_low_rank(self) -> None:
@@ -503,6 +549,22 @@ class RBLNGlm5KDA(nn.Module):
             o = torch.ops.rbln_custom_ops.kda_prefill(
                 q, k, v, g, beta, state, slot, has_initial_state
             )[:, :, :tokens]
+        elif tokens > 1 and self.draft is not None:
+            # An MTP verify step: token 0 always accepted, tokens 1 .. K the drafts.
+            draft, draft_slot, _ = self.draft.inputs()
+            o = torch.ops.rbln_custom_ops.kda_verify(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state,
+                draft,
+                slot,
+                metadata.num_accepted.view(-1),
+                None,
+                draft_slot.view(-1),
+            )
         else:
             o = torch.ops.rbln_custom_ops.kda_decode(q, k, v, g, beta, state, slot)
 
@@ -868,6 +930,65 @@ class RBLNGlm5DecoderLayer(nn.Module):
         )
 
 
+def _load_glm5_weights(
+    module: nn.Module,
+    config: PretrainedConfig,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    keep,
+) -> set[str]:
+    """Load GLM-5.3 checkpoint weights (the dense MLP's stacked gate / up, the routed
+    experts' fused params, everything else by name) into `module`, skipping a name
+    `keep` refuses."""
+    stacked_params_mapping = [
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
+    ]
+    expert_params_mapping = fused_moe_make_expert_params_mapping(
+        module,
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=config.n_routed_experts,
+    )
+    params_dict = dict(module.named_parameters())
+    loaded_params: set[str] = set()
+    for name, loaded_weight in weights:
+        if not keep(name):
+            continue
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name not in name or "mlp.experts." in name:
+                continue
+            name = name.replace(weight_name, param_name)
+            param = params_dict[name]
+            param.weight_loader(param, loaded_weight, shard_id)
+            break
+        else:
+            for (
+                param_name,
+                weight_name,
+                expert_id,
+                shard_id,
+            ) in expert_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                param.weight_loader(
+                    param,
+                    loaded_weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                break
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+        loaded_params.add(name)
+    return loaded_params
+
+
 class RBLNGlm5Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -915,59 +1036,16 @@ class RBLNGlm5Model(nn.Module):
         return self.norm(streams.mean(dim=1))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        expert_params_mapping = fused_moe_make_expert_params_mapping(
+        # Layers not built here: the MTP head, or past a VLLM_RBLN_NUM_HIDDEN_LAYERS cut.
+        loaded_params = _load_glm5_weights(
             self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            self.config,
+            weights,
+            lambda name: (
+                not name.startswith("layers.")
+                or self.start_layer <= int(name.split(".", 2)[1]) < self.end_layer
+            ),
         )
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            # Layers not built here: the MTP head, or past a VLLM_RBLN_NUM_HIDDEN_LAYERS cut.
-            if name.startswith("layers.") and not (
-                self.start_layer <= int(name.split(".", 2)[1]) < self.end_layer
-            ):
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name or "mlp.experts." in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for (
-                    param_name,
-                    weight_name,
-                    expert_id,
-                    shard_id,
-                ) in expert_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    param.weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.expand_hc_scales()
             if isinstance(layer.self_attn, RBLNGlm5DSA):
@@ -1017,6 +1095,137 @@ class RBLNGlm5NextForCausalLM(nn.Module):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return AutoWeightsLoader(self).load_weights(
+            weights, mapper=self.hf_to_vllm_mapper
+        )
+
+
+class RBLNGlm5MTPLayer(nn.Module):
+    """GLM-5.3's MTP layer: enorm(embed) | hnorm(previous hidden) -> eh_proj, then a
+    DSA + MoE block with a plain residual (no mHC), then the shared head's norm."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        hidden_size = config.hidden_size
+        self.enorm = RBLNRMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = RBLNRMSNorm(hidden_size, eps=config.rms_norm_eps)
+        # bf16 in the checkpoint, so no quant_config.
+        self.eh_proj = ReplicatedLinear(
+            2 * hidden_size, hidden_size, bias=False, prefix=f"{prefix}.eh_proj"
+        )
+        self.input_layernorm = RBLNRMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = RBLNGlm5DSA(config, quant_config, f"{prefix}.self_attn")
+        self.post_attention_layernorm = RBLNRMSNorm(
+            hidden_size, eps=config.rms_norm_eps
+        )
+        self.mlp = RBLNGlm5MoE(config, quant_config, f"{prefix}.mlp")
+        self.shared_head = nn.Module()
+        self.shared_head.norm = RBLNRMSNorm(hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self, inputs_embeds: torch.Tensor, previous_hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        # NOTE(RBLN): upstream zeroes the embedding at position 0; dropped, as the
+        # DeepSeek MTP patch does (the position-conditional select is rejected
+        # under device tensor). Position 0 is never a draft step.
+        x = torch.cat(
+            [self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)], dim=-1
+        )
+        x = self.eh_proj(x)[0]
+        x = x + self.self_attn(self.input_layernorm(x))
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return self.shared_head.norm(x)
+
+
+class RBLNGlm5MTPModel(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_text_config
+        self.config = config
+        quant_config = vllm_config.quant_config
+        # The MTP layers sit past the target's (layer num_hidden_layers onward), as
+        # their checkpoint names and the KV cache layer index both expect.
+        self.mtp_start_layer_idx = config.num_hidden_layers
+        self.num_mtp_layers = config.num_nextn_predict_layers
+        self.layers = nn.ModuleDict(
+            {
+                str(idx): RBLNGlm5MTPLayer(
+                    config, quant_config, f"{prefix}.layers.{idx}"
+                )
+                for idx in range(
+                    self.mtp_start_layer_idx,
+                    self.mtp_start_layer_idx + self.num_mtp_layers,
+                )
+            }
+        )
+        # Replaced by the target's (the proposer shares an MTP draft's embedding).
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        prefixes = tuple(f"layers.{idx}." for idx in self.layers)
+        loaded_params = _load_glm5_weights(
+            self, self.config, weights, lambda name: name.startswith(prefixes)
+        )
+        for layer in self.layers.values():
+            layer.self_attn.indexer.fold_hadamard()
+        return loaded_params
+
+
+class RBLNGlm5NextMTP(nn.Module):
+    """The GLM-5.3 MTP drafter (``Glm5NextMTPModel``), one draft step a layer. The
+    embedding and the lm_head are the target's: the checkpoint's MTP layer carries
+    neither, only the shared head's norm."""
+
+    # The proposer then shares the target's lm_head.
+    has_own_lm_head = False
+    hf_to_vllm_mapper = RBLNGlm5NextForCausalLM.hf_to_vllm_mapper
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_text_config
+        self.config = config
+        self.model = RBLNGlm5MTPModel(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self._mtp_layers = list(self.model.layers.values())
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_index: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        layer = self._mtp_layers[spec_step_index % len(self._mtp_layers)]
+        out = layer(inputs_embeds, hidden_states)
+        # Post-norm, for both the draft logits and the next step's hidden.
+        return out, out
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor(self.lm_head, hidden_states)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The lm_head is the target's (shared by the proposer).
+        weights = ((n, w) for n, w in weights if not n.startswith("lm_head."))
         return AutoWeightsLoader(self).load_weights(
             weights, mapper=self.hf_to_vllm_mapper
         )
