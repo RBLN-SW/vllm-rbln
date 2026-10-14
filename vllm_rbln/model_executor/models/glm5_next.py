@@ -102,6 +102,8 @@ KDA_HEAD_DIM = 128
 KDA_CONV_RING = 4
 # kda_prefill runs whole 128-token chunks.
 KDA_CHUNK = 128
+# The sparse MLA kernel's table must span a multiple of this many tokens.
+MLA_TABLE_TOKENS = 16384
 INDEX_KPOOL = _rbln_glm5_ops.KPOOL
 INDEX_HEAD_DIM = _rbln_glm5_ops.INDEX_HEAD_DIM
 
@@ -686,6 +688,12 @@ class RBLNGlm5DSA(nn.Module):
         # later compiler pass), which relay's einsum refuses next to bf16 weights.
         q_mla = torch.matmul(q.transpose(1, 2), w_uk)  # [B, H, T, L]
         latent_cache, block_table, metadata = self.latent_cache.inputs()
+        # The kernel walks the table in groups of 16384 tokens: a max_model_len below
+        # that gets null-block (0) columns, past every sequence, so never read.
+        block_size = latent_cache.shape[1]
+        pad = -block_table.shape[-1] * block_size % MLA_TABLE_TOKENS // block_size
+        if pad:
+            block_table = F.pad(block_table, (0, pad))
         o = torch.ops.rbln_custom_ops.sparse_attn_glm5_mla(
             q_mla,
             kv_c,
