@@ -119,7 +119,9 @@ def test_host_logits_are_argmaxed_on_the_host(sampler):
         raise AssertionError("the compiled argmax ran on host logits")
 
     sampler._compiled_greedy_sample = refuse
-    metadata = make_sampling_metadata(temperature=None, all_greedy=True, all_random=False)
+    metadata = make_sampling_metadata(
+        temperature=None, all_greedy=True, all_random=False
+    )
 
     sampled, _ = sampler.sample(near_tied_logits(), metadata)
 
