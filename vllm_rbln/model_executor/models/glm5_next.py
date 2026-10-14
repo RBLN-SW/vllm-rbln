@@ -660,11 +660,24 @@ class RBLNGlm5DSA(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
         self.indexer = RBLNGlm5Indexer(config, f"{prefix}.indexer")
-        dtype = get_current_vllm_config().model_config.dtype
+        vllm_config = get_current_vllm_config()
+        # KV8 (--kv-cache-dtype fp8): [fp8 512] latent rows in a uint8 container under
+        # one per-tensor k_scale; the op routes a uint8 cache to its fp8 kernel. The
+        # checkpoint carries no KV scale, so k_scale is 1.0, held as vLLM's Attention
+        # does (a rank-0 fp32 buffer a checkpoint scale could fill in place). The
+        # indexer and the KDA / tail-ring caches keep their own dtypes.
+        if not vllm_config.cache_config.cache_dtype.startswith("fp8"):
+            raise ValueError(
+                "GLM-5.3 on RBLN runs with an fp8 KV cache only "
+                f"(--kv-cache-dtype fp8), got {vllm_config.cache_config.cache_dtype!r}"
+            )
+        self.register_buffer(
+            "_k_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False
+        )
         self.latent_cache = RBLNGlm5PagedCache(
             f"{prefix}.attn.{SLOT_DSA_LATENT}",
             self.kv_lora_rank,
-            dtype,
+            torch.uint8,
             1,
             RBLNGlm5LatentBackend,
         )
@@ -702,6 +715,8 @@ class RBLNGlm5DSA(nn.Module):
             metadata.seq_lens.to(torch.int32),
             block_table,
             topk,
+            k_scale=self._k_scale,
+            cache_dtype=torch.float8_e4m3fn,
             is_prompt_sorted=self.is_prompt_sorted,
         )
         o = torch.matmul(o, w_uv.transpose(2, 3))  # [B, H, T, V]

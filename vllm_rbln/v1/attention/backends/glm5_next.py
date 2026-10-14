@@ -30,7 +30,9 @@ from .flash_attention import RBLNFlashAttentionMetadataBuilder
 
 class _RBLNGlm5CacheBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[str]] = ["auto", "bfloat16"]
+    # KV8 only: --kv-cache-dtype fp8 sets the MLA latent cache; the other caches keep
+    # their own dtypes (bf16 rings, the fp8 / f16 indexer).
+    supported_kv_cache_dtypes: ClassVar[list[str]] = ["fp8", "fp8_e4m3"]
     accept_output_buffer: bool = False
     # Entries a paged block stores per `block_size` tokens (1 for the ring caches).
     compress_ratio: ClassVar[int] = 1
