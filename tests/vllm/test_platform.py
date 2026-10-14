@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import copy
 import os
+import subprocess
+import sys
+import textwrap
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -114,6 +117,162 @@ def reconfigure(configured):
 @pytest.fixture(autouse=True)
 def isolated_standalone_env(monkeypatch):
     monkeypatch.setenv(_STANDALONE, _UNTOUCHED)
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_config_preserves_rbln_output(tmp_path, bootstrap_logging, color):
+    probe = textwrap.dedent(r"""
+        import io
+        import json
+        import logging
+        import os
+        import re
+        import sys
+        from contextlib import closing, redirect_stdout
+        from copy import deepcopy
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        configure_logging(LoggingConfig(configure_logging=True, log_level="ERROR"))
+        import vllm_rbln.platform
+        import vllm_rbln.logger as rbln_logger
+        from vllm_rbln.logger import make_file_handler
+
+        assert logging.getLogger("vllm_rbln").getEffectiveLevel() == logging.ERROR
+        defaults = deepcopy(rbln_logger.DEFAULT_LOGGIN_CONFIG)
+        os.environ["VLLM_CONFIGURE_LOGGING"] = "1"
+        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+        rbln_logger._configure_vllm_root_logger()
+        assert rbln_logger.DEFAULT_LOGGIN_CONFIG == defaults
+        source = sys.modules[LoggingConfig.__module__].__file__
+        record = logging.LogRecord(
+            "vllm_rbln.logging_test", logging.ERROR, source, 7, "path marker", (), None
+        )
+        root = logging.getLogger("vllm_rbln")
+        rendered = root.handlers[0].formatter.format(record)
+        assert "[config/logging.py:7]" in re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
+        console, = root.handlers
+        output = io.StringIO()
+        console.setStream(output)
+        formatter = console.formatter
+        logger = init_logger("vllm_rbln.logging_test")
+        file_path = Path(sys.argv[1]) / "metrics.log"
+        file_handler = make_file_handler(str(file_path))
+        logger.addHandler(file_handler)
+
+        for level in ("INFO", "ERROR", "DEBUG", "INFO"):
+            configure_logging(LoggingConfig(configure_logging=True, log_level=level))
+            assert root.getEffectiveLevel() == getattr(logging, level)
+            assert root.handlers == [console]
+            assert type(console.formatter) is type(formatter)
+            assert console.stream is output
+            assert logger.handlers == [file_handler]
+            output.seek(0)
+            output.truncate()
+            logger.debug("debug marker")
+            logger.info("info marker")
+            logger.error("error marker")
+            logger.handle(record)
+            text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert ("debug marker" in text) == (level == "DEBUG"), text
+            assert ("info marker" in text) == (level != "ERROR"), text
+            assert text.count("error marker") == 1, text
+            assert all(line.startswith("[vllm-rbln] ") for line in text.splitlines())
+            assert "pid=" not in text
+            location = "config/logging.py" if level == "DEBUG" else "logging.py"
+            assert f"[{location}:7]" in text, text
+            assert f"[{location}:7]" in file_path.read_text().splitlines()[-1]
+            level_path = Path(sys.argv[1]) / f"{level}.log"
+            with closing(make_file_handler(str(level_path))) as level_handler:
+                level_handler.handle(record)
+            assert f"[{location}:7]" in level_path.read_text()
+
+        configure_logging(LoggingConfig(configure_logging=False, log_level="ERROR"))
+        assert root.getEffectiveLevel() == logging.INFO
+        logger.info("file marker")
+        file_handler.flush()
+        assert "[vllm-rbln] INFO" in file_path.read_text()
+        assert "file marker" in file_path.read_text()
+
+        custom_path = Path(sys.argv[1]) / "logging.json"
+        custom_path.write_text(json.dumps({
+            "version": 1,
+            "incremental": True,
+            "handlers": {"vllm_rbln": {"level": "ERROR"}},
+            "loggers": {"vllm_rbln": {"level": "WARNING"}},
+        }))
+        configure_logging(LoggingConfig(
+            configure_logging=True,
+            log_level="DEBUG",
+            pylogging_config_file=str(custom_path),
+        ))
+        assert root.getEffectiveLevel() == logging.WARNING
+        output.seek(0)
+        output.truncate()
+        logger.warning("filtered marker")
+        logger.error("incremental marker")
+        assert "filtered marker" not in output.getvalue()
+        assert output.getvalue().count("incremental marker") == 1
+        logger.removeHandler(file_handler)
+        file_handler.close()
+
+        for name in ("application_console", "vllm_rbln"):
+            custom_path.write_text(json.dumps({
+                "version": 1,
+                "disable_existing_loggers": False,
+                "formatters": {"custom": {"format": "[custom] %(message)s"}},
+                "handlers": {name: {
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stdout",
+                    "formatter": "custom",
+                }},
+                "loggers": {"vllm_rbln": {
+                    "handlers": [name], "level": "INFO", "propagate": False,
+                }},
+            }))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                configure_logging(LoggingConfig(
+                    configure_logging=True, pylogging_config_file=str(custom_path),
+                ))
+                persistent_path = Path(sys.argv[1]) / f"{name}.log"
+                persistent = make_file_handler(str(persistent_path))
+                root.addHandler(persistent)
+                logger.info("custom marker")
+                assert output.getvalue().strip() == "[custom] custom marker"
+                output.seek(0)
+                output.truncate()
+                configure_logging(LoggingConfig(
+                    configure_logging=True, log_level="INFO",
+                ))
+                logger.info("transition marker")
+            text = re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+            assert text.count("transition marker") == 1, text
+            assert text.startswith("[vllm-rbln] "), text
+            assert persistent in root.handlers
+            assert "transition marker" in persistent_path.read_text()
+            root.removeHandler(persistent)
+            persistent.close()
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "VLLM_CONFIGURE_LOGGING": bootstrap_logging,
+            "VLLM_LOGGING_LEVEL": "INFO",
+            "VLLM_LOGGING_CONFIG_PATH": "",
+            "VLLM_LOGGING_COLOR": color,
+            "NO_COLOR": "",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class TestPlatformIdentity:
