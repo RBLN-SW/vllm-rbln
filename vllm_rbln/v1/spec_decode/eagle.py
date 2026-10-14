@@ -11,19 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from copy import copy
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.utils import AttentionGroup
 
 import vllm_rbln.envs as envs
 from vllm_rbln.compilation import (
@@ -88,6 +96,95 @@ class RBLNEagleProposer(EagleProposer):
         # Whether a draft forward joins the DP all-gather; see `load_model`.
         self.draft_has_moe = False
 
+    def _draft_layer_groups(self, kv_cache_config: KVCacheConfig) -> dict[str, int]:
+        layer_to_gid: dict[str, int] = {}
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                if layer_name in self._draft_attn_layer_names:
+                    layer_to_gid[layer_name] = gid
+        return layer_to_gid
+
+    def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
+        # NOTE(RBLN): a draft layer may own several caches in different groups
+        # (GLM-5.3's MTP layer: the latent, the indexer key and scale, the tail
+        # ring). `initialize_attn_backend` gives each group its own attention
+        # group, and every metadata build takes that group's block table.
+        pass
+
+    def initialize_attn_backend(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int] | None = None,
+    ) -> None:
+        layer_to_gid = self._draft_layer_groups(kv_cache_config)
+        if len(set(layer_to_gid.values())) <= 1:
+            super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+            return
+
+        all_attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+        )
+        attention_groups: dict[tuple[int, str], AttentionGroup] = {}
+        for layer_name in sorted(layer_to_gid):
+            gid = layer_to_gid[layer_name]
+            group_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+            spec = group_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[layer_name]
+            attn_backend = all_attn_layers[layer_name].get_attn_backend()
+            key = (gid, attn_backend.full_cls_name())
+            if key in attention_groups:
+                attention_groups[key].layer_names.append(layer_name)
+                continue
+            attn_group = AttentionGroup(
+                backend=attn_backend,
+                layer_names=[layer_name],
+                kv_cache_spec=spec,
+                kv_cache_group_id=gid,
+            )
+            attn_group.create_metadata_builders(
+                self.vllm_config,
+                self.device,
+                kernel_block_size=(
+                    kernel_block_sizes[gid] if kernel_block_sizes is not None else None
+                ),
+            )
+            attention_groups[key] = attn_group
+        self.draft_attn_groups = list(attention_groups.values())
+
+        # The primary group: the first paged (non-ring) one, whose block table the
+        # runner hands over as the drafter's common metadata.
+        gids = sorted(set(layer_to_gid.values()))
+        paged = [
+            gid
+            for gid in gids
+            if not isinstance(
+                kv_cache_config.kv_cache_groups[gid].kv_cache_spec, SlidingWindowSpec
+            )
+        ]
+        self.kv_cache_gid = (paged or gids)[0]
+        self.block_size = (
+            kernel_block_sizes[self.kv_cache_gid]
+            if kernel_block_sizes is not None
+            else kv_cache_config.kv_cache_groups[
+                self.kv_cache_gid
+            ].kv_cache_spec.block_size
+        )
+
+    def _group_attn_metadata(
+        self, common_attn_metadata: CommonAttentionMetadata, attn_group: AttentionGroup
+    ) -> CommonAttentionMetadata:
+        """The common metadata with the block table of the group's own cache."""
+        # The runner may hand over another group's table (group 0 unless the
+        # drafter is a draft model), so always take the group's own.
+        gid = attn_group.kv_cache_group_id
+        cm = copy(common_attn_metadata)
+        cm.block_table_tensor = self.runner.input_batch.block_table[
+            gid
+        ].get_cpu_tensor()[: common_attn_metadata.num_reqs]
+        return cm
+
     def propose(
         self,
         target_token_ids: torch.Tensor,
@@ -122,7 +219,9 @@ class RBLNEagleProposer(EagleProposer):
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
-                common_attn_metadata=common_attn_metadata,
+                common_attn_metadata=self._group_attn_metadata(
+                    common_attn_metadata, attn_group
+                ),
                 positions=target_positions,
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
@@ -238,7 +337,9 @@ class RBLNEagleProposer(EagleProposer):
             per_layer_attn_metadata.clear()
             for attn_group in self.draft_attn_groups:
                 attn_metadata = attn_group.get_metadata_builder().build(
-                    common_attn_metadata=common_attn_metadata,
+                    common_attn_metadata=self._group_attn_metadata(
+                        common_attn_metadata, attn_group
+                    ),
                     positions=positions,
                     is_prefill=False,
                     batch_pad=num_reqs_padded,
@@ -539,7 +640,9 @@ class RBLNEagleProposer(EagleProposer):
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
-                common_attn_metadata=common_attn_metadata,
+                common_attn_metadata=self._group_attn_metadata(
+                    common_attn_metadata, attn_group
+                ),
                 positions=self.positions[:num_tokens],
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
@@ -607,7 +710,9 @@ class RBLNEagleProposer(EagleProposer):
         per_layer_attn_metadata.clear()
         for attn_group in self.draft_attn_groups:
             attn_metadata = attn_group.get_metadata_builder().build(
-                common_attn_metadata=common_attn_metadata,
+                common_attn_metadata=self._group_attn_metadata(
+                    common_attn_metadata, attn_group
+                ),
                 positions=self.positions[:num_reqs],
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
