@@ -29,6 +29,18 @@ from typing import Any
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_host_links(monkeypatch, tmp_path_factory):
+    """No test reads this host's links, or a reading another test cached."""
+    from tests.vllm.distributed.kv_connector.utils import setattr_in_package
+
+    setattr_in_package(
+        monkeypatch,
+        _SYS_CLASS_NET=tmp_path_factory.mktemp("sys_class_net"),
+        _link_poll=(-1.0, False),
+    )
+
+
 @pytest.fixture
 def make_worker(monkeypatch, tmp_path_factory):
     """Build a real RblnNixl*ConnectorWorker; call it from the test body."""
@@ -44,8 +56,8 @@ def make_worker(monkeypatch, tmp_path_factory):
         engine_config,
         fake_nixl_rbln,
         patch_in_package,
+        set_connector_options,
     )
-    from vllm_rbln import envs
     from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker import (  # noqa: E501
         RblnNixlPullConnectorWorker,
     )
@@ -62,7 +74,7 @@ def make_worker(monkeypatch, tmp_path_factory):
         direction: str = "pull",
         draft_kv_heads: int | None = None,
         kv_cache: KvGeometry | None = None,
-        swa_view_opt: bool = False,
+        swa_window_mode: bool = False,
         register: bool = True,
         stripe_width: int | None = None,
     ) -> Any:
@@ -80,6 +92,7 @@ def make_worker(monkeypatch, tmp_path_factory):
         # Left open for the test's duration: get_current_attn_backends reads it
         # during __init__, and later production calls read it again.
         stack.enter_context(set_current_vllm_config(config))
+        set_connector_options(monkeypatch, config, swa_window_mode=swa_window_mode)
 
         if geometry.draft_layers:
             assert config.speculative_config is not None, (
@@ -99,7 +112,6 @@ def make_worker(monkeypatch, tmp_path_factory):
         monkeypatch.setattr(
             up_worker, "get_tensor_model_parallel_world_size", lambda: 1
         )
-        monkeypatch.setattr(envs, "VLLM_RBLN_NIXL_SWA_VIEW_OPT", swa_view_opt)
         # The other device-identity probe (see KvGeometry.kv_caches): the D2D
         # path asks rebel for the tensor's context pointer, which it hands
         # straight to the adapter. `aligned_tensor` is a separate name and
@@ -128,6 +140,14 @@ def make_worker(monkeypatch, tmp_path_factory):
         # registration always reads an allocated count; leaving it None here
         # would build a state production cannot reach.
         config.cache_config.num_gpu_blocks = geometry.num_blocks
+
+        # What the runner binds before it registers: every layer, unfiltered
+        # (`rbln_model_runner.initialize_kv_cache_tensors`). This is where the
+        # connector reads a sliding-window layer's view.
+        for name, view in geometry.forward_context_caches().items():
+            config.compilation_config.static_forward_context[name] = SimpleNamespace(
+                kv_cache=view
+            )
 
         worker = cls(config, "local-engine", geometry.kv_cache_config())
 

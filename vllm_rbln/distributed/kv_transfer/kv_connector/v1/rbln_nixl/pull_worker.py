@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
@@ -25,7 +26,9 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.base_worker imp
 from vllm_rbln.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqMeta
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        ReqMeta,
+    )
 
 logger = init_logger(__name__)
 
@@ -59,13 +62,35 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
         # mid-transfer.
         self._engine_last_active[engine_id] = time.perf_counter()
         pp_size = self._remote_pp_size.get(engine_id, 1)
+        # `or None`: a producer that kept no blocks reports zero, and zero is
+        # not a last block anyone can size -- the whole block goes.
+        valid_tokens = meta.remote.num_tokens or None
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         # Per-shard lists exist exactly for peers serving part of what a
         # whole-engine handle covers. Re-deriving that from the parallel sizes
         # misses the reverse case: a producer without pipelining still serves
         # several of our ranks when ours is the finer one.
         if not self._overlapping_ranks.get(engine_id):
-            return super()._read_blocks_for_req(req_id, meta)
+            # Chunk mode registers per-shard state against every peer unless
+            # this engine owns the whole-engine lists, so reaching upstream's
+            # read without either means it did not.
+            assert not self._shape.chunk_mode or self._own_engine_layout, (
+                f"RBLN NIXL: chunk mode reached upstream's whole-engine read "
+                f"for {engine_id}, whose notification cannot name the part of "
+                "a request a chunked read fills"
+            )
+            # Counted before the call: upstream trims the front of both lists
+            # against the local prefix cache, and the token count describes the
+            # request's own blocks.
+            tail: AbstractContextManager = (
+                self._tail_viewed_as(
+                    valid_tokens, self._prompt_blocks(meta.remote.block_ids)
+                )
+                if self._shape.chunk_mode or self._own_engine_layout
+                else nullcontext()
+            )
+            with tail:
+                return super()._read_blocks_for_req(req_id, meta)
 
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size
@@ -85,6 +110,9 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
             engine_id, meta.remote.request_id, remote_info.remote_tp_size
         )
         prefix_hit = len(local_block_ids) == 0
+        # Counted before the prefix trim below, which cuts the front: the token
+        # count describes the producer's whole list, and both lists keep their
+        # tail, so the last element is still the request's last block.
         n_prompt_blocks = sum(len(g) for g in remote_block_ids)
 
         if not prefix_hit:
@@ -147,16 +175,29 @@ class RblnNixlPullConnectorWorker(RblnNixlWorkerBase, NixlPullConnectorWorker):
                     self.xfer_stats.record_failed_notification()
                 continue
 
-            remote_descs = self._get_block_descs_ids_for_shard(
+            # Per peer, because the chunk grid is: a read reaches several
+            # producers, and there is no step where they agree on one.
+            remote_descs = self._shard_descs_for_tokens(
                 engine_id,
                 global_rank,
                 self.dst_num_blocks[engine_id],
                 remote_block_ids,
+                num_valid_tokens=valid_tokens,
+                num_prompt_blocks=n_prompt_blocks,
             )
-            local_descs = self._get_block_descs_ids_for_shard(
-                engine_id, global_rank, self.num_blocks, local_block_ids
+            local_descs = self._shard_descs_for_tokens(
+                engine_id,
+                global_rank,
+                self.num_blocks,
+                local_block_ids,
+                num_valid_tokens=valid_tokens,
+                num_prompt_blocks=n_prompt_blocks,
             )
-            assert len(local_descs) == len(remote_descs)
+            assert len(local_descs) == len(remote_descs), (
+                f"RBLN NIXL: {len(local_descs)} local vs {len(remote_descs)} "
+                f"remote descriptor(s) for {engine_id} rank {global_rank}; the "
+                "two lists pair by position, so a transfer would misread"
+            )
             local_handle = self.src_xfer_handles_by_remote[
                 (engine_id, global_rank, remote_block_size)
             ]

@@ -23,8 +23,7 @@ from tests.vllm.utils import check_logprobs_close
 MODELS = [
     CompileModelSpec("meta-llama/Llama-3.2-1B-Instruct"),
     CompileModelSpec("Qwen/Qwen3-0.6B"),
-    # SWA models are incompatible with sub-block prefix caching.
-    CompileModelSpec("google/gemma-3-1b-it", envs={"VLLM_RBLN_SUB_BLOCK_CACHE": "0"}),
+    CompileModelSpec("google/gemma-3-1b-it"),
     # Quantization schemes
     CompileModelSpec("Qwen/Qwen3-0.6B-FP8"),
     CompileModelSpec("RedHatAI/Qwen2.5-0.5B-quantized.w8a16"),

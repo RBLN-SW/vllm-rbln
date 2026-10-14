@@ -22,6 +22,8 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.metrics.stats import PrefixCacheStats
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from tests.vllm.v1.core.utils import (
@@ -93,16 +95,14 @@ class TestSchedulerInit:
         sched = create_rbln_scheduler(enable_prefix_caching=False)
         assert not isinstance(sched.kv_cache_manager, RBLNKVCacheManager)
 
-    def test_the_scheduler_hands_its_own_geometry_to_the_rules(self):
-        # The rules themselves are covered on sub_block_size_in_use; this is
-        # the wiring, which a wrong block_size or chunk would silently pass.
-        with pytest.raises(ValueError, match="block_size >="):
+    def test_sub_block_size_above_token_budget_is_rejected(self):
+        with pytest.raises(ValueError, match="got 512 >= 128 >= 256"):
             create_rbln_scheduler(
                 enable_prefix_caching=True,
-                block_size=16,
+                block_size=512,
                 max_num_batched_tokens=128,
                 max_model_len=128,
-                sub_block_size=8,
+                sub_block_size=256,
             )
 
     def test_equal_block_and_sub_block_size_is_rejected(self):
@@ -207,6 +207,124 @@ class TestUpdateFromOutput:
 
 
 @pytest.mark.usefixtures("cr13")
+class TestSubBlockIndexAfterSpecDecodeStop:
+    # A request whose last decode step lands num_computed_tokens on a block
+    # boundary frees its last block without the synthetic hash, while the index
+    # still lists the sub-blocks recorded during decode.
+    _BS = 16
+    _SUB = 4
+    _PROMPT = list(range(1000, 1024))  # one full block and 8 tokens
+    _PROBE = list(range(2000, 2009))  # two sub-blocks and one token
+    _FILLER = list(range(4000, 4009))
+
+    def _scheduler(self):
+        return create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=self._BS,
+            max_num_batched_tokens=self._BS,
+            sub_block_size=self._SUB,
+            max_model_len=128,
+            num_blocks=20,
+            num_speculative_tokens=3,
+        )
+
+    @staticmethod
+    def _step(sched, sampled=None, spec=None):
+        for req_id, ids in (spec or {}).items():
+            sched.requests[req_id].spec_token_ids = list(ids)
+        out = sched.schedule()
+        req_ids = list(out.num_scheduled_tokens)
+        sched.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                sampled_token_ids=[list((sampled or {}).get(r, [])) for r in req_ids],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        return out
+
+    def _run_long_request(self, sched, *, last_step_spec):
+        # Prefill in two chunks, then one decode step with 3 drafts all accepted
+        # (computed 28, 3 sub-blocks of block 1 indexed), then the last step.
+        req = make_request("long", self._PROMPT, self._BS, max_tokens=6)
+        sched.add_request(req)
+        self._step(sched)
+        self._step(sched, sampled={"long": [7]})
+        self._step(sched, sampled={"long": [7] * 4}, spec={"long": [7] * 3})
+        block1 = sched.kv_cache_manager.coordinator.get_blocks("long")[0][1]
+        n = len(last_step_spec)
+        self._step(
+            sched, sampled={"long": [7] * (n + 1)}, spec={"long": last_step_spec}
+        )
+        assert req.is_finished()
+        return req, block1
+
+    def _run_probe(self, sched, req_id, tokens=None):
+        tokens = self._PROBE if tokens is None else tokens
+        sched.add_request(make_request(req_id, tokens, self._BS, max_tokens=1))
+        out = self._step(sched, sampled={req_id: [7]})
+        return out.scheduled_new_reqs[0].block_ids[0][0]
+
+    def test_reusing_a_hashless_block_removes_its_sub_block_index(self):
+        sched = self._scheduler()
+        req, block1 = self._run_long_request(sched, last_step_spec=[7] * 3)
+        # max_tokens stopped the request after one of the four sampled tokens,
+        # but num_computed_tokens kept all four.
+        assert req.num_computed_tokens == 32 > req.num_tokens - 1
+        manager = sched.kv_cache_manager
+        idx = manager._group_infos[0].sub_block_index
+        assert block1.block_hash is None
+        assert idx.contains(block1.block_id)
+        pool = manager.block_pool
+        reused = pool.get_new_blocks(pool.get_num_free_blocks())
+        assert block1 in reused
+        assert not idx.contains(block1.block_id)
+        pool.free_blocks(reused)
+
+    def test_probe_after_the_long_request_matches(self):
+        sched = self._scheduler()
+        self._run_long_request(sched, last_step_spec=[7] * 3)
+        # The block past the boundary went back to the queue head after block 1.
+        self._run_probe(sched, "filler", self._FILLER)
+        self._run_probe(sched, "probe")
+        repeat = make_request("repeat", self._PROBE, self._BS, max_tokens=1)
+        match = sched.kv_cache_manager.get_computed_blocks_sub_block(repeat, 0)
+        assert match is not None and match.num_tokens == 2 * self._SUB
+        sched.kv_cache_manager.release_sub_block_match(match)
+
+    def test_old_prefix_does_not_match_a_block_overwritten_by_the_probe(self):
+        sched = self._scheduler()
+        self._run_long_request(sched, last_step_spec=[7] * 3)
+        self._run_probe(sched, "filler", self._FILLER)
+        probe_block = self._run_probe(sched, "probe")
+        query = make_request("old", self._PROMPT[: 16 + 12] + [3000] * 4, self._BS)
+        m = sched.kv_cache_manager
+        _, num_computed, _ = m.get_computed_blocks(query)
+        match = m.get_computed_blocks_sub_block(query, num_computed)
+        if match is not None:
+            src = match.group_matches[0].src_block.block_id
+            m.release_sub_block_match(match)
+            assert src != probe_block, "matched KV the probe overwrote"
+
+    def test_without_overshoot_the_probe_matches(self):
+        # Control: the last step schedules no drafts, so num_computed_tokens stops
+        # inside block 1 and free gives it the synthetic hash.
+        sched = self._scheduler()
+        req, _ = self._run_long_request(sched, last_step_spec=[])
+        assert req.num_computed_tokens == req.num_tokens - 1
+        self._run_probe(sched, "filler", self._FILLER)
+        self._run_probe(sched, "probe")
+        repeat = make_request("repeat", self._PROBE, self._BS, max_tokens=1)
+        match = sched.kv_cache_manager.get_computed_blocks_sub_block(repeat, 0)
+        assert match is not None and match.num_tokens == 2 * self._SUB
+        sched.kv_cache_manager.release_sub_block_match(match)
+
+
+@pytest.mark.usefixtures("cr13")
 class TestTrySubBlockMatch:
     @staticmethod
     def _seeded_scheduler():
@@ -266,6 +384,53 @@ class TestIsPrefill:
 
 
 class TestScheduleBasic:
+    @pytest.mark.usefixtures("cr13")
+    @pytest.mark.parametrize("sub_block", [False, True])
+    @pytest.mark.parametrize("preempted", [False, True])
+    def test_prefix_cache_stats_recorded_once_at_admission(
+        self, monkeypatch, sub_block, preempted
+    ):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            block_size=16,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            sub_block_size=8 if sub_block else None,
+            additional_config={"enable_sub_block_cache": sub_block},
+        )
+        seed = make_request("seed", list(range(32)), 16, max_tokens=1)
+        sched.add_request(seed)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        assert seed.is_finished()
+        manager = sched.kv_cache_manager
+        manager.make_prefix_cache_stats()
+
+        query = make_request("query", list(range(24)) + [100] * 16, 16)
+        if preempted:
+            query.status = RequestStatus.PREEMPTED
+            query.num_preemptions = 1
+        sched.add_request(query)
+        with monkeypatch.context() as patch:
+            patch.setattr(manager, "allocate_slots", lambda *args, **kwargs: None)
+            assert not sched.schedule().num_scheduled_tokens
+            assert manager.make_prefix_cache_stats() == PrefixCacheStats()
+
+        out = sched.schedule()
+        assert query.request_id in out.num_scheduled_tokens
+        hits = 24 if sub_block else 16
+        if preempted:
+            expected = PrefixCacheStats(
+                preempted_requests=1,
+                preempted_queries=query.num_tokens,
+                preempted_hits=hits,
+            )
+        else:
+            expected = PrefixCacheStats(requests=1, queries=query.num_tokens, hits=hits)
+        assert manager.make_prefix_cache_stats() == expected
+
     def test_admits_and_counts_tokens(self):
         # add -> schedule returns RBLNSchedulerOutput scheduling one prefill with
         # the exact prompt length (also smokes the ported schedule() on 0.22.0).
@@ -290,7 +455,7 @@ class TestScheduleBasic:
 
     def test_chunked_prefill_across_steps(self):
         # A prompt longer than max_num_batched_tokens is chunked across steps.
-        sched = create_rbln_scheduler(max_num_batched_tokens=256)
+        sched = create_rbln_scheduler(max_num_batched_tokens=256, block_size=256)
         req = create_requests(1, num_tokens=500)[0]
         sched.add_request(req)
         out = sched.schedule()
@@ -318,7 +483,7 @@ class TestScheduleNoMixedBatching:
     def test_prefill_evicts_running_decode(self):
         # RBLN difference: a new prefill evicts running decodes (no mixing).
         sched = create_rbln_scheduler(
-            max_num_batched_tokens=128, block_size=16, num_blocks=10000
+            max_num_batched_tokens=128, block_size=128, num_blocks=10000
         )
         req_a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
         advance_to_decode(sched, req_a)
@@ -380,20 +545,20 @@ class TestScheduleDecodeBatchLimit:
 
 class TestSchedulePrefillAllocation:
     def test_prefill_not_scheduled_when_full_prompt_cannot_fit(self):
-        # KV is reserved for the whole prompt: 500 tokens need 32 blocks and only
-        # ~19 are usable, so nothing is scheduled even though one chunk would fit.
+        # KV is reserved for the whole prompt: 500 tokens need 4 blocks and only
+        # 3 are usable, so nothing is scheduled even though one chunk would fit.
         sched = create_rbln_scheduler(
-            max_num_batched_tokens=128, block_size=16, num_blocks=20
+            max_num_batched_tokens=128, block_size=128, num_blocks=4
         )
-        req = create_requests(1, num_tokens=500, block_size=16)[0]
+        req = create_requests(1, num_tokens=500, block_size=128)[0]
         sched.add_request(req)
         out = sched.schedule()
         assert req.request_id not in out.num_scheduled_tokens
         # With ample blocks the same request schedules its first full chunk.
         sched2 = create_rbln_scheduler(
-            max_num_batched_tokens=128, block_size=16, num_blocks=10000
+            max_num_batched_tokens=128, block_size=128, num_blocks=10000
         )
-        req2 = create_requests(1, num_tokens=500, block_size=16)[0]
+        req2 = create_requests(1, num_tokens=500, block_size=128)[0]
         sched2.add_request(req2)
         out2 = sched2.schedule()
         assert out2.num_scheduled_tokens[req2.request_id] == 128
@@ -405,7 +570,7 @@ class TestSchedulePrefillAllocation:
         sched = create_rbln_scheduler(
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=4,
-            block_size=16,
+            block_size=128,
             num_blocks=10000,
         )
         req_a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
@@ -447,6 +612,7 @@ class TestScheduleSpecDecodeCap:
     def _scheduler(self, **kwargs):
         return create_rbln_scheduler(
             block_size=self._BS,
+            max_num_batched_tokens=self._BS,
             num_blocks=self._NUM_BLOCKS,
             max_num_seqs=self._MAX_NUM_SEQS,
             num_speculative_tokens=4,
@@ -522,13 +688,14 @@ class TestFixedWindowReservation:
 
 
 class TestBlockBoundaryJoin:
-    _BS = 16
+    _BS = 32
     _NUM_SPEC = 4
 
     def _scheduler(self):
         return create_rbln_scheduler(
             num_speculative_tokens=self._NUM_SPEC,
             block_size=self._BS,
+            max_num_batched_tokens=self._BS,
             num_blocks=256,
             max_num_seqs=8,
             enable_prefix_caching=True,
@@ -545,7 +712,9 @@ class TestBlockBoundaryJoin:
             same_prompt=True,
             req_ids=[seed_id, req_id],
         )
-        advance_to_decode(sched, seed)  # caches the shared first block
+        sched.add_request(seed)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
         sched.add_request(req)
         return req
 
@@ -579,7 +748,7 @@ class TestStrandedBlockDelta:
     def _stash_evicted_block():
         block_size = 16
         sched = create_rbln_scheduler(
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
             max_num_seqs=4,
             block_size=block_size,
             num_blocks=10000,
@@ -752,27 +921,41 @@ class TestStopping:
 
 
 class TestPreemption:
-    def test_kv_exhaustion_preempts(self):
+    @pytest.mark.parametrize("num_prompt_blocks", [1, 5])
+    def test_kv_exhaustion_preempts(self, num_prompt_blocks):
         # Under KV pressure a running request is preempted; the preempted
         # request still receives its sampled token from the in-flight step.
         sched = create_rbln_scheduler(
             max_num_batched_tokens=100,
-            block_size=16,
-            num_blocks=11,
+            block_size=100,
+            num_blocks=2 * num_prompt_blocks + 1,
             enable_prefix_caching=False,
         )
-        reqs = create_requests(2, num_tokens=80, block_size=16)
+        reqs = create_requests(2, num_tokens=100 * num_prompt_blocks, block_size=100)
         sched.add_request(reqs[0])
+        for _ in range(num_prompt_blocks - 1):
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out))
         out0 = sched.schedule()
-        assert len(out0.scheduled_new_reqs[0].block_ids[0]) == 5
+        assert len(sched.kv_cache_manager.get_blocks(reqs[0].request_id).blocks[0]) == (
+            num_prompt_blocks
+        )
         sched.add_request(reqs[1])
+        for _ in range(num_prompt_blocks - 1):
+            out = sched.schedule()
+            sched.update_from_output(out, make_model_runner_output(out))
         out1 = sched.schedule()
-        assert len(out1.scheduled_new_reqs[0].block_ids[0]) == 5
+        assert len(sched.kv_cache_manager.get_blocks(reqs[1].request_id).blocks[0]) == (
+            num_prompt_blocks
+        )
         sched.update_from_output(out0, make_model_runner_output(out0, 0))
         sched.schedule()
         assert len(sched.running) == 1
         assert sched.running[0] == reqs[0]
         assert reqs[1].status == RequestStatus.PREEMPTED
+        assert sched.kv_cache_manager.block_pool.get_num_free_blocks() == (
+            num_prompt_blocks - 1
+        )
         sched.update_from_output(out1, make_model_runner_output(out1, 42))
         assert reqs[1].output_token_ids[0] == 42
 
@@ -863,8 +1046,8 @@ class TestFullRunInvariants:
     @pytest.mark.parametrize(
         ("num_tokens", "max_num_batched_tokens"),
         [
-            (10, 8192),  # prompt in one chunk
-            (1, 8192),  # single-token prompt: no prefill step at all
+            (10, 16),  # prompt in one chunk
+            (1, 16),  # single-token prompt: no prefill step at all
             (33, 16),  # chunked, tail chunk of 1 token
             (32, 16),  # chunked, block-aligned
         ],
@@ -937,7 +1120,7 @@ class TestRunningQueueCapacity:
             max_num_seqs=8,
             block_size=16,
             num_blocks=6,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
         )
         reqs = create_requests(4, num_tokens=30, max_tokens=3, block_size=16)
         for r in reqs:
@@ -963,7 +1146,7 @@ class TestPreemptResumeCompletion:
             max_num_seqs=4,
             block_size=16,
             num_blocks=8,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
             enable_prefix_caching=False,
         )
         reqs = create_requests(
@@ -1095,7 +1278,7 @@ class TestPriorityScheduling:
             max_num_seqs=4,
             policy="priority",
             num_blocks=8,
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
         )
         high = create_requests(
             1, req_ids=["high"], num_tokens=10, max_tokens=30, priority=0
@@ -1161,13 +1344,13 @@ class TestNoSpecDuringPrefill:
         # gated on `not is_prefill` even when spec_token_ids are set.
         sched = create_rbln_scheduler(
             num_speculative_tokens=4,
-            block_size=16,
+            block_size=32,
             max_num_batched_tokens=32,
             max_model_len=2048,
             num_blocks=10000,
         )
         req = create_requests(
-            1, num_tokens=100, block_size=16, max_tokens=50, req_ids=["0"]
+            1, num_tokens=100, block_size=32, max_tokens=50, req_ids=["0"]
         )[0]
         sched.add_request(req)
         out = sched.schedule()  # first prefill chunk
@@ -1265,10 +1448,13 @@ class TestDecodeCapMachinery:
         n = 6
         # max_num_seqs=16, pp=2 -> hard cap 8; n=6 active -> soft ceil(6/2)=3.
         sched = create_rbln_scheduler(
-            max_num_seqs=16, pipeline_parallel_size=2, block_size=16
+            max_num_seqs=16,
+            pipeline_parallel_size=2,
+            block_size=32,
+            max_num_batched_tokens=32,
         )
         reqs = create_requests(
-            n, num_tokens=32, block_size=16, req_ids=[f"d{i}" for i in range(n)]
+            n, num_tokens=32, block_size=32, req_ids=[f"d{i}" for i in range(n)]
         )
         for r in reqs:
             advance_to_decode(sched, r)
@@ -1297,7 +1483,7 @@ class TestDecodeCapMachinery:
         # prefill (2) leaves exactly one free for a decode boundary block, so
         # only one of the two decodes can grow this step.
         sched = create_rbln_scheduler(
-            max_num_batched_tokens=128,
+            max_num_batched_tokens=16,
             max_num_seqs=4,
             block_size=16,
             num_blocks=4,
@@ -1464,11 +1650,14 @@ class TestDraftingLookahead:
 
         sched.kv_cache_manager.allocate_slots = spy
 
-        request = create_requests(1, num_tokens=self.PROMPT)[0]
+        num_tokens = self.PROMPT if remote_prefill else 16
+        request = create_requests(1, num_tokens=num_tokens)[0]
         if remote_prefill:
             request.kv_transfer_params = {"do_remote_prefill": True}
         sched.add_request(request)
         sched.schedule()
+        if not remote_prefill:
+            assert request.num_computed_tokens == request.num_prompt_tokens
         return seen
 
     def test_a_first_chunk_gets_the_drafting_lookahead(self):

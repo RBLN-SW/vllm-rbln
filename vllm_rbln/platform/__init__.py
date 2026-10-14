@@ -47,6 +47,7 @@ envs.publish_to_vllm_envs()
 USE_DEVICE_TENSOR: bool = False
 # RBLN default for an unset max_num_seqs (upstream vLLM defaults to 256).
 RBLN_DEFAULT_MAX_NUM_SEQS = 1
+RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS = 512
 # RBLN default for gpu_memory_utilization (upstream vLLM defaults to 0.92).
 RBLN_DEFAULT_GPU_MEMORY_UTILIZATION = 0.93
 # Superseded by RblnPlatform.device_control_env_var.
@@ -249,6 +250,8 @@ class RblnPlatform(Platform):
                     config["user_max_num_batched_tokens"] = self.max_num_batched_tokens
                 elif isinstance(config, OptimumRBLNConfig):
                     config.user_max_num_batched_tokens = self.max_num_batched_tokens
+            elif self.max_num_batched_tokens is None:
+                self.max_num_batched_tokens = RBLN_DEFAULT_MAX_NUM_BATCHED_TOKENS
             _apply_model_impl(model_impl)
             return orig_create_engine_config(self, *args, **kwargs)
 

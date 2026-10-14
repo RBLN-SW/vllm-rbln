@@ -520,11 +520,13 @@ class RBLNScheduler(Scheduler):
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
+                did_prefix_cache_lookup = False
                 sub_block_match = None
                 num_sub_block_tokens = 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    did_prefix_cache_lookup = True
                     # Get locally-cached tokens (full-block matches only).
                     (
                         new_computed_blocks,
@@ -773,6 +775,12 @@ class RBLNScheduler(Scheduler):
                             num_hits=connector_prefix_cache_hits,
                             preempted=request.num_preemptions > 0,
                         )
+
+                # Record at admission so unscheduled lookups are not counted.
+                if did_prefix_cache_lookup:
+                    self.kv_cache_manager.record_prefix_cache_stats(
+                        request, num_new_local_computed_tokens + num_sub_block_tokens
+                    )
 
                 request = request_queue.pop_request()
                 if load_kv_async:

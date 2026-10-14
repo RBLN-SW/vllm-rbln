@@ -34,8 +34,10 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import pathlib
 import pkgutil
 import textwrap
+from typing import TypeGuard
 
 
 def _lifetimes() -> tuple[type, list[type]]:
@@ -89,6 +91,73 @@ def _collisions(base: type, mixins: list[type]) -> list[str]:
         for name in sorted(_own_callables(cls) & shared)
     ]
     return sorted(found)
+
+
+def _is_window_question(node: ast.AST) -> TypeGuard[ast.Attribute]:
+    """`self._shape.<window field>`, the read that answers "is there a window"."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr in ("window_ratio", "has_window_range")
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "_shape"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "self"
+    )
+
+
+def _window_asked_outside_the_layout(
+    sources: dict[str, str] | None = None,
+) -> list[str]:
+    """Where the package asks the shape for a window rather than asking layout.
+
+    Two questions ride on the window and they came apart: `_own_engine_layout`
+    is "does this engine build the whole-engine lists", which a hybrid writing
+    part of a block also answers yes, and `_window_grid` is "is there a window
+    range, and how is it cut". Asking either off the ratio ties the descriptor
+    layout back to one knob, which is what the connector spent a round
+    untangling.
+
+    The two that answer are skipped by name, and `base_worker.py` whole: the
+    ratio is derived there, and the reads around that derivation are about
+    whether there is one to derive.
+
+    Args:
+        sources: filename -> source, for the test that feeds this a known
+            offender. Reads the package when absent.
+    """
+    if sources is None:
+        from vllm_rbln.distributed.kv_transfer.kv_connector.v1 import rbln_nixl
+
+        root = pathlib.Path(rbln_nixl.__file__).parent
+        sources = {p.name: p.read_text() for p in sorted(root.glob("*.py"))}
+    found: list[str] = []
+    for name, source in sorted(sources.items()):
+        if name == "base_worker.py":
+            continue  # where the window knob's own outcome is reported
+        tree = ast.parse(source)
+        answers = {
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("_own_engine_layout", "_window_grid")
+        }
+        skip = {id(sub) for node in answers for sub in ast.walk(node)}
+        for node in ast.walk(tree):
+            if id(node) in skip:
+                continue
+            if isinstance(node, (ast.If, ast.IfExp, ast.While, ast.Assert)):
+                tests = [node.test]
+            elif isinstance(node, ast.BoolOp):
+                tests = node.values
+            else:
+                continue
+            for test in tests:
+                found += [
+                    f"{name}:{sub.lineno}"
+                    for sub in ast.walk(test)
+                    if _is_window_question(sub)
+                ]
+    return sorted(set(found))
 
 
 def _self_reads(cls: type) -> set[str]:
@@ -222,3 +291,42 @@ def test_the_check_sees_a_read_across_two_lifetimes():
     # Nobody owns `owned_by_one` now, and a lifetime reading its own member
     # is what the rule permits -- both must come back clean.
     assert _cross_reads(CrossBase, [CrossSibling]) == []
+
+
+def test_the_layout_question_is_asked_in_one_place():
+    # `_own_engine_layout` is what every builder, peer mirror and index
+    # arithmetic dispatches on. Asking the shape for a window instead binds the
+    # descriptor layout to whichever feature happens to set the ratio.
+    assert _window_asked_outside_the_layout() == []
+
+
+def test_the_check_sees_a_window_asked_outside_the_layout():
+    # Without this the test above passes on a rule that matches nothing, and
+    # re-walking the tree here would pass on a rule of its own -- so this feeds
+    # the check an offender and asks what IT found.
+    assert _window_asked_outside_the_layout(
+        {"made_up.py": "if self._shape.window_ratio is None:\n    pass\n"}
+    ) == ["made_up.py:1"]
+
+    # And the two exemptions are exemptions, not blind spots: the same read
+    # inside the functions that answer, and anywhere in the file that derives
+    # the ratio, is not a finding.
+    assert (
+        _window_asked_outside_the_layout(
+            {
+                "made_up.py": "def _window_grid(self):\n"
+                "    if self._shape.window_ratio is None:\n        pass\n",
+                "base_worker.py": "if self._shape.window_ratio is None:\n    pass\n",
+            }
+        )
+        == []
+    )
+
+    # The nesting is the part that can silently stop matching: the read the
+    # rule looks for goes through the shape, not straight off `self`.
+    assert (
+        _window_asked_outside_the_layout(
+            {"made_up.py": "if self.window_ratio:\n    pass\n"}
+        )
+        == []
+    )

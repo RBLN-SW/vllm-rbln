@@ -93,14 +93,14 @@ def cfg_noncausal():
     return make_vllm_config(
         max_model_len=MAX_LEN,
         max_num_batched_tokens=CHUNK,
-        additional_config={"use_flash_causal_attn": False},
+        attention_config={"use_non_causal": True},
     )
 
 
 @pytest.fixture(scope="module")
 def cfg_square():
     # block_size == max_model_len, so is_normal can be True.
-    return make_vllm_config(max_model_len=64, block_size=64)
+    return make_vllm_config(max_model_len=64, block_size=64, max_num_batched_tokens=64)
 
 
 class TestFlashAttentionBackendStatic:
@@ -303,7 +303,7 @@ class TestBuildPrefillNonCausal:
                 max_model_len=MAX_LEN,
                 max_num_batched_tokens=CHUNK,
                 enforce_eager=True,
-                additional_config={"use_flash_causal_attn": False},
+                attention_config={"use_non_causal": True},
             )
             if eager
             else cfg_noncausal

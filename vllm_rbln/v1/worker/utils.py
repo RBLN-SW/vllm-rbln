@@ -28,8 +28,10 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 import numpy as np
 import torch
+from rebel import profiler as rbln_profiler
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.profiler.wrapper import WorkerProfiler
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
     get_allowed_cpu_list,
@@ -181,6 +183,16 @@ def worker_fail_fast(function: _F) -> _F:
             raise
 
     return guarded  # type: ignore[return-value]
+
+
+class RblnProfilerWrapper(WorkerProfiler):
+    """Write the RBLN profiler trace at stop_profile."""
+
+    def _start(self) -> None:
+        rbln_profiler.start()
+
+    def _stop(self) -> None:
+        rbln_profiler.done()
 
 
 RBLN_SYSFS_CLASS_DIR = "/sys/class/rebellions"
@@ -426,11 +438,6 @@ def dynamic_kv_unsupported_reason(vllm_config: VllmConfig) -> str | None:
         return (
             "RBLN_USE_CUSTOM_KERNEL is on, and the rbln_triton_ops kernels take "
             "no dynamic KV input"
-        )
-    if not rbln_config.use_flash_causal_attn:
-        return (
-            "flash causal attention is off, so the model dispatches to an "
-            "attention kernel that does not accept a dynamic KV input"
         )
     speculative = vllm_config.speculative_config
     if speculative is not None and speculative.method == "dflash":

@@ -48,7 +48,6 @@ def _stub_config(digest: str = "cfghash"):
         compute_hash=lambda: digest,
         additional_config=SimpleNamespace(
             use_custom_kernel=False,
-            use_flash_causal_attn=True,
             use_dynamic_kv_cache=None,
         ),
         speculative_config=None,

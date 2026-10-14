@@ -31,6 +31,7 @@ import torch
 from pydantic import ValidationError
 from vllm.config import CompilationMode, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -182,6 +183,37 @@ class TestPlatformIdentity:
 
 
 class TestRejectedConfigs:
+    @pytest.mark.parametrize(
+        ("block_size", "max_num_batched_tokens", "invalid_block_size"),
+        [(128, 128, 127), (16384, 128, 16385), (16384, 16384, 16385)],
+    )
+    def test_block_size_range(
+        self, block_size, max_num_batched_tokens, invalid_block_size
+    ):
+        _build(block_size=block_size, max_num_batched_tokens=max_num_batched_tokens)
+        with pytest.raises(
+            ValidationError,
+            match=(
+                "RBLN requires max_num_batched_tokens <= block_size <= max_block_size"
+            ),
+        ):
+            _build(
+                block_size=invalid_block_size,
+                max_num_batched_tokens=max_num_batched_tokens,
+            )
+
+    @pytest.mark.parametrize("max_num_batched_tokens", [16, 128, None])
+    def test_block_size_must_be_explicit(self, max_num_batched_tokens):
+        with pytest.raises(ValidationError, match="requires an explicit block_size"):
+            _build(block_size=None, max_num_batched_tokens=max_num_batched_tokens)
+
+    def test_token_budget_exceeds_block_size_limit(self):
+        with pytest.raises(
+            ValidationError,
+            match="max_num_batched_tokens=16385.*--max-num-batched-tokens",
+        ):
+            _build(block_size=16384, max_num_batched_tokens=16385)
+
     def test_v2_model_runner(self, monkeypatch, reconfigure):
         # The refusal reads VllmConfig.use_v2_model_runner, and how upstream
         # resolves that from the env or from a feature that forces V2 is its
@@ -431,6 +463,32 @@ class TestCompilation:
 
 
 class TestSchedulerOverrides:
+    @pytest.mark.parametrize(
+        ("engine_args_cls", "usage_context"),
+        [
+            (EngineArgs, UsageContext.LLM_CLASS),
+            (AsyncEngineArgs, UsageContext.OPENAI_API_SERVER),
+            (EngineArgs, None),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "max_num_batched_tokens, expected", [(None, 512), (128, 128)]
+    )
+    def test_token_budget_default(
+        self, engine_args_cls, usage_context, max_num_batched_tokens, expected
+    ):
+        config = engine_args_cls(
+            model=local_model_path(_MODEL),
+            **{**_ENGINE_ARGS, "max_num_batched_tokens": max_num_batched_tokens},
+        ).create_engine_config(usage_context=usage_context)
+
+        assert config.scheduler_config.max_num_batched_tokens == expected
+
+    def test_throughput_mode_keeps_the_rbln_token_budget_default(self):
+        config = _build(max_num_batched_tokens=None, performance_mode="throughput")
+
+        assert config.scheduler_config.max_num_batched_tokens == 512
+
     def test_async_scheduling_is_honored(self, monkeypatch):
         # The platform used to force this off unconditionally. It now follows
         # vLLM's --async-scheduling, as long as the device-side token path is
@@ -994,12 +1052,14 @@ class TestModelImpl:
         first = EngineArgs(model=local_model_path(_MODEL), model_impl="vllm")
         EngineArgs.create_engine_config(first)
         assert platform._MODEL_IMPL == "vllm"
+        assert first.max_num_batched_tokens == 512
 
         # Left at `auto`, so the path is the model's own: optimum-rbln runs this
         # architecture, and the first engine's answer is not consulted.
         second = EngineArgs(model=local_model_path(_MODEL))
         EngineArgs.create_engine_config(second)
         assert platform._MODEL_IMPL == "optimum"
+        assert second.max_num_batched_tokens is None
 
     def test_the_upstream_flag_picks_the_path_and_is_handed_back(self):
         """`--model-impl` says which path runs, and upstream never sees that.
@@ -1058,7 +1118,11 @@ class TestModelImpl:
         RblnPlatform._capture_model_impl()
 
         EngineArgs.create_engine_config(
-            SimpleNamespace(additional_config={"model_impl": "vllm"}, model_impl="auto")
+            SimpleNamespace(
+                additional_config={"model_impl": "vllm"},
+                model_impl="auto",
+                max_num_batched_tokens=None,
+            )
         )
 
         assert seen == [{"model_impl": "vllm"}]

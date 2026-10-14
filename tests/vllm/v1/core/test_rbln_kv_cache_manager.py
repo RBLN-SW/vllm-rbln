@@ -516,18 +516,6 @@ class TestApplyReleaseSubBlockMatch:
         assert op.dst_block_id != op.src_block_id
         manager.release_copy_ops(ops)
 
-    def test_apply_records_prefix_cache_stats(self):
-        # With log_stats, apply records the sub-block hits.
-        manager = make_manager(8, 4, 10, log_stats=True)
-        req0 = make_request("0", list(range(8)), 8)
-        prefill_request(manager, req0)
-        manager.free(req0)
-        req1 = make_request("1", list(range(4)) + [100] * 8, 8)
-        prefill_request(manager, req1)
-        assert manager.prefix_cache_stats is not None
-        assert manager.prefix_cache_stats.hits >= 4
-        manager.release_copy_ops(manager.drain_pending_copy_ops())
-
     def test_release_frees_source_refs(self):
         # release frees the source-block ref the match held.
         manager = make_manager(8, 4, 10)
@@ -1114,6 +1102,22 @@ class TestKVEvents:
         for ev in removed_events:
             seen.update(ev.block_hashes)
         assert expected & seen
+
+    def test_hashless_partial_block_eviction_emits_remove(self):
+        manager = make_manager(8, 4, 4, enable_kv_cache_events=True)
+        req = make_request("0", list(range(4)), 8)
+        prefill_request(manager, req)
+        block = manager.coordinator.get_blocks(req.request_id)[0][0]
+        assert block.block_hash is None
+        assert sub_block_index(manager).contains(block.block_id)
+        stored = self._stored(manager)
+
+        manager.block_pool.evict_blocks({block.block_id})
+
+        assert not sub_block_index(manager).contains(block.block_id)
+        removed = [e for e in manager.take_events() if isinstance(e, BlockRemoved)]
+        assert len(removed) == 1
+        assert removed[0].block_hashes == stored[0].block_hashes
 
     def test_extra_keys_round_trip_multimodal(self):
         # Re-hashing the emitted token_ids + extra_keys + parent_block_hash must
