@@ -341,6 +341,26 @@ class TestSamplePadding:
         assert rejection_sampler.call_args.args[3] is sampling_metadata
 
 
+@pytest.mark.parametrize("num_reqs", [1, 2])
+def test_reference_sampler_warmup_finishes(num_reqs):
+    runner = _make_runner_stub(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 32),
+        sampler=mr.Sampler(),
+        input_batch=SimpleNamespace(
+            temperature=torch.ones(num_reqs),
+            top_p=torch.ones(num_reqs),
+            top_k=torch.ones(num_reqs, dtype=torch.int32),
+            frequency_penalties=torch.zeros(num_reqs),
+            presence_penalties=torch.zeros(num_reqs),
+            repetition_penalties=torch.ones(num_reqs),
+        ),
+    )
+
+    runner._dummy_sampler_run(num_reqs)
+
+
 def test_rejection_sampler_warmup_asks_for_the_synthetic_variant():
     """Synthetic mode feeds the graph one more input and dynamo specializes on
     it, so a warm-up forced to `synthetic_mode=False` would compile a variant the
