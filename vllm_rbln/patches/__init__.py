@@ -49,6 +49,7 @@ from . import (
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
+    sampler,
     speculative_config,
 )
 
