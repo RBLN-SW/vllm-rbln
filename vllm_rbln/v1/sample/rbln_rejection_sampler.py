@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.ops import topk_topp_sampler
 from vllm.v1.sample.rejection_sampler import RejectionSampler, generate_uniform_probs
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -324,9 +324,7 @@ class TorchRejectionSamplerImpl(RejectionSamplerImpl):
                 num_tokens,
             )
 
-        # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
-        # which is slow for large vocab sizes. This may cause performance issues.
-        return apply_top_k_top_p(logits, top_k, top_p)
+        return topk_topp_sampler.apply_top_k_top_p(logits, top_k, top_p)
 
 
 class RBLNRejectionSamplerImpl(RejectionSamplerImpl):
