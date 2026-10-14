@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.10, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'linux'",
@@ -1221,20 +1221,9 @@ wheels = [
 ]
 
 [[package]]
-name = "intel-cmplr-lib-ur"
-version = "2024.2.1"
-source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-cmplr-lib-ur/2024.2.1/intel_cmplr_lib_ur-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:8b78d58ab501d6e5a582967be80fdbf7b03b33279135a303da36dbf11f481ed7" },
-]
-
-[[package]]
 name = "intel-openmp"
 version = "2024.2.1"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
-dependencies = [
-    { name = "intel-cmplr-lib-ur" },
-]
 wheels = [
     { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/intel-openmp/2024.2.1/intel_openmp-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:21892ea07a9c6e164707d2b44e6f396f9f2ab6cc7e108755011fad59b596182a" },
 ]
@@ -2679,7 +2668,7 @@ wheels = [
 
 [[package]]
 name = "rebel-compiler"
-version = "0.12.0rc1"
+version = "0.12.1.dev102+g29213901"
 source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "attrs" },
@@ -2699,11 +2688,11 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0rc1/rebel_compiler-0.12.0rc1-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:1e06a5b00afe54f2e31b3d80d8a0437f" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0rc1/rebel_compiler-0.12.0rc1-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:4911cb9d529f28b48ec98b15ec3e8bb2" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0rc1/rebel_compiler-0.12.0rc1-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:56017582e88e285aa9b1ab25d565b517" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0rc1/rebel_compiler-0.12.0rc1-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:572a54dfbc073517b28a6ddf97f8b448" },
-    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0rc1/rebel_compiler-0.12.0rc1-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:ccc8453eb6c9441d957884e070bafb55" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.1.dev102+g29213901/rebel_compiler-0.12.1.dev102+g29213901-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:070b361bf2c5f3f5bfd337ed8a473a74" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.1.dev102+g29213901/rebel_compiler-0.12.1.dev102+g29213901-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:37e816e0c4dd2cf5e2e1747f8c5d9515" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.1.dev102+g29213901/rebel_compiler-0.12.1.dev102+g29213901-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:e25e0d81c521ed9e64c5ee13ea78912a" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.1.dev102+g29213901/rebel_compiler-0.12.1.dev102+g29213901-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:e771266d6445227c91a89ede67f145b9" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.1.dev102+g29213901/rebel_compiler-0.12.1.dev102+g29213901-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:4be7c297f7a22fa0a61dc97106c8a179" },
 ]
 
 [[package]]
@@ -3639,7 +3628,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "pyyaml" },
     { name = "qwen-vl-utils", marker = "extra == 'examples'" },
-    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = ">=0.12.0rc1,<0.12.1" },
+    { name = "rebel-compiler", marker = "extra == 'runtime'", specifier = ">=0.12.1.dev102,<0.12.2" },
     { name = "setuptools", specifier = ">=64" },
     { name = "setuptools-scm", specifier = ">=8" },
     { name = "setuptools-scm", marker = "extra == 'build'" },
