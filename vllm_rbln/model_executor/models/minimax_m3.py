@@ -1131,6 +1131,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
     def compile_mm_encoder(self, compile_fn) -> None:
         """Called by the runner at model load with its compile wrapper."""
+        # Non-first PP ranks and configurations with both image/video limits
+        # set to zero own no vision tower, but still receive encoder setup calls.
         if self.vision_tower is None:
             return
         encoder = _RBLNVisionEncoder(self.vision_tower).eval()
