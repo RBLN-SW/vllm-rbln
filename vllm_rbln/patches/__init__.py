@@ -33,6 +33,7 @@ from . import (
     dynamic_kv,
     engine_core,
     fp8_moe_method,
+    glm5_next,
     gpt_oss,
     gpt_oss_mxfp4_config,
     harmony,
