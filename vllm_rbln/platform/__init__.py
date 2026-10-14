@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.logging import LoggingConfig
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -28,17 +29,30 @@ else:
     VllmConfig = None
 
 import rebel
+import vllm.logger as vllm_logger
 from torch._dynamo import register_backend
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
-import vllm_rbln.logger  # noqa: F401
+import vllm_rbln.logger
 from vllm_rbln import envs
 
 logger = init_logger(__name__)
 # Earliest point at which `vllm.envs` is guaranteed to exist, and still before
 # any engine code reads a variable.
 envs.publish_to_vllm_envs()
+
+_configure_upstream_logging = vllm_logger._configure_vllm_root_logger
+
+
+def _configure_logging(config: "LoggingConfig | None" = None) -> None:
+    _configure_upstream_logging(config)
+    vllm_rbln.logger._sync_logging_config(config)
+
+
+# No logging callback exists for a separate namespace. This must precede
+# argument parsing and cover both model paths, before the patch registry runs.
+vllm_logger._configure_vllm_root_logger = _configure_logging
 
 # Assigned by `_apply_model_impl`, which this module calls once at the bottom
 # and `register_ops` calls again once the arguments name the model path. Eight
