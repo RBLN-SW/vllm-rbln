@@ -283,7 +283,6 @@ class TestInitGuards:
 
         from tests.vllm.v1.spec_decode.utils import _spec_vllm_config
 
-        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
         # Only the proposer should observe MM support on this text-model config.
         _spec_vllm_config("eagle", 3)
 
