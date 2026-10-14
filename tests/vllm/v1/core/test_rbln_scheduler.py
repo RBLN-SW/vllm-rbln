@@ -42,6 +42,11 @@ from vllm_rbln.v1.core.rbln_scheduler import RBLNScheduler, RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import is_prefill, step_is_prefill
 
 
+@pytest.fixture(autouse=True)
+def _use_v1_model_runner(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+
+
 class TestSchedulerInit:
     @pytest.mark.usefixtures("cr13")
     def test_sub_block_caching_enabled_uses_rbln_manager(self):
@@ -384,6 +389,108 @@ class TestIsPrefill:
 
 
 class TestScheduleBasic:
+    @pytest.mark.parametrize("policy", ["fcfs", "priority"])
+    def test_kv_holder_runs_before_blockless_request_under_kv_pressure(self, policy):
+        sched = create_rbln_scheduler(
+            policy=policy,
+            num_blocks=6,
+            block_size=64,
+            max_num_batched_tokens=64,
+            max_model_len=512,
+            use_kv_connector=MockKVConfig(matched_tokens=192, is_async=True),
+        )
+        local = create_requests(
+            1,
+            req_ids=["local"],
+            num_tokens=256,
+            block_size=64,
+            max_tokens=1,
+            priority=0,
+        )[0]
+        remote = create_requests(
+            1,
+            req_ids=["remote"],
+            num_tokens=192,
+            block_size=64,
+            max_tokens=1,
+            priority=10,
+        )[0]
+        local.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+        remote.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(local)
+        sched.add_request(remote)
+
+        output = sched.schedule()
+        assert output.total_num_scheduled_tokens == 0
+        assert list(sched.waiting) == [local]
+        assert list(sched.kv_holding_waiting) == [remote]
+        assert sched.deferred_waiting == {local, remote}
+        pool = sched.kv_cache_manager.block_pool
+        assert pool.get_num_free_blocks() < 4
+
+        local.status = RequestStatus.WAITING
+        sched.update_from_output(
+            output, make_model_runner_output(output, finished_recving={"remote"})
+        )
+        output = sched.schedule()
+        assert output.num_scheduled_tokens == {"remote": 1}
+        assert remote not in sched.deferred_waiting
+        sched.update_from_output(output, make_model_runner_output(output, 1))
+
+        output = sched.schedule()
+        assert output.num_scheduled_tokens == {"local": 64}
+        assert not sched.deferred_waiting
+        sched.update_from_output(output, make_model_runner_output(output, 1))
+        _drain(sched)
+        assert sched.get_num_unfinished_requests() == 0
+        assert pool.get_num_free_blocks() == 5
+
+    @pytest.mark.parametrize("receive_complete", [False, True])
+    def test_aborting_deferred_remote_load_cleans_up_queues(self, receive_complete):
+        sched = create_rbln_scheduler(
+            use_kv_connector=MockKVConfig(matched_tokens=16, is_async=True)
+        )
+        request = create_requests(1, num_tokens=16)[0]
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        output = sched.schedule()
+        assert request in sched.kv_holding_waiting
+        assert request in sched.deferred_waiting
+        if receive_complete:
+            sched.update_from_output(
+                output,
+                make_model_runner_output(output, finished_recving={request.request_id}),
+            )
+
+        sched.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+        assert not sched.kv_holding_waiting
+        assert not sched.deferred_waiting
+        assert sched.get_request_counts() == (0, 0)
+        stats = sched.make_stats()
+        assert stats.num_skipped_waiting_reqs == 0
+
+    def test_pending_kv_lookup_stays_in_blockless_waiting_queue(self, monkeypatch):
+        sched = create_rbln_scheduler(use_kv_connector=MockKVConfig())
+        request = create_requests(1)[0]
+        sched.add_request(request)
+        monkeypatch.setattr(
+            sched.connector, "get_num_new_matched_tokens", lambda *args: (None, False)
+        )
+
+        assert sched.schedule().total_num_scheduled_tokens == 0
+        assert list(sched.waiting) == [request]
+        assert not sched.kv_holding_waiting
+        stats = sched.make_stats()
+        assert stats.num_waiting_reqs == 0
+        assert stats.num_skipped_waiting_reqs == 1
+
+        monkeypatch.setattr(
+            sched.connector, "get_num_new_matched_tokens", lambda *args: (0, False)
+        )
+        assert sched.schedule().num_scheduled_tokens == {request.request_id: 10}
+        assert not sched.deferred_waiting
+
     @pytest.mark.usefixtures("cr13")
     @pytest.mark.parametrize("sub_block", [False, True])
     @pytest.mark.parametrize("preempted", [False, True])
