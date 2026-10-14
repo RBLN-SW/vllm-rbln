@@ -1131,7 +1131,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
     def compile_mm_encoder(self, compile_fn) -> None:
         """Called by the runner at model load with its compile wrapper."""
-        assert self.vision_tower is not None
+        if self.vision_tower is None:
+            return
         encoder = _RBLNVisionEncoder(self.vision_tower).eval()
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
 
@@ -1192,6 +1193,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
     def warmup_mm_encoder(self) -> None:
         """Run the compiled encoder once on an all-padding image."""
+        if self.vision_tower is None:
+            return
         side = math.isqrt(MM_ENCODER_PATCH_BUCKET)
         with torch.inference_mode():
             self._mm_encoder(*self._encoder_inputs(None, [1, side, side]))
