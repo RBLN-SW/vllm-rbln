@@ -481,7 +481,8 @@ class RBLNScheduler(Scheduler):
             sub_block_match = None
 
             while token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+                num_running = len(self.running) + self.num_waiting_for_streaming_input
+                if num_running >= self.max_num_active_reqs:
                     break
 
                 request_queue = self.kv_holding_waiting or self.waiting
