@@ -103,6 +103,14 @@ INDEX_KPOOL = _rbln_glm5_ops.KPOOL
 INDEX_HEAD_DIM = _rbln_glm5_ops.INDEX_HEAD_DIM
 
 
+def _set_from_host(dst: torch.Tensor, value: torch.Tensor) -> None:
+    """Write a load-time weight transform computed on the host into `dst` whole. The
+    transforms run on the CPU so that only a host-to-device copy touches the device: an
+    eager op on a device tensor (the einsum, a copy into a view) cannot run without an
+    NPU, which compile-only (RBLN_DUMMY_DEVICE) has not."""
+    dst.data.copy_(value.to(dst.dtype).reshape(dst.shape).contiguous())
+
+
 def _layer_index_of(prefix: str) -> int:
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
@@ -410,7 +418,7 @@ class RBLNGlm5KDA(nn.Module):
             (self.f_weight, self.f_a_proj, self.f_b_proj),
             (self.g_weight, self.g_a_proj, self.g_b_proj),
         ):
-            fused.copy_(b.weight.float() @ a.weight.float())
+            _set_from_host(fused, b.weight.cpu().float() @ a.weight.cpu().float())
 
     def _l2norm(self, x: torch.Tensor) -> torch.Tensor:
         x = x.float()
@@ -546,9 +554,12 @@ class RBLNGlm5Indexer(nn.Module):
 
     @torch.no_grad()
     def fold_hadamard(self) -> None:
-        w = self.wq_b.weight.data.view(self.n_head, self.head_dim, -1)
-        rot = _rbln_glm5_ops.hadamard_128().to(w.device)
-        w.copy_(torch.einsum("ij,hjk->hik", rot, w.float()).to(w.dtype))
+        weight = self.wq_b.weight
+        w = weight.cpu().float().view(self.n_head, self.head_dim, -1)
+        rot = _rbln_glm5_ops.hadamard_128().float()
+        _set_from_host(
+            weight, torch.einsum("ij,hjk->hik", rot, w).reshape(weight.shape)
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, is_prompt_sorted: bool
@@ -758,11 +769,11 @@ class RBLNGlm5DecoderLayer(nn.Module):
     @torch.no_grad()
     def expand_hc_scales(self) -> None:
         n = self.n
-        lanes = torch.tensor([n, n, n * n], device=self.hc_attn_scale.device)
+        lanes = torch.tensor([n, n, n * n])
         for kind in ("attn", "ffn"):
-            scale = getattr(self, f"hc_{kind}_scale")
-            getattr(self, f"hc_{kind}_scale_lanes").copy_(
-                scale.repeat_interleave(lanes)
+            scale = getattr(self, f"hc_{kind}_scale").cpu()
+            _set_from_host(
+                getattr(self, f"hc_{kind}_scale_lanes"), scale.repeat_interleave(lanes)
             )
 
     def _hc_mix(
