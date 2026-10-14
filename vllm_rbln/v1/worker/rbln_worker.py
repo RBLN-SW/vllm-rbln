@@ -127,6 +127,9 @@ class RBLNWorker(WorkerBase):
         logger.warning("Sleep mode is not supported on RBLN, ignore it.")
         pass
 
+    def discard(self, tags: tuple[str, ...]) -> None:
+        raise RuntimeError("Selective discard is not supported on RBLN.")
+
     def _init_device_env(self) -> None:
         rbln_config: RBLNConfig = self.vllm_config.additional_config
         env_var = current_platform.device_control_env_var
