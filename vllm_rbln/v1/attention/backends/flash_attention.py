@@ -163,6 +163,8 @@ class RBLNFlashAttentionMetadata:
     swa_attn_masks: torch.Tensor | None = None
 
     use_custom_kernel: bool = False
+    # A verify step's accepted drafts of the previous step, [B, 1] int32 (spec decode).
+    num_accepted: torch.Tensor | None = None
 
     def __post_init__(self):
         # FIXME(RBLN): to_dynamic_index does not accept int64 inputs.Thus in the
@@ -258,6 +260,7 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prefill: bool,
         skip_attn_masks: bool = False,
         back_pad: torch.Tensor | None = None,
+        num_accepted: torch.Tensor | None = None,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         # NOTE(RBLN): vllm-rbln keeps attention metadata on the host and copies
@@ -358,6 +361,12 @@ class RBLNFlashAttentionMetadataBuilder(
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
             swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
             use_custom_kernel=self.use_custom_kernel,
+            num_accepted=self._stage(
+                None
+                if num_accepted is None
+                else rbln_utils.pad(num_accepted.view(-1, 1), 0, batch_pad),
+                "num_accepted",
+            ),
         )
 
         return attn_metadata

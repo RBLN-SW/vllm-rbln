@@ -1053,6 +1053,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 logits_indices
             )
 
+        # A verify step's accepted drafts of the previous step, per request (the
+        # count without the bonus token), for the recurrent layers' replay.
+        num_accepted = None
+        if self.speculative_config is not None and not self.is_prefill:
+            num_accepted = torch.from_numpy(
+                np.maximum(self.input_batch.num_accepted_tokens_cpu[:num_reqs] - 1, 0)
+            ).to(torch.int32)
+
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
@@ -1083,6 +1091,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     is_prefill=self.is_prefill,
                     batch_pad=num_reqs_padded,
                     back_pad=back_pad,
+                    num_accepted=num_accepted,
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -1561,6 +1570,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         logprobs_tensors=logprobs_tensors,
                     )
                 )
+                # NOTE(RBLN): a hybrid model's recurrent state keeps only the tokens
+                # it is sure of; the next verify step replays the accepted drafts,
+                # so it needs this step's count (accepted drafts + the bonus token,
+                # as upstream's num_accepted_tokens).
+                for i, ids in enumerate(valid_sampled_token_ids[:num_reqs]):
+                    self.input_batch.num_accepted_tokens_cpu[i] = max(len(ids), 1)
         else:
             # The sampled tokens and the logprobs stay on device; the D2H is
             # deferred to AsyncRBLNModelRunnerOutput.get_output().
