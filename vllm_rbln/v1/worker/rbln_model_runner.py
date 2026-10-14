@@ -2899,7 +2899,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                    # A KV-sharing layer has no spec of its own; it reads its
+                    # target's cache, so it takes the target's.
+                    spec_layer = self.shared_kv_cache_layers.get(layer_name, layer_name)
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[spec_layer]
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(
                     attn_backend, layer_kv_cache_spec
@@ -3413,9 +3416,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
         for layer_name, attn_module in attn_layers.items():
-            if isinstance(attn_module, Attention) and (
-                kv_tgt_layer := attn_module.kv_sharing_target_layer_name
-            ):
+            # Any attention layer may share: vLLM's `Attention` and the custom
+            # cache-only layers (e.g. MiniMax-M3's dense-layer index-key cache).
+            kv_tgt_layer = getattr(attn_module, "kv_sharing_target_layer_name", None)
+            if kv_tgt_layer:
                 # The layer doesn't need its own KV cache and will use that of
                 # the target layer. We skip creating a KVCacheSpec for it, so
                 # that KV cache management logic will act as this layer does

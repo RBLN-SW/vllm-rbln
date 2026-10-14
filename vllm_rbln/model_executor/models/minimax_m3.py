@@ -14,6 +14,7 @@
 
 import importlib.util
 import math
+import re
 import sys
 from collections.abc import Iterable
 from itertools import islice
@@ -30,6 +31,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -103,6 +105,30 @@ from vllm_rbln.v1.worker.utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _shared_index_cache_target(config: PretrainedConfig, prefix: str) -> str | None:
+    """Index-key cache a dense layer's placeholder aliases: the first sparse layer's
+    on this pipeline stage, or None when the stage has no sparse layer.
+
+    A dense layer has no indexer, so its placeholder cache is never read; aliasing a
+    real one (vLLM KV sharing) keeps the runner's per-layer cache list aligned
+    without allocating a tensor no compiled program binds.
+    """
+    sparse_cfg = getattr(config, "sparse_attention_config", None)
+    sparse_freq = sparse_cfg.get("sparse_attention_freq") if sparse_cfg else None
+    match = re.search(r"\.layers\.(\d+)\.", prefix)
+    if not sparse_freq or match is None:
+        return None
+    pp = get_pp_group()
+    start, end = get_pp_indices(
+        config.num_hidden_layers, pp.rank_in_group, pp.world_size
+    )
+    sparse = [i for i in range(start, end) if i < len(sparse_freq) and sparse_freq[i]]
+    if not sparse:
+        return None
+    target = f"{prefix[: match.start(1)]}{sparse[0]}{prefix[match.end(1) :]}"
+    return f"{target}.attn.indexer"
 
 
 def _layer_index_of(prefix: str) -> int:
@@ -330,10 +356,17 @@ class RBLNMiniMaxM3Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        # Dense layers carry no index-key cache, but the runner binds
+        # `num_attn_module` caches per decoder layer, so give it one to keep the
+        # compacted cache list aligned. It aliases a sparse layer's index-key
+        # cache instead of allocating one nothing reads, so every KV tensor vllm
+        # allocates is one a compiled program binds (dynamic KV attributes the
+        # block count off exactly those).
         self.indexer_cache = RBLNMiniMaxM3IndexerCache(
             head_dim=config.sparse_attention_config["sparse_index_dim"],
             prefix=f"{prefix}.attn.indexer",
             cache_config=cache_config,
+            kv_sharing_target_layer_name=_shared_index_cache_target(config, prefix),
         )
 
     def forward(
@@ -359,10 +392,13 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         prefix: str,
         cache_config: CacheConfig | None = None,
+        kv_sharing_target_layer_name: str | None = None,
     ) -> None:
         super().__init__()
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
+        # Read by the runner's `get_kv_cache_spec`, as on vLLM's `Attention`.
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         vllm_config = get_current_vllm_config()
         cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
         self.fp8_dtype = _fp8_cache_dtype(cache_dtype)
