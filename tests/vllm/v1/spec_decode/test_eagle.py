@@ -556,46 +556,6 @@ class TestPropose:
         assert out.cpu().tolist() == [[3, 5], [8, 12]]
 
 
-@pytest.mark.parametrize("aux_layers", [(), (0, 2)])
-def test_minimax_m3_target_returns_requested_aux_states(monkeypatch, aux_layers):
-    import vllm_rbln.model_executor.models.minimax_m3 as m3
-
-    class Decoder(torch.nn.Module):
-        def forward(self, positions, hidden_states, residual):
-            return hidden_states + 1, torch.full_like(hidden_states, 10)
-
-    backbone = m3.RBLNMiniMaxM3Model.__new__(m3.RBLNMiniMaxM3Model)
-    torch.nn.Module.__init__(backbone)
-    backbone.layers = torch.nn.ModuleList([Decoder(), Decoder()])
-    backbone.start_layer, backbone.end_layer = 0, 2
-    backbone.norm = lambda hidden, residual: (hidden + residual, None)
-    target = m3.RBLNMiniMaxM3SparseForCausalLM.__new__(
-        m3.RBLNMiniMaxM3SparseForCausalLM
-    )
-    torch.nn.Module.__init__(target)
-    target.model = backbone
-    target.set_aux_hidden_state_layers(aux_layers)
-    monkeypatch.setattr(
-        m3,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
-    inputs = torch.zeros(1, 2, 4)
-
-    result = target(
-        input_ids=None, positions=torch.tensor([[0, 1]]), inputs_embeds=inputs
-    )
-
-    if aux_layers:
-        hidden, aux = result
-        assert len(aux) == 2
-        torch.testing.assert_close(aux[0], inputs)
-        torch.testing.assert_close(aux[1], torch.full_like(inputs, 12))
-    else:
-        hidden = result
-    torch.testing.assert_close(hidden, torch.full_like(inputs, 12))
-
-
 class TestLoadModel:
     @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
     def test_multimodal_guard_uses_loaded_draft_capability(

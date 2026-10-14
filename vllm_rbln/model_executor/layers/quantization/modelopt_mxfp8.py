@@ -25,7 +25,6 @@ from vllm.model_executor.parameter import (
 
 # MXFP8: fp8 (e4m3) weights with one e8m0 scale per 32 input elements.
 MXFP8_GROUP_SIZE = 32
-_E8M0_BIAS = 127
 
 
 @register_weight_loader_v2_supported_method

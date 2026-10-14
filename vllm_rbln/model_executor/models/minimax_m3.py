@@ -107,30 +107,6 @@ from vllm_rbln.v1.worker.utils import (
 logger = init_logger(__name__)
 
 
-def _shared_index_cache_target(config: PretrainedConfig, prefix: str) -> str | None:
-    """Index-key cache a dense layer's placeholder aliases: the first sparse layer's
-    on this pipeline stage, or None when the stage has no sparse layer.
-
-    A dense layer has no indexer, so its placeholder cache is never read; aliasing a
-    real one (vLLM KV sharing) keeps the runner's per-layer cache list aligned
-    without allocating a tensor no compiled program binds.
-    """
-    sparse_cfg = getattr(config, "sparse_attention_config", None)
-    sparse_freq = sparse_cfg.get("sparse_attention_freq") if sparse_cfg else None
-    match = re.search(r"\.layers\.(\d+)\.", prefix)
-    if not sparse_freq or match is None:
-        return None
-    pp = get_pp_group()
-    start, end = get_pp_indices(
-        config.num_hidden_layers, pp.rank_in_group, pp.world_size
-    )
-    sparse = [i for i in range(start, end) if i < len(sparse_freq) and sparse_freq[i]]
-    if not sparse:
-        return None
-    target = f"{prefix[: match.start(1)]}{sparse[0]}{prefix[match.end(1) :]}"
-    return f"{target}.attn.indexer"
-
-
 def _layer_index_of(prefix: str) -> int:
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
@@ -356,17 +332,31 @@ class RBLNMiniMaxM3Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Dense layers carry no index-key cache, but the runner binds
-        # `num_attn_module` caches per decoder layer, so give it one to keep the
-        # compacted cache list aligned. It aliases a sparse layer's index-key
-        # cache instead of allocating one nothing reads, so every KV tensor vllm
-        # allocates is one a compiled program binds (dynamic KV attributes the
-        # block count off exactly those).
+        # Dense placeholders alias a local sparse cache to keep the runner's
+        # per-layer cache list aligned without allocating an unbound KV tensor.
+        # Dynamic KV sizing requires allocated tensors to be bound by a program.
+        sparse_cfg = getattr(config, "sparse_attention_config", None)
+        sparse_freq = sparse_cfg.get("sparse_attention_freq") if sparse_cfg else None
+        match = re.search(r"\.layers\.(\d+)\.", prefix)
+        shared_index_cache_target = None
+        if sparse_freq and match is not None:
+            pp = get_pp_group()
+            start, end = get_pp_indices(
+                config.num_hidden_layers, pp.rank_in_group, pp.world_size
+            )
+            sparse = [
+                i for i in range(start, end) if i < len(sparse_freq) and sparse_freq[i]
+            ]
+            if sparse:
+                target = (
+                    f"{prefix[: match.start(1)]}{sparse[0]}{prefix[match.end(1) :]}"
+                )
+                shared_index_cache_target = f"{target}.attn.indexer"
         self.indexer_cache = RBLNMiniMaxM3IndexerCache(
             head_dim=config.sparse_attention_config["sparse_index_dim"],
             prefix=f"{prefix}.attn.indexer",
             cache_config=cache_config,
-            kv_sharing_target_layer_name=_shared_index_cache_target(config, prefix),
+            kv_sharing_target_layer_name=shared_index_cache_target,
         )
 
     def forward(
@@ -989,7 +979,11 @@ def _load_upstream_common(name: str) -> ModuleType:
     assert spec is not None and spec.loader is not None, path
     module = importlib.util.module_from_spec(spec)
     sys.modules[full_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(full_name, None)
+        raise
     return module
 
 

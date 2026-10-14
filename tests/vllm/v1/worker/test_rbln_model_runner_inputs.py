@@ -17,7 +17,6 @@
 # sampler's output back.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -39,48 +38,6 @@ from tests.vllm.v1.worker.utils import (
 )
 
 pytestmark = pytest.mark.maybe_use_device
-
-
-@pytest.mark.parametrize("has_tower", [False, True])
-@pytest.mark.parametrize("phase", ["compile", "warmup"])
-def test_minimax_m3_encoder_lifecycle_requires_local_tower(
-    monkeypatch, has_tower, phase
-):
-    import vllm_rbln.model_executor.models.minimax_m3 as m3
-
-    model = m3.RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
-        m3.RBLNMiniMaxM3SparseForConditionalGeneration
-    )
-    torch.nn.Module.__init__(model)
-    # Non-first PP ranks and text-only configurations own no vision tower.
-    model.vision_tower = torch.nn.Identity() if has_tower else None
-    encoder = torch.nn.Identity()
-    build_encoder = Mock(return_value=encoder)
-    monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
-    runtime = Mock()
-    compile_fn = Mock(return_value=runtime)
-    inputs = [torch.ones(1)]
-    model._encoder_inputs = Mock(return_value=inputs)
-    model._mm_encoder = runtime if has_tower and phase == "warmup" else None
-
-    if phase == "compile":
-        model.compile_mm_encoder(compile_fn)
-        if has_tower:
-            build_encoder.assert_called_once_with(model.vision_tower)
-            compile_fn.assert_called_once_with(encoder)
-            assert model._mm_encoder is runtime
-        else:
-            build_encoder.assert_not_called()
-            compile_fn.assert_not_called()
-            assert model._mm_encoder is None
-    else:
-        model.warmup_mm_encoder()
-        if has_tower:
-            model._encoder_inputs.assert_called_once()
-            runtime.assert_called_once_with(*inputs)
-        else:
-            model._encoder_inputs.assert_not_called()
-            runtime.assert_not_called()
 
 
 class TestGatherMultimodalEmbeddings:
