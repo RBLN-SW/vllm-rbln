@@ -331,7 +331,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             :, scale_intermediate_size:, :
         ]
 
+        # SwiGLU clamp (GLM-5.3, DeepSeek-V4): silu(min(gate, L)) * clamp(up, -L, L).
+        # The compiler spells it SwiGLU-OAI with alpha 1 and beta 0, which the fp8
+        # group-dequantize kernel runs; the W8A8 kernel has no clamp.
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        clamped = False
+        hidden_act = layer.activation.value
+        swiglu_kwargs = {}
+        if swiglu_limit is not None and swiglu_limit > 0:
+            clamped = True
+            if hidden_act not in ("silu", "swish"):
+                raise NotImplementedError(
+                    f"swiglu_limit {swiglu_limit} with activation {hidden_act!r}: "
+                    "the RBLN MoE kernels clamp the SwiGLU (silu) gate only"
+                )
+            hidden_act = "swigluoai"
+            swiglu_kwargs = {
+                "swiglu_alpha": 1.0,
+                "swiglu_limit": float(swiglu_limit),
+                "swiglu_beta": 0.0,
+            }
+
         if self.use_w8a8:
+            if clamped:
+                raise NotImplementedError(
+                    f"swiglu_limit {swiglu_limit}: the RBLN W8A8 MoE kernel has no "
+                    "SwiGLU clamp; use the fp8 weight-only (W8A16) MoE path"
+                )
             # W8A8: dynamically quantize hidden_states to fp8 per (1, block_k)
             # group along K and hand both the fp8 tensor and the per-(token,
             # K-block) scale to the W8A8 MoE custom op.
@@ -380,11 +406,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     down_proj_weight_scale,
                     masked_routing_weights,
                     torch.tensor(self.weight_block_size[1], dtype=torch.int32),
-                    layer.activation.value,
+                    hidden_act,
                     None,  # gate_proj_bias
                     None,  # up_proj_bias
                     None,  # down_proj_bias
                     layer.expert_map,
+                    **swiglu_kwargs,
                 )
             )
 
