@@ -111,7 +111,10 @@ class TestBlockTableMaintenance:
 
 
 class TestEncoderCache:
-    def test_only_scheduler_released_images_are_evicted(self, make_model_runner):
+    def test_only_scheduler_released_images_are_evicted(
+        self, make_model_runner, monkeypatch
+    ):
+        _last_rank(monkeypatch)
         runner = make_model_runner()
         retained = torch.ones(2, 4)
         runner.encoder_cache.update(released=torch.zeros(2, 4), retained=retained)

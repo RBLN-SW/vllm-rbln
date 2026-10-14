@@ -87,11 +87,11 @@ def _resolved_batch(
 
 
 def _make_runner_stub(**attrs):
-    # A bare RBLNModelRunner (no __init__); set only the attributes the method
-    # under test reads. dp_status is the exception: __init__ always sets it, and
-    # the dummy step reads it before anything publishes one.
+    # Text-only runner without __init__; tests supply method-specific state.
+    # A dummy step can read dp_status before anything publishes one.
     runner = object.__new__(RBLNModelRunner)
     runner.dp_status = None
+    runner.supports_mm_inputs = False
     for key, value in attrs.items():
         setattr(runner, key, value)
     return runner
@@ -1208,6 +1208,7 @@ def _new_req(req_id, *, prompt_logprobs=None):
 def _sched(*, new=(), finished=(), scheduled=None, cached=None, spec=None):
     return SimpleNamespace(
         finished_req_ids=list(finished),
+        free_encoder_mm_hashes=[],
         num_scheduled_tokens=scheduled if scheduled is not None else {},
         scheduled_new_reqs=list(new),
         scheduled_cached_reqs=cached or _empty_cached(),

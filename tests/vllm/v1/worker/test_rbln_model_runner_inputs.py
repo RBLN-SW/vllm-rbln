@@ -41,7 +41,12 @@ pytestmark = pytest.mark.maybe_use_device
 
 
 class TestGatherMultimodalEmbeddings:
-    def test_scheduled_images_are_encoded_and_cached_by_hash(self, make_model_runner):
+    def test_scheduled_images_are_encoded_and_cached_by_hash(
+        self, make_model_runner, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
         runner = make_model_runner()
         step = schedule_new("images")
         pixels = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
@@ -78,8 +83,11 @@ class TestGatherMultimodalEmbeddings:
         [(0, [0, 0, 11]), (3, [0, 22, 33]), (6, [0, 0, 0])],
     )
     def test_chunk_boundaries_preserve_text_holes_and_request_order(
-        self, make_model_runner, computed, values
+        self, make_model_runner, monkeypatch, computed, values
     ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
         runner = make_model_runner()
         step = schedule_new(
             "image",
