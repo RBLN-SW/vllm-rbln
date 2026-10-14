@@ -123,10 +123,7 @@ def test_shutdown_flushes_a_profile_that_was_never_stopped(
     monkeypatch.setenv("VLLM_RBLN_METRICS", "1")
     worker = make_worker(ProfilerConfig())
     worker.model_runner = SimpleNamespace(
-        model_performance_tracker=SimpleNamespace(
-            print_final_stats=lambda: rbln_calls.append("stats")
-        ),
-        sampler_performance_tracker=None,
+        _metrics_ctx=SimpleNamespace(print_stats=lambda: rbln_calls.append("stats")),
     )
 
     worker.profile(is_start=True)

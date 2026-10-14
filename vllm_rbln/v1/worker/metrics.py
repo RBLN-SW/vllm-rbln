@@ -1,435 +1,232 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
-
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at:
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Shared wall-clock metrics for model execution passes."""
 
+import json
 import os
+import time
 from collections import defaultdict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from enum import Enum
 
 import numpy as np
 
 from vllm_rbln import envs
-from vllm_rbln.logger import init_logger, make_file_handler
+from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
 
-_metrics_file_attached = False
+_CTX_ATTR = "_metrics_ctx"
 
 
-def _attach_metrics_file_handler() -> None:
-    """Mirror metrics output to VLLM_RBLN_METRICS_FILE if configured.
+def metrics_enabled() -> bool:
+    return envs.VLLM_RBLN_METRICS
 
-    The configured path is suffixed with the worker pid so concurrent workers
-    (TP/DP) write to separate files instead of clobbering one another. Runs at
-    most once; a failure to open the file is logged and stdout output is kept.
+
+def get_performance_context(runner: object) -> "PerformanceContext":
+    """The runner's context, built on first use.
+
+    Deferred because the rank tag reads the parallelism groups, which are not
+    initialised while the runner is still being constructed.
     """
-    global _metrics_file_attached
-    if _metrics_file_attached or not envs.VLLM_RBLN_METRICS_FILE:
-        return
-    _metrics_file_attached = True
-    root, ext = os.path.splitext(envs.VLLM_RBLN_METRICS_FILE)
-    path = f"{root}.{os.getpid()}{ext}"
-    try:
-        logger.addHandler(make_file_handler(path))
-    except OSError as e:
-        _metrics_file_attached = False
-        logger.warning("Failed to open metrics file %s: %s", path, e)
+    ctx = getattr(runner, _CTX_ATTR, None)
+    if ctx is None:
+        ctx = PerformanceContext("runner")
+        setattr(runner, _CTX_ATTR, ctx)
+    return ctx
+
+
+class Phase(Enum):
+    """Report phases, in report order; the value is the section label."""
+
+    PREFILL = "PREFILL"
+    DECODE = "DECODE"
+    PADDED_DECODE = "PADDED DECODE"
 
 
 @dataclass
-class StepMetrics:
-    """Metrics for a single execution step."""
-
+class _Metrics:
     latencies: list[float] = field(default_factory=list)
-    token_counts: list[int] = field(default_factory=list)
-    host_times: list[int] = field(default_factory=list)
-    device_times: list[int] = field(default_factory=list)
-    ccl_times: list[int] = field(default_factory=list)
-    prepare_times: list[int] = field(default_factory=list)
 
-    def add_measurement(
-        self,
-        latency: float,
-        token_count: int,
-        host_time: int | None = None,
-        device_time: int | None = None,
-        ccl_time: int | None = None,
-        prepare_time: int | None = None,
-    ):
-        """Add a latency, token count, and timing measurements."""
+    def record(self, latency: float) -> None:
         self.latencies.append(latency)
-        self.token_counts.append(token_count)
-        if host_time is not None:
-            self.host_times.append(host_time)
-        if device_time is not None:
-            self.device_times.append(device_time)
-        if ccl_time is not None:
-            self.ccl_times.append(ccl_time)
-        if prepare_time is not None:
-            self.prepare_times.append(prepare_time)
 
-    def get_avg_latency(self) -> float:
-        """Mean per-step latency in milliseconds (no outlier removal)."""
+    @property
+    def call_count(self) -> int:
+        return len(self.latencies)
+
+    def mean_latency_ms(self) -> float:
         if not self.latencies:
             return 0.0
         return sum(self.latencies) / len(self.latencies) * 1000
 
-    def get_latency_percentiles(
+    def latency_percentiles_ms(
         self, percentiles: tuple[float, ...] = (50.0, 90.0, 99.0)
     ) -> dict[str, float]:
-        """Latency percentiles and max in milliseconds (empty if no data)."""
         if not self.latencies:
             return {}
         arr = np.asarray(self.latencies, dtype=float) * 1000.0
-        stats = {f"p{p:g}": float(np.percentile(arr, p)) for p in percentiles}
-        stats["max"] = float(arr.max())
-        return stats
+        return {f"p{p:g}": float(np.percentile(arr, p)) for p in percentiles}
 
-    def get_avg_throughput(self) -> float:
-        """Aggregate throughput in tokens/second (total tokens / total time)."""
-        total_time = sum(self.latencies)
-        return sum(self.token_counts) / total_time if total_time > 0 else 0.0
-
-    def get_avg_host_time(self) -> float:
-        """Mean host time in microseconds."""
-        return sum(self.host_times) / len(self.host_times) if self.host_times else 0.0
-
-    def get_avg_device_time(self) -> float:
-        """Mean device time in microseconds."""
-        return (
-            sum(self.device_times) / len(self.device_times)
-            if self.device_times
-            else 0.0
-        )
-
-    def get_avg_ccl_time(self) -> float:
-        """Mean ccl time in microseconds."""
-        return sum(self.ccl_times) / len(self.ccl_times) if self.ccl_times else 0.0
-
-    def get_avg_prepare_time(self) -> float:
-        """Mean prepare time (PrepareInputs + PrepareOutputs around Run), us."""
-        return (
-            sum(self.prepare_times) / len(self.prepare_times)
-            if self.prepare_times
-            else 0.0
-        )
-
-    def get_call_counts(self) -> int:
-        """Get total number of requests processed."""
-        return len(self.latencies)
-
-    def show_stats(self, stat_type: str):
-        if self.get_call_counts() <= 0:
-            logger.info("%s METRICS: No data recorded", stat_type)
-            return
-        pct = self.get_latency_percentiles()
-        logger.info("%s METRICS:", stat_type)
-        logger.info("  Total call counts: %d", self.get_call_counts())
-        logger.info(
-            "  Latency (ms): mean %.2f | p50 %.2f | p90 %.2f | p99 %.2f | max %.2f",
-            self.get_avg_latency(),
-            pct["p50"],
-            pct["p90"],
-            pct["p99"],
-            pct["max"],
-        )
-        if sum(self.token_counts) > 0:
-            logger.info("  Total tokens processed: %d", sum(self.token_counts))
-            logger.info(
-                "  Average throughput: %.2f tokens/sec", self.get_avg_throughput()
-            )
-        if self.host_times:
-            logger.info("  Average host time: %.2f us", self.get_avg_host_time())
-        if self.device_times:
-            logger.info("  Average device time: %.2f us", self.get_avg_device_time())
-        if self.ccl_times:
-            logger.info("  Average ccl time: %.2f us", self.get_avg_ccl_time())
-        if self.prepare_times:
-            logger.info("  Average prepare time: %.2f us", self.get_avg_prepare_time())
-
-
-class PrefillMetricsByRequestID:
-    """Metrics for prefill step by request id."""
-
-    def __init__(self):
-        self.metrics = defaultdict(StepMetrics)
-
-    def add_measurement(
-        self,
-        request_id: str,
-        latency: float,
-        token_count: int,
-        host_time: int | None = None,
-        device_time: int | None = None,
-        ccl_time: int | None = None,
-        prepare_time: int | None = None,
-    ):
-        """Add a latency and token count measurement."""
-        self.metrics[request_id].add_measurement(
-            latency,
-            token_count,
-            host_time,
-            device_time,
-            ccl_time,
-            prepare_time,
-        )
-
-    def get_avg_latency_per_request(self) -> dict[str, float]:
-        """Get average latency per request."""
+    def to_dict(self) -> dict:
         return {
-            request_id: metric.get_avg_latency()
-            for request_id, metric in self.metrics.items()
+            "call_count": self.call_count,
+            "mean_latency_ms": self.mean_latency_ms(),
+            "latency_percentiles_ms": self.latency_percentiles_ms(),
         }
 
-    def get_total_latency_per_request(self) -> dict[str, float]:
-        """Total prefill latency per request (sum of its chunk latencies), ms."""
-        return {
-            request_id: sum(metric.latencies) * 1000.0
-            for request_id, metric in self.metrics.items()
-        }
 
-    def get_num_request_ids(self) -> int:
-        """Get total number of request ids processed."""
-        return len(self.metrics)
+class PerformanceContext:
+    """One runner's measurements, accumulated a pass at a time."""
 
-
-class PerformanceTracker:
-    """Tracks performance metrics for prefill and decode steps."""
-
-    def __init__(self, name: str | None = None):
+    def __init__(self, name: str | None = None) -> None:
         self.name = name
-        self.prefill_metrics = StepMetrics()
-        self.decode_metrics = StepMetrics()
-        self.prefill_metrics_by_request_id = PrefillMetricsByRequestID()
-        self.padded_decode_metrics = StepMetrics()
+        self.rank_tag = _rank_tag()
+        self._graph: dict[Phase, _Metrics] = defaultdict(_Metrics)
+        self._e2e: dict[Phase, _Metrics] = defaultdict(_Metrics)
+        self._start: float | None = None
+        self._phase: Phase | None = None
+        self._graph_latency: float | None = None
 
-    def check_dummy_request(self, request_ids: list[str] | None) -> bool:
-        if request_ids:
-            request_id = request_ids[0]
-            if request_id.startswith("dummy_request_"):
-                return True
-        return False
+    @property
+    def in_pass(self) -> bool:
+        return self._start is not None
 
-    def record_prefill(
-        self,
-        latency: float,
-        token_count: int,
-        host_time: int | None = None,
-        device_time: int | None = None,
-        ccl_time: int | None = None,
-        prepare_time: int | None = None,
-        request_ids: list[str] | None = None,
-    ):
-        """Record prefill step metrics."""
-        if self.check_dummy_request(request_ids):
+    def start_pass(self) -> None:
+        self._start = time.perf_counter()
+        self._phase = None
+        self._graph_latency = None
+
+    def end_pass(self) -> None:
+        end = time.perf_counter()
+        start, self._start = self._start, None
+        phase, self._phase = self._phase, None
+        graph, self._graph_latency = self._graph_latency, None
+        if start is None or phase is None or graph is None:
+            # No pass was open, or it never reached the forward: an empty batch, KV
+            # send/recv with no forward work, or a pass that raised.
             return
-        request_id = None
-        if request_ids is not None:
-            assert len(request_ids) == 1, (
-                f"Expected exactly one request_id during prefill, "
-                f"got {len(request_ids)}: {request_ids}"
-            )
-            request_id = request_ids[0]
-        self.prefill_metrics.add_measurement(
-            latency,
-            token_count,
-            host_time,
-            device_time,
-            ccl_time,
-            prepare_time,
-        )
-        if request_id:
-            self.prefill_metrics_by_request_id.add_measurement(
-                request_id,
-                latency,
-                token_count,
-                host_time,
-                device_time,
-                ccl_time,
-                prepare_time,
-            )
+        self._e2e[phase].record(end - start)
+        self._graph[phase].record(graph)
 
-    def record_decode(
-        self,
-        latency: float,
-        token_count: int,
-        host_time: int | None = None,
-        device_time: int | None = None,
-        ccl_time: int | None = None,
-        prepare_time: int | None = None,
-        padded_decode: bool = False,
-        request_ids: list[str] | None = None,
-    ):
-        """Record decode step metrics."""
-        if self.check_dummy_request(request_ids):
-            return
-        metrics = self.padded_decode_metrics if padded_decode else self.decode_metrics
-        metrics.add_measurement(
-            latency,
-            token_count,
-            host_time,
-            device_time,
-            ccl_time,
-            prepare_time,
-        )
+    def mark_phase(self, phase: Phase) -> None:
+        if self._start is not None:
+            self._phase = phase
 
-    def record(self, report: "StepReport") -> None:
-        if report.is_prefill:
-            self.record_prefill(
-                report.latency,
-                report.token_count,
-                host_time=report.host_time,
-                device_time=report.device_time,
-                ccl_time=report.ccl_time,
-                prepare_time=report.prepare_time,
-                request_ids=report.request_ids,
-            )
-        else:
-            self.record_decode(
-                report.latency,
-                report.token_count,
-                host_time=report.host_time,
-                device_time=report.device_time,
-                ccl_time=report.ccl_time,
-                prepare_time=report.prepare_time,
-                padded_decode=report.padded_decode,
-                request_ids=report.request_ids,
-            )
+    def add_graph_time(self, latency: float) -> None:
+        if self._start is not None:
+            self._graph_latency = (self._graph_latency or 0.0) + latency
 
-    def _show_per_request_prefill(self) -> None:
-        """Log per-request prefill latency (sum of each request's chunks)."""
-        totals = list(
-            self.prefill_metrics_by_request_id.get_total_latency_per_request().values()
-        )
-        if not totals:
-            return
-        arr = np.asarray(totals, dtype=float)
-        logger.info(
-            "  Per-request prefill (ms): mean %.2f | p50 %.2f | max %.2f (%d requests)",
-            float(arr.mean()),
-            float(np.percentile(arr, 50)),
-            float(arr.max()),
-            len(totals),
-        )
-
-    def print_final_stats(self):
-        _attach_metrics_file_handler()
-        logger.info("=" * 80)
-        if self.name:
-            logger.info("FINAL PERFORMANCE STATISTICS [%s]", self.name)
-        else:
-            logger.info("FINAL PERFORMANCE STATISTICS")
-        logger.info("=" * 80)
-
-        # Prefill stats
-        self.prefill_metrics.show_stats("PREFILL")
-        self._show_per_request_prefill()
-        logger.info("-" * 40)
-
-        # Decode stats
-        self.decode_metrics.show_stats("DECODE")
-        logger.info("-" * 40)
-
-        # Padded decode stats
-        self.padded_decode_metrics.show_stats("PADDED DECODE")
-        logger.info("=" * 80)
+    def print_stats(self) -> None:
+        sections: dict[str, _Metrics] = {}
+        for label, table in (("MODEL + SAMPLE", self._graph), ("E2E", self._e2e)):
+            for phase in Phase:
+                if phase in table:
+                    sections[f"{label} ({phase.value})"] = table[phase]
+        name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
+        logger.info("%s", "\n".join(_render_metrics_report(name, sections)))
+        _write_metrics_json(self.name, self.rank_tag, sections)
 
 
-@dataclass
-class StepReport:
-    """One execution step's timing before it is recorded into a tracker.
+def _rank_tag() -> str:
+    """Rank tag including only parallelism axes with degree > 1; '' if none."""
 
-    Lets model and sampler timings be summed into a single combined
-    measurement (merged_with) instead of being tracked separately.
-    """
+    def get_rank_info(group_name: str, get_group_func) -> str:
+        try:
+            group = get_group_func()
+            if group.world_size > 1:
+                return f"{group_name}{group.rank_in_group}"
+        except (AssertionError, RuntimeError):
+            return ""
+        return ""
 
-    latency: float
-    token_count: int = 0
-    host_time: int | None = None
-    device_time: int | None = None
-    ccl_time: int | None = None
-    prepare_time: int | None = None
-    is_prefill: bool = False
-    padded_decode: bool = False
-    request_ids: list[str] | None = None
+    parts = []
 
-    @classmethod
-    def from_reports(
-        cls,
-        start_time: float,
-        end_time: float,
-        reports: list[dict] | None,
-        *,
-        token_count: int = 0,
-        is_prefill: bool = False,
-        padded_decode: bool = False,
-        request_ids: list[str] | None = None,
-    ) -> "StepReport":
-        host_time = device_time = ccl_time = prepare_time = None
-        if reports:
-            host_time = reports[0].get("total_host", None)
-            device_time = reports[0].get("total_device", None)
-            ccl_time = reports[0].get("total_ccl", None)
-        if reports and len(reports) > 1:
-            prepare_time = reports[1].get("prepare_input_us", 0) + reports[1].get(
-                "prepare_output_us", 0
-            )
-        return cls(
-            latency=end_time - start_time,
-            token_count=token_count,
-            host_time=host_time,
-            device_time=device_time,
-            ccl_time=ccl_time,
-            prepare_time=prepare_time,
-            is_prefill=is_prefill,
-            padded_decode=padded_decode,
-            request_ids=request_ids,
-        )
+    from vllm.distributed import get_dp_group, get_ep_group, get_pp_group, get_tp_group
 
-    def merged_with(self, other: "StepReport | None") -> "StepReport":
-        """Sum `other`'s timings into this step, keeping this step's metadata."""
-        if other is None:
-            return self
+    for group_name, get_group_func in [
+        ("TP", get_tp_group),
+        ("PP", get_pp_group),
+        ("DP", get_dp_group),
+        ("EP", get_ep_group),
+    ]:
+        rank_info = get_rank_info(group_name, get_group_func)
+        if rank_info:
+            parts.append(rank_info)
 
-        def _add(a: int | None, b: int | None) -> int | None:
-            if a is None and b is None:
-                return None
-            return (a or 0) + (b or 0)
-
-        return replace(
-            self,
-            latency=self.latency + other.latency,
-            host_time=_add(self.host_time, other.host_time),
-            device_time=_add(self.device_time, other.device_time),
-            ccl_time=_add(self.ccl_time, other.ccl_time),
-            prepare_time=_add(self.prepare_time, other.prepare_time),
-        )
+    return " ".join(parts)
 
 
-def collect_metrics(
-    performance_tracker: PerformanceTracker,
-    is_prefill: bool,
-    start_time: float,
-    end_time: float,
-    reports: list[dict],
-    token_count: int,
+def _render_metrics(label: str, m: _Metrics) -> list[str]:
+    if m.call_count == 0:
+        return [f"{label} METRICS: No data recorded"]
+
+    lines = [
+        f"{label} METRICS:",
+        f"  {'Total call counts':<25}: {m.call_count}",
+        f"  {'Mean latency (ms)':<25}: {m.mean_latency_ms():.2f}",
+    ]
+
+    for key, value in m.latency_percentiles_ms().items():
+        stat = "Median" if key == "p50" else key.upper()
+        metric_label = f"{stat} latency (ms)"
+        lines.append(f"  {metric_label:<25}: {value:.2f}")
+
+    return lines
+
+
+def _render_metrics_report(
+    name: str | None, sections: dict[str, _Metrics]
+) -> list[str]:
+    lines = [
+        "=" * 50,
+        f"PERFORMANCE STATISTICS{f' [{name}]' if name else ''}",
+        "=" * 50,
+    ]
+
+    for label, metrics in sections.items():
+        lines.extend(_render_metrics(label, metrics))
+        lines.append("-" * 50)
+
+    lines.append("=" * 50)
+    return lines
+
+
+def _write_metrics_json(
+    name: str | None, rank_tag: str, sections: dict[str, _Metrics]
 ) -> None:
-    performance_tracker.record(
-        StepReport.from_reports(
-            start_time,
-            end_time,
-            reports,
-            token_count=token_count,
-            is_prefill=is_prefill,
-        )
-    )
+    if not envs.VLLM_RBLN_METRICS_DIR:
+        return
+
+    suffix = rank_tag.replace(" ", "_").lower()
+    filename = f"metrics_{suffix}.json" if suffix else "metrics.json"
+    path = os.path.join(envs.VLLM_RBLN_METRICS_DIR, filename)
+    payload = {
+        "name": name,
+        "rank": rank_tag,
+        "sections": {label: m.to_dict() for label, m in sections.items()},
+    }
+
+    try:
+        payload_str = json.dumps(payload, indent=2)
+    except (TypeError, ValueError) as e:
+        logger.warning("Failed to serialize metrics JSON: %s", e)
+        return
+
+    try:
+        os.makedirs(envs.VLLM_RBLN_METRICS_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload_str)
+    except OSError as e:
+        logger.warning("Failed to write metrics JSON to %s: %s", path, e)

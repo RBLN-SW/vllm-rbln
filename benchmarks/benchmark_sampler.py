@@ -13,18 +13,16 @@
 # limitations under the License.
 
 import argparse
-import contextlib
 import time
 
 import numpy as np
-import rebel
 import torch
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
+from vllm_rbln.v1.worker.metrics import PerformanceContext, Phase
 
 MAX_NUM_PROMPT_TOKENS = 64
 
@@ -180,7 +178,7 @@ def run_benchmark(
     # each (the (top_k, top_p) None/tensor combinations), which every default
     # recompile_limit already covers.
     sampler = RBLNSampler()
-    sampler_performance_tracker = PerformanceTracker("SAMPLER")
+    sampler_metrics = PerformanceContext("SAMPLER")
 
     reference_logits = _create_logits(batch_size, vocab_size)
     logits = reference_logits.clone()
@@ -211,22 +209,15 @@ def run_benchmark(
 
     for _ in range(benchmark_iters):
         logits.copy_(reference_logits)
-        if hasattr(rebel, "capture_reports"):
-            capture_ctx = rebel.capture_reports()
-        else:
-            capture_ctx = contextlib.nullcontext()
+        sampler_metrics.start_pass()
+        sampler_metrics.mark_phase(Phase.DECODE)
         start_time = time.perf_counter()
-        with capture_ctx as model_reports:
-            sampler(logits, sampling_metadata)
-        collect_metrics(
-            sampler_performance_tracker,
-            is_prefill=False,
-            start_time=start_time,
-            end_time=time.perf_counter(),
-            reports=model_reports,
-            token_count=0,
-        )
-    sampler_performance_tracker.print_final_stats()
+        output = sampler(logits, sampling_metadata)
+        # The runtime can return before sampling finishes; read the output to wait.
+        output.sampled_token_ids.tolist()
+        sampler_metrics.add_graph_time(time.perf_counter() - start_time)
+        sampler_metrics.end_pass()
+    sampler_metrics.print_stats()
 
 
 def main():
@@ -261,8 +252,8 @@ def main():
         "--benchmark-config",
         type=str,
         choices=[c["name"] for c in BENCHMARK_CONFIGS],
-        default="no_penalty_greedy",
-        help=f"Benchmark config name (default: no_penalty_greedy). "
+        default="greedy",
+        help=f"Benchmark config name (default: greedy). "
         f"Choices: {[c['name'] for c in BENCHMARK_CONFIGS]}",
     )
 

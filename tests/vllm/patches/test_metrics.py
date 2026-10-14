@@ -22,6 +22,7 @@ from vllm.sequence import IntermediateTensors
 
 import vllm_rbln.envs as envs
 import vllm_rbln.patches.metrics as pm
+import vllm_rbln.v1.worker.metrics as wm
 from vllm_rbln.patches import registry
 from vllm_rbln.v1.worker.dp_utils import BatchDescriptor
 
@@ -55,14 +56,15 @@ class _Runner:
 def clock(monkeypatch):
     fake = _Clock()
     monkeypatch.setattr(pm, "time", fake)
+    monkeypatch.setattr(wm, "time", fake)
     return fake
 
 
 @pytest.fixture
 def ctx(monkeypatch):
     # The rank tag reads the parallelism groups; it is irrelevant here.
-    monkeypatch.setattr(pm, "_rank_tag", lambda: "")
-    return pm._PerformanceContext("runner")
+    monkeypatch.setattr(wm, "_rank_tag", lambda: "")
+    return wm.PerformanceContext("runner")
 
 
 def run_pass(ctx, clock, *, phase, before=0.0, model=0.0, sample=None, after=0.0):
@@ -93,25 +95,25 @@ def _desc(num_tokens_padded):
 
 class TestMetrics:
     def test_record_appends_latency(self):
-        m = pm._Metrics()
+        m = wm._Metrics()
         m.record(0.01)
         m.record(0.02)
         assert m.latencies == [0.01, 0.02]
         assert m.call_count == 2
 
     def test_mean_latency_ms_scales_to_ms(self):
-        m = pm._Metrics()
+        m = wm._Metrics()
         m.record(0.01)
         m.record(0.03)
         assert m.mean_latency_ms() == 20.0  # mean 0.02 s -> 20 ms
 
     def test_empty_metrics_report_zero_and_no_percentiles(self):
-        m = pm._Metrics()
+        m = wm._Metrics()
         assert m.mean_latency_ms() == 0.0
         assert m.latency_percentiles_ms() == {}
 
     def test_percentile_keys_and_ms_scaling(self):
-        m = pm._Metrics()
+        m = wm._Metrics()
         for v in (0.01, 0.02, 0.03):
             m.record(v)
         pct = m.latency_percentiles_ms()
@@ -119,7 +121,7 @@ class TestMetrics:
         assert pct["p50"] == 20.0  # median of [10,20,30] ms
 
     def test_to_dict_carries_count_and_latencies_only(self):
-        m = pm._Metrics()
+        m = wm._Metrics()
         m.record(0.01)
         assert set(m.to_dict()) == {
             "call_count",
@@ -133,31 +135,31 @@ class TestPassAccounting:
         run_pass(
             ctx,
             clock,
-            phase=pm._Phase.PREFILL,
+            phase=wm.Phase.PREFILL,
             before=1 * MS,
             model=8 * MS,
             sample=2 * MS,
             after=1 * MS,
         )
-        assert ctx._e2e[pm._Phase.PREFILL].mean_latency_ms() == pytest.approx(12.0)
+        assert ctx._e2e[wm.Phase.PREFILL].mean_latency_ms() == pytest.approx(12.0)
         # MODEL + SAMPLE is the sum of the two calls; the 2ms outside them is the host
         # overhead the difference of the two means is read for.
-        assert ctx._graph[pm._Phase.PREFILL].mean_latency_ms() == pytest.approx(10.0)
+        assert ctx._graph[wm.Phase.PREFILL].mean_latency_ms() == pytest.approx(10.0)
 
     def test_counts_stay_equal_across_the_two_sections(self, ctx, clock):
         for _ in range(3):
-            run_pass(ctx, clock, phase=pm._Phase.DECODE, model=8 * MS, sample=1 * MS)
+            run_pass(ctx, clock, phase=wm.Phase.DECODE, model=8 * MS, sample=1 * MS)
             clock.advance(5 * MS)
-        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=8 * MS)  # sampler-less
+        run_pass(ctx, clock, phase=wm.Phase.DECODE, model=8 * MS)  # sampler-less
 
-        assert ctx._graph[pm._Phase.DECODE].call_count == 4
-        assert ctx._e2e[pm._Phase.DECODE].call_count == 4
+        assert ctx._graph[wm.Phase.DECODE].call_count == 4
+        assert ctx._e2e[wm.Phase.DECODE].call_count == 4
 
     def test_time_between_passes_is_excluded(self, ctx, clock):
         for _ in range(2):
-            run_pass(ctx, clock, phase=pm._Phase.DECODE, model=1 * MS)
+            run_pass(ctx, clock, phase=wm.Phase.DECODE, model=1 * MS)
             clock.advance(10 * MS)  # engine and idle time between passes
-        assert ctx._e2e[pm._Phase.DECODE].latencies == pytest.approx([1 * MS, 1 * MS])
+        assert ctx._e2e[wm.Phase.DECODE].latencies == pytest.approx([1 * MS, 1 * MS])
 
     def test_pass_without_a_phase_is_dropped(self, ctx, clock):
         # Empty batch, or KV send/recv with no forward work.
@@ -170,7 +172,7 @@ class TestPassAccounting:
     def test_pass_without_graph_time_is_dropped(self, ctx, clock):
         # A pass that set its phase but raised before the forward.
         ctx.start_pass()
-        ctx.mark_phase(pm._Phase.DECODE)
+        ctx.mark_phase(wm.Phase.DECODE)
         clock.advance(1 * MS)
         ctx.end_pass()
         assert ctx._e2e == {} and ctx._graph == {}
@@ -180,33 +182,33 @@ class TestPassAccounting:
         assert ctx._e2e == {} and ctx._graph == {}
 
     def test_second_end_does_not_record_again(self, ctx, clock):
-        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=1 * MS)
+        run_pass(ctx, clock, phase=wm.Phase.DECODE, model=1 * MS)
         clock.advance(5 * MS)
         ctx.end_pass()
-        assert ctx._e2e[pm._Phase.DECODE].call_count == 1
+        assert ctx._e2e[wm.Phase.DECODE].call_count == 1
 
     def test_phase_and_graph_time_do_not_carry_over(self, ctx, clock):
-        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=1 * MS)
+        run_pass(ctx, clock, phase=wm.Phase.DECODE, model=1 * MS)
         ctx.start_pass()
         clock.advance(5 * MS)
         ctx.end_pass()  # no phase, no graph time this time
-        assert ctx._e2e[pm._Phase.DECODE].call_count == 1
-        assert ctx._graph[pm._Phase.DECODE].latencies == pytest.approx([1 * MS])
+        assert ctx._e2e[wm.Phase.DECODE].call_count == 1
+        assert ctx._graph[wm.Phase.DECODE].latencies == pytest.approx([1 * MS])
 
     def test_marks_outside_a_pass_are_ignored(self, ctx, clock):
         # Warm-up and dummy runs reach the same code with no pass open.
-        ctx.mark_phase(pm._Phase.PREFILL)
+        ctx.mark_phase(wm.Phase.PREFILL)
         ctx.add_graph_time(9 * MS)
         assert not ctx.in_pass
-        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=1 * MS)
-        assert ctx._graph[pm._Phase.DECODE].latencies == pytest.approx([1 * MS])
+        run_pass(ctx, clock, phase=wm.Phase.DECODE, model=1 * MS)
+        assert ctx._graph[wm.Phase.DECODE].latencies == pytest.approx([1 * MS])
 
 
 class TestReporting:
     def _labels(self, ctx, monkeypatch):
         monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", "")
         captured: list[str] = []
-        monkeypatch.setattr(pm.logger, "info", lambda fmt, msg: captured.append(msg))
+        monkeypatch.setattr(wm.logger, "info", lambda fmt, msg: captured.append(msg))
         ctx.print_stats()
         return [
             line.removesuffix(" METRICS:")
@@ -217,9 +219,9 @@ class TestReporting:
     def test_sections_are_grouped_by_range_then_phase_order(
         self, ctx, clock, monkeypatch
     ):
-        run_pass(ctx, clock, phase=pm._Phase.PADDED_DECODE, model=3 * MS)
-        run_pass(ctx, clock, phase=pm._Phase.PREFILL, model=10 * MS, sample=2 * MS)
-        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=8 * MS, sample=1 * MS)
+        run_pass(ctx, clock, phase=wm.Phase.PADDED_DECODE, model=3 * MS)
+        run_pass(ctx, clock, phase=wm.Phase.PREFILL, model=10 * MS, sample=2 * MS)
+        run_pass(ctx, clock, phase=wm.Phase.DECODE, model=8 * MS, sample=1 * MS)
 
         # Phase order follows the enum, not the order the phases were seen.
         assert self._labels(ctx, monkeypatch) == [
@@ -232,7 +234,7 @@ class TestReporting:
         ]
 
     def test_unseen_phase_is_omitted(self, ctx, clock, monkeypatch):
-        run_pass(ctx, clock, phase=pm._Phase.DECODE, model=8 * MS, sample=1 * MS)
+        run_pass(ctx, clock, phase=wm.Phase.DECODE, model=8 * MS, sample=1 * MS)
         assert self._labels(ctx, monkeypatch) == [
             "MODEL + SAMPLE (DECODE)",
             "E2E (DECODE)",
@@ -245,21 +247,21 @@ class TestReporting:
 class TestWriteMetricsJson:
     def test_no_metrics_dir_skips_write(self, monkeypatch, tmp_path):
         monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", "")
-        pm._write_metrics_json("runner", "", {})  # must not raise
+        wm._write_metrics_json("runner", "", {})  # must not raise
         assert list(tmp_path.iterdir()) == []
 
     def test_writes_payload_with_section_dicts(self, monkeypatch, tmp_path):
         monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
-        m = pm._Metrics()
+        m = wm._Metrics()
         m.record(0.01)
-        pm._write_metrics_json("runner", "", {"E2E (DECODE)": m})
+        wm._write_metrics_json("runner", "", {"E2E (DECODE)": m})
         data = json.loads((tmp_path / "metrics.json").read_text())
         assert data["name"] == "runner" and data["rank"] == ""
         assert data["sections"]["E2E (DECODE)"]["call_count"] == 1
 
     def test_rank_tag_lowercased_into_filename_suffix(self, monkeypatch, tmp_path):
         monkeypatch.setattr(envs, "VLLM_RBLN_METRICS_DIR", str(tmp_path))
-        pm._write_metrics_json("runner", "TP1 DP0", {})
+        wm._write_metrics_json("runner", "TP1 DP0", {})
         assert (tmp_path / "metrics_tp1_dp0.json").exists()
 
 
@@ -279,7 +281,7 @@ class TestRankTag:
     def test_degree_one_axes_are_excluded(self, monkeypatch):
         one = self._grp(1, 0)
         self._patch_groups(monkeypatch, one, one, one, one)
-        assert pm._rank_tag() == ""
+        assert wm._rank_tag() == ""
 
     def test_only_multi_degree_axes_in_fixed_order(self, monkeypatch):
         self._patch_groups(
@@ -289,7 +291,7 @@ class TestRankTag:
             dp=self._grp(4, 3),
             ep=self._grp(1, 0),
         )
-        assert pm._rank_tag() == "TP1 DP3"
+        assert wm._rank_tag() == "TP1 DP3"
 
     def test_group_lookup_failure_yields_empty(self, monkeypatch):
         import vllm.distributed as d
@@ -299,26 +301,26 @@ class TestRankTag:
 
         for name in ("get_tp_group", "get_pp_group", "get_dp_group", "get_ep_group"):
             monkeypatch.setattr(d, name, boom)
-        assert pm._rank_tag() == ""
+        assert wm._rank_tag() == ""
 
 
 class TestRenderMetrics:
     def test_no_data_branch(self):
-        assert pm._render_metrics("E2E (DECODE)", pm._Metrics()) == [
+        assert wm._render_metrics("E2E (DECODE)", wm._Metrics()) == [
             "E2E (DECODE) METRICS: No data recorded"
         ]
 
     def test_p50_is_labelled_median(self):
-        m = pm._Metrics()
+        m = wm._Metrics()
         m.record(0.01)
-        text = "\n".join(pm._render_metrics("E2E (PREFILL)", m))
+        text = "\n".join(wm._render_metrics("E2E (PREFILL)", m))
         assert "Median latency (ms)" in text
         assert "P90 latency (ms)" in text
 
     def test_report_wraps_sections_with_named_header(self):
-        m = pm._Metrics()
+        m = wm._Metrics()
         m.record(0.01)
-        text = "\n".join(pm._render_metrics_report("runner", {"E2E (DECODE)": m}))
+        text = "\n".join(wm._render_metrics_report("runner", {"E2E (DECODE)": m}))
         assert "PERFORMANCE STATISTICS [runner]" in text
         assert "E2E (DECODE) METRICS:" in text
 
@@ -327,14 +329,14 @@ class TestPhase:
     @pytest.mark.parametrize(
         "is_prefill, num_tokens_padded, expected",
         [
-            (True, None, pm._Phase.PREFILL),
-            (True, 128, pm._Phase.PREFILL),
+            (True, None, wm.Phase.PREFILL),
+            (True, 128, wm.Phase.PREFILL),
             # num_tokens_padded is the MoE pad dimension: matching the prefill dim
             # means this decode ran the prefill-sized graph.
-            (False, 128, pm._Phase.PADDED_DECODE),
-            (False, 64, pm._Phase.DECODE),
+            (False, 128, wm.Phase.PADDED_DECODE),
+            (False, 64, wm.Phase.DECODE),
             # Without DP the runner computes no padding at all.
-            (False, None, pm._Phase.DECODE),
+            (False, None, wm.Phase.DECODE),
         ],
     )
     def test_phase_follows_the_padded_token_count(
@@ -345,7 +347,7 @@ class TestPhase:
             pm, "_determine_batch_execution_and_padding", lambda self, *a: padding
         )
         runner = _Runner(is_prefill=is_prefill, max_num_tokens=128)
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
         ctx.start_pass()
 
         assert pm.determine_batch_execution_and_padding(runner, 1, 1) == padding
@@ -359,7 +361,7 @@ class TestPhase:
             lambda self, *a: (_desc(128), None, None),
         )
         runner = _Runner()
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
 
         pm.determine_batch_execution_and_padding(runner, 1, 1)
         assert ctx._phase is None
@@ -371,7 +373,7 @@ class TestPassBoundary:
         runner = _Runner()
 
         assert pm.execute_model(runner) is None
-        assert pm._ctx(runner).in_pass
+        assert wm.get_performance_context(runner).in_pass
 
     def test_early_output_ends_the_pass(self, monkeypatch):
         # The engine calls sample_tokens only after a None, so nobody else would end it.
@@ -379,7 +381,7 @@ class TestPassBoundary:
         runner = _Runner()
 
         assert pm.execute_model(runner) == "output"
-        assert not pm._ctx(runner).in_pass
+        assert not wm.get_performance_context(runner).in_pass
 
     def test_hand_off_output_leaves_the_pass_open(self, monkeypatch):
         # The hand-off follows, so the pass stays open for its wall.
@@ -391,12 +393,12 @@ class TestPassBoundary:
         out = pm.execute_model(runner)
 
         assert isinstance(out, IntermediateTensors)
-        assert pm._ctx(runner).in_pass
+        assert wm.get_performance_context(runner).in_pass
 
     def test_hand_off_folds_the_send_into_the_pass(self, monkeypatch, clock):
         def fake_forward(self, *a, **k):
-            ctx = pm._ctx(self)
-            ctx.mark_phase(pm._Phase.DECODE)
+            ctx = wm.get_performance_context(self)
+            ctx.mark_phase(wm.Phase.DECODE)
             clock.advance(1 * MS)  # dispatch cost
             ctx.add_graph_time(1 * MS)
             return IntermediateTensors({})
@@ -411,15 +413,15 @@ class TestPassBoundary:
         pm.execute_model(runner)
         pm.send_handoff(worker, {})
 
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
         assert not ctx.in_pass
-        assert ctx._graph[pm._Phase.DECODE].latencies == pytest.approx([5 * MS])
-        assert ctx._e2e[pm._Phase.DECODE].latencies == pytest.approx([5 * MS])
+        assert ctx._graph[wm.Phase.DECODE].latencies == pytest.approx([5 * MS])
+        assert ctx._e2e[wm.Phase.DECODE].latencies == pytest.approx([5 * MS])
 
     def test_raising_hand_off_records_nothing(self, monkeypatch, clock):
         def fake_forward(self, *a, **k):
-            ctx = pm._ctx(self)
-            ctx.mark_phase(pm._Phase.DECODE)
+            ctx = wm.get_performance_context(self)
+            ctx.mark_phase(wm.Phase.DECODE)
             ctx.add_graph_time(1 * MS)
             return IntermediateTensors({})
 
@@ -434,7 +436,7 @@ class TestPassBoundary:
         with pytest.raises(RuntimeError, match="boom"):
             pm.send_handoff(types.SimpleNamespace(model_runner=runner), {})
 
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
         assert ctx.in_pass  # left open, like any raising pass
         assert not ctx._e2e and not ctx._graph
 
@@ -454,10 +456,10 @@ class TestPassBoundary:
         pm.sample(runner)
         assert pm.sample_tokens(runner) == "out"
 
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
         assert not ctx.in_pass
-        assert ctx._e2e[pm._Phase.DECODE].call_count == 1
-        assert ctx._graph[pm._Phase.DECODE].call_count == 1
+        assert ctx._e2e[wm.Phase.DECODE].call_count == 1
+        assert ctx._graph[wm.Phase.DECODE].call_count == 1
 
     def test_a_raising_pass_does_not_corrupt_the_next_one(self, monkeypatch, clock):
         def boom(self, *args, **kwargs):
@@ -467,7 +469,7 @@ class TestPassBoundary:
         runner = _Runner()
         with pytest.raises(RuntimeError, match="boom"):
             pm.execute_model(runner)
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
         assert ctx.in_pass  # left open: there is no abort path by design
 
         clock.advance(50 * MS)  # time the failed pass must not claim
@@ -491,7 +493,7 @@ class TestPassBoundary:
         pm.sample_tokens(runner)
 
         # One record, timed from the second start_pass -- none of the 50ms before it.
-        recorded = ctx._e2e[pm._Phase.DECODE]
+        recorded = ctx._e2e[wm.Phase.DECODE]
         assert recorded.call_count == 1
         assert recorded.latencies == pytest.approx([2 * MS])
 
@@ -530,7 +532,7 @@ class TestPassBoundary:
         pm.sample(runner)
         pm.sample_tokens(runner)
 
-        graph = pm._ctx(runner)._graph[pm._Phase.DECODE]
+        graph = wm.get_performance_context(runner)._graph[wm.Phase.DECODE]
         assert graph.latencies == pytest.approx([1 * MS])
 
 
@@ -538,7 +540,7 @@ class TestSamplerTiming:
     def test_sampler_call_adds_graph_time(self, monkeypatch):
         monkeypatch.setattr(pm, "_sample", lambda self, *a, **k: "sampled")
         runner = _Runner()
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
         ctx.start_pass()
 
         assert pm.sample(runner) == "sampled"
@@ -548,7 +550,7 @@ class TestSamplerTiming:
         # Returns a placeholder without running the sampler.
         monkeypatch.setattr(pm, "_sample", lambda self, *a, **k: "placeholder")
         runner = _Runner(is_intermediate_chunked_prefill=True)
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
         ctx.start_pass()
 
         assert pm.sample(runner) == "placeholder"
@@ -569,7 +571,7 @@ class TestModelExecutable:
         monkeypatch.setattr(pm, "_load_model", fake_load_model)
         runner = _Runner()
         pm.load_model(runner)
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
 
         assert runner.model_executable(step=1) == "logits"  # warm-up
         assert ctx._graph_latency is None
@@ -625,7 +627,7 @@ class TestShutdown:
         order: list[str] = []
         monkeypatch.setattr(pm, "_shutdown", lambda self: order.append("shutdown"))
         runner = _Runner()
-        ctx = pm._ctx(runner)
+        ctx = wm.get_performance_context(runner)
         monkeypatch.setattr(ctx, "print_stats", lambda: order.append("stats"))
 
         pm.shutdown(types.SimpleNamespace(model_runner=runner))
