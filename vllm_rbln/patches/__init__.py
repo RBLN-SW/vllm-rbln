@@ -45,7 +45,6 @@ from . import (
     multiproc_executor,
     nan_logprobs,
     oot,
-    profiler,
     qwen2_moe,
     qwen3_moe,
     rotary_embedding,
