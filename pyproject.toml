@@ -75,7 +75,7 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler>=0.12.0rc1,<0.12.1",
+    "rebel-compiler[v2]>=0.12.0rc1,<0.12.1",
 ]
 kv_connectors = [
     "nixl-rbln>=0.12.0rc1,<0.12.1",
