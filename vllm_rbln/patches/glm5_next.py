@@ -29,3 +29,5 @@ def register_glm5_next() -> None:
 
     for arch in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"):
         ModelRegistry.register_model(arch, f"{_MODULE}:RBLNGlm5NextForCausalLM")
+    # The MTP drafter vLLM's speculative config selects for a glm5_next target.
+    ModelRegistry.register_model("Glm5NextMTPModel", f"{_MODULE}:RBLNGlm5NextMTP")

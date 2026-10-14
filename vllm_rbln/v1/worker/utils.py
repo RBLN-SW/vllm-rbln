@@ -256,10 +256,11 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if getattr(hf_config, "model_type", None) == "longcat_flash":
         return 2
     text_config = getattr(model_config, "hf_text_config", hf_config)
-    # GLM-5.3: four caches a layer (KDA state and q/k/v conv rings, or the DSA latent,
-    # indexer key, scale and tail ring); see model_executor/models/glm5_next.py.
-    if getattr(text_config, "model_type", None) == "glm5_next_text":
-        return 4
+    # GLM-5.3: up to five caches a layer (KDA state, q/k/v conv rings and, with MTP,
+    # the draft buffer; or the DSA latent, indexer key, scale and tail ring); see
+    # model_executor/models/glm5_next.py (CACHES_PER_LAYER).
+    if getattr(text_config, "model_type", None) in ("glm5_next_text", "glm5_next_mtp"):
+        return 5
     # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
     # or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
