@@ -143,7 +143,6 @@ def create_requests(
     mm_positions: list[list[PlaceholderRange]] | None = None,
     max_tokens: int = 16,
     stop_token_ids: list[int] | None = None,
-    prompt_logprobs: int | None = None,
     same_prompt: bool = False,
     block_size: int = 16,
     sample_json_schema: str | None = None,
@@ -180,7 +179,6 @@ def create_requests(
         ignore_eos=False,
         max_tokens=max_tokens,
         stop_token_ids=stop_token_ids,
-        prompt_logprobs=prompt_logprobs,
         structured_outputs=structured_outputs,
     )
     for i in range(num_requests):
@@ -237,6 +235,5 @@ def create_model_runner_output(
         req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
         sampled_token_ids=[[i] for i in range(len(req_ids))],
         logprobs=None,
-        prompt_logprobs_dict={},
         pooler_output=[],
     )
