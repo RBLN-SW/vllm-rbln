@@ -23,6 +23,7 @@ import torch
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -177,6 +178,61 @@ class TestLayerIndexFollowsCacheOrder:
         assert runner.kv_cache_names == list(names)
         assert [ctx[name].layer_index for name in names] == [0, 1, 2]
         assert runner.kv_caches[2] is ctx[names[-1]].kv_cache
+
+
+class TestBlockAuxKVCaches:
+    @staticmethod
+    def _aux(owner, shape=(4, 64), dtype=torch.bfloat16):
+        spec = RBLNBlockAuxSpec(owner, shape, dtype)
+        return SimpleNamespace(get_aux_cache_spec=lambda _config: spec)
+
+    def _allocate(self, runner, config, monkeypatch, auxes):
+        # GLM-5.3, the one model with aux caches, runs a static KV cache.
+        monkeypatch.setattr(mr, "dynamic_kv_enabled", lambda _config: False)
+        context = runner.compilation_config.static_forward_context
+        for name, module in auxes.items():
+            monkeypatch.setitem(context, name, module)
+        caches, bases, infos, axes = {}, {}, {}, {}
+        runner._allocate_aux_kv_caches(config, caches, bases, infos, axes)
+        return caches, infos, axes
+
+    def test_owners_on_one_extent_share_by_ordinal(
+        self, make_model_runner, monkeypatch
+    ):
+        # Two groups overlay one extent: their layers never hold one block at
+        # once, so an owner's k-th aux cache of a kind shares the other's k-th.
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        config = make_kv_cache_config(runner, groups=[("layer.0",), ("layer.1",)])
+        caches, infos, axes = self._allocate(
+            runner,
+            config,
+            monkeypatch,
+            {
+                "aux.0.a": self._aux("layer.0"),
+                "aux.0.b": self._aux("layer.0"),
+                "aux.1.a": self._aux("layer.1"),
+                "aux.1.f": self._aux("layer.1", dtype=torch.float16),
+            },
+        )
+        assert tuple(caches["aux.0.a"].shape) == (config.num_blocks, 4, 64)
+        assert caches["aux.0.a"] is not caches["aux.0.b"]
+        assert caches["aux.1.a"] is caches["aux.0.a"]
+        assert caches["aux.1.f"].dtype == torch.float16
+        assert infos["aux.1.f"].view_shape == (config.num_blocks, 4, 64)
+        assert set(axes.values()) == {0}
+
+    def test_owners_on_distinct_extents_do_not_share(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner(layers=("layer.0", "layer.1"), init_kv_cache=False)
+        config = make_kv_cache_config(runner, groups=[("layer.0", "layer.1")])
+        caches, _, _ = self._allocate(
+            runner,
+            config,
+            monkeypatch,
+            {"aux.0": self._aux("layer.0"), "aux.1": self._aux("layer.1")},
+        )
+        assert caches["aux.0"] is not caches["aux.1"]
 
 
 class TestHostBufferCopyOp:

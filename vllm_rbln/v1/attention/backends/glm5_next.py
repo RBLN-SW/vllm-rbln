@@ -13,19 +13,74 @@
 # limitations under the License.
 """GLM-5.3 (glm5_next) cache backends for RBLN.
 
-Per KDA layer, one slot per request (``RBLNSlidingWindowSpec``): the recurrent state
-``[H * 128, 128]`` and the q / k / v short-conv rings ``[C * W / 64, 64]``.
-Per DSA layer: the paged MLA latent cache ``[NB, block, 512]``, the paged kpool indexer
-key ``[NB, block / 4, 128]`` fp8 and its scale ``[.., 1]`` f16, and the indexer's tail
-ring ``[4, 256]`` one slot per request. All reuse ``RBLNFlashAttentionMetadataBuilder``.
+The layout is vLLM's GLM-5.3 one (``_get_kv_cache_groups_glm5_next``), region by region
+(design README 2.7, SoA):
+
+* one attention group of every DSA layer's paged MLA latent ``[N, b, 512]`` uint8 (fp8)
+  and kpool indexer key ``[N, b / 4, 128]`` fp8 / scale ``[N, b / 4, 64]`` f16;
+* KDA state groups: a KDA layer's heads split into g head groups, each a ``MambaSpec``
+  layer of one block a request, its state R1's bytes ``[N, b, 512]`` uint8 on the
+  extent of a latent layer (the same page id is never both: one block pool).
+
+The q / k / v conv rings, the MTP draft buffer and the kpool tail ring are block-aux
+caches (``RBLNBlockAuxSpec``) addressed by their owner's block ids.
 """
 
 from typing import ClassVar
 
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
-from .flash_attention import RBLNFlashAttentionMetadataBuilder
+import vllm_rbln.utils as rbln_utils
+
+from .flash_attention import (
+    RBLNFlashAttentionMetadata,
+    RBLNFlashAttentionMetadataBuilder,
+)
+
+
+class RBLNGlm5MetadataBuilder(RBLNFlashAttentionMetadataBuilder):
+    """Stages each request's cached and total token counts (``cache_seq_lens``,
+    ``cache_offsets``, unclamped) for every GLM-5.3 group, not only a ring's: the KDA
+    state, the conv rings and the kpool tail take the step's valid tokens from them."""
+
+    def build(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        positions: torch.Tensor,
+        batch_pad: int,
+        is_prefill: bool,
+        skip_attn_masks: bool = False,
+        back_pad: torch.Tensor | None = None,
+        **kwargs,
+    ) -> RBLNFlashAttentionMetadata:
+        metadata = super().build(
+            common_attn_metadata,
+            positions,
+            batch_pad,
+            is_prefill,
+            skip_attn_masks=skip_attn_masks,
+            back_pad=back_pad,
+            **kwargs,
+        )
+        if metadata.cache_offsets is not None:
+            return metadata
+        num_reqs = common_attn_metadata.num_reqs
+        query_start_loc = common_attn_metadata.query_start_loc
+        seq_lens = common_attn_metadata.seq_lens[:num_reqs].view(-1, 1)
+        query_lens = (
+            query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
+        ).view(-1, 1)
+        num_computed_tokens = seq_lens - query_lens
+        if back_pad is not None:
+            num_computed_tokens = num_computed_tokens + back_pad[:num_reqs].view(-1, 1)
+        if not is_prefill:
+            num_computed_tokens = rbln_utils.pad(num_computed_tokens, 0, batch_pad)
+            seq_lens = rbln_utils.pad(seq_lens, 0, batch_pad)
+        metadata.cache_seq_lens = self._stage(num_computed_tokens, "cache_seq_lens")
+        metadata.cache_offsets = self._stage(seq_lens, "cache_offsets")
+        return metadata
 
 
 class _RBLNGlm5CacheBackend(AttentionBackend):
@@ -51,7 +106,7 @@ class _RBLNGlm5CacheBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["RBLNFlashAttentionMetadataBuilder"]:
-        return RBLNFlashAttentionMetadataBuilder
+        return RBLNGlm5MetadataBuilder
 
     @classmethod
     def get_kv_cache_shape(
@@ -75,30 +130,13 @@ class _RBLNGlm5CacheBackend(AttentionBackend):
         return (0, 1, 2)
 
 
-class RBLNGlm5RingBackend(_RBLNGlm5CacheBackend):
-    """A ``[rows, width]`` slot per request, declared as an ``RBLNSlidingWindowSpec`` of
-    ``head_size = width / 2`` (the spec budgets K + V)."""
-
-    # The ops take a whole manager block (a page the hybrid allocator may have grown to
-    # k rings) and use its first rows, so the runner does not split it into k kernel
-    # blocks: block ids stay page ids.
-    kernel_block_is_manager_block: ClassVar[bool] = True
+class RBLNGlm5StateBackend(_RBLNGlm5CacheBackend):
+    """A KDA head group's recurrent state, one ``MambaSpec`` block a request (the
+    runner shapes it from the spec), and the block-aux caches."""
 
     @staticmethod
     def get_name() -> str:
-        return "RBLN_GLM5_RING"
-
-    @classmethod
-    def get_kv_cache_shape(
-        cls,
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        assert num_kv_heads == 1
-        return (num_blocks, block_size, 2 * head_size)
+        return "RBLN_GLM5_STATE"
 
 
 class RBLNGlm5LatentBackend(_RBLNGlm5CacheBackend):

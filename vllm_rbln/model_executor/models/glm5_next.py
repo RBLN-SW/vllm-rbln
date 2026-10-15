@@ -19,13 +19,16 @@ hybrid mamba state manager. This keeps its module tree and weight names and runs
 
 * mHC (4 residual streams) through ``hc_stream_reduce`` / ``hc_residual_add`` /
   ``sinkhorn_normalize``;
-* KDA layers through ``kda_conv`` and ``kda_prefill`` / ``kda_decode``, the recurrent state
-  and the q / k / v conv rings each one ``RBLNSlidingWindowSpec`` slot per request;
+* KDA layers through ``kda_conv`` and ``kda_prefill`` / ``kda_decode``, the recurrent
+  state split into g head groups, each a ``MambaSpec`` block that shares R1's bytes
+  with a DSA layer's latent block;
 * DSA layers (NoPE MLA) through ``glm5_kpool_compress``, ``sparse_attn_glm5_indexer`` and
   ``sparse_attn_glm5_mla`` over paged latent / indexer key / indexer scale caches.
 
-Every decoder layer owns four caches, named ``{prefix}.attn.{slot}``. Text only: the
-vision tower and the MTP head are not modeled and their weights are skipped. TP 1.
+The cache layout is region by region (SoA, design README 2.7; see
+``v1/attention/backends/glm5_next.py``). A decoder layer's caches are named
+``{prefix}.attn.{slot}``. Text only: the vision tower is not modeled and its weights are
+skipped. TP 1.
 """
 
 from collections.abc import Iterable
@@ -69,7 +72,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 
 from vllm_rbln.config import get_rbln_config
 from vllm_rbln.patches.attention import _resolve_kv_cache
@@ -79,21 +82,23 @@ from vllm_rbln.v1.attention.backends.flash_attention import (
 from vllm_rbln.v1.attention.backends.glm5_next import (
     RBLNGlm5IndexerBackend,
     RBLNGlm5LatentBackend,
-    RBLNGlm5RingBackend,
+    RBLNGlm5StateBackend,
 )
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
-# The four caches of a decoder layer, by the slot in its cache names.
-SLOT_KDA_STATE, SLOT_KDA_CONV_Q, SLOT_KDA_CONV_K, SLOT_KDA_CONV_V = range(4)
-# MTP: the KDA draft buffer (kda_verify), a fifth cache of a KDA layer.
-SLOT_KDA_DRAFT = 4
-# Caches a decoder layer may own, for the layer-index stride (num_attn_module).
-CACHES_PER_LAYER = 5
+# A KDA layer's caches by the slot in their names: the g head groups' states at
+# 0 .. g-1, then the q / k / v conv rings, then (MTP) the g head groups' drafts.
+KDA_CONV_SLOTS = 3
+# The stride of a layer's cache slots (num_attn_module), past the most a layer owns.
+CACHES_PER_LAYER = 16
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
     4
 )
+CACHES_PER_DSA_LAYER = 4
 
 KDA_HEAD_DIM = 128
+# R1 (a KDA state shares an fp8 MLA latent block): rows of the latent's width.
+R1_ROW_BYTES = _rbln_kda_ops.R1_ROW_BYTES
 # The conv ring's width: the 3 taps before the current token (no MTP verify tokens).
 KDA_CONV_RING = 4
 # kda_prefill runs whole 128-token chunks.
@@ -110,19 +115,40 @@ def _set_from_host(dst: torch.Tensor, value: torch.Tensor) -> None:
     dst.data.copy_(value.to(dst.dtype).reshape(dst.shape).contiguous())
 
 
+def kda_head_groups(vllm_config: VllmConfig) -> int:
+    """g: a KDA layer's heads split into g head groups, so that one group's state is
+    exactly an MLA latent block, b * 512 bytes (R1): h = b / 64 heads of a bf16
+    [128, 128] state each."""
+    config = vllm_config.model_config.hf_text_config
+    block_size = vllm_config.cache_config.block_size
+    state_bytes = KDA_HEAD_DIM * KDA_HEAD_DIM * vllm_config.model_config.dtype.itemsize
+    latent_bytes = block_size * config.kv_lora_rank  # fp8
+    num_heads = config.linear_num_heads
+    if latent_bytes % state_bytes or num_heads % (latent_bytes // state_bytes):
+        raise ValueError(
+            f"GLM-5.3: block_size {block_size} does not split the {num_heads} KDA "
+            f"heads into states of a latent block ({latent_bytes} B, {state_bytes} B "
+            "a head)"
+        )
+    return num_heads // (latent_bytes // state_bytes)
+
+
 def _layer_index_of(prefix: str) -> int:
     """The cache's position in the runner's KV cache list, which holds the caches
     of this rank's layers in name order (then the MTP layers'), compacted: a KDA
-    layer owns 4 caches (5 with the MTP draft buffer), a DSA layer 4, so the
-    `layer * CACHES_PER_LAYER + slot` index of `pipeline_adjusted_layer_index`
-    only holds while every layer owns the stride."""
+    layer owns g states + 3 conv rings (+ g draft buffers with MTP), a DSA layer 4."""
     vllm_config = get_current_vllm_config()
     config = vllm_config.model_config.hf_text_config
     spec = vllm_config.speculative_config
-    kda_caches = 5 if spec is not None and spec.num_speculative_tokens else 4
+    groups = kda_head_groups(vllm_config)
+    kda_caches = groups + KDA_CONV_SLOTS
+    if spec is not None and spec.num_speculative_tokens:
+        kda_caches += groups
 
     def caches(layer: int) -> int:
-        return kda_caches if config.layer_types[layer] == "linear_attention" else 4
+        if config.layer_types[layer] == "linear_attention":
+            return kda_caches
+        return CACHES_PER_DSA_LAYER
 
     ints = [int(name) for name in prefix.split(".") if name.isdigit()]
     layer, slot = ints[0], ints[-1]
@@ -135,7 +161,9 @@ def _layer_index_of(prefix: str) -> int:
     )
     if layer >= num_layers:  # MTP layers (DSA), after this rank's layers
         return (
-            sum(caches(i) for i in range(start, end)) + 4 * (layer - num_layers) + slot
+            sum(caches(i) for i in range(start, end))
+            + CACHES_PER_DSA_LAYER * (layer - num_layers)
+            + slot
         )
     assert start <= layer < end, f"{prefix} is not on this PP rank [{start}, {end})"
     return sum(caches(i) for i in range(start, layer)) + slot
@@ -165,67 +193,34 @@ class _RBLNGlm5Cache(nn.Module, AttentionLayerBase):
     def forward(self) -> None: ...
 
 
-class RBLNGlm5RingCache(_RBLNGlm5Cache):
-    """One ``[rows, width]`` slot per request. ``RBLNSlidingWindowSpec`` budgets K + V, so
-    it is declared with half the row width."""
+class RBLNGlm5StateCache(_RBLNGlm5Cache):
+    """A KDA head group's recurrent state, one block a request (``MambaSpec``,
+    block_size = max_model_len): R1's bytes, uint8 ``[rows, 512]``, the size of an MLA
+    latent block, whose extent it shares (the KDA ops' ``_r1`` kernels reinterpret
+    them)."""
 
-    def __init__(
-        self,
-        prefix: str,
-        rows: int,
-        width: int,
-        dtype: torch.dtype,
-        *,
-        page_rows: bool = True,
-        slot_shape: tuple[int, ...] | None = None,
-    ) -> None:
+    def __init__(self, prefix: str, rows: int) -> None:
         super().__init__(prefix)
-        assert width % 2 == 0
         self.rows = rows
-        self.width = width
-        self.dtype = dtype
-        # The op takes the whole page as one block, [pages, k * rows, width], and uses
-        # its first rows; else (the KDA state, which sets the page size) a page is one
-        # slot.
-        self.page_rows = page_rows
-        # A kernel that loads a whole [*slot_shape] block (kda_verify's draft buffer):
-        # the page is seen as k such slots and the request's is slot page * k.
-        self.slot_shape = slot_shape
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return RBLNSlidingWindowSpec(
-            block_size=self.rows,
-            num_kv_heads=1,
-            head_size=self.width // 2,
-            dtype=self.dtype,
-            sliding_window=self.rows,
+        return MambaSpec(
+            block_size=vllm_config.model_config.max_model_len,
+            shapes=((self.rows, R1_ROW_BYTES),),
+            dtypes=(torch.uint8,),
+            mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
         )
 
-    def get_attn_backend(self) -> type[RBLNGlm5RingBackend]:
-        return RBLNGlm5RingBackend
+    def get_attn_backend(self) -> type[RBLNGlm5StateBackend]:
+        return RBLNGlm5StateBackend
 
     def inputs(self) -> tuple[torch.Tensor, torch.Tensor, RBLNFlashAttentionMetadata]:
-        """(ring, slot [B, 1], metadata). Read only the metadata fields an op takes:
-        a graph input nothing uses is pruned from the compiled module, and the runtime
-        then binds the inputs out of step."""
+        """(state [N, rows, 512], block [B, 1], metadata). Read only the metadata fields
+        an op takes: a graph input nothing uses is pruned from the compiled module, and
+        the runtime then binds the inputs out of step."""
         metadata = _metadata(self.prefix)
-        ring = _resolve_kv_cache(metadata, self.layer_index)
-        # The hybrid allocator unifies page sizes by growing a smaller spec's block
-        # size, so a page may hold k slots; the request's is the first. The op addresses
-        # the page itself ([pages, k * rows, width], the ring its first rows): the slot
-        # is the page id, inside the kernels' i16 index however many slots a page holds
-        # (a page id times k overflowed it past 32 pages for the 2 KiB tail ring).
-        per_page = ring.numel() // (ring.shape[0] * self.rows * self.width)
-        slot = metadata.local_block_tables.reshape(-1, 1).to(torch.int32)
-        if self.slot_shape is not None:
-            ring = ring.view(ring.shape[0] * per_page, *self.slot_shape)
-            return ring, slot * per_page, metadata
-        if self.page_rows:
-            ring = ring.view(ring.shape[0], per_page * self.rows, self.width)
-        else:
-            assert per_page == 1, f"{self.prefix}: {per_page} slots a page"
-            ring = ring.view(ring.shape[0], self.rows, self.width)
-        return ring, slot, metadata
+        state = _resolve_kv_cache(metadata, self.layer_index)
+        return state, metadata.block_tables.reshape(-1, 1).to(torch.int32), metadata
 
 
 class RBLNGlm5PagedCache(_RBLNGlm5Cache):
@@ -265,6 +260,36 @@ class RBLNGlm5PagedCache(_RBLNGlm5Cache):
             metadata.block_tables,
             metadata,
         )
+
+
+class RBLNGlm5AuxCache(_RBLNGlm5Cache):
+    """A per-block region of `owner`'s blocks (``RBLNBlockAuxSpec``),
+    ``[N, *block_shape]`` in its own dtype: not a KV cache layer the manager sees (no
+    spec, no group, no block table), addressed by the owner's block ids."""
+
+    def __init__(
+        self,
+        prefix: str,
+        owner: str,
+        block_shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__(prefix)
+        self.owner = owner
+        self.block_shape = block_shape
+        self.dtype = dtype
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> None:
+        return None
+
+    def get_aux_cache_spec(self, vllm_config: VllmConfig) -> RBLNBlockAuxSpec:
+        return RBLNBlockAuxSpec(self.owner, self.block_shape, self.dtype)
+
+    def get_attn_backend(self) -> type[RBLNGlm5StateBackend]:
+        return RBLNGlm5StateBackend
+
+    def inputs(self) -> torch.Tensor:
+        return _resolve_kv_cache(_metadata(self.owner), self.layer_index)
 
 
 class _ConvWeight(nn.Module):
@@ -447,38 +472,49 @@ class RBLNGlm5KDA(nn.Module):
             proj, hidden_size, bias=False, prefix=f"{prefix}.o_proj"
         )
 
-        dtype = get_current_vllm_config().model_config.dtype
-        self.state = RBLNGlm5RingCache(
-            f"{prefix}.attn.{SLOT_KDA_STATE}",
-            proj,
-            self.head_dim,
-            dtype,
-            page_rows=False,
+        vllm_config = get_current_vllm_config()
+        dtype = vllm_config.model_config.dtype
+        # The heads split into g head groups (their recurrences are independent), each
+        # a state the size of an MLA latent block (R1); the ops run once a group.
+        self.num_groups = kda_head_groups(vllm_config)
+        self.group_heads = self.num_heads // self.num_groups
+        rows = vllm_config.cache_config.block_size
+        self.states = nn.ModuleList(
+            RBLNGlm5StateCache(f"{prefix}.attn.{j}", rows)
+            for j in range(self.num_groups)
         )
+        # The q / k / v conv rings, whole layer's channels, on head group 0's block.
         conv_rows = proj * KDA_CONV_RING // 64
         self.conv_q, self.conv_k, self.conv_v = (
-            RBLNGlm5RingCache(f"{prefix}.attn.{slot}", conv_rows, 64, dtype)
-            for slot in (SLOT_KDA_CONV_Q, SLOT_KDA_CONV_K, SLOT_KDA_CONV_V)
+            RBLNGlm5AuxCache(
+                f"{prefix}.attn.{self.num_groups + i}",
+                self.states[0].prefix,
+                (conv_rows, 64),
+                dtype,
+            )
+            for i in range(KDA_CONV_SLOTS)
         )
         # MTP: a verify step (1 + K tokens) keeps the state after token 0 and the K
         # drafts' (k, v, exp(g), beta) in this buffer; the next step replays the
-        # accepted ones (kda_verify, design README 2.5 method 2).
-        spec = get_current_vllm_config().speculative_config
+        # accepted ones (kda_verify, design README 2.5 method 2). One a head group, on
+        # that group's block.
+        spec = vllm_config.speculative_config
         self.num_drafts = spec.num_speculative_tokens if spec is not None else 0
-        self.draft = None
+        self.drafts = None
         if self.num_drafts:
             # The conv ring indexes by position: it must hold the 3 taps before a
             # verify step's tokens.
             assert self.num_drafts <= KDA_CONV_RING - 3, (
                 f"KDA conv ring {KDA_CONV_RING} holds {KDA_CONV_RING - 3} draft(s)"
             )
-            slot_shape = (self.num_heads, self.num_drafts, 4, self.head_dim)
-            self.draft = RBLNGlm5RingCache(
-                f"{prefix}.attn.{SLOT_KDA_DRAFT}",
-                self.num_heads * self.num_drafts * 4,
-                self.head_dim,
-                dtype,
-                slot_shape=slot_shape,
+            self.drafts = nn.ModuleList(
+                RBLNGlm5AuxCache(
+                    f"{prefix}.attn.{self.num_groups + KDA_CONV_SLOTS + j}",
+                    state.prefix,
+                    (self.group_heads, self.num_drafts, 4, self.head_dim),
+                    dtype,
+                )
+                for j, state in enumerate(self.states)
             )
 
     @torch.no_grad()
@@ -499,19 +535,19 @@ class RBLNGlm5KDA(nn.Module):
         batch, tokens, _ = hidden_states.shape
         shape = (batch, tokens, self.num_heads, self.head_dim)
 
-        state, slot, metadata = self.state.inputs()
+        group_states = [state.inputs() for state in self.states]
+        metadata = group_states[0][2]
         seq_idx = metadata.seq_lens.to(torch.int32)
         query_len = (metadata.cache_offsets - metadata.cache_seq_lens).to(torch.int32)
         has_initial_state = (seq_idx > 0).to(torch.int32).view(-1)
-        slot = slot.view(-1)
+        conv_slot = group_states[0][1].view(-1)
 
-        def conv(x: torch.Tensor, cache: RBLNGlm5RingCache, weight: torch.Tensor):
-            ring, conv_slot, _ = cache.inputs()
+        def conv(x: torch.Tensor, cache: RBLNGlm5AuxCache, weight: torch.Tensor):
             return torch.ops.rbln_custom_ops.kda_conv(
                 x,
                 weight,
-                ring,
-                conv_slot.view(-1),
+                cache.inputs(),
+                conv_slot,
                 seq_idx.view(-1),
                 query_len.view(-1),
                 has_initial_state,
@@ -532,7 +568,6 @@ class RBLNGlm5KDA(nn.Module):
         g = self.lower_bound * torch.sigmoid(decay)  # [B, T, H, D] f32
         beta = torch.sigmoid(self.b_proj(hidden_states)[0].float())  # [B, T, H]
 
-        state = state.view(-1, self.num_heads, self.head_dim, self.head_dim)
         q, k, v, g = (x.transpose(1, 2) for x in (q, k, v, g))
         beta = beta.transpose(1, 2).to(hidden_states.dtype)
         if metadata.is_prefill:
@@ -546,27 +581,37 @@ class RBLNGlm5KDA(nn.Module):
             if pad:
                 q, k, v, g = (F.pad(x, (0, 0, 0, pad)) for x in (q, k, v, g))
                 beta = F.pad(beta, (0, pad))
-            o = torch.ops.rbln_custom_ops.kda_prefill(
-                q, k, v, g, beta, state, slot, has_initial_state
-            )[:, :, :tokens]
-        elif tokens > 1 and self.draft is not None:
-            # An MTP verify step: token 0 always accepted, tokens 1 .. K the drafts.
-            draft, draft_slot, _ = self.draft.inputs()
-            o = torch.ops.rbln_custom_ops.kda_verify(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                state,
-                draft,
-                slot,
-                metadata.num_accepted.view(-1),
-                None,
-                draft_slot.view(-1),
-            )
-        else:
-            o = torch.ops.rbln_custom_ops.kda_decode(q, k, v, g, beta, state, slot)
+
+        outs = []
+        for j, (state, slot, _) in enumerate(group_states):
+            heads = slice(j * self.group_heads, (j + 1) * self.group_heads)
+            qj, kj, vj, gj, bj = (x[:, heads] for x in (q, k, v, g, beta))
+            slot = slot.view(-1)
+            if metadata.is_prefill:
+                o = torch.ops.rbln_custom_ops.kda_prefill(
+                    qj, kj, vj, gj, bj, state, slot, has_initial_state
+                )[:, :, :tokens]
+            elif tokens > 1 and self.drafts is not None:
+                # An MTP verify step: token 0 always accepted, tokens 1 .. K the drafts.
+                o = torch.ops.rbln_custom_ops.kda_verify(
+                    qj,
+                    kj,
+                    vj,
+                    gj,
+                    bj,
+                    state,
+                    self.drafts[j].inputs(),
+                    slot,
+                    metadata.num_accepted.view(-1),
+                    None,
+                    slot,
+                )
+            else:
+                o = torch.ops.rbln_custom_ops.kda_decode(
+                    qj, kj, vj, gj, bj, state, slot
+                )
+            outs.append(o)
+        o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
 
         o = o.transpose(1, 2)  # [B, T, H, D]
         gate = F.linear(hidden_states, self.g_weight).view(shape)
@@ -617,9 +662,9 @@ class RBLNGlm5Indexer(nn.Module):
             INDEX_KPOOL,
             RBLNGlm5IndexerBackend,
         )
-        # f16 rows of the key row's bytes, so both get one page size (a block's E scales
-        # use its first E * 2 bytes) without a dtype view in the graph. It is another
-        # KV cache group, so it takes its own block table.
+        # f16 rows of the key row's bytes (a block's E scales use its first E * 2
+        # bytes), so the indexer caches have one page size, as vLLM's GLM-5.3 grouping
+        # takes, without a dtype view in the graph. The latent's group, its block table.
         self.scale_cache = RBLNGlm5PagedCache(
             f"{attn_prefix}.attn.{SLOT_DSA_INDEX_SCALE}",
             self.head_dim // 2,
@@ -627,15 +672,17 @@ class RBLNGlm5Indexer(nn.Module):
             INDEX_KPOOL,
             RBLNGlm5IndexerBackend,
         )
-        self.tail_cache = RBLNGlm5RingCache(
+        # The raw (key | gate) rows of the pool a step ended inside, in the block that
+        # holds it (design README 2.6): a block's region beside its latent rows. A
+        # block size is a multiple of 4, so a pool never straddles two blocks.
+        self.tail_cache = RBLNGlm5AuxCache(
             f"{attn_prefix}.attn.{SLOT_DSA_INDEX_TAIL}",
-            INDEX_KPOOL,
-            2 * self.head_dim,
+            f"{attn_prefix}.attn.{SLOT_DSA_LATENT}",
+            (INDEX_KPOOL, 2 * self.head_dim),
             torch.bfloat16,
         )
-        # The tail ring is one slot per request: a block holding every position.
-        max_model_len = get_current_vllm_config().model_config.max_model_len
-        self.tail_block_size = -(-max_model_len // INDEX_KPOOL) * INDEX_KPOOL
+        self.block_size = get_current_vllm_config().cache_config.block_size
+        assert self.block_size % INDEX_KPOOL == 0
 
     @torch.no_grad()
     def fold_hadamard(self) -> None:
@@ -661,21 +708,20 @@ class RBLNGlm5Indexer(nn.Module):
             * self.weights_scale
         )
 
-        tail, tail_slot, metadata = self.tail_cache.inputs()
+        key_cache, key_table, metadata = self.key_cache.inputs()
+        scale_cache, scale_table, _ = self.scale_cache.inputs()
         seq_idx = metadata.seq_lens.to(torch.int32)
         query_len = (metadata.cache_offsets - metadata.cache_seq_lens).to(torch.int32)
         k_cur = torch.ops.rbln_custom_ops.glm5_kpool_compress(
             key,
             gate,
             self.index_kpool_compress_ape,
-            tail,
+            self.tail_cache.inputs(),
             seq_idx,
             query_len,
-            tail_slot,
-            self.tail_block_size,
+            key_table.view(batch, -1),
+            self.block_size,
         )
-        key_cache, key_table, _ = self.key_cache.inputs()
-        scale_cache, scale_table, _ = self.scale_cache.inputs()
         scale_cache = scale_cache.reshape(scale_cache.shape[0], -1, 1)
         return torch.ops.rbln_custom_ops.sparse_attn_glm5_indexer(
             q.transpose(1, 2),
