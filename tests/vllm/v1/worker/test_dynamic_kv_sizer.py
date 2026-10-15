@@ -244,6 +244,7 @@ class TestComputeDynamicKvNumBlocks:
                     kv_cache_groups=list(kv_cache_groups),
                 ),
                 _kernel_block_sizes=list(kernel_block_sizes),
+                num_aux_kv_tensors=0,
             ),
             programs=list(programs),
             memory_snapshot=lambda device: (snapshot, "stub"),
@@ -1095,6 +1096,7 @@ class TestReleaseKvCacheTensors:
             kv_cache_names=["l0"],
             kv_cache_block_axes={"l0": 1},
             compilation_config=SimpleNamespace(static_forward_context={"l0": layer}),
+            aux_kv_cache_layers=[],
         )
         sizer = SimpleNamespace(
             model_runner=model_runner,

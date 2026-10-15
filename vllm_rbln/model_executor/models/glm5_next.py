@@ -662,15 +662,14 @@ class RBLNGlm5Indexer(nn.Module):
             INDEX_KPOOL,
             RBLNGlm5IndexerBackend,
         )
-        # f16 rows of the key row's bytes (a block's E scales use its first E * 2
-        # bytes), so the indexer caches have one page size, as vLLM's GLM-5.3 grouping
-        # takes, without a dtype view in the graph. The latent's group, its block table.
-        self.scale_cache = RBLNGlm5PagedCache(
+        # One f16 scale a pool, a region of the key's blocks addressed by the key's
+        # (the latent's) block table: [N, b / 4], the [blocks, pools] the op reads, so the
+        # graph input needs no reshape (one is a host op, refused for a dynamic KV input).
+        self.scale_cache = RBLNGlm5AuxCache(
             f"{attn_prefix}.attn.{SLOT_DSA_INDEX_SCALE}",
-            self.head_dim // 2,
+            f"{attn_prefix}.attn.{SLOT_DSA_INDEX_KEY}",
+            (get_current_vllm_config().cache_config.block_size // INDEX_KPOOL,),
             torch.float16,
-            INDEX_KPOOL,
-            RBLNGlm5IndexerBackend,
         )
         # The raw (key | gate) rows of the pool a step ended inside, in the block that
         # holds it (design README 2.6): a block's region beside its latent rows. A
@@ -709,7 +708,6 @@ class RBLNGlm5Indexer(nn.Module):
         )
 
         key_cache, key_table, metadata = self.key_cache.inputs()
-        scale_cache, scale_table, _ = self.scale_cache.inputs()
         seq_idx = metadata.seq_lens.to(torch.int32)
         query_len = (metadata.cache_offsets - metadata.cache_seq_lens).to(torch.int32)
         k_cur = torch.ops.rbln_custom_ops.glm5_kpool_compress(
@@ -722,18 +720,16 @@ class RBLNGlm5Indexer(nn.Module):
             key_table.view(batch, -1),
             self.block_size,
         )
-        scale_cache = scale_cache.reshape(scale_cache.shape[0], -1, 1)
         return torch.ops.rbln_custom_ops.sparse_attn_glm5_indexer(
             q.transpose(1, 2),
             k_cur,
             key_cache,
-            scale_cache,
+            self.scale_cache.inputs(),
             weights,
             seq_idx,
             query_len,
             key_table,
             self.topk,
-            scale_table,
         )
 
 
