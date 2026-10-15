@@ -34,7 +34,6 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     BatchedTensorInputs,
     MultiModalFeatureSpec,
@@ -174,14 +173,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
 
-        # # Multi-modal data support
-        # # NOTE There is a bug in vLLM MM registry internally in v0.10.X.
-        # # As a workaround, VLLM_WORKER_MULTIPROC_METHOD should be set "spawn"
-        # # in case of multi-modal encoder-decoder models.
-        self.mm_registry = MULTIMODAL_REGISTRY
-        self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
-            model_config
-        )
+        self.supports_mm_inputs = model_config.supports_multimodal_inputs
 
         # Sampler
         rbln_config: OptimumRBLNConfig = vllm_config.additional_config
