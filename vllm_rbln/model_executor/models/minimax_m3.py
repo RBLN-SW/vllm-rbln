@@ -1128,7 +1128,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
 
         The compiled encoder is kept outside the module tree: its weights are
         the registered ``vision_tower``'s, and registering the wrapper too would
-        list them twice in ``named_parameters()`` / ``state_dict()``."""
+        add duplicate paths to ``state_dict()``."""
         # Non-first PP ranks and configurations with both image/video limits
         # set to zero own no vision tower, but still receive encoder setup calls.
         if self.vision_tower is None:

@@ -119,3 +119,37 @@ def test_upstream_common_import_failure_can_be_retried(monkeypatch, tmp_path):
         with pytest.raises(RuntimeError, match="import failed"):
             m3._load_upstream_common("test_broken")
         assert full_name not in sys.modules
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+
+    model = m3.RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
+        m3.RBLNMiniMaxM3SparseForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.vision_tower = torch.nn.Linear(2, 2, bias=False)
+    model.vision_tower.spatial_merge_size = 1
+    encoder = torch.nn.Sequential(model.vision_tower)
+    build_encoder = Mock(return_value=encoder)
+    monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
+    object.__setattr__(model, "_mm_encoder", encoder if compiled else None)
+    model._encoder_inputs = Mock(side_effect=lambda pixels, grid: [pixels])
+    pixels = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    grids = torch.tensor([[1, 1, 1], [1, 1, 2]])
+
+    for _ in range(2):
+        outputs = model.embed_multimodal(pixel_values=pixels, image_grid_thw=grids)
+        assert len(outputs) == 2
+        torch.testing.assert_close(outputs[0], model.vision_tower(pixels[:1]))
+        torch.testing.assert_close(outputs[1], model.vision_tower(pixels[1:]))
+
+    if compiled:
+        build_encoder.assert_not_called()
+    else:
+        build_encoder.assert_called_once_with(model.vision_tower)
+        assert not encoder.training
+    assert model._mm_encoder is encoder
+    assert "_mm_encoder" not in model._modules
+    assert list(model.state_dict()) == ["vision_tower.weight"]

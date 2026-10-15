@@ -215,6 +215,46 @@ class TestModelOptMxFp8:
             output, torch.tensor([[145.0, 190.0], [-143.0, -194.0]], dtype=dtype)
         )
 
+    @pytest.mark.parametrize("scale_byte", [0, 255])
+    def test_e8m0_boundary_scales(self, scale_byte):
+        method = RBLNModelOptMxFp8LinearMethod()
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.ones(1, 32).to(torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.tensor([[scale_byte]], dtype=torch.uint8), requires_grad=False
+        )
+
+        method.process_weights_after_loading(layer)
+
+        expected = 2.0**-127 if scale_byte == 0 else float("nan")
+        torch.testing.assert_close(
+            layer.weight_scale,
+            torch.tensor([[expected]], dtype=torch.bfloat16),
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+
+    def test_fp16_dequantizes_before_casting_large_scale(self):
+        method = RBLNModelOptMxFp8LinearMethod()
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.full((1, 32), 2.0**-9).to(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.tensor([[143]], dtype=torch.uint8), requires_grad=False
+        )
+        method.process_weights_after_loading(layer)
+
+        output = method.apply(layer, torch.ones(1, 32, dtype=torch.float16))
+
+        torch.testing.assert_close(
+            output, torch.tensor([[4096.0]], dtype=torch.float16), rtol=0, atol=0
+        )
+
     def test_rejects_partial_scale_groups(self):
         with pytest.raises(ValueError, match="multiple of the group size"):
             RBLNModelOptMxFp8LinearMethod().create_weights(
