@@ -15,11 +15,31 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import torch
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import Request
+
+
+@dataclass(frozen=True)
+class RBLNBlockAuxSpec:
+    """A per-block cache region beside a scheduled KV layer's cache.
+
+    The KV cache manager never sees it: the runner allocates
+    ``[num_blocks, *block_shape]`` of ``dtype`` for it and the model addresses it with
+    the block ids of ``owner`` (a layer that has a ``KVCacheSpec``), so it holds the
+    owner's blocks' worth of extra state without a group or a block table of its own.
+    """
+
+    owner: str
+    block_shape: tuple[int, ...]
+    dtype: torch.dtype
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self.dtype.itemsize * int(torch.Size(self.block_shape).numel())
 
 
 @dataclass(frozen=True)

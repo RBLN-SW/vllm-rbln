@@ -256,11 +256,12 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if getattr(hf_config, "model_type", None) == "longcat_flash":
         return 2
     text_config = getattr(model_config, "hf_text_config", hf_config)
-    # GLM-5.3: up to five caches a layer (KDA state, q/k/v conv rings and, with MTP,
-    # the draft buffer; or the DSA latent, indexer key, scale and tail ring); see
-    # model_executor/models/glm5_next.py (CACHES_PER_LAYER).
+    # GLM-5.3: a KDA layer's g head-group states, q/k/v conv rings and, with MTP, g
+    # draft buffers; a DSA layer's latent, indexer key, scale and tail ring. The
+    # stride only orders the caches; see model_executor/models/glm5_next.py
+    # (CACHES_PER_LAYER).
     if getattr(text_config, "model_type", None) in ("glm5_next_text", "glm5_next_mtp"):
-        return 5
+        return 16
     # A DSA model puts the lightning-indexer key cache next to MLA: 2 modules,
     # or 3 when the indexer cache is fp8 (a companion fp16 scale cache).
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
@@ -1130,15 +1131,7 @@ def prepare_kernel_block_sizes(
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
         if isinstance(kv_cache_spec, SlidingWindowSpec):
-            if any(
-                getattr(g.backend, "kernel_block_is_manager_block", False)
-                for g in attn_groups[kv_cache_gid]
-            ):
-                # The op addresses the whole manager block (GLM-5.3's ring caches take
-                # [blocks, k * rows, width] and use the first rows): the block id stays
-                # the page id, not page * k, inside the kernels' int16 block index.
-                kernel_block_sizes.append(kv_cache_group.kv_cache_spec.block_size)
-            elif sub_block_size is None or isinstance(
+            if sub_block_size is None or isinstance(
                 kv_cache_spec, RBLNSlidingWindowSpec
             ):
                 # The shift kernel holds one window per block; the append kernel

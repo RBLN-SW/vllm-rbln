@@ -138,6 +138,7 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
@@ -2864,7 +2865,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert not isinstance(
                 kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
             )
-            assert not isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+            # A MambaSpec group (one state block a request) has block_size =
+            # max_model_len, so its table is one block wide.
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
             max_num_blocks_per_req = cdiv(max_model_len, block_size)
@@ -2918,19 +2920,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
         device = self.device if USE_DEVICE_TENSOR else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
-        if self._kv_layers_own_storage():
-            kv_cache_raw_tensors = {
-                layer_name: torch.empty(extent[1], dtype=torch.int8, device=device)
-                for layer_name, extent in extent_of.items()
-            }
-        else:
-            buffers = {
-                extent: torch.empty(extent[1], dtype=torch.int8, device=device)
-                for extent in set(extent_of.values())
-            }
-            kv_cache_raw_tensors = {
-                layer_name: buffers[extent] for layer_name, extent in extent_of.items()
-            }
+        buffers = {
+            extent: torch.empty(extent[1], dtype=torch.int8, device=device)
+            for extent in set(extent_of.values())
+        }
+        kv_cache_raw_tensors = {
+            layer_name: buffers[extent] for layer_name, extent in extent_of.items()
+        }
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -2949,17 +2945,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for attn_groups in self.attn_groups:
             yield from attn_groups
 
-    def _kv_layers_own_storage(self) -> bool:
-        """Whether every KV layer gets a buffer of its own instead of its extent's.
-
-        GLM-5.3's caches on one extent differ in dtype (bf16 states, fp8 index keys, f16
-        scales), and a view to another dtype does not survive compilation, so each takes
-        its own buffer: one extent's size a layer. A workaround until the KV tensor
-        refactor; the block count has to be sized for it (num_gpu_blocks_override).
-        """
-        text_config = self.model_config.hf_text_config
-        return getattr(text_config, "model_type", None) == "glm5_next_text"
-
     def _select_canonical_kv_layers_per_pool(
         self, kv_cache_config: KVCacheConfig
     ) -> set[str]:
@@ -2974,8 +2959,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for attn_group in self._kv_cache_spec_attn_group_iterator()
             for layer_name in attn_group.layer_names
         }
-        if self._kv_layers_own_storage():
-            return set(layer_to_spec)
         return canonical_kv_layers(kv_cache_config, layer_to_spec)
 
     def _reshape_kv_cache_tensors(
@@ -3095,6 +3078,27 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         permute_order=tuple(inv_order),
                         dynamic_axis=base_dynamic_axis,
                     )
+                elif isinstance(kv_cache_spec, MambaSpec):
+                    # One state of one dtype a block (GLM-5.3's KDA state as R1's
+                    # uint8 bytes); its page is the MLA latent's, the extent it
+                    # shares (vllm's _get_kv_cache_groups_glm5_next).
+                    assert len(kv_cache_spec.shapes) == 1, kv_cache_spec
+                    assert (
+                        kv_cache_spec.real_page_size_bytes
+                        == kv_cache_spec.page_size_bytes
+                    ), kv_cache_spec
+                    assert not dynamic_kv_enabled(self.vllm_config)
+                    dtype = kv_cache_spec.dtypes[0]
+                    kv_cache_shape = (num_blocks, *kv_cache_spec.shapes[0])
+                    typed_base = raw_tensor.view(dtype).view(kv_cache_shape)
+                    kv_caches[layer_name] = typed_base
+                    kv_cache_block_axes[layer_name] = 0
+                    kv_cache_base_tensors[layer_name] = typed_base
+                    kv_cache_view_infos[layer_name] = KVCacheViewInfo(
+                        view_dtype=dtype,
+                        view_shape=kv_cache_shape,
+                        permute_order=tuple(range(len(kv_cache_shape))),
+                    )
                 else:
                     raise NotImplementedError
 
@@ -3142,6 +3146,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 kv_cache_raw_tensors,
                 kernel_block_sizes,
             )
+        )
+
+        self._allocate_aux_kv_caches(
+            kv_cache_config,
+            kv_caches,
+            kv_cache_bases_by_layer,
+            kv_cache_view_infos,
+            block_axes,
         )
 
         # Set up cross-layer KV cache sharing
@@ -3207,6 +3219,63 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 self.compile_context.mark_static_address(kv_cache, name)
 
         return kv_caches
+
+    def _allocate_aux_kv_caches(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_bases_by_layer: dict[str, torch.Tensor],
+        kv_cache_view_infos: dict[str, KVCacheViewInfo],
+        block_axes: dict[str, int],
+    ) -> None:
+        """Allocate the block-aux caches (`RBLNBlockAuxSpec`), `[num_blocks,
+        *block_shape]` each in its own dtype, addressed by its owner's block ids.
+
+        Owners on one extent share its pages but never hold the same block at once
+        (one block pool), so their aux caches share tensors as well: an owner's k-th
+        aux cache of a (shape, dtype) takes the extent's k-th tensor of it.
+        """
+        device = self.device if USE_DEVICE_TENSOR else "meta"
+        num_blocks = kv_cache_config.num_blocks
+        extent_of = kv_cache_extents(kv_cache_config)
+        tensors: dict[tuple, torch.Tensor] = {}
+        ordinals: defaultdict[tuple, int] = defaultdict(int)
+        forward_context = self.compilation_config.static_forward_context
+        for layer_name, module in forward_context.items():
+            get_aux_spec = getattr(module, "get_aux_cache_spec", None)
+            if get_aux_spec is None or (spec := get_aux_spec(self.vllm_config)) is None:
+                continue
+            assert isinstance(spec, RBLNBlockAuxSpec), spec
+            assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
+            assert not dynamic_kv_enabled(self.vllm_config)
+            shape = (num_blocks, *spec.block_shape)
+            kind = (spec.owner, shape, spec.dtype)
+            key = (extent_of[spec.owner], shape, spec.dtype, ordinals[kind])
+            ordinals[kind] += 1
+            if (cache := tensors.get(key)) is None:
+                cache = torch.empty(shape, dtype=spec.dtype, device=device)
+                tensors[key] = cache
+            kv_caches[layer_name] = cache
+            kv_cache_bases_by_layer[layer_name] = cache
+            kv_cache_view_infos[layer_name] = KVCacheViewInfo(
+                view_dtype=spec.dtype,
+                view_shape=shape,
+                permute_order=tuple(range(len(shape))),
+            )
+            block_axes[layer_name] = 0
+        if tensors:
+            logger.info(
+                "Block-aux KV caches: %d layers on %d tensors, %.3f GiB",
+                sum(ordinals.values()),
+                len(tensors),
+                sum(t.numel() * t.element_size() for t in tensors.values()) / 2**30,
+            )
+            if self.cache_config.num_gpu_blocks_override is None:
+                # vllm sized num_blocks by the KV cache groups' pages alone.
+                logger.warning(
+                    "Block-aux KV caches are outside the KV cache memory budget; "
+                    "size the block count for them (num_gpu_blocks_override)."
+                )
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
