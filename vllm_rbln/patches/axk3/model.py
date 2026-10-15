@@ -1,0 +1,380 @@
+# Copyright 2026 Rebellions Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+
+"""A.X K3 on top of the vendored A.X K2 model.
+
+K3 keeps K2's gated MLA (fused output gate in q_b_proj), DSA indexer and MoE,
+and changes three things, all following the checkpoint's ``modeling_axk3.py``:
+
+- Gated Residual replaces both pre-norms and ``model.norm``: the residual is
+  ``num_streams`` copies of the hidden state, each block reads a gated mean of
+  them and writes its output back with a per-stream gate.
+- Index-share: only every ``index_topk_freq``-th layer owns an indexer; the
+  others reuse the top-k of their source layer from the same forward.
+- The indexer reads the pre-``q_a_layernorm`` q latent (K2 feeds the normed one).
+"""
+
+import contextlib
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.model_executor.models.utils import (
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+)
+from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
+
+from vllm_rbln.patches.axk2 import model as _axk2_model
+
+_k2 = _axk2_model._module
+
+
+class AXK3GatedResidual(nn.Module):
+    """Gated Residual read/write over ``num_streams`` residual branches.
+
+    Same numerics as ``AXK3GatedResidual`` in ``modeling_axk3.py``: fp32 RMSNorm
+    statistics, the read gate applied in fp32, the write gate kept in fp32.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_streams: int,
+        rank: int,
+        eps: float,
+        has_write: bool = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_streams = num_streams
+        self.eps = eps
+        wide = num_streams * hidden_size
+        # Stored as the fp32 [n, h] the norm multiplies by, so the graph reads
+        # the weight as is: a cast or reshape of it in the graph is folded
+        # differently by prefill and decode, and decode then cannot reuse
+        # prefill's copy ("no key found on reuse mode").
+        self.gamma = nn.Parameter(
+            torch.ones(num_streams, hidden_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.gamma.weight_loader = self._load_gamma
+        self.read_down = ReplicatedLinear(
+            wide, rank, bias=False, quant_config=None, prefix=f"{prefix}.read_down"
+        )
+        self.read_up = ReplicatedLinear(
+            rank, wide, bias=False, quant_config=None, prefix=f"{prefix}.read_up"
+        )
+        if has_write:
+            self.write_proj = ReplicatedLinear(
+                wide,
+                num_streams,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.write_proj",
+            )
+            self.write_bias = nn.Parameter(
+                torch.zeros(num_streams, dtype=torch.float32)
+            )
+        else:
+            self.write_proj = None
+            self.write_bias = None
+
+    @staticmethod
+    def _load_gamma(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        param.data.copy_(loaded_weight.view_as(param).float())
+
+    def _streams(self, x: torch.Tensor) -> torch.Tensor:
+        return x.view(*x.shape[:-1], self.num_streams, self.hidden_size)
+
+    def read(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """[..., n*h] -> (block input [..., h], write gate [..., n] fp32 or None)."""
+        n = self.num_streams
+        x = self._streams(residual).float()
+        rstd = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        u = (x * rstd * self.gamma).to(residual.dtype).view_as(residual)
+
+        z = F.silu(self.read_down(u)[0] / n)
+        gate = torch.sigmoid(self.read_up(z)[0].float())
+        block_input = self._streams(gate * u.float()).mean(dim=-2).to(residual.dtype)
+
+        write_gate = None
+        if self.write_proj is not None:
+            write_gate = 2.0 * torch.sigmoid(
+                (self.write_proj(u)[0] / n).float() + self.write_bias
+            )
+        return block_input, write_gate
+
+    def write(
+        self, residual: torch.Tensor, y: torch.Tensor, write_gate: torch.Tensor
+    ) -> torch.Tensor:
+        """R'_i = R_i + s_i * y."""
+        scaled = (write_gate.unsqueeze(-1) * y.float().unsqueeze(-2)).to(residual.dtype)
+        return (self._streams(residual) + scaled).view_as(residual)
+
+
+@contextlib.contextmanager
+def _without_indexer():
+    """Build a K2 attention layer with no indexer of its own.
+
+    AXK2MLAAttention gives every DSA layer an indexer; an index-share skip layer
+    must not own one (the checkpoint has no weights for it, and its cache would
+    be allocated for nothing). The layer stays sparse and reads the source
+    layer's top-k instead.
+    """
+    original = _k2.Indexer
+    _k2.Indexer = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        _k2.Indexer = original
+
+
+def _alias_index_cache(
+    vllm_config: VllmConfig, prefix: str, source_layer: int
+) -> DeepseekV32IndexerCache:
+    """An index-key cache for a skip layer that aliases its source layer's.
+
+    The runner binds `num_attn_module` caches per decoder layer (MLA, index key
+    and, for fp8, its scale), so a skip layer still needs them to keep the
+    compacted cache list aligned. Nothing reads them, so they share the source
+    layer's caches through vLLM KV sharing instead of allocating their own.
+    """
+    layers_prefix = prefix.rsplit(".", 1)[0]
+    name = f"{prefix}.self_attn.indexer.k_cache"
+    target = f"{layers_prefix}.{source_layer}.self_attn.indexer.k_cache"
+    cache = DeepseekV32IndexerCache(
+        head_dim=vllm_config.model_config.hf_config.index_head_dim,
+        dtype=torch.bfloat16,
+        prefix=name,
+        cache_config=vllm_config.cache_config,
+    )
+    # Read by the runner's `get_kv_cache_spec`, as on vLLM's `Attention`.
+    cache.kv_sharing_target_layer_name = target
+    if cache.scale_cache is not None:
+        cache.scale_cache.kv_sharing_target_layer_name = f"{target}.scale_cache"
+    return cache
+
+
+def _gated_mla_forward(
+    mla: nn.Module,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """K2's gated MLA forward, returning the top-k it attended with.
+
+    ``mla`` is the AXK2GatedMultiHeadLatentAttentionWrapper. A layer that owns
+    an indexer computes the top-k from the pre-norm q latent; a skip layer is
+    handed its source layer's top-k.
+    """
+    batch_size, seq_len, _ = hidden_states.shape
+
+    qkv_lora = mla.fused_qkv_a_proj(hidden_states)[0]
+    q_c_prenorm, kv_lora = qkv_lora.split(
+        [mla.q_lora_rank, mla.kv_lora_rank + mla.qk_rope_head_dim], dim=-1
+    )
+    q_c = mla.q_a_layernorm(q_c_prenorm)
+
+    # q_b_proj takes [post-norm | pre-norm] and emits per head [q | gate].
+    q_b_out = mla.q_b_proj(torch.cat([q_c, q_c_prenorm], dim=-1))[0]
+    q_gate = q_b_out.view(
+        batch_size, seq_len, mla.num_heads, mla.qk_head_dim + mla.v_head_dim
+    )
+    q, gate = q_gate.split([mla.qk_head_dim, mla.v_head_dim], dim=-1)
+    attn_gate = gate.reshape(batch_size, seq_len, mla.num_heads * mla.v_head_dim)
+
+    kv_c, k_pe = kv_lora.split([mla.kv_lora_rank, mla.qk_rope_head_dim], dim=-1)
+    kv_c_normed = mla.kv_a_layernorm(kv_c)
+
+    q_nope, q_pe = q.split([mla.qk_nope_head_dim, mla.qk_rope_head_dim], dim=-1)
+    q_pe, k_pe = mla.rotary_emb(positions, q_pe, k_pe.unsqueeze(2))
+    q = torch.cat([q_nope, q_pe], dim=-1)
+    k_pe = k_pe.squeeze(2)
+
+    if mla.indexer is not None:
+        topk_indices = mla.indexer(
+            hidden_states, q_c_prenorm, positions, mla.indexer_rope_emb
+        )
+
+    attn_out = mla.mla_attn(
+        q,
+        kv_c_normed,
+        k_pe,
+        output_shape=(batch_size, seq_len, mla.num_heads * mla.v_head_dim),
+        topk_indices=topk_indices,
+    )
+    attn_out = attn_out * torch.sigmoid(attn_gate)
+    return mla.o_proj(attn_out)[0], topk_indices
+
+
+class AXK3DecoderLayer(_k2.AXK2DecoderLayer):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        config=None,
+        topk_indices_buffer: torch.Tensor | None = None,
+    ) -> None:
+        if config is None:
+            config = vllm_config.model_config.hf_config
+        layer_idx = int(prefix.split(sep=".")[-1])
+        index_skip = config.is_index_skip_layer(layer_idx)
+        with _without_indexer() if index_skip else contextlib.nullcontext():
+            super().__init__(
+                vllm_config,
+                prefix,
+                config=config,
+                topk_indices_buffer=topk_indices_buffer,
+            )
+        assert not self.self_attn.dsv3_pad, "axk3 has the DSv3 MLA layout"
+        self.index_skip = index_skip
+        self.index_source_layer = config.index_source_layer(layer_idx)
+        if index_skip:
+            self.index_cache_alias = _alias_index_cache(
+                vllm_config, prefix, self.index_source_layer
+            )
+
+        # Gated Residual replaces both pre-norms.
+        del self.input_layernorm
+        del self.post_attention_layernorm
+        gr_kwargs = dict(
+            hidden_size=config.hidden_size,
+            num_streams=config.gated_residual_num_streams,
+            rank=config.gated_residual_rank,
+            eps=config.rms_norm_eps,
+        )
+        self.attn_gated_residual = AXK3GatedResidual(
+            **gr_kwargs, prefix=f"{prefix}.attn_gated_residual"
+        )
+        self.mlp_gated_residual = AXK3GatedResidual(
+            **gr_kwargs, prefix=f"{prefix}.mlp_gated_residual"
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        topk_by_layer: dict[int, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        x, write_gate = self.attn_gated_residual.read(hidden_states)
+        x, topk_indices = _gated_mla_forward(
+            self.self_attn.mla_attn,
+            positions,
+            x,
+            topk_by_layer[self.index_source_layer] if self.index_skip else None,
+        )
+        topk_by_layer[self.layer_idx] = topk_indices
+        hidden_states = self.attn_gated_residual.write(residual, x, write_gate)
+
+        residual = hidden_states
+        x, write_gate = self.mlp_gated_residual.read(hidden_states)
+        x = self.mlp(x)
+        return self.mlp_gated_residual.write(residual, x, write_gate)
+
+
+@support_torch_compile
+class AXK3Model(nn.Module):
+    fall_back_to_pt_during_load = False
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        if get_pp_group().world_size > 1:
+            raise NotImplementedError("axk3 does not support pipeline parallel yet")
+        if not (
+            config.gated_residual
+            and config.gated_residual_first_layer <= 1
+            and config.gated_residual_final == "gated_read"
+        ):
+            raise NotImplementedError(
+                "axk3 supports only a Gated Residual on every layer with a gated "
+                "final read"
+            )
+        self.num_streams = config.gated_residual_num_streams
+
+        topk_indices_buffer = None
+        if hasattr(config, "index_topk"):
+            topk_indices_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                config.index_topk,
+                dtype=torch.int32,
+                device=current_platform.device_type,
+            )
+
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.embed_tokens",
+        )
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: AXK3DecoderLayer(
+                vllm_config, prefix, topk_indices_buffer=topk_indices_buffer
+            ),
+            prefix=f"{prefix}.layers",
+        )
+        self.final_gated_residual = AXK3GatedResidual(
+            hidden_size=config.hidden_size,
+            num_streams=self.num_streams,
+            rank=config.gated_residual_rank,
+            eps=config.rms_norm_eps,
+            has_write=False,
+            prefix=f"{prefix}.final_gated_residual",
+        )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], config.hidden_size * self.num_streams
+        )
+        self.aux_hidden_state_layers = tuple[int, ...]()
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        # Every stream starts as the embedding.
+        hidden_states = torch.cat([inputs_embeds] * self.num_streams, dim=-1)
+
+        topk_by_layer: dict[int, torch.Tensor] = {}
+        for layer in self.layers:
+            hidden_states = layer(positions, hidden_states, topk_by_layer)
+
+        hidden_states, _ = self.final_gated_residual.read(hidden_states)
+        return hidden_states
+
+
+class AXK3ForCausalLM(_k2.AXK2ForCausalLM):
+    model_cls = AXK3Model
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        raise NotImplementedError("axk3 does not support EAGLE3 yet")
+
+
+__all__ = ["AXK3ForCausalLM", "AXK3Model"]

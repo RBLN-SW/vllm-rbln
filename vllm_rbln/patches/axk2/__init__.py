@@ -12,6 +12,8 @@ from vllm_rbln.patches.registry import add_registration
 ARCH = "AXK2ForCausalLM"
 MODEL_TYPE = "axk2"
 MODEL_CLASS_PATH = "vllm_rbln.patches.axk2.model:AXK2ForCausalLM"
+# axk3 reuses this model and its MLA layers.
+_MLA_MODEL_TYPES = (MODEL_TYPE, "axk3")
 
 
 def _upstream_has_axk2() -> bool:
@@ -61,18 +63,18 @@ def _register_is_deepseek_mla_patch() -> None:
             ".ModelArchConfigConvertorBase.is_deepseek_mla"
         ),
         reason=(
-            "axk2 is an MLA model but upstream decides MLA-ness from a hardcoded "
-            "model_type tuple that does not list it"
+            "axk2 and axk3 are MLA models but upstream decides MLA-ness from a "
+            "hardcoded model_type tuple that does not list them"
         ),
     )
     def is_deepseek_mla(self) -> bool:
         hf_text_config = self.hf_text_config
         model_type = getattr(hf_text_config, "model_type", None)
-        if model_type == MODEL_TYPE:
+        if model_type in _MLA_MODEL_TYPES:
             return getattr(hf_text_config, "kv_lora_rank", None) is not None
         if model_type == "eagle":
             inner = getattr(hf_text_config, "model", None)
-            if getattr(inner, "model_type", None) == MODEL_TYPE:
+            if getattr(inner, "model_type", None) in _MLA_MODEL_TYPES:
                 return getattr(hf_text_config, "kv_lora_rank", None) is not None
         return original(self)
 
