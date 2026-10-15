@@ -22,7 +22,7 @@ from vllm.sequence import IntermediateTensors
 
 import vllm_rbln.envs as envs
 import vllm_rbln.patches.metrics as pm
-import vllm_rbln.v1.worker.metrics as wm
+import vllm_rbln.v1.metrics.performance as wm
 from vllm_rbln.patches import registry
 from vllm_rbln.v1.worker.dp_utils import BatchDescriptor
 

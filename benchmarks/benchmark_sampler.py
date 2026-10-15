@@ -21,8 +21,8 @@ from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from vllm_rbln.v1.metrics.performance import PerformanceContext, Phase
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-from vllm_rbln.v1.worker.metrics import PerformanceContext, Phase
 
 MAX_NUM_PROMPT_TOKENS = 64
 

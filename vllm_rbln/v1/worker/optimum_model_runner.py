@@ -89,15 +89,15 @@ from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
-from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
-from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
-from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
-from vllm_rbln.v1.worker.metrics import (
+from vllm_rbln.v1.metrics.performance import (
     PerformanceContext,
     Phase,
     get_performance_context,
     metrics_enabled,
 )
+from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
+from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
+from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
 if TYPE_CHECKING:

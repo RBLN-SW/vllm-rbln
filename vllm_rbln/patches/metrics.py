@@ -28,7 +28,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_rbln.patches import register_patch
-from vllm_rbln.v1.worker.metrics import (
+from vllm_rbln.v1.metrics.performance import (
     _CTX_ATTR,
     PerformanceContext,
     Phase,
