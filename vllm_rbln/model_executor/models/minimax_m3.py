@@ -1124,7 +1124,11 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         return self.language_model.logits_processor
 
     def compile_mm_encoder(self, compile_fn) -> None:
-        """Called by the runner at model load with its compile wrapper."""
+        """Called by the runner at model load with its compile wrapper.
+
+        The compiled encoder is kept outside the module tree: its weights are
+        the registered ``vision_tower``'s, and registering the wrapper too would
+        list them twice in ``named_parameters()`` / ``state_dict()``."""
         # Non-first PP ranks and configurations with both image/video limits
         # set to zero own no vision tower, but still receive encoder setup calls.
         if self.vision_tower is None:
@@ -1211,7 +1215,11 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         pixel_values = kwargs.get("pixel_values")
         if pixel_values is None:
             return ()
-        assert self._mm_encoder is not None, "the vision encoder is not compiled"
+        if self._mm_encoder is None:
+            # enforce_eager: the runner never calls compile_mm_encoder.
+            assert self.vision_tower is not None
+            encoder = _RBLNVisionEncoder(self.vision_tower).eval()
+            object.__setattr__(self, "_mm_encoder", encoder)
         image_grid_thw = kwargs["image_grid_thw"]
         assert isinstance(pixel_values, torch.Tensor)
         assert isinstance(image_grid_thw, torch.Tensor)
