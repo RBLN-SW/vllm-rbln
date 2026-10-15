@@ -329,6 +329,9 @@ class RBLNOptimumWorker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         raise RuntimeError("It is not required in vLLM RBLN.")
 
+    def discard(self, tags: tuple[str, ...]) -> None:
+        raise RuntimeError("Selective discard is not supported on RBLN.")
+
     def shutdown(self) -> None:
         logger.info("v1 optimum_worker shutdown called")
         if envs.VLLM_RBLN_METRICS:

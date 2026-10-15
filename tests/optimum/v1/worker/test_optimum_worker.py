@@ -103,6 +103,15 @@ def test_rbln_profiler_starts_and_flushes_at_stop(make_worker, monkeypatch, rbln
     assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)
 
 
+def test_discard_rejects_selective_memory_release(make_worker):
+    worker = make_worker(ProfilerConfig())
+
+    with pytest.raises(
+        RuntimeError, match="Selective discard is not supported on RBLN"
+    ):
+        worker.discard(("kv_cache",))
+
+
 def test_rbln_profiler_does_not_stand_in_for_another_profiler(make_worker, monkeypatch):
     monkeypatch.setattr(
         "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
