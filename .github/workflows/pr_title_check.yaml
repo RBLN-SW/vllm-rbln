@@ -9,7 +9,7 @@ on:
       - synchronize
 
 env:
-  GITHUB_TOKEN: ${{ secrets.GIT_PAT }}
+  GITHUB_TOKEN: ${{ github.token }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
