@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,7 +34,11 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.request_queue import (
+    RequestQueue,
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -100,6 +104,7 @@ class RBLNOptimumScheduler(Scheduler):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.grammar_compile_error_reqs: set[str] = set()
+        self.encoder_cache_mismatch_reqs: set[str] = set()
         self.reset_preempted_req_ids: set[str] = set()
         self.observability_config = vllm_config.observability_config
         self.spec_decode_metrics_level = (
@@ -195,8 +200,8 @@ class RBLNOptimumScheduler(Scheduler):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
-        # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.kv_holding_waiting = create_request_queue(self.policy)
+        self.deferred_waiting: set[Request] = set()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -259,12 +264,9 @@ class RBLNOptimumScheduler(Scheduler):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
-        # NOTE(vllm 0.22): inherited _update_after_schedule/update_from_output
-        # read this attribute. Always False on RBLN (no routed-experts return).
-        if vllm_config.model_config.enable_return_routed_experts:
+        if vllm_config.aux_output_config.enabled:
             raise NotImplementedError("enable_return_routed_experts is not supported.")
-
-        self.enable_return_routed_experts = False
+        self.aux_output_connector = None
         if vllm_config.model_config.return_sampling_mask:
             raise NotImplementedError("return_sampling_mask is not supported.")
         self.return_sampling_mask = False
@@ -366,30 +368,31 @@ class RBLNOptimumScheduler(Scheduler):
 
         # First, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            step_skipped_waiting: deque[Request] = deque()
+            step_skipped_kv_holding: deque[Request] = deque()
+
+            def skip_request(from_queue: RequestQueue) -> None:
+                request_to_skip = from_queue.pop_request()
+                self.deferred_waiting.add(request_to_skip)
+                if self._holds_kv_blocks(request_to_skip):
+                    step_skipped_kv_holding.appendleft(request_to_skip)
+                else:
+                    step_skipped_waiting.appendleft(request_to_skip)
+
+            while token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
+                request_queue = self.kv_holding_waiting or self.waiting
+                if not request_queue:
+                    break
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                # try to promote blocked statuses while traversing skipped queue.
                 # NOTE(eunji): prefill request is allowed only one
                 if req_index > 0:
                     break
 
-                # try to promote blocked statuses while traversing skipped queue.
-                if self._is_blocked_waiting_status(
-                    request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
-                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request_id,
-                        )
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                if not self._handle_blocked_waiting_request(request):
+                    skip_request(request_queue)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -403,8 +406,7 @@ class RBLNOptimumScheduler(Scheduler):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
+                    skip_request(request_queue)
                     continue
 
                 assert request.num_computed_tokens == 0
@@ -471,6 +473,7 @@ class RBLNOptimumScheduler(Scheduler):
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = request_queue.pop_request()
+                self.deferred_waiting.discard(request)
 
                 req_index += 1
                 self.running.append(request)
@@ -510,8 +513,10 @@ class RBLNOptimumScheduler(Scheduler):
                             self.ec_connector.update_state_after_alloc(request, i)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
+            if step_skipped_kv_holding:
+                self.kv_holding_waiting.prepend_requests(step_skipped_kv_holding)
             if step_skipped_waiting:
-                self.skipped_waiting.prepend_requests(step_skipped_waiting)
+                self.waiting.prepend_requests(step_skipped_waiting)
 
         # Next, schedule the RUNNING requests.
         if req_index == 0:

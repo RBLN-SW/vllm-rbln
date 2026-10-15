@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from concurrent.futures import Future
+from unittest.mock import Mock
 
 import pytest
 from vllm.v1.request import RequestStatus
@@ -39,6 +41,42 @@ def test_finish_request():
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         assert request.request_id not in scheduler.requests
         assert len(scheduler.waiting) == 9 - i
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+@pytest.mark.parametrize("abort", [False, True])
+def test_blocked_request_requeued_until_grammar_ready(policy, abort):
+    scheduler = create_scheduler(policy=policy)
+    blocked, ready = create_requests(
+        num_requests=2, sample_json_schema='{"type":"object"}'
+    )
+    grammar: Future[Mock] = Future()
+    blocked.structured_output_request.grammar = grammar
+    ready.status = RequestStatus.WAITING
+    ready.structured_output_request = None
+    for request in (blocked, ready):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [ready.request_id]
+    assert scheduler.get_request_counts() == (1, 1)
+    assert list(scheduler.waiting) == [blocked]
+    assert scheduler.deferred_waiting == {blocked}
+    stats = scheduler.make_stats()
+    assert stats.num_waiting_reqs == 0
+    assert stats.num_skipped_waiting_reqs == 1
+
+    if abort:
+        scheduler.finish_requests(blocked.request_id, RequestStatus.FINISHED_ABORTED)
+        assert scheduler.get_request_counts() == (1, 0)
+        assert blocked.request_id not in scheduler.requests
+    else:
+        grammar.set_result(Mock())
+        output = scheduler.schedule()
+        assert [req.req_id for req in output.scheduled_new_reqs] == [blocked.request_id]
+        assert output.cache_slot_id_dict == {blocked.request_id: 1}
+        assert scheduler.get_request_counts() == (2, 0)
+    assert not scheduler.deferred_waiting
 
 
 def test_get_num_unfinished_requests():
