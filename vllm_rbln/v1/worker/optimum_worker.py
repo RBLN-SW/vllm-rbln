@@ -215,6 +215,8 @@ class RBLNOptimumWorker(WorkerBase):
             return nullcontext()
 
         self.profiler.step()
+        if not self.profiler.should_annotate:
+            return nullcontext()
 
         num_new = len(scheduler_output.scheduled_new_reqs)
         num_cached = len(scheduler_output.scheduled_cached_reqs.req_ids)
