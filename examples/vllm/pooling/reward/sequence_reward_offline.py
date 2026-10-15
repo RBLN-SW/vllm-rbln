@@ -46,6 +46,7 @@ def main() -> None:
                 ],
                 tokenize=True,
                 add_generation_prompt=False,
+                return_dict=False,
             )
         }
         for answer in answers
