@@ -27,16 +27,33 @@ Built on top of [vLLM’s Plugin System](https://docs.vllm.ai/en/latest/design/p
 
 You can install this project using `pip` or from source.
 
+> [!IMPORTANT]
+> **Using Ubuntu 22.04 or Enterprise Linux 9?** The upstream vLLM CPU wheel is not compatible with these systems.
+> Use the [dedicated installation command](#ubuntu-2204-and-enterprise-linux-9) below instead.
+
 #### Install via PyPI
 
 ##### Using uv
 ```bash
-uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.24.0/cpu --torch-backend cpu
+uv pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.30.0/cpu --torch-backend cpu
 ```
 
 ##### Using pip
 ```bash
-pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.24.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
+pip install vllm-rbln --extra-index-url https://wheels.vllm.ai/0.30.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+#### Ubuntu 22.04 and Enterprise Linux 9
+
+The upstream vLLM CPU wheel requires glibc 2.39 or later and libstdc++ from GCC 14 or later (`CXXABI_1.3.15`). Ubuntu 22.04 (glibc 2.35, GCC 12) and Enterprise Linux 9 (RHEL, AlmaLinux, and Rocky Linux 9.x; glibc 2.34, GCC 11) do not meet these requirements, so install `vllm-rbln` on them with the following command instead. Its `--find-links` option fetches the vLLM wheel built for these systems from the [vllm-rbln v0.12.0 release assets](https://github.com/RBLN-SW/vllm-rbln/releases/tag/v0.12.0).
+
+```bash
+pip3 install \
+  --extra-index-url https://wheels.vllm.ai/0.30.0/cpu \
+  --extra-index-url https://pypi.rbln.ai/simple \
+  --extra-index-url https://download.pytorch.org/whl/cpu \
+  --find-links https://github.com/RBLN-SW/vllm-rbln/releases/expanded_assets/v0.12.0 \
+  "vllm-rbln[kv-connectors]==0.12.0"
 ```
 
 #### Or from source
@@ -52,7 +69,7 @@ uv pip install -e .
 ```bash
 git clone https://github.com/rbln-sw/vllm-rbln.git
 cd vllm-rbln
-pip install -e . --extra-index-url https://wheels.vllm.ai/0.24.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
+pip install -e . --extra-index-url https://wheels.vllm.ai/0.30.0/cpu --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 ### 🛠️ Development setup
