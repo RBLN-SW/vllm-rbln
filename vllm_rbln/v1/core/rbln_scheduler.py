@@ -66,6 +66,12 @@ class RBLNScheduler(Scheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
+        if self.scheduler_config.disable_chunked_mm_input:
+            # That clamp stops a chunk just before an image every time, so it
+            # can leave a 1-token prefill chunk that the guard after
+            # _try_schedule_encoder_inputs would defer forever.
+            raise ValueError("disable_chunked_mm_input is not supported on RBLN.")
+
         self.num_lookahead_tokens: int = max(
             self.num_lookahead_tokens, self.num_spec_tokens
         )
@@ -309,6 +315,10 @@ class RBLNScheduler(Scheduler):
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
+                if num_new_tokens == 1 and is_prefill(request):
+                    # Cut to 1 token short of an image when the encoder cache
+                    # is full; a 1-token step runs as decode, so wait for room.
+                    num_new_tokens = 0
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
@@ -683,6 +693,13 @@ class RBLNScheduler(Scheduler):
                             encoder_compute_budget,
                             shift_computed_tokens=1 if self.use_eagle else 0,
                         )
+                        if (
+                            num_new_tokens == 1
+                            and num_computed_tokens < request.num_tokens - 1
+                        ):
+                            # Same as in the running loop: never a 1-token
+                            # prefill chunk.
+                            num_new_tokens = 0
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
