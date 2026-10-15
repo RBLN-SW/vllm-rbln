@@ -49,11 +49,8 @@ if TYPE_CHECKING:
 # They can disagree only on a prefill scheduled exactly 1 token. That does not
 # happen: with 1 token left, is_prefill() already reports decode, which is where
 # a 1-token prompt, a chunked prefill's last token, a full remote-KV match and a
-# full prefix-cache match all land. The one clamp that can cut a chunk that
-# short, _try_schedule_encoder_inputs stopping a chunk before an image, is
-# undone in the RBLN scheduler (and disable_chunked_mm_input, which would do it
-# every step, is rejected). The scheduler tests pin both views together across
-# whole runs.
+# full prefix-cache match all land -- and no clamp in schedule() cuts a chunk
+# that short. The scheduler tests pin both views together across whole runs.
 #
 # If that ever breaks, an unfinished prompt runs on the decode graph, and
 # is_intermediate_chunked_prefill falls with it since it ANDs the phase: the step
