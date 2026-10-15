@@ -18,8 +18,8 @@ Start the server in one terminal:
     vllm serve meta-llama/Llama-3.2-1B-Instruct --model-impl vllm \
         --block-size 1024 --max-num-batched-tokens 512 --max-num-seqs 1
 Run the client in another terminal:
-    python examples/vllm/basic/openai_completion_client.py
-    python examples/vllm/basic/openai_completion_client.py --stream
+    python examples/vllm/basic/online_serving/openai_completion_client.py
+    python examples/vllm/basic/online_serving/openai_completion_client.py --stream
 
 The client connects to localhost:8000.
 The client uses the first model returned by the server's models endpoint.
