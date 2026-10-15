@@ -58,6 +58,7 @@ def create_scheduler(
     outer_block_size: int = 16,
     enable_prefix_caching: bool = False,
     policy: str = "fcfs",
+    max_num_active_seqs: int | None = None,
 ) -> RBLNOptimumScheduler:
     """Create RBLNOptimumscheduler under test.
 
@@ -79,6 +80,7 @@ def create_scheduler(
         async_scheduling=async_scheduling,
         is_encoder_decoder=False,
         policy=policy,
+        max_num_active_seqs=max_num_active_seqs,
     )
     model_config = ModelConfig(
         model=model,

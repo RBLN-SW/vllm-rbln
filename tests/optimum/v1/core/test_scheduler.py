@@ -90,6 +90,34 @@ def test_get_num_unfinished_requests():
         assert scheduler.get_num_unfinished_requests() == len(requests) - i - 1
 
 
+@pytest.mark.parametrize("active_cap", [1, 2, None])
+def test_active_request_limit_preserves_capacity_and_admits_waiting_requests(
+    active_cap,
+):
+    scheduler = create_scheduler(
+        max_num_seqs=4, max_num_active_seqs=active_cap, num_blocks=32
+    )
+    requests = create_requests(num_requests=5, max_tokens=2)
+    for request in requests:
+        scheduler.add_request(request)
+
+    expected_cap = active_cap if active_cap is not None else 4
+    peak = 0
+    for _ in range(20):
+        if not scheduler.get_num_unfinished_requests():
+            break
+        output = scheduler.schedule()
+        active = len(scheduler.running)
+        assert active <= expected_cap
+        peak = max(peak, active)
+        scheduler.update_from_output(output, create_model_runner_output(output))
+
+    assert peak == expected_cap
+    assert all(request.is_finished() for request in requests)
+    assert scheduler.max_num_running_reqs == 4
+    assert not scheduler._cache_slot_ids
+
+
 def test_schedule_single_seq():
     """Test scheduling.
     Only one case: no prompt logprobs

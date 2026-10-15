@@ -131,6 +131,11 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        self.max_num_active_reqs = (
+            self.scheduler_config.max_num_active_seqs
+            if self.scheduler_config.max_num_active_seqs is not None
+            else self.max_num_running_reqs
+        )
         # Per-step token budget. Not max_num_batched_tokens: the optimum path
         # repurposes that as the compiled prefill chunk size, and the runner
         # prefills the whole prompt in one step (chunking is internal to the
@@ -380,7 +385,8 @@ class RBLNOptimumScheduler(Scheduler):
                     step_skipped_waiting.appendleft(request_to_skip)
 
             while token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+                num_running = len(self.running) + self.num_waiting_for_streaming_input
+                if num_running >= self.max_num_active_reqs:
                     break
                 request_queue = self.kv_holding_waiting or self.waiting
                 if not request_queue:
