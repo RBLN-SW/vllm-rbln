@@ -338,6 +338,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_cache_block_axes: dict[str, int] = {}
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
+        # Block-aux caches (`_allocate_aux_kv_caches`): their layers and tensors.
+        self.aux_kv_cache_layers: list[str] = []
+        self.num_aux_kv_tensors = 0
         # KV cache layer names in layer-index order; the deterministic
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
@@ -3288,17 +3291,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         kv_cache_spec.real_page_size_bytes
                         == kv_cache_spec.page_size_bytes
                     ), kv_cache_spec
-                    assert not dynamic_kv_enabled(self.vllm_config)
                     dtype = kv_cache_spec.dtypes[0]
                     kv_cache_shape = (num_blocks, *kv_cache_spec.shapes[0])
                     typed_base = raw_tensor.view(dtype).view(kv_cache_shape)
                     kv_caches[layer_name] = typed_base
                     kv_cache_block_axes[layer_name] = 0
+                    dynamic_axis = None
+                    if dynamic_kv_enabled(self.vllm_config):
+                        dynamic_axis = 0
+                        torch._dynamo.mark_dynamic(typed_base, 0)
+                        marked_layers.append((layer_name, 0))
                     kv_cache_base_tensors[layer_name] = typed_base
                     kv_cache_view_infos[layer_name] = KVCacheViewInfo(
                         view_dtype=dtype,
                         view_shape=kv_cache_shape,
                         permute_order=tuple(range(len(kv_cache_shape))),
+                        dynamic_axis=dynamic_axis,
                     )
                 else:
                     raise NotImplementedError
@@ -3446,6 +3454,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         device = self.device if use_device_tensor() else "meta"
         num_blocks = kv_cache_config.num_blocks
         extent_of = kv_cache_extents(kv_cache_config)
+        # Sized with the KV cache: the dynamic-KV resize reads their growth from
+        # the compiled placement like any KV input's.
+        dynamic_axis = 0 if dynamic_kv_enabled(self.vllm_config) else None
         tensors: dict[tuple, torch.Tensor] = {}
         ordinals: defaultdict[tuple, int] = defaultdict(int)
         forward_context = self.compilation_config.static_forward_context
@@ -3455,13 +3466,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 continue
             assert isinstance(spec, RBLNBlockAuxSpec), spec
             assert spec.owner in extent_of, f"{layer_name}: no owner {spec.owner}"
-            assert not dynamic_kv_enabled(self.vllm_config)
             shape = (num_blocks, *spec.block_shape)
             kind = (spec.owner, shape, spec.dtype)
             key = (extent_of[spec.owner], shape, spec.dtype, ordinals[kind])
             ordinals[kind] += 1
             if (cache := tensors.get(key)) is None:
                 cache = torch.empty(shape, dtype=spec.dtype, device=device)
+                if dynamic_axis is not None:
+                    torch._dynamo.mark_dynamic(cache, dynamic_axis)
                 tensors[key] = cache
             kv_caches[layer_name] = cache
             kv_cache_bases_by_layer[layer_name] = cache
@@ -3469,8 +3481,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 view_dtype=spec.dtype,
                 view_shape=shape,
                 permute_order=tuple(range(len(shape))),
+                dynamic_axis=dynamic_axis,
             )
             block_axes[layer_name] = 0
+        self.aux_kv_cache_layers = [
+            name for name, info in kv_cache_view_infos.items() if name not in extent_of
+        ]
+        self.num_aux_kv_tensors = len(tensors)
         if tensors:
             logger.info(
                 "Block-aux KV caches: %d layers on %d tensors, %.3f GiB",

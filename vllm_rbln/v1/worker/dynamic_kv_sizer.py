@@ -494,6 +494,8 @@ class DynamicKvSizer:
         # A KV input is one allocated cache, and the layers on one extent share
         # it, so the count is the extents rather than the layer total.
         num_caches = len(set(kv_cache_extents(cfg).values()))
+        # Block-aux caches are KV inputs of their own, outside the config's tensors.
+        num_caches += self.model_runner.num_aux_kv_tensors
         specs = self._specs_covering_tensors(groups, num_caches)
         logger.info(
             "[Dynamic KV] the slope is summed over %d KV input(s) from %d set(s); "
@@ -756,7 +758,8 @@ class DynamicKvSizer:
         forward_context = mr.compilation_config.static_forward_context
         unbound = 0
         for layer_name in dict.fromkeys(
-            name for t in old_cfg.kv_cache_tensors for name in t.layers
+            [name for t in old_cfg.kv_cache_tensors for name in t.layers]
+            + mr.aux_kv_cache_layers
         ):
             layer = forward_context.get(layer_name)
             if layer is None:
