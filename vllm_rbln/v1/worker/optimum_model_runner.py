@@ -86,6 +86,7 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumDecoderMixin,
     RBLNOptimumMultimodalMixin,
 )
+from vllm_rbln.platform.optimum_impl import patch_upstream
 from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
@@ -120,6 +121,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     input_batch: RBLNInputBatch
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        patch_upstream()
+
         # Raises if the architecture has no optimum-rbln counterpart. Must run
         # before the remap below, which rewrites it to an optimum-rbln-internal
         # name. vLLM has already rejected anything it cannot resolve itself, so
