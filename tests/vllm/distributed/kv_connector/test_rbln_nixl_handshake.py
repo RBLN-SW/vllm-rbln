@@ -22,11 +22,13 @@
 
 import collections
 import inspect
+import itertools
 import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from typing import NamedTuple
 from unittest.mock import MagicMock, call, patch
 
 import msgspec
@@ -64,8 +66,11 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker imp
     RblnNixlPushConnectorWorker,
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
-    _as_descs,
+    RblnNixlWorkerState,
     kv_chunk_tokens,
+)
+from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.transfer import (
+    _chunk_desc_ids,
 )
 
 
@@ -1143,7 +1148,7 @@ class TestPeerRegionView:
         addr, span, dev = (int(x) for x in plain[0])
         assert np.array_equal(
             both[len(plain) : len(plain) + 2],
-            _as_descs([(addr, span // 2, dev), (addr + span // 2, span // 2, dev)]),
+            [(addr, span // 2, dev), (addr + span // 2, span // 2, dev)],
         )
 
     def test_more_than_one_run_walks_the_piece(self):
@@ -1166,14 +1171,12 @@ class TestPeerRegionView:
         # run 0's two chunks, then run 1's -- the second run starts halfway.
         assert np.array_equal(
             both[len(plain) : len(plain) + 4],
-            _as_descs(
-                [
-                    (addr, quarter, dev),
-                    (addr + quarter, quarter, dev),
-                    (addr + 2 * quarter, quarter, dev),
-                    (addr + 3 * quarter, quarter, dev),
-                ]
-            ),
+            [
+                (addr, quarter, dev),
+                (addr + quarter, quarter, dev),
+                (addr + 2 * quarter, quarter, dev),
+                (addr + 3 * quarter, quarter, dev),
+            ],
         )
 
     def test_a_stage_starting_at_our_first_layer_needs_no_translation(self):
@@ -2507,7 +2510,7 @@ class TestHeadBandMatching:
         # Derived here rather than handed in, from the split this list used.
         assert grid.call_args.kwargs["split"] == 1
 
-        assert both[: len(plain)] == plain
+        assert np.array_equal(both[: len(plain)], plain)
         assert len(both) == len(plain) * 5
         start, span, _ = plain[0]
         assert [(a - start, ln) for a, ln, _ in both[len(plain) : len(plain) + 4]] == [
@@ -3021,6 +3024,626 @@ class TestDescriptorOrderContract:
             ((5, 1, 1), (7, 1, 0)),
         }
         assert len(set(pairs)) == len(pairs)
+
+
+# The two descriptor sweeps below decode every row back to what it covers, from
+# the layout alone: a region's block is K then V where they share one
+# (`kv_per_block` 2), each a run of heads, each head `_TOKENS` tokens of the
+# layer's token width.
+_HEADS = 8
+_TOKENS = 16
+_TOKEN_BYTES = 4
+
+
+class _Unit(NamedTuple):
+    """One token of one head in one half of one block of one logical region."""
+
+    region: int
+    block: int
+    half: int
+    head: int
+    token: int
+
+
+class _RegionLayout(NamedTuple):
+    """What one registered region holds, in the terms a sweep varies."""
+
+    logical: int
+    heads: tuple[int, ...]
+    token_bytes: int
+    kv_per_block: int
+
+    @property
+    def block_len(self) -> int:
+        return self.kv_per_block * len(self.heads) * _TOKENS * self.token_bytes
+
+
+def _region_bases(layouts, num_blocks):
+    """Bases spaced past the widest region, so an address names one region."""
+    span = max(lay.block_len for lay in layouts) * num_blocks
+    return [span * (i + 1) for i in range(len(layouts))]
+
+
+def _decode_units(rows, *, bases, layouts, num_blocks):
+    """(region, the units it covers) for each descriptor row."""
+    out = []
+    for addr, length, _dev in np.asarray(rows).tolist():
+        hits = [
+            r
+            for r, base in enumerate(bases)
+            if base <= addr < base + num_blocks * layouts[r].block_len
+        ]
+        assert len(hits) == 1, f"address {addr:#x} lands in {len(hits)} regions"
+        region = hits[0]
+        lay = layouts[region]
+        head_bytes = _TOKENS * lay.token_bytes
+        half_bytes = len(lay.heads) * head_bytes
+        block, off = divmod(addr - bases[region], lay.block_len)
+        half, off = divmod(off, half_bytes)
+        head_ix, off = divmod(off, head_bytes)
+
+        def unit(half, head_ix, token, lay=lay, block=block):
+            return _Unit(lay.logical, block, half, lay.heads[head_ix], token)
+
+        if length > half_bytes:
+            # Whole halves: a whole packed block.
+            assert off == 0 and head_ix == 0 and length % half_bytes == 0
+            assert half + length // half_bytes <= lay.kv_per_block
+            units = [
+                unit(half + k, h, t)
+                for k in range(length // half_bytes)
+                for h in range(len(lay.heads))
+                for t in range(_TOKENS)
+            ]
+        elif length >= head_bytes:
+            # A band of whole heads, every token of each.
+            assert off == 0 and length % head_bytes == 0, (addr, length)
+            assert head_ix + length // head_bytes <= len(lay.heads)
+            units = [
+                unit(half, head_ix + h, t)
+                for h in range(length // head_bytes)
+                for t in range(_TOKENS)
+            ]
+        else:
+            # Some tokens of one head.
+            assert off % lay.token_bytes == 0 and length % lay.token_bytes == 0
+            first, n = off // lay.token_bytes, length // lay.token_bytes
+            assert first + n <= _TOKENS
+            units = [unit(half, head_ix, t) for t in range(first, first + n)]
+        out.append((region, tuple(units)))
+    return out
+
+
+def _covers(rows, tag, *, regions, heads, halves, blocks, tokens, times):
+    """`rows` name exactly these units, each `times` over, and nothing else."""
+    got = Counter(u for _, units in rows for u in units)
+    want = {
+        _Unit(region, block, half, head, token)
+        for region in regions
+        for block in blocks
+        for half in halves
+        for head in heads
+        for token in tokens
+    }
+    assert set(got) == want, f"({tag}) the rows name other units than asked for"
+    assert set(got.values()) == {times}, (
+        f"({tag}) a unit is named {sorted(set(got.values()))} times, not {times}"
+    )
+
+
+def _chunk_tokens(case, chunk_span):
+    """The tokens chunks `[lo, hi)` of a block hold."""
+    lo, hi = chunk_span
+    width = _TOKENS // case["chunks"]
+    return range(lo * width, hi * width)
+
+
+def _assert_shard_contract(w, case, *, peer_key, mine, peers, grid, fanout, **units):
+    """A, B and C for one peer's two lists and the shard index arithmetic.
+
+    - (A) row i of ours and row i of the peer's name the same units
+    - (B) the rows the arithmetic picks for a block, or for chunks of one,
+      name that block's units, or those chunks', on both lists
+    - (C) each range names our units once per peer copy, and a peer
+      region's once
+
+    A sees the two lists only against each other, so a mistake both make
+    alike -- a chunk range walked chunk-major, say -- passes it and fails B.
+    """
+    assert len(mine) == len(peers), "(A) the two lists differ in length"
+    for i, ((_, ours), (_, theirs)) in enumerate(zip(mine, peers)):
+        assert ours == theirs, f"(A) row {i} pairs different units"
+
+    num_blocks = case["num_blocks"]
+
+    def covers(rows, tag, **where):
+        _covers(rows, tag, times=fanout, **units, **where)
+
+    per_grid = 1 if grid is None else 1 + grid[0] * grid[1]
+    whole = len(mine) // per_grid
+    for lo, hi in [(0, whole)] + ([(whole, len(mine))] if grid else []):
+        covers(mine[lo:hi], "C", blocks=range(num_blocks), tokens=range(_TOKENS))
+        named = Counter((r, u) for r, us in peers[lo:hi] for u in us)
+        assert set(named.values()) == {1}, "(C) a peer region's unit is named twice"
+
+    engine, rank = peer_key
+    for block in range(num_blocks):
+        ids = w._get_block_descs_ids_for_shard(engine, rank, num_blocks, [[block]])
+        for rows in (mine, peers):
+            covers([rows[i] for i in ids], "B", blocks=[block], tokens=range(_TOKENS))
+        if grid is None:
+            continue
+        chunks = case["chunks"]
+        for span in [(c, c + 1) for c in range(chunks)] + [(0, chunks)]:
+            ids = w._chunk_descs_ids_for_shard(engine, rank, num_blocks, block, span)
+            for rows in (mine, peers):
+                covers(
+                    [rows[i] for i in ids],
+                    "B",
+                    blocks=[block],
+                    tokens=_chunk_tokens(case, span),
+                )
+
+
+def _shard_worker(w, *, layouts, num_blocks, chunked):
+    """A hand-built worker wired for `_register_shard_xfer_state` over `layouts`."""
+    set_shape(w, chunk_mode=chunked)
+    w.engine_id = "eng"
+    w.block_size = _TOKENS
+    w.num_blocks = num_blocks
+    w.device_id = 0
+    w._has_mamba = False
+    w.nixl_memory_type = "DRAM"
+    w.num_regions = len(layouts)
+    w.block_len_per_layer = [lay.block_len for lay in layouts]
+    w.kv_caches_base_addr = {"eng": {w.tp_rank: _region_bases(layouts, num_blocks)}}
+    w.kv_cache_config = MagicMock(transfer_groups=[MagicMock()])
+    w.nixl_wrapper = MagicMock()
+    w.src_xfer_handles_by_remote = {}
+    w._shard_region_group_ids = {}
+    w._shard_descs_per_block = {}
+    w._shard_chunk_grids = {}
+    w._borrowed_src_handles = set()
+    w.use_host_buffer = False
+    w._kv_split_axis = KVSplitAxis.HEAD
+    if w._writes_into_peer:
+        # __init__ never ran, so the writer state shutdown() reaches through
+        # __del__ is absent.
+        w.shutdown = lambda: None
+    return w
+
+
+class _HeadSide(NamedTuple):
+    """One side of a head-matched pairing, in the terms the sweep varies."""
+
+    tp_rank: int
+    tp_size: int
+    areas: int
+    slices: int
+
+    @property
+    def heads_per_slice(self) -> int:
+        return _HEADS // (self.tp_size * self.slices)
+
+    def heads_of(self, area: int) -> tuple[int, ...]:
+        """The model heads chiplet `area` of this rank holds.
+
+        Ranks cut the heads into contiguous bands, a rank's slices cut its band
+        again, and the `areas // slices` areas of one slice hold it alike.
+        """
+        slice_ = area // (self.areas // self.slices)
+        first = (self.tp_rank * self.slices + slice_) * self.heads_per_slice
+        return tuple(range(first, first + self.heads_per_slice))
+
+    def layouts(self, kv_per_block, n_logical=2):
+        return [
+            _RegionLayout(logical, self.heads_of(a), _TOKEN_BYTES, kv_per_block)
+            for logical in range(n_logical)
+            for a in range(self.areas)
+        ]
+
+
+class TestHeadMatchedDescriptorSweep:
+    """The head-matched lists against what their rows mean, over many shapes.
+
+    The contract is three things that have to agree: what each of our rows
+    names, what each of the peer's rows names, and which rows the index
+    arithmetic picks for a block or a chunk (`_assert_shard_contract`).
+    Nothing here reads a band, a split or a grid off the code under test.
+    """
+
+    @staticmethod
+    def _shapes():
+        """Shapes the handshake accepts, each with the peer ranks we pair with.
+
+        Unequal TP in both directions, at commensurate cuts and with none of
+        our areas straddling two peer ranks; the refusals have their own tests.
+        """
+        locals_ = [
+            _HeadSide(0, 1, 2, 2),
+            _HeadSide(0, 1, 4, 4),
+            _HeadSide(0, 2, 2, 2),
+            _HeadSide(1, 2, 2, 2),
+        ]
+        peers = [  # (tp, slices, replicas)
+            (1, 1, 1),
+            (1, 2, 1),
+            (1, 2, 2),
+            (2, 1, 1),
+            (2, 2, 1),
+            (2, 2, 2),
+            (4, 1, 1),
+            (4, 1, 2),
+            (4, 2, 1),
+        ]
+        out = []
+        for local in locals_:
+            ours = {h for a in range(local.areas) for h in local.heads_of(a)}
+            for tp_r, slices_r, replicas_r in peers:
+                cuts_l, cuts_r = local.tp_size * local.slices, tp_r * slices_r
+                if (
+                    tp_r == local.tp_size
+                    or max(cuts_l, cuts_r) % min(cuts_l, cuts_r)
+                    or local.heads_per_slice > _HEADS // tp_r
+                ):
+                    continue
+                ranks = [
+                    _HeadSide(t, tp_r, slices_r * replicas_r, slices_r)
+                    for t in range(tp_r)
+                ]
+                paired = [
+                    r
+                    for r in ranks
+                    if ours & {h for a in range(r.areas) for h in r.heads_of(a)}
+                ]
+                for direction, kv_per_block, chunks in itertools.product(
+                    ("pull", "push"), (1, 2), (None, 2, 4)
+                ):
+                    out.append(
+                        dict(
+                            direction=direction,
+                            kv_per_block=kv_per_block,
+                            local=local,
+                            peer=paired,
+                            num_blocks=3,
+                            chunks=chunks,
+                        )
+                    )
+        return out
+
+    @staticmethod
+    def _expected(case, peer):
+        """(split, peer copies, halves, grid, our areas it serves) from the shape."""
+        local = case["local"]
+        theirs = {h for a in range(peer.areas) for h in peer.heads_of(a)}
+        areas = [a for a in range(local.areas) if set(local.heads_of(a)) <= theirs]
+        # A piece is the part of our area one peer slice holds.
+        split = max(1, local.heads_per_slice // peer.heads_per_slice)
+        fanout = peer.areas // peer.slices if case["direction"] == "push" else 1
+        # Equal cuts move whole blocks; unequal ones read a band out of each
+        # half, so the halves come apart.
+        same_cuts = local.tp_size * local.slices == peer.tp_size * peer.slices
+        halves = 1 if same_cuts else case["kv_per_block"]
+        grid = None
+        if case["chunks"] is not None:
+            # A token range is one run per head of the piece, in each half the
+            # piece still holds.
+            runs = case["kv_per_block"] // halves * (local.heads_per_slice // split)
+            grid = (runs, case["chunks"])
+        peer_areas = None if len(areas) == local.areas else areas
+        return split, fanout, halves, grid, peer_areas
+
+    def _check(self, case):
+        """Assert the contract for every peer rank of `case`."""
+        local_side = case["local"]
+        layouts = local_side.layouts(case["kv_per_block"])
+        w = TestHeadBandMatching._worker(
+            tp_rank=local_side.tp_rank,
+            tp_size=local_side.tp_size,
+            areas=local_side.areas,
+            slices=local_side.slices,
+            n_logical=2,
+            block_len=layouts[0].block_len,
+            kv_heads=_HEADS,
+        )
+        w.__class__ = (
+            RblnNixlPullConnectorWorker
+            if case["direction"] == "pull"
+            else RblnNixlPushConnectorWorker
+        )
+        w._kv_per_block = case["kv_per_block"]
+        w.local_seen_layer_names = ["l0", "l1"]
+        _shard_worker(
+            w,
+            layouts=layouts,
+            num_blocks=case["num_blocks"],
+            chunked=case["chunks"] is not None,
+        )
+        for peer in case["peer"]:
+            split, fanout, halves, grid, peer_areas = self._expected(case, peer)
+            peer_layouts = peer.layouts(case["kv_per_block"])
+            meta = _agent_meta(
+                kv_areas=peer.areas,
+                kv_slices=peer.slices,
+                num_blocks=case["num_blocks"],
+                block_size=_TOKENS,
+                kv_caches_base_addr=_region_bases(peer_layouts, case["num_blocks"]),
+                block_lens=[lay.block_len for lay in peer_layouts],
+            )
+            # The grid is the shape's: deriving it is not what these lists are
+            # held to here.
+            with patch.object(type(w), "_shard_chunk_grid", return_value=grid):
+                remote = w._build_head_matched_remote(
+                    meta,
+                    remote_tp_rank=peer.tp_rank,
+                    remote_tp_size=peer.tp_size,
+                    peer_areas=peer_areas,
+                )
+                w._register_shard_xfer_state(
+                    "peer",
+                    peer.tp_rank,
+                    _TOKENS,
+                    ("l0", "l1"),
+                    peer_areas=peer_areas,
+                    split=split,
+                    remote_tp_size=peer.tp_size,
+                    replica_fanout=fanout,
+                    kv_runs=halves,
+                )
+            local = w.nixl_wrapper.get_xfer_descs.call_args.args[0]
+            _assert_shard_contract(
+                w,
+                case,
+                peer_key=("peer", peer.tp_rank),
+                mine=_decode_units(
+                    local,
+                    bases=w.kv_caches_base_addr["eng"][local_side.tp_rank],
+                    layouts=layouts,
+                    num_blocks=case["num_blocks"],
+                ),
+                peers=_decode_units(
+                    remote,
+                    bases=meta.kv_caches_base_addr,
+                    layouts=peer_layouts,
+                    num_blocks=case["num_blocks"],
+                ),
+                grid=grid,
+                fanout=fanout,
+                regions=range(2),
+                heads=sorted(
+                    h
+                    for a in (peer_areas or range(local_side.areas))
+                    for h in local_side.heads_of(a)
+                ),
+                halves=range(case["kv_per_block"]),
+            )
+
+    def test_every_shape_pairs_and_picks_what_it_names(self):
+        for case in self._shapes():
+            try:
+                assert case["peer"], "no peer rank holds our heads"
+                self._check(case)
+            except AssertionError as e:
+                raise AssertionError(f"{case}: {e}") from e
+
+
+class TestStageDescriptorSweep:
+    """The equal-TP stage lists against what their rows mean.
+
+    Upstream builds the peer's whole-block range and we add its chunk range
+    (`_build_fa_remote`), cut at each row's own length. A draft layer's head is
+    wider than the target's, so the rows of one list are not all one length and
+    a length taken from the wrong row shows up as the wrong units.
+    """
+
+    LAYERS = ("l0", "l1", "l2", "l3")
+    # The last layer is a draft whose heads are twice as wide.
+    TOKEN_BYTES = (_TOKEN_BYTES, _TOKEN_BYTES, _TOKEN_BYTES, 2 * _TOKEN_BYTES)
+
+    @classmethod
+    def _shapes(cls):
+        out = []
+        for direction, kv_per_block, heads, pp, chunks in itertools.product(
+            ("pull", "push"), (1, 2), (1, 2), (2, 4), (None, 2, 4)
+        ):
+            per_stage = len(cls.LAYERS) // pp
+            out.append(
+                dict(
+                    direction=direction,
+                    kv_per_block=kv_per_block,
+                    heads=heads,
+                    stages=[
+                        cls.LAYERS[s * per_stage : (s + 1) * per_stage]
+                        for s in range(pp)
+                    ],
+                    num_blocks=3,
+                    chunks=chunks,
+                )
+            )
+        return out
+
+    @classmethod
+    def _layouts(cls, case, layers):
+        # Split K/V is a region each, packed is one region of both halves.
+        rpl = 2 // case["kv_per_block"]
+        return [
+            _RegionLayout(
+                cls.LAYERS.index(name) * rpl + k,
+                tuple(range(case["heads"])),
+                cls.TOKEN_BYTES[cls.LAYERS.index(name)],
+                case["kv_per_block"],
+            )
+            for name in layers
+            for k in range(rpl)
+        ]
+
+    def _check(self, case):
+        layouts = self._layouts(case, self.LAYERS)
+        w = TestPeerRegionView._consumer(uniform_lens=True)
+        w.__class__ = (
+            RblnNixlPullConnectorWorker
+            if case["direction"] == "pull"
+            else RblnNixlPushConnectorWorker
+        )
+        w._kv_per_block = case["kv_per_block"]
+        w.tp_rank = 0
+        w.local_seen_layer_names = list(self.LAYERS)
+        w._region_is_mla = [False] * len(layouts)
+        _shard_worker(
+            w,
+            layouts=layouts,
+            num_blocks=case["num_blocks"],
+            chunked=case["chunks"] is not None,
+        )
+        # A token range is one run per head, in each half a block holds.
+        grid = (
+            None
+            if case["chunks"] is None
+            else (case["kv_per_block"] * case["heads"], case["chunks"])
+        )
+        for rank, layers in enumerate(case["stages"]):
+            peer_layouts = self._layouts(case, layers)
+            meta = _agent_meta(
+                engine_id="p",
+                num_blocks=case["num_blocks"],
+                block_size=_TOKENS,
+                kv_caches_base_addr=_region_bases(peer_layouts, case["num_blocks"]),
+                block_lens=[lay.block_len for lay in peer_layouts],
+                region_names=[
+                    name for name in layers for _ in range(2 // case["kv_per_block"])
+                ],
+                pp_rank=rank,
+                pp_size=len(case["stages"]),
+            )
+            with patch.object(type(w), "_shard_chunk_grid", return_value=grid):
+                remote = w._build_fa_remote(
+                    TestPeerRegionView._plan(), meta, block_size_ratio=1
+                )
+                w._register_shard_xfer_state("p", rank, _TOKENS, tuple(layers))
+            local = w.nixl_wrapper.get_xfer_descs.call_args.args[0]
+            _assert_shard_contract(
+                w,
+                case,
+                peer_key=("p", rank),
+                mine=_decode_units(
+                    local,
+                    bases=w.kv_caches_base_addr["eng"][0],
+                    layouts=layouts,
+                    num_blocks=case["num_blocks"],
+                ),
+                peers=_decode_units(
+                    remote,
+                    bases=meta.kv_caches_base_addr,
+                    layouts=peer_layouts,
+                    num_blocks=case["num_blocks"],
+                ),
+                grid=grid,
+                fanout=1,
+                regions=sorted(lay.logical for lay in peer_layouts),
+                heads=range(case["heads"]),
+                halves=range(case["kv_per_block"]),
+            )
+
+    def test_every_shape_pairs_and_picks_what_it_names(self):
+        for case in self._shapes():
+            try:
+                self._check(case)
+            except AssertionError as e:
+                raise AssertionError(f"{case}: {e}") from e
+
+
+class TestChunkRangeSweep:
+    """The whole-engine chunk range against the arithmetic that indexes it.
+
+    Both whole-engine lists come out of `_chunk_range_descs`, so they cannot be
+    held against each other; a mistake there is the same on both sides. What
+    pins it is the layout and `_chunk_desc_ids`: every grid tiles each piece's
+    block once, and the ids picked for chunks of a block are those chunks'
+    bytes, run by run. The pieces differ in base, length, stride and device, so
+    a length or a device taken from another row shows.
+    """
+
+    PIECES = [
+        (0x1000, 256, 512, 0),
+        (0x9000, 512, 512, 1),
+        (0x20000, 1024, 2048, 0),
+    ]
+
+    @staticmethod
+    def _shapes():
+        return [
+            dict(num_blocks=num_blocks, grid=grid, regions=regions)
+            for num_blocks in (1, 3)
+            for grid in ((1, 2), (2, 1), (2, 4), (4, 2))
+            for regions in (1, 3)
+        ]
+
+    def _check(self, case):
+        pieces = self.PIECES[: case["regions"]]
+        num_blocks, (runs, chunks) = case["num_blocks"], case["grid"]
+        rows = np.asarray(
+            RblnNixlWorkerState._chunk_range_descs(
+                pieces, num_blocks=num_blocks, grid=case["grid"]
+            )
+        ).tolist()
+
+        # (C) Each piece's block, tiled once, on that piece's device.
+        tiles = defaultdict(list)
+        for addr, length, dev in rows:
+            hits = [
+                (i, b)
+                for i, (base, whole, stride, _) in enumerate(pieces)
+                for b in range(num_blocks)
+                if base + b * stride <= addr < base + b * stride + whole
+            ]
+            assert len(hits) == 1, f"(C) {addr:#x} is in {len(hits)} blocks"
+            assert dev == pieces[hits[0][0]][3], "(C) a row on another device"
+            tiles[hits[0]].append((addr, addr + length))
+        for i, (base, whole, stride, _) in enumerate(pieces):
+            for b in range(num_blocks):
+                spans = sorted(tiles[(i, b)])
+                start = base + b * stride
+                assert spans[0][0] == start and spans[-1][1] == start + whole, "(C)"
+                assert all(a[1] == b_[0] for a, b_ in zip(spans, spans[1:])), (
+                    "(C) the rows of a block leave a gap or overlap"
+                )
+
+        # (B) The ids for chunks [lo, hi) of a block are those chunks' bytes in
+        # every run of every piece. A run is `whole / runs` bytes and holds the
+        # block's tokens once, so chunk c of it is its c-th `chunks`-th.
+        for block in range(num_blocks):
+            for span in [(c, c + 1) for c in range(chunks)] + [(0, chunks)]:
+                ids = _chunk_desc_ids(
+                    start=0,
+                    positions=np.arange(len(pieces), dtype=np.int64),
+                    num_blocks=num_blocks,
+                    block_id=block,
+                    per_block=1,
+                    grid=case["grid"],
+                    chunk_span=span,
+                )
+                picked = {(rows[i][0], rows[i][1]) for i in ids}
+                want = {
+                    (
+                        base
+                        + block * stride
+                        + r * (whole // runs)
+                        + c * (whole // runs // chunks),
+                        whole // runs // chunks,
+                    )
+                    for base, whole, stride, _ in pieces
+                    for r in range(runs)
+                    for c in range(*span)
+                }
+                assert picked == want, "(B) the ids name other bytes than the chunks"
+                assert len(ids) == len(want), "(B) a chunk picked twice"
+
+    def test_every_shape_tiles_and_picks_its_chunks(self):
+        for case in self._shapes():
+            try:
+                self._check(case)
+            except AssertionError as e:
+                raise AssertionError(f"{case}: {e}") from e
 
 
 class TestFanInAreaPartition:
@@ -4148,12 +4771,15 @@ class TestAddRemoteAgentSwa:
         # 2 regions x 8 blocks, whole then sw_ratio granules of each, and last
         # 2 regions x 8 blocks x 2 runs x 2 chunks.
         assert len(blocks_data) == 16 * (1 + worker._shape.window_ratio) + 64
-        assert blocks_data[48:52] == [
-            (0x5000, 64, 1),
-            (0x5040, 64, 1),
-            (0x5080, 64, 1),
-            (0x50C0, 64, 1),
-        ]
+        assert np.array_equal(
+            blocks_data[48:52],
+            [
+                (0x5000, 64, 1),
+                (0x5040, 64, 1),
+                (0x5080, 64, 1),
+                (0x50C0, 64, 1),
+            ],
+        )
 
     def test_a_smaller_remote_block_shortens_descs_and_adds_a_local_handle(
         self, monkeypatch

@@ -163,6 +163,7 @@ class RBLNFlashAttentionMetadata:
     swa_attn_masks: torch.Tensor | None = None
 
     use_custom_kernel: bool = False
+    is_prompt_sorted: bool = False
     # A verify step's accepted drafts of the previous step, [B, 1] int32 (spec decode).
     num_accepted: torch.Tensor | None = None
 
@@ -260,6 +261,7 @@ class RBLNFlashAttentionMetadataBuilder(
         is_prefill: bool,
         skip_attn_masks: bool = False,
         back_pad: torch.Tensor | None = None,
+        is_prompt_sorted: bool = False,
         num_accepted: torch.Tensor | None = None,
     ) -> RBLNFlashAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
@@ -361,6 +363,7 @@ class RBLNFlashAttentionMetadataBuilder(
             local_block_tables=self._stage(local_block_tables, "local_block_tables"),
             swa_attn_masks=self._stage(swa_attn_masks, "swa_attn_masks"),
             use_custom_kernel=self.use_custom_kernel,
+            is_prompt_sorted=is_prompt_sorted,
             num_accepted=self._stage(
                 None
                 if num_accepted is None
@@ -586,6 +589,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     attn_metadata.block_tables,
                     self.sliding_window,
                     self.sinks,
+                    is_prompt_sorted=attn_metadata.is_prompt_sorted,
                 )
             else:
                 assert self.sliding_window == kv_cache.size(-2), (
@@ -606,6 +610,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.local_block_tables,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
                 else:
                     attn_output = sliding_window_attention_naive_decode(
@@ -622,6 +627,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         else None,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
 
         elif self.is_causal:
@@ -637,6 +643,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.block_tables,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
                 else:
                     attn_output = causal_attention_naive_decode(
@@ -649,6 +656,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.block_tables,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
             else:
                 # * batched attention - seq_lens[B, 1] == seq_idx,
@@ -672,6 +680,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         v_quantize_scale,
                         cache_dtype,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
                 else:
                     attn_output = flash_causal_attention_naive_decode(
@@ -687,6 +696,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         v_quantize_scale,
                         cache_dtype,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
         else:
             if self.is_normal:
@@ -702,6 +712,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.block_tables,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
                 else:
                     attn_output = attention_naive_decode(
@@ -715,6 +726,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.block_tables,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
             else:
                 if attn_metadata.is_prefill:
@@ -729,6 +741,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.block_tables,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
                 else:
                     attn_output = flash_attention_naive_decode(
@@ -742,6 +755,7 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                         attn_metadata.block_tables,
                         self.sinks,
                         use_custom_kernel=self.use_custom_kernel,
+                        is_prompt_sorted=attn_metadata.is_prompt_sorted,
                     )
 
         # 2. attention output reshape for attention backend return
