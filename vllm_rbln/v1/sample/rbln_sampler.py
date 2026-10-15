@@ -22,6 +22,7 @@ from vllm.sampling_params import _SAMPLING_EPS
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
+from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.sampler import Sampler as VLLMSampler
 
 import vllm_rbln.envs as envs
@@ -193,6 +194,26 @@ class RBLNSampler(VLLMSampler):
         self._compiled_greedy_sample = compile_sampler(
             rbln_greedy_sample, compile_context
         )
+
+    @staticmethod
+    def apply_penalties(
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        output_token_ids: list[list[int]],
+    ) -> torch.Tensor:
+        if sampling_metadata.no_penalties:
+            return logits
+
+        assert sampling_metadata.prompt_token_ids is not None
+        original_device = logits.device
+        return apply_all_penalties(
+            logits.to("cpu"),
+            sampling_metadata.prompt_token_ids.to("cpu"),
+            sampling_metadata.presence_penalties.to("cpu"),
+            sampling_metadata.frequency_penalties.to("cpu"),
+            sampling_metadata.repetition_penalties.to("cpu"),
+            output_token_ids,
+        ).to(original_device)
 
     def greedy_sample(
         self, logits: torch.Tensor, staging_owner: Any = None

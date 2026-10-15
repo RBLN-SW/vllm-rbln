@@ -17,6 +17,7 @@ import pytest
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops import penalties
 
 from vllm_rbln.v1.sample import rbln_sampler as module
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
@@ -110,3 +111,47 @@ def test_all_greedy_batch_takes_the_argmax_op(sampler, op_args):
     # An all-greedy batch skips the top-k/top-p op entirely.
     assert op_args == []
     assert sampled.tolist() == [6, 1]
+
+
+@pytest.mark.use_device
+@pytest.mark.parametrize("device", ["cpu", "rbln"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_penalties_run_on_cpu_and_restore_device(monkeypatch, device, dtype):
+    reference_logits = torch.tensor(
+        [[1.0078125, -4, 2, -2, 1, 0, -float("inf"), -1]] * 2,
+        dtype=dtype,
+    )
+    prompt = torch.tensor([[0, 1, VOCAB_SIZE], [VOCAB_SIZE] * 3])
+    presence = torch.tensor([0.5, 0.0])
+    frequency = torch.tensor([0.5, 0.0])
+    repetition = torch.tensor([1.1, 1.0])
+    output_ids = [[0, 2, 2, -1], []]
+    expected = penalties.apply_all_penalties(
+        reference_logits.clone(), prompt, presence, frequency, repetition, output_ids
+    )
+    logits = reference_logits.to(device)
+    original_device = logits.device
+    metadata = make_sampling_metadata(None, True, False)
+    original = penalties.apply_penalties
+    calls = []
+
+    def cpu_only(*tensors):
+        assert all(tensor.device.type == "cpu" for tensor in tensors)
+        calls.append(True)
+        return original(*tensors)
+
+    monkeypatch.setattr(penalties, "apply_penalties", cpu_only)
+    assert RBLNSampler.apply_penalties(logits, metadata, output_ids) is logits
+    assert calls == []
+
+    metadata.no_penalties = False
+    metadata.prompt_token_ids = prompt.to(device)
+    metadata.presence_penalties = presence.to(device)
+    metadata.frequency_penalties = frequency.to(device)
+    metadata.repetition_penalties = repetition.to(device)
+    result = RBLNSampler.apply_penalties(logits, metadata, output_ids)
+
+    assert calls == [True]
+    assert result.device == original_device
+    assert result.dtype == dtype
+    torch.testing.assert_close(result.to("cpu"), expected, rtol=0, atol=0)

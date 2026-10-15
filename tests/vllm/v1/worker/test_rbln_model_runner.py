@@ -43,6 +43,7 @@ import vllm_rbln.v1.worker.dp_utils as dp_utils
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 import vllm_rbln.v1.worker.utils as worker_utils
 from tests.vllm.v1.worker.utils import (
+    make_kv_cache_config,
     make_runner_config,
     make_speculative_config,
     schedule_new,
@@ -169,6 +170,56 @@ def _cached_state(req_id, *, prompt_len=3, num_computed=0, block_ids=None):
         num_computed_tokens=num_computed,
         output_token_ids=[],
     )
+
+
+@pytest.mark.use_device
+@pytest.mark.parametrize("reinitialize", [False, True])
+def test_penalty_metadata_stays_on_cpu_after_reordering(
+    make_model_runner, reinitialize
+):
+    runner = make_model_runner(
+        additional_config={"use_custom_sampler": True}, init_kv_cache=False
+    )
+    if reinitialize:
+        runner.may_reinitialize_input_batch(
+            make_kv_cache_config(runner, block_size=2048), [2048]
+        )
+    batch = runner.input_batch
+    for i in range(2):
+        request = _cached_state(f"r{i}", prompt_len=2 + i)
+        request.sampling_params = SamplingParams(
+            temperature=0.9,
+            top_p=0.9,
+            top_k=50,
+            frequency_penalty=0.5 + i,
+            presence_penalty=0.25 + i,
+            repetition_penalty=1.1 + i,
+            allowed_token_ids=[0, 1],
+        )
+        batch.add_request(request)
+    batch.swap_states(0, 1)
+    batch.refresh_metadata()
+    metadata = batch.sampling_metadata
+
+    for name in ("frequency_penalties", "presence_penalties", "repetition_penalties"):
+        tensor = getattr(metadata, name)
+        assert tensor.device.type == "cpu"
+        assert tensor.data_ptr() == getattr(batch, f"{name}_cpu_tensor").data_ptr()
+    assert metadata.frequency_penalties.tolist() == [1.5, 0.5]
+    assert metadata.prompt_token_ids.device.type == "cpu"
+    assert metadata.prompt_token_ids.tolist() == [[0, 1, 2], [0, 1, batch.vocab_size]]
+    for name in ("temperature", "top_p", "top_k", "allowed_token_ids_mask"):
+        assert getattr(metadata, name).device == batch.temperature.device
+    assert batch.device == runner.device
+
+    batch.remove_request("r1")
+    batch.condense()
+    batch.refresh_metadata()
+    padded = _pad_sampling_metadata(batch.sampling_metadata, 4)
+    assert padded.frequency_penalties.tolist() == [0.5] * 4
+    assert padded.prompt_token_ids.tolist() == [[0, 1]] * 4
+    assert padded.prompt_token_ids.device.type == "cpu"
+    assert padded.temperature.device == batch.temperature.device
 
 
 class TestGetCumsumAndArange:

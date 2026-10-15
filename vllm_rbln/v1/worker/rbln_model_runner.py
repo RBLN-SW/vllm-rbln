@@ -240,6 +240,18 @@ class ExecuteModelState(NamedTuple):
     combined_hidden_states: torch.Tensor | None
 
 
+class CPUPenaltyInputBatch(InputBatch):
+    def _make_sampling_metadata(self) -> SamplingMetadata:
+        # Build through a shallow view to reuse upstream metadata construction
+        # without changing the live batch's device or other device buffers.
+        batch = copy(self)
+        batch.device = torch.device("cpu")
+        batch.frequency_penalties = self.frequency_penalties_cpu_tensor
+        batch.presence_penalties = self.presence_penalties_cpu_tensor
+        batch.repetition_penalties = self.repetition_penalties_cpu_tensor
+        return InputBatch._make_sampling_metadata(batch)
+
+
 class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def __init__(
         self,
@@ -415,7 +427,14 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.is_pooling_model,
             custom_logitsprocs,
         )
-        self.input_batch = InputBatch(
+        input_batch_cls = (
+            CPUPenaltyInputBatch
+            if self.rbln_config.use_custom_sampler
+            and self.speculative_config is None
+            and not self.is_pooling_model
+            else InputBatch
+        )
+        self.input_batch = input_batch_cls(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
@@ -2840,7 +2859,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
-            self.input_batch = InputBatch(
+            self.input_batch = type(self.input_batch)(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,
