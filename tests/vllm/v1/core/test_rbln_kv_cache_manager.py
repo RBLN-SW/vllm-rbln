@@ -1019,6 +1019,94 @@ class TestKVEvents:
         flat_tokens = [t for e in self._stored(manager) for t in e.token_ids]
         assert flat_tokens == tokens[: 2 * 8]
 
+    def test_remote_load_indexing_resumes_without_duplicate_events(self):
+        manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
+        tokens = list(range(32))
+        request = make_request("0", tokens, 8)
+        assert (
+            manager.allocate_slots(
+                request, 0, num_external_computed_tokens=16, delay_cache_blocks=True
+            )
+            is not None
+        )
+        request.num_computed_tokens = 16
+        manager.cache_blocks(request, 16)
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+        assert [t for e in self._stored(manager) for t in e.token_ids] == tokens[:16]
+
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+        assert manager.take_events() == []
+
+        assert manager.allocate_slots(request, 8) is not None
+        request.num_computed_tokens = 24
+        manager.do_pending_indexing()
+        assert [t for e in self._stored(manager) for t in e.token_ids] == tokens[16:24]
+
+    def test_two_pending_steps_keep_remotely_loaded_prefix(self):
+        manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
+        tokens = list(range(40))
+        request = make_request("0", tokens, 8)
+        assert (
+            manager.allocate_slots(
+                request, 0, num_external_computed_tokens=16, delay_cache_blocks=True
+            )
+            is not None
+        )
+        request.num_computed_tokens = 16
+        manager.cache_blocks(request, 16)
+        for _ in range(2):
+            assert manager.allocate_slots(request, 8) is not None
+            request.num_computed_tokens += 8
+
+        manager.do_pending_indexing()
+
+        assert [t for e in self._stored(manager) for t in e.token_ids] == tokens[:32]
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+        assert manager.take_events() == []
+
+    def test_remote_load_progress_is_independent_per_group(self):
+        manager = RBLNKVCacheManager(
+            kv_cache_config=make_kv_cache_config(
+                [full_attention_spec(16), sliding_window_spec(8, 128)], 30
+            ),
+            max_model_len=128,
+            scheduler_block_size=16,
+            hash_block_size=8,
+            sub_block_size=4,
+            hash_fn=sha256,
+            enable_kv_cache_events=True,
+        )
+        tokens = list(range(48))
+        request = make_request("0", tokens, 8)
+        assert (
+            manager.allocate_slots(
+                request, 0, num_external_computed_tokens=32, delay_cache_blocks=True
+            )
+            is not None
+        )
+        request.num_computed_tokens = 32
+        manager.cache_blocks(request, 32)
+        manager.schedule_sub_block_indexing(request)
+        manager.do_pending_indexing()
+        expected, _, _ = SubBlockHasher(sha256, 4).hash_tokens(tokens, request)
+
+        for lo, hi in [(0, 32), (32, 48)]:
+            events = self._stored(manager)
+            assert {e.group_idx for e in events} == {0, 1}
+            for gid in range(2):
+                group_events = [e for e in events if e.group_idx == gid]
+                assert [t for e in group_events for t in e.token_ids] == tokens[lo:hi]
+                assert [h for e in group_events for h in e.block_hashes] == [
+                    maybe_convert_block_hash(h) for h in expected[lo // 4 : hi // 4]
+                ]
+            if hi == 32:
+                assert manager.allocate_slots(request, 16) is not None
+                request.num_computed_tokens = 48
+                manager.do_pending_indexing()
+
     def test_dedup_on_multi_turn_same_prefix(self):
         # A second request caching the same prefix skips already-indexed hashes
         # (first_fresh_idx dedup) -> no fresh BlockStored.

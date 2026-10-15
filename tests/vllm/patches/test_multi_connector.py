@@ -68,6 +68,16 @@ def test_every_child_is_called_even_when_none_reports():
     assert [child.calls for child in children] == [1, 1]
 
 
+@pytest.mark.parametrize("reporting_child", [0, 1, 2])
+def test_reporting_child_does_not_skip_later_children(reporting_child):
+    events = object()
+    children = [_Child() for _ in range(3)]
+    children[reporting_child].events = events
+
+    assert get_kv_connector_kv_cache_events(_multi(*children)) is events
+    assert [child.calls for child in children] == [1, 1, 1]
+
+
 def test_events_from_two_children_are_refused():
     with pytest.raises(NotImplementedError, match="more than one child"):
         get_kv_connector_kv_cache_events(_multi(_Child(object()), _Child(object())))
