@@ -19,6 +19,7 @@
 import queue
 import threading
 from collections import defaultdict
+from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlBaseConnectorWorker,
     NixlPullConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import NixlKVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
@@ -332,6 +334,8 @@ class TestShardReadPath:
         # What get_transfer_results reads.
         w._replicated_pcp_done_sending = set()
         w._failed_recv_reqs = queue.Queue()
+        w._handshake_lock = threading.RLock()
+        w._handshake_futures = {}
         w._pending_recv_notifs = {}
         w.use_host_buffer = False
         # What upstream's failure path reads: it logs with the engine id, looks the
@@ -360,8 +364,13 @@ class TestShardReadPath:
         w._remote_agents = {
             "eng": {divmod(r, peer_tp_size): f"agent{r}" for r in range(pp_size)}
         }
+        # The handshake records where the engine answered; an agent without an
+        # address reads as a replaced peer and upstream's sweep drops it.
+        w._engine_by_address = {("host", 1234): "eng"}
         # What dropping an unreachable engine releases.
         w._borrowed_src_handles = set()
+        w._engine_clock_offset = {"eng": 0.0}
+        w.dst_region_mem_types = {"eng": ["VRAM", "VRAM"], "local": ["VRAM", "VRAM"]}
         w._remote_shard_layer_names = {}
         w.kv_caches_base_addr = {"eng": [0]}
         w.tp_mappings = {"eng": MagicMock()}
@@ -400,13 +409,24 @@ class TestShardReadPath:
         # the two lists are the same.
         meta.local_block_ids = local_ids
         meta.local_num_computed_blocks = [0] * len(local_ids)
+        # As upstream's scheduler sets it: only a request with external tokens
+        # to load is awaited, and only such a request has local blocks.
+        meta.awaiting_kvs = any(local_ids)
         return meta
+
+    @staticmethod
+    def _read(w, req_id, meta):
+        # Upstream stores an awaited request's metadata before reading it, and
+        # the read path counts on that.
+        if meta.awaiting_kvs:
+            w._recving_metadata[req_id] = meta
+        w._read_blocks_for_req(req_id, meta)
 
     def test_reads_every_stage(self):
         # pp_size=2 -> one prepped READ per stage, each with its own shard
         # handles; the request accrues one transfer handle per stage.
         w = self._read_worker(pp_size=2)
-        w._read_blocks_for_req("r0", self._meta([[1, 2]], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", self._meta([[1, 2]], [[3, 4]]))
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
         # stage 0 uses local handle 100 / remote 200; stage 1 -> 101 / 201.
         calls = w.nixl_wrapper.make_prepped_xfer.call_args_list
@@ -427,7 +447,7 @@ class TestShardReadPath:
         meta = self._meta([[1, 2]], [[3, 4]])
         w._recving_metadata["r0"] = meta
 
-        w._read_blocks_for_req("r0", meta)
+        TestShardReadPath._read(w, "r0", meta)
 
         assert w._recving_transfers["r0"] == []
         # The mock is installed to keep the log quiet; assert on it too, or a
@@ -442,11 +462,12 @@ class TestShardReadPath:
         # Reported failed exactly once, which is what the engine counts.
         # 0.30.0 collects these in a set the handler is handed, not a queue.
         assert w._recv_failures == {"r0"}
+        w.xfer_stats.record_failed_transfer.assert_called_once()
 
     def test_prefix_hit_notifies_each_stage_no_read(self):
         # Full prefix hit (empty local list): no read, one notif per stage.
         w = self._read_worker(pp_size=2)
-        w._read_blocks_for_req("r0", self._meta([], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", self._meta([], [[3, 4]]))
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 0
         assert w.nixl_wrapper.send_notif.call_count == 2
         assert len(w._recving_transfers["r0"]) == 0
@@ -457,7 +478,7 @@ class TestShardReadPath:
         # that reach it run one local stage, where asking changes nothing.
         w = self._read_worker(pp_size=2, local_pp=4)
 
-        w._read_blocks_for_req("r0", self._meta([], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", self._meta([], [[3, 4]]))
 
         assert {
             c.kwargs["notif_msg"] for c in w.nixl_wrapper.send_notif.call_args_list
@@ -468,7 +489,7 @@ class TestShardReadPath:
         # no-op and the wrong divisor 1 goes unnoticed. Here flat rank 1 is the
         # peer's (pp 0, tp 1), so the two shards share a stage.
         w = self._read_worker(pp_size=2, peer_tp_size=2)
-        w._read_blocks_for_req("r0", self._meta([], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", self._meta([], [[3, 4]]))
         assert [c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list] == [
             "agent0",
             "agent1",
@@ -482,7 +503,7 @@ class TestShardReadPath:
         w._log_failure = MagicMock()
         w.nixl_wrapper.send_notif.side_effect = [RuntimeError("dropped"), None, None]
 
-        w._read_blocks_for_req("r0", self._meta([], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", self._meta([], [[3, 4]]))
 
         assert w.nixl_wrapper.send_notif.call_count == 3
         assert w._log_failure.call_args.kwargs["remote_pp_rank"] == 0
@@ -493,7 +514,7 @@ class TestShardReadPath:
         # remote prompt is 3 blocks, so the remote is end-trimmed to the last
         # block -> local/remote desc counts match per stage and the read fires.
         w = self._read_worker(pp_size=2)
-        w._read_blocks_for_req("r0", self._meta([[7]], [[3, 4, 7]]))
+        TestShardReadPath._read(w, "r0", self._meta([[7]], [[3, 4, 7]]))
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
         for c in w.nixl_wrapper.make_prepped_xfer.call_args_list:
             local_descs, remote_descs = c.args[2], c.args[4]
@@ -512,7 +533,7 @@ class TestShardReadPath:
         w._kv_split_axis = KVSplitAxis.NON_HEAD
         w.block_size = 16
 
-        w._read_blocks_for_req("r0", self._meta([[7]], [[3, 4, 7]], num_tokens=33))
+        TestShardReadPath._read(w, "r0", self._meta([[7]], [[3, 4, 7]], num_tokens=33))
 
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
         for c in w.nixl_wrapper.make_prepped_xfer.call_args_list:
@@ -525,6 +546,7 @@ class TestShardReadPath:
         # the per-stage loop would key handles the non-PP registration never
         # wrote. Liveness is stamped first so TTL eviction sees it as active.
         w = object.__new__(RblnNixlPullConnectorWorker)
+        w._recving_metadata = {}
         w._engine_last_active = {}
         w._remote_agents = {"eng": {}}  # handshaken, so the read goes ahead
         w._remote_pp_size = {}  # unknown engine defaults to a single stage
@@ -539,7 +561,7 @@ class TestShardReadPath:
         meta.remote.num_tokens = None
 
         with patch.object(NixlPullConnectorWorker, "_read_blocks_for_req") as base_read:
-            w._read_blocks_for_req("r0", meta)
+            TestShardReadPath._read(w, "r0", meta)
 
         base_read.assert_called_once_with("r0", meta)
         assert "eng" in w._engine_last_active
@@ -550,6 +572,7 @@ class TestShardReadPath:
         # view gave the whole-engine list the extra range, and the per-shard
         # lists cannot name its two KV groups at all.
         w = object.__new__(RblnNixlPullConnectorWorker)
+        w._recving_metadata = {}
         w._engine_last_active = {}
         w._remote_pp_size = {}
         w._overlapping_ranks = {}
@@ -570,7 +593,7 @@ class TestShardReadPath:
             "_read_blocks_for_req",
             lambda self, req_id, m: seen.append(self._request_tail),
         ):
-            w._read_blocks_for_req("r0", meta)
+            TestShardReadPath._read(w, "r0", meta)
 
         # The token count and the request's own block count, parked for the
         # length of that call: upstream's `_compute_desc_ids` is what selects
@@ -584,6 +607,7 @@ class TestShardReadPath:
         # `tail is None` path and names every granule of every block, which is
         # the transfer the range exists to avoid.
         w = object.__new__(RblnNixlPullConnectorWorker)
+        w._recving_metadata = {}
         w._engine_last_active = {}
         w._remote_pp_size = {}
         w._overlapping_ranks = {}
@@ -605,7 +629,7 @@ class TestShardReadPath:
             "_read_blocks_for_req",
             lambda self, req_id, m: seen.append(self._request_tail),
         ):
-            w._read_blocks_for_req("r0", meta)
+            TestShardReadPath._read(w, "r0", meta)
 
         assert seen == [(17, 2, ())]
 
@@ -615,6 +639,7 @@ class TestShardReadPath:
         # granule at all; the whole block is what a request with nothing said
         # about it gets.
         w = object.__new__(RblnNixlPullConnectorWorker)
+        w._recving_metadata = {}
         w._engine_last_active = {}
         w._remote_pp_size = {}
         w._overlapping_ranks = {}
@@ -636,7 +661,7 @@ class TestShardReadPath:
             "_read_blocks_for_req",
             lambda self, req_id, m: seen.append(self._request_tail),
         ):
-            w._read_blocks_for_req("r0", meta)
+            TestShardReadPath._read(w, "r0", meta)
 
         assert seen == [(None, 2, ())]
 
@@ -644,6 +669,7 @@ class TestShardReadPath:
         # The other side of the same rule: nothing else leaves a chunked
         # engine on a list that cannot leave part of a block out.
         w = object.__new__(RblnNixlPullConnectorWorker)
+        w._recving_metadata = {}
         w._engine_last_active = {}
         w._remote_pp_size = {}
         w._overlapping_ranks = {}
@@ -655,7 +681,7 @@ class TestShardReadPath:
         meta.remote.num_tokens = None
 
         with pytest.raises(AssertionError):
-            w._read_blocks_for_req("r0", meta)
+            TestShardReadPath._read(w, "r0", meta)
 
     @pytest.mark.parametrize(
         ("local_tp", "remote_tp", "local_pp", "remote_pp", "expected_readers"),
@@ -694,7 +720,7 @@ class TestShardReadPath:
         w = self._read_worker(pp_size=1)
         w._overlapping_ranks = {}
         with patch.object(NixlPullConnectorWorker, "_read_blocks_for_req") as base_read:
-            w._read_blocks_for_req("r0", self._meta([[1, 2]], [[3, 4]]))
+            TestShardReadPath._read(w, "r0", self._meta([[1, 2]], [[3, 4]]))
         base_read.assert_called_once()
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 0
 
@@ -705,7 +731,7 @@ class TestShardReadPath:
         w = self._read_worker(pp_size=1)
         w._overlapping_ranks = {"eng": [0]}
         with patch.object(NixlPullConnectorWorker, "_read_blocks_for_req") as base_read:
-            w._read_blocks_for_req("r0", self._meta([[1, 2]], [[3, 4]]))
+            TestShardReadPath._read(w, "r0", self._meta([[1, 2]], [[3, 4]]))
         base_read.assert_not_called()
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 1
 
@@ -715,7 +741,7 @@ class TestShardReadPath:
         # nor notified (another decode rank owns and notifies them).
         w = self._read_worker(pp_size=4)
         w._overlapping_ranks = {"eng": [0, 1]}  # this rank's band = stages 0,1
-        w._read_blocks_for_req("r0", self._meta([[1, 2]], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", self._meta([[1, 2]], [[3, 4]]))
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 2
         # only stages 0,1 local handles used (100, 101); never 102/103.
         used = {c.args[1] for c in w.nixl_wrapper.make_prepped_xfer.call_args_list}
@@ -727,7 +753,7 @@ class TestShardReadPath:
         # Full prefix hit under decode-PP: notify only this rank's stages.
         w = self._read_worker(pp_size=4)
         w._overlapping_ranks = {"eng": [0, 1]}
-        w._read_blocks_for_req("r0", self._meta([], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", self._meta([], [[3, 4]]))
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 0
         assert w.nixl_wrapper.send_notif.call_count == 2  # only stages 0,1
         notified = {c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list}
@@ -781,12 +807,31 @@ class TestUpstreamReachesTheOverride:
             )
         }
 
-        w._read_blocks_for_req("r0", TestShardReadPath._meta([[1]], [[1]]))
+        TestShardReadPath._read(w, "r0", TestShardReadPath._meta([[1]], [[1]]))
 
         # The SWA descs live in the second range, which starts past every id
         # upstream's own formula can produce.
         ids = w.nixl_wrapper.make_prepped_xfer.call_args.args[2]
         assert min(ids) >= w.num_regions * w.dst_num_blocks["eng"]
+
+    def test_a_queued_failure_reaches_our_failure_report(self):
+        # Upstream drains the failures its handshake thread queued through our
+        # _handle_failed_transfer, by keyword, and asks it not to count them as
+        # transfer failures a second time.
+        w = TestShardReadPath._read_worker(pp_size=1)
+        w.tp_rank = 0
+        w._reqs_to_send = {}
+        w._recving_metadata["r0"] = TestShardReadPath._meta([[1]], [[1]])
+        w._failed_recv_reqs.put("r0")
+        w.xfer_stats = MagicMock(spec=NixlKVConnectorStats)
+
+        assert w.get_transfer_results().failed_recving == {"r0"}
+        w.xfer_stats.record_failed_transfer.assert_not_called()
+        # Only our override marks the peer for a fresh handshake.
+        assert "eng" not in w._remote_agents
+        # Past every step of upstream's teardown that can raise: one that failed
+        # partway is caught and drops only the agent.
+        assert "eng" not in w._engine_clock_offset
 
 
 class TestFailedRead:
@@ -802,7 +847,7 @@ class TestFailedRead:
         w.nixl_wrapper.make_prepped_xfer.side_effect = [1, 2]
         meta = TestShardReadPath._meta([[1, 2]], [[3, 4]])
         w._recving_metadata["r0"] = meta
-        w._read_blocks_for_req("r0", meta)
+        TestShardReadPath._read(w, "r0", meta)
         return w
 
     def test_a_peer_is_dropped_only_once_its_handles_drain(self):
@@ -847,6 +892,55 @@ class TestLocalLinkDown:
             w._ensure_handshake("eng", "host", 1234, 1, 2, False).result()
         dial.assert_not_called()
 
+    def test_a_refused_handshake_is_counted_once_as_a_handshake(
+        self, monkeypatch, tmp_path
+    ):
+        # A request waiting on a refused handshake fails as a handshake once and
+        # is not counted again as a transfer.
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="down"))
+        w._link_down_exit_s = 0  # the option's default: never exit
+        w.get_transfer_results()
+        w.xfer_stats = MagicMock(spec=NixlKVConnectorStats)
+        meta = TestShardReadPath._meta([[1, 2]], [[3, 4]])
+        w._recving_metadata["r0"] = meta
+        w._remote_agents = {}
+
+        w._background_nixl_handshake("r0", "eng", meta)
+
+        assert w.get_transfer_results().failed_recving == {"r0"}
+        w.xfer_stats.record_failed_handshake.assert_called_once()
+        w.xfer_stats.record_failed_transfer.assert_not_called()
+
+    def test_a_refusal_upstream_would_not_have_dialled_is_not_counted(
+        self, monkeypatch, tmp_path
+    ):
+        # Guard: heartbeats ask for a connected engine every step, and an engine
+        # whose handshake is in flight is asked again by each request on it.
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="down"))
+        w.get_transfer_results()
+        w.xfer_stats = MagicMock(spec=NixlKVConnectorStats)
+        w._handshake_futures = {"pending": Future()}
+
+        for engine_id in ("eng", "pending"):
+            with pytest.raises(RuntimeError, match="local RDMA link"):
+                w._ensure_handshake(engine_id, "host", 1234, 1).result()
+
+        w.xfer_stats.record_failed_handshake.assert_not_called()
+
+    def test_a_handshake_on_a_live_link_is_left_to_upstream_to_count(
+        self, monkeypatch, tmp_path
+    ):
+        # Guard: a dial on a live link is upstream's to count when it fails.
+        w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="up"))
+        w.get_transfer_results()
+        w.xfer_stats = MagicMock(spec=NixlKVConnectorStats)
+        dial = MagicMock(return_value=None)
+        monkeypatch.setattr(NixlBaseConnectorWorker, "_ensure_handshake", dial)
+
+        assert w._ensure_handshake("new", "host", 1234, 1) is None
+        dial.assert_called_once_with("new", "host", 1234, 1)
+        w.xfer_stats.record_failed_handshake.assert_not_called()
+
     def test_a_live_spare_link_is_not_down(self, monkeypatch, tmp_path):
         w = self._worker(monkeypatch, fake_sysfs_net(tmp_path, ens1="down", ens2="up"))
         w.get_transfer_results()
@@ -886,13 +980,13 @@ class TestReadMarksTheEngineActive:
 
     def test_read_marks_remote_active(self):
         w = TestShardReadPath._read_worker(pp_size=2)
-        w._read_blocks_for_req("r0", TestShardReadPath._meta([[1, 2]], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", TestShardReadPath._meta([[1, 2]], [[3, 4]]))
         assert "eng" in w._engine_last_active
 
     def test_prefix_hit_read_marks_remote_active(self):
         # A full prefix hit sends notifs only -- still activity.
         w = TestShardReadPath._read_worker(pp_size=2)
-        w._read_blocks_for_req("r0", TestShardReadPath._meta([], [[3, 4]]))
+        TestShardReadPath._read(w, "r0", TestShardReadPath._meta([], [[3, 4]]))
         assert "eng" in w._engine_last_active
 
 
@@ -901,13 +995,58 @@ class TestAReadDeferredPastTheTeardown:
     # the agent, so a heartbeat can declare that engine gone in between and take
     # the descriptors with it.
 
-    def test_it_is_failed_rather_than_read(self):
+    def test_upstream_re_handshakes_it_before_any_read(self):
+        # Guard: our read path asserts the agent is there, on the strength of
+        # this check in upstream's drain.
         w = TestShardReadPath._read_worker(pp_size=1)
         meta = TestShardReadPath._meta([[1, 2]], [[3, 4]])
         w._recving_metadata["r0"] = meta
+        w._ready_requests = queue.Queue()
+        w._ready_requests.put(("r0", meta))
         w._remote_agents.pop("eng")
+        w._background_nixl_handshake = MagicMock()
 
-        w._read_blocks_for_req("r0", meta)
+        NixlPullConnectorWorker.start_load_kv(w, MagicMock(reqs_to_recv={}))
 
-        assert w._recv_failures == {"r0"}
+        w._background_nixl_handshake.assert_called_once_with("r0", "eng", meta)
         assert w.nixl_wrapper.make_prepped_xfer.call_count == 0
+
+    def test_a_read_queued_for_a_failed_request_is_never_issued(self):
+        # The engine is registered and a read for an already reported request is
+        # still queued, as a handshake landing after the report leaves it; an
+        # awaited read and a notification queued beside it still go out.
+        w = TestShardReadPath._read_worker(pp_size=2)
+        reported = TestShardReadPath._meta([[1, 2]], [[3, 4]])
+        awaited = TestShardReadPath._meta([[5]], [[6]])
+        notif = TestShardReadPath._meta([], [[9]])
+        w._recving_metadata["r1"] = awaited
+        w._ready_requests = queue.Queue()
+        for entry in (("r0", reported), ("r1", awaited), ("r2", notif)):
+            w._ready_requests.put(entry)
+
+        w.xfer_stats = MagicMock(spec=NixlKVConnectorStats)
+
+        NixlPullConnectorWorker.start_load_kv(w, MagicMock(reqs_to_recv={}))
+
+        assert set(w._recving_transfers) == {"r1"}
+        assert w.nixl_wrapper.send_notif.call_count == 2
+        # A skipped read is not a second failure for a request already reported.
+        assert w._recv_failures == set()
+        assert w._engines_to_rehandshake == set()
+        w.xfer_stats.record_failed_transfer.assert_not_called()
+
+    def test_nor_through_upstreams_whole_engine_read(self, monkeypatch):
+        # The same reported read for an engine nothing narrows, whose reads go
+        # through upstream's route.
+        w = TestShardReadPath._read_worker(pp_size=1)
+        w._overlapping_ranks = {}
+        upstream_read = MagicMock()
+        monkeypatch.setattr(
+            NixlPullConnectorWorker, "_read_blocks_for_req", upstream_read
+        )
+        w._ready_requests = queue.Queue()
+        w._ready_requests.put(("r0", TestShardReadPath._meta([[1, 2]], [[3, 4]])))
+
+        NixlPullConnectorWorker.start_load_kv(w, MagicMock(reqs_to_recv={}))
+
+        upstream_read.assert_not_called()

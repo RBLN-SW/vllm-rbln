@@ -1223,6 +1223,11 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 # flush gave up on it past its deadline. Filed here either
                 # way -- these handles are in flight, and upstream's map is
                 # what releases them.
+                if streamed is not None or len(handles) < len(writes):
+                    # Held out of upstream's success report: a flush already
+                    # returned this request's blocks, and a lost submission is
+                    # one upstream holds back from its own report too.
+                    self._send_failures.add(req_id)
                 self._sending_transfers[req_id].extend(handles)
 
     def _stream_window(

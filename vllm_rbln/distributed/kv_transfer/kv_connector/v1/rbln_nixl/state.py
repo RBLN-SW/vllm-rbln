@@ -263,6 +263,7 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         req_id: str,
         handle: int | None,
         failed_req_ids: set[str] | None = None,
+        record_failed_transfer: bool = True,
     ) -> bool:
         """Upstream's failure report, minus the reads nothing is waiting on.
 
@@ -282,7 +283,12 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             return True
         if meta is not None and meta.remote is not None:
             self._engines_to_rehandshake.add(meta.remote.engine_id)
-        return super()._handle_failed_transfer(req_id, handle, failed_req_ids)
+        return super()._handle_failed_transfer(
+            req_id,
+            handle,
+            failed_req_ids,
+            record_failed_transfer=record_failed_transfer,
+        )
 
     def _layer_overlap(
         self, registered_layer_names: tuple[str, ...] | list[str]
