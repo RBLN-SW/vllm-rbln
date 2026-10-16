@@ -32,7 +32,6 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -146,32 +145,6 @@ def _without_indexer():
         _k2.Indexer = original
 
 
-def _alias_index_cache(
-    vllm_config: VllmConfig, prefix: str, source_layer: int
-) -> DeepseekV32IndexerCache:
-    """An index-key cache for a skip layer that aliases its source layer's.
-
-    The runner binds `num_attn_module` caches per decoder layer (MLA, index key
-    and, for fp8, its scale), so a skip layer still needs them to keep the
-    compacted cache list aligned. Nothing reads them, so they share the source
-    layer's caches through vLLM KV sharing instead of allocating their own.
-    """
-    layers_prefix = prefix.rsplit(".", 1)[0]
-    name = f"{prefix}.self_attn.indexer.k_cache"
-    target = f"{layers_prefix}.{source_layer}.self_attn.indexer.k_cache"
-    cache = DeepseekV32IndexerCache(
-        head_dim=vllm_config.model_config.hf_config.index_head_dim,
-        dtype=torch.bfloat16,
-        prefix=name,
-        cache_config=vllm_config.cache_config,
-    )
-    # Read by the runner's `get_kv_cache_spec`, as on vLLM's `Attention`.
-    cache.kv_sharing_target_layer_name = target
-    if cache.scale_cache is not None:
-        cache.scale_cache.kv_sharing_target_layer_name = f"{target}.scale_cache"
-    return cache
-
-
 def _gated_mla_forward(
     mla: nn.Module,
     positions: torch.Tensor,
@@ -246,10 +219,6 @@ class AXK3DecoderLayer(_k2.AXK2DecoderLayer):
         assert not self.self_attn.dsv3_pad, "axk3 has the DSv3 MLA layout"
         self.index_skip = index_skip
         self.index_source_layer = config.index_source_layer(layer_idx)
-        if index_skip:
-            self.index_cache_alias = _alias_index_cache(
-                vllm_config, prefix, self.index_source_layer
-            )
 
         # Gated Residual replaces both pre-norms.
         del self.input_layernorm
