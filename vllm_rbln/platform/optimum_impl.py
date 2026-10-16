@@ -27,7 +27,11 @@ logger = init_logger(__name__)
 
 
 def patch_upstream() -> None:
-    pass
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    # Upstream selects Triton filtering without a platform dispatch hook.
+    # The optimum path does not apply the vllm path's patch registry.
+    topk_topp_sampler.apply_top_k_top_p = topk_topp_sampler.apply_top_k_top_p_pytorch
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:
