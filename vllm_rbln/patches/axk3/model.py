@@ -21,6 +21,7 @@ and changes three things, all following the checkpoint's ``modeling_axk3.py``:
 """
 
 import contextlib
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +44,9 @@ from vllm.sequence import IntermediateTensors
 from vllm_rbln.patches.axk2 import model as _axk2_model
 
 _k2 = _axk2_model._module
+# Loaded at import time from the frozen copy, so mypy cannot see these classes.
+_AXK2DecoderLayer: Any = _k2.AXK2DecoderLayer
+_AXK2ForCausalLM: Any = _k2.AXK2ForCausalLM
 
 
 class AXK3GatedResidual(nn.Module):
@@ -191,7 +195,7 @@ def _gated_mla_forward(
     return mla.o_proj(attn_out)[0], topk_indices
 
 
-class AXK3DecoderLayer(_k2.AXK2DecoderLayer):
+class AXK3DecoderLayer(_AXK2DecoderLayer):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -333,7 +337,7 @@ class AXK3Model(nn.Module):
         return hidden_states
 
 
-class AXK3ForCausalLM(_k2.AXK2ForCausalLM):
+class AXK3ForCausalLM(_AXK2ForCausalLM):
     model_cls = AXK3Model
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
