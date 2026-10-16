@@ -133,6 +133,7 @@ def _push_worker():
     w.consumer_notification_counts_by_req = {}
     w._sending_transfers = defaultdict(list)
     w._sending_transfers_lock = threading.Lock()
+    w._send_failures = set()
     # __init__ never ran, so the writer state shutdown() reaches through
     # __del__ is absent; silence it rather than leak an unraisable at GC.
     w.shutdown = lambda: None
@@ -600,6 +601,84 @@ class TestPerShardWrite:
 
         worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(handle)
         assert worker._sending_transfers["r0"] == []
+
+    @classmethod
+    def _written_to_two_peers(cls, monkeypatch, submissions):
+        # Upstream's `NixlBaseConnectorWorker` report is stubbed empty, so the
+        # push worker's is the only one with content.
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker,
+            "get_transfer_results",
+            lambda self: KVConnectorTransferResults(),
+        )
+        worker = cls._writing_worker(ranks=2)
+        worker.nixl_wrapper.make_prepped_xfer.side_effect = submissions
+        worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
+        worker._log_failure = MagicMock()
+        worker.xfer_stats = MagicMock()
+        worker._evict_finished_inbox = queue.Queue()
+        worker._push_writer_wake = threading.Event()
+        worker._reqs_to_send = {"r0": 1.0}
+        worker._xfer_blocks_for_req("r0", cls._meta(([1, 2],), ([3, 4],)))
+        return worker
+
+    def test_a_peer_that_did_not_submit_keeps_the_request_unsent(self, monkeypatch):
+        # The other peer's WRITE lands, and upstream reports a request as sent
+        # once its handles are done, freeing blocks one consumer never got.
+        worker = self._written_to_two_peers(monkeypatch, [RuntimeError("boom"), 7])
+
+        assert worker.get_transfer_results().finished_sending == set()
+        assert worker._reqs_to_send == {"r0": 1.0}
+
+    def test_a_request_none_of_whose_writes_went_out_is_not_sent(self, monkeypatch):
+        # Every submission failing files no handle at all, and upstream reads an
+        # empty handle list as done.
+        worker = self._written_to_two_peers(
+            monkeypatch, [RuntimeError("boom"), RuntimeError("boom")]
+        )
+
+        assert worker.get_transfer_results().finished_sending == set()
+        assert worker._reqs_to_send == {"r0": 1.0}
+
+    def test_a_batch_recorded_after_its_flush_gave_up_is_not_reported_sent(
+        self, monkeypatch
+    ):
+        # The flush dropped the record, so the batch lands on upstream's map,
+        # whose report covers a request still being processed. A preempted one
+        # still is, so the scheduler would free a live request's blocks.
+        monkeypatch.setattr(
+            NixlBaseConnectorWorker,
+            "get_transfer_results",
+            lambda self: KVConnectorTransferResults(),
+        )
+        setattr_in_package(monkeypatch, _EARLY_FLUSH_DRAIN_TIMEOUT_S=0.0)
+        worker = self._writing_worker(ranks=1)
+        worker.nixl_wrapper.check_xfer_state.return_value = "DONE"
+        worker.xfer_stats = MagicMock()
+        worker._evict_finished_inbox = queue.Queue()
+        worker._push_writer_wake = threading.Event()
+        worker._reqs_to_process = {"r0"}
+        dropped = _send(worker, released=True, issued=1)
+        worker.flush_early_sends({"r0"})
+        late = pw._Write(
+            peer_rank=0,
+            local_handle=100,
+            remote_handle=200,
+            local_descs=[1],
+            remote_descs=[3],
+        )
+
+        worker._submit_writes("r0", "eng", b"r0:1", [late], dropped)
+
+        assert worker.get_transfer_results().finished_sending == set()
+        assert worker._sending_transfers == {}
+
+    def test_writes_that_all_landed_report_the_request_sent(self, monkeypatch):
+        # Guard: holding every request back would leave each to its lease.
+        worker = self._written_to_two_peers(monkeypatch, [7, 8])
+
+        assert worker.get_transfer_results().finished_sending == {"r0"}
+        assert worker._reqs_to_send == {}
 
     def test_the_engine_is_kept_off_the_staleness_sweep(self):
         # The sweep drops a quiet engine's state, and this path reads it. The

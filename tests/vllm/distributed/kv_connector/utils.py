@@ -139,12 +139,12 @@ def mock_vllm_config(**options) -> Any:
     from unittest.mock import MagicMock
 
     config = MagicMock()
-    # The one attribute outside the knobs that a mock answers wrongly rather
-    # than harmlessly: a chunk size is floored by it, and arithmetic on a mock
-    # raises instead of producing a chunk size that is merely wrong. The value
-    # is the one `engine_config` builds, so a mocked config and a real one size
-    # a chunk the same way.
+    # Attributes outside the knobs that a mock answers wrongly: comparing a mock
+    # with a number raises. The values are what `engine_config` builds by
+    # default, so a mocked config and a real one size a chunk and a prefill the
+    # same way.
     config.scheduler_config.max_num_batched_tokens = 128
+    config.num_prefill_lookahead_tokens = 0
     set_mock_connector_options(config, **options)
     return config
 
