@@ -126,7 +126,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         pass
 
     @abstractmethod
-    def _create_video_embedding_inputs(self, video_embeds, video_grid_thw) -> Any:
+    def _create_video_embedding_inputs(
+        self, video_embeds, video_grid_thw, second_per_grid_ts
+    ) -> Any:
         """Create video embedding inputs based on model type"""
         pass
 
@@ -166,7 +168,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
             )
 
         if video_embeds is not None:
-            return self._create_video_embedding_inputs(video_embeds, video_grid_thw)
+            return self._create_video_embedding_inputs(
+                video_embeds, video_grid_thw, second_per_grid_ts
+            )
 
         # fallback return if both are None
         return None
@@ -316,7 +320,7 @@ class RBLNOptimumQwen2_5_VLForConditionalGeneration(
         self,
         pixel_values_videos: torch.Tensor,
         video_grid_thw: torch.Tensor,
-        second_per_grid_ts=torch.Tensor | None,
+        second_per_grid_ts: torch.Tensor | None,
     ):
         if second_per_grid_ts is None:
             raise ValueError(
@@ -329,11 +333,14 @@ class RBLNOptimumQwen2_5_VLForConditionalGeneration(
             second_per_grid_ts=second_per_grid_ts,
         )
 
-    def _create_video_embedding_inputs(self, video_embeds, video_grid_thw):
+    def _create_video_embedding_inputs(
+        self, video_embeds, video_grid_thw, second_per_grid_ts
+    ):
         return Qwen2_5_VLVideoEmbeddingInputs(
             type="video_embeds",
             video_embeds=video_embeds,
             video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
         )
 
 
@@ -367,7 +374,9 @@ class RBLNOptimumQwen2VLForConditionalGeneration(
             video_grid_thw=video_grid_thw,
         )
 
-    def _create_video_embedding_inputs(self, video_embeds, video_grid_thw):
+    def _create_video_embedding_inputs(
+        self, video_embeds, video_grid_thw, second_per_grid_ts
+    ):
         return Qwen2VLVideoEmbeddingInputs(
             type="video_embeds",
             video_embeds=video_embeds,
