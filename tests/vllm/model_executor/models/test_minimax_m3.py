@@ -153,3 +153,25 @@ def test_image_encoding_reuses_eager_or_compiled_encoder(monkeypatch, compiled):
     assert model._mm_encoder is encoder
     assert "_mm_encoder" not in model._modules
     assert list(model.state_dict()) == ["vision_tower.weight"]
+
+
+def test_text_config_loads_from_local_checkpoint(tmp_path):
+    from vllm.transformers_utils.config import get_config
+    from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
+
+    config = MiniMaxM3TextConfig(
+        architectures=["MiniMaxM3SparseForCausalLM"],
+        hidden_size=512,
+        num_hidden_layers=2,
+        vocab_size=256,
+        num_mtp_modules=0,
+    )
+    config.save_pretrained(tmp_path)
+
+    loaded = get_config(str(tmp_path), trust_remote_code=False)
+
+    assert isinstance(loaded, MiniMaxM3TextConfig)
+    assert loaded.hidden_size == 512
+    assert loaded.num_hidden_layers == 2
+    assert loaded.vocab_size == 256
+    assert loaded.architectures == ["MiniMaxM3SparseForCausalLM"]
