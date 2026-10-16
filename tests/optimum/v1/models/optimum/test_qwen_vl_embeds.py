@@ -96,6 +96,23 @@ class TestEmbedMultimodal:
         assert model.embed_multimodal() == []
 
 
+class TestQwen2_5VideoInputs:
+    def test_pixel_inputs_require_time_interval(self):
+        model = _qwen(Qwen2_5VL, visual=None)
+        with pytest.raises(ValueError, match="second_per_grid_ts is required"):
+            model._parse_and_validate_video_input(
+                pixel_values_videos=PIXELS, video_grid_thw=GRID
+            )
+
+    def test_embedding_inputs_preserve_time_interval(self):
+        model = _qwen(Qwen2_5VL, visual=None)
+        seconds = torch.tensor([0.5, 1.0])
+        video = model._parse_and_validate_video_input(
+            video_embeds=_rows(6), video_grid_thw=GRID, second_per_grid_ts=seconds
+        )
+        assert video["second_per_grid_ts"] is seconds
+
+
 def _prefill_input(tokens, mm_embeds, is_mm_embed):
     return ModelInputForRBLN(
         input_tokens=torch.tensor([tokens]),
@@ -227,6 +244,14 @@ class TestMropeInputPositions:
         ((_, kwargs),) = calls
         assert "second_per_grid_ts" not in kwargs
         assert kwargs["image_grid_thw"] is None
+
+    def test_qwen2_5_requires_video_time_interval(self):
+        model, calls = _mrope_model(Qwen2_5VL)
+        with pytest.raises(KeyError, match="second_per_grid_ts"):
+            model.get_mrope_input_positions(
+                self.TOKENS, [_feature("video", 1, [2, 2, 2])]
+            )
+        assert not calls
 
 
 def test_position_embed_zeroes_the_padding_rows():
