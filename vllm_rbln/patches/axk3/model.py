@@ -28,6 +28,7 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -47,7 +48,7 @@ _k2 = _axk2_model._module
 class AXK3GatedResidual(nn.Module):
     """Gated Residual read/write over ``num_streams`` residual branches.
 
-    Same numerics as ``AXK3GatedResidual`` in ``modeling_axk3.py``: fp32 RMSNorm
+    Numerics follow ``AXK3GatedResidual`` in ``modeling_axk3.py``: fp32 RMSNorm
     statistics, the read gate applied in fp32, the write gate kept in fp32.
     """
 
@@ -74,6 +75,7 @@ class AXK3GatedResidual(nn.Module):
             requires_grad=False,
         )
         self.gamma.weight_loader = self._load_gamma
+        self.norm = RMSNorm(hidden_size, eps=eps, has_weight=False)
         self.read_down = ReplicatedLinear(
             wide, rank, bias=False, quant_config=None, prefix=f"{prefix}.read_down"
         )
@@ -105,9 +107,13 @@ class AXK3GatedResidual(nn.Module):
     def read(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """[..., n*h] -> (block input [..., h], write gate [..., n] fp32 or None)."""
         n = self.num_streams
-        x = self._streams(residual).float()
-        rstd = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        u = (x * rstd * self.gamma).to(residual.dtype).view_as(residual)
+        # vLLM's RMSNorm over one row per (token, stream), so the norm lowers
+        # like every other RMSNorm; a hand-written [T, n, 1] statistic left a
+        # host rsqrt between the device functions of every decode layer. The
+        # per-stream gain is applied after it.
+        normed = self.norm(residual.reshape(-1, self.hidden_size))
+        u = self._streams(normed.view_as(residual)).float() * self.gamma
+        u = u.to(residual.dtype).view_as(residual)
 
         z = F.silu(self.read_down(u)[0] / n)
         gate = torch.sigmoid(self.read_up(z)[0].float())
