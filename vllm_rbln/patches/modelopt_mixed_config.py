@@ -24,6 +24,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm_rbln.model_executor.layers.quantization.modelopt_fp8 import (
     RBLNModelOptFp8LinearMethod,
 )
+from vllm_rbln.model_executor.layers.quantization.modelopt_mxfp8 import (
+    RBLNModelOptMxFp8LinearMethod,
+)
 from vllm_rbln.model_executor.layers.quantization.nvfp4 import (
     RBLNModelOptNvFp4FusedMoE,
 )
@@ -71,4 +74,19 @@ def register_rbln_modelopt_mixed_config() -> None:
 def register_rbln_modelopt_fp8_linear_method() -> None:
     LINEAR_METHOD_BUILDERS["FP8"] = lambda config, prefix: (
         RBLNModelOptFp8LinearMethod(config)
+    )
+
+
+@add_registration(
+    reason=(
+        "Upstream has no MXFP8 linear method, so build_linear_method leaves the "
+        "layer unquantized: it reads the e4m3 bytes into bf16 and drops the e8m0 "
+        "block scales. Register one through the same LINEAR_METHOD_BUILDERS hook "
+        "the FP8 method uses so MXFP8 linears keep their fp8 weight + block "
+        "scales (W8A16) on RBLN."
+    )
+)
+def register_rbln_modelopt_mxfp8_linear_method() -> None:
+    LINEAR_METHOD_BUILDERS["MXFP8"] = lambda config, prefix: (
+        RBLNModelOptMxFp8LinearMethod()
     )

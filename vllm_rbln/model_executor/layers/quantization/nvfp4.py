@@ -107,6 +107,9 @@ class RBLNModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             up_proj_scale_2=layer.w13_weight_scale_2[:, 1].contiguous(),
             down_proj_scale_2=layer.w2_weight_scale_2,
             weight_dtype=_PACKED_FP4_WEIGHT_DTYPE,
+            swiglu_alpha=getattr(layer, "swiglu_alpha", None),
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
+            swiglu_beta=getattr(layer, "swiglu_beta", None),
         )
         return out.reshape(orig_shape)
 

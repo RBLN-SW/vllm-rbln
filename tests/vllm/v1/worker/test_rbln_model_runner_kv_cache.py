@@ -95,6 +95,62 @@ class TestKVCacheBaseBindings:
         assert runner.kv_cache_view_infos == []
 
 
+class TestMiniMaxM3IndexCacheSharing:
+    def test_dense_placeholder_reuses_sparse_cache_after_resize(
+        self, make_model_runner
+    ):
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        from vllm_rbln.model_executor.models.minimax_m3 import (
+            RBLNMiniMaxM3IndexerCache,
+        )
+
+        runner = make_model_runner(
+            layers=(),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        runner.model_config.hf_text_config.sparse_attention_config = {
+            "sparse_attention_freq": [0, 1]
+        }
+        dense_name = "model.layers.0.self_attn.attn.indexer"
+        sparse_name = "model.layers.1.self_attn.attn.indexer"
+        dense = RBLNMiniMaxM3IndexerCache(
+            head_dim=128,
+            prefix=dense_name,
+            cache_config=runner.cache_config,
+            kv_sharing_target_layer_name=sparse_name,
+        )
+        sparse = RBLNMiniMaxM3IndexerCache(
+            head_dim=128, prefix=sparse_name, cache_config=runner.cache_config
+        )
+        specs = runner.get_kv_cache_spec()
+        assert set(specs) == {sparse_name}
+        assert runner.shared_kv_cache_layers == {dense_name: sparse_name}
+        uniform = UniformTypeKVCacheSpecs(
+            block_size=runner.cache_config.block_size, kv_cache_specs=specs
+        )
+        config = make_kv_cache_config(
+            groups=[(sparse_name,)], num_blocks=2, spec=uniform
+        )
+        runner.initialize_kv_cache(config)
+        assert dense.kv_cache is sparse.kv_cache
+        assert dense.kv_cache.shape[0] == 2
+        assert len(runner.kv_cache_config.kv_cache_tensors) == 1
+        previous = sparse.kv_cache
+
+        resized = make_kv_cache_config(
+            groups=[(sparse_name,)], num_blocks=4, spec=uniform
+        )
+        runner.maybe_add_kv_sharing_layers_to_kv_cache_groups(resized)
+        runner.initialize_kv_cache_tensors(resized, runner._kernel_block_sizes)
+
+        assert dense.kv_cache is sparse.kv_cache
+        assert sparse.kv_cache is not previous
+        assert sparse.kv_cache.shape[0] == 4
+        assert len(resized.kv_cache_tensors) == 1
+
+
 class TestHostBufferCopyOp:
     def test_the_registered_op_reads_the_axes_at_call_time(
         self, make_model_runner, monkeypatch
