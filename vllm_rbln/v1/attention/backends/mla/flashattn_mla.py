@@ -141,8 +141,12 @@ class RBLNFlashAttnMLAImpl(MLAAttentionImpl[RBLNFlashAttentionMetadata]):
                 "Only decoder self-attention is implemented for FlashAttnMLAImpl"
             )
 
+        # MLAAttention hands every sparse layer the top-k buffer, including an
+        # index-share skip layer that owns no indexer and reads another layer's
+        # top-k.
+        is_sparse = self.indexer is not None or topk_indices_buffer is not None
         if is_quantized_kv_cache(self.kv_cache_dtype) and not (
-            self.kv_cache_dtype.startswith("fp8") and self.indexer is not None
+            self.kv_cache_dtype.startswith("fp8") and is_sparse
         ):
             # Only the sparse (DSA) path packs an fp8 latent cache the kernel can
             # read; a dense MLA layer would be handed a cache its bf16 kernel
