@@ -585,11 +585,22 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     self._handle_dead_engine(engine_id, error=e)
                     break
 
-    def _ensure_handshake(self, *args: Any, **kwargs: Any) -> Future | None:
+    def _ensure_handshake(
+        self, engine_id: str, *args: Any, **kwargs: Any
+    ) -> Future | None:
         # A dial from a dead local link leaves nixl a half-loaded remote that
         # fails every later handshake, so nothing is dialled until it is back.
         if self._link_down_since is None:
-            return super()._ensure_handshake(*args, **kwargs)
+            return super()._ensure_handshake(engine_id, *args, **kwargs)
+        # Counted where upstream would have dialled, short of its TTL sweep,
+        # whose NIXL teardown this branch keeps off a dead link. Upstream counts
+        # a failed dial there and drains the requests waiting on it uncounted.
+        with self._handshake_lock:
+            if (
+                engine_id not in self._remote_agents
+                and engine_id not in self._handshake_futures
+            ):
+                self.xfer_stats.record_failed_handshake()
         failed: Future = Future()
         failed.set_exception(RuntimeError("every local RDMA link is down"))
         return failed
