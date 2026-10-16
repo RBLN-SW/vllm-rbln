@@ -14,7 +14,6 @@
 
 import importlib.util
 import math
-import re
 import sys
 from collections.abc import Iterable
 from itertools import islice
@@ -31,7 +30,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -330,33 +328,6 @@ class RBLNMiniMaxM3Attention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
-        )
-
-        # Dense placeholders alias a local sparse cache to keep the runner's
-        # per-layer cache list aligned without allocating an unbound KV tensor.
-        # Dynamic KV sizing requires allocated tensors to be bound by a program.
-        sparse_cfg = getattr(config, "sparse_attention_config", None)
-        sparse_freq = sparse_cfg.get("sparse_attention_freq") if sparse_cfg else None
-        match = re.search(r"\.layers\.(\d+)\.", prefix)
-        shared_index_cache_target = None
-        if sparse_freq and match is not None:
-            pp = get_pp_group()
-            start, end = get_pp_indices(
-                config.num_hidden_layers, pp.rank_in_group, pp.world_size
-            )
-            sparse = [
-                i for i in range(start, end) if i < len(sparse_freq) and sparse_freq[i]
-            ]
-            if sparse:
-                target = (
-                    f"{prefix[: match.start(1)]}{sparse[0]}{prefix[match.end(1) :]}"
-                )
-                shared_index_cache_target = f"{target}.attn.indexer"
-        self.indexer_cache = RBLNMiniMaxM3IndexerCache(
-            head_dim=config.sparse_attention_config["sparse_index_dim"],
-            prefix=f"{prefix}.attn.indexer",
-            cache_config=cache_config,
-            kv_sharing_target_layer_name=shared_index_cache_target,
         )
 
     def forward(

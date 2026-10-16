@@ -3294,6 +3294,15 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
+        # A layer reads its cache at its position in this list (and in the view
+        # infos, ordered the same way). The index set at construction assumes
+        # every decoder layer owns `num_attn_module` caches, so a layer that owns
+        # fewer (e.g. a dense layer with no indexer cache) shifts every later
+        # one; take the position the list actually gives it.
+        for position, layer_name in enumerate(self.kv_cache_names):
+            layer = forward_context[layer_name]
+            if hasattr(layer, "layer_index"):
+                layer.layer_index = position
 
         if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
