@@ -64,7 +64,15 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
             sampled_token_ids.shape,
             dtype=sampled_token_ids.dtype,
             device="cpu",
+            pin_memory=not sampled_token_ids.is_cpu,
         )
+        # Start the D2H right behind the sampler, as AsyncGPUModelRunnerOutput
+        # does. From get_output() it would queue behind the next forward.
+        self._copy_ready_event: torch.Event | None = None
+        if not sampled_token_ids.is_cpu:
+            self._sampled_token_ids_cpu.copy_(sampled_token_ids, non_blocking=True)
+            self._copy_ready_event = torch.Event(device=sampled_token_ids.device)
+            self._copy_ready_event.record()
         # Logprobs ride the same deferral. Only the dense form is free of the
         # tokens: the topk form indexes by the sampled ids, so building it pulls
         # them to the host mid-step and serialises what async just decoupled.
@@ -72,18 +80,18 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
 
     @worker_fail_fast
     def get_output(self) -> ModelRunnerOutput:
-        """Copy the device tensors to the host and return a ModelRunnerOutput.
+        """Wait for the sampled tokens on the host and return a ModelRunnerOutput.
 
         Blocks until the copy finishes; the executor decides which thread calls it.
-        InferenceMode is thread-local, hence off here, and updating
-        _sampled_token_ids_cpu - an inference tensor allocated
-        under sample_tokens - in place with it off is a hard error.
         """
-        # Blocking copy, not non_blocking + a device synchronize: synchronizing
-        # waits on every pending transfer, so once forward(N+1) is dispatched
-        # this thread would wait out a whole forward. This waits on the sampler.
-        with torch.inference_mode():
-            self._sampled_token_ids_cpu.copy_(self._sampled_token_ids)
+        if self._copy_ready_event is not None:
+            self._copy_ready_event.synchronize()
+        else:
+            # InferenceMode is thread-local, hence off here, and updating
+            # _sampled_token_ids_cpu - an inference tensor allocated under
+            # sample_tokens - in place with it off is a hard error.
+            with torch.inference_mode():
+                self._sampled_token_ids_cpu.copy_(self._sampled_token_ids)
 
         valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
         for i in self._invalid_req_indices:
