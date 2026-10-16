@@ -389,6 +389,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.prompt_token_arrays: dict[str, np.ndarray] = {}
         self.num_prompt_logprobs: dict[str, int] = {}
 
         # Input Batch
@@ -616,6 +617,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.prompt_token_arrays.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
@@ -801,7 +803,23 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 sampling_params := request.sampling_params
             ):
                 sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
+            # A prefill-only step evicts every decode request, so each one is re-added
+            # here once per prefill, and converting the prompt list is most of
+            # add_request. Fill the row from an array made on the first add, and give
+            # logits processors back the list.
+            prompt = request.prompt_token_ids
+            if prompt is not None:
+                array = self.prompt_token_arrays.get(request.req_id)
+                if array is None:
+                    array = np.asarray(prompt, dtype=np.int32)
+                    self.prompt_token_arrays[request.req_id] = array
+                request.prompt_token_ids = array
             self.input_batch.add_request(request)
+            request.prompt_token_ids = prompt
+            if request.sampling_params:
+                added = self.input_batch.batch_update_builder.added
+                index, params, _, output_token_ids = added[-1]
+                added[-1] = (index, params, prompt, output_token_ids)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
@@ -821,6 +839,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         """
         self.input_batch.remove_request(req_id)
         req_state = self.requests[req_id]
+        # The prompt changes here, sometimes in place, so drop its cached array.
+        self.prompt_token_arrays.pop(req_id, None)
 
         req_state.prompt_token_ids = new_req_data.prompt_token_ids
         req_state.mm_features = new_req_data.mm_features

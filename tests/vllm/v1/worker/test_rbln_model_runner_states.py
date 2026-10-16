@@ -110,6 +110,78 @@ class TestBlockTableMaintenance:
             assert block_table_matches_state(runner, req_id)
 
 
+class TestPromptRowReAdd:
+    def test_re_add_fills_the_row_from_the_first_prompt_array(
+        self, make_model_runner, monkeypatch
+    ):
+        # A decode evicted by a prefill-only step is re-added from the array made
+        # on its first add; logits processors still see the prompt list.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        prompt = runner.requests["a"].prompt_token_ids
+        array = runner.prompt_token_arrays["a"]
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        handed_in: list[object] = []
+        seen: list[list[int] | None] = []
+        add_request = runner.input_batch.add_request
+        refresh = runner.input_batch.refresh_metadata
+
+        def record_handed_in(request):
+            handed_in.append(request.prompt_token_ids)
+            return add_request(request)
+
+        def record_added():
+            seen.extend(
+                added[2] for added in runner.input_batch.batch_update_builder.added
+            )
+            refresh()
+
+        monkeypatch.setattr(runner.input_batch, "add_request", record_handed_in)
+        monkeypatch.setattr(runner.input_batch, "refresh_metadata", record_added)
+        runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
+
+        assert runner.prompt_token_arrays["a"] is array
+        assert len(handed_in) == 1 and handed_in[0] is array
+        assert runner.requests["a"].prompt_token_ids is prompt
+        assert len(seen) == 1 and seen[0] is prompt
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert (
+            runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
+            == prompt
+        )
+
+    def test_finished_request_drops_its_prompt_array(
+        self, make_model_runner, monkeypatch
+    ):
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        runner._update_states(make_scheduler_output(finished_req_ids={"a"}))
+        assert "a" not in runner.prompt_token_arrays
+
+    def test_streaming_update_refills_the_row_from_the_grown_prompt(
+        self, make_model_runner, monkeypatch
+    ):
+        # Under the uni executor the scheduler extends this same list in place for
+        # a streaming update, so the list identity does not change.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        prompt = [1, 2, 3]
+        runner._update_states(schedule_new("a", prompt_token_ids=[prompt]))
+        prompt.extend([4, 5])
+        runner._update_states(schedule_new("a", prompt_token_ids=[prompt]))
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert runner.input_batch.num_prompt_tokens[req_index] == len(prompt)
+        assert (
+            runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
+            == prompt
+        )
+
+
 class TestOutputTokenAlignment:
     def test_discarded_output_tokens_are_truncated(
         self, make_model_runner, monkeypatch
