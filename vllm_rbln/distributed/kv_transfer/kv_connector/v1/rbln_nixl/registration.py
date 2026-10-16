@@ -332,8 +332,6 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 if isinstance(layer_spec, MambaSpec)
                 else self.num_blocks
             )
-            # Materialize the backing memory of kv_cache.
-            cache_or_caches.zero_()
 
             # Collect this entry's logical K/V regions.
             entry_base_addr = cache_or_caches.data_ptr()

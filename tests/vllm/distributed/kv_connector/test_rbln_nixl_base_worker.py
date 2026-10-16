@@ -43,9 +43,6 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.pull_worker imp
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.push_worker import (
     RblnNixlPushConnectorWorker,
 )
-from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
-    _as_descs,
-)
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
 
 
@@ -605,14 +602,12 @@ class TestRegisterLocalXferHandlerSwa:
         # is a head's stretch of the block, so the second run starts halfway.
         assert np.array_equal(
             blocks_data[24:28],
-            _as_descs(
-                [
-                    (0x1000, 64, 0),
-                    (0x1040, 64, 0),
-                    (0x1080, 64, 0),
-                    (0x10C0, 64, 0),
-                ]
-            ),
+            [
+                (0x1000, 64, 0),
+                (0x1040, 64, 0),
+                (0x1080, 64, 0),
+                (0x10C0, 64, 0),
+            ],
         )
 
     def test_a_packed_block_is_chunked_across_both_halves(self, monkeypatch):

@@ -19,6 +19,9 @@ GREEDY_TEMPERATURE = 0
 GREEDY_TOP_K = 1
 GREEDY_TOP_P = 1.0
 
+# FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+TOP_P_CLAMP = 0.995
+
 
 def build_op_top_k_top_p(
     sampling_metadata: SamplingMetadata,
@@ -44,6 +47,16 @@ def build_op_top_k_top_p(
     In the mixed rows, `a / b` reads: `a` at greedy rows, `b` at random rows.
     `top_k` is never `None` there, because a greedy row is encoded as
     `top_k == 1`.
+
+    Until rbln::top_k_top_p is revised (FIXME above), these rows are patched:
+
+    batch      | filters (random rows)    | top_p
+    -----------+--------------------------+-------------------------------
+    all random | none (pure multinomial)  | tensor of TOP_P_CLAMP
+               | top-k only               | tensor of TOP_P_CLAMP
+    mixed      | none (pure multinomial)  | tensor of TOP_P_CLAMP
+               | top-k only               | tensor of TOP_P_CLAMP
+
     """
     # Reached only from the rejection sampler: spec decode has no separate
     # greedy op, while the normal sampler answers all_greedy with rbln::argmax.
@@ -57,6 +70,12 @@ def build_op_top_k_top_p(
     top_p = sampling_metadata.top_p
     assert top_k is None or top_k.shape == (batch_size,)
     assert top_p is None or top_p.shape == (batch_size,)
+
+    # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+    if top_p is None:
+        top_p = torch.full(
+            (batch_size,), TOP_P_CLAMP, dtype=torch.float32, device=device
+        )
 
     if sampling_metadata.all_random:
         return top_k, top_p

@@ -138,6 +138,7 @@ from vllm_rbln.v1.core.utils import (
     step_is_prefill,
     sub_block_size_in_use,
 )
+from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.sample.rbln_sampler import WARM_UP_CONFIGS, RBLNSampler
@@ -795,6 +796,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
+            # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+            if self.rbln_config.use_custom_sampler and (
+                sampling_params := request.sampling_params
+            ):
+                sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
@@ -1077,6 +1083,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     is_prefill=self.is_prefill,
                     batch_pad=num_reqs_padded,
                     back_pad=back_pad,
+                    is_prompt_sorted=self.sort_batch_by_length,
                 )
 
                 for layer_name in attn_group.layer_names:
@@ -1992,11 +1999,31 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         if propose_drafts_after_bookkeeping:
             propose_draft_token_ids(valid_sampled_token_ids)
 
-        # Finalize the KV connector (wait_for_save + clear metadata) after the
-        # draft model runs. With spec decode, this was deferred from the target
-        # model forward so the draft model can also save its KV cache.
-        if spec_config is not None:
-            self.finalize_kv_connector()
+        # Finalize the KV connector after the draft model runs. With spec decode,
+        # this was deferred from the target model forward so the draft model can
+        # also save its KV cache. Unlike finalize_kv_connector(), collect events
+        # between wait_for_save and clear_connector_metadata, as upstream does.
+        if spec_config is not None and has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            kv_connector.wait_for_save()
+            late_events = kv_connector.get_kv_connector_kv_cache_events()
+            assert self.kv_connector_output is not None
+            if late_events is not None:
+                early_events = self.kv_connector_output.kv_cache_events
+                if early_events is not None:
+                    # Both collections belong to this rank and this step.
+                    # Each occurrence counts as a rank vote, so replace the
+                    # batch with the deduplicated union, keeping early
+                    # removals; clear_events() keeps it one worker's vote.
+                    events = list(
+                        dict.fromkeys(
+                            early_events.get_all_events() + late_events.get_all_events()
+                        )
+                    )
+                    late_events.clear_events()
+                    late_events.add_events(events)
+                self.kv_connector_output.kv_cache_events = late_events
+            kv_connector.clear_connector_metadata()
 
         # self.kv_connector_output may be modified during drafting.
         kv_connector_output = self.kv_connector_output
@@ -2273,7 +2300,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         if self.model_config.enforce_eager:
             self.model_executable = model_wrapper
-            self.compute_logits = self.model.compute_logits
         else:
             process_group_dict = build_process_group_dict()
             self.model_executable = compile(
@@ -2291,22 +2317,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # output buffer can be reused across steps even under async scheduling.
                 use_static_output=True,
                 use_direct_dispatch=True,
-                dtype=self.rbln_config.compile_dtype,
-            )
-            # NOTE(RBLN): We compile compute_logits separately to cover cases when
-            # `self.use_wrapped_compute_logits` is `False`
-            self.compute_logits = compile(
-                self.model.compute_logits,
-                dynamic=False,
-                fullgraph=True,
-                compile_context=self.compile_context,
-                num_devices=self.rbln_config.num_devices_per_local_rank,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
-                process_group_dict=process_group_dict,
-                guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
-                runtime_holder=self.runtime_holder,
-                mode="strict" if envs.VLLM_RBLN_COMPILE_STRICT_MODE else "",
-                use_static_output=True,
                 dtype=self.rbln_config.compile_dtype,
             )
 
@@ -2877,7 +2887,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         device = self.device if USE_DEVICE_TENSOR else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
         buffers = {
-            extent: torch.zeros(extent[1], dtype=torch.int8, device=device)
+            extent: torch.empty(extent[1], dtype=torch.int8, device=device)
             for extent in set(extent_of.values())
         }
         kv_cache_raw_tensors = {
@@ -3610,16 +3620,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
             self.run_model_graphs()
-
-            # 3. compute_logits
-            if not self.use_wrapped_compute_logits:
-                for size in self.bucketing_manager.batch_buckets:
-                    hidden_states = torch.randn(
-                        (size, self.model_config.get_hidden_size()),
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                    _ = self.compute_logits(hidden_states)
 
             # NOTE(RBLN): the sampler and the rejection sampler are built on the
             # last PP rank only, so no other rank has anything to warm up here.

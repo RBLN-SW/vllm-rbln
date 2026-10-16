@@ -92,6 +92,7 @@ from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_rera
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
+from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
@@ -1139,6 +1140,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
+            # FIXME(huijong.jeong): remove this once our rbln.top_k_top_p gets revised.
+            if self.use_rbln_sampler and (sampling_params := request.sampling_params):
+                sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
             self.input_batch.add_request(request)
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()

@@ -415,8 +415,10 @@ def _make_padded_weight_loader(native_shape, pad_fn, original_loader):
 #     The kernel below uses these PyTorch-native shapes directly.
 # ============================================================================
 
-import triton
-import triton.language as tl
+# vllm-rbln: import triton through vLLM's shim instead of directly. The kernel
+# below is CUDA-only and never runs on RBLN, but a bare `import triton` made this
+# module, and with it the whole model, fail to load where triton is not installed.
+from vllm.triton_utils import tl, triton
 from typing import Optional, Tuple
 
 
