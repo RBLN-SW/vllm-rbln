@@ -15,6 +15,7 @@
 """The optimum-rbln model path's half of the platform hooks."""
 
 import contextlib
+from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,8 +27,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@cache
 def patch_upstream() -> None:
-    pass
+    from optimum.rbln.transformers.models.decoderonly.modeling_decoderonly import (
+        RBLNDecoderOnlyModel,
+    )
+
+    from vllm_rbln.model_executor.models.optimum.compilation.decoder_regions import (
+        with_decoder_regions,
+    )
+
+    # Optimum has no registration hook for decoder preparation before export.
+    # Its shared compile entry also covers decoder submodels of multimodal models.
+    RBLNDecoderOnlyModel.compile = classmethod(
+        with_decoder_regions(RBLNDecoderOnlyModel.compile.__func__)
+    )
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:

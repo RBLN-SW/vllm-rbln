@@ -56,3 +56,11 @@ class TestGenerateModelPathName:
         name_bf16 = _generate_model_path_name(_vllm_config(dtype=torch.bfloat16))
         name_fp32 = _generate_model_path_name(_vllm_config(dtype=torch.float32))
         assert name_bf16 != name_fp32
+
+    def test_nested_region_changes_hash(self, monkeypatch):
+        monkeypatch.delenv("VLLM_RBLN_NESTED_COMPILE_REGION", raising=False)
+        default = _generate_model_path_name(_vllm_config())
+        monkeypatch.setenv("VLLM_RBLN_NESTED_COMPILE_REGION", "1")
+        assert _generate_model_path_name(_vllm_config()) != default
+        monkeypatch.setenv("VLLM_RBLN_NESTED_COMPILE_REGION", "0")
+        assert _generate_model_path_name(_vllm_config()) == default
