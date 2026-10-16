@@ -76,7 +76,7 @@ The `--find-links` option makes compatible vLLM wheels from the [vllm-rbln v0.12
 --find-links https://github.com/RBLN-SW/vllm-rbln/releases/expanded_assets/v0.12.0
 ```
 
-When installing from source with `uv pip install -e .`, also add `--no-sources-package vllm` to override the vLLM index pinned in `pyproject.toml`.
+When using `uv`, also add `--no-sources-package vllm` to allow installation of the compatible wheel.
 
 ### 🛠️ Development setup
 
