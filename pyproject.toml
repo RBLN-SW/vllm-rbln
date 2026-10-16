@@ -43,8 +43,8 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "torch-rbln>=0.12.0rc1,<0.12.1 ; platform_machine == 'x86_64'",
-    "optimum-rbln>=0.12.0rc1,<0.12.1",
+    "torch-rbln>=0.12.0,<0.12.1 ; platform_machine == 'x86_64'",
+    "optimum-rbln>=0.12.0,<0.12.1",
 ]
 
 [project.optional-dependencies]
@@ -75,11 +75,11 @@ dev = [
 ]
 
 runtime = [
-    "rebel-compiler>=0.12.0rc1,<0.12.1",
+    "rebel-compiler>=0.12.0,<0.12.1",
 ]
 kv_connectors = [
-    "nixl-rbln>=0.12.0rc1,<0.12.1",
-    "lmcache-rbln>=0.12.0rc1,<0.12.1",
+    "nixl-rbln>=0.12.0,<0.12.1",
+    "lmcache-rbln>=0.12.0,<0.12.1",
 ]
 
 
@@ -219,6 +219,8 @@ torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
 torchcodec = { index = "pytorch-cpu" }
 optimum-rbln = { index = "pypi" }
+torch-rbln = { index = "pypi" }
+nixl-rbln = { index = "rbln-release" }
 
 [tool.typos.default]
 binary = false
