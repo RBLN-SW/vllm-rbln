@@ -88,6 +88,16 @@ def test_minimax_m3_small_config_compiles_and_generates(
         max_position_embeddings=4096,
         num_mtp_modules=0,
         moe_layer_freq=[0, 1],
+        quantization_config={
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.1.block_sparse_moe.experts": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                },
+            },
+        },
     )
     config.sparse_attention_config.update(
         sparse_num_index_heads=1,
@@ -96,8 +106,8 @@ def test_minimax_m3_small_config_compiles_and_generates(
     )
     config.save_pretrained(tmp_path)
 
-    # A local config plus dummy weights exercises both decoder types without
-    # downloading the full checkpoint or claiming meaningful generated text.
+    # SwiGLU-OAI is supported by the compiler's packed NVFP4 MoE kernel,
+    # not its unquantized MoE kernel. Dense/attention weights stay in BF16.
     with vllm_runner(
         str(tmp_path),
         load_format="dummy",
