@@ -11,259 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wall-clock metrics for the vllm runner, installed only under VLLM_RBLN_METRICS.
+"""Wall-clock instrumentation for the vllm model path.
 
-Three ranges are timed with perf_counter: the pass (execute_model through
-sample_tokens), the model call, and the sampler call with the bookkeeping over its
-output. The last two are reported as one sum, so MODEL + SAMPLE carries the same call
-count as E2E and the difference of the two means is the host overhead around the
-graphs. The bookkeeping is in that sum because it holds the step's first blocking read
-of the sampler output -- the cast that used to hold it inside _sample is gone, and
-leaving the read untimed drops this section to dispatch cost while the E2E residual
-absorbs the wait. Async defers that read out of the pass, so there it is dispatch.
-A pass is recorded only once its phase and its graph time are both known, which is
-what keeps those counts equal.
-
-Spec decode moves that first blocking read again -- into the spec-only logits gather
-in execute_model's postprocess block, which syncs on the target forward. The gather
-is an inline block with no method to wrap, so timed_region folds the runner's
-"postprocess" profiler region into the graph sum; it is empty without spec decode.
-The drafter, which runs between _sample and _bookkeeping_sync, is deliberately not
-folded: MODEL + SAMPLE stays the main-graph number, and the drafter's time -- under
-EAGLE/MTP a draft-model forward, plus any sampler wait its first read absorbs --
-shows up in the E2E residual.
-
-The whole feature lives in this module so the runner carries no metrics code at all. A
-range that is not a whole method -- the model call sits mid-way through execute_model --
-is reached by wrapping the callable the runner holds, and the phase, which is a local of
-execute_model, is read where the runner computes it.
+The shared context records execute_model through sample_tokens as E2E and
+sums the model call, sampler, and blocking bookkeeping as MODEL + SAMPLE.
+Spec decode's postprocess gather also holds a blocking read, so its profiler
+region is included in that sum. Drafter time stays in the E2E residual.
+Non-last PP ranks close their pass after the hand-off waits on compute.
 """
 
 import contextlib
 import functools
-import json
-import os
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
-from enum import Enum
 
-import numpy as np
 from vllm.sequence import IntermediateTensors
 from vllm.v1.utils import record_function_or_nullcontext
 
-from vllm_rbln import envs
-from vllm_rbln.logger import init_logger
 from vllm_rbln.patches import register_patch
+from vllm_rbln.v1.metrics.performance import (
+    _CTX_ATTR,
+    PerformanceContext,
+    Phase,
+    get_performance_context,
+    metrics_enabled,
+)
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.rbln_worker import RBLNWorker
-
-logger = init_logger(__name__)
-
-_CTX_ATTR = "_metrics_ctx"
-
-
-class _Phase(Enum):
-    """Report phases, in report order; the value is the section label."""
-
-    PREFILL = "PREFILL"
-    DECODE = "DECODE"
-    PADDED_DECODE = "PADDED DECODE"
-
-
-@dataclass
-class _Metrics:
-    latencies: list[float] = field(default_factory=list)
-
-    def record(self, latency: float) -> None:
-        self.latencies.append(latency)
-
-    @property
-    def call_count(self) -> int:
-        return len(self.latencies)
-
-    def mean_latency_ms(self) -> float:
-        if not self.latencies:
-            return 0.0
-        return sum(self.latencies) / len(self.latencies) * 1000
-
-    def latency_percentiles_ms(
-        self, percentiles: tuple[float, ...] = (50.0, 90.0, 99.0)
-    ) -> dict[str, float]:
-        if not self.latencies:
-            return {}
-        arr = np.asarray(self.latencies, dtype=float) * 1000.0
-        return {f"p{p:g}": float(np.percentile(arr, p)) for p in percentiles}
-
-    def to_dict(self) -> dict:
-        return {
-            "call_count": self.call_count,
-            "mean_latency_ms": self.mean_latency_ms(),
-            "latency_percentiles_ms": self.latency_percentiles_ms(),
-        }
-
-
-class _PerformanceContext:
-    """One runner's measurements, accumulated a pass at a time."""
-
-    def __init__(self, name: str | None = None) -> None:
-        self.name = name
-        self.rank_tag = _rank_tag()
-        self._graph: dict[_Phase, _Metrics] = defaultdict(_Metrics)
-        self._e2e: dict[_Phase, _Metrics] = defaultdict(_Metrics)
-        self._start: float | None = None
-        self._phase: _Phase | None = None
-        self._graph_latency: float | None = None
-
-    @property
-    def in_pass(self) -> bool:
-        return self._start is not None
-
-    def start_pass(self) -> None:
-        self._start = time.perf_counter()
-        self._phase = None
-        self._graph_latency = None
-
-    def end_pass(self) -> None:
-        end = time.perf_counter()
-        start, self._start = self._start, None
-        phase, self._phase = self._phase, None
-        graph, self._graph_latency = self._graph_latency, None
-        if start is None or phase is None or graph is None:
-            # No pass was open, or it never reached the forward: an empty batch, KV
-            # send/recv with no forward work, or a pass that raised.
-            return
-        self._e2e[phase].record(end - start)
-        self._graph[phase].record(graph)
-
-    def mark_phase(self, phase: _Phase) -> None:
-        if self._start is not None:
-            self._phase = phase
-
-    def add_graph_time(self, latency: float) -> None:
-        if self._start is not None:
-            self._graph_latency = (self._graph_latency or 0.0) + latency
-
-    def print_stats(self) -> None:
-        sections: dict[str, _Metrics] = {}
-        for label, table in (("MODEL + SAMPLE", self._graph), ("E2E", self._e2e)):
-            for phase in _Phase:
-                if phase in table:
-                    sections[f"{label} ({phase.value})"] = table[phase]
-        name = f"{self.name} | {self.rank_tag}" if self.rank_tag else self.name
-        logger.info("%s", "\n".join(_render_metrics_report(name, sections)))
-        _write_metrics_json(self.name, self.rank_tag, sections)
-
-
-def _rank_tag() -> str:
-    """Rank tag including only parallelism axes with degree > 1; '' if none."""
-
-    def get_rank_info(group_name: str, get_group_func) -> str:
-        try:
-            group = get_group_func()
-            if group.world_size > 1:
-                return f"{group_name}{group.rank_in_group}"
-        except Exception:
-            return ""
-        return ""
-
-    parts = []
-
-    from vllm.distributed import get_dp_group, get_ep_group, get_pp_group, get_tp_group
-
-    for group_name, get_group_func in [
-        ("TP", get_tp_group),
-        ("PP", get_pp_group),
-        ("DP", get_dp_group),
-        ("EP", get_ep_group),
-    ]:
-        rank_info = get_rank_info(group_name, get_group_func)
-        if rank_info:
-            parts.append(rank_info)
-
-    return " ".join(parts)
-
-
-def _render_metrics(label: str, m: _Metrics) -> list[str]:
-    if m.call_count == 0:
-        return [f"{label} METRICS: No data recorded"]
-
-    lines = [
-        f"{label} METRICS:",
-        f"  {'Total call counts':<25}: {m.call_count}",
-        f"  {'Mean latency (ms)':<25}: {m.mean_latency_ms():.2f}",
-    ]
-
-    for key, value in m.latency_percentiles_ms().items():
-        stat = "Median" if key == "p50" else key.upper()
-        metric_label = f"{stat} latency (ms)"
-        lines.append(f"  {metric_label:<25}: {value:.2f}")
-
-    return lines
-
-
-def _render_metrics_report(
-    name: str | None, sections: dict[str, _Metrics]
-) -> list[str]:
-    lines = [
-        "=" * 50,
-        f"PERFORMANCE STATISTICS{f' [{name}]' if name else ''}",
-        "=" * 50,
-    ]
-
-    for label, metrics in sections.items():
-        lines.extend(_render_metrics(label, metrics))
-        lines.append("-" * 50)
-
-    lines.append("=" * 50)
-    return lines
-
-
-def _write_metrics_json(
-    name: str | None, rank_tag: str, sections: dict[str, _Metrics]
-) -> None:
-    if not envs.VLLM_RBLN_METRICS_DIR:
-        return
-
-    suffix = rank_tag.replace(" ", "_").lower()
-    filename = f"metrics_{suffix}.json" if suffix else "metrics.json"
-    path = os.path.join(envs.VLLM_RBLN_METRICS_DIR, filename)
-    payload = {
-        "name": name,
-        "rank": rank_tag,
-        "sections": {label: m.to_dict() for label, m in sections.items()},
-    }
-
-    try:
-        payload_str = json.dumps(payload, indent=2)
-    except (TypeError, ValueError) as e:
-        logger.warning("Failed to serialize metrics JSON: %s", e)
-        return
-
-    try:
-        os.makedirs(envs.VLLM_RBLN_METRICS_DIR, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(payload_str)
-    except OSError as e:
-        logger.warning("Failed to write metrics JSON to %s: %s", path, e)
-
-
-def _metrics_enabled() -> bool:
-    return envs.VLLM_RBLN_METRICS
-
-
-def _ctx(runner: RBLNModelRunner) -> _PerformanceContext:
-    """The runner's context, built on first use.
-
-    Deferred because the rank tag reads the parallelism groups, which are not
-    initialised while the runner is still being constructed.
-    """
-    ctx = getattr(runner, _CTX_ATTR, None)
-    if ctx is None:
-        ctx = _PerformanceContext("runner")
-        setattr(runner, _CTX_ATTR, ctx)
-    return ctx
-
 
 _execute_model = RBLNModelRunner.execute_model
 _sample_tokens = RBLNModelRunner.sample_tokens
@@ -279,7 +52,7 @@ _shutdown = RBLNWorker.shutdown
 @functools.wraps(_execute_model)
 def execute_model(self, *args, **kwargs):
     global _ACTIVE_CTX
-    ctx = _ctx(self)
+    ctx = get_performance_context(self)
     _ACTIVE_CTX = ctx
     ctx.start_pass()
     output = _execute_model(self, *args, **kwargs)
@@ -293,7 +66,7 @@ def execute_model(self, *args, **kwargs):
 @functools.wraps(_sample_tokens)
 def sample_tokens(self, *args, **kwargs):
     output = _sample_tokens(self, *args, **kwargs)
-    _ctx(self).end_pass()
+    get_performance_context(self).end_pass()
     return output
 
 
@@ -303,7 +76,7 @@ def bookkeeping_sync(self, *args, **kwargs):
     try:
         return _bookkeeping_sync(self, *args, **kwargs)
     finally:
-        _ctx(self).add_graph_time(time.perf_counter() - start)
+        get_performance_context(self).add_graph_time(time.perf_counter() - start)
 
 
 @functools.wraps(_sample)
@@ -314,7 +87,7 @@ def sample(self, *args, **kwargs):
         return _sample(self, *args, **kwargs)
     start = time.perf_counter()
     output = _sample(self, *args, **kwargs)
-    _ctx(self).add_graph_time(time.perf_counter() - start)
+    get_performance_context(self).add_graph_time(time.perf_counter() - start)
     return output
 
 
@@ -324,7 +97,7 @@ def load_model(self, *args, **kwargs):
     executable = self.model_executable
 
     def timed_executable(*call_args, **call_kwargs):
-        ctx = _ctx(self)
+        ctx = get_performance_context(self)
         if not ctx.in_pass:
             # Warm-up and dummy runs: skip the clock reads as well as the record.
             return executable(*call_args, **call_kwargs)
@@ -346,17 +119,17 @@ def determine_batch_execution_and_padding(self, *args, **kwargs):
         return result
     num_tokens_padded = batch_desc.num_tokens_padded
     if self.is_prefill:
-        phase = _Phase.PREFILL
+        phase = Phase.PREFILL
     elif num_tokens_padded == self.max_num_tokens:
         # num_tokens_padded is the MoE pad dimension, so matching the prefill dim means
         # this decode ran the prefill-sized graph. Only reachable under DP, where the
         # padding is computed at all. Changing how the runner pads means revisiting
         # this line.
-        phase = _Phase.PADDED_DECODE
+        phase = Phase.PADDED_DECODE
     else:
-        phase = _Phase.DECODE
+        phase = Phase.DECODE
     # A no-op on the dummy run, which reaches this with no pass open.
-    _ctx(self).mark_phase(phase)
+    get_performance_context(self).mark_phase(phase)
     return result
 
 
@@ -367,7 +140,7 @@ _send_handoff = RBLNWorker._send_handoff
 def send_handoff(self, *args, **kwargs):
     # The send waits on this stage's compute, so its wall carries the stage's time.
     # No try/finally: a raising hand-off leaves the pass open, like any raising pass.
-    ctx = _ctx(self.model_runner)
+    ctx = get_performance_context(self.model_runner)
     start = time.perf_counter()
     output = _send_handoff(self, *args, **kwargs)
     ctx.add_graph_time(time.perf_counter() - start)
@@ -386,7 +159,7 @@ def shutdown(self):
     _shutdown(self)
 
 
-_ACTIVE_CTX: _PerformanceContext | None = None
+_ACTIVE_CTX: PerformanceContext | None = None
 
 # The region that holds the spec-only logits gather (see the module docstring); it
 # belongs to the graph sum, and is empty without spec decode.
@@ -474,7 +247,7 @@ def _register_patches() -> None:
             reason=reason,
             key=f"vllm_rbln.patches.metrics.{target.rsplit('.', 1)[-1]}",
             owner_module="vllm_rbln.patches.metrics",
-            condition=_metrics_enabled,
+            condition=metrics_enabled,
         )(replacement)
 
 
