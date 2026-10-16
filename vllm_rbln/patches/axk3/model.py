@@ -65,15 +65,7 @@ class AXK3GatedResidual(nn.Module):
         self.hidden_size = hidden_size
         self.num_streams = num_streams
         wide = num_streams * hidden_size
-        # Stored as the fp32 [n, h] the norm multiplies by, so the graph reads
-        # the weight as is: a cast or reshape of it in the graph is folded
-        # differently by prefill and decode, and decode then cannot reuse
-        # prefill's copy ("no key found on reuse mode").
-        self.gamma = nn.Parameter(
-            torch.ones(num_streams, hidden_size, dtype=torch.float32),
-            requires_grad=False,
-        )
-        self.gamma.weight_loader = self._load_gamma
+        self.gamma = nn.Parameter(torch.ones(wide), requires_grad=False)
         self.norm = RMSNorm(hidden_size, eps=eps, has_weight=False)
         self.read_down = ReplicatedLinear(
             wide, rank, bias=False, quant_config=None, prefix=f"{prefix}.read_down"
@@ -96,10 +88,6 @@ class AXK3GatedResidual(nn.Module):
             self.write_proj = None
             self.write_bias = None
 
-    @staticmethod
-    def _load_gamma(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        param.data.copy_(loaded_weight.view_as(param).float())
-
     def _streams(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(*x.shape[:-1], self.num_streams, self.hidden_size)
 
@@ -111,7 +99,8 @@ class AXK3GatedResidual(nn.Module):
         # host rsqrt between the device functions of every decode layer. The
         # per-stream gain is applied after it.
         normed = self.norm(residual.reshape(-1, self.hidden_size))
-        u = self._streams(normed.view_as(residual)).float() * self.gamma
+        gamma = self.gamma.view(n, self.hidden_size).float()
+        u = self._streams(normed.view_as(residual)).float() * gamma
         u = u.to(residual.dtype).view_as(residual)
 
         z = F.silu(self.read_down(u)[0] / n)
