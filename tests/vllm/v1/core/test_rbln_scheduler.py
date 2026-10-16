@@ -716,6 +716,7 @@ class TestScheduleSpecDecodeCap:
     def _scheduler(self, **kwargs):
         return create_rbln_scheduler(
             block_size=self._BS,
+            max_num_batched_tokens=self._BS,
             num_blocks=self._NUM_BLOCKS,
             max_num_seqs=self._MAX_NUM_SEQS,
             num_speculative_tokens=4,
@@ -791,13 +792,14 @@ class TestFixedWindowReservation:
 
 
 class TestBlockBoundaryJoin:
-    _BS = 16
+    _BS = 32
     _NUM_SPEC = 4
 
     def _scheduler(self):
         return create_rbln_scheduler(
             num_speculative_tokens=self._NUM_SPEC,
             block_size=self._BS,
+            max_num_batched_tokens=self._BS,
             num_blocks=256,
             max_num_seqs=8,
             enable_prefix_caching=True,
@@ -814,7 +816,9 @@ class TestBlockBoundaryJoin:
             same_prompt=True,
             req_ids=[seed_id, req_id],
         )
-        advance_to_decode(sched, seed)  # caches the shared first block
+        sched.add_request(seed)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out))
         sched.add_request(req)
         return req
 
