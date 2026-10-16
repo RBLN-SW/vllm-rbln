@@ -112,13 +112,29 @@ def every_local_link_down() -> bool:
     return all_down
 
 
-def _as_descs(blocks_data: list[tuple[int, int, int]]) -> np.ndarray:
-    """Columns are (addr, len, device), in upstream's own descriptor shape.
+def _grid_descs(
+    starts: np.ndarray,
+    length: np.ndarray | int,
+    grid: tuple[int, int],
+    device_id: np.ndarray | int,
+) -> np.ndarray:
+    """`runs * chunks` descriptors under each of `starts`, run-major.
 
-    ``src_blocks_data`` is read back by upstream's hetero-TP split, which calls
-    ``.tolist()`` on it.
+    `starts` is already in descriptor order; `length` (the span a start's grid
+    cuts) and `device_id` are per start or one for all.
     """
-    return np.asarray(blocks_data, dtype=np.uint64).reshape(-1, 3)
+    runs, chunks = grid
+    starts = np.asarray(starts, dtype=np.uint64)
+    run_span = np.asarray(length, dtype=np.uint64)[..., None] // np.uint64(runs)
+    desc_len = run_span // np.uint64(chunks)
+    r = np.repeat(np.arange(runs, dtype=np.uint64), chunks)
+    c = np.tile(np.arange(chunks, dtype=np.uint64), runs)
+    addrs = starts[:, None] + r * run_span + c * desc_len
+    lens = np.broadcast_to(desc_len, addrs.shape)
+    devs = np.broadcast_to(
+        np.asarray(device_id, dtype=np.uint64)[..., None], addrs.shape
+    )
+    return np.stack([addrs.ravel(), lens.ravel(), devs.ravel()], axis=1)
 
 
 class RblnNixlWorkerState(NixlBaseConnectorWorker):
@@ -372,9 +388,9 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         *,
         num_blocks: int,
         grid: tuple[int, int],
-    ) -> list[tuple[int, int, int]]:
-        """A range past the whole-block one: every block of every region, cut
-        into token chunks.
+    ) -> np.ndarray:
+        """Every block of every region, cut into token chunks; `(1, 1)` is the
+        whole-block range itself.
 
         `pieces` is `(base address, whole length, block stride, device id)` per
         region; the two sides differ in where those come from and in nothing
@@ -386,19 +402,15 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         holds -- naming it as a single prefix would move the first head's
         tokens and leave the rest stale, and nothing would report it.
         """
-        runs, chunks = grid
-        out: list[tuple[int, int, int]] = []
-        for base, whole_len, stride, device_id in pieces:
-            run_span = whole_len // runs
-            desc_len = run_span // chunks
-            for block_id in range(num_blocks):
-                start = base + block_id * stride
-                for r in range(runs):
-                    for c in range(chunks):
-                        out.append(
-                            (start + r * run_span + c * desc_len, desc_len, device_id)
-                        )
-        return out
+        p = np.asarray(pieces, dtype=np.uint64).reshape(-1, 4)
+        blocks = np.arange(num_blocks, dtype=np.uint64)
+        starts = p[:, 0:1] + blocks * p[:, 2:3]
+        return _grid_descs(
+            starts.ravel(),
+            np.repeat(p[:, 1], num_blocks),
+            grid,
+            np.repeat(p[:, 3], num_blocks),
+        )
 
     def _shard_chunk_grid(
         self, *, block_size: int, split: int, kv_runs: int = 1
@@ -622,7 +634,6 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
         block_size_ratio = self.block_size // block_size
         local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
         num_blocks = self.num_blocks * block_size_ratio
-        blocks_data: list[tuple[int, int, int]] = []
 
         # A whole block is one range whatever it packs, since K and V are
         # adjacent in it.
@@ -636,30 +647,29 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             )
             stride = self.block_len_per_layer[i] // block_size_ratio
             pieces.append((base_addr, kv_block_len, stride, self.device_id))
-            for block_id in range(num_blocks):
-                blocks_data.append(
-                    (base_addr + block_id * stride, kv_block_len, self.device_id)
-                )
 
+        grids = [(1, 1)]
         # Both further ranges cut the same block, and differ only in the piece:
         # a window's is `sliding_window` tokens, a chunk's a prefill step.
         window = self._window_grid_cut
         if window is not None:
-            blocks_data += self._chunk_range_descs(
-                pieces, num_blocks=num_blocks, grid=window
-            )
+            grids.append(window)
         # Asked for here rather than handed in, so that the block size it is
         # derived from is the block size this list was built with.
         grid = self._shard_chunk_grid(block_size=block_size, split=1)
         if grid is not None:
-            blocks_data += self._chunk_range_descs(
-                pieces, num_blocks=num_blocks, grid=grid
-            )
+            grids.append(grid)
+        descs_data = np.concatenate(
+            [
+                self._chunk_range_descs(pieces, num_blocks=num_blocks, grid=g)
+                for g in grids
+            ]
+        )
 
         logger.info(
             "RBLN NIXL: %d local descriptor(s) for this engine over %d region(s) "
             "x %d block(s): whole, %s, and %s.",
-            len(blocks_data),
+            len(descs_data),
             len(local_base_addresses),
             num_blocks,
             f"a window range of {window[0]} run(s) x {window[1]} granule(s)"
@@ -670,7 +680,6 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
             else "no chunk range",
         )
 
-        descs_data = _as_descs(blocks_data)
         descs = self.nixl_wrapper.get_xfer_descs(descs_data, self.nixl_memory_type)
         return (
             self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs),
@@ -710,11 +719,14 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 registered_layer_names, peer_areas=peer_areas
             )
 
-        blocks_data: list[tuple[int, int, int]] = []
+        parts: list[np.ndarray] = []
         # The whole piece first, then its chunks. `(1, 1)` names the piece
         # itself, so the first pass is what this built before `chunk_grid`.
         grids = [(1, 1)] if chunk_grid is None else [(1, 1), chunk_grid]
-        for runs, chunks in grids:
+        block_ids = np.arange(num_blocks, dtype=np.uint64)[:, None, None, None]
+        js = np.arange(split, dtype=np.uint64)[None, :, None, None]
+        kvs = np.arange(kv_runs, dtype=np.uint64)[None, None, None, :]
+        for grid in grids:
             for region_id in region_ids:
                 base_addr = all_base_addrs[region_id]
                 kv_block_len = (
@@ -731,30 +743,16 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 # stays inside the one it started in.
                 kv_stride = kv_block_len // kv_runs
                 sub_len = kv_stride // split
-                run_span = sub_len // runs
-                desc_len = run_span // chunks
-                for block_id in range(num_blocks):
-                    for j in range(split):
-                        # One entry per peer copy this piece goes to: the same
-                        # bytes reach every replica (see _head_matched_desc),
-                        # so the source repeats while the destination advances.
-                        for _ in range(replica_fanout):
-                            for kv in range(kv_runs):
-                                piece = (
-                                    base_addr
-                                    + block_id * stride
-                                    + kv * kv_stride
-                                    + j * sub_len
-                                )
-                                for r in range(runs):
-                                    for c in range(chunks):
-                                        blocks_data.append(
-                                            (
-                                                piece + r * run_span + c * desc_len,
-                                                desc_len,
-                                                self.device_id,
-                                            )
-                                        )
+                # Axes are block, piece, peer copy, K/V. One entry per peer copy
+                # this piece goes to: the same bytes reach every replica (see
+                # _head_matched_desc), so the source repeats while the
+                # destination advances.
+                starts = np.broadcast_to(
+                    base_addr + block_ids * stride + kvs * kv_stride + js * sub_len,
+                    (num_blocks, split, replica_fanout, kv_runs),
+                )
+                parts.append(_grid_descs(starts.ravel(), sub_len, grid, self.device_id))
+        descs_data = np.concatenate(parts)
 
         if chunk_grid is not None:
             runs, chunks = chunk_grid
@@ -763,14 +761,13 @@ class RblnNixlWorkerState(NixlBaseConnectorWorker):
                 "RBLN NIXL: %d local descriptor(s) for this shard, %d of them a "
                 "chunk range of %d run(s) x %d chunk(s) carrying %dB each; a "
                 "whole piece carries %dB.",
-                len(blocks_data),
-                len(blocks_data) // per_grid * (per_grid - 1),
+                len(descs_data),
+                len(descs_data) // per_grid * (per_grid - 1),
                 runs,
                 chunks,
-                blocks_data[-1][1],
-                blocks_data[0][1],
+                descs_data[-1][1],
+                descs_data[0][1],
             )
-        descs_data = _as_descs(blocks_data)
         descs = self.nixl_wrapper.get_xfer_descs(descs_data, self.nixl_memory_type)
         return (
             self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs),
