@@ -1081,6 +1081,12 @@ class RBLNScheduler(Scheduler):
                 lo = max(0, req.num_computed_tokens - self.num_spec_tokens)
                 hi = req.num_computed_tokens + base
                 data.new_token_ids[idx] = req.all_token_ids[lo:hi]
+        # NOTE(RBLN): the RBLN model runner never reads
+        # CachedRequestData.all_token_ids. After a prefill-only step every decode
+        # request is outside prev_step_scheduled_req_ids, so upstream ships a full
+        # token copy for each of them, and under the mp executor the worker
+        # unpickles it on the critical path before the next decode.
+        data.all_token_ids.clear()
         return data
 
     def _free_request(

@@ -494,6 +494,22 @@ class TestScheduleNoMixedBatching:
         assert req_a.request_id not in out.num_scheduled_tokens
         assert req_b.request_id in out.num_scheduled_tokens
 
+    def test_decode_back_from_eviction_ships_no_token_copy(self):
+        # The evicted decode returns outside prev_step_scheduled_req_ids, where
+        # upstream attaches all of its tokens; the RBLN runner never reads them.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128, block_size=128, num_blocks=10000
+        )
+        req_a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
+        advance_to_decode(sched, req_a)
+        req_b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
+        sched.add_request(req_b)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        out = sched.schedule()
+        assert req_a.request_id in out.scheduled_cached_reqs.req_ids
+        assert out.scheduled_cached_reqs.all_token_ids == {}
+
 
 class TestScheduleDecodeBatchLimit:
     def test_decode_batch_capped_by_pipeline_parallel(self):
