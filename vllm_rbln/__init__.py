@@ -58,3 +58,7 @@ def register_ops():
 
         apply_registrations()
         apply_registered_patches()
+    elif envs.INHERITED_MODEL_IMPL == "optimum":
+        from vllm_rbln.platform.optimum_impl import patch_upstream
+
+        patch_upstream()
