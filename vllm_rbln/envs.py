@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     VLLM_RBLN_METRICS_FILE: str = ""
     VLLM_RBLN_METRICS_DIR: str = ""
     VLLM_RBLN_NUMA: bool = True
+    VLLM_RBLN_NESTED_COMPILE_REGION: bool = False
 
     # ====================================================================
     # Read only when VLLM_RBLN_USE_VLLM_MODEL=False
@@ -50,7 +51,6 @@ if TYPE_CHECKING:
     # --- COMPILE / RUNTIME ---
     VLLM_RBLN_COMPILE_STRICT_MODE: bool = True
     VLLM_RBLN_COMPILE_ONLY: bool = False
-    VLLM_RBLN_NESTED_COMPILE_REGION: bool = False
     VLLM_RBLN_NUM_HIDDEN_LAYERS: int = 0
     VLLM_RBLN_USE_DEVICE_TENSOR: bool = True
     VLLM_RBLN_DISABLE_OFFLOAD: bool = True
@@ -201,6 +201,12 @@ environment_variables = {
     # ====================================================================
     # Common: read regardless of the VLLM_RBLN_USE_VLLM_MODEL value
     # ====================================================================
+    # Experimental decoder boundaries in both model paths.
+    # Requires nested-region support in rebel-compiler; this does not emit loops.
+    "VLLM_RBLN_NESTED_COMPILE_REGION": (
+        lambda: os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
+        in ("true", "1")
+    ),
     # Number of NPU devices per local rank (was VLLM_RBLN_TP_SIZE).
     "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK": get_num_devices_per_local_rank,
     # Use customized sampler
@@ -251,12 +257,6 @@ environment_variables = {
         lambda: (
             os.environ.get("VLLM_RBLN_COMPILE_ONLY", "False").lower() in ("true", "1")
         )
-    ),
-    # Experimental decoder boundaries for MiniMax-M2 and GPT-OSS.
-    # Requires nested-region support in rebel-compiler; this does not emit loops.
-    "VLLM_RBLN_NESTED_COMPILE_REGION": (
-        lambda: os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
-        in ("true", "1")
     ),
     # Build only the first N decoder layers and leave the rest as
     # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the

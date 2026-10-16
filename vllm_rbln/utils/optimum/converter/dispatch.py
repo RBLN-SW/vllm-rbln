@@ -91,6 +91,9 @@ def _generate_model_path_name(
     if stripped_config:
         config_dict["rbln_config"] = stripped_config
 
+    if envs.VLLM_RBLN_NESTED_COMPILE_REGION:
+        config_dict["nested_compile_region"] = True
+
     config_json = json.dumps(config_dict, sort_keys=True, default=str)
     config_hash = hashlib.sha256(config_json.encode()).hexdigest()[:16]
 
