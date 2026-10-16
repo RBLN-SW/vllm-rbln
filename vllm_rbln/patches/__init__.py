@@ -43,6 +43,7 @@ from . import (
     mla,
     modelopt_mixed_config,
     models_utils,
+    multi_connector,
     multiproc_executor,
     nan_logprobs,
     oot,
