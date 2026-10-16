@@ -64,7 +64,6 @@ class AXK3GatedResidual(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_streams = num_streams
-        self.eps = eps
         wide = num_streams * hidden_size
         # Stored as the fp32 [n, h] the norm multiplies by, so the graph reads
         # the weight as is: a cast or reshape of it in the graph is folded
@@ -214,8 +213,8 @@ class AXK3DecoderLayer(_k2.AXK2DecoderLayer):
         if config is None:
             config = vllm_config.model_config.hf_config
         layer_idx = int(prefix.split(sep=".")[-1])
-        index_skip = config.is_index_skip_layer(layer_idx)
-        with _without_indexer() if index_skip else contextlib.nullcontext():
+        skip_topk = config.is_index_skip_layer(layer_idx)
+        with _without_indexer() if skip_topk else contextlib.nullcontext():
             super().__init__(
                 vllm_config,
                 prefix,
@@ -223,7 +222,7 @@ class AXK3DecoderLayer(_k2.AXK2DecoderLayer):
                 topk_indices_buffer=topk_indices_buffer,
             )
         assert not self.self_attn.dsv3_pad, "axk3 has the DSv3 MLA layout"
-        self.index_skip = index_skip
+        self.skip_topk = skip_topk
         self.index_source_layer = config.index_source_layer(layer_idx)
 
         # Gated Residual replaces both pre-norms.
@@ -254,7 +253,7 @@ class AXK3DecoderLayer(_k2.AXK2DecoderLayer):
             self.self_attn.mla_attn,
             positions,
             x,
-            topk_by_layer[self.index_source_layer] if self.index_skip else None,
+            topk_by_layer[self.index_source_layer] if self.skip_topk else None,
         )
         topk_by_layer[self.layer_idx] = topk_indices
         hidden_states = self.attn_gated_residual.write(residual, x, write_gate)
@@ -320,7 +319,7 @@ class AXK3Model(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size * self.num_streams
         )
-        self.aux_hidden_state_layers = tuple[int, ...]()
+        self.aux_hidden_state_layers = ()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
