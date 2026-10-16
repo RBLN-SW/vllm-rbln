@@ -934,8 +934,9 @@ class RBLNGlm5DecoderLayer(nn.Module):
         # sublayers; the [B, T, n * hidden] form stays on the device.
         flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
         mixes = F.linear(flat, fn)
-        # The mHC ops take bf16 operands (they compute in fp32).
-        z = (mixes * scale + base).to(streams.dtype)
+        # The gate / mix logits stay fp32, as upstream's mHC pre (mhc_pre_torch); the
+        # mHC ops run fp32 operands as dlf16 and compute in fp32.
+        z = mixes * scale + base
         z_pre, z_post = z[..., :n], z[..., n : 2 * n]
         comb = torch.ops.rbln_custom_ops.sinkhorn_normalize(
             z[..., 2 * n :],
@@ -946,11 +947,18 @@ class RBLNGlm5DecoderLayer(nn.Module):
 
     def _sublayer(self, streams, fn, scale, base, norm, sublayer) -> torch.Tensor:
         z_pre, z_post, comb = self._hc_mix(streams, fn, scale, base)
-        x = torch.ops.rbln_custom_ops.hc_stream_reduce(streams, z_pre, eps=self.hc_eps)
+        # Upstream collapses and adds the streams in fp32 and casts back to the
+        # streams' dtype (mhc_pre_torch / mhc_post_torch). An mHC op takes one dtype
+        # across its tensors (a mix runs on the host), so the bf16 streams go in as
+        # fp32 too: the device holds them as dlf16, which bf16 values fit exactly.
+        streams_f32 = streams.float()
+        x = torch.ops.rbln_custom_ops.hc_stream_reduce(
+            streams_f32, z_pre, eps=self.hc_eps
+        ).to(streams.dtype)
         x = sublayer(norm(x))
         return torch.ops.rbln_custom_ops.hc_residual_add(
-            x, streams, z_post, comb, post_mult=self.post_mult
-        )
+            x.float(), streams_f32, z_post, comb, post_mult=self.post_mult
+        ).to(streams.dtype)
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         """streams [B, n, T, H] -> [B, n, T, H]."""
