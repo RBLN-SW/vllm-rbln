@@ -18,6 +18,7 @@ import pytest
 import torch
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from tests.vllm.v1.attention.utils import make_mla_impl
 from tests.vllm.vllm_config import make_vllm_config
@@ -182,6 +183,25 @@ class TestIndexerCacheBackends:
     cache is handed to the kernel flat as [num_blocks, block_size]: a trailing
     head dim squeezed inside the graph is a host op on a dynamic input, which the
     compiler refuses."""
+
+    @pytest.mark.parametrize(
+        "backend",
+        [RBLNDeepseekV32IndexerBackend, RBLNDeepseekV32IndexerScaleBackend],
+    )
+    def test_kernel_block_sizes_accept_cache_spec(self, backend):
+        spec = MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=backend.get_supported_head_sizes()[0],
+            dtype=backend.supported_dtypes[0],
+        )
+        expected = backend.get_supported_kernel_block_sizes()[0].base
+        assert backend.get_supported_kernel_block_sizes(spec)[0].base == expected
+        assert (
+            backend.get_supported_kernel_block_sizes(kv_cache_spec=spec)[0].base
+            == expected
+        )
+        assert backend.get_supported_kernel_block_sizes(None)[0].base == expected
 
     def test_key_cache_shape_keeps_the_head_dim(self):
         shape = RBLNDeepseekV32IndexerBackend.get_kv_cache_shape(

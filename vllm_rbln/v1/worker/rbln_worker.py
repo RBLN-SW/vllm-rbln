@@ -127,6 +127,9 @@ class RBLNWorker(WorkerBase):
         logger.warning("Sleep mode is not supported on RBLN, ignore it.")
         pass
 
+    def discard(self, tags: tuple[str, ...]) -> None:
+        raise RuntimeError("Selective discard is not supported on RBLN.")
+
     def _init_device_env(self) -> None:
         rbln_config: RBLNConfig = self.vllm_config.additional_config
         env_var = current_platform.device_control_env_var
@@ -655,19 +658,18 @@ class RBLNWorker(WorkerBase):
 
             # Create the profiler wrapper only on the first start call
             if self.profiler is None:
-                from vllm.profiler.wrapper import TorchProfilerActivityMap
-
-                activities = ["CPU"]
-                if "RBLN" in TorchProfilerActivityMap:
-                    activities.append("RBLN")
-
                 profiler_type = self.profiler_config.profiler
                 if profiler_type == "torch":
                     self.profiler = TorchProfilerWrapper(
                         self.profiler_config,
                         worker_name=trace_name,
                         local_rank=self.local_rank,
-                        activities=activities,
+                        activities=(
+                            self.profiler_config.torch_profiler_activities
+                            if self.profiler_config.torch_profiler_activities
+                            is not None
+                            else ("CPU", "PrivateUse1")
+                        ),
                     )
                     logger.debug(
                         "Starting torch profiler with tarce name: %s", trace_name
