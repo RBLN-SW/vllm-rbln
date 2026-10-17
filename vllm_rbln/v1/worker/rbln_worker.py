@@ -132,24 +132,31 @@ class RBLNWorker(WorkerBase):
         env_var = current_platform.device_control_env_var
         num_devices = rbln_config.num_devices_per_local_rank
 
-        dp_rank = self.parallel_config.data_parallel_rank_local or 0
-        slot = dp_rank * self.parallel_config.world_size + self.local_rank
-        first = slot * num_devices
-        # The visible variant, because every worker process is handed a data
-        # parallel mapping of one device per rank that the logical variant
-        # prefers (MultiprocExecutor.worker_main), and a rank owning
-        # num_devices NPUs cannot be described by one entry.
-        try:
-            selected = [
-                current_platform.visible_device_id_to_physical_device_id(first + offset)
-                for offset in range(num_devices)
-            ]
-        except IndexError as e:
-            raise ValueError(
-                f"rank slot {slot} needs {num_devices} NPU(s) from index "
-                f"{first} of {env_var}={os.environ.get(env_var, '')!r}. "
-                "One entry per NPU is expected."
-            ) from e
+        assigned = self.parallel_config.assigned_physical_gpu_ids
+        if num_devices == 1 and assigned is not None:
+            # vLLM's one-device-per-rank mapping: --device-ids, which the
+            # multi-port external LB launcher uses to place each DP server
+            # whose local DP rank is always 0, or this DP rank's shard.
+            selected = [assigned[self.local_rank]]
+        else:
+            dp_rank = self.parallel_config.data_parallel_rank_local or 0
+            slot = dp_rank * self.parallel_config.world_size + self.local_rank
+            first = slot * num_devices
+            # The visible variant, because the mapping above has one entry per
+            # rank, and a rank owning num_devices NPUs cannot be described by one.
+            try:
+                selected = [
+                    current_platform.visible_device_id_to_physical_device_id(
+                        first + offset
+                    )
+                    for offset in range(num_devices)
+                ]
+            except IndexError as e:
+                raise ValueError(
+                    f"rank slot {slot} needs {num_devices} NPU(s) from index "
+                    f"{first} of {env_var}={os.environ.get(env_var, '')!r}. "
+                    "One entry per NPU is expected."
+                ) from e
 
         selected_devices = ",".join(str(device) for device in selected)
         os.environ[env_var] = selected_devices
