@@ -101,8 +101,8 @@ KDA_HEAD_DIM = 128
 R1_ROW_BYTES = _rbln_kda_ops.R1_ROW_BYTES
 # The conv ring's width: the 3 taps before the current token (no MTP verify tokens).
 KDA_CONV_RING = 4
-# kda_prefill runs whole 128-token chunks.
-KDA_CHUNK = 128
+# kda_prefill runs whole chunks of the compiler's size (64 tokens).
+KDA_CHUNK = _rbln_kda_ops.CHUNK
 INDEX_KPOOL = _rbln_glm5_ops.KPOOL
 INDEX_HEAD_DIM = _rbln_glm5_ops.INDEX_HEAD_DIM
 
