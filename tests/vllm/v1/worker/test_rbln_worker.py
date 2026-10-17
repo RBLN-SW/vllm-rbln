@@ -563,12 +563,32 @@ class TestInitDeviceEnv:
         )
         assert os.environ["RBLN_VISIBLE_DEVICES"] == "4,5"
 
-    def test_device_ids_mapping_is_ignored(self, make_worker):
+    def test_device_ids_mapping_is_ignored_with_rsd(self, make_worker):
         # --device-ids leaves one entry per rank on the config, which cannot
         # express rsd, so the pool position decides instead.
         os.environ["RBLN_VISIBLE_DEVICES"] = "0,1,2,3"
+        make_worker(
+            world_size=2, assigned_physical_gpu_ids=[2, 3], num_devices=2, local_rank=1
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "2,3"
+
+    def test_device_ids_mapping_places_a_single_npu_rank(self, make_worker):
+        os.environ["RBLN_VISIBLE_DEVICES"] = "0,1,2,3"
         make_worker(world_size=2, assigned_physical_gpu_ids=[2, 3], local_rank=1)
-        assert os.environ["RBLN_VISIBLE_DEVICES"] == "1"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "3"
+
+    @pytest.mark.parametrize("dp_rank", [0, 1, 2, 3])
+    def test_multi_port_external_lb_server_takes_its_device(self, make_worker, dp_rank):
+        # Each DP server the launcher spawns sees itself as local DP rank 0 and
+        # learns its NPU only from --device-ids.
+        make_worker(
+            world_size=1,
+            data_parallel_size=4,
+            data_parallel_rank=dp_rank,
+            data_parallel_rank_local=0,
+            assigned_physical_gpu_ids=[dp_rank],
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == str(dp_rank)
 
 
 def _params():
