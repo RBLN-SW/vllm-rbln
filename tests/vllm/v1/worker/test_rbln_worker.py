@@ -590,6 +590,42 @@ class TestInitDeviceEnv:
         )
         assert os.environ["RBLN_VISIBLE_DEVICES"] == str(dp_rank)
 
+    @pytest.mark.parametrize(
+        "dp_rank, local_rank, expected",
+        [(0, 0, "0"), (0, 1, "1"), (1, 0, "2"), (1, 1, "3")],
+    )
+    @pytest.mark.parametrize("launch", ["in_process", "multi_port_external_lb"])
+    def test_tp2_dp2_ranks_do_not_share(
+        self, make_worker, launch, dp_rank, local_rank, expected
+    ):
+        # In-process DP: the engine hands each DP rank its shard of the host.
+        # Multi-port external LB: the launcher hands each server --device-ids,
+        # and the server sees itself as local DP rank 0.
+        make_worker(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=dp_rank,
+            data_parallel_rank_local=dp_rank if launch == "in_process" else 0,
+            assigned_physical_gpu_ids=[dp_rank * 2, dp_rank * 2 + 1],
+            local_rank=local_rank,
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
+
+    @pytest.mark.parametrize("local_rank, expected", [(0, "2"), (1, "3")])
+    def test_tp2_dp_server_given_its_own_pool(self, make_worker, local_rank, expected):
+        # One server per DP rank started by hand with RBLN_VISIBLE_DEVICES set to
+        # its NPUs: vLLM builds the mapping from that pool.
+        os.environ["RBLN_VISIBLE_DEVICES"] = "2,3"
+        make_worker(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            data_parallel_rank_local=0,
+            assigned_physical_gpu_ids=[2, 3],
+            local_rank=local_rank,
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
+
 
 def _params():
     # 100 float16 weights + 50 int8 (quantized) weights.
