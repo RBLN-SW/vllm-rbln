@@ -478,3 +478,46 @@ class TestApplySites:
         vllm_impl.patch_upstream()
 
         assert applied == ["registrations", "patches"]
+
+
+class TestCompressedTensorsRegistration:
+    @pytest.mark.parametrize("strategy", ["channel", "block"])
+    def test_weight_only_fp8_moe_selects_rbln_method(self, strategy):
+        import torch
+        from compressed_tensors.quantization import QuantizationArgs
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
+        from vllm.model_executor.layers.quantization import get_quantization_config
+
+        from vllm_rbln.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a16_fp8 import (  # noqa: E501
+            CompressedTensorsW8A16Fp8MoEMethod,
+        )
+
+        weights = QuantizationArgs(
+            num_bits=8,
+            type="float",
+            strategy=strategy,
+            block_structure=[128, 128] if strategy == "block" else None,
+        )
+        config = get_quantization_config("compressed-tensors")(
+            target_scheme_map={"Linear": {"weights": weights}},
+            ignore=[],
+            quant_format="float-quantized",
+        )
+        layer = RoutedExperts.__new__(RoutedExperts)
+        torch.nn.Module.__init__(layer)
+        layer.moe_config = types.SimpleNamespace()
+
+        method = config.get_quant_method(layer, "model.layers.0.mlp.experts")
+
+        assert isinstance(method, CompressedTensorsW8A16Fp8MoEMethod)
+        assert method.weight_quant is weights
+        assert method.moe is layer.moe_config
+
+    def test_other_layers_delegate_to_upstream(self):
+        import torch
+        from vllm.model_executor.layers.quantization import get_quantization_config
+
+        config = get_quantization_config("compressed-tensors")(
+            target_scheme_map={}, ignore=[], quant_format="float-quantized"
+        )
+        assert config.get_quant_method(torch.nn.Module(), "model.layer") is None
