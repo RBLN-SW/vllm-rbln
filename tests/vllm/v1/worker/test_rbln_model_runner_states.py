@@ -15,11 +15,13 @@
 # _update_states on a real runner: the block table, the CPU token buffers and the
 # pipeline-parallel branches, none of which a bare stub can reach.
 
+from collections.abc import Iterable
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
 from tests.vllm.v1.worker.utils import (
@@ -116,7 +118,7 @@ class TestPromptRowReAdd:
         self, make_model_runner, monkeypatch
     ):
         # A decode evicted by a prefill-only step is re-added from the int32 array
-        # made on its first add; a logits processor still gets the prompt list.
+        # made on its first add, and a logits processor still keeps the prompt list.
         _last_rank(monkeypatch)
         runner = make_model_runner()
         runner._update_states(schedule_new("a"))
@@ -133,15 +135,16 @@ class TestPromptRowReAdd:
             handed_in.append(request.prompt_token_ids)
             return add_request(request)
 
-        class RecordPrompts:
-            def __init__(self):
-                self.prompts: list[list[int] | None] = []
+        class KeepsPrompt(AdapterLogitsProcessor):
+            # A per-request processor that takes the prompt, the way a user's does.
+            # The adapter holds that prompt for as long as the request runs.
+            def is_argmax_invariant(self):
+                return False
 
-            def update_state(self, batch_update):
-                if batch_update:
-                    self.prompts.extend(added[2] for added in batch_update.added)
+            def new_req_logits_processor(self, params):
+                return lambda prompt_ids, output_ids, logits: logits
 
-        logitsproc = RecordPrompts()
+        logitsproc = KeepsPrompt(runner.vllm_config, torch.device("cpu"), False)
         runner.input_batch.logitsprocs.non_argmax_invariant.append(logitsproc)
         monkeypatch.setattr(runner.input_batch, "add_request", record_handed_in)
         runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
@@ -149,8 +152,8 @@ class TestPromptRowReAdd:
         assert runner.prompt_token_arrays["a"] is array
         assert len(handed_in) == 1 and handed_in[0] is array
         assert runner.requests["a"].prompt_token_ids is prompt
-        assert len(logitsproc.prompts) == 1 and logitsproc.prompts[0] is prompt
         req_index = runner.input_batch.req_id_to_index["a"]
+        assert logitsproc.req_info[req_index].args[0] is prompt
         assert (
             runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
             == prompt
@@ -164,6 +167,39 @@ class TestPromptRowReAdd:
         runner._update_states(schedule_new("a"))
         runner._update_states(make_scheduler_output(finished_req_ids={"a"}))
         assert "a" not in runner.prompt_token_arrays
+
+    def test_re_add_leaves_the_array_nowhere_in_the_batch(
+        self, make_model_runner, monkeypatch
+    ):
+        # The array is only lent to add_request. If upstream starts keeping the
+        # prompt it is handed, the array would stay behind without any error.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        array = runner.prompt_token_arrays["a"]
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
+
+        seen: set[int] = set()
+        pending: list[tuple[object, int]] = [(runner.input_batch, 0)]
+        while pending:
+            obj, depth = pending.pop()
+            assert obj is not array
+            if (
+                depth == 3
+                or id(obj) in seen
+                or isinstance(obj, (np.ndarray, torch.Tensor))
+            ):
+                continue
+            seen.add(id(obj))
+            children: Iterable[object]
+            if isinstance(obj, dict):
+                children = obj.values()
+            elif isinstance(obj, (list, tuple, set)):
+                children = obj
+            else:
+                children = getattr(obj, "__dict__", {}).values()
+            pending.extend((child, depth + 1) for child in children)
 
     def test_streaming_update_refills_the_row_from_the_grown_prompt(
         self, make_model_runner, monkeypatch
