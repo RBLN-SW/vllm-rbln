@@ -22,10 +22,7 @@ import torch
 
 
 @pytest.mark.parametrize("has_tower", [False, True])
-@pytest.mark.parametrize("phase", ["compile", "warmup"])
-def test_minimax_m3_encoder_lifecycle_requires_local_tower(
-    monkeypatch, has_tower, phase
-):
+def test_minimax_m3_encoder_compile_requires_local_tower(monkeypatch, has_tower):
     import vllm_rbln.model_executor.models.minimax_m3 as m3
 
     model = m3.RBLNMiniMaxM3SparseForConditionalGeneration.__new__(
@@ -39,28 +36,18 @@ def test_minimax_m3_encoder_lifecycle_requires_local_tower(
     monkeypatch.setattr(m3, "_RBLNVisionEncoder", build_encoder)
     runtime = Mock()
     compile_fn = Mock(return_value=runtime)
-    inputs = [torch.ones(1)]
-    model._encoder_inputs = Mock(return_value=inputs)
-    model._mm_encoder = runtime if has_tower and phase == "warmup" else None
+    model._mm_encoder = None
 
-    if phase == "compile":
-        model.compile_mm_encoder(compile_fn)
-        if has_tower:
-            build_encoder.assert_called_once_with(model.vision_tower)
-            compile_fn.assert_called_once_with(encoder)
-            assert model._mm_encoder is runtime
-        else:
-            build_encoder.assert_not_called()
-            compile_fn.assert_not_called()
-            assert model._mm_encoder is None
+    model.compile_mm_encoder(compile_fn)
+
+    if has_tower:
+        build_encoder.assert_called_once_with(model.vision_tower)
+        compile_fn.assert_called_once_with(encoder)
+        assert model._mm_encoder is runtime
     else:
-        model.warmup_mm_encoder()
-        if has_tower:
-            model._encoder_inputs.assert_called_once()
-            runtime.assert_called_once_with(*inputs)
-        else:
-            model._encoder_inputs.assert_not_called()
-            runtime.assert_not_called()
+        build_encoder.assert_not_called()
+        compile_fn.assert_not_called()
+        assert model._mm_encoder is None
 
 
 @pytest.mark.parametrize("aux_layers", [(), (0, 2)])

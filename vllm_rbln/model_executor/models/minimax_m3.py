@@ -1095,7 +1095,8 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         return self.language_model.logits_processor
 
     def compile_mm_encoder(self, compile_fn) -> None:
-        """Called by the runner at model load with its compile wrapper.
+        """Called by the runner at model load with its compile wrapper; the
+        runner also warms the result up through ``embed_multimodal``.
 
         The compiled encoder is kept outside the module tree: its weights are
         the registered ``vision_tower``'s, and registering the wrapper too would
@@ -1108,10 +1109,9 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         object.__setattr__(self, "_mm_encoder", compile_fn(encoder))
 
     def _encoder_inputs(
-        self, pixel_values: torch.Tensor | None, grid_thw: list[int]
+        self, pixel_values: torch.Tensor, grid_thw: list[int]
     ) -> list[torch.Tensor]:
-        """Pad one image to the bucket and build its host 3D-RoPE and key mask.
-        ``pixel_values`` None gives an all-padding (warm-up) image."""
+        """Pad one image to the bucket and build its host 3D-RoPE and key mask."""
         tower = self.vision_tower
         assert tower is not None
         vm = tower.vision_model
@@ -1125,8 +1125,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         device = next(tower.parameters()).device
         patch_dim = vm.embeddings.patch_embedding.weight[0].numel()
         padded = torch.zeros(bucket, patch_dim, dtype=dtype)
-        if pixel_values is not None:
-            padded[:num_patches] = pixel_values.to(dtype)
+        padded[:num_patches] = pixel_values.to(dtype)
 
         t, h, w = grid_thw
         merge = tower.spatial_merge_size
@@ -1161,14 +1160,6 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         key_bias = torch.zeros(1, 1, 1, bucket)
         key_bias[..., num_patches:] = -30000.0
         return [x.to(device=device, dtype=dtype) for x in (padded, cos, sin, key_bias)]
-
-    def warmup_mm_encoder(self) -> None:
-        """Run the compiled encoder once on an all-padding image."""
-        if self.vision_tower is None:
-            return
-        side = math.isqrt(MM_ENCODER_PATCH_BUCKET)
-        with torch.inference_mode():
-            self._mm_encoder(*self._encoder_inputs(None, [1, side, side]))
 
     def _encode_image(
         self, pixel_values: torch.Tensor, grid_thw: list[int]
