@@ -572,9 +572,14 @@ class RBLNGlm5KDA(nn.Module):
         beta = beta.transpose(1, 2).to(hidden_states.dtype)
         if metadata.is_prefill:
             # Padding tokens carry the state through unchanged: no decay, no update.
-            valid = torch.arange(tokens, device=g.device).view(
-                1, 1, -1
-            ) < query_len.view(-1, 1, 1)
+            # query_len - t > 0 on the device: an int32 broadcast or a compare with a
+            # scalar int32 runs on the host only, so the length spreads over the tokens
+            # as int16 and the compare is int16 (query_len - t is within a chunk).
+            ahead = query_len.to(torch.int16).view(-1, 1, 1).expand(-1, 1, tokens)
+            ahead = ahead.to(torch.int32) - torch.arange(
+                tokens, dtype=torch.int32, device=g.device
+            ).view(1, 1, -1)
+            valid = ahead.to(torch.int16) > 0
             g = g * valid.unsqueeze(-1)
             beta = beta * valid
             pad = -tokens % KDA_CHUNK
