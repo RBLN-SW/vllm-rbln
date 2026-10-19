@@ -460,6 +460,13 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
 
+    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        with pytest.raises(ValueError, match="M-RoPE"):
+            reconfigure(lambda config: None)
+
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):
             reconfigure(

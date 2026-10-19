@@ -75,6 +75,15 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
+    if model_config.uses_mrope:
+        # The RBLN RoPE override covers `RotaryEmbedding` and takes
+        # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
+        # no RBLN forward, and its native one reads a 2-D tensor as `[3, N]`.
+        raise ValueError(
+            "M-RoPE models (e.g. the Qwen2-VL family) are not supported on the "
+            "RBLN vLLM path yet. Use the optimum path."
+        )
+
     if rbln_config.compile_dtype:
         from vllm_rbln.compilation import check_dtype_option_supported
 

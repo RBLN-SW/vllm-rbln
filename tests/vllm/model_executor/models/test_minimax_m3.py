@@ -162,3 +162,12 @@ def test_text_config_loads_from_local_checkpoint(tmp_path):
     assert loaded.num_hidden_layers == 2
     assert loaded.vocab_size == 256
     assert loaded.architectures == ["MiniMaxM3SparseForCausalLM"]
+
+
+def test_minimax_m3_opts_in_to_the_rbln_multimodal_path():
+    import vllm_rbln.model_executor.models.minimax_m3 as m3
+    from vllm_rbln.model_executor.models.interfaces import supports_rbln_multimodal
+
+    assert supports_rbln_multimodal(m3.RBLNMiniMaxM3SparseForConditionalGeneration)
+    # Only an explicit declaration counts; being multimodal is not enough.
+    assert not supports_rbln_multimodal(torch.nn.Identity())

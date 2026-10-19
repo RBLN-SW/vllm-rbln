@@ -88,6 +88,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_rbln.config import get_rbln_config
 from vllm_rbln.logger import init_logger
+from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
 from vllm_rbln.v1.attention.backends.minimax_m3 import (
@@ -1021,7 +1022,7 @@ class _RBLNVisionEncoder(nn.Module):
     dummy_inputs=_mm_preprocess.MiniMaxM3VLDummyInputsBuilder,
 )
 class RBLNMiniMaxM3SparseForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3
+    nn.Module, SupportsMultiModal, SupportsRBLNMultiModal, SupportsPP, SupportsEagle3
 ):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],

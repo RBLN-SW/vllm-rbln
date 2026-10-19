@@ -122,6 +122,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
 )
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
+from vllm_rbln.model_executor.models.interfaces import supports_rbln_multimodal
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
@@ -291,10 +292,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Model-related.
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
-        self.supports_mm_inputs = model_config.supports_multimodal_inputs
-        assert not (self.supports_mm_inputs and model_config.uses_mrope), (
-            "M-RoPE multimodal models are not supported on the vLLM path"
-        )
+        # Decided in load_model: only a model that merges image embeddings inside
+        # its graph (SupportsRBLNMultiModal) takes the multimodal path.
+        self.supports_mm_inputs = False
 
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
@@ -1356,6 +1356,25 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             model_kwargs,
         )
 
+    def _resolve_mm_support(self) -> bool:
+        """Whether this runner feeds image embeddings to the loaded model.
+
+        A multimodal model that does not merge them inside its graph would get
+        the staged `mm_embeds` / `mm_mask` through `**kwargs` and ignore them:
+        the encoder would run for nothing and the request would be answered as
+        text. Refuse that instead of serving it wrong."""
+        if not self.model_config.supports_multimodal_inputs:
+            return False
+        if not supports_rbln_multimodal(self.model):
+            raise ValueError(
+                f"{type(self.model).__name__} takes multimodal inputs, but the RBLN "
+                "vLLM path serves them only for models that merge image embeddings "
+                "inside the compiled graph (SupportsRBLNMultiModal). Serve it "
+                "text-only with --limit-mm-per-prompt (every modality 0), or use "
+                "the optimum path."
+            )
+        return True
+
     def _execute_mm_encoder(self, scheduler_output: RBLNSchedulerOutput) -> None:
         """Encode this step's scheduled multimodal items on the host into
         ``self.encoder_cache``."""
@@ -2344,6 +2363,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             self.model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
+        self.supports_mm_inputs = self._resolve_mm_support()
 
         if hasattr(self.model, "logits_processor"):
             self.logits_processor = self.model.logits_processor
