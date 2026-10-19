@@ -138,15 +138,15 @@ class TestDeviceInventory:
         assert rbln_device_count() == mounted
 
     @pytest.mark.parametrize(
-        ("kwargs", "rsd", "expected"),
+        ("kwargs", "expected"),
         [
-            ({}, 1, 1),
-            ({"tensor_parallel_size": 2, "data_parallel_size": 4}, 1, 8),
-            ({"pipeline_parallel_size": 2}, 2, 4),
+            ({}, 1),
+            ({"tensor_parallel_size": 2, "data_parallel_size": 4}, 8),
+            ({"pipeline_parallel_size": 2, "tensor_parallel_size": 2}, 4),
         ],
     )
-    def test_devices_needed_multiplies_every_axis(self, kwargs, rsd, expected):
-        assert devices_needed(kwargs, rsd) == expected
+    def test_devices_needed_multiplies_every_axis(self, kwargs, expected):
+        assert devices_needed(kwargs) == expected
 
 
 def test_scrub_covers_every_name_the_env_table_reads():

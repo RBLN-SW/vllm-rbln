@@ -2307,7 +2307,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                num_devices=self.rbln_config.num_devices_per_local_rank,
+                num_devices=1,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
