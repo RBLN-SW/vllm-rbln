@@ -19,12 +19,15 @@ with its output kept."""
 from __future__ import annotations
 
 import glob
+import json
 import os
 import shlex
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 _RSD_ENV = "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"
 _RSD_SERVE = "rbln_num_devices_per_local_rank"
@@ -168,7 +171,7 @@ def run_logged(cmd: list[str], log: Path, env: dict[str, str]) -> int:
         tee.wait()
 
 
-def _agent_bin() -> str | None:
+def agent_bin() -> str | None:
     """A containerized step gets the agent bind-mounted into the build root
     rather than installed, so `which` alone finds nothing."""
     if found := shutil.which("buildkite-agent"):
@@ -185,6 +188,130 @@ def _agent_bin() -> str | None:
         if os.access(candidate, os.X_OK):
             return str(candidate)
     return None
+
+
+def write_result(out: Path, result: dict[str, Any]) -> None:
+    """Keep result.json readable when a job is interrupted during a write."""
+    temporary = out / "result.tmp"
+    temporary.write_text(json.dumps(result))
+    temporary.replace(out / "result.json")
+
+
+def start_case(out: Path, *, resume: bool = False) -> dict[str, Any]:
+    if out.exists() and not resume:
+        raise ValueError(f"Cannot overwrite {out}; use a new --run-id")
+    out.mkdir(parents=True, exist_ok=True)
+    build_url = os.environ.get("BUILDKITE_BUILD_URL")
+    job_id = os.environ.get("BUILDKITE_JOB_ID")
+    result: dict[str, Any] = {
+        "exit_code": None,
+        "job_url": f"{build_url}#{job_id}" if build_url and job_id else None,
+        "rows": [],
+    }
+    write_result(out, result)
+    return result
+
+
+def case_status(result: dict[str, Any] | None) -> str:
+    if result is None:
+        return "no result"
+    if result["exit_code"] is None:
+        return "incomplete"
+    if result["exit_code"] != 0:
+        return f"failed (exit {result['exit_code']})"
+    if not result["rows"]:
+        return "no results"
+    return "ok"
+
+
+def download_results(lane: str, run_id: str, chip: str) -> None:
+    agent = agent_bin()
+    if agent is None:
+        raise RuntimeError("buildkite-agent is required to download results")
+    pattern = f"{lane}-results/{run_id}/{chip}/**/result.json"
+    found = subprocess.run(
+        [agent, "artifact", "search", pattern, "--allow-empty-results"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    if found.stdout.strip():
+        subprocess.run([agent, "artifact", "download", pattern, "."], check=True)
+
+
+def measured_pipeline(
+    lane: str,
+    driver: Path,
+    targets: dict[str, Any],
+    cases: list[tuple[str, ...]],
+    *,
+    chip: str,
+    run_id: str,
+    targets_dir: Path,
+) -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[4]
+    template = yaml.safe_load((root / ".buildkite/vllm-rbln-nightly.yml").read_text())[
+        f"_{lane.replace('-', '_')}"
+    ]
+    chip_name = chip.removeprefix("RBLN-")
+    prefix = f"nightly-{lane}-{chip_name.lower()}"
+    driver = driver.relative_to(root)
+    runner = driver.with_name(driver.stem.replace("_", "-") + ".sh")
+    common = [
+        "--chip",
+        chip,
+        "--run-id",
+        run_id,
+        "--targets-dir",
+        os.path.relpath(targets_dir, root),
+    ]
+    steps = []
+    for case in cases:
+        name, launch = case[:2]
+        target = targets[name]
+        serve = target["serve"] | target["serve_params"][launch]
+        selection = [
+            arg
+            for flag, value in zip(("--launch", "--bench"), case[1:])
+            for arg in (flag, value)
+        ]
+        command = shlex.join(["bash", str(runner), name, *selection, *common])
+        steps.append(
+            template
+            | {
+                "label": " / ".join(case),
+                "key": f"{prefix}-{'-'.join(case)}",
+                "resources": {
+                    "npu": {
+                        "count": devices_needed(serve, target_env(target)),
+                        "product": chip,
+                    }
+                },
+                "command": [*template["command"], command],
+            }
+        )
+    summary = template | {
+        "label": "summary",
+        "key": f"{prefix}-summary",
+        "depends_on": [step["key"] for step in steps],
+        "allow_dependency_failure": True,
+        "timeout_in_minutes": 10,
+        "artifact_paths": [f"{lane}-results/{run_id}/{chip}/**/summary.md"],
+        "command": "uv run --no-project --python 3.12 --with pyyaml python "
+        + shlex.join([str(driver), "summary", *targets, *common, "--download"]),
+    }
+    for key in ("agents", "secrets", "plugins"):
+        del summary[key]
+    steps.append(summary)
+    return {
+        "steps": [
+            {
+                "group": f"[{chip_name}] {lane}",
+                "key": prefix,
+                "steps": steps,
+            }
+        ]
+    }
 
 
 def publish_summary(
@@ -225,7 +352,7 @@ def _publish_summary(
 
     if not on_ci:
         return
-    agent = _agent_bin()
+    agent = agent_bin()
     if agent is None:
         print("  summary: no buildkite-agent found; annotation skipped", flush=True)
         return

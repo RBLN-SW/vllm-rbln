@@ -13,12 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Turn a target file into a `vllm bench sweep serve` run.
+"""Run isolated perf cases, generate CI jobs, and collect their results.
 
-The sweep itself -- starting the server, waiting for it, benchmarking, resetting
-caches, tearing down, resuming -- is upstream's. This adds only what a target
-needs and the sweep cannot express: the chip it runs on, the env it runs under,
-and the device budget it fits in.
+Each serve/bench pair gets its own upstream sweep and server process. CI jobs
+write case artifacts; the summary job publishes one table per target and chip.
 """
 
 from __future__ import annotations
@@ -42,14 +40,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lane import (  # noqa: E402
     build_cmd,
+    case_status,
     device_count,
     devices_needed,
+    download_results,
     host_chip,
+    measured_pipeline,
     output_dir,
     publish_summary,
     run_logged,
+    start_case,
     target_env,
     write_repro,
+    write_result,
 )
 
 _HERE = Path(__file__).resolve().parent
@@ -106,8 +109,8 @@ def _workload(row: dict[str, str]) -> dict[str, str]:
     return facts
 
 
-def _read_rows(out: Path) -> list[dict[str, str]]:
-    """Every run the sweep recorded for one launch. Its columns are the benchmark's
+def _read_rows(out: Path) -> list[dict[str, Any]]:
+    """Every run the sweep recorded for one case. Its columns are the benchmark's
     own JSON keys plus run_number and the swept overrides."""
     results = out / "results"
     try:
@@ -132,69 +135,71 @@ def _read_rows(out: Path) -> list[dict[str, str]]:
 
 def summarize(
     target: str,
-    chip: str | None,
-    launches: dict[str, list[dict[str, str]]],
-    skipped: dict[str, str],
+    chip: str,
+    cases: dict[tuple[str, str], dict[str, Any] | None],
 ) -> tuple[str, bool]:
-    """One table for the whole target: its serve_params entries exist to be
-    compared. A fact shared by every row moves to the header, leaving the table
-    to what differs."""
-    rows = [(launch, row) for launch, runs in launches.items() for row in runs]
-    if not rows:
-        note = "\n".join(f"- {name}: {why}" for name, why in skipped.items())
-        return f"#### {target}\n\nno perf results.\n{note}", True
-
-    shapes = [_workload(row) for _, row in rows]
+    """Include every planned case, even when a job produced no artifact."""
+    shapes = [
+        _workload(row)
+        for result in cases.values()
+        if result is not None
+        for row in result["rows"]
+    ]
     shared = {
         key: value
-        for key, value in shapes[0].items()
+        for key, value in (shapes[0] if shapes else {}).items()
         if all(shape.get(key) == value for shape in shapes[1:])
     }
 
-    degraded = bool(skipped)
+    degraded = False
     lines = []
-    for launch, row in rows:
-        cells = [launch, str(row.get("_benchmark_name", "--"))]
-        for key, _, fmt in _METRICS:
-            value = _num(row, key)
-            cells.append(fmt(value) if value is not None else "--")
-        completed, prompts = _num(row, "completed"), _num(row, "num_prompts")
-        failed = _num(row, "failed") or 0
-        done = f"{completed:.0f}/{prompts:.0f}" if completed and prompts else "--"
-        cells.append(done)
-        if failed or (completed and prompts and completed != prompts):
-            degraded = True
-        lines.append("| " + " | ".join(cells) + " |")
+    for (launch, bench), result in cases.items():
+        status = case_status(result)
+        if result is None:
+            rows, job = [], "--"
+        else:
+            rows = result["rows"]
+            job = f"[log]({result['job_url']})" if result["job_url"] else "--"
 
-    titles = ["launch", "bench", *(title for _, title, _ in _METRICS), "done"]
+        for row in rows or [{}]:
+            cells = [launch, bench]
+            for key, _, fmt in _METRICS:
+                value = _num(row, key)
+                cells.append(fmt(value) if value is not None else "--")
+            completed, prompts = _num(row, "completed"), _num(row, "num_prompts")
+            failed = _num(row, "failed") or 0
+            done = (
+                f"{completed:.0f}/{prompts:.0f}"
+                if completed is not None and prompts is not None
+                else "--"
+            )
+            row_status = status
+            if failed or (
+                completed is not None and prompts is not None and completed != prompts
+            ):
+                row_status = "incomplete requests" if status == "ok" else status
+            degraded |= row_status != "ok"
+            cells += [done, row_status, job]
+            lines.append("| " + " | ".join(cells) + " |")
+
+    titles = [
+        "launch",
+        "bench",
+        *(title for _, title, _ in _METRICS),
+        "done",
+        "status",
+        "job",
+    ]
     body = [
-        f"#### {target}" + (f" -- {chip}" if chip else ""),
+        f"#### {target} -- {chip}",
         "",
         " · ".join(f"{k} {v}" for k, v in shared.items()),
         "",
         "| " + " | ".join(titles) + " |",
-        "|:--|:--" + "|--:" * (len(titles) - 2) + "|",
+        "|:--|:--" + "|--:" * (len(_METRICS) + 1) + "|:--|:--|",
         *lines,
     ]
-    if skipped:
-        body += ["", *(f"- {name}: {why}" for name, why in skipped.items())]
     return "\n".join(body), degraded
-
-
-def affordable_serve_params(
-    target: dict[str, Any], budget: int
-) -> tuple[dict[str, Any], dict[str, str]]:
-    """The entries this host can run, and why each of the rest was left out --
-    a launch missing from the summary should say so rather than not appear."""
-    kept, skipped = {}, {}
-    for name, overrides in target["serve_params"].items():
-        needed = devices_needed({**target["serve"], **overrides}, target_env(target))
-        if needed > budget:
-            print(f"  skip {name}: needs {needed} NPUs, host has {budget}")
-            skipped[name] = f"needs {needed} NPUs, host has {budget}"
-            continue
-        kept[name] = overrides
-    return kept, skipped
 
 
 def spread_across_ranks(bench_cmd: list[str], serve: dict[str, Any]) -> list[str]:
@@ -207,80 +212,36 @@ def spread_across_ranks(bench_cmd: list[str], serve: dict[str, Any]) -> list[str
     return [sys.executable, str(_RR_BENCH), "--dp-size", str(dp), *bench_cmd]
 
 
-def run_target(path: Path, out_dir: Path, run_id: str, passthrough: list[str]) -> int:
-    target = yaml.safe_load(path.read_text())
-    name = path.stem
-    print(f"=== {name} ({path})")
+def run_case(
+    out: Path,
+    target: dict[str, Any],
+    launch: str,
+    bench: str,
+    passthrough: list[str],
+) -> int:
+    result = start_case(out, resume="--resume" in passthrough)
 
-    chips = target.get("chips")
-    chip = host_chip()
-    if chips and chip and chip not in chips:
-        print(f"  skip: needs {'/'.join(chips)}, host is {chip}")
-        return 0
-
-    serve_params, skipped = affordable_serve_params(target, device_count())
-    if not serve_params:
-        print("  skip: no combination fits this host")
-        return 0
+    overrides = target["serve_params"][launch]
+    serve = target["serve"] | overrides
+    needed, available = devices_needed(serve, target_env(target)), device_count()
+    if needed > available:
+        raise ValueError(f"{launch} needs {needed} NPUs, host has {available}")
 
     model = target["model"]
-    serve_cmd = build_cmd(["vllm", "serve", "--model", model], target.get("serve", {}))
+    serve_cmd = build_cmd(["vllm", "serve", "--model", model], target["serve"])
     bench_cmd = build_cmd(
         ["vllm", "bench", "serve", "--model", model], target.get("bench", {})
     )
-    env = os.environ | target_env(target)
-
-    # One sweep per serve_params entry, rather than one sweep over all of them:
-    # an entry is one server launch, so this is what puts each launch's results,
-    # summary and log in a directory of its own.
-    status = 0
-    launches: dict[str, list[dict[str, str]]] = {}
-    for launch, overrides in serve_params.items():
-        out = out_dir / run_id / name / launch
-        print(f"--- {name} / {launch} -> {out}")
-        rc = run_launch(
-            out, {launch: overrides}, target, serve_cmd, bench_cmd, env, passthrough
-        )
-        status = max(status, rc)
-        launches[launch] = _read_rows(out)
-        if not launches[launch]:
-            # The exit status separates a sweep that died from one that ran and
-            # wrote nothing -- different logs to open.
-            died = f" (sweep exited {rc}, see {out / 'perf.log'})" if rc else ""
-            skipped[launch] = f"no results{died}"
-
-    # A malformed row must not turn a lane that ran into a lane that failed.
-    try:
-        body, degraded = summarize(name, chip, launches, skipped)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  summary: not built ({type(exc).__name__}: {exc})")
-    else:
-        publish_summary(
-            "perf", out_dir / run_id / name, body, chip=chip, degraded=degraded
-        )
-    return status
-
-
-def run_launch(
-    out: Path,
-    serve_params: dict[str, Any],
-    target: dict[str, Any],
-    serve_cmd: list[str],
-    bench_cmd: list[str],
-    env: dict[str, str],
-    passthrough: list[str],
-) -> int:
-    (overrides,) = serve_params.values()
-    bench_cmd = spread_across_ranks(bench_cmd, {**target["serve"], **overrides})
+    bench_cmd = spread_across_ranks(bench_cmd, serve)
+    bench_params = {bench: target["bench_params"][bench]}
 
     log = out / "perf.log"
     repro = write_repro(
         out,
         target_env(target),
-        {"serve": build_cmd(serve_cmd, overrides)}
-        | {
-            name: build_cmd(bench_cmd, bench_overrides)
-            for name, bench_overrides in target["bench_params"].items()
+        {
+            "serve": build_cmd(serve_cmd, overrides),
+            bench: build_cmd(bench_cmd, bench_params[bench]),
         },
     )
     print(f"  wrote {out / 'repro.sh'}")
@@ -292,8 +253,8 @@ def run_launch(
     with tempfile.TemporaryDirectory() as tmp:
         serve_file = Path(tmp) / "serve-params.json"
         bench_file = Path(tmp) / "bench-params.json"
-        serve_file.write_text(json.dumps(serve_params))
-        bench_file.write_text(json.dumps(target["bench_params"]))
+        serve_file.write_text(json.dumps({launch: overrides}))
+        bench_file.write_text(json.dumps(bench_params))
 
         cmd = [
             "vllm",
@@ -312,8 +273,7 @@ def run_launch(
             "--show-stdout",
             "--output-dir",
             str(out),
-            # The launch is the experiment, so its results stay beside the log and
-            # the repro script rather than under a directory the sweep names.
+            # Keep the sweep's files under the case's log and repro directory.
             "--experiment-name",
             "results",
             "--server-ready-timeout",
@@ -324,27 +284,40 @@ def run_launch(
         ]
         print(f"  {shlex.join(cmd)}")
         print(f"  logging to {log}")
-        return run_logged(cmd, log, env)
+        rc = run_logged(cmd, log, os.environ | target_env(target))
+
+    result["exit_code"] = rc
+    result["rows"] = _read_rows(out)
+    write_result(out, result)
+    return rc
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "targets",
-        nargs="*",
-        help="target names to run (default: every file in --targets-dir)",
-    )
-    parser.add_argument("--targets-dir", type=Path, default=_HERE / "targets")
-    parser.add_argument(
-        "--run-id",
-        default=datetime.now().strftime("%Y%m%d_%H%M%S"),
-        help="groups this run's launches; pass the same one with --resume",
-    )
+    commands = parser.add_subparsers(dest="action", required=True)
+    for action in ("run", "pipeline", "summary"):
+        command = commands.add_parser(action)
+        command.add_argument("targets", nargs="*", help="target names (default: all)")
+        command.add_argument("--targets-dir", type=Path, default=_HERE / "targets")
+        command.add_argument("--chip", required=action != "run")
+        command.add_argument(
+            "--run-id",
+            default=os.environ.get("BUILDKITE_BUILD_ID")
+            or datetime.now().strftime("%Y%m%d_%H%M%S"),
+            help="shared by the cases and summary; pass the same ID to resume",
+        )
+        if action == "run":
+            command.add_argument("--launch")
+            command.add_argument("--bench")
+        elif action == "summary":
+            command.add_argument("--download", action="store_true")
     args, passthrough = parser.parse_known_args()
+    if passthrough and args.action != "run":
+        parser.error(f"unrecognized arguments: {shlex.join(passthrough)}")
 
     # Not a flag: an --output-dir here would reach the sweep through passthrough
     # and move its results out from under the launch directory.
-    if bad := {"-o", "--output-dir"} & set(passthrough):
+    if bad := {"-o", "--output-dir"} & {arg.split("=", 1)[0] for arg in passthrough}:
         parser.error(f"{', '.join(sorted(bad))} is set with PERF_OUTPUT_DIR instead")
 
     paths = sorted([*args.targets_dir.glob("*.yaml"), *args.targets_dir.glob("*.yml")])
@@ -356,8 +329,73 @@ def main() -> int:
     if not paths:
         parser.error(f"no targets under {args.targets_dir}")
 
-    out_dir = output_dir("PERF_OUTPUT_DIR", "perf-results")
-    return max(run_target(p, out_dir, args.run_id, passthrough) for p in paths)
+    if args.action == "run":
+        chip = host_chip()
+        if chip is None:
+            parser.error("cannot determine the host NPU chip")
+        if args.chip is not None and args.chip != chip:
+            parser.error(f"expected chip {args.chip}, host reports {chip}")
+        args.chip = chip
+    targets = {path.stem: yaml.safe_load(path.read_text()) for path in paths}
+    targets = {
+        name: target
+        for name, target in targets.items()
+        if not target.get("chips") or args.chip in target["chips"]
+    }
+    cases = [
+        (name, launch, bench)
+        for name, target in targets.items()
+        for launch in target["serve_params"]
+        for bench in target["bench_params"]
+    ]
+    if args.action == "run":
+        for selected, column in ((args.launch, 1), (args.bench, 2)):
+            if selected is not None:
+                if selected not in {case[column] for case in cases}:
+                    parser.error(
+                        f"no such {'launch' if column == 1 else 'bench'}: {selected}"
+                    )
+                cases = [case for case in cases if case[column] == selected]
+    if not cases:
+        parser.error(f"no perf cases for {args.chip}")
+
+    if args.action == "pipeline":
+        pipeline = measured_pipeline(
+            "perf",
+            Path(__file__).resolve(),
+            targets,
+            cases,
+            chip=args.chip,
+            run_id=args.run_id,
+            targets_dir=args.targets_dir,
+        )
+        print(json.dumps(pipeline))
+        return 0
+
+    base = output_dir("PERF_OUTPUT_DIR", "perf-results") / args.run_id / args.chip
+    if args.action == "run":
+        status = 0
+        for name, launch, bench in cases:
+            out = base / name / launch / bench
+            print(f"--- {name} / {launch} / {bench} -> {out}", flush=True)
+            rc = run_case(out, targets[name], launch, bench, passthrough)
+            status = max(status, int(rc != 0))
+        return status
+
+    assert args.action == "summary"
+    if args.download:
+        download_results("perf", args.run_id, args.chip)
+    for name in targets:
+        results = {}
+        for case_name, launch, bench in cases:
+            if case_name == name:
+                path = base / name / launch / bench / "result.json"
+                results[launch, bench] = (
+                    json.loads(path.read_text()) if path.exists() else None
+                )
+        body, degraded = summarize(name, args.chip, results)
+        publish_summary("perf", base / name, body, chip=args.chip, degraded=degraded)
+    return 0
 
 
 if __name__ == "__main__":
