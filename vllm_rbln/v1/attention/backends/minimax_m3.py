@@ -18,6 +18,7 @@ from typing import ClassVar
 
 import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_rbln.logger import init_logger
 
@@ -45,7 +46,9 @@ class RBLNMiniMaxM3SparseBackend(AttentionBackend):
         return "RBLN_MINIMAX_M3_SPARSE"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
         return [MultipleOf(4 * MSA_SPARSE_BLOCK_SIZE)]
 
     @classmethod
@@ -92,7 +95,9 @@ class RBLNMiniMaxM3IndexerBackend(AttentionBackend):
         return "RBLN_MINIMAX_M3_INDEXER"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
         return [MultipleOf(4 * MSA_SPARSE_BLOCK_SIZE)]
 
     @classmethod
