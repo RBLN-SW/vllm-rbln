@@ -27,7 +27,12 @@ _MODULE = "vllm_rbln.model_executor.models.glm5_next"
 def register_glm5_next() -> None:
     from vllm.model_executor.models import ModelRegistry
 
-    for arch in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"):
-        ModelRegistry.register_model(arch, f"{_MODULE}:RBLNGlm5NextForCausalLM")
+    ModelRegistry.register_model(
+        "Glm5NextForCausalLM", f"{_MODULE}:RBLNGlm5NextForCausalLM"
+    )
+    ModelRegistry.register_model(
+        "Glm5NextForConditionalGeneration",
+        f"{_MODULE}:RBLNGlm5NextForConditionalGeneration",
+    )
     # The MTP drafter vLLM's speculative config selects for a glm5_next target.
     ModelRegistry.register_model("Glm5NextMTPModel", f"{_MODULE}:RBLNGlm5NextMTP")

@@ -14,7 +14,7 @@
 
 """GLM-5.3 (glm5_next) text backbone for RBLN.
 
-Upstream's ``vllm.models.glm5next.nvidia`` binds FLA / TileLang / DeepGEMM kernels and the
+Upstream's ``vllm.models.glm5next`` binds FLA / TileLang / DeepGEMM kernels and the
 hybrid mamba state manager. This keeps its module tree and weight names and runs:
 
 * mHC (4 residual streams) through ``hc_stream_reduce`` / ``hc_residual_add`` /
@@ -27,12 +27,17 @@ hybrid mamba state manager. This keeps its module tree and weight names and runs
 
 The cache layout is region by region (SoA, design README 2.7; see
 ``v1/attention/backends/glm5_next.py``). A decoder layer's caches are named
-``{prefix}.attn.{slot}``. Text only: the vision tower is not modeled and its weights are
-skipped. TP 1.
+``{prefix}.attn.{slot}``. The vision tower runs through its own compiled graph (see
+``RBLNGlm5NextForConditionalGeneration``). TP 1.
 """
 
+import importlib.util
+import math
+import sys
 from collections.abc import Iterable
 from itertools import islice
+from pathlib import Path
+from types import ModuleType
 
 import torch
 import torch.nn.functional as F
@@ -64,17 +69,25 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.glm4_1v import Glm4vDummyInputsBuilder
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     make_layers,
     maybe_prefix,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
 
 from vllm_rbln.config import get_rbln_config
+from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadata,
@@ -1153,6 +1166,363 @@ class RBLNGlm5NextForCausalLM(nn.Module):
         return AutoWeightsLoader(self).load_weights(
             weights, mapper=self.hf_to_vllm_mapper
         )
+
+
+def _load_upstream_glm5_multimodal() -> ModuleType:
+    """Import ``vllm.models.glm5next.common.multimodal`` (the multimodal processor)
+    without running the package ``__init__``, which imports the NVIDIA model (CUDA
+    custom ops) at import time. The module only uses absolute imports."""
+    full_name = "vllm.models.glm5next.common.multimodal"
+    if (module := sys.modules.get(full_name)) is not None:
+        return module
+    import vllm.models
+
+    path = Path(vllm.models.__file__).parent / "glm5next" / "common" / "multimodal.py"
+    spec = importlib.util.spec_from_file_location(full_name, path)
+    assert spec is not None and spec.loader is not None, path
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[full_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_glm5_mm = _load_upstream_glm5_multimodal()
+
+# Patches per image the compiled vision encoder takes (64 x 64 grid, 896 x 896 px,
+# 1024 image tokens).
+VISION_PATCH_BUCKET = 4096
+# The checkpoint's vision_config.rms_norm_eps is 1e-5, but the tower was trained with
+# 1e-6; 1e-5 gives repetitive / degraded image descriptions (the reference model forces
+# it). The q / k norms keep upstream's 1e-5.
+VISION_RMS_NORM_EPS = 1e-6
+VISION_QK_NORM_EPS = 1e-5
+VISION_ROPE_THETA = 10000.0
+
+
+def _clamped_glu(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
+    return F.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+
+
+class RBLNGlm5VisionAttention(nn.Module):
+    def __init__(self, config: PretrainedConfig) -> None:
+        super().__init__()
+        dim = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = dim // self.num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=config.attention_bias)
+        self.proj = nn.Linear(dim, dim, bias=config.attention_bias)
+        self.q_norm = RBLNRMSNorm(self.head_dim, eps=VISION_QK_NORM_EPS)
+        self.k_norm = RBLNRMSNorm(self.head_dim, eps=VISION_QK_NORM_EPS)
+
+
+class RBLNGlm5VisionMLP(nn.Module):
+    def __init__(self, dim: int, hidden: int, bias: bool) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden, bias=bias)
+        self.up_proj = nn.Linear(dim, hidden, bias=bias)
+        self.down_proj = nn.Linear(hidden, dim, bias=bias)
+
+
+class RBLNGlm5VisionBlock(nn.Module):
+    def __init__(self, config: PretrainedConfig) -> None:
+        super().__init__()
+        self.norm1 = RBLNRMSNorm(config.hidden_size, eps=VISION_RMS_NORM_EPS)
+        self.norm2 = RBLNRMSNorm(config.hidden_size, eps=VISION_RMS_NORM_EPS)
+        self.attn = RBLNGlm5VisionAttention(config)
+        self.mlp = RBLNGlm5VisionMLP(
+            config.hidden_size, config.intermediate_size, config.attention_bias
+        )
+
+
+class RBLNGlm5VisionPatchEmbed(nn.Module):
+    def __init__(self, config: PretrainedConfig) -> None:
+        super().__init__()
+        kernel = (config.temporal_patch_size, config.patch_size, config.patch_size)
+        self.proj = nn.Conv3d(
+            config.in_channels, config.hidden_size, kernel_size=kernel, stride=kernel
+        )
+
+
+class RBLNGlm5VisionPatchMerger(nn.Module):
+    def __init__(self, dim: int, context_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.post_projection_norm = nn.LayerNorm(dim)
+        self.gate_proj = nn.Linear(dim, context_dim, bias=False)
+        self.up_proj = nn.Linear(dim, context_dim, bias=False)
+        self.down_proj = nn.Linear(context_dim, dim, bias=False)
+
+
+class RBLNGlm5VisionModel(nn.Module):
+    """GLM-5.3's vision tower (``Glm5NextVisionModel``, the checkpoint's names) as a
+    fixed-length forward of one image, compiled for the device.
+
+    ``forward(pixel_values [N, C*T*P*P], cos [N, D], sin [N, D], key_bias [1, 1, N])
+    -> [N / merge^2, out_hidden]`` with ``N`` the bucket: rows past the image's patches
+    are padding, masked out as keys by ``key_bias`` and dropped from the output by the
+    caller. The caller builds the axial 2D RoPE on the host (``cos`` / ``sin`` over the
+    whole head dim, ``[h, w, h, w]`` frequencies). The patch embed (a Conv3d with stride
+    == kernel) and the 2 x 2 downsample (a Conv2d over merge-ordered rows) are linears
+    over their weights' views, rotate_half is a matmul (no last-dim slice at 32), and
+    attention is explicit matmul / softmax.
+    """
+
+    def __init__(self, config: PretrainedConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.spatial_merge_size = config.spatial_merge_size
+        self.num_heads = config.num_heads
+        self.head_dim = config.hidden_size // config.num_heads
+        self.swiglu_limit = config.swiglu_limit
+        self.patch_embed = RBLNGlm5VisionPatchEmbed(config)
+        self.blocks = nn.ModuleList(
+            [RBLNGlm5VisionBlock(config) for _ in range(config.depth)]
+        )
+        self.merger = RBLNGlm5VisionPatchMerger(
+            config.out_hidden_size, config.projection_intermediate_size
+        )
+        self.downsample = nn.Conv2d(
+            config.hidden_size,
+            config.out_hidden_size,
+            kernel_size=config.spatial_merge_size,
+            stride=config.spatial_merge_size,
+        )
+        self.post_layernorm = RBLNRMSNorm(config.hidden_size, eps=VISION_RMS_NORM_EPS)
+        # (x @ rot)[j] = -x[j + half] for j < half, x[j - half] for j >= half. Built on
+        # the host (the default device here is the NPU), then put with the weights.
+        half = self.head_dim // 2
+        rot = torch.zeros(self.head_dim, self.head_dim, device="cpu")
+        for j in range(half):
+            rot[j + half, j] = -1.0
+            rot[j, j + half] = 1.0
+        weight = self.patch_embed.proj.weight
+        self.register_buffer(
+            "rot", rot.to(device=weight.device, dtype=weight.dtype), persistent=False
+        )
+        # Axial RoPE: the same head_dim // 4 frequencies for the h and w grids (host).
+        spatial = self.head_dim // 2
+        exponents = torch.arange(0, spatial, 2, dtype=torch.float32, device="cpu")
+        self.inv_freq = 1.0 / VISION_ROPE_THETA ** (exponents / spatial)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.patch_embed.proj.weight.dtype
+
+    def rope(self, grid_thw: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Host cos / sin [t*h*w, head_dim] of one image or video, rows in the merge
+        order of the processor's patches (upstream ``rot_pos_emb``)."""
+        t, h, w = grid_thw
+        merge = self.spatial_merge_size
+
+        def merge_order(ids: torch.Tensor) -> torch.Tensor:
+            return (
+                ids.reshape(h // merge, merge, w // merge, merge)
+                .permute(0, 2, 1, 3)
+                .flatten()
+                .repeat(t)
+            )
+
+        h_ids = merge_order(torch.arange(h).unsqueeze(1).expand(-1, w))
+        w_ids = merge_order(torch.arange(w).unsqueeze(0).expand(h, -1))
+        freqs_h = torch.outer(h_ids.float(), self.inv_freq)
+        freqs_w = torch.outer(w_ids.float(), self.inv_freq)
+        angles = torch.cat([freqs_h, freqs_w, freqs_h, freqs_w], dim=-1)
+        return angles.cos(), angles.sin()
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        key_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        n = pixel_values.shape[0]
+        w = self.patch_embed.proj.weight
+        x = F.linear(
+            pixel_values, w.reshape(w.shape[0], -1), self.patch_embed.proj.bias
+        )
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        scale = self.head_dim**-0.5
+        limit = self.swiglu_limit
+        for block in self.blocks:
+            attn = block.attn
+            qkv = attn.qkv(block.norm1(x)).view(n, 3, self.num_heads, self.head_dim)
+            q = attn.q_norm(qkv[:, 0])
+            k = attn.k_norm(qkv[:, 1])
+            v = qkv[:, 2]  # [N, heads, D]
+            q = q * cos + torch.matmul(q, self.rot) * sin
+            k = k * cos + torch.matmul(k, self.rot) * sin
+            q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+            scores = torch.matmul(q, k.transpose(1, 2)) * scale + key_bias
+            out = torch.matmul(torch.softmax(scores, dim=-1), v)
+            x = x + attn.proj(out.transpose(0, 1).reshape(n, -1))
+            h = block.norm2(x)
+            mlp = block.mlp
+            x = x + mlp.down_proj(_clamped_glu(mlp.gate_proj(h), mlp.up_proj(h), limit))
+        x = self.post_layernorm(x)
+        # Each run of merge^2 rows is one 2 x 2 block in (kh, kw) order: the Conv2d is
+        # a linear over its weight in that order.
+        merge2 = self.spatial_merge_size**2
+        d = self.downsample.weight
+        x = F.linear(
+            x.reshape(n // merge2, merge2 * x.shape[-1]),
+            d.permute(0, 2, 3, 1).reshape(d.shape[0], -1),
+            self.downsample.bias,
+        )
+        merger = self.merger
+        x = F.gelu(merger.post_projection_norm(merger.proj(x)))
+        return merger.down_proj(
+            _clamped_glu(merger.gate_proj(x), merger.up_proj(x), limit)
+        )
+
+
+class RBLNGlm5NextProcessingInfo(_glm5_mm.Glm5NextProcessingInfo):
+    """Upstream's processing info with the image token budget capped at the vision
+    encoder's bucket (the checkpoint allows 8000 tokens an image): the processor
+    resizes larger images down to it, and vLLM's token budgeting agrees."""
+
+    def get_hf_processor(self, **kwargs: object):
+        processor = super().get_hf_processor(**kwargs)
+        image_processor = processor.image_processor
+        merge = image_processor.merge_size
+        image_processor.max_image_tokens = min(
+            image_processor.max_image_tokens, VISION_PATCH_BUCKET // (merge * merge)
+        )
+        return processor
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    _glm5_mm.Glm5NextMultiModalProcessor,
+    info=RBLNGlm5NextProcessingInfo,
+    dummy_inputs=Glm4vDummyInputsBuilder,
+)
+class RBLNGlm5NextForConditionalGeneration(
+    RBLNGlm5NextForCausalLM, SupportsMultiModal, SupportsRBLNMultiModal
+):
+    """GLM-5.3 with images: the text model (same module tree and cache names) plus the
+    vision tower, run through its own compiled graph one image at a time, padded to
+    ``VISION_PATCH_BUCKET`` patches (see ``RBLNGlm5VisionModel``). The runner compiles
+    it (``compile_mm_encoder``), warms it up on its largest dummy image and caches its
+    outputs; they reach the text model's graph as ``mm_embeds`` / ``mm_mask`` (see
+    ``forward``). The text model is NoPE, so the runner's plain positions serve (no
+    M-RoPE). ``--limit-mm-per-prompt '{"image": 0, "video": 0}'`` skips the tower and
+    gives the text-only model.
+    """
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "model.visual.": "visual.",
+        }
+    )
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return "<|begin_of_image|><|image|><|end_of_image|>"
+        if modality.startswith("video"):
+            return "<|begin_of_video|><|video|><|end_of_video|>"
+        raise ValueError(f"Unsupported modality: {modality!r}")
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        with self._mark_language_model(vllm_config):
+            super().__init__(vllm_config=vllm_config, prefix=prefix)
+        vision_config = vllm_config.model_config.hf_config.vision_config
+        # fp32 tower (dlfp16 on the device, as MiniMax-M3's).
+        with (
+            self._mark_tower_model(vllm_config, {"image", "video"}),
+            set_default_torch_dtype(torch.float32),
+        ):
+            self.visual = RBLNGlm5VisionModel(vision_config)
+        # Upstream's EAGLE drafter reads the image token off the target's config, the
+        # text config here.
+        self.config.image_token_index = (
+            vllm_config.model_config.hf_config.image_token_id
+        )
+        # Set by ``compile_mm_encoder``; kept out of the module tree (it shares the
+        # tower's parameters).
+        object.__setattr__(self, "_mm_encoder", None)
+
+    def get_language_model(self) -> nn.Module:
+        # The text model is this module itself (the CausalLM it extends), not a child:
+        # upstream's EAGLE drafter shares ``model.embed_tokens`` / ``lm_head`` off it.
+        return self
+
+    def compile_mm_encoder(self, compile_fn) -> None:
+        """Called by the runner at model load with its compile wrapper."""
+        object.__setattr__(self, "_mm_encoder", compile_fn(self.visual.eval()))
+
+    def _encoder_inputs(
+        self, pixel_values: torch.Tensor, grid_thw: list[int]
+    ) -> list[torch.Tensor]:
+        """Pad one image to the bucket with its host RoPE and padding-key bias."""
+        visual = self.visual
+        bucket = VISION_PATCH_BUCKET
+        num_patches = math.prod(grid_thw)
+        assert num_patches <= bucket, (
+            f"an image of {num_patches} patches (grid {grid_thw}) exceeds the "
+            f"vision encoder's {bucket}-patch bucket"
+        )
+        dtype = visual.dtype
+        device = visual.patch_embed.proj.weight.device
+        patch_dim = visual.patch_embed.proj.weight[0].numel()
+        padded = torch.zeros(bucket, patch_dim, dtype=dtype)
+        padded[:num_patches] = pixel_values.to(dtype)
+        cos = torch.ones(bucket, visual.head_dim)
+        sin = torch.zeros(bucket, visual.head_dim)
+        cos[:num_patches], sin[:num_patches] = visual.rope(grid_thw)
+        key_bias = torch.zeros(1, 1, bucket)
+        key_bias[..., num_patches:] = -30000.0
+        return [x.to(device=device, dtype=dtype) for x in (padded, cos, sin, key_bias)]
+
+    def _encode_image(
+        self, pixel_values: torch.Tensor, grid_thw: list[int]
+    ) -> torch.Tensor:
+        assert self._mm_encoder is not None, "the vision encoder is not compiled"
+        embeds = self._mm_encoder(*self._encoder_inputs(pixel_values, grid_thw))
+        merge = self.visual.spatial_merge_size
+        return embeds[: math.prod(grid_thw) // (merge * merge)].cpu()
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        if "pixel_values_videos" in kwargs:
+            raise NotImplementedError("GLM-5.3 video inputs are not supported on RBLN")
+        pixel_values = kwargs.get("pixel_values")
+        if pixel_values is None:
+            return ()
+        image_grid_thw = kwargs["image_grid_thw"]
+        assert isinstance(pixel_values, torch.Tensor)
+        assert isinstance(image_grid_thw, torch.Tensor)
+        grid_thw = image_grid_thw.tolist()
+        sizes = [math.prod(g) for g in grid_thw]
+        with torch.inference_mode():
+            return tuple(
+                self._encode_image(pv, g)
+                for pv, g in zip(pixel_values.split(sizes), grid_thw)
+            )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        mm_embeds: torch.Tensor | None = None,
+        mm_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # ``mm_embeds`` [B, L, H] holds the vision embeddings at image placeholder
+        # tokens and zeros elsewhere; ``mm_mask`` [B, L, 1] is 1 at those tokens. Every
+        # prefill graph of a multimodal model takes them, so text-only and image chunks
+        # share one graph.
+        if mm_embeds is not None and inputs_embeds is None:
+            assert mm_mask is not None
+            text_embeds = self.embed_input_ids(input_ids)
+            # Tensor-first: a scalar-first binary op (``1 - mm_mask``) lowers to a wrong
+            # device tensor-const.
+            inputs_embeds = torch.where(mm_mask > 0.5, mm_embeds, text_embeds)
+            input_ids = None
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
 
 class RBLNGlm5MTPLayer(nn.Module):
