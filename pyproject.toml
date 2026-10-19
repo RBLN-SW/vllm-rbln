@@ -38,7 +38,7 @@ dependencies = [
     "setuptools-scm>=8",
     "pyyaml",
     "datasets>=4.0.0",
-    "vllm==0.31.0+cpu",
+    "vllm @ https://pypi.rebellions.in/api/package/vllm/vllm-0.31.1.dev1+g2dd0629d8.cpu-cp38-abi3-linux_x86_64.whl",
     "torch",
     "torchvision",
     "torchaudio",
@@ -181,19 +181,29 @@ required-version = ">=0.11.25"
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
-# uv requires registry dependencies' transitive URLs to be declared explicitly (from vllm==0.31.0+cpu).
+# uv requires dependencies' transitive URLs to be declared explicitly (from the vllm wheel above).
 constraint-dependencies = [
     "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version == '3.10'",
     "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version == '3.11'",
     "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; python_version >= '3.12'",
 ]
-# pypi.rebellions.in is intentionally NOT registered: packages appear/disappear
+# pypi.rebellions.in is intentionally NOT used for resolution (the explicit+unmapped
+# entry below is a credential anchor only): packages appear/disappear
 # there independently of dev/main, so a full lock refresh could pin versions that
 # must not be used. Install packages from it ad-hoc via --extra-index-url instead
-# (see DEVELOPMENT.md).
+# (see DEVELOPMENT.md). The ax-k1-fp8 vllm build above is a direct URL for the same
+# reason — registering the index would move every package there, and mapping
+# `vllm` to it would drag consumers' released vllm onto it too.
 # Exact reproduction is uv.lock's job — installs without the lock are out of contract.
 index-strategy = "unsafe-best-match"
 prerelease = "if-necessary-or-explicit"   # pin uv's default explicitly — prereleases only for packages with a marker (or prerelease-only packages)
+
+[[tool.uv.index]]
+# Never resolved from (explicit, no source mapping); exists so
+# UV_INDEX_REBELLIONS_USERNAME/PASSWORD authenticate the direct-URL vllm wheel above.
+name = "rebellions"
+url = "https://pypi.rebellions.in/"
+explicit = true
 
 [[tool.uv.index]]
 name = "vllm-cpu"
@@ -219,7 +229,6 @@ url = "https://pypi.org/simple/"
 explicit = true
 
 [tool.uv.sources]
-vllm = { index = "vllm-cpu" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
