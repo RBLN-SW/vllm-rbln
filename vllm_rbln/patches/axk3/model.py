@@ -43,8 +43,9 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_rbln.patches.axk2 import model as _axk2_model
 
-_k2 = _axk2_model._module
-# Loaded at import time from the frozen copy, so mypy cannot see these classes.
+# Loaded at import time from the frozen copy, so mypy cannot see its classes
+# (nor `Indexer`, which `_without_indexer` swaps on the module).
+_k2: Any = _axk2_model._module
 _AXK2DecoderLayer: Any = _k2.AXK2DecoderLayer
 _AXK2ForCausalLM: Any = _k2.AXK2ForCausalLM
 

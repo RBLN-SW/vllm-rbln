@@ -21,6 +21,11 @@ class AXK3Config(AXK2Config):
 
     model_type = "axk3"
 
+    # Assigned by the frozen ``AXK2Config.__init__``, which mypy does not check;
+    # declared here so the single-group reset below type-checks.
+    n_group: int | None
+    topk_group: int | None
+
     def __init__(
         self,
         gated_residual: bool = False,
