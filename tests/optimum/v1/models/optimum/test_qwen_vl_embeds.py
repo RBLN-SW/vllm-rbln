@@ -64,7 +64,9 @@ def _qwen(cls, visual, *, deepstack_layers=0, dtype=torch.float32):
             image_token_id=IMAGE_TOKEN,
             video_token_id=8,
             vision_config=types.SimpleNamespace(
-                deepstack_visual_indexes=list(range(deepstack_layers))
+                deepstack_visual_indexes=list(range(deepstack_layers)),
+                spatial_merge_size=2,
+                tokens_per_second=2.0,
             ),
         ),
         rbln_config=types.SimpleNamespace(dtype=dtype),
@@ -221,20 +223,36 @@ def _mrope_model(cls):
 class TestMropeInputPositions:
     TOKENS = [1, 8, 8, 2, IMAGE_TOKEN, 3]  # a video item, then an image item
 
-    def test_grids_follow_prompt_order_and_token_types_mark_each_modality(self):
-        model, calls = _mrope_model(Qwen2_5VL)
-        features = [
-            _feature("image", 4, [1, 2, 2]),
-            _feature("video", 1, [2, 2, 2], second_per_grid_ts=0.5),
-        ]
-        positions, delta = model.get_mrope_input_positions(self.TOKENS, features)
+    def test_qwen2_5_video_time_axis_sets_following_text_position(self):
+        model, _ = _mrope_model(Qwen2_5VL)
+        positions, delta = model.get_mrope_input_positions(
+            [1, 8, 8, 8, 2],
+            [_feature("video", 1, [3, 2, 2], second_per_grid_ts=1.5)],
+        )
 
-        assert positions.shape == (3, 6) and delta == 5
-        ((token_types, kwargs),) = calls
-        assert token_types.tolist() == [[0, 2, 2, 0, 1, 0]]
-        assert kwargs["image_grid_thw"].tolist() == [[1, 2, 2]]
-        assert kwargs["video_grid_thw"].tolist() == [[2, 2, 2]]
-        assert kwargs["second_per_grid_ts"].tolist() == [0.5]
+        assert positions.tolist() == [
+            [0, 1, 4, 7, 8],
+            [0, 1, 1, 1, 8],
+            [0, 1, 1, 1, 8],
+        ]
+        assert delta == 4
+
+    def test_qwen2_5_mixed_features_follow_prompt_order(self):
+        model, _ = _mrope_model(Qwen2_5VL)
+        positions, delta = model.get_mrope_input_positions(
+            [1, 8, 8, 8, 2, IMAGE_TOKEN, 3],
+            [
+                _feature("image", 5, [1, 2, 2]),
+                _feature("video", 1, [3, 2, 2], second_per_grid_ts=1.5),
+            ],
+        )
+
+        assert positions.tolist() == [
+            [0, 1, 4, 7, 8, 9, 10],
+            [0, 1, 1, 1, 8, 9, 10],
+            [0, 1, 1, 1, 8, 9, 10],
+        ]
+        assert delta == 4
 
     def test_qwen3_passes_no_second_per_grid_ts(self):
         model, calls = _mrope_model(Qwen3VL)

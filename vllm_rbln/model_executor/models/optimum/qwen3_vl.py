@@ -22,7 +22,11 @@ from vllm.model_executor.models.qwen2_5_vl import (
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 from .base import ModelInputForRBLN
-from .qwen2_vl import RBLNOptimumQwen2_5_VLForConditionalGeneration, split_by_grid_thw
+from .qwen2_vl import (
+    RBLNOptimumQwen2_5_VLForConditionalGeneration,
+    RBLNOptimumQwenVLForConditionalGeneration,
+    split_by_grid_thw,
+)
 
 logger = init_logger(__name__)
 
@@ -40,6 +44,10 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
     the window cut carry them unchanged; `embed_input_ids` strips them and
     `_pack_deepstack` lays them out for the graph.
     """
+
+    get_mrope_input_positions = (
+        RBLNOptimumQwenVLForConditionalGeneration.get_mrope_input_positions
+    )
 
     def _video_rope_kwargs(
         self, video_features: list[MultiModalFeatureSpec]
