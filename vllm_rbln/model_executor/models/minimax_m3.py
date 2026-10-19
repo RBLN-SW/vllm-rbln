@@ -80,6 +80,7 @@ from vllm.utils.torch_utils import (
     kv_cache_dtype_str_to_dtype,
     set_default_torch_dtype,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -597,6 +598,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 else ()
             ),
             is_prompt_sorted=self.is_prompt_sorted,
+            null_block_id=NULL_BLOCK_ID,
         )
         attn_output = torch.ops.rbln_custom_ops.sparse_attn_minimax_m3_msa(
             q5,
@@ -613,6 +615,7 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 else ()
             ),
             is_prompt_sorted=self.is_prompt_sorted,
+            null_block_id=NULL_BLOCK_ID,
         )
         # [B, H_kv, G, L, D] -> [B, L, H * D]
         attn_output = attn_output.view(batch, num_heads, seq_len, head_dim).transpose(
