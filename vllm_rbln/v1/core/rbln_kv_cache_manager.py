@@ -363,9 +363,7 @@ class RBLNKVCacheManager(KVCacheManager):
         # copy op holds a ref count of its source block to prevent eviction.
         self.pending_copy_ops: list[KVCacheCopyOp] = []
 
-        # Requests for which sub-block indexing is pending.
-        # Each entry stores the per-group full-block count snapshot
-        # taken before allocate_slots, used to narrow the scan range.
+        # Requests whose newly cached blocks still need sub-block indexing.
         self._pending_indexing: dict[str, Request] = {}
 
         # Sub-block-granular KV event queue. We intercept the upstream pool's
