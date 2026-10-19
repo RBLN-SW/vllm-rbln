@@ -17,6 +17,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -114,39 +115,41 @@ class TestPromptRowReAdd:
     def test_re_add_fills_the_row_from_the_first_prompt_array(
         self, make_model_runner, monkeypatch
     ):
-        # A decode evicted by a prefill-only step is re-added from the array made
-        # on its first add; logits processors still see the prompt list.
+        # A decode evicted by a prefill-only step is re-added from the int32 array
+        # made on its first add; a logits processor still gets the prompt list.
         _last_rank(monkeypatch)
         runner = make_model_runner()
         runner._update_states(schedule_new("a"))
         prompt = runner.requests["a"].prompt_token_ids
         array = runner.prompt_token_arrays["a"]
+        assert isinstance(array, np.ndarray) and array.dtype == np.int32
         runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
         assert not is_in_batch(runner, "a")
 
         handed_in: list[object] = []
-        seen: list[list[int] | None] = []
         add_request = runner.input_batch.add_request
-        refresh = runner.input_batch.refresh_metadata
 
         def record_handed_in(request):
             handed_in.append(request.prompt_token_ids)
             return add_request(request)
 
-        def record_added():
-            seen.extend(
-                added[2] for added in runner.input_batch.batch_update_builder.added
-            )
-            refresh()
+        class RecordPrompts:
+            def __init__(self):
+                self.prompts: list[list[int] | None] = []
 
+            def update_state(self, batch_update):
+                if batch_update:
+                    self.prompts.extend(added[2] for added in batch_update.added)
+
+        logitsproc = RecordPrompts()
+        runner.input_batch.logitsprocs.non_argmax_invariant.append(logitsproc)
         monkeypatch.setattr(runner.input_batch, "add_request", record_handed_in)
-        monkeypatch.setattr(runner.input_batch, "refresh_metadata", record_added)
         runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
 
         assert runner.prompt_token_arrays["a"] is array
         assert len(handed_in) == 1 and handed_in[0] is array
         assert runner.requests["a"].prompt_token_ids is prompt
-        assert len(seen) == 1 and seen[0] is prompt
+        assert len(logitsproc.prompts) == 1 and logitsproc.prompts[0] is prompt
         req_index = runner.input_batch.req_id_to_index["a"]
         assert (
             runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
@@ -180,6 +183,35 @@ class TestPromptRowReAdd:
             runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
             == prompt
         )
+
+
+class TestWritebackBeforeReAdd:
+    def test_evicted_decode_comes_back_with_its_sampled_token(
+        self, make_model_runner, monkeypatch
+    ):
+        # Async scheduling leaves a -1 for the token still being sampled. If a
+        # prefill-only step evicts the request first, only the writeback repairs
+        # its cached state, as all_token_ids no longer arrives; the re-add then
+        # rebuilds the row from that state.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        state = runner.requests["a"]
+        n = state.num_prompt_tokens
+        state.output_token_ids.append(-1)
+        runner._pending_token_writeback.append((["a"], [[42]], {"a": n}))
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        runner._apply_pending_token_writeback()
+        runner._update_states(
+            schedule_cached(
+                req_ids=["a"], num_computed_tokens=[n], num_output_tokens=[1]
+            )
+        )
+
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert runner.input_batch.token_ids_cpu[req_index, n] == 42
 
 
 class TestOutputTokenAlignment:
