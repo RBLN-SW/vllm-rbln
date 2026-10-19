@@ -45,7 +45,8 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
     `_pack_deepstack` lays them out for the graph.
     """
 
-    # Qwen3-VL positions video frames separately instead of as one video grid.
+    # Qwen2-VL and Qwen2.5-VL use one (T, H, W) grid per video.
+    # Qwen3-VL locates each frame in the prompt to compute its positions.
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
