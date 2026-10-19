@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import replace
 from typing import Any
 
@@ -296,55 +297,78 @@ class RBLNOptimumQwen2_5_VLForConditionalGeneration(
     # - <5.18.0 truncated fractional second_per_grid_ts (fixed in 5.18.0).
     # - 5.20.1 still advances post-video text by max(H, W), even when
     #   the temporal position is larger.
+    def iter_mm_grid_thw(
+        self, mm_features: list[MultiModalFeatureSpec]
+    ) -> Iterator[tuple[int, int, int, int, float]]:
+        spatial_merge_size = self.model.config.vision_config.spatial_merge_size
+        tokens_per_second = getattr(
+            self.model.config.vision_config, "tokens_per_second", 1.0
+        )
+        for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
+            offset = mm_feature.mm_position.offset
+            data = mm_feature.data
+            assert data is not None
+            if mm_feature.modality == "image":
+                grid = data["image_grid_thw"].data
+                assert isinstance(grid, torch.Tensor)
+                t, h, w = grid.tolist()
+                assert t == 1, f"Image must have 1 frame, got {t}"
+                yield offset, 1, h // spatial_merge_size, w // spatial_merge_size, 1.0
+            elif mm_feature.modality == "video":
+                grid = data["video_grid_thw"].data
+                assert isinstance(grid, torch.Tensor)
+                t, h, w = grid.tolist()
+                seconds = data["second_per_grid_ts"]
+                assert isinstance(seconds.data, torch.Tensor)
+                second_per_grid_ts = seconds.data.item()
+                t_factor = second_per_grid_ts * tokens_per_second
+                yield (
+                    offset,
+                    t,
+                    h // spatial_merge_size,
+                    w // spatial_merge_size,
+                    t_factor,
+                )
+            else:
+                raise ValueError(f"Unsupported modality: {mm_feature.modality}")
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
-        """Match vLLM Qwen2.5-VL's video time axis and text offsets."""
-        vision_config = self.model.config.vision_config
-        merge_size = vision_config.spatial_merge_size
-        tokens_per_second = getattr(vision_config, "tokens_per_second", 1.0)
-        position_chunks: list[np.ndarray] = []
-        token_offset = 0
+        llm_pos_ids_list: list[np.ndarray] = []
+        st = 0
 
-        for feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
-            offset = feature.mm_position.offset
-            grid = feature.data[f"{feature.modality}_grid_thw"].data
-            t, h, w = grid.tolist()
-            if feature.modality == "image":
-                assert t == 1, f"Image must have 1 frame, got {t}"
-                time_factor = 1.0
-            elif feature.modality == "video":
-                time_factor = (
-                    feature.data["second_per_grid_ts"].data.item() * tokens_per_second
-                )
-            else:
-                raise ValueError(f"Unsupported modality: {feature.modality}")
-
-            text_len = offset - token_offset
-            start = position_chunks[-1].max() + 1 if position_chunks else 0
-            position_chunks.append(
-                np.broadcast_to(np.arange(text_len), (3, text_len)) + start
+        for (
+            offset,
+            llm_grid_t,
+            llm_grid_h,
+            llm_grid_w,
+            t_factor,
+        ) in self.iter_mm_grid_thw(mm_features):
+            text_len = offset - st
+            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+            llm_pos_ids_list.append(
+                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
             )
 
-            grid_t, grid_h, grid_w = t, h // merge_size, w // merge_size
-            indices = np.indices((grid_t, grid_h, grid_w))
-            if time_factor != 1.0:
-                indices[0] = (indices[0] * time_factor).astype(np.int64)
-            position_chunks.append(indices.reshape(3, -1) + text_len + start)
-            token_offset = offset + grid_t * grid_h * grid_w
+            grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
+            if t_factor != 1.0:
+                grid_indices[0] = (grid_indices[0] * t_factor).astype(np.int64)
+            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
+            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
 
-        if token_offset < len(input_tokens):
-            start = position_chunks[-1].max() + 1 if position_chunks else 0
-            text_len = len(input_tokens) - token_offset
-            position_chunks.append(
-                np.broadcast_to(np.arange(text_len), (3, text_len)) + start
+        if st < len(input_tokens):
+            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+            text_len = len(input_tokens) - st
+            llm_pos_ids_list.append(
+                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
             )
 
-        positions = np.concatenate(position_chunks, axis=1).reshape(3, -1)
-        delta = int(positions.max() + 1 - len(input_tokens))
-        return torch.from_numpy(positions), delta
+        llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
+        mrope_position_delta = int(llm_positions.max() + 1 - len(input_tokens))
+        return torch.from_numpy(llm_positions), mrope_position_delta
 
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
         return Qwen2_5_VLImagePixelInputs(
