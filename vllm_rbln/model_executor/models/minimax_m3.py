@@ -354,13 +354,10 @@ class RBLNMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         prefix: str,
         cache_config: CacheConfig | None = None,
-        kv_sharing_target_layer_name: str | None = None,
     ) -> None:
         super().__init__()
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
-        # Read by the runner's `get_kv_cache_spec`, as on vLLM's `Attention`.
-        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         vllm_config = get_current_vllm_config()
         cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
         self.fp8_dtype = _fp8_cache_dtype(cache_dtype)
