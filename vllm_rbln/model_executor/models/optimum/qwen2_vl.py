@@ -222,79 +222,8 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     ) -> ModelInputForRBLN:
         return replace(model_input, position_embed=self._position_embed(model_input))
 
-    def get_mrope_input_positions(
-        self,
-        input_tokens: list[int],
-        mm_features: list[MultiModalFeatureSpec],
-    ) -> tuple[torch.Tensor, int]:
-        """Whole-prompt MRoPE positions [3, N] and the decode delta, from HF's
-        get_rope_index that optimum-rbln exposes on the model."""
-        input_ids = torch.tensor([input_tokens])
-        config = self.model.config
-        mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
-        mm_token_type_ids[input_ids == config.image_token_id] = 1
-        mm_token_type_ids[input_ids == config.video_token_id] = 2
-        features = sorted(mm_features, key=lambda f: f.mm_position.offset)
-        images = [f for f in features if f.modality == "image"]
-        videos = [f for f in features if f.modality == "video"]
-        position_ids, rope_deltas = self.model._get_rope_index_func(
-            input_ids,
-            mm_token_type_ids,
-            image_grid_thw=self._grid_thw(images, "image_grid_thw"),
-            video_grid_thw=self._grid_thw(videos, "video_grid_thw"),
-            **self._video_rope_kwargs(videos),
-        )
-        return position_ids[:, 0], int(rope_deltas)
-
-    @staticmethod
-    def _grid_thw(
-        features: list[MultiModalFeatureSpec], key: str
-    ) -> torch.Tensor | None:
-        if not features:
-            return None
-        return torch.stack([f.data[key].data for f in features]).to(torch.int64)
-
-    def _video_rope_kwargs(
-        self, video_features: list[MultiModalFeatureSpec]
-    ) -> dict[str, torch.Tensor]:
-        """Extra get_rope_index kwargs a variant needs for videos; none here."""
-        return {}
-
-    def _position_embed(self, model_input: ModelInputForRBLN) -> torch.Tensor:
-        """cos/sin for the runner's MRoPE positions, [2, padded_batch_size, 1,
-        seq_len, head_dim], zero in the padding rows."""
-        assert model_input.mrope_positions is not None
-        embed = self.model._get_position_embeddings(
-            torch.zeros(1, dtype=self.dtype), model_input.mrope_positions
-        )
-        rows = model_input.batch_rows
-        out = torch.zeros_like(embed)
-        out[:, rows] = embed[:, rows]
-        return out
-
-    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
-        if model_input.is_prompt:
-            return self.model.prefill_decoder(
-                inputs_embeds=model_input.inputs_embeds,
-                position_embed=model_input.position_embed,
-                block_tables=model_input.block_tables,
-                cache_position=model_input.input_positions,
-            ).logits
-
-        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
-        return self.model.decoder(
-            inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
-            cache_position=model_input.input_positions,
-            position_embed=model_input.position_embed,
-            block_tables=model_input.block_tables,
-        ).logits
-
-
-class RBLNOptimumQwen2_5_VLForConditionalGeneration(
-    RBLNOptimumQwenVLForConditionalGeneration
-):
-    # FIXME(transformers): Remove this override when both cases match vLLM:
-    # - <5.18.0 truncated fractional second_per_grid_ts (fixed in 5.18.0).
+    # FIXME(transformers): Remove this calculation when both cases match vLLM:
+    # - Qwen2.5-VL <5.18.0 truncated fractional second_per_grid_ts.
     # - 5.20.1 still advances post-video text by max(H, W), even when
     #   the temporal position is larger.
     def iter_mm_grid_thw(
@@ -318,9 +247,11 @@ class RBLNOptimumQwen2_5_VLForConditionalGeneration(
                 grid = data["video_grid_thw"].data
                 assert isinstance(grid, torch.Tensor)
                 t, h, w = grid.tolist()
-                seconds = data["second_per_grid_ts"]
-                assert isinstance(seconds.data, torch.Tensor)
-                second_per_grid_ts = seconds.data.item()
+                # Qwen2-VL defaults to 1.0, while Qwen2.5-VL uses the supplied interval.
+                second_per_grid_ts = 1.0
+                seconds = data.get("second_per_grid_ts")
+                if seconds is not None:
+                    second_per_grid_ts = seconds.data.item()
                 t_factor = second_per_grid_ts * tokens_per_second
                 yield (
                     offset,
@@ -370,6 +301,39 @@ class RBLNOptimumQwen2_5_VLForConditionalGeneration(
         mrope_position_delta = int(llm_positions.max() + 1 - len(input_tokens))
         return torch.from_numpy(llm_positions), mrope_position_delta
 
+    def _position_embed(self, model_input: ModelInputForRBLN) -> torch.Tensor:
+        """cos/sin for the runner's MRoPE positions, [2, padded_batch_size, 1,
+        seq_len, head_dim], zero in the padding rows."""
+        assert model_input.mrope_positions is not None
+        embed = self.model._get_position_embeddings(
+            torch.zeros(1, dtype=self.dtype), model_input.mrope_positions
+        )
+        rows = model_input.batch_rows
+        out = torch.zeros_like(embed)
+        out[:, rows] = embed[:, rows]
+        return out
+
+    def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
+        if model_input.is_prompt:
+            return self.model.prefill_decoder(
+                inputs_embeds=model_input.inputs_embeds,
+                position_embed=model_input.position_embed,
+                block_tables=model_input.block_tables,
+                cache_position=model_input.input_positions,
+            ).logits
+
+        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
+        return self.model.decoder(
+            inputs_embeds=self.model.embed_tokens(model_input.input_tokens),
+            cache_position=model_input.input_positions,
+            position_embed=model_input.position_embed,
+            block_tables=model_input.block_tables,
+        ).logits
+
+
+class RBLNOptimumQwen2_5_VLForConditionalGeneration(
+    RBLNOptimumQwenVLForConditionalGeneration
+):
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
         return Qwen2_5_VLImagePixelInputs(
             type="pixel_values",
