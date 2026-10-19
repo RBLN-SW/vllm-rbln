@@ -292,6 +292,9 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 class RBLNOptimumQwen2_5_VLForConditionalGeneration(
     RBLNOptimumQwenVLForConditionalGeneration
 ):
+    # FIXME(transformers): Remove this override after upgrading to a release
+    # whose get_rope_index preserves fractional video seconds and starts
+    # post-video text after the largest temporal or spatial position.
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
