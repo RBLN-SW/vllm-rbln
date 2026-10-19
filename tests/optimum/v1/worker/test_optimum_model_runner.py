@@ -23,6 +23,7 @@ from vllm.config import (
     ECTransferConfig,
     ModelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -107,6 +108,37 @@ def model_runner():
 
 def _is_req_scheduled(model_runner, req_id: str) -> bool:
     return req_id in model_runner.input_batch.req_id_to_index
+
+
+@pytest.mark.parametrize("method", [None, "ngram", "medusa"])
+def test_runner_speculative_decoding_setup(monkeypatch, method):
+    vllm_config = get_vllm_config()
+    vllm_config.additional_config.use_custom_sampler = False
+    if method is not None:
+        vllm_config.speculative_config = SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=3,
+        )
+        vllm_config.speculative_config.method = method
+    monkeypatch.setattr(
+        runner_module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+
+    if method == "medusa":
+        with pytest.raises(ValueError, match="optimum model path: medusa"):
+            RBLNOptimumModelRunner(vllm_config, torch.device("cpu"))
+        return
+
+    runner = RBLNOptimumModelRunner(vllm_config, torch.device("cpu"))
+    if method is None:
+        assert runner.drafter is None
+        assert runner.num_spec_tokens == runner.prev_num_spec_tokens == 0
+    else:
+        assert isinstance(runner.drafter, runner_module.NgramProposer)
+        assert isinstance(runner.rejection_sampler, runner_module.RBLNRejectionSampler)
+        assert runner.rejection_sampler.sampler is runner.sampler
+        assert runner.num_spec_tokens == runner.prev_num_spec_tokens == 3
+        assert runner.effective_drafter_max_model_len == runner.max_model_len
 
 
 def _is_req_added(model_runner, req_id: str) -> bool:

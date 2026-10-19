@@ -68,6 +68,8 @@ from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.block_table import SlotMappingMode
@@ -91,7 +93,7 @@ from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
-from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNSampler
+from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNRejectionSampler, RBLNSampler
 from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
@@ -152,7 +154,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # self.load_config = vllm_config.load_config
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
-        # self.speculative_config = vllm_config.speculative_config
+        self.speculative_config = vllm_config.speculative_config
         # self.prompt_adapter_config = vllm_config.prompt_adapter_config
         # self.observability_config = vllm_config.observability_config
 
@@ -200,6 +202,35 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
         self.sampler = sampler
 
+        self.drafter: NgramProposer | SuffixDecodingProposer | None = None
+        if self.speculative_config and get_pp_group().is_last_rank:
+            if self.speculative_config.method == "ngram":
+                self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "suffix":
+                self.drafter = SuffixDecodingProposer(self.vllm_config)
+            else:
+                raise ValueError(
+                    "Unsupported speculative decoding method on the optimum "
+                    f"model path: {self.speculative_config.method}"
+                )
+            self.rejection_sampler = RBLNRejectionSampler(
+                self.sampler,
+                spec_config=self.speculative_config,
+                device=self.device,
+                use_rbln_sampler=self.use_rbln_sampler,
+            )
+
+        self.num_spec_tokens = 0
+        self.prev_num_spec_tokens = 0
+        if self.speculative_config:
+            self.num_spec_tokens = self.speculative_config.num_speculative_tokens
+            self.prev_num_spec_tokens = self.num_spec_tokens
+            draft_config = self.speculative_config.draft_model_config
+            if draft_config is not None and draft_config.max_model_len is not None:
+                self.effective_drafter_max_model_len = draft_config.max_model_len
+            else:
+                self.effective_drafter_max_model_len = self.max_model_len
+
         # Attention groups are not supported.
         self.attn_groups = []  # type: ignore
 
@@ -242,7 +273,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             # or the token-alignment padding used by vLLM's slot-mapping kernel.
             slot_mapping_modes=[SlotMappingMode.NONE],
             logitsprocs=logitsprocs,
-            num_spec_tokens=0,  # No spec decode in optimum model runner
+            num_spec_tokens=self.num_spec_tokens,
             is_pooling_model=self.is_pooling_model,
             use_rbln_sampler=self.use_rbln_sampler,
         )

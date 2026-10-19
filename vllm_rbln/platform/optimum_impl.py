@@ -82,10 +82,6 @@ def check_and_update(vllm_config: "VllmConfig") -> None:
         "Pipeline parallelism is not supported on the optimum model path. "
         "Set --model-impl vllm to use it."
     )
-    assert vllm_config.speculative_config is None, (
-        "Speculative decoding is not supported on the optimum model path. "
-        "Set --model-impl vllm to use it."
-    )
     # T5EncoderModel is encoder-only but inherits T5Config which has
     # is_encoder_decoder=True. This causes vllm to route inputs
     # through the enc-dec path, prepending decoder_start_token_id and
