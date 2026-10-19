@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -291,16 +292,55 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 class RBLNOptimumQwen2_5_VLForConditionalGeneration(
     RBLNOptimumQwenVLForConditionalGeneration
 ):
-    def _video_rope_kwargs(
-        self, video_features: list[MultiModalFeatureSpec]
-    ) -> dict[str, torch.Tensor]:
-        if not video_features:
-            return {}
-        return {
-            "second_per_grid_ts": torch.tensor(
-                [float(f.data["second_per_grid_ts"].data) for f in video_features]
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> tuple[torch.Tensor, int]:
+        """Match vLLM Qwen2.5-VL's video time axis and text offsets."""
+        vision_config = self.model.config.vision_config
+        merge_size = vision_config.spatial_merge_size
+        tokens_per_second = getattr(vision_config, "tokens_per_second", 1.0)
+        position_chunks: list[np.ndarray] = []
+        token_offset = 0
+
+        for feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
+            offset = feature.mm_position.offset
+            grid = feature.data[f"{feature.modality}_grid_thw"].data
+            t, h, w = grid.tolist()
+            if feature.modality == "image":
+                assert t == 1, f"Image must have 1 frame, got {t}"
+                time_factor = 1.0
+            elif feature.modality == "video":
+                time_factor = (
+                    feature.data["second_per_grid_ts"].data.item() * tokens_per_second
+                )
+            else:
+                raise ValueError(f"Unsupported modality: {feature.modality}")
+
+            text_len = offset - token_offset
+            start = position_chunks[-1].max() + 1 if position_chunks else 0
+            position_chunks.append(
+                np.broadcast_to(np.arange(text_len), (3, text_len)) + start
             )
-        }
+
+            grid_t, grid_h, grid_w = t, h // merge_size, w // merge_size
+            indices = np.indices((grid_t, grid_h, grid_w))
+            if time_factor != 1.0:
+                indices[0] = (indices[0] * time_factor).astype(np.int64)
+            position_chunks.append(indices.reshape(3, -1) + text_len + start)
+            token_offset = offset + grid_t * grid_h * grid_w
+
+        if token_offset < len(input_tokens):
+            start = position_chunks[-1].max() + 1 if position_chunks else 0
+            text_len = len(input_tokens) - token_offset
+            position_chunks.append(
+                np.broadcast_to(np.arange(text_len), (3, text_len)) + start
+            )
+
+        positions = np.concatenate(position_chunks, axis=1).reshape(3, -1)
+        delta = int(positions.max() + 1 - len(input_tokens))
+        return torch.from_numpy(positions), delta
 
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
         return Qwen2_5_VLImagePixelInputs(
