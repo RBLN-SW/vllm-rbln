@@ -1,0 +1,126 @@
+env:
+  UV_CACHE_DIR: "/root/.cache/uv"
+  UV_LINK_MODE: "symlink"
+  UV_INDEX_STRATEGY: "unsafe-best-match"
+
+_if_changed: &if_changed
+  include:
+    - ".buildkite/**"
+    - "tests/vllm/**"
+    - "vllm_rbln/**"
+    - "pyproject.toml"
+    - "uv.lock"
+  exclude:
+    - ".buildkite/pipelines/optimum-pr/**"
+    - "tests/optimum/**"
+    - "vllm_rbln/distributed/ec_transfer/**"
+    - "vllm_rbln/model_executor/models/**"
+    - "vllm_rbln/utils/optimum/**"
+    - "vllm_rbln/v1/**/optimum_*"
+    - "vllm_rbln/v1/core/prefix_cache_manager/**"
+    - "vllm_rbln/v1/worker/ec_disagg_helpers.py"
+
+_secrets: &secrets
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_USERNAME: MGMT_NEXUS_USERNAME
+  UV_INDEX_RBLN_NEXUS_NIGHTLY_PASSWORD: MGMT_NEXUS_PASSWORD
+  UV_INDEX_REBELLIONS_USERNAME: REBEL_SW_DEV_USERNAME
+  UV_INDEX_REBELLIONS_PASSWORD: REBEL_SW_DEV_PASSWORD
+  HF_TOKEN: FSW_HF_TOKEN
+  HF_HOME: FSW_HF_HOME
+
+_sync: &sync |
+  echo '--- :package: uv sync'
+  uv sync --locked --python 3.12 --extra test --extra dev --extra runtime
+  ${PYTEST_COMPILER_OVERRIDE_COMMAND:-}
+
+_dshm: &dshm
+  - kubernetes:
+      podSpecPatch:
+        containers:
+          - name: container-0
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 4Gi
+
+_pytest: &pytest
+  if_changed: *if_changed
+  agents:
+    queue: udc
+  resources:
+    npu:
+      count: 4
+      product: "RBLN-CR13"
+  image: "${DEVTOOLS_DOCKER_IMAGE}"
+  secrets: *secrets
+  plugins: *dshm
+  timeout_in_minutes: 60
+
+_e2e: &e2e
+  <<: *pytest
+  env:
+    VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
+    VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
+  timeout_in_minutes: "${PYTEST_E2E_TIMEOUT:-60}"
+
+steps:
+  - <<: *pytest
+    label: ":pytest: [CR13] pytest (unit)"
+    key: "vllm-rbln-pytest-cr13"
+    command:
+      - *sync
+      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-unit.sh"
+
+  - group: ":pytest: [CR13] pytest (e2e)"
+    key: "vllm-rbln-pytest-e2e-cr13"
+    steps:
+      - <<: *e2e
+        label: "basic_correctness"
+        key: "vllm-rbln-e2e-basic-correctness-cr13"
+        resources:
+          npu:
+            count: 1
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group basic_correctness ${PYTEST_E2E_ARGS:-}"
+
+      - <<: *e2e
+        label: "model_compile"
+        key: "vllm-rbln-e2e-model-compile-cr13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group model_compile ${PYTEST_E2E_ARGS:-}"
+
+      - <<: *e2e
+        label: "dp"
+        key: "vllm-rbln-e2e-dp-cr13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group dp ${PYTEST_E2E_ARGS:-}"
+
+      - <<: *e2e
+        label: "specdec"
+        key: "vllm-rbln-e2e-specdec-cr13"
+        resources:
+          npu:
+            count: 2
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group specdec ${PYTEST_E2E_ARGS:-}"
+
+      - <<: *e2e
+        label: "core"
+        key: "vllm-rbln-e2e-core-cr13"
+        resources:
+          npu:
+            count: 1
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group core ${PYTEST_E2E_ARGS:-}"

@@ -53,40 +53,17 @@ _examples: &examples
     - "example-results/**/*"
 
 steps:
-  - label: ":pytest: [CR13] pytest (T0)"
-    key: "nightly-t0-cr13"
-    agents:
-      queue: udc
-    resources:
-      npu:
-        count: 4
-        product: "RBLN-CR13"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    secrets: *secrets
-    plugins: *dshm
-    timeout_in_minutes: 60
-    command:
-      - *sync
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t0-unit.sh"
-
-  - label: ":pytest: [CR13] pytest (T2)"
-    key: "nightly-t2-cr13"
-    agents:
-      queue: udc
-    resources:
-      npu:
-        count: 4
-        product: "RBLN-CR13"
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    secrets: *secrets
-    plugins: *dshm
+  - label: ":sparkles: upload pytest"
+    key: "nightly-pytest"
+    checkout:
+      sparse:
+        paths:
+          - .buildkite
     env:
-      VLLM_RBLN_TEST_COMPILE_TIMEOUT_S: "3600"
-      VLLM_RBLN_TEST_DP_TIMEOUT_S: "3600"
-    timeout_in_minutes: 120
-    command:
-      - *sync
-      - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
+      PYTEST_COMPILER_OVERRIDE_COMMAND: ""
+      PYTEST_E2E_ARGS: "--num-hidden-layers 0 --maxfail=0"
+      PYTEST_E2E_TIMEOUT: "120"
+    command: "buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pytest.yml --apply-if-changed=false"
 
   - group: "examples (vllm)"
     key: "nightly-examples-vllm"
@@ -182,15 +159,13 @@ steps:
       - "lm-eval-results/**/*"
     command: *lm_eval
 
-  # The two gating lanes above; perf and lm-eval are measured, not gated, so
-  # they stay out of depends_on. No NPU needed -- the wheel is a pure CPU build,
-  # so this runs on the default queue.
+  # Depending on the upload also waits for every uploaded pytest job.
+  # No NPU needed -- the wheel is a pure CPU build.
   - label: ":package: nightly publish"
     key: "nightly-publish"
     if: 'build.env("NIGHTLY_DEPLOY") == "1"'
     depends_on:
-      - "nightly-t0-cr13"
-      - "nightly-t2-cr13"
+      - "nightly-pytest"
     image: "${DEVTOOLS_DOCKER_IMAGE}"
     secrets:
       # rbln-nexus-nightly is a non-explicit index, so resolving the build
