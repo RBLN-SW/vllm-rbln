@@ -258,7 +258,6 @@ def _fields_of(cls: type[RBLNConfigBase]) -> tuple["DataclassField[Any]", ...]:
 # The envs.py attribute a renamed field reads. Goes away with the env vars.
 _ENV_NAME: dict[str, str] = {
     "use_custom_sampler": "VLLM_RBLN_SAMPLER",
-    "use_batch_attn_opt": "VLLM_RBLN_BATCH_ATTN_OPT",
     "use_all2all_dispatch": "VLLM_RBLN_DISPATCH_ALL2ALL",
     "use_all2all_combine": "VLLM_RBLN_COMBINE_ALL2ALL",
     "enable_sub_block_cache": "VLLM_RBLN_SUB_BLOCK_CACHE",
