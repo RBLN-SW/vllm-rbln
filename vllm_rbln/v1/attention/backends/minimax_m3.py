@@ -32,7 +32,9 @@ MSA_SPARSE_BLOCK_SIZE = 128
 class RBLNMiniMaxM3SparseBackend(AttentionBackend):
     """Main GQA K/V cache of a MiniMax-M3 sparse attention layer."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
+    # bf16 only, with the indexer backend below: the MSA kernels are validated
+    # in bf16 (and a KV8 fp8 cache), and the platform rejects other dtypes.
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[str]] = [
         "auto",
         "fp8",

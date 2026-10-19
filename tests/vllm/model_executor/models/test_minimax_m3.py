@@ -171,3 +171,15 @@ def test_minimax_m3_opts_in_to_the_rbln_multimodal_path():
     assert supports_rbln_multimodal(m3.RBLNMiniMaxM3SparseForConditionalGeneration)
     # Only an explicit declaration counts; being multimodal is not enough.
     assert not supports_rbln_multimodal(torch.nn.Identity())
+
+
+def test_minimax_m3_backends_declare_bfloat16_only():
+    from vllm_rbln.v1.attention.backends.minimax_m3 import (
+        RBLNMiniMaxM3IndexerBackend,
+        RBLNMiniMaxM3SparseBackend,
+    )
+
+    # The two caches of a sparse layer feed one kernel family that is validated
+    # in bf16 only; the platform's dtype check relies on both saying so.
+    assert RBLNMiniMaxM3SparseBackend.supported_dtypes == [torch.bfloat16]
+    assert RBLNMiniMaxM3IndexerBackend.supported_dtypes == [torch.bfloat16]
