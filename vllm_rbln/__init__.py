@@ -41,6 +41,8 @@ def register_ops():
     from vllm_rbln import envs
     from vllm_rbln.platform import RblnPlatform
 
+    RblnPlatform._use_v1_model_runner()
+
     # Both `vllm serve` and `LLM(...)` load the plugins before they build a
     # config, and only the first of them parses arguments, so this is the one
     # point early enough to see every `create_engine_config` call.
