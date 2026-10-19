@@ -79,11 +79,15 @@ def register_rbln_modelopt_fp8_linear_method() -> None:
 
 @add_registration(
     reason=(
-        "Upstream has no MXFP8 linear method, so build_linear_method leaves the "
-        "layer unquantized: it reads the e4m3 bytes into bf16 and drops the e8m0 "
-        "block scales. Register one through the same LINEAR_METHOD_BUILDERS hook "
-        "the FP8 method uses so MXFP8 linears keep their fp8 weight + block "
-        "scales (W8A16) on RBLN."
+        "vLLM ships a generic MXFP8 linear method (ModelOptMxFp8Config, "
+        "init_mxfp8_linear_kernel): on CUDA DeepGEMM quantizes the activations "
+        "to MXFP8 as well (W8A8), and the emulation fallback dequantizes the "
+        "weight to bf16 once at load. RBLN runs neither: this method keeps the "
+        "e4m3 weight and its e8m0 block scales as loaded and dequantizes them "
+        "per 32-element group inside the compiled graph (W8A16), so the weight "
+        "stays one byte on the device and an fp16 scale above 65504 is applied "
+        "in fp32. LINEAR_METHOD_BUILDERS is the hook build_linear_method reads "
+        "before falling back to the generic method."
     )
 )
 def register_rbln_modelopt_mxfp8_linear_method() -> None:
