@@ -7,6 +7,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
 
+from vllm_rbln.patches.model_arch_config import register_mla_convertor
 from vllm_rbln.patches.registry import add_registration
 
 ARCH = "AXK3ForCausalLM"
@@ -35,6 +36,7 @@ def register_axk3() -> None:
 
     _CONFIG_REGISTRY[MODEL_TYPE] = AXK3Config
     ModelRegistry.register_model(ARCH, MODEL_CLASS_PATH)
+    register_mla_convertor(MODEL_TYPE)
 
 
 __all__ = ["ARCH", "MODEL_CLASS_PATH", "MODEL_TYPE"]
