@@ -100,7 +100,8 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 # A KDA layer's caches by the slot in their names: the g head groups' states at
-# 0 .. g-1, then the q / k / v conv rings, then (MTP) the g head groups' drafts.
+# 0 .. g-1, then each head group's q / k / v conv rings, then (MTP) the g head
+# groups' drafts.
 KDA_CONV_SLOTS = 3
 # The stride of a layer's cache slots (num_attn_module), past the most a layer owns.
 CACHES_PER_LAYER = 16
@@ -149,12 +150,12 @@ def kda_head_groups(vllm_config: VllmConfig) -> int:
 def _layer_index_of(prefix: str) -> int:
     """The cache's position in the runner's KV cache list, which holds the caches
     of this rank's layers in name order (then the MTP layers'), compacted: a KDA
-    layer owns g states + 3 conv rings (+ g draft buffers with MTP), a DSA layer 4."""
+    layer owns g states + 3g conv rings (+ g draft buffers with MTP), a DSA layer 4."""
     vllm_config = get_current_vllm_config()
     config = vllm_config.model_config.hf_text_config
     spec = vllm_config.speculative_config
     groups = kda_head_groups(vllm_config)
-    kda_caches = groups + KDA_CONV_SLOTS
+    kda_caches = groups * (1 + KDA_CONV_SLOTS)
     if spec is not None and spec.num_speculative_tokens:
         kda_caches += groups
 
@@ -165,6 +166,7 @@ def _layer_index_of(prefix: str) -> int:
 
     ints = [int(name) for name in prefix.split(".") if name.isdigit()]
     layer, slot = ints[0], ints[-1]
+    assert slot < CACHES_PER_LAYER, f"{prefix}: slot past CACHES_PER_LAYER"
     num_layers = config.num_hidden_layers
     # Looked up per call: vllm-rbln patches it (VLLM_RBLN_NUM_HIDDEN_LAYERS).
     start, end = dist_utils.get_pp_indices(
@@ -484,6 +486,8 @@ class RBLNGlm5KDA(nn.Module):
         self.o_proj = RowParallelLinear(
             proj, hidden_size, bias=False, prefix=f"{prefix}.o_proj"
         )
+        # forward takes o_proj's columns a head group at a time: whole, unquantized.
+        assert self.o_proj.tp_size == 1 and hasattr(self.o_proj, "weight")
 
         vllm_config = get_current_vllm_config()
         dtype = vllm_config.model_config.dtype
@@ -496,16 +500,21 @@ class RBLNGlm5KDA(nn.Module):
             RBLNGlm5StateCache(f"{prefix}.attn.{j}", rows)
             for j in range(self.num_groups)
         )
-        # The q / k / v conv rings, whole layer's channels, on head group 0's block.
-        conv_rows = proj * KDA_CONV_RING // 64
-        self.conv_q, self.conv_k, self.conv_v = (
-            RBLNGlm5AuxCache(
-                f"{prefix}.attn.{self.num_groups + i}",
-                self.states[0].prefix,
-                (conv_rows, 64),
-                dtype,
+        # A head group's q / k / v conv rings: slot-major [W, C] in 64-lane blocks, so
+        # that RSD cuts the channels as it cuts the heads, and one a group, so that no
+        # op slices the heads of a tensor RSD has already cut. All on head group 0's
+        # block: one slot, so the kernels' slot tables are computed once, up front.
+        self.conv_rings = nn.ModuleList(
+            nn.ModuleList(
+                RBLNGlm5AuxCache(
+                    f"{prefix}.attn.{self.num_groups + KDA_CONV_SLOTS * j + i}",
+                    self.states[0].prefix,
+                    (KDA_CONV_RING, proj // self.num_groups // 64, 64),
+                    dtype,
+                )
+                for i in range(KDA_CONV_SLOTS)
             )
-            for i in range(KDA_CONV_SLOTS)
+            for j in range(self.num_groups)
         )
         # MTP: a verify step (1 + K tokens) keeps the state after token 0 and the K
         # drafts' (k, v, exp(g), beta) in this buffer; the next step replays the
@@ -522,7 +531,7 @@ class RBLNGlm5KDA(nn.Module):
             )
             self.drafts = nn.ModuleList(
                 RBLNGlm5AuxCache(
-                    f"{prefix}.attn.{self.num_groups + KDA_CONV_SLOTS + j}",
+                    f"{prefix}.attn.{self.num_groups * (1 + KDA_CONV_SLOTS) + j}",
                     state.prefix,
                     (self.group_heads, self.num_drafts, 4, self.head_dim),
                     dtype,
@@ -538,10 +547,25 @@ class RBLNGlm5KDA(nn.Module):
         ):
             _set_from_host(fused, b.weight.cpu().float() @ a.weight.cpu().float())
 
-    def _l2norm(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float()
-        return (x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)).to(
-            torch.bfloat16
+    @staticmethod
+    def _l2norm(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Under 64 heads (a g = 2 group's decode step) an rsqrt over the heads lowers to
+        # a host op, which cuts the graph at every layer: q's and k's then share one
+        # rsqrt along a last axis of 2. At 64 heads that axis would tie the heads to
+        # the lanes in RSD's analysis and leave v and the gates uncut.
+        q, k = q.float(), k.float()
+        if q.shape[-2] >= 64:
+            return tuple(
+                (x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)).to(
+                    torch.bfloat16
+                )
+                for x in (q, k)
+            )
+        sums = torch.stack((q.square().sum(-1), k.square().sum(-1)), dim=-1)
+        scale = torch.rsqrt(sums + 1e-6)
+        return (
+            (q * scale[..., 0:1]).to(torch.bfloat16),
+            (k * scale[..., 1:2]).to(torch.bfloat16),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -555,24 +579,36 @@ class RBLNGlm5KDA(nn.Module):
         has_initial_state = (seq_idx > 0).to(torch.int32).view(-1)
         conv_slot = group_states[0][1].view(-1)
 
-        def conv(x: torch.Tensor, cache: RBLNGlm5AuxCache, weight: torch.Tensor):
-            return torch.ops.rbln_custom_ops.kda_conv(
-                x,
-                weight,
-                cache.inputs(),
-                conv_slot,
-                seq_idx.view(-1),
-                query_len.view(-1),
-                has_initial_state,
-                KDA_CONV_RING,
+        qkv = tuple(
+            (proj(hidden_states)[0], conv.weight)
+            for proj, conv in (
+                (self.q_proj, self.q_conv1d),
+                (self.k_proj, self.k_conv1d),
+                (self.v_proj, self.v_conv1d),
             )
-
-        q = conv(self.q_proj(hidden_states)[0], self.conv_q, self.q_conv1d.weight)
-        k = conv(self.k_proj(hidden_states)[0], self.conv_k, self.k_conv1d.weight)
-        v = conv(self.v_proj(hidden_states)[0], self.conv_v, self.v_conv1d.weight)
-        q = self._l2norm(q.view(shape))
-        k = self._l2norm(k.view(shape))
-        v = v.view(shape)
+        )
+        group_shape = (batch, tokens, self.group_heads, self.head_dim)
+        group_channels = self.group_heads * self.head_dim
+        group_qkv = []
+        for j in range(self.num_groups):
+            # The group's channels straight off the projection (the compiler takes
+            # them into the projection's weight) and through its own conv ring.
+            channels = slice(j * group_channels, (j + 1) * group_channels)
+            qj, kj, vj = (
+                torch.ops.rbln_custom_ops.kda_conv(
+                    x[..., channels],
+                    weight[channels],
+                    ring.inputs(),
+                    conv_slot,
+                    seq_idx.view(-1),
+                    query_len.view(-1),
+                    has_initial_state,
+                    KDA_CONV_RING,
+                ).view(group_shape)
+                for (x, weight), ring in zip(qkv, self.conv_rings[j])
+            )
+            qj, kj = self._l2norm(qj, kj)
+            group_qkv.append(tuple(x.transpose(1, 2) for x in (qj, kj, vj)))
 
         f = F.linear(hidden_states, self.f_weight).view(shape)
         decay = self.A_log.exp().view(-1, 1) * (
@@ -581,8 +617,9 @@ class RBLNGlm5KDA(nn.Module):
         g = self.lower_bound * torch.sigmoid(decay)  # [B, T, H, D] f32
         beta = torch.sigmoid(self.b_proj(hidden_states)[0].float())  # [B, T, H]
 
-        q, k, v, g = (x.transpose(1, 2) for x in (q, k, v, g))
+        g = g.transpose(1, 2)
         beta = beta.transpose(1, 2).to(hidden_states.dtype)
+        pad = -tokens % KDA_CHUNK if metadata.is_prefill else 0
         if metadata.is_prefill:
             # Padding tokens carry the state through unchanged: no decay, no update.
             # query_len - t > 0 on the device: an int32 broadcast or a compare with a
@@ -595,16 +632,19 @@ class RBLNGlm5KDA(nn.Module):
             valid = ahead.to(torch.int16) > 0
             g = g * valid.unsqueeze(-1)
             beta = beta * valid
-            pad = -tokens % KDA_CHUNK
-            if pad:
-                q, k, v, g = (F.pad(x, (0, 0, 0, pad)) for x in (q, k, v, g))
-                beta = F.pad(beta, (0, pad))
 
+        gate = F.linear(hidden_states, self.g_weight).view(shape)
         outs = []
-        for j, (state, slot, _) in enumerate(group_states):
-            heads = slice(j * self.group_heads, (j + 1) * self.group_heads)
-            qj, kj, vj, gj, bj = (x[:, heads] for x in (q, k, v, g, beta))
+        for j, ((state, slot, _), (qj, kj, vj)) in enumerate(
+            zip(group_states, group_qkv)
+        ):
             slot = slot.view(-1)
+            channels = slice(j * group_channels, (j + 1) * group_channels)
+            heads = slice(j * self.group_heads, (j + 1) * self.group_heads)
+            gj, bj = g[:, heads], beta[:, heads]
+            if pad:
+                qj, kj, vj, gj = (F.pad(x, (0, 0, 0, pad)) for x in (qj, kj, vj, gj))
+                bj = F.pad(bj, (0, pad))
             if metadata.is_prefill:
                 o = torch.ops.rbln_custom_ops.kda_prefill(
                     qj, kj, vj, gj, bj, state, slot, has_initial_state
@@ -628,13 +668,14 @@ class RBLNGlm5KDA(nn.Module):
                 o = torch.ops.rbln_custom_ops.kda_decode(
                     qj, kj, vj, gj, bj, state, slot
                 )
-            outs.append(o)
-        o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
-
-        o = o.transpose(1, 2)  # [B, T, H, D]
-        gate = F.linear(hidden_states, self.g_weight).view(shape)
-        o = self.o_norm(o) * torch.sigmoid(gate.float()).to(o.dtype)
-        return self.o_proj(o.reshape(batch, tokens, -1))[0]
+            # Gated and projected a group at a time (o_proj's columns of the group,
+            # summed), so that no op concatenates heads RSD has cut.
+            o = o.transpose(1, 2)  # [B, T, h, D]
+            o = self.o_norm(o) * torch.sigmoid(gate[:, :, heads].float()).to(o.dtype)
+            outs.append(
+                F.linear(o.reshape(batch, tokens, -1), self.o_proj.weight[:, channels])
+            )
+        return sum(outs[1:], outs[0])
 
 
 class RBLNGlm5Indexer(nn.Module):
