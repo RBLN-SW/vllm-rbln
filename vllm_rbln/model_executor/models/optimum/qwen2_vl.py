@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
 from dataclasses import replace
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -28,12 +26,12 @@ from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
 from vllm.model_executor.models.qwen2_vl import (
+    Qwen2VLForConditionalGeneration,
     Qwen2VLImageEmbeddingInputs,
     Qwen2VLImagePixelInputs,
     Qwen2VLVideoEmbeddingInputs,
     Qwen2VLVideoPixelInputs,
 )
-from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 from .base import ModelInputForRBLN
 from .model_base import (
@@ -69,6 +67,18 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
     Automatically detects model type based on the model configuration.
     """
+
+    # FIXME(transformers): Use its rope index after it matches vLLM for
+    # fractional video seconds (fixed in 5.18.0) and post-video text
+    # placement (still differs in 5.20.1).
+    iter_mm_grid_thw = Qwen2VLForConditionalGeneration.iter_mm_grid_thw
+    get_mrope_input_positions = (
+        Qwen2VLForConditionalGeneration.get_mrope_input_positions
+    )
+
+    @property
+    def config(self):
+        return self.model.config
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -221,85 +231,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
         self, model_input: ModelInputForRBLN
     ) -> ModelInputForRBLN:
         return replace(model_input, position_embed=self._position_embed(model_input))
-
-    # FIXME(transformers): Remove this calculation when both cases match vLLM:
-    # - Qwen2.5-VL <5.18.0 truncated fractional second_per_grid_ts.
-    # - 5.20.1 still advances post-video text by max(H, W), even when
-    #   the temporal position is larger.
-    def iter_mm_grid_thw(
-        self, mm_features: list[MultiModalFeatureSpec]
-    ) -> Iterator[tuple[int, int, int, int, float]]:
-        spatial_merge_size = self.model.config.vision_config.spatial_merge_size
-        tokens_per_second = getattr(
-            self.model.config.vision_config, "tokens_per_second", 1.0
-        )
-        for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
-            offset = mm_feature.mm_position.offset
-            data = mm_feature.data
-            assert data is not None
-            if mm_feature.modality == "image":
-                grid = data["image_grid_thw"].data
-                assert isinstance(grid, torch.Tensor)
-                t, h, w = grid.tolist()
-                assert t == 1, f"Image must have 1 frame, got {t}"
-                yield offset, 1, h // spatial_merge_size, w // spatial_merge_size, 1.0
-            elif mm_feature.modality == "video":
-                grid = data["video_grid_thw"].data
-                assert isinstance(grid, torch.Tensor)
-                t, h, w = grid.tolist()
-                # Qwen2-VL defaults to 1.0, while Qwen2.5-VL uses the supplied interval.
-                second_per_grid_ts = 1.0
-                seconds = data.get("second_per_grid_ts")
-                if seconds is not None:
-                    second_per_grid_ts = seconds.data.item()
-                t_factor = second_per_grid_ts * tokens_per_second
-                yield (
-                    offset,
-                    t,
-                    h // spatial_merge_size,
-                    w // spatial_merge_size,
-                    t_factor,
-                )
-            else:
-                raise ValueError(f"Unsupported modality: {mm_feature.modality}")
-
-    def get_mrope_input_positions(
-        self,
-        input_tokens: list[int],
-        mm_features: list[MultiModalFeatureSpec],
-    ) -> tuple[torch.Tensor, int]:
-        llm_pos_ids_list: list[np.ndarray] = []
-        st = 0
-
-        for (
-            offset,
-            llm_grid_t,
-            llm_grid_h,
-            llm_grid_w,
-            t_factor,
-        ) in self.iter_mm_grid_thw(mm_features):
-            text_len = offset - st
-            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-            llm_pos_ids_list.append(
-                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
-            )
-
-            grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
-            if t_factor != 1.0:
-                grid_indices[0] = (grid_indices[0] * t_factor).astype(np.int64)
-            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
-            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
-
-        if st < len(input_tokens):
-            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-            text_len = len(input_tokens) - st
-            llm_pos_ids_list.append(
-                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
-            )
-
-        llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-        mrope_position_delta = int(llm_positions.max() + 1 - len(input_tokens))
-        return torch.from_numpy(llm_positions), mrope_position_delta
 
     def _position_embed(self, model_input: ModelInputForRBLN) -> torch.Tensor:
         """cos/sin for the runner's MRoPE positions, [2, padded_batch_size, 1,
