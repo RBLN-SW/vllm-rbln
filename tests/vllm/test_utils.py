@@ -35,7 +35,7 @@ from .utils import (
 @pytest.mark.parametrize(
     ("key", "expected"),
     [
-        ("VLLM_RBLN_USE_CUSTOM_KERNEL", True),
+        ("VLLM_RBLN_USE_DYNAMIC_KV_CACHE", True),
         # Bare RBLN_ names belong to the host and the compiler, not to the
         # package under test, so the shell keeps them.
         ("RBLN_DEVICES", False),
@@ -60,7 +60,7 @@ def test_is_scrubbed_classification(key, expected):
 def test_scrub_env_removes_reports_and_preserves():
     """The three observable halves of the contract, in one pass."""
     environ = {
-        "VLLM_RBLN_USE_CUSTOM_KERNEL": "1",
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": "1",
         "RBLN_USE_CUSTOM_KERNEL": "1",
         "RBLN_DEVICES": "0,1",
         "PATH": "/usr/bin",
@@ -69,7 +69,7 @@ def test_scrub_env_removes_reports_and_preserves():
 
     # Reported with values, so pytest_report_header can show what it took.
     assert removed == {
-        "VLLM_RBLN_USE_CUSTOM_KERNEL": "1",
+        "VLLM_RBLN_USE_DYNAMIC_KV_CACHE": "1",
         "RBLN_USE_CUSTOM_KERNEL": "1",
     }
     # Mutated in place, and nothing else was touched.
