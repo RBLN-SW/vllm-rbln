@@ -85,7 +85,7 @@ Building from source? See **[DEVELOPMENT.md](./DEVELOPMENT.md)** for the `uv` de
 ### 📚 Documentation
 
 - [Overview & Supported Models](https://docs.rbln.ai/latest/software/model_serving/vllm_support/index.html)
-- [API Tutorial](https://docs.rbln.ai/software/model_serving/vllm_support/tutorial/vllm_llama3-8b.html)
+- [Recipes](https://docs.rbln.ai/latest/software/model_serving/vllm_support/recipes/index.html)
 
 
 ## 🤝 Contributing
