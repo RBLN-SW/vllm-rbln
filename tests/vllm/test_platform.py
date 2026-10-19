@@ -119,27 +119,47 @@ def isolated_standalone_env(monkeypatch):
     monkeypatch.setenv(_STANDALONE, _UNTOUCHED)
 
 
+@pytest.fixture
+def run_logging_probe(tmp_path):
+    def run(probe, bootstrap_logging, color):
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(probe), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "VLLM_CONFIGURE_LOGGING": bootstrap_logging,
+                "VLLM_LOGGING_LEVEL": "INFO",
+                "VLLM_LOGGING_CONFIG_PATH": "",
+                "VLLM_LOGGING_COLOR": color,
+                "NO_COLOR": "",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    return run
+
+
 @pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
 @pytest.mark.parametrize("color", ["0", "1"])
-def test_logging_config_preserves_rbln_output(tmp_path, bootstrap_logging, color):
-    probe = textwrap.dedent(r"""
-        import io
-        import json
+def test_logging_initialization_honors_upstream_config(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
         import logging
         import os
         import re
         import sys
-        from contextlib import closing, redirect_stdout
         from copy import deepcopy
-        from pathlib import Path
 
         from vllm.config.logging import LoggingConfig
-        from vllm.logger import configure_logging, init_logger
+        from vllm.logger import configure_logging
 
         configure_logging(LoggingConfig(configure_logging=True, log_level="ERROR"))
         import vllm_rbln.platform
         import vllm_rbln.logger as rbln_logger
-        from vllm_rbln.logger import make_file_handler
 
         assert logging.getLogger("vllm_rbln").getEffectiveLevel() == logging.ERROR
         defaults = deepcopy(rbln_logger.DEFAULT_LOGGIN_CONFIG)
@@ -154,6 +174,37 @@ def test_logging_config_preserves_rbln_output(tmp_path, bootstrap_logging, color
         root = logging.getLogger("vllm_rbln")
         rendered = root.handlers[0].formatter.format(record)
         assert "[config/logging.py:7]" in re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_reconfiguration_preserves_rbln_output(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import io
+        import logging
+        import re
+        import sys
+        from contextlib import closing
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        import vllm_rbln.platform
+        from vllm_rbln.logger import make_file_handler
+
+        root = logging.getLogger("vllm_rbln")
+        source = sys.modules[LoggingConfig.__module__].__file__
+        record = logging.LogRecord(
+            "vllm_rbln.logging_test", logging.ERROR, source, 7, "path marker", (), None
+        )
         configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
         console, = root.handlers
         output = io.StringIO()
@@ -197,6 +248,40 @@ def test_logging_config_preserves_rbln_output(tmp_path, bootstrap_logging, color
         file_handler.flush()
         assert "[vllm-rbln] INFO" in file_path.read_text()
         assert "file marker" in file_path.read_text()
+        logger.removeHandler(file_handler)
+        file_handler.close()
+        """,
+        bootstrap_logging,
+        color,
+    )
+
+
+@pytest.mark.parametrize("bootstrap_logging", ["0", "1"])
+@pytest.mark.parametrize("color", ["0", "1"])
+def test_logging_custom_config_and_default_transition(
+    run_logging_probe, bootstrap_logging, color
+):
+    run_logging_probe(
+        r"""
+        import io
+        import json
+        import logging
+        import re
+        import sys
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        from vllm.config.logging import LoggingConfig
+        from vllm.logger import configure_logging, init_logger
+
+        import vllm_rbln.platform
+        from vllm_rbln.logger import make_file_handler
+
+        configure_logging(LoggingConfig(configure_logging=True, log_level="INFO"))
+        root = logging.getLogger("vllm_rbln")
+        output = io.StringIO()
+        root.handlers[0].setStream(output)
+        logger = init_logger("vllm_rbln.logging_test")
 
         custom_path = Path(sys.argv[1]) / "logging.json"
         custom_path.write_text(json.dumps({
@@ -217,8 +302,6 @@ def test_logging_config_preserves_rbln_output(tmp_path, bootstrap_logging, color
         logger.error("incremental marker")
         assert "filtered marker" not in output.getvalue()
         assert output.getvalue().count("incremental marker") == 1
-        logger.removeHandler(file_handler)
-        file_handler.close()
 
         for name in ("application_console", "vllm_rbln"):
             custom_path.write_text(json.dumps({
@@ -257,22 +340,10 @@ def test_logging_config_preserves_rbln_output(tmp_path, bootstrap_logging, color
             assert "transition marker" in persistent_path.read_text()
             root.removeHandler(persistent)
             persistent.close()
-    """)
-    result = subprocess.run(
-        [sys.executable, "-c", probe, str(tmp_path)],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={
-            **os.environ,
-            "VLLM_CONFIGURE_LOGGING": bootstrap_logging,
-            "VLLM_LOGGING_LEVEL": "INFO",
-            "VLLM_LOGGING_CONFIG_PATH": "",
-            "VLLM_LOGGING_COLOR": color,
-            "NO_COLOR": "",
-        },
+        """,
+        bootstrap_logging,
+        color,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class TestPlatformIdentity:
