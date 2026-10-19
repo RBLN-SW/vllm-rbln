@@ -31,6 +31,7 @@ import torch
 from vllm.v1.outputs import ModelRunnerOutput
 
 import vllm_rbln.v1.worker.utils as worker_utils
+from vllm_rbln.v1.sample.rbln_sampler import compile_sampler, rbln_greedy_sample
 from vllm_rbln.v1.worker.async_output import (
     AsyncRBLNModelRunnerOutput,
     PendingTokenWriteback,
@@ -52,19 +53,15 @@ def _output(req_ids):
 
 
 def _async_output(
-    tokens,
-    *,
-    invalid_req_indices=(),
-    fail_fast=False,
-    rank=None,
-    dp_rank=None,
-    device="cpu",
+    tokens, *, invalid_req_indices=(), fail_fast=False, rank=None, dp_rank=None
 ):
     req_ids = [f"r{i}" for i in range(len(tokens))]
     queue: PendingTokenWriteback = deque()
     async_out = AsyncRBLNModelRunnerOutput(
         model_runner_output=_output(req_ids),
-        sampled_token_ids=torch.tensor(tokens, dtype=torch.int32).to(device),
+        sampled_token_ids=tokens
+        if isinstance(tokens, torch.Tensor)
+        else torch.tensor(tokens, dtype=torch.int32),
         invalid_req_indices=list(invalid_req_indices),
         pending_token_writeback=queue,
         req_ids=req_ids,
@@ -181,11 +178,14 @@ class TestGetOutput:
 
     @pytest.mark.use_device
     def test_device_tokens_are_copied_behind_the_sampler(self):
-        async_out, _ = _async_output([[7], [8]], device="rbln")
+        # A compiled sampler output stays on the device, so this is a real async D2H;
+        # a tensor moved over with .to("rbln") would be copied back synchronously.
+        greedy = compile_sampler(rbln_greedy_sample, None)
+        logits = torch.tensor([[0.0, 5.0, 1.0], [9.0, 0.0, 2.0]], dtype=torch.float16)
+        async_out, _ = _async_output(greedy(logits.to("rbln")).unsqueeze(-1))
         # The D2H starts at construction; get_output() only waits on it.
         assert async_out._copy_ready_event is not None
-        assert async_out._sampled_token_ids_cpu.is_pinned()
-        assert async_out.get_output().sampled_token_ids == [[7], [8]]
+        assert async_out.get_output().sampled_token_ids == [[1], [0]]
 
     def test_clears_the_rows_the_sampler_discarded(self):
         async_out, _ = _async_output([[7], [8]], invalid_req_indices=[1])
