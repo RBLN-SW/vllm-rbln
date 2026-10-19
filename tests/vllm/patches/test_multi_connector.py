@@ -14,7 +14,7 @@
 
 """MultiConnector forwards its child connectors' worker-side KV events.
 
-Stub children only -- the patch reads nothing but ``_connectors``.
+Stub children only -- the patches read nothing but ``_connectors``.
 """
 
 from __future__ import annotations
@@ -22,11 +22,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
 )
 
-from vllm_rbln.patches.multi_connector import get_kv_connector_kv_cache_events
+from vllm_rbln.patches.multi_connector import (
+    _build_init,
+    get_kv_connector_kv_cache_events,
+)
 
 
 class _Child:
@@ -78,6 +82,32 @@ def test_reporting_child_does_not_skip_later_children(reporting_child):
     assert [child.calls for child in children] == [1, 1, 1]
 
 
-def test_events_from_two_children_are_refused():
+class _Silent:
+    get_kv_connector_kv_cache_events = (
+        KVConnectorBase_V1.get_kv_connector_kv_cache_events
+    )
+
+
+def _construct(monkeypatch, *children):
+    def upstream_init(self, connectors):
+        self._connectors = connectors
+
+    monkeypatch.setattr(MultiConnector, "__init__", upstream_init)
+    multi = SimpleNamespace()
+    _build_init()(multi, list(children))
+    return multi
+
+
+def test_the_init_guard_is_installed():
+    assert MultiConnector.__init__.__wrapped__ is not None
+
+
+def test_one_reporting_child_constructs(monkeypatch):
+    children = [_Silent(), _Child()]
+
+    assert _construct(monkeypatch, *children)._connectors == children
+
+
+def test_two_reporting_children_are_refused_at_construction(monkeypatch):
     with pytest.raises(NotImplementedError, match="more than one child"):
-        get_kv_connector_kv_cache_events(_multi(_Child(object()), _Child(object())))
+        _construct(monkeypatch, _Child(), _Silent(), _Child())

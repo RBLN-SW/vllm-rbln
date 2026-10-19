@@ -22,8 +22,10 @@ aggregated output back to every child on the scheduler side and chains their
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
 )
@@ -54,15 +56,43 @@ def get_kv_connector_kv_cache_events(
     self: MultiConnector,
 ) -> KVConnectorKVEvents | None:
     # Every child is called each step: a child may drain its worker-side queue
-    # in this call even on the workers that report nothing.
-    events = [
-        child_events
-        for child in self._connectors
-        if (child_events := child.get_kv_connector_kv_cache_events()) is not None
-    ]
-    if len(events) > 1:
-        raise NotImplementedError(
-            "MultiConnector cannot merge KV events from more than one child "
-            f"connector; got them from {len(events)} children"
-        )
-    return events[0] if events else None
+    # in this call even on the workers that report nothing. At most one child
+    # reports; MultiConnector.__init__ refuses more.
+    events = [child.get_kv_connector_kv_cache_events() for child in self._connectors]
+    return next((e for e in events if e is not None), None)
+
+
+@register_patch(
+    target=(
+        "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector."
+        "MultiConnector.__init__"
+    ),
+    reason=(
+        "Forwarding a child's KV events cannot merge two children's events: "
+        "each carries its own cross-worker aggregate() rule. Refuse a second "
+        "reporting child at construction, so the engine fails at load rather "
+        "than mid-serving. TODO(vllm-rbln): delete with the patch above."
+    ),
+    key="vllm_rbln.patches.multi_connector.init",
+    owner_module="vllm_rbln.patches.multi_connector",
+    build=True,
+)
+def _build_init():
+    original = MultiConnector.__init__
+    base = KVConnectorBase_V1.get_kv_connector_kv_cache_events
+
+    @functools.wraps(original)
+    def __init__(self: MultiConnector, *args, **kwargs) -> None:
+        original(self, *args, **kwargs)
+        reporters = [
+            type(child).__name__
+            for child in self._connectors
+            if type(child).get_kv_connector_kv_cache_events is not base
+        ]
+        if len(reporters) > 1:
+            raise NotImplementedError(
+                "MultiConnector cannot merge KV events from more than one child "
+                f"connector; {reporters} all report them"
+            )
+
+    return __init__
