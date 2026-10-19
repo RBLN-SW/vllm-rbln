@@ -930,9 +930,8 @@ class TestEvictionHook:
 
 
 class TestKVEvents:
-    # An external router re-hashes the emitted token_ids in sub_block_size chunks
-    # from parent_block_hash and matches them against our block_hashes, so the
-    # payload must be exact. RBLN re-emits at sub_block granularity.
+    # Hashes use tagged keys, while event extra_keys keep the untagged format
+    # consumed by routers. RBLN emits both at sub-block granularity.
 
     R = BLOCK_SIZE // SUB_BLOCK_SIZE  # sub-blocks per block
 
@@ -1119,9 +1118,19 @@ class TestKVEvents:
         assert len(removed) == 1
         assert removed[0].block_hashes == stored[0].block_hashes
 
-    def test_extra_keys_round_trip_multimodal(self):
-        # Re-hashing the emitted token_ids + extra_keys + parent_block_hash must
-        # reproduce the emitted block_hashes, with mm_idx advancing mid-chain.
+    def test_cache_salt_event_extra_keys_are_untagged(self):
+        manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
+        req = make_request("salted", list(range(8)), 8, cache_salt="salt")
+        prefill_request(manager, req)
+        stored = self._stored(manager)
+        assert stored
+        event_extra_keys = []
+        for event in stored:
+            assert event.extra_keys is not None
+            event_extra_keys.extend(event.extra_keys)
+        assert event_extra_keys == [("salt",), None]
+
+    def test_multimodal_event_extra_keys_are_untagged(self):
         # Images at [0,4), [8,14), [16,20) over sub_block_size=4, block_size=8.
         mm_features = [
             MultiModalFeatureSpec(
@@ -1152,27 +1161,24 @@ class TestKVEvents:
         stored = self._stored(manager)
         assert stored
 
-        prev_bare_hash = None
+        previous_hash = None
+        event_extra_keys = []
         for e in stored:
-            expected_parent = (
-                maybe_convert_block_hash(prev_bare_hash)
-                if prev_bare_hash is not None
-                else None
-            )
-            assert e.parent_block_hash == expected_parent
+            assert e.parent_block_hash == previous_hash
             assert e.extra_keys is not None
             assert len(e.extra_keys) == len(e.block_hashes)
             assert len(e.token_ids) == len(e.block_hashes) * e.block_size
-            parent = prev_bare_hash
-            for i, emitted_hash in enumerate(e.block_hashes):
-                sub_tokens = e.token_ids[i * e.block_size : (i + 1) * e.block_size]
-                bare = hash_block_tokens(sha256, parent, sub_tokens, e.extra_keys[i])
-                assert maybe_convert_block_hash(bare) == emitted_hash
-                parent = bare
-            prev_bare_hash = parent
+            previous_hash = e.block_hashes[-1]
+            event_extra_keys.extend(e.extra_keys)
 
-        # The reconstructed chain matches what generate_block_hash_extra_keys
-        # produces for the same prompt (mm_idx threaded through event boundaries).
+        assert event_extra_keys == [
+            (("hash_img_a", 0), "sprinkle"),
+            None,
+            (("hash_img_b", 0),),
+            (("hash_img_b", -4),),
+            (("hash_img_c", 0),),
+        ]
+
         mm_idx = 0
         parent = None
         expected_chain: list = []
@@ -1192,9 +1198,7 @@ class TestKVEvents:
             flat_emitted.extend(e.block_hashes)
         assert flat_emitted == expected_chain[: len(flat_emitted)]
 
-    def test_extra_keys_round_trip_lora(self):
-        # LoRA + cache_salt: re-hashing the extras reproduces the emitted hash and
-        # the lora_id / lora_name fields surface on the event.
+    def test_lora_event_extra_keys_are_untagged(self):
         lora = LoRARequest(lora_name="sales_bot", lora_int_id=42, lora_path="/tmp/x")
         manager = make_manager(8, 4, 10, enable_kv_cache_events=True)
         req = make_request(
@@ -1203,17 +1207,17 @@ class TestKVEvents:
         prefill_request(manager, req)
         stored = self._stored(manager)
         assert stored
+        event_extra_keys = []
         for e in stored:
             assert e.lora_id == 42
             assert e.lora_name == "sales_bot"
             assert e.extra_keys is not None
-        parent = None
-        for e in stored:
-            for i, emitted_hash in enumerate(e.block_hashes):
-                sub_tokens = e.token_ids[i * e.block_size : (i + 1) * e.block_size]
-                bare = hash_block_tokens(sha256, parent, sub_tokens, e.extra_keys[i])
-                assert maybe_convert_block_hash(bare) == emitted_hash
-                parent = bare
+            event_extra_keys.extend(e.extra_keys)
+        assert event_extra_keys == [("sales_bot", "pepper"), ("sales_bot",)]
+        hashes, _, _ = _hasher().hash_tokens(req.all_token_ids, req)
+        assert [h for e in stored for h in e.block_hashes] == [
+            maybe_convert_block_hash(h) for h in hashes
+        ]
 
 
 class TestResetPrefixCache:

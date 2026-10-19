@@ -43,7 +43,6 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
@@ -291,9 +290,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Model-related.
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
-        self.supports_mm_inputs = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
-            model_config
-        )
+        self.supports_mm_inputs = model_config.supports_multimodal_inputs
         assert not (self.supports_mm_inputs and model_config.uses_mrope), (
             "M-RoPE multimodal models are not supported on the vLLM path"
         )

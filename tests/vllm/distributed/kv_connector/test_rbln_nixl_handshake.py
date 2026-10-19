@@ -312,6 +312,7 @@ class TestUpstreamReachesTheHandshake:
         w._remote_agents = {}
         w._engine_clock_offset = {}
         w._engine_last_active = {}
+        w._engine_by_address = {}
         w._log_failure = MagicMock()
         # This stand-in holds no NIXL state, and __del__ runs shutdown().
         w.shutdown = w._handshake_initiation_executor.shutdown
@@ -1048,6 +1049,8 @@ class TestPeerRegionView:
         if not uniform_lens:
             w.block_len_per_layer[-cls.RPL :] = [cls.DRAFT_LEN] * cls.RPL
         w._region_is_mla = [False] * (w.num_regions - mla_tail) + [True] * mla_tail
+        # Empty as upstream's __init__ leaves it: regions pair by index.
+        w._transfer_layer_region_indices = ()
         w._kv_areas = 1
         set_shape(w, chunk_mode=False)
         w.device_id = 0
@@ -1988,6 +1991,7 @@ class TestValidateRemoteAgentHandshake:
         w.dst_region_group_ids = {"eng": [0] * (num_layers * 2 * areas)}
         w.dst_uses_region_group_mapping = {"eng": False}
         w._uses_region_group_mapping = False
+        w._transfer_layer_region_indices = ()
         w.nixl_memory_type = "VRAM"
         w.region_mem_types = ["VRAM"] * (num_layers * 2 * areas)
         w.dst_region_mem_types = {"eng": ["VRAM"] * (num_layers * 2 * areas)}

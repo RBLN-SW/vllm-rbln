@@ -38,6 +38,7 @@ from vllm.v1.core.kv_cache_utils import (
     hash_block_tokens,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
+    to_event_extra_keys,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -827,7 +828,11 @@ class RBLNKVCacheManager(KVCacheManager):
                 ),
                 medium=MEDIUM_GPU,
                 lora_name=(request.lora_request.name if request.lora_request else None),
-                extra_keys=extras if any(e is not None for e in extras) else None,
+                extra_keys=(
+                    to_event_extra_keys(extras)
+                    if any(e is not None for e in extras)
+                    else None
+                ),
                 group_idx=gi.group_id,
                 kv_cache_spec_kind=kind,
                 kv_cache_spec_sliding_window=sliding_window,

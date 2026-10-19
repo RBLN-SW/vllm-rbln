@@ -278,10 +278,15 @@ class TestPrepareNextTokenIdsPadded:
 
 class TestInitGuards:
     def test_defers_multimodal_support_check_until_draft_load(self, monkeypatch):
-        from vllm.multimodal import MULTIMODAL_REGISTRY
+        from vllm.config import ModelConfig
+
+        from tests.vllm.v1.spec_decode.utils import _spec_vllm_config
+
+        # Only the proposer should observe MM support on this text-model config.
+        _spec_vllm_config("eagle", 3)
 
         monkeypatch.setattr(
-            MULTIMODAL_REGISTRY, "supports_multimodal_inputs", lambda cfg: True
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
         )
         proposer = make_eagle_proposer()
         assert proposer.supports_mm_inputs
@@ -561,11 +566,16 @@ class TestLoadModel:
     def test_multimodal_guard_uses_loaded_draft_capability(
         self, monkeypatch, draft_needs_mm_inputs
     ):
-        from vllm.multimodal import MULTIMODAL_REGISTRY
+        from vllm.config import ModelConfig
         from vllm.v1.spec_decode.eagle import EagleProposer
 
+        from tests.vllm.v1.spec_decode.utils import _spec_vllm_config
+
+        # Only the proposer should observe MM support on this text-model config.
+        _spec_vllm_config("eagle", 3)
+
         monkeypatch.setattr(
-            MULTIMODAL_REGISTRY, "supports_multimodal_inputs", lambda cfg: True
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
         )
         proposer = make_eagle_proposer()
         monkeypatch.setattr(
