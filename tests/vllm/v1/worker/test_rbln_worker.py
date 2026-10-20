@@ -428,7 +428,8 @@ class TestConformance:
 class TestInitDeviceEnv:
     """A rank takes one NPU, resolved as upstream does: vLLM's per-DP-rank
     mapping (``assigned_physical_gpu_ids``, which carries ``--device-ids``)
-    indexed by the local rank, and without a mapping the env var pool."""
+    indexed by the local rank, and without a mapping the env var pool at
+    ``data_parallel_rank_local * world_size + local_rank``."""
 
     def test_unset_pool_is_the_whole_host(self, make_worker):
         make_worker(world_size=1)
@@ -469,6 +470,32 @@ class TestInitDeviceEnv:
         with pytest.raises(ValueError):
             make_worker(world_size=4, local_rank=0)
 
+    @pytest.mark.parametrize(
+        "dp_rank, local_rank, expected",
+        [(0, 0, "0"), (0, 1, "1"), (1, 0, "2"), (1, 1, "3")],
+    )
+    def test_dp_ranks_do_not_share(self, make_worker, dp_rank, local_rank, expected):
+        # In-process DP (InprocClient) reaches the worker with no mapping.
+        make_worker(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=dp_rank,
+            data_parallel_rank_local=dp_rank,
+            local_rank=local_rank,
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
+
+    def test_dp_without_a_mapping_indexes_the_pool(self, make_worker):
+        os.environ["RBLN_VISIBLE_DEVICES"] = "4,5,6,7"
+        make_worker(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            data_parallel_rank_local=1,
+            local_rank=1,
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "7"
+
     def test_device_ids_mapping_decides_over_the_pool(self, make_worker):
         os.environ["RBLN_VISIBLE_DEVICES"] = "0,1,2,3"
         make_worker(world_size=2, assigned_physical_gpu_ids=[2, 3], local_rank=1)
@@ -486,6 +513,20 @@ class TestInitDeviceEnv:
             executor_published=False,
         )
         assert os.environ["RBLN_VISIBLE_DEVICES"] == "1"
+
+    def test_non_moe_dp_without_a_mapping_offsets_by_the_local_dp_rank(
+        self, make_worker
+    ):
+        # vLLM resets data_parallel_size and data_parallel_rank for an
+        # independent non-MoE DP rank; data_parallel_rank_local still tells the
+        # replicas apart.
+        make_worker(
+            world_size=2,
+            data_parallel_size=1,
+            data_parallel_rank=0,
+            data_parallel_rank_local=1,
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "2"
 
     def test_non_moe_dp_keeps_its_shard(self, make_worker):
         # vLLM reconfigures a non-MoE DP rank as an independent engine (DP fields

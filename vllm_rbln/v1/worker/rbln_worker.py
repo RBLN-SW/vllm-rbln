@@ -136,15 +136,21 @@ class RBLNWorker(WorkerBase):
         # As upstream's GPU worker: vLLM's per-DP-rank mapping, which carries
         # --device-ids, decides the device; without one the pool in env_var does.
         # Published here because UniProcExecutor, unlike worker_main, does not.
+        # In-process DP (InprocClient) gets no mapping, so offset into the pool
+        # by the local DP rank, as upstream's GPU worker does.
         assigned = self.parallel_config.assigned_physical_gpu_ids
         if assigned is not None:
             set_assigned_physical_gpu_ids(assigned)
+            device_id = self.local_rank
+        else:
+            dp_rank = self.parallel_config.data_parallel_rank_local or 0
+            device_id = dp_rank * self.parallel_config.world_size + self.local_rank
         try:
-            selected = current_platform.device_id_to_physical_device_id(self.local_rank)
+            selected = current_platform.device_id_to_physical_device_id(device_id)
         except IndexError as e:
             raise ValueError(
-                f"local rank {self.local_rank} has no NPU in "
-                f"assigned_physical_gpu_ids={assigned} / "
+                f"device index {device_id} (local rank {self.local_rank}) has no "
+                f"NPU in assigned_physical_gpu_ids={assigned} / "
                 f"{env_var}={os.environ.get(env_var, '')!r}."
             ) from e
 
