@@ -460,25 +460,20 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
 
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-    def test_msa_models_need_bfloat16(self, reconfigure, dtype):
-        def mutate(config):
-            config.model_config.hf_text_config.sparse_attention_config = {
-                "sparse_attention_freq": [0, 1]
-            }
-            config.model_config.dtype = dtype
+    def test_msa_models_need_bfloat16(self, reconfigure):
+        def msa(dtype):
+            def mutate(config):
+                config.model_config.hf_text_config.sparse_attention_config = {
+                    "sparse_attention_freq": [0, 1]
+                }
+                config.model_config.dtype = dtype
 
-        with pytest.raises(ValueError, match="bfloat16 only"):
-            reconfigure(mutate)
+            return mutate
 
-    def test_msa_models_in_bfloat16_pass(self, reconfigure):
-        def mutate(config):
-            config.model_config.hf_text_config.sparse_attention_config = {
-                "sparse_attention_freq": [0, 1]
-            }
-            config.model_config.dtype = torch.bfloat16
-
-        reconfigure(mutate)
+        for dtype in (torch.float16, torch.float32):
+            with pytest.raises(ValueError, match="bfloat16 only"):
+                reconfigure(msa(dtype))
+        reconfigure(msa(torch.bfloat16))
 
     def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
         from vllm.config import ModelConfig

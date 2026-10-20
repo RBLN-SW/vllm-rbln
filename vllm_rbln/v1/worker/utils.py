@@ -261,10 +261,8 @@ def num_attn_module(model_config, cache_dtype) -> int:
     if hasattr(text_config, "index_topk") or hasattr(hf_config, "index_topk"):
         is_fp8 = bool(cache_dtype) and cache_dtype.startswith("fp8")
         return 3 if is_fp8 else 2
-    # MiniMax-M3 MSA puts the lightning indexer's key cache next to the GQA
-    # K/V cache. A dense layer owns only the K/V cache; the runner re-indexes
-    # every layer by its position in the bound cache list, so the count here
-    # only has to order the caches (`extract_layer_index`).
+    # MiniMax-M3 MSA: the indexer key cache next to the GQA K/V cache. Dense
+    # layers own only K/V; the runner re-indexes layers by bound position.
     if getattr(text_config, "sparse_attention_config", None) or getattr(
         hf_config, "sparse_attention_config", None
     ):

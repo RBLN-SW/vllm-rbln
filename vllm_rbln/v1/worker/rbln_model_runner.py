@@ -122,7 +122,10 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
 )
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.model_executor.models.interfaces import supports_rbln_multimodal
+from vllm_rbln.model_executor.models.interfaces import (
+    SupportsRBLNMultiModal,
+    supports_rbln_multimodal,
+)
 from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
@@ -292,8 +295,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Model-related.
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
-        # Decided in load_model: only a model that merges image embeddings inside
-        # its graph (SupportsRBLNMultiModal) takes the multimodal path.
+        # Set in load_model by _resolve_mm_support.
         self.supports_mm_inputs = False
 
         self.encoder_cache: dict[str, torch.Tensor] = {}
@@ -1289,12 +1291,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
     def _preprocess(
         self,
+        scheduler_output: RBLNSchedulerOutput,
         num_reqs: int,
         num_reqs_padded: int,
         num_input_tokens: int,
         logits_indices: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
-        scheduler_output: RBLNSchedulerOutput | None = None,
     ) -> tuple[
         StagedModelInputs,
         dict[str, Any],
@@ -1338,7 +1340,6 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         }
 
         if self.supports_mm_inputs and is_prefill and get_pp_group().is_first_rank:
-            assert scheduler_output is not None
             self._execute_mm_encoder(scheduler_output)
             mm_embeds, mm_mask = self._gather_mm_embeddings(
                 scheduler_output, num_input_tokens
@@ -1961,12 +1962,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 staged_model_inputs,
                 model_kwargs,
             ) = self._preprocess(
+                scheduler_output,
                 num_reqs,
                 batch_desc.num_reqs_padded,
                 num_query_tokens,
                 logits_indices,
                 intermediate_tensors,
-                scheduler_output,
             )
 
             if self.use_async_scheduling:
@@ -2484,8 +2485,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 use_direct_dispatch=True,
                 dtype=self.rbln_config.compile_dtype,
             )
-            if self.supports_mm_inputs and hasattr(self.model, "compile_mm_encoder"):
-                self.model.compile_mm_encoder(
+            if self.supports_mm_inputs:
+                cast(SupportsRBLNMultiModal, self.model).compile_mm_encoder(
                     lambda encoder: compile(
                         encoder,
                         dynamic=False,
@@ -3335,11 +3336,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
-        # A layer reads its cache at its position in this list (and in the view
-        # infos, ordered the same way). The index set at construction assumes
-        # every decoder layer owns `num_attn_module` caches, so a layer that owns
-        # fewer (e.g. a dense layer with no indexer cache) shifts every later
-        # one; take the position the list actually gives it.
+        # A layer reads the cache at its position in this list. The index set at
+        # construction assumes `num_attn_module` caches per layer, which a layer
+        # owning fewer (a MiniMax-M3 dense layer has no indexer cache) breaks.
         for position, layer_name in enumerate(self.kv_cache_names):
             layer = forward_context[layer_name]
             if hasattr(layer, "layer_index"):

@@ -14,8 +14,10 @@
 
 """Model capabilities the RBLN vLLM path needs beyond upstream's interfaces."""
 
+from collections.abc import Callable
 from typing import ClassVar, Literal, Protocol, runtime_checkable
 
+from torch import nn
 from typing_extensions import TypeIs
 
 
@@ -36,6 +38,11 @@ class SupportsRBLNMultiModal(Protocol):
     """
 
     merges_mm_embeds_in_graph: ClassVar[Literal[True]] = True
+
+    def compile_mm_encoder(self, compile_fn: Callable[[nn.Module], nn.Module]) -> None:
+        """Compile the multimodal encoder with the runner's compile wrapper. A
+        rank that owns no encoder returns without calling ``compile_fn``."""
+        ...
 
 
 def supports_rbln_multimodal(model: object) -> TypeIs[SupportsRBLNMultiModal]:

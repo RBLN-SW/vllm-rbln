@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.config import ModelConfig
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
@@ -38,6 +39,42 @@ from tests.vllm.v1.worker.utils import (
 )
 
 pytestmark = pytest.mark.maybe_use_device
+
+
+class _InGraphMergeModel(torch.nn.Module):
+    merges_mm_embeds_in_graph = True
+
+
+class TestResolveMultiModalSupport:
+    @staticmethod
+    def _multimodal(monkeypatch, value: bool) -> None:
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: value)
+        )
+
+    def test_a_text_model_stays_off_the_path(self, make_model_runner, monkeypatch):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, False)
+        runner.model = _InGraphMergeModel()
+
+        assert runner._resolve_mm_support() is False
+
+    def test_a_model_that_merges_in_graph_opts_in(self, make_model_runner, monkeypatch):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, True)
+        runner.model = _InGraphMergeModel()
+
+        assert runner._resolve_mm_support() is True
+
+    def test_any_other_multimodal_model_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, True)
+        runner.model = SimpleNamespace(embed_multimodal=lambda **kw: ())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMultiModal"):
+            runner._resolve_mm_support()
 
 
 class TestGatherMultimodalEmbeddings:

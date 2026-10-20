@@ -20,20 +20,15 @@ import torch
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
-from vllm_rbln.logger import init_logger
-
 from .flash_attention import RBLNFlashAttentionMetadataBuilder
 
-logger = init_logger(__name__)
-
 MSA_SPARSE_BLOCK_SIZE = 128
+_MSA_KERNEL_BLOCK_SIZE = MultipleOf(4 * MSA_SPARSE_BLOCK_SIZE)
 
 
 class RBLNMiniMaxM3SparseBackend(AttentionBackend):
     """Main GQA K/V cache of a MiniMax-M3 sparse attention layer."""
 
-    # bf16 only, with the indexer backend below: the MSA kernels are validated
-    # in bf16 (and a KV8 fp8 cache), and the platform rejects other dtypes.
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[str]] = [
         "auto",
@@ -51,7 +46,7 @@ class RBLNMiniMaxM3SparseBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
-        return [MultipleOf(4 * MSA_SPARSE_BLOCK_SIZE)]
+        return [_MSA_KERNEL_BLOCK_SIZE]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -100,7 +95,7 @@ class RBLNMiniMaxM3IndexerBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
-        return [MultipleOf(4 * MSA_SPARSE_BLOCK_SIZE)]
+        return [_MSA_KERNEL_BLOCK_SIZE]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:

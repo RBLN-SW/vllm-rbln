@@ -79,18 +79,12 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight = layer.weight.data
-        device = weight.device
-        # E8M0 -> bf16 by moving the exponent byte into bf16's exponent field.
-        # That is exact for bytes 1..254; 0 (2^-127) is a bf16 subnormal and 255
-        # is NaN, so those two are set apart.
-        e8m0 = layer.weight_scale.data.to("cpu")
-        bits = e8m0.to(torch.int16) << 7
-        bits[e8m0 == 0] = 0x0040
-        bits[e8m0 == 255] = 0x7FC0
-        scale = bits.view(torch.bfloat16)
-        layer.weight = Parameter(weight, requires_grad=False)
-        layer.weight_scale = Parameter(scale.to(device), requires_grad=False)
+        layer.weight = Parameter(layer.weight.data, requires_grad=False)
+        # bf16 shares E8M0's 8-bit exponent, so every scale converts exactly.
+        layer.weight_scale = Parameter(
+            layer.weight_scale.data.view(torch.float8_e8m0fnu).to(torch.bfloat16),
+            requires_grad=False,
+        )
 
     def apply(
         self,
@@ -99,18 +93,10 @@ class RBLNModelOptMxFp8LinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         out_features, in_features = layer.weight.shape
-        # In fp16 a scale above 65504 (E8M0 byte >= 143) is inf on its own even
-        # when weight * scale fits, so multiply in fp32 there. In bf16 the
-        # product is exact (a power-of-two scale), so that graph is unchanged.
-        mul_dtype = torch.float32 if x.dtype == torch.float16 else x.dtype
         weight = (
-            (
-                layer.weight.view(
-                    out_features, in_features // MXFP8_GROUP_SIZE, MXFP8_GROUP_SIZE
-                ).to(mul_dtype)
-                * layer.weight_scale.to(mul_dtype)[:, :, None]
-            )
-            .to(x.dtype)
-            .view(out_features, in_features)
-        )
+            layer.weight.view(
+                out_features, in_features // MXFP8_GROUP_SIZE, MXFP8_GROUP_SIZE
+            ).to(x.dtype)
+            * layer.weight_scale.to(x.dtype)[:, :, None]
+        ).view(out_features, in_features)
         return torch.nn.functional.linear(x, weight, bias)

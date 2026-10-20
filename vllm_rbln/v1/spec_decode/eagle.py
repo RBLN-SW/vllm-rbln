@@ -69,10 +69,6 @@ class RBLNEagleProposer(EagleProposer):
         super().__init__(vllm_config, torch.device("cpu"), runner)
         self.device = device
 
-        # A multimodal target alone is fine: `load_model` turns
-        # `supports_mm_inputs` off for a text-only draft (upstream), and the
-        # drafter then runs on token embeddings. Only a draft that takes the
-        # target's multimodal embeddings is unsupported; checked there.
         if self.needs_extra_input_slots:
             raise NotImplementedError(
                 "vllm-rbln does not support EAGLE extra input slots required for "

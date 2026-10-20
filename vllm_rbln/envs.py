@@ -255,8 +255,10 @@ environment_variables = {
     # Experimental decoder boundaries for MiniMax-M2 and GPT-OSS.
     # Requires nested-region support in rebel-compiler; this does not emit loops.
     "VLLM_RBLN_NESTED_COMPILE_REGION": (
-        lambda: os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
-        in ("true", "1")
+        lambda: (
+            os.environ.get("VLLM_RBLN_NESTED_COMPILE_REGION", "False").lower()
+            in ("true", "1")
+        )
     ),
     # Build only the first N decoder layers and leave the rest as
     # `PPMissingLayer`, to cut compile time during bring-up. 0 disables the
@@ -287,10 +289,10 @@ environment_variables = {
         )
     ),
     # Disable only for debugging worker failures without terminating the worker.
-    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: os.environ.get(
-        "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False"
-    ).lower()
-    in ("true", "1"),
+    "VLLM_RBLN_DISABLE_WORKER_FAIL_FAST": lambda: (
+        os.environ.get("VLLM_RBLN_DISABLE_WORKER_FAIL_FAST", "False").lower()
+        in ("true", "1")
+    ),
     # Auto port
     "VLLM_RBLN_AUTO_PORT": use_auto_port,
     # enforce model data type into fp32 not model_config.dtype

@@ -87,7 +87,6 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_rbln.config import get_rbln_config
-from vllm_rbln.logger import init_logger
 from vllm_rbln.model_executor.models.interfaces import SupportsRBLNMultiModal
 from vllm_rbln.patches.attention import _resolve_kv_cache
 from vllm_rbln.v1.attention.backends.flash_attention import _fp8_cache_dtype
@@ -102,8 +101,6 @@ from vllm_rbln.v1.worker.utils import (
 from vllm_rbln.v1.worker.utils import (
     pipeline_adjusted_layer_index,
 )
-
-logger = init_logger(__name__)
 
 
 def _layer_index_of(prefix: str) -> int:
@@ -205,7 +202,6 @@ class RBLNMiniMaxM3MoE(nn.Module):
         else:
             self.e_score_correction_bias = None
 
-        # Router weights are fp32 in the checkpoint; the gate is computed in fp32.
         self.gate = GateLinear(
             config.hidden_size,
             config.num_local_experts,
@@ -426,19 +422,19 @@ class RBLNMiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
         self.topk_blocks = int(sparse_cfg["sparse_topk_blocks"])
-        # The runner sorts the batch longest first under the same condition
-        # (RBLNModelRunner.sort_batch_by_length); the MSA indexer stops its
-        # partition loop at batch 0's last partition, so it requires the order
-        # for a batch of more than one row.
+        # Same condition as RBLNModelRunner.sort_batch_by_length: the MSA indexer
+        # stops its partition loop at batch 0's last partition, so a batch of
+        # more than one row must arrive longest first.
         self.is_prompt_sorted = (
             current_platform.is_cr13() or get_rbln_config().use_batch_attn_opt
         )
-        if int(sparse_cfg.get("sparse_block_size", MSA_SPARSE_BLOCK_SIZE)) != (
-            MSA_SPARSE_BLOCK_SIZE
-        ):
+        sparse_block_size = int(
+            sparse_cfg.get("sparse_block_size", MSA_SPARSE_BLOCK_SIZE)
+        )
+        if sparse_block_size != MSA_SPARSE_BLOCK_SIZE:
             raise NotImplementedError(
                 "the RBLN MSA kernels are fixed to a 128-token sparse block; got "
-                f"sparse_block_size={sparse_cfg.get('sparse_block_size')}"
+                f"sparse_block_size={sparse_block_size}"
             )
         if int(sparse_cfg.get("sparse_init_block", 0)) != 0:
             raise NotImplementedError("sparse_init_block != 0 is not supported")
@@ -763,10 +759,10 @@ class RBLNMiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         # islice, not a slice: on torch >= 2.12 Dynamo lifts the parameters of a
         # sliced ModuleList into graph inputs, and the compiler then sees no
         # constant weights (an MXFP8 dense cannot pack).
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
@@ -780,14 +776,11 @@ class RBLNMiniMaxM3Model(nn.Module, EagleModelMixin):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
-        # EAGLE3 drafts off the aux states (layers from the draft config, else
-        # upstream's default (2, L // 2, L - 3)).
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Checkpoint experts use w1=gate, w2=down, w3=up.
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
@@ -948,11 +941,7 @@ def _load_upstream_common(name: str) -> ModuleType:
     assert spec is not None and spec.loader is not None, path
     module = importlib.util.module_from_spec(spec)
     sys.modules[full_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(full_name, None)
-        raise
+    spec.loader.exec_module(module)
     return module
 
 
@@ -960,7 +949,8 @@ _mm_preprocess = _load_upstream_common("mm_preprocess")
 _vision_tower = _load_upstream_common("vision_tower")
 
 
-# (72 x 72 grid, 1008 x 1008 px = max_image_resolution 1008 / patch_size 14).
+# Patches per image the compiled vision encoder takes: the model's largest image,
+# 1008 x 1008 px at patch_size 14 (a 72 x 72 grid).
 MM_ENCODER_PATCH_BUCKET = 5184
 
 
@@ -1093,14 +1083,7 @@ class RBLNMiniMaxM3SparseForConditionalGeneration(
         return self.language_model.logits_processor
 
     def compile_mm_encoder(self, compile_fn) -> None:
-        """Called by the runner at model load with its compile wrapper; the
-        runner also warms the result up through ``embed_multimodal``.
-
-        The compiled encoder is kept outside the module tree: its weights are
-        the registered ``vision_tower``'s, and registering the wrapper too would
-        add duplicate paths to ``state_dict()``."""
-        # Non-first PP ranks and configurations with both image/video limits
-        # set to zero own no vision tower, but still receive encoder setup calls.
+        # Non-first PP ranks and zero image/video limits own no vision tower.
         if self.vision_tower is None:
             return
         encoder = _RBLNVisionEncoder(self.vision_tower).eval()

@@ -853,8 +853,8 @@ class TestFailedRead:
     def test_a_peer_is_dropped_only_once_its_handles_drain(self):
         # Releasing a descriptor list under a live handle would fault the agent.
         w = self._polling_worker()
-        w.nixl_wrapper.check_xfer_state.side_effect = (
-            lambda h: "ERR" if h == 1 else "PROC"
+        w.nixl_wrapper.check_xfer_state.side_effect = lambda h: (
+            "ERR" if h == 1 else "PROC"
         )
         w.get_transfer_results()
         assert "eng" in w._remote_agents
