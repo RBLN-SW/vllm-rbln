@@ -19,10 +19,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
+from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 from .base import ModelInputForRBLN
-from .qwen2_vl import RBLNOptimumQwen2_5_VLForConditionalGeneration, split_by_grid_thw
+from .qwen2_vl import (
+    RBLNOptimumQwen2_5_VLForConditionalGeneration,
+    split_by_grid_thw,
+)
 
 logger = init_logger(__name__)
 
@@ -41,11 +45,16 @@ class RBLNOptimumQwen3VLForConditionalGeneration(
     `_pack_deepstack` lays them out for the graph.
     """
 
-    def _video_rope_kwargs(
-        self, video_features: list[MultiModalFeatureSpec]
-    ) -> dict[str, torch.Tensor]:
-        # Qwen3-VL's get_rope_index takes no second_per_grid_ts.
-        return {}
+    # Qwen2-VL and Qwen2.5-VL use one (T, H, W) grid per video.
+    # Qwen3-VL locates each frame in the prompt to compute its positions.
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> tuple[torch.Tensor, int]:
+        return Qwen3VLForConditionalGeneration._get_mrope_input_positions(
+            input_tokens, mm_features, self.model.config
+        )
 
     def _create_video_pixel_inputs(
         self,

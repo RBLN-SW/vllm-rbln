@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.platforms import current_platform
+from vllm.platforms.interface import set_assigned_physical_gpu_ids
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
@@ -61,7 +62,6 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_rbln.envs as envs
-from vllm_rbln.config import RBLNConfig
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
@@ -131,39 +131,35 @@ class RBLNWorker(WorkerBase):
         raise RuntimeError("Selective discard is not supported on RBLN.")
 
     def _init_device_env(self) -> None:
-        rbln_config: RBLNConfig = self.vllm_config.additional_config
         env_var = current_platform.device_control_env_var
-        num_devices = rbln_config.num_devices_per_local_rank
 
-        dp_rank = self.parallel_config.data_parallel_rank_local or 0
-        slot = dp_rank * self.parallel_config.world_size + self.local_rank
-        first = slot * num_devices
-        # The visible variant, because every worker process is handed a data
-        # parallel mapping of one device per rank that the logical variant
-        # prefers (MultiprocExecutor.worker_main), and a rank owning
-        # num_devices NPUs cannot be described by one entry.
+        # As upstream's GPU worker: vLLM's per-DP-rank mapping, which carries
+        # --device-ids, decides the device; without one the pool in env_var does.
+        # Published here because UniProcExecutor, unlike worker_main, does not.
+        # In-process DP (InprocClient) gets no mapping, so offset into the pool
+        # by the local DP rank, as upstream's GPU worker does.
+        assigned = self.parallel_config.assigned_physical_gpu_ids
+        if assigned is not None:
+            set_assigned_physical_gpu_ids(assigned)
+            device_id = self.local_rank
+        else:
+            dp_rank = self.parallel_config.data_parallel_rank_local or 0
+            device_id = dp_rank * self.parallel_config.world_size + self.local_rank
         try:
-            selected = [
-                current_platform.visible_device_id_to_physical_device_id(first + offset)
-                for offset in range(num_devices)
-            ]
+            selected = current_platform.device_id_to_physical_device_id(device_id)
         except IndexError as e:
             raise ValueError(
-                f"rank slot {slot} needs {num_devices} NPU(s) from index "
-                f"{first} of {env_var}={os.environ.get(env_var, '')!r}. "
-                "One entry per NPU is expected."
+                f"device index {device_id} (local rank {self.local_rank}) has no "
+                f"NPU in assigned_physical_gpu_ids={assigned} / "
+                f"{env_var}={os.environ.get(env_var, '')!r}."
             ) from e
 
-        selected_devices = ",".join(str(device) for device in selected)
-        os.environ[env_var] = selected_devices
+        os.environ[env_var] = str(selected)
         logger.info(
             "Local rank: %d, Selected devices: %s",
             self.local_rank,
-            selected_devices,
+            selected,
         )
-
-        if num_devices > 1:
-            os.environ["RBLN_NPUS_PER_DEVICE"] = str(num_devices)
 
     @worker_fail_fast
     @instrument(span_name="Init device")
@@ -339,13 +335,11 @@ class RBLNWorker(WorkerBase):
 
         logger.info("n_model_bytes = %.2f GB", n_model_bytes / 1024**3)
 
-        rbln_config: RBLNConfig = self.vllm_config.additional_config
         estimate_kwargs = dict(
             model_config=self.model_config,
             parallel_config=self.parallel_config,
             num_runtimes=num_runtimes,
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
-            num_devices_per_local_rank=rbln_config.num_devices_per_local_rank,
         )
 
         speculative_config = self.speculative_config

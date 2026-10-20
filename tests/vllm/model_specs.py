@@ -27,7 +27,6 @@ from tests.vllm.utils import LAYERS_PINNABLE_ENV
 
 # Harness-visible env vars are promoted to fields because the harness branches
 # on them; `envs` is everything the harness does NOT interpret.
-_RSD_ENV = "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK"
 _LAYERS_ENV = "VLLM_RBLN_NUM_HIDDEN_LAYERS"
 _ID_KEYS = (
     ("tp", "tensor_parallel_size", 1),
@@ -49,7 +48,6 @@ class CompileModelSpec:
     model: str
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
     envs: dict[str, str] = field(default_factory=dict)
-    rsd: int = 1
     id: str | None = None
     # The chips this model can run on; the default is every chip.
     chips: AbstractSet[str] = KNOWN_CHIPS
@@ -66,11 +64,10 @@ class CompileModelSpec:
             raise ValueError(
                 f"Unknown chips {sorted(unknown)}; known: {sorted(KNOWN_CHIPS)}"
             )
-        for env, field_name in ((_RSD_ENV, "rsd"), (_LAYERS_ENV, "num_hidden_layers")):
-            if env in self.envs:
-                raise ValueError(f"{env} is harness-visible; set {field_name}= instead")
-        if self.rsd < 1:
-            raise ValueError(f"rsd must be >= 1, got {self.rsd}")
+        if _LAYERS_ENV in self.envs:
+            raise ValueError(
+                f"{_LAYERS_ENV} is harness-visible; set num_hidden_layers= instead"
+            )
         if self.num_hidden_layers is not None and self.num_hidden_layers < 0:
             raise ValueError(
                 f"num_hidden_layers must be >= 0, got {self.num_hidden_layers}"
@@ -86,8 +83,6 @@ class CompileModelSpec:
             for short, key, default in _ID_KEYS
             if self.engine_kwargs.get(key, default) != default
         ]
-        if self.rsd != 1:
-            parts.append(f"rsd{self.rsd}")
         if (
             spec_config := self.engine_kwargs.get("speculative_config", None)
         ) is not None:
@@ -97,7 +92,6 @@ class CompileModelSpec:
     def variant(
         self,
         *,
-        rsd: int | None = None,
         chips: AbstractSet[str] | None = None,
         envs: dict[str, str] | None = None,
         id: str | None = None,
@@ -105,9 +99,9 @@ class CompileModelSpec:
     ) -> CompileModelSpec:
         """This spec with ``engine_kwargs`` merged in.
 
-        The spec's own fields are named rather than left to **kwargs, or
-        ``variant(rsd=4)`` would smuggle ``rsd`` into the engine kwargs and only
-        surface as an engine error. ``envs`` merges like ``engine_kwargs``;
+        The spec's own fields are named rather than left to **kwargs, or one of
+        them would be smuggled into the engine kwargs and only surface as an
+        engine error. ``envs`` merges like ``engine_kwargs``;
         ``chips`` and ``id`` replace. Every variant re-runs __post_init__, so a
         bad combination fails where it is written.
         """
@@ -116,8 +110,6 @@ class CompileModelSpec:
         changed: dict[str, Any] = {
             "engine_kwargs": {**self.engine_kwargs, **engine_kwargs}
         }
-        if rsd is not None:
-            changed["rsd"] = rsd
         if chips is not None:
             changed["chips"] = chips
         if envs is not None:
@@ -140,8 +132,6 @@ def spec_params(specs: list[CompileModelSpec]) -> list[Any]:
 
 
 def apply_spec_envs(spec: CompileModelSpec, monkeypatch) -> None:
-    if spec.rsd > 1:
-        monkeypatch.setenv(_RSD_ENV, str(spec.rsd))
     # Only when --num-hidden-layers was left off: an explicit value -- 0 above
     # all -- belongs to the lane, not to one model.
     if spec.num_hidden_layers is not None and os.environ.get(LAYERS_PINNABLE_ENV):

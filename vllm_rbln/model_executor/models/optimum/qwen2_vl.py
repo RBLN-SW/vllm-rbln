@@ -26,12 +26,12 @@ from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLVideoPixelInputs,
 )
 from vllm.model_executor.models.qwen2_vl import (
+    Qwen2VLForConditionalGeneration,
     Qwen2VLImageEmbeddingInputs,
     Qwen2VLImagePixelInputs,
     Qwen2VLVideoEmbeddingInputs,
     Qwen2VLVideoPixelInputs,
 )
-from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 from .base import ModelInputForRBLN
 from .model_base import (
@@ -67,6 +67,18 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     Unified class for both Qwen2-VL and Qwen2.5-VL models.
     Automatically detects model type based on the model configuration.
     """
+
+    # FIXME(transformers): Use its rope index after it matches vLLM for
+    # fractional video seconds (fixed in 5.18.0) and post-video text
+    # placement (still differs in 5.20.1).
+    iter_mm_grid_thw = Qwen2VLForConditionalGeneration.iter_mm_grid_thw
+    get_mrope_input_positions = (
+        Qwen2VLForConditionalGeneration.get_mrope_input_positions
+    )
+
+    @property
+    def config(self):
+        return self.model.config
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -220,44 +232,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
     ) -> ModelInputForRBLN:
         return replace(model_input, position_embed=self._position_embed(model_input))
 
-    def get_mrope_input_positions(
-        self,
-        input_tokens: list[int],
-        mm_features: list[MultiModalFeatureSpec],
-    ) -> tuple[torch.Tensor, int]:
-        """Whole-prompt MRoPE positions [3, N] and the decode delta, from HF's
-        get_rope_index that optimum-rbln exposes on the model."""
-        input_ids = torch.tensor([input_tokens])
-        config = self.model.config
-        mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
-        mm_token_type_ids[input_ids == config.image_token_id] = 1
-        mm_token_type_ids[input_ids == config.video_token_id] = 2
-        features = sorted(mm_features, key=lambda f: f.mm_position.offset)
-        images = [f for f in features if f.modality == "image"]
-        videos = [f for f in features if f.modality == "video"]
-        position_ids, rope_deltas = self.model._get_rope_index_func(
-            input_ids,
-            mm_token_type_ids,
-            image_grid_thw=self._grid_thw(images, "image_grid_thw"),
-            video_grid_thw=self._grid_thw(videos, "video_grid_thw"),
-            **self._video_rope_kwargs(videos),
-        )
-        return position_ids[:, 0], int(rope_deltas)
-
-    @staticmethod
-    def _grid_thw(
-        features: list[MultiModalFeatureSpec], key: str
-    ) -> torch.Tensor | None:
-        if not features:
-            return None
-        return torch.stack([f.data[key].data for f in features]).to(torch.int64)
-
-    def _video_rope_kwargs(
-        self, video_features: list[MultiModalFeatureSpec]
-    ) -> dict[str, torch.Tensor]:
-        """Extra get_rope_index kwargs a variant needs for videos; none here."""
-        return {}
-
     def _position_embed(self, model_input: ModelInputForRBLN) -> torch.Tensor:
         """cos/sin for the runner's MRoPE positions, [2, padded_batch_size, 1,
         seq_len, head_dim], zero in the padding rows."""
@@ -291,17 +265,6 @@ class RBLNOptimumQwenVLForConditionalGeneration(
 class RBLNOptimumQwen2_5_VLForConditionalGeneration(
     RBLNOptimumQwenVLForConditionalGeneration
 ):
-    def _video_rope_kwargs(
-        self, video_features: list[MultiModalFeatureSpec]
-    ) -> dict[str, torch.Tensor]:
-        if not video_features:
-            return {}
-        return {
-            "second_per_grid_ts": torch.tensor(
-                [float(f.data["second_per_grid_ts"].data) for f in video_features]
-            )
-        }
-
     def _create_image_pixel_inputs(self, pixel_values, image_grid_thw):
         return Qwen2_5_VLImagePixelInputs(
             type="pixel_values",

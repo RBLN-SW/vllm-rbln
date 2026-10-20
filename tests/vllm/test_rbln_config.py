@@ -81,10 +81,13 @@ def test_every_field_gets_a_flag(parser):
     }
 
 
-def test_a_field_of_the_other_path_is_rejected():
+@pytest.mark.parametrize(
+    "entry", [{"optimum_overrides": {}}, {"num_devices_per_local_rank": 2}]
+)
+def test_a_field_of_the_other_path_is_rejected(entry):
     """Both paths' flags are registered, so the class is what narrows them."""
     with pytest.raises(ValueError, match="are not fields"):
-        build_rbln_config({"optimum_overrides": {}})
+        build_rbln_config(entry)
 
 
 def test_defaults_when_nothing_is_passed(parser):
@@ -96,8 +99,6 @@ def test_flags_reach_the_config(parser):
         parser,
         [
             "--no-rbln-use-custom-sampler",
-            "--rbln-num-devices-per-local-rank",
-            "4",
             "--rbln-decode-batch-bucket-strategy",
             "manual",
             "--rbln-decode-batch-bucket-manual-buckets",
@@ -107,7 +108,6 @@ def test_flags_reach_the_config(parser):
         ],
     )
     assert config.use_custom_sampler is False
-    assert config.num_devices_per_local_rank == 4
     assert config.decode_batch_bucket_strategy == "manual"
     assert config.decode_batch_bucket_manual_buckets == [1, 4, 16]
 
