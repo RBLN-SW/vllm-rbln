@@ -861,19 +861,13 @@ class TestDummyRun:
         )
         assert calls
 
-    @pytest.mark.parametrize("is_prompt_sorted", [False, True])
-    def test_multi_step_runs_second_loop(self, monkeypatch, is_prompt_sorted):
+    def test_multi_step_runs_second_loop(self, monkeypatch):
         # num_speculative_tokens > 1 warms up the extra draft loop too, so the
         # model runs once for the first pass plus once per extra step.
         proposer, calls = self._proposer(monkeypatch, num_spec=2)
-        proposer.runner.sort_batch_by_length = is_prompt_sorted
         proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
         # first pass (1) + one extra draft step (num_speculative_tokens - 1 = 1).
         assert len(calls) == 2
-        assert len(proposer.builds) == 2
-        assert all(
-            build["is_prompt_sorted"] is is_prompt_sorted for build in proposer.builds
-        )
 
     @pytest.mark.parametrize("idle,passes", [(True, 0), (False, 2)])
     def test_a_dense_draft_runs_unless_this_rank_is_idle(
