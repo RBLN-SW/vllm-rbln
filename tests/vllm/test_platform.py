@@ -468,6 +468,24 @@ class TestRejectedConfigs:
                 )
             )
 
+    def test_pooling_model_that_cannot_chunk(self):
+        # Bidirectional attention makes a pooling model encoder-only, which
+        # reads each prompt whole: upstream turns chunked prefill off, and
+        # forcing it on would split a prompt its tokens all attend over.
+        whole = dict(
+            runner="pooling",
+            hf_overrides={"is_causal": False},
+            max_model_len=1024,
+            block_size=1024,
+            max_num_batched_tokens=1024,
+            enable_chunked_prefill=None,
+        )
+        config = _build(**whole)
+        assert config.model_config.attn_type == "encoder_only"
+        assert not config.scheduler_config.enable_chunked_prefill
+        with pytest.raises(ValidationError, match="cannot use chunked prefill"):
+            _build(**{**whole, "enable_chunked_prefill": True})
+
     def test_eagle3_under_pp_needs_a_patched_target(self, reconfigure):
         # The default model is a plain LlamaForCausalLM, whose forward still
         # collects aux hidden states with a stage-local index. Asserting through

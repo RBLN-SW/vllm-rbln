@@ -17,6 +17,7 @@ from dataclasses import fields
 
 import pytest
 import torch
+import torch.nn.functional as F
 from vllm.config import set_current_vllm_config
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -780,3 +781,18 @@ class TestForwardSlidingWindow:
         )
         assert tables.tolist() == [7, 8, 9]
         assert window == self.WINDOW
+
+
+def test_bidirectional_attention_matches_sdpa():
+    # Encoder-only prefill: every real token sees every real token, padding none.
+    torch.manual_seed(0)
+    query, key, value = (torch.randn(1, 2, 3, CHUNK, 16) for _ in range(3))
+    key_mask = torch.zeros(1, 1, 1, 1, CHUNK)
+    key_mask[..., :5] = 1
+
+    out = flash_attention._bidirectional_attention(query, key, value, key_mask, 0.25)
+    ref = F.scaled_dot_product_attention(
+        query, key, value, attn_mask=key_mask.bool(), scale=0.25
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)

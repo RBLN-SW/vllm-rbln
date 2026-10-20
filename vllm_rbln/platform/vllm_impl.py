@@ -80,10 +80,20 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
         check_dtype_option_supported()
 
-    if not scheduler_config.enable_chunked_prefill:
+    # A pooling model that cannot chunk (bidirectional attention, MEAN/CLS
+    # pooling) reads each prompt in one prefill, so upstream turns chunked
+    # prefill off and keeps max_num_batched_tokens >= max_model_len.
+    if model_config.is_chunked_prefill_supported:
+        if not scheduler_config.enable_chunked_prefill:
+            raise ValueError(
+                "Disabling chunked prefill is not supported on RBLN. "
+                "Please enable chunked prefill by yourself."
+            )
+    elif scheduler_config.enable_chunked_prefill:
         raise ValueError(
-            "Disabling chunked prefill is not supported on RBLN. "
-            "Please enable chunked prefill by yourself."
+            "This pooling model reads each prompt in one prefill and cannot "
+            "use chunked prefill. Drop --enable-chunked-prefill and set "
+            "--max-num-batched-tokens to at least --max-model-len."
         )
 
     if not vllm_config.cache_config.user_specified_block_size:

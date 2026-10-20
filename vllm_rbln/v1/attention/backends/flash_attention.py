@@ -82,6 +82,26 @@ def _fp8_cache_dtype(kv_cache_dtype: str) -> torch.dtype | None:
     }.get(kv_cache_dtype)
 
 
+def _bidirectional_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_mask: torch.Tensor | None,
+    scale: float,
+) -> torch.Tensor:
+    """Encoder-only attention over one prefill chunk, ``[B, H, G, L, D]``.
+
+    The prompt arrives whole, so the chunk's own keys are all there are and no
+    cache is read. ``key_mask`` is 1 for the chunk's real tokens; a decode
+    step, which warm-up compiles though a pooling model never decodes, has
+    none.
+    """
+    scores = (query.float() @ key.float().transpose(-1, -2)) * scale
+    if key_mask is not None:
+        scores = scores.masked_fill(key_mask == 0, torch.finfo(scores.dtype).min)
+    return (scores.softmax(-1) @ value.float()).to(query.dtype)
+
+
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
 class RBLNFlashAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -212,6 +232,11 @@ class RBLNFlashAttentionMetadataBuilder(
         # the draft config only, so a non-causal drafter and a causal target
         # coexist in one process.
         self.is_causal = not vllm_config.attention_config.use_non_causal
+        # A model whose layers are encoder-only (`is_causal=False` on its text
+        # config) attends over the whole prompt in both directions.
+        self.bidirectional = not getattr(
+            vllm_config.model_config.hf_text_config, "is_causal", True
+        )
 
         self.swa_appends = isinstance(
             kv_cache_spec, SlidingWindowSpec
@@ -283,7 +308,21 @@ class RBLNFlashAttentionMetadataBuilder(
             # NOTE(RBLN): entries beyond num_blocks_per_row must stay 0 -- the
             # padded prefill's multi-block store can address block start_blk+1.
             # See docs/sub_block_prefix_caching.md.
-            if not self.is_causal and not skip_attn_masks:
+            if self.bidirectional:
+                # Encoder-only attention reads the chunk's own keys
+                # (`_bidirectional_attention`), so the prompt has to arrive in
+                # one chunk; the mask marks its real tokens.
+                if seq_idx[0] != 0:
+                    raise ValueError(
+                        "A bidirectional model reads its prompt in one prefill: "
+                        "raise max_num_batched_tokens to at least the prompt "
+                        "length."
+                    )
+                attn_masks = torch.zeros(
+                    1, 1, 1, 1, self.chunked_prefill_size, dtype=torch.float32
+                )
+                attn_masks[..., : int(query_seq_lens_cpu[0])] = 1
+            elif not self.is_causal and not skip_attn_masks:
                 prefill_chunk_size = self.chunked_prefill_size
                 chunked_attention_mask = torch.zeros(
                     1,
@@ -449,7 +488,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             if len(self.sinks.size()) == 1:
                 self.sinks = self.sinks[:, None]
 
-        self.is_causal = not vllm_config.attention_config.use_non_causal
+        self.is_causal = (
+            not vllm_config.attention_config.use_non_causal
+            and attn_type != AttentionType.ENCODER_ONLY
+        )
         self.is_batch_attention_opt = rbln_config.use_batch_attn_opt
         self.is_normal = (self.block_size == self.max_model_len) and (
             self.sinks is None
@@ -565,6 +607,21 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # ex) tensor[block0 : 0, block1 : 100,
         #  block2: 10, block3: 5, ...]
         # attn_output = [batch,H,4,L,D]
+        if self.attn_type == AttentionType.ENCODER_ONLY:
+            attn_output = _bidirectional_attention(
+                query, key, value, attn_metadata.attn_masks, self.scale
+            )
+            # Contiguous: the graph replaces `output` with this tensor, and the
+            # caller views it as [num_tokens, hidden_size].
+            attn_output = (
+                attn_output.reshape(b_size, self.num_heads, q_len, self.head_size)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            output.copy_(
+                attn_output.view(b_size * q_len, self.num_heads, self.head_size)
+            )
+            return
         if self.sliding_window is not None:
             if attn_metadata.swa_appends:
                 # `seq_lens` is the absolute position the chunk starts at, not

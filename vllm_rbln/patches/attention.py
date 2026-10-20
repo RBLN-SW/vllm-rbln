@@ -248,14 +248,16 @@ def patched_attention_init(self: Attention, *args, **kwargs) -> None:
         "A sliding-window layer needs the RBLN spec for the kernel that "
         "shifts the window in place: one block per request, no reclaim, no "
         "prefix sharing. REBEL CR13 carries sliding_window_attention_v1, "
-        "which appends into several blocks and takes upstream's spec."
+        "which appends into several blocks and takes upstream's spec. An "
+        "encoder-only layer gets a cache too: the RBLN attention ops write "
+        "the cache they read, where upstream runs it without one."
     ),
 )
 def patched_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
     # Block size may get updated after model loading, refresh it
     block_size = vllm_config.cache_config.block_size
-    # Should not be called for enc-dec or encoder-only attention.
-    assert self.attn_type == AttentionType.DECODER
+    # Should not be called for enc-dec attention.
+    assert self.attn_type in (AttentionType.DECODER, AttentionType.ENCODER_ONLY)
     if self.sliding_window is not None:
         if vllm_config.model_config.use_mla:
             raise NotImplementedError(
