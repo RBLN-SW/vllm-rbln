@@ -3474,9 +3474,29 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             # a token-level connector (LMCache) addresses each layer through its
             # own view. RBLN NIXL registers storage and picks one layer per
             # buffer itself.
-            kv_transfer_group.register_kv_caches(
-                dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
+            kv_caches = dict(zip(self.kv_cache_names, self.kv_caches, strict=True))
+            register_with_layouts = getattr(
+                kv_transfer_group, "register_kv_caches_with_layouts", None
             )
+            if register_with_layouts is None:
+                kv_transfer_group.register_kv_caches(kv_caches)
+            else:
+                layouts = {}
+                for group in self._kv_cache_spec_attn_group_iterator():
+                    describe = getattr(
+                        group.backend, "get_kv_cache_tensor_layout", None
+                    )
+                    if describe is None:
+                        continue
+                    layout = describe()
+                    for name in group.layer_names:
+                        if name in kv_caches:
+                            layout.validate_shape(kv_caches[name].shape)
+                            layouts[name] = layout
+                for name, target in self.shared_kv_cache_layers.items():
+                    if name in kv_caches and target in layouts:
+                        layouts[name] = layouts[target]
+                register_with_layouts(kv_caches, layouts)
 
         kv_transfer_group.set_host_xfer_buffer_ops(self._copy_host_device_kv_blocks)
 
