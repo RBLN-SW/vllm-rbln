@@ -1450,7 +1450,7 @@ wheels = [
 [[package]]
 name = "lmcache-rbln"
 version = "0.12.0"
-source = { registry = "https://pypi.rbln.ai/simple/" }
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "lmcache" },
     { name = "rebel-compiler" },
@@ -1458,7 +1458,7 @@ dependencies = [
     { name = "torch-rbln", extra = ["runtime"] },
 ]
 wheels = [
-    { url = "https://pypi.rbln.ai/api/package/lmcache-rbln/lmcache_rbln-0.12.0-py3-none-any.whl", hash = "sha256:7366afad847dce35e64f1408edbf838bbe6f1de73710eb6ad35fac032aa3ac67" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/lmcache-rbln/0.12.0/lmcache_rbln-0.12.0-py3-none-any.whl", hash = "md5:fc14c9bd7e44d2cb59b94cee76066468" },
 ]
 
 [[package]]
@@ -1772,13 +1772,13 @@ wheels = [
 [[package]]
 name = "nixl-rbln"
 version = "0.12.0"
-source = { registry = "https://pypi.rbln.ai/simple/" }
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "nixl" },
     { name = "rebel-compiler" },
 ]
 wheels = [
-    { url = "https://pypi.rbln.ai/api/package/nixl-rbln/nixl_rbln-0.12.0-py3-none-manylinux_2_34_x86_64.whl", hash = "sha256:174743203d596551c755b3e2e467e3cf9add6e73f82d0b680eb10c1eb0d61132" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/nixl-rbln/0.12.0/nixl_rbln-0.12.0-py3-none-manylinux_2_34_x86_64.whl", hash = "md5:0eafbac5d5536e0bbc5aa8614ff0d734" },
 ]
 
 [[package]]
@@ -2675,7 +2675,7 @@ wheels = [
 [[package]]
 name = "rebel-compiler"
 version = "0.12.0"
-source = { registry = "https://pypi.rbln.ai/simple/" }
+source = { registry = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" }
 dependencies = [
     { name = "attrs" },
     { name = "cloudpickle" },
@@ -2694,11 +2694,11 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://pypi.rbln.ai/api/package/rebel-compiler/rebel_compiler-0.12.0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:c3f83dd902dbad1ab86e293413458ba964ddb8825560348b571d69e74cc534f6" },
-    { url = "https://pypi.rbln.ai/api/package/rebel-compiler/rebel_compiler-0.12.0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:64952237eb0977c08c89eef363ea1242db47b3da8fd8881060e44087eee1e221" },
-    { url = "https://pypi.rbln.ai/api/package/rebel-compiler/rebel_compiler-0.12.0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:51726e6b63a9b247e6d5f93188844f693232a1e5e08c810940efe96268f83d76" },
-    { url = "https://pypi.rbln.ai/api/package/rebel-compiler/rebel_compiler-0.12.0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:661bf95c36ba3776d045911aaea9d7c8dbf839197ef78e096974f87a03d29b6c" },
-    { url = "https://pypi.rbln.ai/api/package/rebel-compiler/rebel_compiler-0.12.0-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "sha256:7553a19fd36a356e82c2eee6ad3f711e461eac0ccefdecab9f52e27e1d0c1268" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0/rebel_compiler-0.12.0-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "md5:bc3f440b24a0b500085b5bc18aeeb9b8" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0/rebel_compiler-0.12.0-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "md5:7d6cc2e7a42068ae5b62958078b585e1" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0/rebel_compiler-0.12.0-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "md5:30183b95a62f78fbb790b1335a58914d" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0/rebel_compiler-0.12.0-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "md5:25e94cf1a254e05e99e30197cb32709a" },
+    { url = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/packages/rebel-compiler/0.12.0/rebel_compiler-0.12.0-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "md5:b78546f7e420fc4eee0f1efe8dcb8278" },
 ]
 
 [[package]]
@@ -3662,7 +3662,7 @@ requires-dist = [
     { name = "fire", marker = "extra == 'dev'" },
     { name = "huggingface-hub", marker = "extra == 'dev'" },
     { name = "lmcache-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0,<0.12.1" },
-    { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0,<0.12.1", index = "https://pypi.rbln.ai/simple/" },
+    { name = "nixl-rbln", marker = "extra == 'kv-connectors'", specifier = ">=0.12.0,<0.12.1", index = "https://nexus.mgmt.rbln.in/repository/pypi-group-nightly/simple/" },
     { name = "optimum-rbln", specifier = ">=0.12.0,<0.12.1", index = "https://pypi.org/simple/" },
     { name = "packaging", marker = "extra == 'dev'" },
     { name = "pynvml", marker = "extra == 'dev'" },
