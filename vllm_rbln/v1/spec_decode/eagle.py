@@ -129,6 +129,7 @@ class RBLNEagleProposer(EagleProposer):
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
                 back_pad=self.runner.decode_back_pad,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -243,6 +244,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     is_prefill=False,
                     batch_pad=num_reqs_padded,
+                    is_prompt_sorted=self.runner.sort_batch_by_length,
                 )
                 attach_kv_cache_bindings(
                     attn_metadata,
@@ -539,6 +541,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=self.positions[:num_tokens],
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -606,6 +609,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=self.positions[:num_reqs],
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
