@@ -279,10 +279,15 @@ class TestPrepareNextTokenIdsPadded:
 class TestInitGuards:
     def test_rejects_multimodal_inputs(self, monkeypatch):
         # Multimodal targets are unsupported; the guard trips at construction.
-        from vllm.multimodal import MULTIMODAL_REGISTRY
+        from vllm.config import ModelConfig
+
+        from tests.vllm.v1.spec_decode.utils import _spec_vllm_config
+
+        # Only the proposer should observe MM support on this text-model config.
+        _spec_vllm_config("eagle", 3)
 
         monkeypatch.setattr(
-            MULTIMODAL_REGISTRY, "supports_multimodal_inputs", lambda cfg: True
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
         )
         with pytest.raises(NotImplementedError):
             make_eagle_proposer()

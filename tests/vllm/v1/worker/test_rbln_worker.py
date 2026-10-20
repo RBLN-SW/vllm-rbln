@@ -373,6 +373,14 @@ class TestConformance:
     def test_extends_worker_base(self):
         assert issubclass(RBLNWorker, WorkerBase)
 
+    def test_selective_discard_is_rejected(self, make_worker):
+        worker = make_worker()
+
+        with pytest.raises(
+            RuntimeError, match="Selective discard is not supported on RBLN"
+        ):
+            worker.discard(("kv_cache",))
+
     def test_key_override_signatures_match_base(self):
         # The overrides stay call-compatible with WorkerBase so the engine can
         # drive RBLNWorker like any other. load_model is excluded (see below).
@@ -1329,8 +1337,16 @@ class TestProfile:
     # patched on the worker, not exported: a unit test must not switch the device
     # profiler on.
     @pytest.mark.parametrize("rbln_profiler", [False, True])
+    @pytest.mark.parametrize(
+        ("activities", "expected"),
+        [
+            (None, ("CPU", "PrivateUse1")),
+            (["CPU"], ("CPU",)),
+            (["PrivateUse1"], ("PrivateUse1",)),
+        ],
+    )
     def test_torch_profiler_keeps_the_rbln_session_to_itself(
-        self, make_worker, monkeypatch, tmp_path, rbln_profiler
+        self, make_worker, monkeypatch, tmp_path, rbln_profiler, activities, expected
     ):
         monkeypatch.setattr(
             wm, "rbln_flags", SimpleNamespace(RBLN_PROFILER=rbln_profiler)
@@ -1349,12 +1365,16 @@ class TestProfile:
             profiler="torch",
             torch_profiler_dir=str(tmp_path),
             torch_profiler_dump_cuda_time_total=False,
+            torch_profiler_activities=activities,
         )
         worker = make_worker(vllm_config=vllm_config)
 
         worker.profile(is_start=True)
         worker.profile(is_start=False)
 
+        assert worker.profiler._profiler_kwargs["activities"] == [
+            getattr(torch.profiler.ProfilerActivity, name) for name in expected
+        ]
         assert calls == []
 
     def test_rbln_profiler_starts_and_flushes_at_stop(self, make_worker, monkeypatch):

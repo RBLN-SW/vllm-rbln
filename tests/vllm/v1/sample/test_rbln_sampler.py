@@ -17,6 +17,7 @@ import pytest
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_rbln.v1.sample import rbln_sampler as module
 from vllm_rbln.v1.sample.rbln_sampler import RBLNSampler
@@ -47,6 +48,24 @@ def make_sampling_metadata(
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
     )
+
+
+@pytest.mark.parametrize(("top_k", "top_p"), [(1, None), (None, 0.1), (1, 0.1)])
+def test_reference_sampler_filters_without_triton(top_k, top_p):
+    metadata = make_sampling_metadata(torch.ones(1), False, True)
+    metadata.top_k = (
+        torch.tensor([top_k], dtype=torch.int32) if top_k is not None else None
+    )
+    metadata.top_p = torch.tensor([top_p]) if top_p is not None else None
+    metadata.max_num_logprobs = 1
+    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+    expected_logprob = logits.log_softmax(dim=-1)[:, 3]
+
+    output = Sampler()(logits, metadata)
+
+    assert output.sampled_token_ids.tolist() == [[3]]
+    assert output.logprobs_tensors is not None
+    torch.testing.assert_close(output.logprobs_tensors.logprobs[:, 0], expected_logprob)
 
 
 @pytest.fixture
