@@ -13,7 +13,7 @@ if [ "${1:-}" = "--group" ]; then
   fi
   case "$2" in
     basic_correctness) paths=(tests/vllm/basic_correctness) ;;
-    model_compile) paths=(tests/vllm/compile) ;;
+    compile) paths=(tests/vllm/compile) ;;
     dp) paths=(tests/vllm/distributed) ;;
     specdec) paths=(tests/vllm/v1/spec_decode) ;;
     core) paths=(tests/vllm/v1/core) ;;

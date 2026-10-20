@@ -79,7 +79,7 @@ steps:
       PYTEST_E2E_TIMEOUT: "120"
     command: "buildkite-agent pipeline upload .buildkite/pipelines/vllm-rbln/pipeline-pytest.yml --apply-if-changed=false"
 
-  - group: "examples (vllm)"
+  - group: "[CR13] examples (vllm)"
     key: "nightly-examples-vllm"
     steps:
       - <<: *examples
@@ -139,25 +139,31 @@ steps:
   # Measured, not gated: soft_fail keeps the build green and no measured lane
   # appears in the deploy step's depends_on.
 
-  - label: ":sparkles: upload perf"
+  - group: "[CR13] perf"
     key: "nightly-perf"
-    soft_fail: true
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    command: |
-      set -euo pipefail
-      uv run --no-project --python 3.12 --with pyyaml python \
-        .buildkite/pipelines/vllm-rbln/scripts/perf/run_perf.py pipeline --chip RBLN-CR13 \
-        | buildkite-agent pipeline upload
+    steps:
+      - label: ":sparkles: upload perf"
+        key: "nightly-perf-upload"
+        soft_fail: true
+        image: "${DEVTOOLS_DOCKER_IMAGE}"
+        command: |
+          set -euo pipefail
+          uv run --no-project --python 3.12 --with pyyaml python \
+            .buildkite/pipelines/vllm-rbln/scripts/perf/run_perf.py pipeline --chip RBLN-CR13 \
+            | buildkite-agent pipeline upload
 
-  - label: ":sparkles: upload lm-eval"
+  - group: "[CR13] lm-eval"
     key: "nightly-lm-eval"
-    soft_fail: true
-    image: "${DEVTOOLS_DOCKER_IMAGE}"
-    command: |
-      set -euo pipefail
-      uv run --no-project --python 3.12 --with pyyaml python \
-        .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run_lm_eval.py pipeline --chip RBLN-CR13 \
-        | buildkite-agent pipeline upload
+    steps:
+      - label: ":sparkles: upload lm-eval"
+        key: "nightly-lm-eval-upload"
+        soft_fail: true
+        image: "${DEVTOOLS_DOCKER_IMAGE}"
+        command: |
+          set -euo pipefail
+          uv run --no-project --python 3.12 --with pyyaml python \
+            .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run_lm_eval.py pipeline --chip RBLN-CR13 \
+            | buildkite-agent pipeline upload
 
   # Depending on the upload also waits for every uploaded pytest job.
   # No NPU needed -- the wheel is a pure CPU build.

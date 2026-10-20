@@ -90,11 +90,11 @@ steps:
           - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group basic_correctness ${PYTEST_E2E_ARGS:-}"
 
       - <<: *e2e
-        label: "model_compile"
-        key: "vllm-rbln-e2e-model-compile-cr13"
+        label: "compile"
+        key: "vllm-rbln-e2e-compile-cr13"
         command:
           - *sync
-          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group model_compile ${PYTEST_E2E_ARGS:-}"
+          - "bash .buildkite/pipelines/vllm-rbln/scripts/run-e2e.sh --group compile ${PYTEST_E2E_ARGS:-}"
 
       - <<: *e2e
         label: "dp"
