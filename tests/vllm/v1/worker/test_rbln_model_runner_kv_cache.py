@@ -246,3 +246,60 @@ class TestBuildAttentionMetadata:
         metadata = attn_metadata["layer.0"]
         assert metadata.kv_caches is runner.kv_caches
         assert metadata.kv_cache_view_infos is None
+
+
+class TestLayerIndexFollowsCachePosition:
+    """A layer reads its cache by `layer_index` into the runner's cache list.
+
+    Construction numbers the layers as if every decoder layer owned
+    `num_attn_module` caches. A layer that owns fewer -- an index-share skip
+    layer with no indexer cache -- shifts every later one, so after binding the
+    runner gives each layer the position the bound list actually has for it.
+    """
+
+    # The fp8 DSA layout, three caches per decoder layer: the attention cache,
+    # the indexer's key cache and its fp16 scale cache. Decoder layer 1 shares
+    # layer 0's top-k and owns the attention cache alone.
+    LAYERS = (
+        "model.layers.0.self_attn.attn",
+        "model.layers.0.self_attn.indexer.k_cache",
+        "model.layers.0.self_attn.indexer.k_cache.scale_cache",
+        "model.layers.1.self_attn.attn",
+        "model.layers.2.self_attn.attn",
+        "model.layers.2.self_attn.indexer.k_cache",
+        "model.layers.2.self_attn.indexer.k_cache.scale_cache",
+    )
+
+    @classmethod
+    def _assert_each_layer_reads_its_own_cache(cls, runner) -> None:
+        forward_context = runner.compilation_config.static_forward_context
+        positions = []
+        for name in cls.LAYERS:
+            layer = forward_context[name]
+            positions.append(layer.layer_index)
+            assert runner.kv_cache_names[layer.layer_index] == name
+            assert runner.kv_caches[layer.layer_index] is layer.kv_cache
+        # One slot each: no two layers resolve to the same cache.
+        assert sorted(positions) == list(range(len(cls.LAYERS)))
+
+    def test_after_initialization_and_after_a_rebind(
+        self, make_model_runner, monkeypatch
+    ):
+        monkeypatch.setattr(mr, "rbln_num_attn_module", lambda *args, **kwargs: 3)
+        runner = make_model_runner(layers=self.LAYERS, init_kv_cache=False)
+
+        runner.initialize_kv_cache(
+            make_kv_cache_config(runner, groups=[(name,) for name in self.LAYERS])
+        )
+        self._assert_each_layer_reads_its_own_cache(runner)
+
+        # A dynamic-KV resize rebuilds every tensor and binds them again.
+        before = list(runner.kv_caches)
+        runner.initialize_kv_cache_tensors(
+            runner.kv_cache_config, runner._kernel_block_sizes
+        )
+
+        assert all(
+            old is not new for old, new in zip(before, runner.kv_caches, strict=True)
+        )
+        self._assert_each_layer_reads_its_own_cache(runner)
