@@ -73,6 +73,7 @@ def _wire_runner(proposer, *, num_reqs, intermediate_chunk=False):
         shape_config=_shape_config(),
         dp_status=None,
         decode_back_pad=torch.zeros(num_reqs, dtype=torch.int32),
+        sort_batch_by_length=False,
     )
     proposer.draft_attn_groups = [
         SimpleNamespace(
@@ -279,10 +280,15 @@ class TestPrepareNextTokenIdsPadded:
 class TestInitGuards:
     def test_rejects_multimodal_inputs(self, monkeypatch):
         # Multimodal targets are unsupported; the guard trips at construction.
-        from vllm.multimodal import MULTIMODAL_REGISTRY
+        from vllm.config import ModelConfig
+
+        from tests.vllm.v1.spec_decode.utils import _spec_vllm_config
+
+        # Only the proposer should observe MM support on this text-model config.
+        _spec_vllm_config("eagle", 3)
 
         monkeypatch.setattr(
-            MULTIMODAL_REGISTRY, "supports_multimodal_inputs", lambda cfg: True
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
         )
         with pytest.raises(NotImplementedError):
             make_eagle_proposer()
@@ -360,6 +366,26 @@ class TestToTargetTokenIds:
 
 
 class TestPropose:
+    @pytest.mark.parametrize("is_prompt_sorted", [False, True])
+    def test_prompt_sorting_reaches_every_draft_step(
+        self, monkeypatch, is_prompt_sorted
+    ):
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle3", num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.runner.sort_batch_by_length = is_prompt_sorted
+        builder = mock.Mock()
+        proposer.draft_attn_groups[0].get_metadata_builder = lambda: builder
+        proposer.model_executable = _echo_model_exec(proposer.hidden_size)
+
+        _call_propose(proposer)
+
+        assert builder.build.call_count == 3
+        assert all(
+            call.kwargs["is_prompt_sorted"] is is_prompt_sorted
+            for call in builder.build.call_args_list
+        )
+
     def test_single_step_early_exit_takes_ids_once(self, monkeypatch):
         # num_speculative_tokens == 1 takes the early-exit branch: one model pass,
         # the graph's ids sliced per request, shaped [num_reqs, 1].
@@ -780,6 +806,7 @@ class TestDummyRun:
             kv_cache_view_infos=[],
             shape_config=_shape_config(specialized=specialized),
             dp_status=dp_status,
+            sort_batch_by_length=False,
             _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
                 np.cumsum(nt, dtype=cumsum_dtype),
                 None,

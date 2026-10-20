@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from vllm.config import ProfilerConfig
@@ -103,6 +105,15 @@ def test_rbln_profiler_starts_and_flushes_at_stop(make_worker, monkeypatch, rbln
     assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)
 
 
+def test_discard_rejects_selective_memory_release(make_worker):
+    worker = make_worker(ProfilerConfig())
+
+    with pytest.raises(
+        RuntimeError, match="Selective discard is not supported on RBLN"
+    ):
+        worker.discard(("kv_cache",))
+
+
 def test_rbln_profiler_does_not_stand_in_for_another_profiler(make_worker, monkeypatch):
     monkeypatch.setattr(
         "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
@@ -148,3 +159,28 @@ def test_a_profiled_step_is_annotated_through_the_wrapper(make_worker, tmp_path)
 
     with worker.annotate_profile(_scheduler_output()):
         pass
+
+
+@pytest.mark.parametrize("should_annotate", [False, True])
+def test_annotation_uses_profiler_state_after_step(make_worker, should_annotate):
+    worker = make_worker(ProfilerConfig())
+    profiler = SimpleNamespace(
+        should_annotate=not should_annotate,
+        annotate_context_manager=Mock(return_value=nullcontext()),
+    )
+    profiler.step = Mock(
+        side_effect=lambda: setattr(profiler, "should_annotate", should_annotate)
+    )
+    worker.profiler = profiler
+    scheduler_output = _scheduler_output() if should_annotate else object()
+
+    with worker.annotate_profile(scheduler_output):
+        pass
+
+    profiler.step.assert_called_once_with()
+    if should_annotate:
+        profiler.annotate_context_manager.assert_called_once_with(
+            "execute_new_1_cached_2"
+        )
+    else:
+        profiler.annotate_context_manager.assert_not_called()

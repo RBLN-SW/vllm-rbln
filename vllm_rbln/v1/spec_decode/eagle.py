@@ -129,6 +129,7 @@ class RBLNEagleProposer(EagleProposer):
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
                 back_pad=self.runner.decode_back_pad,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -243,6 +244,7 @@ class RBLNEagleProposer(EagleProposer):
                     positions=positions,
                     is_prefill=False,
                     batch_pad=num_reqs_padded,
+                    is_prompt_sorted=self.runner.sort_batch_by_length,
                 )
                 attach_kv_cache_bindings(
                     attn_metadata,
@@ -455,7 +457,7 @@ class RBLNEagleProposer(EagleProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.runner.compile_context,
-                num_devices=rbln_config.num_devices_per_local_rank,
+                num_devices=1,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
@@ -539,6 +541,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=self.positions[:num_tokens],
                 is_prefill=is_prefill,
                 batch_pad=num_reqs_padded,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,
@@ -606,6 +609,7 @@ class RBLNEagleProposer(EagleProposer):
                 positions=self.positions[:num_reqs],
                 is_prefill=False,
                 batch_pad=num_reqs_padded,
+                is_prompt_sorted=self.runner.sort_batch_by_length,
             )
             attach_kv_cache_bindings(
                 attn_metadata,

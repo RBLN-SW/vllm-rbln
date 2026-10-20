@@ -24,6 +24,9 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
 from vllm_rbln.model_executor.models.optimum.qwen2_vl import (
     RBLNOptimumQwen2_5_VLForConditionalGeneration as Qwen2_5VL,
 )
+from vllm_rbln.model_executor.models.optimum.qwen2_vl import (
+    RBLNOptimumQwen2VLForConditionalGeneration as Qwen2VL,
+)
 from vllm_rbln.model_executor.models.optimum.qwen2_vl import split_by_grid_thw
 from vllm_rbln.model_executor.models.optimum.qwen3_vl import (
     RBLNOptimumQwen3VLForConditionalGeneration as Qwen3VL,
@@ -63,8 +66,12 @@ def _qwen(cls, visual, *, deepstack_layers=0, dtype=torch.float32):
         config=types.SimpleNamespace(
             image_token_id=IMAGE_TOKEN,
             video_token_id=8,
+            vision_start_token_id=9,
+            vision_end_token_id=10,
             vision_config=types.SimpleNamespace(
-                deepstack_visual_indexes=list(range(deepstack_layers))
+                deepstack_visual_indexes=list(range(deepstack_layers)),
+                spatial_merge_size=2,
+                tokens_per_second=2.0,
             ),
         ),
         rbln_config=types.SimpleNamespace(dtype=dtype),
@@ -94,6 +101,23 @@ class TestEmbedMultimodal:
     def test_no_inputs_means_no_items(self):
         model = _qwen(Qwen2_5VL, visual=None)
         assert model.embed_multimodal() == []
+
+
+class TestQwen2_5VideoInputs:
+    def test_pixel_inputs_require_time_interval(self):
+        model = _qwen(Qwen2_5VL, visual=None)
+        with pytest.raises(ValueError, match="second_per_grid_ts is required"):
+            model._parse_and_validate_video_input(
+                pixel_values_videos=PIXELS, video_grid_thw=GRID
+            )
+
+    def test_embedding_inputs_preserve_time_interval(self):
+        model = _qwen(Qwen2_5VL, visual=None)
+        seconds = torch.tensor([0.5, 1.0])
+        video = model._parse_and_validate_video_input(
+            video_embeds=_rows(6), video_grid_thw=GRID, second_per_grid_ts=seconds
+        )
+        assert video["second_per_grid_ts"] is seconds
 
 
 def _prefill_input(tokens, mm_embeds, is_mm_embed):
@@ -204,29 +228,81 @@ def _mrope_model(cls):
 class TestMropeInputPositions:
     TOKENS = [1, 8, 8, 2, IMAGE_TOKEN, 3]  # a video item, then an image item
 
-    def test_grids_follow_prompt_order_and_token_types_mark_each_modality(self):
-        model, calls = _mrope_model(Qwen2_5VL)
-        features = [
-            _feature("image", 4, [1, 2, 2]),
-            _feature("video", 1, [2, 2, 2], second_per_grid_ts=0.5),
-        ]
-        positions, delta = model.get_mrope_input_positions(self.TOKENS, features)
-
-        assert positions.shape == (3, 6) and delta == 5
-        ((token_types, kwargs),) = calls
-        assert token_types.tolist() == [[0, 2, 2, 0, 1, 0]]
-        assert kwargs["image_grid_thw"].tolist() == [[1, 2, 2]]
-        assert kwargs["video_grid_thw"].tolist() == [[2, 2, 2]]
-        assert kwargs["second_per_grid_ts"].tolist() == [0.5]
-
-    def test_qwen3_passes_no_second_per_grid_ts(self):
-        model, calls = _mrope_model(Qwen3VL)
-        model.get_mrope_input_positions(
-            self.TOKENS, [_feature("video", 1, [2, 2, 2], second_per_grid_ts=0.5)]
+    def test_qwen2_video_time_axis_sets_following_text_position(self):
+        model, calls = _mrope_model(Qwen2VL)
+        del model.model.config.vision_config.tokens_per_second
+        positions, delta = model.get_mrope_input_positions(
+            [1, 8, 8, 8, 8, 2],
+            [_feature("video", 1, [4, 2, 2])],
         )
-        ((_, kwargs),) = calls
-        assert "second_per_grid_ts" not in kwargs
-        assert kwargs["image_grid_thw"] is None
+
+        assert positions.tolist() == [
+            [0, 1, 2, 3, 4, 5],
+            [0, 1, 1, 1, 1, 5],
+            [0, 1, 1, 1, 1, 5],
+        ]
+        assert delta == 0
+        assert not calls
+
+    def test_qwen2_5_video_time_axis_sets_following_text_position(self):
+        model, _ = _mrope_model(Qwen2_5VL)
+        positions, delta = model.get_mrope_input_positions(
+            [1, 8, 8, 8, 2],
+            [_feature("video", 1, [3, 2, 2], second_per_grid_ts=1.5)],
+        )
+
+        assert positions.tolist() == [
+            [0, 1, 4, 7, 8],
+            [0, 1, 1, 1, 8],
+            [0, 1, 1, 1, 8],
+        ]
+        assert delta == 4
+
+    def test_qwen2_5_mixed_features_follow_prompt_order(self):
+        model, _ = _mrope_model(Qwen2_5VL)
+        positions, delta = model.get_mrope_input_positions(
+            [1, 8, 8, 8, 2, IMAGE_TOKEN, 3],
+            [
+                _feature("image", 5, [1, 2, 2]),
+                _feature("video", 1, [3, 2, 2], second_per_grid_ts=1.5),
+            ],
+        )
+
+        assert positions.tolist() == [
+            [0, 1, 4, 7, 8, 9, 10],
+            [0, 1, 1, 1, 8, 9, 10],
+            [0, 1, 1, 1, 8, 9, 10],
+        ]
+        assert delta == 4
+
+    def test_qwen3_video_frames_follow_upstream_positions(self):
+        model, calls = _mrope_model(Qwen3VL)
+        positions, delta = model.get_mrope_input_positions(
+            [1, 9, 8, 8, 10, 2, 9, 8, 8, 10, 3],
+            [_feature("video", 1, [2, 2, 4])],
+        )
+
+        assert positions.tolist() == [
+            [0, 1, 2, 2, 4, 5, 6, 7, 7, 9, 10],
+            [0, 1, 2, 2, 4, 5, 6, 7, 7, 9, 10],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        ]
+        assert delta == 0
+        assert not calls
+
+    def test_qwen2_5_defaults_video_time_interval(self):
+        model, calls = _mrope_model(Qwen2_5VL)
+        positions, delta = model.get_mrope_input_positions(
+            [1, 8, 8, 8, 2], [_feature("video", 1, [3, 2, 2])]
+        )
+
+        assert positions.tolist() == [
+            [0, 1, 3, 5, 6],
+            [0, 1, 1, 1, 6],
+            [0, 1, 1, 1, 6],
+        ]
+        assert delta == 2
+        assert not calls
 
 
 def test_position_embed_zeroes_the_padding_rows():

@@ -76,7 +76,6 @@ def make_request(
     hash_fn: Callable = sha256,
     mm_positions: list[PlaceholderRange] | None = None,
     mm_hashes: list[str] | None = None,
-    prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
     min_tokens: int = 0,
     stop_token_ids: list[int] | None = None,
@@ -103,7 +102,6 @@ def make_request(
 
     sampling_params = SamplingParams(
         max_tokens=17,
-        prompt_logprobs=prompt_logprobs,
         structured_outputs=structured_outputs,
         top_p=top_p,
         top_k=top_k,

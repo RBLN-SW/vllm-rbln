@@ -38,6 +38,20 @@ _lm_eval: &lm_eval
   - *sync
   - "bash .buildkite/pipelines/vllm-rbln/scripts/lm-eval/run-lm-eval.sh"
 
+_examples: &examples
+  agents:
+    queue: udc
+  resources:
+    npu:
+      count: 1
+      product: "RBLN-CR13"
+  image: "${DEVTOOLS_DOCKER_IMAGE}"
+  secrets: *secrets
+  plugins: *dshm
+  timeout_in_minutes: 180
+  artifact_paths:
+    - "example-results/**/*"
+
 steps:
   - label: ":pytest: [CR13] pytest (T0)"
     key: "nightly-t0-cr13"
@@ -73,6 +87,63 @@ steps:
     command:
       - *sync
       - "bash .buildkite/pipelines/vllm-rbln/scripts/run-t2-compile-full.sh"
+
+  - group: "examples (vllm)"
+    key: "nightly-examples-vllm"
+    steps:
+      - <<: *examples
+        label: "basic"
+        key: "nightly-examples-vllm-basic"
+        command:
+          - *sync
+          - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py basic"
+
+      - <<: *examples
+        label: "features"
+        key: "nightly-examples-vllm-features"
+        resources:
+          npu:
+            count: 4
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py features"
+
+      - <<: *examples
+        label: "specdec (NGRAM/EAGLE/EAGLE3/suffix)"
+        key: "nightly-examples-vllm-specdec"
+        command:
+          - *sync
+          - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py specdec"
+
+      - <<: *examples
+        label: "specdec (MTP)"
+        key: "nightly-examples-vllm-mtp"
+        resources:
+          npu:
+            count: 8
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py mtp"
+
+      - <<: *examples
+        label: "specdec (DFlash)"
+        key: "nightly-examples-vllm-dflash"
+        resources:
+          npu:
+            count: 4
+            product: "RBLN-CR13"
+        command:
+          - *sync
+          - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py dflash"
+
+      - <<: *examples
+        label: "pooling"
+        key: "nightly-examples-vllm-pooling"
+        command:
+          - *sync
+          - "uv run --no-sync python .buildkite/pipelines/vllm-rbln/scripts/run_examples.py pooling"
 
   # Measured, not gated: soft_fail keeps the build green and no measured lane
   # appears in the deploy step's depends_on.

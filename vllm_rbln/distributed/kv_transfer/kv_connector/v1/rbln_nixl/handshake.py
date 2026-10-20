@@ -48,7 +48,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.metadata import
 )
 from vllm_rbln.distributed.kv_transfer.kv_connector.v1.rbln_nixl.state import (
     RblnNixlWorkerState,
-    _as_descs,
+    _grid_descs,
     every_local_link_down,
 )
 from vllm_rbln.logger import init_logger
@@ -213,20 +213,9 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # The same addresses cut finer, appended after the whole-block range
         # rather than inside it, which is the order the local list takes --
         # a prepared transfer pairs the two by position.
-        runs, chunks = grid
-        # `.tolist()` first: this arithmetic runs once per chunk descriptor, and
-        # plain Python ints carry it better than numpy scalars do.
-        chunk_rows = [
-            (
-                addr + r * (length // runs) + c * (length // runs // chunks),
-                length // runs // chunks,
-                device_id,
-            )
-            for addr, length, device_id in whole.tolist()
-            for r in range(runs)
-            for c in range(chunks)
-        ]
-        return np.concatenate([whole, _as_descs(chunk_rows)])
+        return np.concatenate(
+            [whole, _grid_descs(whole[:, 0], whole[:, 1], grid, whole[:, 2])]
+        )
 
     def _build_head_matched_remote(
         self,
@@ -235,7 +224,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         remote_tp_size: int,
         registered_layer_names: tuple[str, ...] | list[str] | None = None,
         peer_areas: list[int] | None = None,
-    ) -> list[tuple[int, int, int]]:
+    ) -> np.ndarray:
         """Remote descriptors for a peer whose TP degree differs from ours.
 
         Emitted in LOCAL region order, so ``_compute_desc_ids``'s positional
@@ -275,7 +264,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # Which of our areas this peer holds (see _fan_in_peer_areas).
         areas_iter = range(areas_l) if peer_areas is None else peer_areas
 
-        out: list[tuple[int, int, int]] = []
+        parts: list[np.ndarray] = []
         # Axis order is `_shard_local_region_ids`'; within a region, block-major
         # to match _compute_desc_ids' region_id * num_blocks + b.
         # Every region for one grid before the next, which is the order
@@ -305,7 +294,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     side="peer",
                 )
                 for area_l in areas_iter:
-                    out.extend(
+                    parts.append(
                         self._head_matched_desc(
                             region_id=logical_l * areas_l + area_l,
                             logical_r=logical_r,
@@ -322,6 +311,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                             grid=grid,
                         )
                     )
+        out = np.concatenate(parts)
         # Per block, a region becomes one descriptor per head piece per peer
         # copy per K/V range -- the same count
         # `_register_shard_local_xfer_handler` builds locally and
@@ -595,11 +585,22 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     self._handle_dead_engine(engine_id, error=e)
                     break
 
-    def _ensure_handshake(self, *args: Any, **kwargs: Any) -> Future | None:
+    def _ensure_handshake(
+        self, engine_id: str, *args: Any, **kwargs: Any
+    ) -> Future | None:
         # A dial from a dead local link leaves nixl a half-loaded remote that
         # fails every later handshake, so nothing is dialled until it is back.
         if self._link_down_since is None:
-            return super()._ensure_handshake(*args, **kwargs)
+            return super()._ensure_handshake(engine_id, *args, **kwargs)
+        # Counted where upstream would have dialled, short of its TTL sweep,
+        # whose NIXL teardown this branch keeps off a dead link. Upstream counts
+        # a failed dial there and drains the requests waiting on it uncounted.
+        with self._handshake_lock:
+            if (
+                engine_id not in self._remote_agents
+                and engine_id not in self._handshake_futures
+            ):
+                self.xfer_stats.record_failed_handshake()
         failed: Future = Future()
         failed.set_exception(RuntimeError("every local RDMA link is down"))
         return failed
@@ -700,7 +701,7 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         split: int,
         kv_runs: int = 1,
         grid: tuple[int, int] = (1, 1),
-    ) -> list[tuple[int, int, int]]:
+    ) -> np.ndarray:
         """Descriptors for one local region: ``split * kv_runs`` per block.
 
         The split is the caller's, one value for the whole transfer; the head
@@ -729,7 +730,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # stale KV. Reading takes the first; writing takes them all.
         fanout = replicas_r if self._writes_into_peer else 1
 
-        out: list[tuple[int, int, int]] = []
         pieces: list[tuple[int, int]] = []
         for j in range(split):
             # The remote slice covering this piece's first head, and how far
@@ -774,23 +774,12 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
         # `sub_len`. The caller runs every region for one grid before moving to
         # the next, which is the order the local list is built in -- and
         # `make_prepped_xfer` pairs the two lists by position.
-        runs, chunks = grid
-        run_span = sub_len // runs
-        desc_len = run_span // chunks
-        for block_id in range(num_blocks):
-            for base, page in pieces:
-                for kv in range(kv_runs):
-                    start = base + block_id * page + kv * (page // kv_runs)
-                    for r in range(runs):
-                        for c in range(chunks):
-                            out.append(
-                                (
-                                    start + r * run_span + c * desc_len,
-                                    desc_len,
-                                    device_id,
-                                )
-                            )
-        return out
+        p = np.asarray(pieces, dtype=np.uint64).reshape(-1, 2)
+        bases, pages = p[None, :, 0, None], p[None, :, 1, None]
+        block_ids = np.arange(num_blocks, dtype=np.uint64)[:, None, None]
+        kvs = np.arange(kv_runs, dtype=np.uint64)[None, None, :]
+        starts = bases + block_ids * pages + kvs * (pages // np.uint64(kv_runs))
+        return _grid_descs(starts.ravel(), sub_len, grid, device_id)
 
     @staticmethod
     def _head_split(cuts_l: int, cuts_r: int) -> int:
@@ -1741,7 +1730,6 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
             f"(tp_ratio={tp_ratio})."
         )
 
-        blocks_data: list[tuple[int, int, int]] = []
         num_blocks = nixl_agent_meta.num_blocks
 
         pieces: list[tuple[int, int, int, int]] = []
@@ -1766,29 +1754,24 @@ class RblnNixlHandshakeMixin(RblnNixlWorkerState):
                     nixl_agent_meta.device_id,
                 )
             )
-            for block_id in range(num_blocks):
-                blocks_data.append(
-                    (
-                        base_addr + block_id * page_size + rank_offset,
-                        local_block_len,
-                        nixl_agent_meta.device_id,
-                    )
-                )
 
+        grids = [(1, 1)]
         # Derived here rather than passed between the lists: a range one side
         # carries and the other does not pairs its descriptors against whole
         # blocks, and the length check ahead of a transfer compares how many
         # indices each side named, not how far they reach.
         window = self._window_grid_cut
         if window is not None:
-            blocks_data += self._chunk_range_descs(
-                pieces, num_blocks=num_blocks, grid=window
-            )
+            grids.append(window)
         grid = self._shard_chunk_grid(block_size=nixl_agent_meta.block_size, split=1)
         if grid is not None:
-            blocks_data += self._chunk_range_descs(
-                pieces, num_blocks=num_blocks, grid=grid
-            )
+            grids.append(grid)
+        blocks_data = np.concatenate(
+            [
+                self._chunk_range_descs(pieces, num_blocks=num_blocks, grid=g)
+                for g in grids
+            ]
+        )
 
         logger.info(
             "RBLN NIXL: %d remote descriptor(s) for engine %s rank %d: whole, "

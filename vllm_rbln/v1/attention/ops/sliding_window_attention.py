@@ -29,6 +29,7 @@ def sliding_window_attention_naive_prefill(
     sinks: torch.Tensor | None = None,
     *,
     use_custom_kernel: bool,
+    is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     if use_custom_kernel:
         return torch.ops.rbln_triton_ops.sliding_window_attention_naive_prefill(
@@ -54,6 +55,7 @@ def sliding_window_attention_naive_prefill(
             block_tables,
             scale,  # dummy
             sinks,
+            is_prompt_sorted=is_prompt_sorted,
         )
 
 
@@ -70,6 +72,7 @@ def sliding_window_attention_naive_decode(
     sinks: torch.Tensor | None = None,
     *,
     use_custom_kernel: bool,
+    is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     if use_custom_kernel:
         return torch.ops.rbln_triton_ops.sliding_window_attention_naive_decode(
@@ -96,6 +99,7 @@ def sliding_window_attention_naive_decode(
             scale,  # dummy
             attn_mask,
             sinks,
+            is_prompt_sorted=is_prompt_sorted,
         )
 
 
@@ -109,6 +113,8 @@ def sliding_window_attention_v1(
     block_tables: torch.Tensor,
     window_size: int,
     sinks: torch.Tensor | None = None,
+    *,
+    is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     return torch.ops.rbln_custom_ops.sliding_window_attention_v1(
         q,
@@ -122,4 +128,5 @@ def sliding_window_attention_v1(
         True,  # is_causal
         None,  # attn_mask: derived from the window by the converter
         sinks,
+        is_prompt_sorted=is_prompt_sorted,
     )

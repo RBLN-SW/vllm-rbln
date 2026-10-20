@@ -782,6 +782,39 @@ def test_update_states_rejects_a_streaming_request(model_runner):
         model_runner._update_states(scheduler_output)
 
 
+@pytest.mark.parametrize("prompt_logprob_start", [None, 1])
+def test_update_states_rejects_prompt_token_logprobs(
+    model_runner, prompt_logprob_start
+):
+    scheduler_output = _schedule_new_request(
+        "req_0", block_ids=([1],), outer_block_ids=[1]
+    )
+    params = scheduler_output.scheduled_new_reqs[0].sampling_params
+    params.prompt_logprob_token_ids = [3]
+    params.prompt_logprob_start = prompt_logprob_start
+
+    with pytest.raises(NotImplementedError, match="prompt_logprob_token_ids"):
+        model_runner._update_states(scheduler_output)
+
+    assert "req_0" not in model_runner.requests
+    assert "req_0" not in model_runner.input_batch.req_id_to_index
+
+
+@pytest.mark.parametrize("prompt_logprobs", [0, 1, -1])
+def test_update_states_rejects_prompt_logprobs(model_runner, prompt_logprobs):
+    scheduler_output = _schedule_new_request(
+        "req_0", block_ids=([1],), outer_block_ids=[1]
+    )
+    params = scheduler_output.scheduled_new_reqs[0].sampling_params
+    params.prompt_logprobs = prompt_logprobs
+
+    with pytest.raises(NotImplementedError, match="prompt_logprobs"):
+        model_runner._update_states(scheduler_output)
+
+    assert "req_0" not in model_runner.requests
+    assert "req_0" not in model_runner.input_batch.req_id_to_index
+
+
 def test_init_rejects_nan_counting(monkeypatch):
     monkeypatch.setenv("VLLM_COMPUTE_NANS_IN_LOGITS", "1")
 
