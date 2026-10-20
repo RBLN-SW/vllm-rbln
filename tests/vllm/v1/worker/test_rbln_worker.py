@@ -120,7 +120,6 @@ def _env_cleanup(monkeypatch):
     # Save/restore the process env vars the worker touches.
     keys = [
         "RBLN_VISIBLE_DEVICES",
-        "RBLN_NPUS_PER_DEVICE",
         "LOCAL_RANK",
         "WORLD_SIZE",
         "RCCL_PORT_GEN",
@@ -154,7 +153,7 @@ def make_worker(monkeypatch):
         data_parallel_rank_local=None,
         world_size_across_dp=None,
         assigned_physical_gpu_ids=None,
-        num_devices=1,
+        executor_published=True,
         device_name="RBLN-CA25",
         vllm_config=None,
     ):
@@ -172,17 +171,16 @@ def make_worker(monkeypatch):
             data_parallel_rank_local=data_parallel_rank_local,
             world_size_across_dp=wsd,
             assigned_physical_gpu_ids=assigned_physical_gpu_ids,
-            additional_config=RBLNConfig(num_devices_per_local_rank=num_devices),
+            additional_config=RBLNConfig(),
         )
-        # MultiprocExecutor.worker_main publishes the mapping in every worker
-        # process before the worker is built, so a test that supplies one must
-        # too or it exercises a path the engine never takes.
-        if assigned_physical_gpu_ids is not None:
-            monkeypatch.setattr(
-                platform_interface,
-                "_assigned_physical_gpu_ids",
-                assigned_physical_gpu_ids,
-            )
+        # MultiprocExecutor.worker_main publishes the mapping before the worker
+        # is built; UniProcExecutor does not, which executor_published=False
+        # stands for. Either way the global starts from a known value.
+        monkeypatch.setattr(
+            platform_interface,
+            "_assigned_physical_gpu_ids",
+            assigned_physical_gpu_ids if executor_published else None,
+        )
         monkeypatch.setattr(WorkerBase, "__init__", _fake_super_init)
         monkeypatch.setattr(
             wm,
@@ -194,12 +192,8 @@ def make_worker(monkeypatch):
                 device_control_env_var=RblnPlatform.device_control_env_var,
                 dist_backend="gloo",
                 get_device_name=lambda: device_name,
-                # Both real resolvers: the pool semantics under test are
-                # upstream's, and which of the two the worker picks is the
-                # difference between reading the pool and reading the mapping.
-                visible_device_id_to_physical_device_id=(
-                    RblnPlatform.visible_device_id_to_physical_device_id
-                ),
+                # The real resolver: the pool and mapping semantics under test
+                # are upstream's.
                 device_id_to_physical_device_id=(
                     RblnPlatform.device_id_to_physical_device_id
                 ),
@@ -432,12 +426,10 @@ class TestConformance:
 
 
 class TestInitDeviceEnv:
-    """The env var is a pool of NPUs to index into, one entry per NPU.
-
-    A rank takes ``VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK`` consecutive entries
-    starting at its rank slot times that count. The slot spans the whole
-    deployment: ``data_parallel_rank_local * world_size + local_rank``.
-    """
+    """A rank takes one NPU, resolved as upstream does: vLLM's per-DP-rank
+    mapping (``assigned_physical_gpu_ids``, which carries ``--device-ids``)
+    indexed by the local rank, and without a mapping the env var pool at
+    ``data_parallel_rank_local * world_size + local_rank``."""
 
     def test_unset_pool_is_the_whole_host(self, make_worker):
         make_worker(world_size=1)
@@ -479,40 +471,11 @@ class TestInitDeviceEnv:
             make_worker(world_size=4, local_rank=0)
 
     @pytest.mark.parametrize(
-        "pool, world_size, num_devices, local_rank, expected",
-        [
-            ("1,2", 1, 2, 0, "1,2"),
-            ("0,1,2,3,4,5,6,7", 2, 4, 0, "0,1,2,3"),
-            ("0,1,2,3,4,5,6,7", 2, 4, 1, "4,5,6,7"),
-            ("4,5,6,7", 2, 2, 1, "6,7"),
-        ],
-    )
-    def test_rsd_takes_consecutive_entries(
-        self, make_worker, pool, world_size, num_devices, local_rank, expected
-    ):
-        # A rank's group is enumerated, not derived by multiplying its entry,
-        # which reached past the pool the job was given.
-        os.environ["RBLN_VISIBLE_DEVICES"] = pool
-        make_worker(
-            world_size=world_size, num_devices=num_devices, local_rank=local_rank
-        )
-        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
-
-    @pytest.mark.parametrize("local_rank, expected", [(0, "0,1"), (1, "2,3")])
-    def test_unset_pool_with_rsd(self, make_worker, local_rank, expected):
-        make_worker(world_size=2, num_devices=2, local_rank=local_rank)
-        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
-        assert os.environ["RBLN_NPUS_PER_DEVICE"] == "2"
-
-    def test_single_device_skips_npus(self, make_worker):
-        make_worker(world_size=1, num_devices=1)
-        assert "RBLN_NPUS_PER_DEVICE" not in os.environ
-
-    @pytest.mark.parametrize(
         "dp_rank, local_rank, expected",
         [(0, 0, "0"), (0, 1, "1"), (1, 0, "2"), (1, 1, "3")],
     )
     def test_dp_ranks_do_not_share(self, make_worker, dp_rank, local_rank, expected):
+        # In-process DP (InprocClient) reaches the worker with no mapping.
         make_worker(
             world_size=2,
             data_parallel_size=2,
@@ -522,61 +485,109 @@ class TestInitDeviceEnv:
         )
         assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
 
-    @pytest.mark.parametrize(
-        "dp_rank, local_rank, expected",
-        [
-            (0, 0, "0,1,2,3"),
-            (0, 1, "4,5,6,7"),
-            (1, 0, "8,9,10,11"),
-            (1, 1, "12,13,14,15"),
-        ],
-    )
-    def test_dp_ranks_do_not_share_with_rsd(
-        self, make_worker, dp_rank, local_rank, expected
-    ):
-        make_worker(
-            world_size=2,
-            data_parallel_size=2,
-            data_parallel_rank=dp_rank,
-            data_parallel_rank_local=dp_rank,
-            # What vLLM's slicer hands this DP rank: one entry per rank.
-            assigned_physical_gpu_ids=[dp_rank * 2, dp_rank * 2 + 1],
-            num_devices=4,
-            local_rank=local_rank,
-        )
-        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
-
-    def test_dp_with_rsd_indexes_the_pool(self, make_worker):
-        os.environ["RBLN_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(16, 32))
+    def test_dp_without_a_mapping_indexes_the_pool(self, make_worker):
+        os.environ["RBLN_VISIBLE_DEVICES"] = "4,5,6,7"
         make_worker(
             world_size=2,
             data_parallel_size=2,
             data_parallel_rank=1,
             data_parallel_rank_local=1,
-            num_devices=4,
             local_rank=1,
         )
-        assert os.environ["RBLN_VISIBLE_DEVICES"] == "28,29,30,31"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "7"
 
-    def test_non_moe_dp_offsets_by_the_local_rank(self, make_worker):
-        # vLLM treats non-MoE DP ranks as independent engines: it resets
-        # data_parallel_size and data_parallel_rank, and only
-        # data_parallel_rank_local still tells the replicas apart.
+    def test_device_ids_mapping_decides_over_the_pool(self, make_worker):
+        os.environ["RBLN_VISIBLE_DEVICES"] = "0,1,2,3"
+        make_worker(world_size=2, assigned_physical_gpu_ids=[2, 3], local_rank=1)
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "3"
+
+    def test_mapping_the_executor_did_not_publish(self, make_worker):
+        # UniProcExecutor builds the worker without publishing the mapping, so
+        # the worker has to, or a DP=2 TP=1 engine would land on device 0.
+        make_worker(
+            world_size=1,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            data_parallel_rank_local=1,
+            assigned_physical_gpu_ids=[1],
+            executor_published=False,
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "1"
+
+    def test_non_moe_dp_without_a_mapping_offsets_by_the_local_dp_rank(
+        self, make_worker
+    ):
+        # vLLM resets data_parallel_size and data_parallel_rank for an
+        # independent non-MoE DP rank; data_parallel_rank_local still tells the
+        # replicas apart.
         make_worker(
             world_size=2,
             data_parallel_size=1,
             data_parallel_rank=0,
             data_parallel_rank_local=1,
-            num_devices=2,
         )
-        assert os.environ["RBLN_VISIBLE_DEVICES"] == "4,5"
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "2"
 
-    def test_device_ids_mapping_is_ignored(self, make_worker):
-        # --device-ids leaves one entry per rank on the config, which cannot
-        # express rsd, so the pool position decides instead.
-        os.environ["RBLN_VISIBLE_DEVICES"] = "0,1,2,3"
-        make_worker(world_size=2, assigned_physical_gpu_ids=[2, 3], local_rank=1)
-        assert os.environ["RBLN_VISIBLE_DEVICES"] == "1"
+    def test_non_moe_dp_keeps_its_shard(self, make_worker):
+        # vLLM reconfigures a non-MoE DP rank as an independent engine (DP fields
+        # reset to 1) after it has handed the rank its shard of the host.
+        make_worker(
+            world_size=2,
+            data_parallel_size=1,
+            data_parallel_rank=0,
+            data_parallel_rank_local=1,
+            assigned_physical_gpu_ids=[2, 3],
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == "2"
+
+    @pytest.mark.parametrize("dp_rank", [0, 1, 2, 3])
+    def test_multi_port_external_lb_server_takes_its_device(self, make_worker, dp_rank):
+        # Each DP server the launcher spawns sees itself as local DP rank 0 and
+        # learns its NPU only from --device-ids.
+        make_worker(
+            world_size=1,
+            data_parallel_size=4,
+            data_parallel_rank=dp_rank,
+            data_parallel_rank_local=0,
+            assigned_physical_gpu_ids=[dp_rank],
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == str(dp_rank)
+
+    @pytest.mark.parametrize(
+        "dp_rank, local_rank, expected",
+        [(0, 0, "0"), (0, 1, "1"), (1, 0, "2"), (1, 1, "3")],
+    )
+    @pytest.mark.parametrize("launch", ["in_process", "multi_port_external_lb"])
+    def test_tp2_dp2_ranks_do_not_share(
+        self, make_worker, launch, dp_rank, local_rank, expected
+    ):
+        # In-process DP: the engine hands each DP rank its shard of the host.
+        # Multi-port external LB: the launcher hands each server --device-ids,
+        # and the server sees itself as local DP rank 0.
+        make_worker(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=dp_rank,
+            data_parallel_rank_local=dp_rank if launch == "in_process" else 0,
+            assigned_physical_gpu_ids=[dp_rank * 2, dp_rank * 2 + 1],
+            local_rank=local_rank,
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
+
+    @pytest.mark.parametrize("local_rank, expected", [(0, "2"), (1, "3")])
+    def test_tp2_dp_server_given_its_own_pool(self, make_worker, local_rank, expected):
+        # One server per DP rank started by hand with RBLN_VISIBLE_DEVICES set to
+        # its NPUs: vLLM builds the mapping from that pool.
+        os.environ["RBLN_VISIBLE_DEVICES"] = "2,3"
+        make_worker(
+            world_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            data_parallel_rank_local=0,
+            assigned_physical_gpu_ids=[2, 3],
+            local_rank=local_rank,
+        )
+        assert os.environ["RBLN_VISIBLE_DEVICES"] == expected
 
 
 def _params():

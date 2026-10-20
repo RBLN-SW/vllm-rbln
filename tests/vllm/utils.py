@@ -260,23 +260,16 @@ def host_chip() -> str | None:
         return None
 
 
-def devices_needed(engine_kwargs: dict, rsd: int = 1) -> int:
+def devices_needed(engine_kwargs: dict) -> int:
     """NPUs an engine built with ``engine_kwargs`` will occupy. Mirrors
     RBLNWorker._init_device_env: DP ranks do not share, and every rank of
-    vLLM's world size takes ``rsd`` devices.
-
-    ``rsd`` is a spec's ``CompileModelSpec.rsd``, i.e. the
-    VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK the engine will run with. It is an
-    argument rather than an env read because the caller checks the budget *before*
-    ``apply_spec_envs`` publishes it, and because the suite scrubs that name from
-    the parent's environment anyway.
+    vLLM's world size takes one device.
     """
     return (
         engine_kwargs.get("tensor_parallel_size", 1)
         * engine_kwargs.get("pipeline_parallel_size", 1)
         * engine_kwargs.get("prefill_context_parallel_size", 1)
         * engine_kwargs.get("data_parallel_size", 1)
-        * rsd
     )
 
 
