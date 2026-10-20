@@ -170,3 +170,23 @@ def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
 
     # Two built layers, each adding one; nothing from the unbuilt tail.
     torch.testing.assert_close(out, torch.full((3, 8), 2.0))
+
+
+def test_eagle3_is_refused_on_both_aux_layer_setup_paths():
+    """The runner resolves the aux layers from the speculative config, or from
+    the model's default, then calls the setter; neither path may silently
+    accept a target whose forward returns no aux hidden states."""
+    from vllm.model_executor.models.interfaces import supports_eagle3
+
+    import vllm_rbln.patches.axk3.model as axk3_model
+
+    model = axk3_model.AXK3ForCausalLM.__new__(axk3_model.AXK3ForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.model = SimpleNamespace(layers=[None] * 12, aux_hidden_state_layers=())
+
+    # Inherited from the K2 base, which is why the runner reaches the setup at all.
+    assert supports_eagle3(model)
+    with pytest.raises(NotImplementedError, match="EAGLE3"):
+        model.get_eagle3_default_aux_hidden_state_layers()
+    with pytest.raises(NotImplementedError, match="EAGLE3"):
+        model.set_aux_hidden_state_layers((2, 6, 9))

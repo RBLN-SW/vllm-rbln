@@ -341,11 +341,23 @@ class AXK3Model(nn.Module):
         return hidden_states
 
 
+_NO_EAGLE3 = (
+    "axk3 does not support EAGLE3 yet: its forward produces no auxiliary hidden states"
+)
+
+
 class AXK3ForCausalLM(_AXK2ForCausalLM):
     model_cls = AXK3Model
 
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        raise NotImplementedError("axk3 does not support EAGLE3 yet")
+    # The K2 base advertises EAGLE3, so the runner goes on to resolve the aux
+    # layers, from the speculative config or from the default below, and hands
+    # them to the setter. Both paths end here; refusing on either keeps a draft
+    # from being paired with a target that never returns the states it reads.
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        raise NotImplementedError(_NO_EAGLE3)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        raise NotImplementedError(_NO_EAGLE3)
 
 
 __all__ = ["AXK3ForCausalLM", "AXK3Model"]
