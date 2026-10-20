@@ -70,6 +70,7 @@ def _init_model_with(monkeypatch, tmp_path, hf_config) -> dict:
         scheduler_config=obj.scheduler_config,
         cache_config=types.SimpleNamespace(gpu_memory_utilization=0.9),
         ec_transfer_config=None,
+        speculative_config=None,
     )
     obj.init_model()
     return passed
