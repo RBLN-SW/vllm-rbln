@@ -73,6 +73,7 @@ def _wire_runner(proposer, *, num_reqs, intermediate_chunk=False):
         shape_config=_shape_config(),
         dp_status=None,
         decode_back_pad=torch.zeros(num_reqs, dtype=torch.int32),
+        sort_batch_by_length=False,
     )
     proposer.draft_attn_groups = [
         SimpleNamespace(
@@ -365,6 +366,26 @@ class TestToTargetTokenIds:
 
 
 class TestPropose:
+    @pytest.mark.parametrize("is_prompt_sorted", [False, True])
+    def test_prompt_sorting_reaches_every_draft_step(
+        self, monkeypatch, is_prompt_sorted
+    ):
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle3", num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.runner.sort_batch_by_length = is_prompt_sorted
+        builder = mock.Mock()
+        proposer.draft_attn_groups[0].get_metadata_builder = lambda: builder
+        proposer.model_executable = _echo_model_exec(proposer.hidden_size)
+
+        _call_propose(proposer)
+
+        assert builder.build.call_count == 3
+        assert all(
+            call.kwargs["is_prompt_sorted"] is is_prompt_sorted
+            for call in builder.build.call_args_list
+        )
+
     def test_single_step_early_exit_takes_ids_once(self, monkeypatch):
         # num_speculative_tokens == 1 takes the early-exit branch: one model pass,
         # the graph's ids sliced per request, shaped [num_reqs, 1].
@@ -785,6 +806,7 @@ class TestDummyRun:
             kv_cache_view_infos=[],
             shape_config=_shape_config(specialized=specialized),
             dp_status=dp_status,
+            sort_batch_by_length=False,
             _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
                 np.cumsum(nt, dtype=cumsum_dtype),
                 None,
@@ -839,13 +861,19 @@ class TestDummyRun:
         )
         assert calls
 
-    def test_multi_step_runs_second_loop(self, monkeypatch):
+    @pytest.mark.parametrize("is_prompt_sorted", [False, True])
+    def test_multi_step_runs_second_loop(self, monkeypatch, is_prompt_sorted):
         # num_speculative_tokens > 1 warms up the extra draft loop too, so the
         # model runs once for the first pass plus once per extra step.
         proposer, calls = self._proposer(monkeypatch, num_spec=2)
+        proposer.runner.sort_batch_by_length = is_prompt_sorted
         proposer.dummy_run(num_reqs=2, num_tokens_per_req=4, is_prefill=True)
         # first pass (1) + one extra draft step (num_speculative_tokens - 1 = 1).
         assert len(calls) == 2
+        assert len(proposer.builds) == 2
+        assert all(
+            build["is_prompt_sorted"] is is_prompt_sorted for build in proposer.builds
+        )
 
     @pytest.mark.parametrize("idle,passes", [(True, 0), (False, 2)])
     def test_a_dense_draft_runs_unless_this_rank_is_idle(
