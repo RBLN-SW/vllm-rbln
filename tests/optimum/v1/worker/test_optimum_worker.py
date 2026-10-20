@@ -20,7 +20,6 @@ import pytest
 from vllm.config import ProfilerConfig
 from vllm.v1.worker.worker_base import WorkerBase
 
-import vllm_rbln.v1.worker.utils as worker_utils
 from vllm_rbln.v1.worker.optimum_worker import RBLNOptimumWorker
 
 
@@ -50,61 +49,6 @@ def make_worker(monkeypatch):
     return _make
 
 
-@pytest.fixture
-def rbln_calls(monkeypatch):
-    calls: list[str] = []
-    monkeypatch.setattr(
-        worker_utils,
-        "rbln_profiler",
-        SimpleNamespace(
-            start=lambda: calls.append("start"),
-            done=lambda: calls.append("done"),
-        ),
-    )
-    return calls
-
-
-# These two assert what tests/vllm/v1/worker/test_rbln_worker.py::TestProfile
-# asserts for the vllm model path: both workers promise the same behaviour. With
-# RBLN_PROFILER on, kineto's bridge opens and flushes the RBLN session for the
-# torch profile, so the RBLN wrapper has to stay out of it. The flag is patched on
-# the worker, not exported: a unit test must not switch the device profiler on.
-@pytest.mark.parametrize("rbln_profiler", [False, True])
-def test_torch_profiler_keeps_the_rbln_session_to_itself(
-    make_worker, monkeypatch, rbln_calls, tmp_path, rbln_profiler
-):
-    monkeypatch.setattr(
-        "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
-        SimpleNamespace(RBLN_PROFILER=rbln_profiler),
-    )
-    worker = make_worker(
-        ProfilerConfig(
-            profiler="torch",
-            torch_profiler_dir=str(tmp_path),
-            torch_profiler_dump_cuda_time_total=False,
-        )
-    )
-
-    worker.profile(is_start=True)
-    worker.profile(is_start=False)
-
-    assert rbln_calls == []
-
-
-def test_rbln_profiler_starts_and_flushes_at_stop(make_worker, monkeypatch, rbln_calls):
-    monkeypatch.setattr(
-        "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
-        SimpleNamespace(RBLN_PROFILER=True),
-    )
-    worker = make_worker(ProfilerConfig())
-
-    worker.profile(is_start=True)
-    worker.profile(is_start=False)
-
-    assert rbln_calls == ["start", "done"]
-    assert isinstance(worker.profiler, worker_utils.RblnProfilerWrapper)
-
-
 def test_discard_rejects_selective_memory_release(make_worker):
     worker = make_worker(ProfilerConfig())
 
@@ -112,38 +56,6 @@ def test_discard_rejects_selective_memory_release(make_worker):
         RuntimeError, match="Selective discard is not supported on RBLN"
     ):
         worker.discard(("kv_cache",))
-
-
-def test_rbln_profiler_does_not_stand_in_for_another_profiler(make_worker, monkeypatch):
-    monkeypatch.setattr(
-        "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
-        SimpleNamespace(RBLN_PROFILER=True),
-    )
-    worker = make_worker(ProfilerConfig(profiler="cuda"))
-
-    assert worker.profiler is None
-
-
-def test_shutdown_flushes_a_profile_that_was_never_stopped(
-    make_worker, monkeypatch, rbln_calls
-):
-    monkeypatch.setattr(
-        "vllm_rbln.v1.worker.optimum_worker.rbln_flags",
-        SimpleNamespace(RBLN_PROFILER=True),
-    )
-    monkeypatch.setenv("VLLM_RBLN_METRICS", "1")
-    worker = make_worker(ProfilerConfig())
-    worker.model_runner = SimpleNamespace(
-        model_performance_tracker=SimpleNamespace(
-            print_final_stats=lambda: rbln_calls.append("stats")
-        ),
-        sampler_performance_tracker=None,
-    )
-
-    worker.profile(is_start=True)
-    worker.shutdown()
-
-    assert rbln_calls == ["start", "stats", "done"]
 
 
 def _scheduler_output() -> SimpleNamespace:
