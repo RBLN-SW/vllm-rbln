@@ -20,9 +20,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
-from tests.vllm.v1.worker.utils import make_kv_cache_config, schedule_new
+from tests.vllm.v1.worker.utils import BLOCK_SIZE, make_kv_cache_config, schedule_new
 
 pytestmark = pytest.mark.maybe_use_device
 
@@ -93,6 +94,35 @@ class TestKVCacheBaseBindings:
         runner = make_model_runner()
         assert runner.kv_cache_bases == []
         assert runner.kv_cache_view_infos == []
+
+    def test_a_shared_buffer_is_bound_in_the_full_attention_shape(
+        self, make_model_runner
+    ):
+        # A sliding-window layer ahead of a full-attention one on one buffer, its
+        # kernel on its window: the two views differ, and the graph input must
+        # be the full-attention layer's, the one the static address names.
+        window = BLOCK_SIZE // 4
+        runner = make_model_runner(
+            layers=("layer.0", "layer.1"),
+            init_kv_cache=False,
+            additional_config={"enable_sub_block_cache": False},
+        )
+        full = make_kv_cache_config(runner).kv_cache_groups[0].kv_cache_spec
+        sliding = SlidingWindowSpec(
+            block_size=full.block_size,
+            num_kv_heads=full.num_kv_heads,
+            head_size=full.head_size,
+            dtype=full.dtype,
+            sliding_window=window,
+        )
+        runner.initialize_kv_cache(
+            make_kv_cache_config(
+                groups=[("layer.0",), ("layer.1",)], specs=[sliding, full]
+            )
+        )
+        window_info, full_info = runner.kv_cache_view_infos
+        assert window_info.view_shape != full_info.view_shape
+        assert [tuple(b.shape) for b in runner.kv_cache_bases] == [full_info.view_shape]
 
 
 class TestLayerIndexFollowsCacheOrder:
