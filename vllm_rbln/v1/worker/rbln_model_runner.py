@@ -121,6 +121,10 @@ from vllm_rbln.platform import USE_DEVICE_TENSOR
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
+from vllm_rbln.v1.attention.backends.gdn_attn import (
+    RBLNGDNAttentionMetadata,
+    RBLNGDNAttentionMetadataBuilder,
+)
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     KVCacheViewInfo,
     attach_kv_cache_bindings,
@@ -329,6 +333,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # KV cache layer names in layer-index order; the deterministic
         # ordering the KV connector relies on for region<->layer agreement.
         self.kv_cache_names: list[str] = []
+        # Mamba layer name -> its conv / ssm state cache.
+        self.mamba_conv_states: dict[str, torch.Tensor] = {}
+        self.mamba_ssm_states: dict[str, torch.Tensor] = {}
+        # Filled by the Mamba layers while the graph is traced; returned from
+        # it so the compiler keeps the state writes.
+        self.mamba_state_updates: list[torch.Tensor] = []
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -1075,7 +1085,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 attn_group = self.attn_groups[kv_cache_gid][attn_gid]
                 builder = attn_group.get_metadata_builder(0)
-                assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
+                assert isinstance(
+                    builder,
+                    (
+                        RBLNFlashAttentionMetadataBuilder,
+                        RBLNGDNAttentionMetadataBuilder,
+                    ),
+                )
 
                 attn_metadata_i = builder.build(
                     common_attn_metadata=cm,
@@ -1090,6 +1106,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     attn_metadata[layer_name] = attn_metadata_i
 
         self._attach_kv_cache_bindings(attn_metadata)
+        self._zero_fresh_mamba_states(attn_metadata)
 
         return attn_metadata, spec_decode_common_attn_metadata
 
@@ -1841,7 +1858,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 flush_deferred_loads(get_kv_transfer_group())
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
-            hidden_states, logits, combined_hidden_states = model_output
+            hidden_states, logits, combined_hidden_states = model_output[:3]
 
             if not get_pp_group().is_last_rank:
                 # Return the intermediate tensors; carry the connector output
@@ -2296,6 +2313,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         combined_hidden_states
                     )
 
+            if self.mamba_state_updates:
+                return (
+                    hidden_states,
+                    logits,
+                    combined_hidden_states,
+                    list(self.mamba_state_updates),
+                )
             return hidden_states, logits, combined_hidden_states
 
         if self.model_config.enforce_eager:
@@ -2829,13 +2853,16 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         max_num_blocks = []
         max_model_len = self.max_model_len
         for kv_cache_group in kv_cache_config.kv_cache_groups:
-            assert not isinstance(
-                kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
-            )
-            assert not isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
-            block_size = kv_cache_group.kv_cache_spec.block_size
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            assert not isinstance(kv_cache_spec, EncoderOnlyAttentionSpec)
+            block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
-            max_num_blocks_per_req = cdiv(max_model_len, block_size)
+            if isinstance(kv_cache_spec, MambaSpec):
+                max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
+                    self.vllm_config, max_model_len
+                )
+            else:
+                max_num_blocks_per_req = cdiv(max_model_len, block_size)
             max_num_blocks.append(max_num_blocks_per_req)
 
         if (
@@ -2966,6 +2993,9 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # There may be a last group for layers without kv cache.
                 continue
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            if isinstance(kv_cache_spec, MambaSpec):
+                # Allocated apart by `_allocate_mamba_state_tensors`.
+                continue
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
@@ -3062,6 +3092,52 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             kv_cache_block_axes,
         )
 
+    def _allocate_mamba_state_tensors(
+        self,
+        kv_cache_raw_tensors: dict[str, torch.Tensor],
+    ) -> dict[str, tuple[torch.Tensor, ...]]:
+        """One tensor per state of each Mamba layer, ``[num_blocks, *shape]``.
+
+        Not views of the layer's raw buffer: its states sit at byte offsets in
+        a page, and a graph input cannot carry an offset. Device tensors, so
+        that `_zero_fresh_mamba_states` can clear a row between graphs.
+        """
+        if not USE_DEVICE_TENSOR:
+            raise NotImplementedError(
+                "Mamba layers need VLLM_RBLN_USE_DEVICE_TENSOR: the runner "
+                "clears a request's state rows with an eager device op."
+            )
+        states: dict[str, tuple[torch.Tensor, ...]] = {}
+        for group in self._kv_cache_spec_attn_group_iterator():
+            spec = group.kv_cache_spec
+            if not isinstance(spec, MambaSpec):
+                continue
+            for layer_name in group.layer_names:
+                raw_tensor = kv_cache_raw_tensors[layer_name]
+                assert raw_tensor.numel() % spec.page_size_bytes == 0
+                num_blocks = raw_tensor.numel() // spec.page_size_bytes
+                states[layer_name] = tuple(
+                    torch.zeros((num_blocks, *shape), dtype=dtype, device=self.device)
+                    for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True)
+                )
+        return states
+
+    def _zero_fresh_mamba_states(self, attn_metadata: PerLayerAttnMetadata) -> None:
+        """Zero the state rows of the requests that start in this step.
+
+        A row holds what its last owner left. Clearing it inside the model
+        graph, by masking the row the graph reads, does not keep the stale
+        values out on RBLN, so the rows are cleared here, before the graph runs.
+        """
+        for layer_name, metadata in attn_metadata.items():
+            if not isinstance(metadata, RBLNGDNAttentionMetadata):
+                continue
+            if not metadata.fresh_slots:
+                continue
+            rows = torch.tensor(metadata.fresh_slots, device=self.device)
+            self.mamba_conv_states[layer_name].index_fill_(0, rows, 0)
+            self.mamba_ssm_states[layer_name].index_fill_(0, rows, 0)
+
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
@@ -3138,6 +3214,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         forward_context = self.compilation_config.static_forward_context
         for layer_name, kv_cache in kv_caches.items():
             forward_context[layer_name].kv_cache = kv_cache
+
+        mamba_states = self._allocate_mamba_state_tensors(kv_cache_raw_tensors)
+        self.mamba_conv_states = {name: s[0] for name, s in mamba_states.items()}
+        self.mamba_ssm_states = {name: s[1] for name, s in mamba_states.items()}
+        for layer_name, layer_states in mamba_states.items():
+            forward_context[layer_name].kv_cache = layer_states
+        if mamba_states:
+            # Attention layers index the cache list by decoder layer index,
+            # which counts the Mamba layers the list leaves out.
+            for index, layer_name in enumerate(self.kv_cache_names):
+                forward_context[layer_name].layer_index = index
 
         if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
@@ -3335,7 +3422,13 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     ) -> None:
         if attn_metadata is None:
             return
+        self.mamba_state_updates.clear()
         for attn_metadatum in attn_metadata.values():
+            if isinstance(attn_metadatum, RBLNGDNAttentionMetadata):
+                attn_metadatum.conv_states = self.mamba_conv_states
+                attn_metadatum.ssm_states = self.mamba_ssm_states
+                attn_metadatum.state_updates = self.mamba_state_updates
+                continue
             attach_kv_cache_bindings(
                 attn_metadatum,
                 self.kv_caches,
