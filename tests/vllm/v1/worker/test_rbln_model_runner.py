@@ -1272,6 +1272,7 @@ class TestUpdateStates:
             input_batch=input_batch,
             requests=requests if requests is not None else {},
             num_prompt_logprobs={},
+            prompt_token_arrays={},
             is_pooling_model=False,
             sort_batch_by_length=False,
             kv_cache_config=SimpleNamespace(kv_cache_groups=[]),

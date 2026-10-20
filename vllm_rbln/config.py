@@ -73,9 +73,6 @@ CompileDtype = Literal["", "float16", "bfloat16"]
 class RBLNConfigBase:
     """RBLN NPU options that are not specific to one model path."""
 
-    num_devices_per_local_rank: int = 1
-    """Number of NPU devices assigned to each local rank."""
-
     use_custom_sampler: bool = True
     """Use the customized RBLN sampler."""
 
@@ -179,6 +176,9 @@ class RBLNConfig(RBLNConfigBase):
 @vllm_config_dataclass
 class OptimumRBLNConfig(RBLNConfigBase):
     """RBLN NPU options for the optimum-rbln model path."""
+
+    num_devices_per_local_rank: int = 1
+    """Number of NPU devices assigned to each local rank."""
 
     optimum_overrides: dict[str, Any] = field(default_factory=dict)
     """Entries for optimum-rbln's own model config, laid over what vllm-rbln

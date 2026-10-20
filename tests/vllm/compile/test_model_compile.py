@@ -51,7 +51,7 @@ def _generate(spec: CompileModelSpec, vllm_runner, async_vllm_runner) -> list:
 def test_compile_and_generate(
     vllm_runner, async_vllm_runner, spec: CompileModelSpec, monkeypatch
 ) -> None:
-    needed = devices_needed(spec.engine_kwargs, spec.rsd)
+    needed = devices_needed(spec.engine_kwargs)
     available = rbln_device_count()
     if available < needed:
         pytest.skip(f"{spec.test_id} needs {needed} NPUs, host has {available}")

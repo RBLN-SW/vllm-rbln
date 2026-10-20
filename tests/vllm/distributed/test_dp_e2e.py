@@ -77,7 +77,7 @@ class DPLane:
 @pytest.fixture(scope="module", params=spec_params(DP_MODELS))
 def dp_lane(request, async_vllm_runner):
     spec: CompileModelSpec = request.param
-    needed = devices_needed(spec.engine_kwargs, spec.rsd)
+    needed = devices_needed(spec.engine_kwargs)
     available = rbln_device_count()
     if available < needed:
         pytest.skip(f"{spec.test_id} needs {needed} NPUs, host has {available}")
