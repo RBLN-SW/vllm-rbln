@@ -14,7 +14,7 @@
 
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -63,12 +63,24 @@ class KVCacheViewInfo:
 def build_kv_cache_base_bindings(
     kv_cache_bases_by_layer: dict[str, torch.Tensor],
     kv_cache_view_infos_by_layer: dict[str, KVCacheViewInfo],
+    canonical_layers: Collection[str],
     num_attn_module: int = 1,
 ) -> tuple[list[torch.Tensor], list[KVCacheViewInfo]]:
-    """Deduplicate KV cache inputs by storage and capture per-layer view info."""
+    """Deduplicate KV cache inputs by storage and capture per-layer view info.
+
+    Each storage is bound in the shape of its layer in `canonical_layers` rather
+    than the first layer's; every storage needs a layer there, and layers named
+    for one storage must view it in one shape. The other layers view the base.
+    """
     base_tensors: list[torch.Tensor] = []
     view_infos: list[KVCacheViewInfo] = []
     base_index_by_view: dict[tuple[torch.device, int, int, int, int], int] = {}
+    canonical_bases = {
+        kv_cache_tensor_key(kv_cache_bases_by_layer[name]): kv_cache_bases_by_layer[
+            name
+        ]
+        for name in canonical_layers
+    }
 
     layer_names = _get_ordered_layer_names(
         kv_cache_view_infos_by_layer, num_attn_module
@@ -83,7 +95,7 @@ def build_kv_cache_base_bindings(
         if base_index is None:
             base_index = len(base_tensors)
             base_index_by_view[view_key] = base_index
-            base_tensors.append(base_tensor)
+            base_tensors.append(canonical_bases[view_key])
 
         view_info = kv_cache_view_infos_by_layer[layer_name]
         if view_info.view_dtype == base_tensors[base_index].dtype:

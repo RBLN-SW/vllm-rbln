@@ -82,10 +82,12 @@ def make_kv_cache_config(
     num_blocks: int = NUM_BLOCKS,
     block_size: int = BLOCK_SIZE,
     spec: KVCacheSpec | None = None,
+    specs: Sequence[KVCacheSpec] | None = None,
 ) -> KVCacheConfig:
     """One group (and one tensor) per entry in ``groups``; each entry lists the
-    layer names sharing that group. The spec comes from ``runner`` unless given."""
-    if spec is None:
+    layer names sharing that group. The spec comes from ``runner`` unless given,
+    and ``specs`` gives each group its own (a hybrid model's groups)."""
+    if spec is None and specs is None:
         assert runner is not None, "pass either a runner or an explicit spec"
         spec = FullAttentionSpec(
             block_size=block_size,
@@ -96,7 +98,8 @@ def make_kv_cache_config(
     # Layer-compact layout, as upstream's builder produces it: groups overlay
     # from byte 0 and the backing allocation is sized by the widest one, so
     # every tensor reports the same total size.
-    page = spec.page_size_bytes
+    specs = specs or [spec] * len(groups)
+    page = specs[0].page_size_bytes
     layer_stride = page * num_blocks
     size = max(len(layer_names) for layer_names in groups) * layer_stride
     return KVCacheConfig(
@@ -111,8 +114,8 @@ def make_kv_cache_config(
             for layer_names in groups
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=list(layer_names), kv_cache_spec=spec)
-            for layer_names in groups
+            KVCacheGroupSpec(layer_names=list(layer_names), kv_cache_spec=group_spec)
+            for layer_names, group_spec in zip(groups, specs, strict=True)
         ],
     )
 
