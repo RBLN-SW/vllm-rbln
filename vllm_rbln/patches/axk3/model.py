@@ -21,6 +21,7 @@ and changes three things, all following the checkpoint's ``modeling_axk3.py``:
 """
 
 import contextlib
+from itertools import islice
 from typing import Any
 
 import torch
@@ -331,7 +332,9 @@ class AXK3Model(nn.Module):
         hidden_states = torch.cat([inputs_embeds] * self.num_streams, dim=-1)
 
         topk_by_layer: dict[int, torch.Tensor] = {}
-        for layer in self.layers:
+        # `make_layers` pads the list to the full depth with `PPMissingLayer`,
+        # which returns its first argument; walk only the layers this rank built.
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(positions, hidden_states, topk_by_layer)
 
         hidden_states, _ = self.final_gated_residual.read(hidden_states)

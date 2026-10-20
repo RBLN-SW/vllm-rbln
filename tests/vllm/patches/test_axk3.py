@@ -19,8 +19,10 @@ from __future__ import annotations
 import pickle
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_rbln.patches.axk3.config import AXK3Config
 
@@ -120,3 +122,51 @@ def test_axk3_registers_its_mla_convertor(monkeypatch):
     assert convertor_cls is KvLoraRankMLAConvertor
     config = SimpleNamespace(model_type="axk3", kv_lora_rank=512)
     assert convertor_cls(config, config).is_deepseek_mla()
+
+
+def test_forward_runs_only_the_layers_this_rank_built(monkeypatch):
+    """`VLLM_RBLN_NUM_HIDDEN_LAYERS` builds the first N layers by shrinking the
+    `end_layer` that `make_layers` sees; the list it returns still has one entry
+    per layer, the rest `PPMissingLayer`. That placeholder returns its first
+    argument, so a forward that walks the whole list hands `positions` on as the
+    hidden state from layer N."""
+    import vllm.distributed.parallel_state as parallel_state
+    import vllm.distributed.utils as dist_utils
+    from vllm.model_executor.models.utils import PPMissingLayer, make_layers
+
+    import vllm_rbln.patches.axk3.model as axk3_model
+    from vllm_rbln import envs
+    from vllm_rbln.patches.distributed_utils import patched_get_pp_indices
+
+    class Layer(torch.nn.Module):
+        def forward(self, positions, hidden_states, topk_by_layer):
+            return hidden_states + 1
+
+    monkeypatch.setattr(envs, "VLLM_RBLN_NUM_HIDDEN_LAYERS", 2)
+    monkeypatch.setattr(dist_utils, "get_pp_indices", patched_get_pp_indices)
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: group)
+
+    model = axk3_model.AXK3Model.__new__(axk3_model.AXK3Model)
+    torch.nn.Module.__init__(model)
+    model.num_streams = 1
+    model.start_layer, model.end_layer, model.layers = make_layers(
+        4, lambda prefix: Layer(), prefix="model.layers"
+    )
+    assert [type(layer) for layer in model.layers] == [
+        Layer,
+        Layer,
+        PPMissingLayer,
+        PPMissingLayer,
+    ]
+    model.embed_input_ids = lambda input_ids: torch.zeros(len(input_ids), 8)
+    model.final_gated_residual = SimpleNamespace(read=lambda hidden: (hidden, None))
+
+    out = model.forward(
+        input_ids=torch.zeros(3, dtype=torch.long),
+        positions=torch.arange(3),
+        intermediate_tensors=None,
+    )
+
+    # Two built layers, each adding one; nothing from the unbuilt tail.
+    torch.testing.assert_close(out, torch.full((3, 8), 2.0))
