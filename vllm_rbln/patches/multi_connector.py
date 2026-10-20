@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm_rbln.patches import register_patch
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.distributed.kv_events import KVConnectorKVEvents
 
 
@@ -42,12 +43,11 @@ if TYPE_CHECKING:
         "MultiConnector.get_kv_connector_kv_cache_events"
     ),
     reason=(
-        "MultiConnector leaves get_kv_connector_kv_cache_events unimplemented "
-        "(a TODO; vllm-project/vllm#31811 closed unmerged), so a child's "
-        "worker-side KV events never reach the scheduler: the RDS events of "
-        "RBLNLMCacheConnectorV1 under MultiConnector(NIXL + LMCache) are "
-        "dropped. TODO(vllm-rbln): delete once upstream MultiConnector "
-        "forwards them."
+        "MultiConnector drops in-process LMCache's worker-side RDS events "
+        "(vllm-project/vllm#31811 closed unmerged). TODO(vllm-rbln): delete "
+        "both patches after LMCache moves to multiprocess (MP) mode and "
+        "the router receives RDS events from the LMCache server process "
+        "without this worker-side hook."
     ),
     key="vllm_rbln.patches.multi_connector.get_kv_connector_kv_cache_events",
     owner_module="vllm_rbln.patches.multi_connector",
@@ -56,8 +56,8 @@ def get_kv_connector_kv_cache_events(
     self: MultiConnector,
 ) -> KVConnectorKVEvents | None:
     # Every child is called each step: a child may drain its worker-side queue
-    # in this call even on the workers that report nothing. At most one child
-    # reports; MultiConnector.__init__ refuses more.
+    # in this call even on the workers that report nothing. With events enabled,
+    # MultiConnector.__init__ allows at most one child to override this hook.
     events = [child.get_kv_connector_kv_cache_events() for child in self._connectors]
     return next((e for e in events if e is not None), None)
 
@@ -69,9 +69,9 @@ def get_kv_connector_kv_cache_events(
     ),
     reason=(
         "Forwarding a child's KV events cannot merge two children's events: "
-        "each carries its own cross-worker aggregate() rule. Refuse a second "
-        "reporting child at construction, so the engine fails at load rather "
-        "than mid-serving. TODO(vllm-rbln): delete with the patch above."
+        "each carries its own cross-worker aggregate() rule. With KV events "
+        "enabled, refuse a second reporting child at construction instead of "
+        "mid-serving. TODO(vllm-rbln): delete with the forwarding patch."
     ),
     key="vllm_rbln.patches.multi_connector.init",
     owner_module="vllm_rbln.patches.multi_connector",
@@ -82,8 +82,13 @@ def _build_init():
     base = KVConnectorBase_V1.get_kv_connector_kv_cache_events
 
     @functools.wraps(original)
-    def __init__(self: MultiConnector, *args, **kwargs) -> None:
-        original(self, *args, **kwargs)
+    def __init__(
+        self: MultiConnector, vllm_config: VllmConfig, *args, **kwargs
+    ) -> None:
+        original(self, vllm_config, *args, **kwargs)
+        event_config = vllm_config.kv_events_config
+        if event_config is None or not event_config.enable_kv_cache_events:
+            return
         reporters = [
             type(child).__name__
             for child in self._connectors

@@ -14,7 +14,7 @@
 
 """MultiConnector forwards its child connectors' worker-side KV events.
 
-Stub children only -- the patches read nothing but ``_connectors``.
+Stub children and event configuration only; no worker or scheduler is started.
 """
 
 from __future__ import annotations
@@ -88,13 +88,24 @@ class _Silent:
     )
 
 
-def _construct(monkeypatch, *children):
-    def upstream_init(self, connectors):
+def _construct(monkeypatch, *children, enable_events=True, config_as_keyword=False):
+    def upstream_init(self, vllm_config, connectors):
         self._connectors = connectors
 
     monkeypatch.setattr(MultiConnector, "__init__", upstream_init)
+    config = SimpleNamespace(
+        kv_events_config=(
+            None
+            if enable_events is None
+            else SimpleNamespace(enable_kv_cache_events=enable_events)
+        )
+    )
     multi = SimpleNamespace()
-    _build_init()(multi, list(children))
+    init = _build_init()
+    if config_as_keyword:
+        init(multi, vllm_config=config, connectors=list(children))
+    else:
+        init(multi, config, list(children))
     return multi
 
 
@@ -108,6 +119,33 @@ def test_one_reporting_child_constructs(monkeypatch):
     assert _construct(monkeypatch, *children)._connectors == children
 
 
-def test_two_reporting_children_are_refused_at_construction(monkeypatch):
+@pytest.mark.parametrize("config_as_keyword", [False, True])
+def test_two_reporting_children_are_refused_at_construction(
+    monkeypatch, config_as_keyword
+):
     with pytest.raises(NotImplementedError, match="more than one child"):
-        _construct(monkeypatch, _Child(), _Silent(), _Child())
+        _construct(
+            monkeypatch,
+            _Child(),
+            _Silent(),
+            _Child(),
+            config_as_keyword=config_as_keyword,
+        )
+
+
+@pytest.mark.parametrize("enable_events", [None, False], ids=["absent", "disabled"])
+@pytest.mark.parametrize("config_as_keyword", [False, True])
+def test_two_reporting_children_construct_without_events(
+    monkeypatch, enable_events, config_as_keyword
+):
+    children = [_Child(), _Silent(), _Child()]
+
+    assert (
+        _construct(
+            monkeypatch,
+            *children,
+            enable_events=enable_events,
+            config_as_keyword=config_as_keyword,
+        )._connectors
+        == children
+    )
