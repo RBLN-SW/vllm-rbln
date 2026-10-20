@@ -15,7 +15,6 @@
 """The optimum-rbln model path's half of the platform hooks."""
 
 import contextlib
-from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,26 +26,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-@cache
 def patch_upstream() -> None:
-    from optimum.rbln.transformers.models.decoderonly.modeling_decoderonly import (
-        RBLNDecoderOnlyModel,
-    )
     from vllm.v1.sample.ops import topk_topp_sampler
-
-    from vllm_rbln.model_executor.models.optimum.compilation.decoder_regions import (
-        with_decoder_regions,
-    )
 
     # Upstream selects Triton filtering without a platform dispatch hook.
     # The optimum path does not apply the vllm path's patch registry.
     topk_topp_sampler.apply_top_k_top_p = topk_topp_sampler.apply_top_k_top_p_pytorch
-
-    # Optimum has no registration hook for decoder preparation before export.
-    # Its shared compile entry also covers decoder submodels of multimodal models.
-    RBLNDecoderOnlyModel.compile = classmethod(
-        with_decoder_regions(RBLNDecoderOnlyModel.compile.__func__)
-    )
 
 
 def check_and_update(vllm_config: "VllmConfig") -> None:

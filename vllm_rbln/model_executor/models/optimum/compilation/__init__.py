@@ -22,6 +22,7 @@ from optimum.rbln import (
     RBLNAutoModelForCausalLM,
     RBLNAutoModelForSpeechSeq2Seq,
 )
+from vllm_rbln import envs
 from vllm_rbln.utils.optimum.registry import (
     get_rbln_model_info,
     is_enc_dec_arch,
@@ -148,6 +149,16 @@ class RBLNCompileSpec:
             raise NotImplementedError(
                 f"Compilation is not implemented for architecture {architectures[0]}"
             )
+
+        if envs.VLLM_RBLN_NESTED_COMPILE_REGION and (
+            is_generation_arch(config) or is_multi_modal(config)
+        ):
+            decoder_config = spec.rbln_config
+            for name in ("language_model", "text_model"):
+                if name in decoder_config:
+                    decoder_config = decoder_config[name]
+                    break
+            decoder_config["nested_compile_region"] = True
 
         # rbln_overrides must not overwrite fields vllm derives from its own
         # config (batch_size, max_seq_len, memory_budget, ...); a silent
