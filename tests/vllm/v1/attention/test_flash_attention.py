@@ -780,3 +780,168 @@ class TestForwardSlidingWindow:
         )
         assert tables.tolist() == [7, 8, 9]
         assert window == self.WINDOW
+
+
+@pytest.mark.parametrize("kind", ["swa", "full"])
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_triton_dispatch_preserves_sink_mass(monkeypatch, kind, phase):
+    from vllm_rbln.v1.attention.ops import (
+        flash_causal_attention_naive,
+        sliding_window_attention,
+    )
+
+    prefix = "sliding_window" if kind == "swa" else "flash_causal"
+    name = f"{prefix}_attention_naive_{phase}"
+    module = sliding_window_attention if kind == "swa" else flash_causal_attention_naive
+    batch = 1 if phase == "prefill" else 2
+    q = torch.zeros(batch, 1, 2, 1, 64, dtype=torch.bfloat16)
+    k = v = torch.zeros(batch, 1, 1, 1, 64, dtype=q.dtype)
+    sinks = torch.tensor([3.0, 7.0]).log().reshape(2, 1)
+
+    def denominator(packed, *args):
+        # One zero-score key with unit value isolates the sink's probability mass.
+        sink_scores = packed[..., 64:]
+        scores = torch.cat([torch.zeros_like(packed[..., :1]), sink_scores], dim=-1)
+        return (
+            scores.float()
+            .softmax(-1)[..., :1]
+            .expand(*q.shape)
+            .contiguous()
+            .to(packed.dtype)
+        )
+
+    monkeypatch.setattr(torch.ops.rbln_triton_ops, name, denominator)
+    cache = torch.zeros(2, 1, 1, 1, 128, 64)
+    seq = torch.zeros(1, 1, dtype=torch.int32)
+    scale = torch.tensor(0.125)
+    bt = torch.zeros(1, 1, dtype=torch.int32)
+    if kind == "swa":
+        args = [q, k, v, cache, seq, seq + 1, scale, bt]
+    else:
+        args = [q, k, v, cache, scale, seq, bt]
+    expected = torch.tensor([0.25, 0.125], dtype=q.dtype).reshape(1, 1, 2, 1, 1)
+    for sink_values, reference in (
+        (sinks, expected.expand_as(q)),
+        (None, torch.ones_like(q)),
+        (torch.full_like(sinks, float("-inf")), torch.ones_like(q)),
+    ):
+        result = getattr(module, name)(*args, sinks=sink_values, use_custom_kernel=True)
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        assert result.dtype == q.dtype
+    assert torch.equal(q, torch.zeros_like(q))
+
+
+@pytest.mark.use_device
+@pytest.mark.parametrize("kind", ["swa", "full"])
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_triton_sink_normalization_across_cache_boundary(tmp_path, kind, phase):
+    import rebel
+
+    from vllm_rbln.v1.attention.ops import (
+        flash_causal_attention_naive,
+        sliding_window_attention,
+    )
+
+    length = 64 if phase == "prefill" else 1
+    capacity = 128
+
+    prefix = "sliding_window" if kind == "swa" else "flash_causal"
+    module = sliding_window_attention if kind == "swa" else flash_causal_attention_naive
+    op = getattr(module, f"{prefix}_attention_naive_{phase}")
+
+    class Layer(torch.nn.Module):
+        def forward(self, q, k, v, cache, seq, end, bt, sinks):
+            scale = torch.tensor(0.125)
+            args = [q, k, v, cache]
+            args += [seq, end, scale, bt] if kind == "swa" else [scale, seq, bt]
+            return op(*args, sinks=sinks, use_custom_kernel=True)
+
+    batch = 1 if phase == "prefill" else 2
+    partitions = 1 if kind == "swa" else 2
+    q = torch.zeros(batch, 8, 8, length, 64)
+    k = torch.zeros(batch, 8, 1, length, 64)
+    values = torch.arange(1, batch + 1).reshape(batch, 1, 1, 1, 1)
+    v = torch.ones_like(k) * values
+    cache = torch.zeros(2, batch * partitions, 8, 1, capacity, 64)
+    mass = torch.linspace(64, 128, 64)
+    data = dict(
+        q=q,
+        k=k,
+        v=v,
+        cache=cache,
+        seq=torch.zeros(
+            (batch,) if kind == "swa" else (batch, partitions), dtype=torch.int16
+        ),
+        end=torch.full((batch,), length, dtype=torch.int16),
+        bt=torch.arange(batch * partitions, dtype=torch.int32)
+        .flip(0)
+        .reshape(batch, partitions),
+        sinks=mass.log().reshape(64, 1),
+    )
+    if phase == "prefill":
+        data["bt"] = data["bt"].flatten()
+    context = rebel.CompileContext()
+    context.mark_static_address(cache)
+    compiled = rebel.compile_from_torch(
+        Layer(), example_inputs=list(data.values()), compile_context=context
+    )
+    artifact = tmp_path / "attention.rbln"
+    compiled.save(artifact)
+    names = [
+        item["name"] for item in rebel.RBLNCompiledModel.inspect(artifact)["inputs"]
+    ]
+    runtime = rebel.Runtime(artifact, tensor_type="pt")
+    for start in range(0, capacity + 1, length):
+        positions = torch.tensor(
+            [start // (b + 1) for b in range(batch)], dtype=torch.int16
+        )
+        counts = positions.clamp(max=capacity)[:, None]
+        if kind == "full":
+            counts = torch.cat(
+                (counts, (positions - capacity).clamp(min=0)[:, None]), dim=1
+            )
+        data["seq"] = counts.reshape_as(data["seq"])
+        data["end"] = positions.clamp(max=capacity) + length
+        actual = runtime(*[data[name] for name in names])
+        keys = positions.float()[:, None] + torch.arange(1, length + 1)
+        if kind == "swa":
+            keys = keys.clamp(max=capacity)
+        # Zero scores isolate sink mass; distinct values expose cross-batch cache reads.
+        expected = keys[:, None, :] / (keys[:, None, :] + mass[None, :, None])
+        expected = (expected.reshape(batch, 8, 8, length, 1) * values).expand_as(q)
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "phase, invalid",
+    [
+        (phase, invalid)
+        for phase in ["prefill", "decode"]
+        for invalid in ["noncausal", "head", "sinks", "batch"]
+        if phase == "prefill" or invalid != "batch"
+    ],
+)
+def test_triton_sinks_reject_unsupported_inputs(monkeypatch, phase, invalid):
+    from vllm_rbln.v1.attention.ops import (
+        flash_attention_naive,
+        sliding_window_attention,
+    )
+
+    noncausal = invalid == "noncausal"
+    prefix = "flash" if noncausal else "sliding_window"
+    name = f"{prefix}_attention_naive_{phase}"
+    module = flash_attention_naive if noncausal else sliding_window_attention
+    q = torch.zeros(
+        2 if invalid == "batch" else 1, 1, 2, 1, 32 if invalid == "head" else 64
+    )
+    monkeypatch.setattr(torch.ops.rbln_triton_ops, name, lambda *args: q)
+    args = (
+        [q, q, q, q, q, torch.tensor(0.125), q, q]
+        if noncausal
+        else [q, q, q, q, q, q, torch.tensor(0.125), q]
+    )
+    kwargs = dict(
+        sinks=torch.zeros(3 if invalid == "sinks" else 2, 1), use_custom_kernel=True
+    )
+    with pytest.raises(ValueError if invalid == "sinks" else NotImplementedError):
+        getattr(module, name)(*args, **kwargs)

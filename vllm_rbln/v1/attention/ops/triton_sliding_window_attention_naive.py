@@ -40,6 +40,7 @@ def sliding_window_attention_naive_prefill(
     NUM_BATCH: tl.constexpr,
     NUM_BLOCK: tl.constexpr,
     DIM_BLOCK_TABLE: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
 ):
     tl.static_assert(NUM_BATCH == 1)
     NUM_PARTITION: tl.constexpr = 1
@@ -140,20 +141,37 @@ def sliding_window_attention_naive_prefill(
         )
 
         # 2. normal attention calculation with attention mask
+        QUERY_HEAD_DIM: tl.constexpr = HEAD_DIM * (2 if HAS_SINKS else 1)
         query_ptr = tl.make_block_ptr(
             base=query_base,
-            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, QUERY_HEAD_DIM),
             strides=(
-                NUM_HEAD * NUM_GROUP * QUERY_LEN * HEAD_DIM,
-                NUM_GROUP * QUERY_LEN * HEAD_DIM,
-                QUERY_LEN * HEAD_DIM,
-                HEAD_DIM,
+                NUM_HEAD * NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                QUERY_LEN * QUERY_HEAD_DIM,
+                QUERY_HEAD_DIM,
                 1,
             ),
             offsets=(batch_id, 0, 0, 0, 0),
             block_shape=(1, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
             order=(4, 3, 2, 1, 0),
         )
+        if HAS_SINKS:
+            sink_ptr = tl.make_block_ptr(
+                base=query_base,
+                shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, QUERY_HEAD_DIM),
+                strides=(
+                    NUM_HEAD * NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                    NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                    QUERY_LEN * QUERY_HEAD_DIM,
+                    QUERY_HEAD_DIM,
+                    1,
+                ),
+                offsets=(batch_id, 0, 0, 0, HEAD_DIM),
+                block_shape=(1, NUM_HEAD, NUM_GROUP, 1, HEAD_DIM),
+                order=(4, 3, 2, 1, 0),
+            )
+            sink = tl.load(sink_ptr)
         output_ptr = tl.make_block_ptr(
             base=output_base,
             shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
@@ -193,9 +211,14 @@ def sliding_window_attention_naive_prefill(
         # 2.2 b = a * qk_scale
         qk_scaled = qk * qk_scale  # (1,h,g,l,p)
         # 2.3 c = window_softmax(b)
-        window_qk_scaled = rblib.window_softmax(
-            qk_scaled, cache_start, window_size=WINDOW_SIZE
-        )
+        if HAS_SINKS:
+            window_qk_scaled = rblib.window_softmax(
+                qk_scaled, cache_start, window_size=WINDOW_SIZE, sink=sink
+            )
+        else:
+            window_qk_scaled = rblib.window_softmax(
+                qk_scaled, cache_start, window_size=WINDOW_SIZE
+            )
 
         v_state = tl.load(v_block_ptr)
         v_state = tl.reshape(v_state, (1, 1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM))
@@ -234,6 +257,7 @@ def sliding_window_attention_naive_decode(
     NUM_BATCH: tl.constexpr,
     NUM_BLOCK: tl.constexpr,
     DIM_BLOCK_TABLE: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
 ):
     tl.static_assert(QUERY_LEN == 1)
     tl.static_assert(NUM_BATCH >= 1)
@@ -241,6 +265,7 @@ def sliding_window_attention_naive_decode(
     WINDOW_AXIS: tl.constexpr = 4
     PAD_SIZE: tl.constexpr = 63
 
+    QUERY_HEAD_DIM: tl.constexpr = HEAD_DIM * (2 if HAS_SINKS else 1)
     for batch_id in tl.static_range(0, NUM_BATCH, 1):
         # -- get physical block index from block table --
         block_table_ptr = tl.make_block_ptr(
@@ -339,18 +364,34 @@ def sliding_window_attention_naive_decode(
         # 2. normal attention calculation with attention mask
         query_ptr = tl.make_block_ptr(
             base=query_base,
-            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, QUERY_HEAD_DIM),
             strides=(
-                NUM_HEAD * NUM_GROUP * QUERY_LEN * HEAD_DIM,
-                NUM_GROUP * QUERY_LEN * HEAD_DIM,
-                QUERY_LEN * HEAD_DIM,
-                HEAD_DIM,
+                NUM_HEAD * NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                QUERY_LEN * QUERY_HEAD_DIM,
+                QUERY_HEAD_DIM,
                 1,
             ),
             offsets=(batch_id, 0, 0, 0, 0),
             block_shape=(1, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
             order=(4, 3, 2, 1, 0),
         )
+        if HAS_SINKS:
+            sink_ptr = tl.make_block_ptr(
+                base=query_base,
+                shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, QUERY_HEAD_DIM),
+                strides=(
+                    NUM_HEAD * NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                    NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                    QUERY_LEN * QUERY_HEAD_DIM,
+                    QUERY_HEAD_DIM,
+                    1,
+                ),
+                offsets=(batch_id, 0, 0, 0, HEAD_DIM),
+                block_shape=(1, NUM_HEAD, NUM_GROUP, 1, HEAD_DIM),
+                order=(4, 3, 2, 1, 0),
+            )
+            sink = tl.load(sink_ptr)
         output_ptr = tl.make_block_ptr(
             base=output_base,
             shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
@@ -394,9 +435,14 @@ def sliding_window_attention_naive_decode(
         # 2.2 b = a * qk_scale
         qk_scaled = qk * qk_scale  # (1,h,g,l,p)
         # 2.3 c = window_softmax(b)
-        window_qk_scaled = rblib.window_softmax(
-            qk_scaled, cache_start, window_size=WINDOW_SIZE
-        )
+        if HAS_SINKS:
+            window_qk_scaled = rblib.window_softmax(
+                qk_scaled, cache_start, window_size=WINDOW_SIZE, sink=sink
+            )
+        else:
+            window_qk_scaled = rblib.window_softmax(
+                qk_scaled, cache_start, window_size=WINDOW_SIZE
+            )
 
         v_state = tl.load(v_block_ptr)
         v_state = tl.reshape(v_state, (1, 1, NUM_HEAD, 1, QUERY_LEN, HEAD_DIM))
@@ -449,15 +495,16 @@ def sliding_window_attention_naive_prefill_wrapper(
     value = value.to(torch.float32)
     kv_cache = kv_cache.to(torch.float32)
     qk_scale = qk_scale.to(torch.float32)
-    output = torch.empty_like(query)
+    output = torch.empty_like(query[..., : key.shape[-1]])
 
+    HAS_SINKS = query.shape[-1] != key.shape[-1]
     query = rblib.align_tensor_last_dim_to_64(query)
     key = rblib.align_tensor_last_dim_to_64(key)
     value = rblib.align_tensor_last_dim_to_64(value)
 
     NUM_HEAD = query.shape[1]
     NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
+    HEAD_DIM = key.shape[-1]
     QUERY_LEN = query.shape[-2]
     WINDOW_SIZE = kv_cache.shape[-2]
     NUM_BATCH = query.shape[0]
@@ -483,6 +530,7 @@ def sliding_window_attention_naive_prefill_wrapper(
         NUM_BATCH,
         NUM_BLOCK,
         DIM_BLOCK_TABLE,
+        HAS_SINKS,
     ]
 
     warmup(sliding_window_attention_naive_prefill, *params)
@@ -502,7 +550,7 @@ def _(
     block_table: torch.Tensor,
     dummy: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty_like(query)
+    return torch.empty_like(query[..., : key.shape[-1]])
 
 
 @triton_op("rbln_triton_ops::sliding_window_attention_naive_decode", mutates_args=())
@@ -524,15 +572,16 @@ def sliding_window_attention_naive_decode_wrapper(
     value = value.to(torch.float32)
     kv_cache = kv_cache.to(torch.float32)
     qk_scale = qk_scale.to(torch.float32)
-    output = torch.empty_like(query)
+    output = torch.empty_like(query[..., : key.shape[-1]])
 
+    HAS_SINKS = query.shape[-1] != key.shape[-1]
     query = rblib.align_tensor_last_dim_to_64(query)
     key = rblib.align_tensor_last_dim_to_64(key)
     value = rblib.align_tensor_last_dim_to_64(value)
 
     NUM_HEAD = query.shape[1]
     NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
+    HEAD_DIM = key.shape[-1]
     QUERY_LEN = query.shape[-2]
     WINDOW_SIZE = kv_cache.shape[-2]
     NUM_BATCH = query.shape[0]
@@ -558,6 +607,7 @@ def sliding_window_attention_naive_decode_wrapper(
         NUM_BATCH,
         NUM_BLOCK,
         DIM_BLOCK_TABLE,
+        HAS_SINKS,
     ]
 
     warmup(sliding_window_attention_naive_decode, *params)
@@ -577,4 +627,4 @@ def _(
     block_table: torch.Tensor,
     dummy: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty_like(query)
+    return torch.empty_like(query[..., : key.shape[-1]])

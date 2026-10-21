@@ -14,7 +14,10 @@
 
 import torch
 
-from . import triton_flash_causal_attention  # noqa: F401
+from . import (
+    pack_attention_sinks,
+    triton_flash_causal_attention,  # noqa: F401
+)
 
 
 def flash_causal_attention_naive_prefill(
@@ -34,7 +37,9 @@ def flash_causal_attention_naive_prefill(
     is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     if use_custom_kernel:
-        return torch.ops.rbln_triton_ops.flash_causal_attention_naive_prefill(
+        output_dtype = q.dtype
+        q = pack_attention_sinks(q, sinks, is_prefill=True)
+        output = torch.ops.rbln_triton_ops.flash_causal_attention_naive_prefill(
             q,
             k,
             v,
@@ -44,6 +49,7 @@ def flash_causal_attention_naive_prefill(
             block_tables,
             scale,  # dummy
         )
+        return output.to(output_dtype)
     else:
         return torch.ops.rbln_custom_ops.flash_causal_attention_naive_prefill(
             q,
@@ -79,7 +85,9 @@ def flash_causal_attention_naive_decode(
     is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     if use_custom_kernel:
-        return torch.ops.rbln_triton_ops.flash_causal_attention_naive_decode(
+        output_dtype = q.dtype
+        q = pack_attention_sinks(q, sinks, is_prefill=False)
+        output = torch.ops.rbln_triton_ops.flash_causal_attention_naive_decode(
             q,
             k,
             v,
@@ -89,6 +97,7 @@ def flash_causal_attention_naive_decode(
             block_tables,
             scale,  # dummy,
         )
+        return output.to(output_dtype)
     else:
         return torch.ops.rbln_custom_ops.flash_causal_attention_naive_decode(
             q,

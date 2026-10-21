@@ -40,6 +40,7 @@ def flash_causal_attention_naive_prefill(
     MAX_SEQ_LEN: tl.constexpr,
     NUM_BLOCK: tl.constexpr,
     DIM_BLOCK_TABLE: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
 ):
     tl.static_assert(MAX_SEQ_LEN % PARTITION_SIZE == 0)
     NUM_PARTITION: tl.constexpr = MAX_SEQ_LEN // PARTITION_SIZE
@@ -47,20 +48,37 @@ def flash_causal_attention_naive_prefill(
     tl.static_assert(NUM_BATCH == 1)
 
     for batch_id in tl.static_range(0, NUM_BATCH, 1):
+        QUERY_HEAD_DIM: tl.constexpr = HEAD_DIM * (2 if HAS_SINKS else 1)
         query_ptr = tl.make_block_ptr(
             base=query_base,
-            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, QUERY_HEAD_DIM),
             strides=(
-                NUM_HEAD * NUM_GROUP * QUERY_LEN * HEAD_DIM,
-                NUM_GROUP * QUERY_LEN * HEAD_DIM,
-                QUERY_LEN * HEAD_DIM,
-                HEAD_DIM,
+                NUM_HEAD * NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                QUERY_LEN * QUERY_HEAD_DIM,
+                QUERY_HEAD_DIM,
                 1,
             ),
             offsets=(batch_id, 0, 0, 0, 0),
             block_shape=(1, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
             order=(4, 3, 2, 1, 0),
         )
+        if HAS_SINKS:
+            sink_ptr = tl.make_block_ptr(
+                base=query_base,
+                shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, QUERY_HEAD_DIM),
+                strides=(
+                    NUM_HEAD * NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                    NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                    QUERY_LEN * QUERY_HEAD_DIM,
+                    QUERY_HEAD_DIM,
+                    1,
+                ),
+                offsets=(batch_id, 0, 0, 0, HEAD_DIM),
+                block_shape=(1, NUM_HEAD, NUM_GROUP, 1, HEAD_DIM),
+                order=(4, 3, 2, 1, 0),
+            )
+            sink = tl.load(sink_ptr)
         output_ptr = tl.make_block_ptr(
             base=output_base,
             shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
@@ -205,6 +223,13 @@ def flash_causal_attention_naive_prefill(
                             qk_scaled, block_offset, row_max_prev
                         )
                     )
+                elif HAS_SINKS:
+                    # Later partitions carry the first partition's sink mass in row_sum.
+                    row_max_global, row_exp_normalize, row_sum_cur = (
+                        rblib.dynamic_flash_attn_tile(
+                            qk_scaled, block_offset, sink=sink
+                        )
+                    )
                 else:
                     row_max_global, row_exp_normalize, row_sum_cur = (
                         rblib.dynamic_flash_attn_tile(qk_scaled, block_offset)
@@ -282,27 +307,45 @@ def flash_causal_attention_naive_decode(
     MAX_SEQ_LEN: tl.constexpr,
     NUM_BLOCK: tl.constexpr,
     DIM_BLOCK_TABLE: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
 ):
     tl.static_assert(MAX_SEQ_LEN % PARTITION_SIZE == 0)
     NUM_PARTITION: tl.constexpr = MAX_SEQ_LEN // PARTITION_SIZE
     DYNAMIC_AXIS: tl.constexpr = 4
     tl.static_assert(NUM_BATCH >= 1)
 
+    QUERY_HEAD_DIM: tl.constexpr = HEAD_DIM * (2 if HAS_SINKS else 1)
     for batch_id in tl.static_range(0, NUM_BATCH, 1):
         query_ptr = tl.make_block_ptr(
             base=query_base,
-            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
+            shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, QUERY_HEAD_DIM),
             strides=(
-                NUM_HEAD * NUM_GROUP * QUERY_LEN * HEAD_DIM,
-                NUM_GROUP * QUERY_LEN * HEAD_DIM,
-                QUERY_LEN * HEAD_DIM,
-                HEAD_DIM,
+                NUM_HEAD * NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                QUERY_LEN * QUERY_HEAD_DIM,
+                QUERY_HEAD_DIM,
                 1,
             ),
             offsets=(batch_id, 0, 0, 0, 0),
             block_shape=(1, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
             order=(4, 3, 2, 1, 0),
         )
+        if HAS_SINKS:
+            sink_ptr = tl.make_block_ptr(
+                base=query_base,
+                shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, QUERY_HEAD_DIM),
+                strides=(
+                    NUM_HEAD * NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                    NUM_GROUP * QUERY_LEN * QUERY_HEAD_DIM,
+                    QUERY_LEN * QUERY_HEAD_DIM,
+                    QUERY_HEAD_DIM,
+                    1,
+                ),
+                offsets=(batch_id, 0, 0, 0, HEAD_DIM),
+                block_shape=(1, NUM_HEAD, NUM_GROUP, 1, HEAD_DIM),
+                order=(4, 3, 2, 1, 0),
+            )
+            sink = tl.load(sink_ptr)
         output_ptr = tl.make_block_ptr(
             base=output_base,
             shape=(NUM_BATCH, NUM_HEAD, NUM_GROUP, QUERY_LEN, HEAD_DIM),
@@ -446,6 +489,12 @@ def flash_causal_attention_naive_decode(
                             qk_scaled, block_offset, row_max_prev
                         )
                     )
+                elif HAS_SINKS:
+                    row_max_global, row_exp_normalize, row_sum_cur = (
+                        rblib.dynamic_flash_attn_tile(
+                            qk_scaled, block_offset, sink=sink
+                        )
+                    )
                 else:
                     row_max_global, row_exp_normalize, row_sum_cur = (
                         rblib.dynamic_flash_attn_tile(qk_scaled, block_offset)
@@ -532,15 +581,16 @@ def flash_causal_attention_naive_prefill_wrapper(
     kv_cache = kv_cache.to(torch.float32)
     qk_scale = qk_scale.to(torch.float32)
 
-    output = torch.empty_like(query)
+    output = torch.empty_like(query[..., : key.shape[-1]])
 
+    HAS_SINKS = query.shape[-1] != key.shape[-1]
     query = rblib.align_tensor_last_dim_to_64(query)
     key = rblib.align_tensor_last_dim_to_64(key)
     value = rblib.align_tensor_last_dim_to_64(value)
 
     NUM_HEAD = query.shape[1]
     NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
+    HEAD_DIM = key.shape[-1]
     QUERY_LEN = query.shape[-2]
     PARTITION_SIZE = kv_cache.shape[-2]
     MAX_SEQ_LEN = PARTITION_SIZE * seq_idx.shape[1]
@@ -567,6 +617,7 @@ def flash_causal_attention_naive_prefill_wrapper(
         MAX_SEQ_LEN,
         NUM_BLOCK,
         DIM_BLOCK_TABLE,
+        HAS_SINKS,
     ]
 
     warmup(flash_causal_attention_naive_prefill, *params)
@@ -585,7 +636,7 @@ def _(
     block_table: torch.Tensor,
     dummy0: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty_like(query)
+    return torch.empty_like(query[..., : key.shape[-1]])
 
 
 @triton_op("rbln_triton_ops::flash_causal_attention_naive_decode", mutates_args=())
@@ -607,15 +658,16 @@ def flash_causal_attention_naive_decode_wrapper(
     kv_cache = kv_cache.to(torch.float32)
     qk_scale = qk_scale.to(torch.float32)
 
-    output = torch.empty_like(query)
+    output = torch.empty_like(query[..., : key.shape[-1]])
 
+    HAS_SINKS = query.shape[-1] != key.shape[-1]
     query = rblib.align_tensor_last_dim_to_64(query)
     key = rblib.align_tensor_last_dim_to_64(key)
     value = rblib.align_tensor_last_dim_to_64(value)
 
     NUM_HEAD = query.shape[1]
     NUM_GROUP = query.shape[2]
-    HEAD_DIM = query.shape[-1]
+    HEAD_DIM = key.shape[-1]
     QUERY_LEN = query.shape[-2]
     PARTITION_SIZE = kv_cache.shape[-2]
     MAX_SEQ_LEN = PARTITION_SIZE * seq_idx.shape[1]
@@ -642,6 +694,7 @@ def flash_causal_attention_naive_decode_wrapper(
         MAX_SEQ_LEN,
         NUM_BLOCK,
         DIM_BLOCK_TABLE,
+        HAS_SINKS,
     ]
 
     warmup(flash_causal_attention_naive_decode, *params)
@@ -660,4 +713,4 @@ def _(
     block_table: torch.Tensor,
     dummy0: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.empty_like(query)
+    return torch.empty_like(query[..., : key.shape[-1]])

@@ -32,6 +32,10 @@ def flash_attention_naive_prefill(
     is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     if use_custom_kernel:
+        if sinks is not None:
+            raise NotImplementedError(
+                "Triton non-causal attention does not support sinks"
+            )
         return torch.ops.rbln_triton_ops.flash_attention_naive_prefill(
             q,
             k,
@@ -74,6 +78,10 @@ def flash_attention_naive_decode(
     is_prompt_sorted: bool = False,
 ) -> torch.Tensor:
     if use_custom_kernel:
+        if sinks is not None:
+            raise NotImplementedError(
+                "Triton non-causal attention does not support sinks"
+            )
         return torch.ops.rbln_triton_ops.flash_attention_naive_decode(
             q,
             k,
