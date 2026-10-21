@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,7 @@ else:
     VllmConfig = None
 
 import rebel
+import vllm
 import vllm.logger as vllm_logger
 from torch._dynamo import register_backend
 from vllm.logger import init_logger
@@ -368,6 +370,19 @@ class RblnPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         _impl().check_and_update(vllm_config)
+
+        # Same as CpuPlatform: preload the tcmalloc that vLLM's CPU wheel ships
+        # (source builds don't). LD_PRELOAD only takes effect at exec, so a
+        # forked child would never see it; hence spawn.
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        ld_preload = os.environ.get("LD_PRELOAD", "")
+        if "libtcmalloc" not in ld_preload:
+            vllm_libs = os.path.join(os.path.dirname(vllm.__file__), "libs")
+            tcmalloc = glob.glob(os.path.join(vllm_libs, "libtcmalloc*.so*"))
+            if tcmalloc:
+                os.environ["LD_PRELOAD"] = ":".join(
+                    filter(None, [tcmalloc[0], ld_preload])
+                )
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.distributed_executor_backend not in (None, "mp", "uni"):
