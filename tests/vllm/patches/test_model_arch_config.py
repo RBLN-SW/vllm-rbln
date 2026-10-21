@@ -78,6 +78,15 @@ class TestEagleDraftConvertor:
 
         assert EagleDraftConvertor(draft, draft).is_deepseek_mla() is False
 
+    def test_an_upstream_target_keeps_upstreams_answer(self, monkeypatch):
+        def _unexpected(*args, **kwargs):
+            raise AssertionError("upstream's convertor must not be consulted")
+
+        monkeypatch.setitem(MODEL_ARCH_CONFIG_CONVERTORS, "upstream", _unexpected)
+        draft = self._draft("upstream", kv_lora_rank=512)
+
+        assert EagleDraftConvertor(draft, draft).is_deepseek_mla() is False
+
     def test_registration_takes_the_eagle_type(self, monkeypatch):
         monkeypatch.delitem(MODEL_ARCH_CONFIG_CONVERTORS, "eagle", raising=False)
 
