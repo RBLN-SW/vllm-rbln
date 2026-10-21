@@ -653,6 +653,10 @@ class TestFlashImplInit:
         with pytest.raises(NotImplementedError, match="--rbln-use-custom-kernel"):
             make_impl(cfg_custom_kernel, kv_cache_dtype="fp8")
 
+    def test_sinks_with_custom_kernel_raises(self, cfg_custom_kernel):
+        with pytest.raises(NotImplementedError, match="sinks are not supported"):
+            make_impl(cfg_custom_kernel, sinks=torch.zeros(8))
+
     def test_logits_soft_cap_disabled_with_warning(self, cfg, monkeypatch):
         # RBLN does not support a logits soft cap: it warns and forces it to 0.
         from vllm_rbln.v1.attention.backends import flash_attention

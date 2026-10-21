@@ -448,6 +448,12 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             )
             if len(self.sinks.size()) == 1:
                 self.sinks = self.sinks[:, None]
+            if self.use_custom_kernel:
+                raise NotImplementedError(
+                    "Attention sinks are not supported with "
+                    "--rbln-use-custom-kernel: the rbln_triton_ops attention "
+                    "kernels take no sinks input."
+                )
 
         self.is_causal = not vllm_config.attention_config.use_non_causal
         self.is_batch_attention_opt = rbln_config.use_batch_attn_opt
