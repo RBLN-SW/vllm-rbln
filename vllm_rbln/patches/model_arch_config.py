@@ -44,7 +44,7 @@ class EagleDraftConvertor(ModelArchConfigConvertorBase):
         convertor_cls = MODEL_ARCH_CONFIG_CONVERTORS.get(
             getattr(target, "model_type", None)
         )
-        if convertor_cls is None:
+        if convertor_cls is not KvLoraRankMLAConvertor:
             return super().is_deepseek_mla()
         return convertor_cls(target, target, revision=self.revision).is_deepseek_mla()
 

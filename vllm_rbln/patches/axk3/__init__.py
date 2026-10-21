@@ -28,7 +28,11 @@ def register_axk3() -> None:
 
     from vllm_rbln.patches.axk3.config import AXK3Config
 
-    if ARCH in ModelRegistry.get_supported_archs():
+    registered = ModelRegistry.models.get(ARCH)
+    if registered is not None and (
+        getattr(registered, "module_name", None),
+        getattr(registered, "class_name", None),
+    ) != tuple(MODEL_CLASS_PATH.split(":")):
         raise RuntimeError(
             "upstream vLLM now ships the axk3 architecture; delete "
             "vllm_rbln/patches/axk3/ and this registration."

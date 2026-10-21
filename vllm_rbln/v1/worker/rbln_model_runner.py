@@ -3145,8 +3145,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # every later one; take the position the list actually gives it.
         for position, layer_name in enumerate(self.kv_cache_names):
             layer = forward_context[layer_name]
-            if hasattr(layer, "layer_index"):
-                layer.layer_index = position
+            assert hasattr(layer, "layer_index"), layer_name
+            layer.layer_index = position
 
         if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
