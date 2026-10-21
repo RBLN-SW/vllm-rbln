@@ -421,6 +421,78 @@ def test_pooling_warmup_runs_without_language_model_head(monkeypatch):
     cache.save.assert_called_once_with("pooling", cache.config_signature.return_value)
 
 
+def test_run_model_graphs_returns_single_token_decode_logits():
+    decode_logits = {n: torch.zeros(n, 8) for n in (1, 4)}
+
+    def fake_dummy_run(num_reqs, query_len, is_prefill, **kwargs):
+        return None if is_prefill else decode_logits[num_reqs]
+
+    runner = _make_runner_stub(
+        max_num_tokens=16,
+        speculative_config=None,
+        specialized_moe_decode=False,
+        bucketing_manager=SimpleNamespace(decode_batch_buckets=[1, 4]),
+        _dummy_run=fake_dummy_run,
+    )
+
+    assert runner.run_model_graphs() == decode_logits
+
+
+def test_sampler_warmup_runs_on_decode_logits(monkeypatch):
+    cache = SimpleNamespace(config_signature=Mock(), load=Mock(), save=Mock())
+    monkeypatch.setattr(mr, "mega_cache", cache)
+    monkeypatch.setattr(mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    decode_logits = {1: torch.zeros(1, 8), 4: torch.zeros(4, 8)}
+    runner = _make_runner_stub(
+        vllm_config=None,
+        model_config=SimpleNamespace(model="m"),
+        is_pooling_model=False,
+        run_model_graphs=Mock(return_value=decode_logits),
+        offload_context=nullcontext,
+        bucketing_manager=SimpleNamespace(batch_buckets=[1, 2, 4]),
+        _dummy_sampler_run=Mock(),
+        _warmup_sampler_decode_batches=Mock(),
+        _warmup_mm_encoder=Mock(),
+        drafter=None,
+    )
+
+    runner.warmup_model()
+
+    calls = runner._dummy_sampler_run.call_args_list
+    assert [c.args for c in calls] == [
+        (1, decode_logits[1]),
+        (2, None),
+        (4, decode_logits[4]),
+    ]
+
+
+def test_sampler_warmup_falls_back_on_mismatched_logits():
+    runner = _make_runner_stub(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 32),
+        sampler=Mock(),
+        input_batch=SimpleNamespace(
+            temperature=torch.ones(2),
+            top_p=torch.ones(2),
+            top_k=torch.ones(2, dtype=torch.int32),
+            frequency_penalties=torch.zeros(2),
+            presence_penalties=torch.zeros(2),
+            repetition_penalties=torch.ones(2),
+        ),
+    )
+    held = torch.zeros(2, 32)
+
+    runner._dummy_sampler_run(2, held)
+    assert all(c.kwargs["logits"] is held for c in runner.sampler.call_args_list)
+
+    runner.sampler.reset_mock()
+    runner._dummy_sampler_run(2, torch.zeros(4, 32))
+    assert all(
+        c.kwargs["logits"].shape == (2, 32) for c in runner.sampler.call_args_list
+    )
+
+
 @pytest.mark.parametrize("num_reqs", [1, 2])
 def test_reference_sampler_warmup_finishes(num_reqs):
     runner = _make_runner_stub(

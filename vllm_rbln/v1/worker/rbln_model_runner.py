@@ -2683,8 +2683,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         *,
         num_tokens_padded_override: int | None = None,
         warmup: bool = True,
-    ) -> None:
+    ) -> torch.Tensor | None:
         """Run a dummy forward pass, in one of two modes.
+
+        Returns the logits on the last PP rank, else None.
 
         warmup=True (default, compile-time): trigger compilation of the graph
         for this (num_reqs, num_tokens_per_req) shape ahead of serving.
@@ -2819,7 +2821,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             num_padded_tokens=batch_desc.num_tokens_padded,
             **build_kv_cache_forward_context_kwargs(self.kv_cache_bases),
         ):
-            _ = self.model_executable(
+            model_output = self.model_executable(
                 **staged_model_input.as_kwargs(), **self._dummy_mm_kwargs(layout)
             )
             # The submission a step with no forward of its own was waiting for.
@@ -2846,6 +2848,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         self.input_batch.num_tokens_no_spec[:num_reqs] = 0
 
+        if not get_pp_group().is_last_rank:
+            return None
+        return model_output[1]
+
     def _dummy_mm_kwargs(self, layout: InputLayout) -> dict[str, torch.Tensor]:
         """All-text ``mm_embeds`` / ``mm_mask`` for a dummy prefill"""
         if not (
@@ -2861,14 +2867,17 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         return {"mm_embeds": mm_embeds, "mm_mask": mm_mask}
 
     @torch.inference_mode()
-    def _dummy_sampler_run(self, num_reqs: int) -> None:
+    def _dummy_sampler_run(
+        self, num_reqs: int, logits: torch.Tensor | None = None
+    ) -> None:
         from vllm_rbln.v1.sample import WARM_UP_CONFIGS
 
-        logits = torch.randn(
-            (num_reqs, self.model_config.get_vocab_size()),
-            device=self.device,
-            dtype=self.dtype,
-        )
+        if logits is None or logits.dim() != 2 or logits.shape[0] != num_reqs:
+            logits = torch.randn(
+                (num_reqs, self.model_config.get_vocab_size()),
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         for config in WARM_UP_CONFIGS:
             dummy_metadata = SamplingMetadata(
@@ -3790,8 +3799,11 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 bonus_logits=bonus_kwargs.get("bonus_logits"),
             )
 
-    def run_model_graphs(self) -> None:
-        """Every model graph once, at the shapes serving will ask for."""
+    def run_model_graphs(self) -> dict[int, torch.Tensor]:
+        """Every model graph once, at the shapes serving will ask for.
+
+        Returns the single-token decode logits by batch bucket.
+        """
         # 1. prefill
         self._dummy_run(1, self.max_num_tokens, True)
 
@@ -3804,9 +3816,12 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 if self.uses_fixed_decode_window
                 else [1, spec_query_len]
             )
+        decode_logits: dict[int, torch.Tensor] = {}
         for num_req in self.bucketing_manager.decode_batch_buckets:
             for query_len in query_lens:
-                self._dummy_run(num_req, query_len, False)
+                logits = self._dummy_run(num_req, query_len, False)
+                if query_len == 1 and logits is not None:
+                    decode_logits[num_req] = logits
 
         if self.specialized_moe_decode:
             # NOTE(RBLN): Compile decode graphs with prefill-sized padding to
@@ -3833,6 +3848,8 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     * (self.speculative_config.num_speculative_tokens + 1),
                 )
 
+        return decode_logits
+
     def warmup_model(self) -> None:
         # NOTE(RBLN): Warm-up must not route through execute_model() while a
         # KV transfer group exists: the KV-connector mixin asserts
@@ -3844,7 +3861,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         sig = mega_cache.config_signature(self.vllm_config)
         mega_cache.load(self.model_config.model, sig)
         with set_compile_stage("warmup"), self.offload_context():
-            self.run_model_graphs()
+            decode_logits = self.run_model_graphs()
 
             # NOTE(RBLN): the sampler and the rejection sampler are built on the
             # last PP rank only, so no other rank has anything to warm up here.
@@ -3852,7 +3869,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 # 4-1. sampler
                 if not self.is_pooling_model:
                     for size in self.bucketing_manager.batch_buckets:
-                        self._dummy_sampler_run(size)
+                        self._dummy_sampler_run(size, decode_logits.get(size))
 
                 # 4-2. rejection sampler
                 self._warmup_sampler_decode_batches()
