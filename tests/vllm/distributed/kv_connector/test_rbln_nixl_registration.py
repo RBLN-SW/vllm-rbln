@@ -184,6 +184,30 @@ TOKEN_AXIS = 4
 MLA_TOKEN_AXIS = 1
 
 
+# Pipeline stages of a model that mixes attention backends, each holding a
+# different set of them. A peer pairs with every stage, so every stage has to
+# publish the same hash.
+_STAGES = (
+    ("BACKEND_A", ("BACKEND_A", "BACKEND_B")),
+    ("BACKEND_B", ("BACKEND_B",)),
+    ("BACKEND_A", ("BACKEND_A",)),
+)
+
+
+def _backends(names):
+    return [MagicMock(**{"get_name.return_value": name}) for name in names]
+
+
+def _hashed_backend_name():
+    """The `attn_backend_name` the last upstream hash call was given."""
+    call = registration.compute_nixl_compatibility_hash.call_args
+    assert call is not None, "nothing reached the upstream hash"
+    bound = inspect.signature(compute_nixl_compatibility_hash).bind(
+        *call.args, **call.kwargs
+    )
+    return bound.arguments["attn_backend_name"]
+
+
 def _probe_kv_shape(topo):
     topo.kv_head_dim, topo.kv_token_dim = HEAD_AXIS, TOKEN_AXIS
 
@@ -464,6 +488,42 @@ class TestRegisterKvCaches:
             RegionGeometry(ChipletSplitAxis.HEAD, 1, (AreaPlace(0x2000, 2048, 0),)),
         ]
 
+    def test_host_staging_publishes_one_hash_across_pipeline_stages(self, monkeypatch):
+        # This path keeps upstream's registration, whose hash takes the rank's
+        # first backend; what it publishes must not.
+        names, published = [], []
+        for backend_name, backends in _STAGES:
+            worker = build_worker(
+                monkeypatch, kv_buffer_device="cpu", nixl_available=True
+            )
+            worker.backend_name = backend_name
+            worker.attn_backends = _backends(backends)
+            worker.nixl_wrapper = "wrapper"
+            worker.topo.cross_layers_blocks = False
+            worker._layer_specs = {"layer0": _impl_layer_spec()}
+            worker.block_len_per_layer = [2048, 2048]
+            worker.tp_rank = 0
+            worker.kv_caches_base_addr = {
+                worker.engine_id: {worker.tp_rank: [0x1000, 0x2000]}
+            }
+            worker.compat_hash = f"upstream-{backend_name}"
+            worker.xfer_handshake_metadata = MagicMock()
+            monkeypatch.setattr(
+                sys.modules["nixl_rbln"],
+                "ensure_rbln_backend",
+                lambda wrapper, device_id=0, **kw: None,
+                raising=False,
+            )
+            monkeypatch.setattr(
+                NixlBaseConnectorWorker, "register_kv_caches", lambda self, kv: None
+            )
+            with _patch_worker_nixl_symbols(MagicMock()):
+                worker.register_kv_caches({"layer0": "tensor"})
+                names.append(_hashed_backend_name())
+            published.append(worker.compat_hash)
+
+        assert len(set(names)) == len(set(published)) == 1
+
     @pytest.mark.parametrize(
         "stripe_width, passed",
         [(None, {}), (0, {"stripe_width": 0}), (4096, {"stripe_width": 4096})],
@@ -647,6 +707,22 @@ class TestRegisterKvCachesImpl:
         )
         bound.apply_defaults()
         assert bound.arguments["transfer_mode"] == worker._TRANSFER_MODE
+
+    def test_the_compat_hash_is_equal_across_pipeline_stages(self, monkeypatch):
+        names, published = [], []
+        for backend_name, backends in _STAGES:
+            worker = _prep_impl_worker(monkeypatch)
+            worker.backend_name = backend_name
+            worker.attn_backends = _backends(backends)
+            spec = _impl_layer_spec()
+            worker._layer_specs = {"l0": spec, "l1": spec}
+            kv_caches = _impl_kv_caches(num_blocks=worker.num_blocks)
+            with _registering(worker, _impl_topo(_split_kv(worker.num_blocks))):
+                worker._register_kv_caches_impl(kv_caches)
+                names.append(_hashed_backend_name())
+            published.append(worker.compat_hash)
+
+        assert len(set(names)) == len(set(published)) == 1
 
     def test_region_group_ids_index_the_transfer_groups(self, monkeypatch):
         # Upstream's descriptor machinery indexes `transfer_groups`, so a
@@ -1462,7 +1538,6 @@ class TestPublishHandshakeMetadata:
         # __init__ never ran, so the writer state shutdown() reaches through
         # __del__ is absent; silence it rather than leak an unraisable at GC.
         w.shutdown = lambda: None
-        w.compat_hash = "BASE"
         # _check_pp_constraints reads these; a plain PP producer passes.
         w.vllm_config = mock_vllm_config()
         w.vllm_config.parallel_config.pipeline_parallel_size = pp_size
@@ -1489,7 +1564,12 @@ class TestPublishHandshakeMetadata:
         pp_group = MagicMock()
         pp_group.rank_in_group = pp_rank
         pp_group.world_size = pp_size
-        with patched_in_package("get_pp_group", MagicMock(return_value=pp_group)):
+        with (
+            patched_in_package("get_pp_group", MagicMock(return_value=pp_group)),
+            patched_in_package(
+                "compute_nixl_compatibility_hash", MagicMock(return_value="BASE")
+            ),
+        ):
             w._publish_handshake_metadata(
                 self._base_meta(layer_names) if base_meta is None else base_meta
             )

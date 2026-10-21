@@ -201,8 +201,14 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
                 else 0
             ),
         )
-        base_hash = self.compat_hash
-        assert base_hash is not None
+        # Upstream hashes the first attention backend among this rank's layers,
+        # which can differ between pipeline stages of a model that mixes backends,
+        # so a peer pairing with every stage would fail the hash on some of them.
+        # Both registration paths reach here; on host staging upstream has
+        # already hashed that backend, and this replaces it.
+        base_hash = compute_nixl_compatibility_hash(
+            self.vllm_config, "RBLN", transfer_mode=self._TRANSFER_MODE
+        )
         self.compat_hash = rbln_compat_hash(
             base_hash,
             writes_into_peer=self._writes_into_peer,
@@ -234,11 +240,6 @@ class RblnNixlRegistrationMixin(RblnNixlWorkerState):
             if not self._has_mamba
             else None,
             is_mamba=self._has_mamba,
-        )
-        self.compat_hash = compute_nixl_compatibility_hash(
-            self.vllm_config,
-            self.backend_name,
-            transfer_mode=self._TRANSFER_MODE,
         )
 
         # Device id for the RBLN backend's RblnContext.
