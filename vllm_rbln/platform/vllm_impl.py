@@ -21,7 +21,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_rbln import envs
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -219,7 +219,7 @@ def _validate(vllm_config: "VllmConfig") -> None:
 
     # FIXME(jiwoo.park) This is a temporary workaround.
     if model_config.enforce_eager:
-        if not USE_DEVICE_TENSOR:
+        if not use_device_tensor():
             raise ValueError(
                 "enforce_eager=True requires VLLM_RBLN_USE_DEVICE_TENSOR=1. "
                 "Eager mode bypasses torch.compile, so ops must dispatch "

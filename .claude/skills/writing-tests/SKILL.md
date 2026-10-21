@@ -64,7 +64,7 @@ There is no `e2e/` directory today; four such files sit in four different subsys
 
 Read `tests/vllm/conftest.py` for the full text; the constraints that bite:
 
-- `--device-tensor {0,1}` is session-wide. `platform/__init__.py` resolves it at module scope and several modules copy the value into their own namespace, so it **cannot** be parametrized per test. Run the suite once per value.
+- `--device-tensor {0,1}` is session-wide. `platform/__init__.py` resolves it at module scope into `RblnPlatform.device_type` and friends, so it **cannot** be parametrized per test. Run the suite once per value.
 - `--num-hidden-layers N` builds only the first N decoder layers to cut compile time, and `hf_runner` truncates to the same N so comparisons stay like-for-like. Default is 3; `0` means the whole model.
 - The suite scrubs exported `VLLM_RBLN_*` variables. These options are the way in — do not read the environment directly to get around them.
 

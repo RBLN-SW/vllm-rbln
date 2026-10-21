@@ -33,7 +33,7 @@ from vllm_rbln.compilation import (
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.forward_context import set_forward_context
 from vllm_rbln.logger import init_logger
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_forward_context_kwargs,
@@ -460,7 +460,7 @@ class RBLNEagleProposer(EagleProposer):
                 fullgraph=True,
                 compile_context=self.runner.compile_context,
                 num_devices=1,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                model_trace_method="export" if use_device_tensor() else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runner.runtime_holder,

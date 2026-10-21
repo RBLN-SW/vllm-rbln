@@ -16,7 +16,7 @@ import torch
 from vllm.model_executor.models.deepseek_mtp import DeepSeekMultiTokenPredictorLayer
 
 from vllm_rbln.patches import register_patch
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 
 
 @register_patch(
@@ -29,7 +29,7 @@ from vllm_rbln.platform import USE_DEVICE_TENSOR
         "the RBLN compiler rejects its position-conditional select with "
         "[UNEXPECTED_GRAPH] under device tensor."
     ),
-    condition=lambda: USE_DEVICE_TENSOR,
+    condition=use_device_tensor,
 )
 def patched_deepseek_mtp_layer_forward(
     self: DeepSeekMultiTokenPredictorLayer,

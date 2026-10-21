@@ -126,7 +126,7 @@ from vllm_rbln.model_executor.models.interfaces import (
     SupportsRBLNMultiModal,
     supports_rbln_multimodal,
 )
-from vllm_rbln.platform import USE_DEVICE_TENSOR
+from vllm_rbln.platform import use_device_tensor
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -303,7 +303,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # NOTE(RBLN): Compilation context for marking the KV cache address as static.
         self.compile_context = (
             create_compile_context(use_weight_sharing=True, use_global_ctx=True)
-            if not USE_DEVICE_TENSOR
+            if not use_device_tensor()
             else None
         )
         self.runtime_holder: list = []
@@ -530,7 +530,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         )
 
         self.offload_context = nullcontext
-        if USE_DEVICE_TENSOR and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
+        if use_device_tensor() and not envs.VLLM_RBLN_DISABLE_OFFLOAD:
             self.offload_context = torch.rbln.offload
 
         # What this step's ranks reported. The draft decides its own shapes from
@@ -2494,7 +2494,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 fullgraph=True,
                 compile_context=self.compile_context,
                 num_devices=1,
-                model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                model_trace_method="export" if use_device_tensor() else "",
                 process_group_dict=process_group_dict,
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                 runtime_holder=self.runtime_holder,
@@ -2513,7 +2513,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                         fullgraph=True,
                         compile_context=self.compile_context,
                         num_devices=1,
-                        model_trace_method="export" if USE_DEVICE_TENSOR else "",
+                        model_trace_method="export" if use_device_tensor() else "",
                         process_group_dict=process_group_dict,
                         guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,
                         runtime_holder=self.runtime_holder,
@@ -3102,7 +3102,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         # One buffer per extent, so the layers that alias one cache get one
         # tensor and the rest get their own. Not one pool the layers slice: a
         # graph input is a whole tensor, and dynamo refuses a slice's offset.
-        device = self.device if USE_DEVICE_TENSOR else "meta"
+        device = self.device if use_device_tensor() else "meta"
         extent_of = kv_cache_extents(kv_cache_config)
         buffers = {
             extent: torch.empty(extent[1], dtype=torch.int8, device=device)
@@ -3364,7 +3364,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
             assert hasattr(layer, "layer_index"), layer_name
             layer.layer_index = position
 
-        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
+        if not use_device_tensor() and not self.model_config.enforce_eager:
             # `mark_static_address` is last-write-wins on storage->name. Pin to
             # one canonical layer per pool so the runtime, the connector's host
             # buffers, and the runtime copy path address the same name (and the
@@ -3890,7 +3890,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self,
         copy_ops: list[KVCacheCopyOp],
     ) -> None:
-        if not USE_DEVICE_TENSOR and not self.model_config.enforce_eager:
+        if not use_device_tensor() and not self.model_config.enforce_eager:
             # NOTE(RBLN): The runtime KV-copy interface is no longer actively maintained
             # in this path (--model-impl vllm).
             for op in copy_ops:

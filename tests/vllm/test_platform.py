@@ -57,10 +57,9 @@ _ENGINE_ARGS = dict(
     enable_chunked_prefill=True,
 )
 
-# Modules that bind platform.USE_DEVICE_TENSOR into their own namespace at
-# import. _apply_model_impl cannot reach them, so none may be imported before
-# the model path is resolved.
-_DEVICE_FLAG_COPIERS = frozenset(
+# Modules that read the device flag. The DP launcher of vllm-rbln-executor
+# imports them before the model path is resolved.
+_DEVICE_FLAG_READERS = frozenset(
     {
         "vllm_rbln.patches.deepseek_mtp",
         "vllm_rbln.platform.vllm_impl",
@@ -1429,13 +1428,7 @@ class TestModelImpl:
             )
         assert os.environ[platform.envs.RESOLVED_MODEL_IMPL_ENV] == _UNTOUCHED
 
-    def test_the_modules_that_copy_the_device_flag_import_late(self):
-        """They bind USE_DEVICE_TENSOR at their own import.
-
-        That is only correct while none of them is imported before the path is
-        resolved, so the platform module is the only one _apply_model_impl has
-        to reach. A new early import here would silently pin a stale value.
-        """
+    def test_register_ops_applies_no_patch_before_the_path_is_resolved(self):
         import subprocess
         import sys
 
@@ -1446,10 +1439,7 @@ class TestModelImpl:
             "vllm_rbln.register_model();"
             "vllm_rbln.register_ops();"
             "applied = sys.modules.get('vllm_rbln.patches.registry');"
-            "print(applied and applied._applied_patch_keys,"
-            " [m for m in sys.modules if m in COPIERS])".replace(
-                "COPIERS", repr(_DEVICE_FLAG_COPIERS)
-            )
+            "print(applied and applied._applied_patch_keys)"
         )
         out = subprocess.run(
             [sys.executable, "-c", probe],
@@ -1463,6 +1453,31 @@ class TestModelImpl:
             },
         )
         assert out.returncode == 0, out.stderr[-2000:]
-        # "None []": the registry was never imported, so nothing was applied and
-        # no module bound a stale USE_DEVICE_TENSOR.
-        assert out.stdout.strip().endswith("None []"), out.stdout
+        assert out.stdout.strip().endswith("None"), out.stdout
+
+    def test_a_module_imported_before_resolution_reads_the_resolved_flag(self):
+        import subprocess
+        import sys
+
+        probe = (
+            "import importlib, sys;"
+            "from vllm.platforms import current_platform;"
+            "from vllm_rbln import platform;"
+            "mods = [importlib.import_module(m) for m in sorted(READERS)];"
+            "platform._apply_model_impl('vllm');"
+            "print(platform.USE_DEVICE_TENSOR,"
+            " [m.__name__ for m in mods if hasattr(m, 'USE_DEVICE_TENSOR')])"
+        ).replace("READERS", repr(_DEVICE_FLAG_READERS))
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env={
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("VLLM_RBLN")
+                and k != platform.envs.RESOLVED_MODEL_IMPL_ENV
+            },
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip().endswith("True []"), out.stdout
