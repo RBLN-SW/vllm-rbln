@@ -187,3 +187,11 @@ def test_annotation_uses_profiler_state_after_step(make_worker, should_annotate)
         )
     else:
         profiler.annotate_context_manager.assert_not_called()
+
+
+def test_take_draft_token_ids_delegates_to_runner(make_worker):
+    worker = make_worker(ProfilerConfig())
+    worker.model_runner = Mock()
+    drafts = worker.take_draft_token_ids()
+    assert drafts is worker.model_runner.take_draft_token_ids.return_value
+    worker.model_runner.take_draft_token_ids.assert_called_once_with()

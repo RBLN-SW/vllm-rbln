@@ -23,6 +23,7 @@ from vllm.config import (
     ECTransferConfig,
     ModelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -37,6 +38,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 import vllm_rbln.v1.worker.optimum_model_runner as runner_module
 from vllm_rbln.model_executor.models.optimum.decoder_only import RBLNOptimumForCausalLM
@@ -44,6 +46,7 @@ from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumMultimodalMixin,
 )
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.sample import RBLNRejectionSampler
 from vllm_rbln.v1.worker.optimum_model_runner import RBLNOptimumModelRunner
 
 from .utils import MockModelWrapper, _schedule_new_request, fake_load_model
@@ -54,7 +57,7 @@ DEVICE = current_platform.device_type
 
 
 # TODO add tests for both `enable_prefix_caching = True` and `False`
-def get_vllm_config(async_scheduling=False):
+def get_vllm_config(async_scheduling=False, speculative=False):
     scheduler_config = SchedulerConfig(
         max_num_seqs=10,
         max_num_batched_tokens=128,
@@ -75,7 +78,18 @@ def get_vllm_config(async_scheduling=False):
         cache_config=cache_config,
         model_config=model_config,
         scheduler_config=scheduler_config,
+        speculative_config=(
+            SpeculativeConfig(
+                model="ngram",
+                num_speculative_tokens=3,
+                prompt_lookup_min=1,
+                prompt_lookup_max=2,
+            )
+            if speculative
+            else None
+        ),
         additional_config={
+            "use_custom_sampler": not speculative,
             "sub_block_size": 4,
             "optimum_overrides": {
                 "prefill_chunk_size": 4,
@@ -86,8 +100,8 @@ def get_vllm_config(async_scheduling=False):
 
 
 @pytest.fixture
-def model_runner():
-    vllm_config = get_vllm_config()
+def model_runner(request):
+    vllm_config = get_vllm_config(speculative=getattr(request, "param", False))
     with set_current_vllm_config(vllm_config, check_compile=False):
         temp_file = tempfile.mkstemp()[1]
         init_distributed_environment(
@@ -641,8 +655,6 @@ def test_execute_model_preserves_speculative_query_logits(model_runner):
         [[0], [1], [2], [3]],
         [[4], [5], [6], [7]],
     ]
-    with pytest.raises(NotImplementedError, match="Rejection sampling"):
-        model_runner.sample_tokens(None)
 
 
 def test_execute_model_keeps_the_running_rows_of_the_padded_decode_batch(
@@ -913,3 +925,147 @@ def test_init_rejects_nan_counting(monkeypatch):
 
     with pytest.raises(NotImplementedError, match="VLLM_COMPUTE_NANS_IN_LOGITS"):
         RBLNOptimumModelRunner(get_vllm_config(), DEVICE)
+
+
+@pytest.mark.parametrize("model_runner", [True], indirect=True)
+@pytest.mark.parametrize("num_drafts", [0, 1, 3])
+@pytest.mark.parametrize("reject_at", [0, 1, 3])
+@pytest.mark.parametrize("logprobs", [None, 2])
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_sample_tokens_rejects_drafts_and_updates_request_state(
+    model_runner, num_drafts, reject_at, logprobs, temperature
+):
+    new = _schedule_new_request("r0", "r1", block_ids=([1],), outer_block_ids=[0])
+    for req in new.scheduled_new_reqs:
+        req.sampling_params.temperature = temperature
+        req.sampling_params.logprobs = logprobs
+    model_runner._update_states(new)
+    output = _decode_scheduler_output(["r0", "r1"], [0, 1])
+    output.scheduled_spec_decode_tokens = {"r0": [11, 12, 13]}
+    if num_drafts:
+        output.scheduled_spec_decode_tokens["r1"] = [21, 22, 23][:num_drafts]
+    output.num_scheduled_tokens = {"r0": 4, "r1": num_drafts + 1}
+    output.total_num_scheduled_tokens = sum(output.num_scheduled_tokens.values())
+    predictions = [[11, 12, 13, 14], [21, 22, 23, 24]]
+    predictions[0][reject_at] = 31
+
+    def forward(inputs):
+        logits = torch.full((inputs.padded_batch_size, 4, 40), -100.0)
+        for row in range(2):
+            for pos, token in enumerate(predictions[row]):
+                logits[row, pos, token] = 100.0
+        return logits
+
+    model_runner.model.forward = forward
+    model_runner.execute_model(output)
+    result = model_runner.sample_tokens(None)
+    expected = [predictions[0][: reject_at + 1], predictions[1][: num_drafts + 1]]
+    assert result.sampled_token_ids == expected
+    for row, req_id in enumerate(result.req_ids):
+        assert model_runner.requests[req_id].output_token_ids == expected[row]
+        end = 3 + len(expected[row])
+        assert model_runner.input_batch.num_tokens_no_spec[row] == end
+        assert (
+            model_runner.input_batch.token_ids_cpu[row, 3:end].tolist() == expected[row]
+        )
+    if logprobs is not None:
+        assert result.logprobs.cu_num_generated_tokens == [
+            0,
+            len(expected[0]),
+            sum(map(len, expected)),
+        ]
+    else:
+        assert result.logprobs is None
+    drafts = model_runner.take_draft_token_ids()
+    assert drafts.req_ids == result.req_ids
+    assert len(drafts.draft_token_ids) == 2
+    assert all(len(tokens) <= 3 for tokens in drafts.draft_token_ids)
+
+
+@pytest.mark.parametrize("model_runner", [True], indirect=True)
+def test_sample_tokens_proposes_drafts_after_ordinary_decode(model_runner):
+    new = _schedule_new_request(
+        "r0", block_ids=([1],), outer_block_ids=[0], token_ids=[1, 2, 3, 1, 2]
+    )
+    new.scheduled_new_reqs[0].sampling_params.temperature = 0
+    model_runner._update_states(new)
+    output = _decode_scheduler_output(["r0"], [0])
+    output.scheduled_cached_reqs.num_computed_tokens = [4]
+
+    def forward(inputs):
+        logits = torch.full((inputs.padded_batch_size, 1, 40), -100.0)
+        logits[:, :, 3] = 100.0
+        return logits
+
+    model_runner.model.forward = forward
+    model_runner.execute_model(output)
+    assert model_runner.take_draft_token_ids() is None
+    result = model_runner.sample_tokens(None)
+    assert result.sampled_token_ids == [[3]]
+    drafts = model_runner.take_draft_token_ids()
+    assert drafts.req_ids == ["r0"]
+    assert drafts.draft_token_ids == [[1, 2, 3]]
+
+
+def test_speculative_sampling_uses_real_batch_size_and_last_base_logit(model_runner):
+    model_runner.speculative_config = SpeculativeConfig(
+        model="ngram", num_speculative_tokens=3
+    )
+    model_runner.vllm_config.speculative_config = model_runner.speculative_config
+    model_runner.drafter = runner_module.NgramProposer(model_runner.vllm_config)
+    model_runner.num_spec_tokens = 3
+    # Exercise RBLN metadata without compiling a sampler on the NPU.
+    model_runner.rejection_sampler = RBLNRejectionSampler(
+        Sampler(), use_rbln_sampler=False
+    )
+    new = _schedule_new_request("r0", "r1", "r2", block_ids=([1],), outer_block_ids=[0])
+    for req in new.scheduled_new_reqs:
+        req.sampling_params.temperature = 0
+    model_runner._update_states(new)
+    output = _decode_scheduler_output(["r2", "r0", "r1"], [2, 0, 1])
+    output.scheduled_spec_decode_tokens = {"r2": [21, 22, 23], "r0": [7]}
+    output.num_scheduled_tokens = {"r0": 3, "r1": 1, "r2": 4}
+    output.total_num_scheduled_tokens = 8
+    predictions = [[30, 7, 8, 31], [9, 31, 31, 31], [21, 22, 23, 24]]
+
+    def forward(inputs):
+        logits = torch.full((inputs.padded_batch_size, 4, 40), -100.0)
+        for row, tokens in enumerate(predictions):
+            for pos, token in enumerate(tokens):
+                logits[row, pos, token] = 100.0
+        return logits
+
+    model_runner.model.forward = forward
+    model_runner.execute_model(output)
+    assert model_runner.input_batch.spec_token_ids[:3] == [[7], [], [21, 22, 23]]
+    result = model_runner.sample_tokens(None)
+    assert result.req_ids == ["r0", "r1", "r2"]
+    assert result.sampled_token_ids == [[7, 8], [9], [21, 22, 23, 24]]
+
+    model_runner.sampler = Sampler()
+
+    def transition_forward(inputs):
+        logits = torch.zeros(
+            inputs.padded_batch_size,
+            inputs.input_tokens.shape[1],
+            model_runner.model_config.get_vocab_size(),
+        )
+        logits[:, :, 7] = 10
+        return logits
+
+    model_runner.model.forward = transition_forward
+    for speculative in (False, True, False):
+        step = _decode_scheduler_output(["r0", "r1", "r2"], [0, 1, 2])
+        step.scheduled_cached_reqs.num_computed_tokens = (
+            model_runner.input_batch.num_tokens_no_spec[:3] - 1
+        ).tolist()
+        if speculative:
+            step.scheduled_spec_decode_tokens = {"r0": [7, 7, 7], "r2": [7]}
+            step.num_scheduled_tokens = {"r0": 4, "r1": 1, "r2": 2}
+            step.total_num_scheduled_tokens = 7
+        model_runner.execute_model(step)
+        metadata = model_runner.input_batch.sampling_metadata
+        assert metadata.frequency_penalties.shape[0] == (3 if speculative else 4)
+        result = model_runner.sample_tokens(None)
+        expected = [[7] * 4, [7], [7] * 2] if speculative else [[7], [7], [7]]
+        assert result.sampled_token_ids == expected

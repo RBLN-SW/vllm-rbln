@@ -15,6 +15,7 @@
 from typing import cast
 
 import torch
+from vllm.v1.sample.logits_processor.interface import BatchUpdate
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -93,6 +94,15 @@ class RBLNInputBatch(InputBatch):
         # not num_reqs. Padding slots hold default params and stay
         # no-ops.
         batch_update = self.batch_update_builder.get_and_reset(bucket_size)
+        # Switching between ordinary and speculative sampling changes the
+        # metadata width even when the requests themselves have not changed.
+        if (
+            batch_update is None
+            and self.sampling_metadata.frequency_penalties.shape[0] != bucket_size
+        ):
+            batch_update = BatchUpdate(
+                batch_size=bucket_size, removed=[], added=[], moved=[]
+            )
         if self.thinking_budget_state_holder is not None and batch_update:
             self.thinking_budget_state_holder.sync_batch(batch_update)
         for logit_proc in self.logitsprocs.all:

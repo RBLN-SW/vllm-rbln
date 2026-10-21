@@ -56,6 +56,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -320,6 +321,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Ephemeral state transferred
         # between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        self._draft_token_ids: list[list[int]] | None = None
+        self._draft_token_req_ids: list[str] | None = None
 
         # EC role flags — ec_transfer_config is static, so cache once.
         ec_cfg = getattr(self.vllm_config, "ec_transfer_config", None)
@@ -398,6 +401,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        self._draft_token_ids = None
+        self._draft_token_req_ids = None
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # with self.synchronize_input_prep():
@@ -1203,10 +1208,17 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # snapshot reflects the sorted order.
         self._may_reorder_batch(scheduler_output)
 
-        # Refresh batch metadata with any pending updates.
-        use_padding = self.use_rbln_sampler and self.input_batch.num_reqs > 1
-        if use_padding:
-            # To pad sampling metadata for RBLN sampler
+        for req_id in self.input_batch.req_ids:
+            self.input_batch.update_req_spec_token_ids(
+                self.requests[req_id], scheduler_output.scheduled_spec_decode_tokens
+            )
+
+        if scheduler_output.scheduled_spec_decode_tokens:
+            if self.use_rbln_sampler:
+                self.input_batch.refresh_metadata_rbln(self.input_batch.num_reqs)
+            else:
+                self.input_batch.refresh_metadata()
+        elif self.use_rbln_sampler and self.input_batch.num_reqs > 1:
             self.bucket_size = select_bucket_size(
                 self.input_batch.num_reqs, self.bucket_sizes
             )
@@ -1492,18 +1504,19 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         invalid_req_indices: list[int] = []
         logprobs_lists = None
-        # Get the valid generated tokens.
-        max_gen_len = sampled_token_ids.shape[-1]
-        assert max_gen_len == 1, (
-            "No spec decode tokens. Max generation length must be 1."
-        )
-        # No spec decode tokens.
-        valid_sampled_token_ids = self._to_list(sampled_token_ids)
-        # Mask out the sampled tokens that should not be sampled.
-        # for i in discard_sampled_tokens_req_indices:
-        #     valid_sampled_token_ids[int(i)].clear()
-        if logprobs_tensors is not None:
-            logprobs_lists = logprobs_tensors.tolists()
+        if spec_decode_metadata is not None:
+            valid_sampled_token_ids, logprobs_lists = (
+                self.rejection_sampler.parse_output(
+                    sampled_token_ids,
+                    self.input_batch.vocab_size,
+                    logprobs_tensors=logprobs_tensors,
+                )
+            )
+        else:
+            assert sampled_token_ids.shape[-1] == 1
+            valid_sampled_token_ids = self._to_list(sampled_token_ids)
+            if logprobs_tensors is not None:
+                logprobs_lists = logprobs_tensors.tolists()
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -1624,10 +1637,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # kv_connector_output = self.kv_connector_output
         # self.kv_connector_output = None
         assert self.execute_model_state is not None
-        if self.execute_model_state.scheduler_output.scheduled_spec_decode_tokens:
-            raise NotImplementedError(
-                "Rejection sampling is not connected on the optimum model path yet."
-            )
 
         # Unpack ephemeral state.
         (
@@ -1636,9 +1645,18 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             is_prompt,
             ec_connector_output,
         ) = self.execute_model_state
-        use_padding = self.use_rbln_sampler and self.input_batch.num_reqs > 1
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        spec_decode_metadata = None
+        if scheduler_output.scheduled_spec_decode_tokens:
+            spec_decode_metadata = self._calc_spec_decode_metadata(
+                scheduler_output, logits.shape[1]
+            )
+            logits = logits.flatten(0, 1)[spec_decode_metadata.logits_indices]
+            use_padding = False
+        else:
+            use_padding = self.use_rbln_sampler and self.input_batch.num_reqs > 1
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -1647,19 +1665,6 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
-            if use_padding:
-                num_reqs = self.input_batch.num_reqs
-                padded_logits = self.pooled_tensors[self.bucket_size]
-                padded_logits[:num_reqs].copy_(logits)
-            elif is_prompt:
-                # Among self.input_batch.num_reqs > 1 cases,
-                # only the prefill stage of multimodal models produces logits
-                # with varying strides during the prefill stage.
-                # To avoid frequent recompilations caused by these stride variations,
-                # we flatten the logits into a 2D tensor with shape (1, -1).
-                padded_logits = logits.reshape(1, -1)
-            else:
-                padded_logits = logits
             sampler_start_time = time.perf_counter()
             if hasattr(rebel, "capture_reports"):
                 capture_ctx = rebel.capture_reports()
@@ -1667,7 +1672,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 # use a dummy context manager that does nothing
                 capture_ctx = contextlib.nullcontext()
             with capture_ctx as sampler_reports:
-                sampler_output = self._sample(padded_logits, spec_decode_metadata=None)
+                sampler_output = self._sample(logits, spec_decode_metadata, is_prompt)
             if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
                 collect_metrics(
                     self.sampler_performance_tracker,
@@ -1692,8 +1697,15 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 sampler_output,
                 logits,
                 use_padding,
-                spec_decode_metadata=None,
+                spec_decode_metadata=spec_decode_metadata,
             )
+
+        if self.speculative_config is not None:
+            with record_function_or_nullcontext("rbln_model_runner: draft"):
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    valid_sampled_token_ids
+                )
+                self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
         with record_function_or_nullcontext("rbln_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -1712,18 +1724,100 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         assert not self.use_async_scheduling
         return output
 
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if not self.num_spec_tokens or not self._draft_token_req_ids:
+            return None
+        assert self._draft_token_ids is not None
+        return DraftTokenIds(self._draft_token_req_ids, self._draft_token_ids)
+
+    def propose_draft_token_ids(
+        self,
+        sampled_token_ids: list[list[int]],
+    ) -> list[list[int]]:
+        spec_config = self.speculative_config
+        assert spec_config is not None
+        if spec_config.method == "ngram":
+            assert isinstance(self.drafter, NgramProposer)
+            draft_token_ids = self.drafter.propose(
+                self.num_spec_tokens,
+                sampled_token_ids,
+                self.input_batch.num_tokens_no_spec,
+                self.input_batch.token_ids_cpu,
+            )
+        else:
+            assert spec_config.method == "suffix"
+            assert isinstance(self.drafter, SuffixDecodingProposer)
+            draft_token_ids = self.drafter.propose(
+                self.num_spec_tokens, self.input_batch, sampled_token_ids
+            )
+        return draft_token_ids
+
+    def _calc_spec_decode_metadata(
+        self,
+        scheduler_output: SchedulerOutput,
+        query_length: int,
+    ) -> SpecDecodeMetadata:
+        draft_token_ids = []
+        num_draft_tokens = []
+        logits_indices: list[int] = []
+        target_logits_indices: list[int] = []
+        bonus_logits_indices = []
+        for row, req_id in enumerate(self.input_batch.req_ids):
+            drafts = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+            num_draft_tokens.append(len(drafts))
+            draft_token_ids.extend(drafts)
+            end = scheduler_output.num_scheduled_tokens[req_id]
+            start = end - len(drafts) - 1
+            assert 0 <= start < end <= query_length
+            offset = len(logits_indices)
+            logits_indices.extend(
+                range(row * query_length + start, row * query_length + end)
+            )
+            target_logits_indices.extend(range(offset, offset + len(drafts)))
+            bonus_logits_indices.append(offset + len(drafts))
+        return SpecDecodeMetadata(
+            draft_token_ids=torch.tensor(draft_token_ids, dtype=torch.int32),
+            num_draft_tokens=num_draft_tokens,
+            cu_num_draft_tokens=torch.tensor(
+                np.cumsum(num_draft_tokens, dtype=np.int32)
+            ),
+            cu_num_sampled_tokens=torch.tensor(
+                np.cumsum(np.array(num_draft_tokens) + 1, dtype=np.int32)
+            ),
+            target_logits_indices=torch.tensor(
+                target_logits_indices, dtype=torch.int64
+            ),
+            bonus_logits_indices=torch.tensor(bonus_logits_indices, dtype=torch.int64),
+            logits_indices=torch.tensor(logits_indices, dtype=torch.int64),
+        )
+
     def _sample(
         self,
-        logits: torch.Tensor | None,
+        logits: torch.Tensor,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        is_prompt: bool,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+        if spec_decode_metadata is not None:
+            return self.rejection_sampler(
+                spec_decode_metadata, None, logits, sampling_metadata
+            )
+        if self.use_rbln_sampler and self.input_batch.num_reqs > 1:
+            num_reqs = self.input_batch.num_reqs
+            padded_logits = self.pooled_tensors[self.bucket_size]
+            padded_logits[:num_reqs].copy_(logits)
+        elif is_prompt:
+            # Multimodal prefills can have varying strides. Flatten the single
+            # request's logits to avoid recompiling the ordinary sampler.
+            padded_logits = logits.reshape(1, -1)
+        else:
+            padded_logits = logits
         return self.sampler(
-            logits=logits,
+            logits=padded_logits,
             sampling_metadata=sampling_metadata,
         )
 
