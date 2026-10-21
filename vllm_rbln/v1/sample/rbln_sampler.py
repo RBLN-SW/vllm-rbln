@@ -428,14 +428,16 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "top_p": 0.9,
         "temperature": 0.5,
     },
-    {
-        "name": "topk",
-        "no_penalties": True,
-        "all_greedy": False,
-        "all_random": True,
-        "top_k": 1.0,
-        "temperature": 0.5,
-    },
+    # FIXME: Restore after repeated mega-cache lookups are supported: the
+    # TOP_P_CLAMP fallback makes topk and topp_topk produce the same graph.
+    # {
+    #     "name": "topk",
+    #     "no_penalties": True,
+    #     "all_greedy": False,
+    #     "all_random": True,
+    #     "top_k": 1.0,
+    #     "temperature": 0.5,
+    # },
     {
         "name": "topp_topk",
         "no_penalties": True,
