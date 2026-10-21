@@ -35,27 +35,10 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-# --- Step phase: prefill graph or decode graph -------------------------------
-#
-# RBLN compiles a graph per shape, so a step runs one graph or the other, never a
-# mix. Two functions answer which, because the scheduler decides the phase but
-# every PP rank has to arrive at the same answer:
-#
-#   is_prefill(request)         2 or more tokens left to compute. The definition,
-#                               on pre-advance state only the scheduler holds.
-#   step_is_prefill(sched_out)  2 or more non-draft tokens scheduled. The same
-#                               phase, from what every rank receives alike.
-#
-# They can disagree only on a prefill scheduled exactly 1 token. That does not
-# happen: with 1 token left, is_prefill() already reports decode, which is where
-# a 1-token prompt, a chunked prefill's last token, a full remote-KV match and a
-# full prefix-cache match all land -- and no clamp in schedule() cuts a chunk
-# that short. The scheduler tests pin both views together across whole runs.
-#
-# If that ever breaks, an unfinished prompt runs on the decode graph, and
-# is_intermediate_chunked_prefill falls with it since it ANDs the phase: the step
-# gets sampled and drafts get proposed with no anchor token, landing drafts on a
-# request that is still prefilling.
+# is_prefill reads the request's remaining tokens; step_is_prefill reads the
+# scheduled non-draft token count shared by all PP ranks. Encoder scheduling
+# can truncate an unfinished prompt to one token, so these views can disagree.
+# A decode step classification therefore does not imply a completed prompt.
 
 
 def is_prefill(request: Request) -> bool:

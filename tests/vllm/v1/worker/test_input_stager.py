@@ -314,6 +314,33 @@ class TestHiddenStates:
 
 
 @pytest.mark.maybe_use_device
+class TestMultimodalEmbeddings:
+    def test_padding_and_reuse_clear_previous_image_tokens(self):
+        stager = _stager()
+        embeds = torch.arange(24, dtype=torch.bfloat16).reshape(2, 3, 4)
+        mask = torch.tensor([[[0], [1], [1]], [[1], [0], [1]]], dtype=torch.bfloat16)
+        staged, staged_mask = stager.stage_mm_embeds(embeds, mask, _layout())
+        expected = torch.zeros(4, 8, 4, dtype=torch.bfloat16)
+        expected[:2, :3] = embeds
+        expected_mask = torch.zeros(4, 8, 1, dtype=torch.bfloat16)
+        expected_mask[:2, :3] = mask
+        torch.testing.assert_close(staged.cpu(), expected)
+        torch.testing.assert_close(staged_mask.cpu(), expected_mask)
+
+        next_embeds, next_mask = stager.stage_mm_embeds(
+            torch.full((1, 2, 4), 9.0, dtype=torch.bfloat16),
+            torch.zeros(1, 2, 1, dtype=torch.bfloat16),
+            _layout(num_reqs=1, query_len=2),
+        )
+        assert next_embeds is staged
+        assert next_mask is staged_mask
+        expected.zero_()
+        expected[:1, :2] = 9.0
+        torch.testing.assert_close(next_embeds.cpu(), expected)
+        assert torch.count_nonzero(next_mask.cpu()) == 0
+
+
+@pytest.mark.maybe_use_device
 class TestPassthrough:
     def test_intermediate_and_embeds_passed_through(self):
         stager = _stager()

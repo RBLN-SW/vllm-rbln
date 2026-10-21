@@ -338,8 +338,8 @@ class TestEarlyWriteWiring:
             cm.NixlPushConnector, "wait_for_save", lambda self: order.append("copy")
         )
         connector = push_worker_connector()
-        connector.connector_worker.start_early_push.side_effect = (
-            lambda meta: order.append("offer")
+        connector.connector_worker.start_early_push.side_effect = lambda meta: (
+            order.append("offer")
         )
         connector._connector_metadata = cm.RblnNixlConnectorMetadata()
 
@@ -397,11 +397,11 @@ class TestEarlyWriteWiring:
         connector = push_worker_connector()
         meta = cm.RblnNixlConnectorMetadata()
         connector._connector_metadata = meta
-        connector.connector_worker.release_early_offers.side_effect = (
-            lambda: order.append("release")
+        connector.connector_worker.release_early_offers.side_effect = lambda: (
+            order.append("release")
         )
-        connector.connector_worker.start_load_kv.side_effect = (
-            lambda held: order.append("adopt")
+        connector.connector_worker.start_load_kv.side_effect = lambda held: (
+            order.append("adopt")
         )
         connector.start_load_kv(object())
 

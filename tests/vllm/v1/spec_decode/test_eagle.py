@@ -73,6 +73,7 @@ def _wire_runner(proposer, *, num_reqs, intermediate_chunk=False):
         shape_config=_shape_config(),
         dp_status=None,
         decode_back_pad=torch.zeros(num_reqs, dtype=torch.int32),
+        sort_batch_by_length=False,
     )
     proposer.draft_attn_groups = [
         SimpleNamespace(
@@ -277,8 +278,7 @@ class TestPrepareNextTokenIdsPadded:
 
 
 class TestInitGuards:
-    def test_rejects_multimodal_inputs(self, monkeypatch):
-        # Multimodal targets are unsupported; the guard trips at construction.
+    def test_defers_multimodal_support_check_until_draft_load(self, monkeypatch):
         from vllm.config import ModelConfig
 
         from tests.vllm.v1.spec_decode.utils import _spec_vllm_config
@@ -289,8 +289,8 @@ class TestInitGuards:
         monkeypatch.setattr(
             ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
         )
-        with pytest.raises(NotImplementedError):
-            make_eagle_proposer()
+        proposer = make_eagle_proposer()
+        assert proposer.supports_mm_inputs
 
     def test_rejects_extra_input_slots(self, monkeypatch):
         # Parallel drafting / draft-model spec decode needs input slots the
@@ -365,6 +365,26 @@ class TestToTargetTokenIds:
 
 
 class TestPropose:
+    @pytest.mark.parametrize("is_prompt_sorted", [False, True])
+    def test_prompt_sorting_reaches_every_draft_step(
+        self, monkeypatch, is_prompt_sorted
+    ):
+        _neutralize(monkeypatch)
+        proposer = make_eagle_proposer(method="eagle3", num_speculative_tokens=3)
+        _wire_runner(proposer, num_reqs=2)
+        proposer.runner.sort_batch_by_length = is_prompt_sorted
+        builder = mock.Mock()
+        proposer.draft_attn_groups[0].get_metadata_builder = lambda: builder
+        proposer.model_executable = _echo_model_exec(proposer.hidden_size)
+
+        _call_propose(proposer)
+
+        assert builder.build.call_count == 3
+        assert all(
+            call.kwargs["is_prompt_sorted"] is is_prompt_sorted
+            for call in builder.build.call_args_list
+        )
+
     def test_single_step_early_exit_takes_ids_once(self, monkeypatch):
         # num_speculative_tokens == 1 takes the early-exit branch: one model pass,
         # the graph's ids sliced per request, shaped [num_reqs, 1].
@@ -563,6 +583,39 @@ class TestPropose:
 
 
 class TestLoadModel:
+    @pytest.mark.parametrize("draft_needs_mm_inputs", [False, True])
+    def test_multimodal_guard_uses_loaded_draft_capability(
+        self, monkeypatch, draft_needs_mm_inputs
+    ):
+        from vllm.config import ModelConfig
+        from vllm.v1.spec_decode.eagle import EagleProposer
+
+        from tests.vllm.v1.spec_decode.utils import _spec_vllm_config
+
+        # Only the proposer should observe MM support on this text-model config.
+        _spec_vllm_config("eagle", 3)
+
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: True)
+        )
+        proposer = make_eagle_proposer()
+        monkeypatch.setattr(
+            proposer.vllm_config.speculative_config, "enforce_eager", True
+        )
+
+        def load_draft(self, target_model):
+            assert self.supports_mm_inputs
+            self.supports_mm_inputs = draft_needs_mm_inputs
+            self.model = torch.nn.Identity()
+
+        monkeypatch.setattr(EagleProposer, "load_model", load_draft)
+        if draft_needs_mm_inputs:
+            with pytest.raises(NotImplementedError, match="multimodal embeddings"):
+                proposer.load_model(target_model=object())
+        else:
+            proposer.load_model(target_model=object())
+            assert callable(proposer.model_executable)
+
     class _FakeMappedDraft(Eagle3LlamaForCausalLM):
         """An EAGLE3 draft head whose output stays in draft-vocab space: it
         carries a d2t mapping and a logits_processor. compute_logits only counts
@@ -785,6 +838,7 @@ class TestDummyRun:
             kv_cache_view_infos=[],
             shape_config=_shape_config(specialized=specialized),
             dp_status=dp_status,
+            sort_batch_by_length=False,
             _get_cumsum_and_arange=lambda nt, cumsum_dtype=None: (
                 np.cumsum(nt, dtype=cumsum_dtype),
                 None,

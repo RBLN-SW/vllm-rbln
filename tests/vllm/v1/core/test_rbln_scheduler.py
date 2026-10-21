@@ -20,6 +20,7 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.metrics.stats import PrefixCacheStats
@@ -171,6 +172,83 @@ class TestPendingRunnerBlockDeltas:
 
 
 class TestUpdateFromOutput:
+    @pytest.mark.usefixtures("cr13")
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    @pytest.mark.parametrize("async_load", [False, True])
+    def test_connector_loaded_prefix_events_survive_scheduling_ahead(
+        self, monkeypatch, async_scheduling, async_load
+    ):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            enable_kv_cache_events=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            async_scheduling=async_scheduling,
+            use_kv_connector=MockKVConfig(matched_tokens=32, is_async=async_load),
+        )
+        published: list[KVEventBatch] = []
+        monkeypatch.setattr(sched.kv_event_publisher, "publish", published.append)
+        request = make_request("remote", list(range(40)), 16)
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        out = sched.schedule()
+        if async_load:
+            assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert out.total_num_scheduled_tokens == 0
+            sched.update_from_output(
+                out,
+                make_model_runner_output(out, finished_recving={request.request_id}),
+            )
+            out = sched.schedule()
+        assert out.num_scheduled_tokens[request.request_id] == 8
+        if async_scheduling:
+            ahead = sched.schedule()
+            assert ahead.num_scheduled_tokens[request.request_id] > 0
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        if async_scheduling:
+            sched.update_from_output(ahead, make_model_runner_output(ahead, 2))
+        events = [e for batch in published for e in batch.events]
+        events.extend(sched.kv_cache_manager.take_events())
+        stored = [e for e in events if isinstance(e, BlockStored)]
+        assert [t for e in stored for t in e.token_ids] == list(range(40))
+
+    @pytest.mark.usefixtures("cr13")
+    def test_preempted_remote_request_reannounces_after_cache_reset(self):
+        sched = create_rbln_scheduler(
+            enable_prefix_caching=True,
+            enable_kv_cache_events=True,
+            block_size=16,
+            sub_block_size=8,
+            max_num_batched_tokens=16,
+            max_model_len=128,
+            use_kv_connector=MockKVConfig(matched_tokens=32),
+        )
+        request = make_request("remote", list(range(40)), 16)
+        request.kv_transfer_params = {"do_remote_prefill": True}
+        sched.add_request(request)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        manager = sched.kv_cache_manager
+        initial = [e for e in manager.take_events() if isinstance(e, BlockStored)]
+        assert [t for e in initial for t in e.token_ids] == list(range(40))
+
+        sched.running.remove(request)
+        sched._preempt_request(request, 0.0)
+        assert request.status == RequestStatus.PREEMPTED
+        assert manager.reset_prefix_cache()
+        manager.take_events()
+
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 2))
+
+        restored = [e for e in manager.take_events() if isinstance(e, BlockStored)]
+        assert [t for e in restored for t in e.token_ids] == list(range(40))
+        assert [h for e in restored for h in e.block_hashes] == [
+            h for e in initial for h in e.block_hashes
+        ]
+
     def test_asserts_rbln_scheduler_output(self):
         # A non-RBLNSchedulerOutput trips the assert on the first line.
         sched = create_rbln_scheduler()
@@ -595,6 +673,22 @@ class TestScheduleNoMixedBatching:
         assert len(out.scheduled_new_reqs) == 1
         assert req_a.request_id not in out.num_scheduled_tokens
         assert req_b.request_id in out.num_scheduled_tokens
+
+    def test_decode_back_from_eviction_ships_no_token_copy(self):
+        # The evicted decode returns outside prev_step_scheduled_req_ids, where
+        # upstream attaches all of its tokens; the RBLN runner never reads them.
+        sched = create_rbln_scheduler(
+            max_num_batched_tokens=128, block_size=128, num_blocks=10000
+        )
+        req_a = create_requests(1, num_tokens=64, req_ids=["A"])[0]
+        advance_to_decode(sched, req_a)
+        req_b = create_requests(1, num_tokens=64, req_ids=["B"])[0]
+        sched.add_request(req_b)
+        out = sched.schedule()
+        sched.update_from_output(out, make_model_runner_output(out, 1))
+        out = sched.schedule()
+        assert req_a.request_id in out.scheduled_cached_reqs.req_ids
+        assert out.scheduled_cached_reqs.all_token_ids == {}
 
 
 class TestScheduleDecodeBatchLimit:

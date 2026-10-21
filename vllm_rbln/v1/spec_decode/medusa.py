@@ -72,7 +72,7 @@ class RBLNMedusaProposer(MedusaProposer):
                 dynamic=False,
                 fullgraph=True,
                 compile_context=self.compile_context,
-                num_devices=rbln_config.num_devices_per_local_rank,
+                num_devices=1,
                 model_trace_method="export" if USE_DEVICE_TENSOR else "",
                 process_group_dict=build_process_group_dict(),
                 guard_filter_fn=torch.compiler.keep_tensor_guards_unsafe,

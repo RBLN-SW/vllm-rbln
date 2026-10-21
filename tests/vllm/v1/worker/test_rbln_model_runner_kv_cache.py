@@ -95,6 +95,90 @@ class TestKVCacheBaseBindings:
         assert runner.kv_cache_view_infos == []
 
 
+class TestLayerIndexFollowsCacheOrder:
+    """`initialize_kv_cache_tensors` gives every layer the position of its cache
+    in `kv_cache_names`. The construction-time index assumes `num_attn_module`
+    caches per decoder layer, which a layer owning fewer breaks for every
+    layer after it."""
+
+    @staticmethod
+    def _bind(make_model_runner, monkeypatch, names, **text_config):
+        runner = make_model_runner(layers=names, init_kv_cache=False)
+        # The test config is memoized, so put the attributes back afterwards.
+        for key, value in text_config.items():
+            monkeypatch.setattr(
+                runner.model_config.hf_text_config, key, value, raising=False
+            )
+        ctx = runner.compilation_config.static_forward_context
+        before = {name: ctx[name].layer_index for name in names}
+
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[names]))
+
+        after = {name: ctx[name].layer_index for name in names}
+        # Whatever the index, it must reach the layer's own bound cache.
+        for name in names:
+            assert runner.kv_caches[after[name]] is ctx[name].kv_cache
+        return runner, before, after
+
+    def test_minimax_m3_dense_layers_own_no_indexer_cache(
+        self, make_model_runner, monkeypatch
+    ):
+        names = (
+            "model.layers.0.self_attn.attn",  # dense: K/V only
+            "model.layers.1.self_attn.attn",  # sparse: K/V ...
+            "model.layers.1.self_attn.attn.indexer",  # ... and the indexer keys
+            "model.layers.2.self_attn.attn",  # dense again
+        )
+        runner, before, after = self._bind(
+            make_model_runner,
+            monkeypatch,
+            names,
+            sparse_attention_config={"sparse_attention_freq": [0, 1, 0]},
+        )
+        # Construction indexed by decoder layer, so two caches collided.
+        assert (
+            before["model.layers.1.self_attn.attn"]
+            == before["model.layers.1.self_attn.attn.indexer"]
+        )
+        assert runner.kv_cache_names == list(names)
+        assert after == {name: i for i, name in enumerate(names)}
+
+    def test_dsa_fp8_keeps_three_caches_per_layer_in_order(
+        self, make_model_runner, monkeypatch
+    ):
+        # DeepSeek-V3.2 / A.X-K3 under KV8: MLA latent, indexer keys, and the
+        # indexer's fp16 scale cache, so `num_attn_module` is 3.
+        monkeypatch.setattr(mr, "rbln_num_attn_module", lambda *args, **kwargs: 3)
+        names = tuple(
+            f"model.layers.{layer}.self_attn.{module}"
+            for layer in (0, 1)
+            for module in ("attn", "indexer.k_cache", "indexer.k_cache.scale_cache")
+        )
+        runner, _, after = self._bind(make_model_runner, monkeypatch, names)
+        assert runner.kv_cache_names == list(names)
+        assert after == {name: i for i, name in enumerate(names)}
+
+    def test_mtp_layer_sits_after_the_target_layers(self, make_model_runner):
+        from tests.vllm.v1.worker.utils import make_runner_config
+
+        config = make_runner_config()
+        num_layers = config.model_config.get_total_num_hidden_layers()
+        names = (
+            "model.layers.0.self_attn.attn",
+            "model.layers.1.self_attn.attn",
+            # An MTP / nextn layer is named past the target's layer count.
+            f"model.layers.{num_layers}.self_attn.attn",
+        )
+        runner = make_model_runner(
+            vllm_config=config, layers=names, init_kv_cache=False
+        )
+        ctx = runner.compilation_config.static_forward_context
+        runner.initialize_kv_cache(make_kv_cache_config(runner, groups=[names]))
+        assert runner.kv_cache_names == list(names)
+        assert [ctx[name].layer_index for name in names] == [0, 1, 2]
+        assert runner.kv_caches[2] is ctx[names[-1]].kv_cache
+
+
 class TestHostBufferCopyOp:
     def test_the_registered_op_reads_the_axes_at_call_time(
         self, make_model_runner, monkeypatch
