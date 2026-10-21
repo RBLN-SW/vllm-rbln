@@ -100,9 +100,11 @@ from vllm_rbln.v1.attention.backends.glm5_next import (
 from vllm_rbln.v1.kv_cache import RBLNBlockAuxSpec
 
 # A KDA layer's caches by the slot in their names: the g head groups' states at
-# 0 .. g-1, then each head group's q / k / v conv rings, then (MTP) the g head
-# groups' drafts.
-KDA_CONV_SLOTS = 3
+# 0 .. g-1, then the layer's one conv ring (q / k / v of every head group), then
+# (MTP) the g head groups' drafts.
+KDA_CONV_SLOTS = 1
+# The conv ring's inputs: q / k / v of each head group.
+KDA_CONV_INPUTS = 3
 # The stride of a layer's cache slots (num_attn_module), past the most a layer owns.
 CACHES_PER_LAYER = 16
 SLOT_DSA_LATENT, SLOT_DSA_INDEX_KEY, SLOT_DSA_INDEX_SCALE, SLOT_DSA_INDEX_TAIL = range(
@@ -150,12 +152,12 @@ def kda_head_groups(vllm_config: VllmConfig) -> int:
 def _layer_index_of(prefix: str) -> int:
     """The cache's position in the runner's KV cache list, which holds the caches
     of this rank's layers in name order (then the MTP layers'), compacted: a KDA
-    layer owns g states + 3g conv rings (+ g draft buffers with MTP), a DSA layer 4."""
+    layer owns g states + a conv ring (+ g draft buffers with MTP), a DSA layer 4."""
     vllm_config = get_current_vllm_config()
     config = vllm_config.model_config.hf_text_config
     spec = vllm_config.speculative_config
     groups = kda_head_groups(vllm_config)
-    kda_caches = groups * (1 + KDA_CONV_SLOTS)
+    kda_caches = groups + KDA_CONV_SLOTS
     if spec is not None and spec.num_speculative_tokens:
         kda_caches += groups
 
@@ -495,26 +497,41 @@ class RBLNGlm5KDA(nn.Module):
         # a state the size of an MLA latent block (R1); the ops run once a group.
         self.num_groups = kda_head_groups(vllm_config)
         self.group_heads = self.num_heads // self.num_groups
+        # The KV cache group whose metadata gives the step's positions (seq_lens, the
+        # query lengths): the model points every KDA layer at the first one's, so that
+        # the conv ring's slot tables, host ops built from them, are built once a step
+        # (CSE merges the layers' copies), not once a layer. None: this layer's own.
+        self.positions_from: str | None = None
+        # The conv ring's weights [3g, C / g, taps] in its inputs' order
+        # (stack_conv_weights): stacked in the graph, the constants' concatenate does
+        # not fold.
+        self.register_buffer(
+            "conv_weight",
+            torch.empty(
+                KDA_CONV_INPUTS * self.num_groups, proj // self.num_groups, taps
+            ),
+            persistent=False,
+        )
         rows = vllm_config.cache_config.block_size
         self.states = nn.ModuleList(
             RBLNGlm5StateCache(f"{prefix}.attn.{j}", rows)
             for j in range(self.num_groups)
         )
-        # A head group's q / k / v conv rings: slot-major [W, C] in 64-lane blocks, so
-        # that RSD cuts the channels as it cuts the heads, and one a group, so that no
-        # op slices the heads of a tensor RSD has already cut. All on head group 0's
-        # block: one slot, so the kernels' slot tables are computed once, up front.
-        self.conv_rings = nn.ModuleList(
-            nn.ModuleList(
-                RBLNGlm5AuxCache(
-                    f"{prefix}.attn.{self.num_groups + KDA_CONV_SLOTS * j + i}",
-                    self.states[0].prefix,
-                    (KDA_CONV_RING, proj // self.num_groups // 64, 64),
-                    dtype,
-                )
-                for i in range(KDA_CONV_SLOTS)
-            )
-            for j in range(self.num_groups)
+        # The layer's conv ring: slot-major [W, P, C] in 64-lane blocks, its P = 3g
+        # inputs q / k / v of each head group side by side in a row, so that one load
+        # or store moves all of them and RSD cuts each input's channels as it cuts the
+        # heads (no op slices the heads of a tensor RSD has already cut). On head
+        # group 0's block.
+        self.conv_ring = RBLNGlm5AuxCache(
+            f"{prefix}.attn.{self.num_groups}",
+            self.states[0].prefix,
+            (
+                KDA_CONV_RING,
+                KDA_CONV_INPUTS * self.num_groups,
+                proj // self.num_groups // 64,
+                64,
+            ),
+            dtype,
         )
         # MTP: a verify step (1 + K tokens) keeps the state after token 0 and the K
         # drafts' (k, v, exp(g), beta) in this buffer; the next step replays the
@@ -531,7 +548,7 @@ class RBLNGlm5KDA(nn.Module):
             )
             self.drafts = nn.ModuleList(
                 RBLNGlm5AuxCache(
-                    f"{prefix}.attn.{self.num_groups * (1 + KDA_CONV_SLOTS) + j}",
+                    f"{prefix}.attn.{self.num_groups + KDA_CONV_SLOTS + j}",
                     state.prefix,
                     (self.group_heads, self.num_drafts, 4, self.head_dim),
                     dtype,
@@ -547,25 +564,16 @@ class RBLNGlm5KDA(nn.Module):
         ):
             _set_from_host(fused, b.weight.cpu().float() @ a.weight.cpu().float())
 
-    @staticmethod
-    def _l2norm(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Under 64 heads (a g = 2 group's decode step) an rsqrt over the heads lowers to
-        # a host op, which cuts the graph at every layer: q's and k's then share one
-        # rsqrt along a last axis of 2. At 64 heads that axis would tie the heads to
-        # the lanes in RSD's analysis and leave v and the gates uncut.
-        q, k = q.float(), k.float()
-        if q.shape[-2] >= 64:
-            return tuple(
-                (x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)).to(
-                    torch.bfloat16
-                )
-                for x in (q, k)
-            )
-        sums = torch.stack((q.square().sum(-1), k.square().sum(-1)), dim=-1)
-        scale = torch.rsqrt(sums + 1e-6)
-        return (
-            (q * scale[..., 0:1]).to(torch.bfloat16),
-            (k * scale[..., 1:2]).to(torch.bfloat16),
+    @torch.no_grad()
+    def stack_conv_weights(self) -> None:
+        """The conv taps in the conv ring's input order: q, k of each head group,
+        then v of each (the kernel normalizes the leading 2g)."""
+        q, k, v = (
+            conv.weight.cpu().view(self.num_groups, -1, conv.weight.shape[-1])
+            for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)
+        )
+        _set_from_host(
+            self.conv_weight, torch.cat([torch.stack((q, k), dim=1).flatten(0, 1), v])
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -574,41 +582,50 @@ class RBLNGlm5KDA(nn.Module):
 
         group_states = [state.inputs() for state in self.states]
         metadata = group_states[0][2]
-        seq_idx = metadata.seq_lens.to(torch.int32)
-        query_len = (metadata.cache_offsets - metadata.cache_seq_lens).to(torch.int32)
+        positions = _metadata(self.positions_from) if self.positions_from else metadata
+        seq_idx = positions.seq_lens.to(torch.int32)
+        query_len = (positions.cache_offsets - positions.cache_seq_lens).to(torch.int32)
         has_initial_state = (seq_idx > 0).to(torch.int32).view(-1)
         conv_slot = group_states[0][1].view(-1)
 
         qkv = tuple(
-            (proj(hidden_states)[0], conv.weight)
-            for proj, conv in (
-                (self.q_proj, self.q_conv1d),
-                (self.k_proj, self.k_conv1d),
-                (self.v_proj, self.v_conv1d),
-            )
+            proj(hidden_states)[0] for proj in (self.q_proj, self.k_proj, self.v_proj)
         )
         group_shape = (batch, tokens, self.group_heads, self.head_dim)
         group_channels = self.group_heads * self.head_dim
-        group_qkv = []
-        for j in range(self.num_groups):
-            # The group's channels straight off the projection (the compiler takes
-            # them into the projection's weight) and through its own conv ring.
-            channels = slice(j * group_channels, (j + 1) * group_channels)
-            qj, kj, vj = (
-                torch.ops.rbln_custom_ops.kda_conv(
-                    x[..., channels],
-                    weight[channels],
-                    ring.inputs(),
-                    conv_slot,
-                    seq_idx.view(-1),
-                    query_len.view(-1),
-                    has_initial_state,
-                    KDA_CONV_RING,
-                ).view(group_shape)
-                for (x, weight), ring in zip(qkv, self.conv_rings[j])
+        # Every head group's q / k / v, its channels straight off the projection (the
+        # compiler takes them into the projection's weight), through the layer's conv
+        # ring in one call: the inputs stacked on an axis of their own, which RSD
+        # leaves whole, q / k of each group first so that the kernel L2-normalizes
+        # them (the leading 2g inputs), then v of each.
+        q, k, v = qkv
+        group = [
+            slice(j * group_channels, (j + 1) * group_channels)
+            for j in range(self.num_groups)
+        ]
+        inputs = [x[..., c] for c in group for x in (q, k)] + [v[..., c] for c in group]
+        convolved = torch.ops.rbln_custom_ops.kda_conv(
+            torch.stack(inputs, dim=2),
+            self.conv_weight,
+            self.conv_ring.inputs(),
+            conv_slot,
+            seq_idx.view(-1),
+            query_len.view(-1),
+            has_initial_state,
+            KDA_CONV_RING,
+            2 * self.num_groups,
+        ).unbind(2)
+        group_qkv = [
+            tuple(
+                x.view(group_shape).transpose(1, 2)
+                for x in (
+                    convolved[2 * j],
+                    convolved[2 * j + 1],
+                    convolved[2 * self.num_groups + j],
+                )
             )
-            qj, kj = self._l2norm(qj, kj)
-            group_qkv.append(tuple(x.transpose(1, 2) for x in (qj, kj, vj)))
+            for j in range(self.num_groups)
+        ]
 
         f = F.linear(hidden_states, self.f_weight).view(shape)
         decay = self.A_log.exp().view(-1, 1) * (
@@ -1120,6 +1137,15 @@ class RBLNGlm5Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
         self.norm = RBLNRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # The KDA layers read the step's positions off the first one's KV cache group
+        # (RBLNGlm5KDA.positions_from).
+        kda = [
+            layer.self_attn
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if isinstance(layer.self_attn, RBLNGlm5KDA)
+        ]
+        for attn in kda:
+            attn.positions_from = kda[0].states[0].prefix
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1161,6 +1187,7 @@ class RBLNGlm5Model(nn.Module):
                 layer.self_attn.indexer.fold_hadamard()
             else:
                 layer.self_attn.fuse_low_rank()
+                layer.self_attn.stack_conv_weights()
         return loaded_params
 
 
