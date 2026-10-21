@@ -146,7 +146,8 @@ class RBLNOptimumScheduler(Scheduler):
             if self.scheduler_config.max_num_scheduled_tokens
             else max(
                 vllm_config.model_config.max_model_len,
-                self.scheduler_config.max_num_seqs,
+                self.scheduler_config.max_num_seqs
+                * (vllm_config.num_speculative_tokens + 1),
             )
         )
         self.max_model_len = vllm_config.model_config.max_model_len
@@ -295,10 +296,9 @@ class RBLNOptimumScheduler(Scheduler):
             else EncoderCacheManager(cache_size=encoder_cache_size)
         )
 
-        # Speculative decoding is not supported on the optimum path
         self.use_eagle = False
         self.num_prefill_lookahead = 0
-        self.num_spec_tokens = 0
+        self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
 
@@ -526,10 +526,31 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Next, schedule the RUNNING requests.
         if req_index == 0:
+            decode_query_length = 1
+            if self.num_spec_tokens and any(req.spec_token_ids for req in self.running):
+                spec_decode_query_length = self.num_spec_tokens + 1
+                block_size = self.kv_cache_manager.block_size
+                # The fixed query length also applies to requests without drafts.
+                # Split-KV stores cannot yet split a window across physical blocks.
+                if all(
+                    req.num_computed_tokens % block_size + spec_decode_query_length
+                    <= block_size
+                    and req.num_computed_tokens + spec_decode_query_length
+                    <= self.max_model_len
+                    for req in self.running
+                ):
+                    decode_query_length = spec_decode_query_length
             while req_index < len(self.running) and token_budget > 0:
                 request = self.running[req_index]
-                num_new_tokens = 1
-                num_new_tokens = min(num_new_tokens, token_budget)
+                assert request.num_output_placeholders == 0, (
+                    "Output placeholders are not supported on the optimum path."
+                )
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
+                num_new_tokens = min(num_new_tokens, token_budget, decode_query_length)
 
                 # Make sure the input position
                 # does not exceed the max model len.
@@ -600,7 +621,19 @@ class RBLNOptimumScheduler(Scheduler):
                 token_budget -= num_new_tokens
                 req_index += 1
 
-        # [skip] speculative decoding, encoder-related tasks
+                if request.spec_token_ids:
+                    num_scheduled_spec_tokens = (
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders
+                    )
+                    if num_scheduled_spec_tokens > 0:
+                        spec_token_ids = request.spec_token_ids
+                        if len(spec_token_ids) > num_scheduled_spec_tokens:
+                            spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                        scheduled_spec_decode_tokens[request_id] = spec_token_ids
+                    request.spec_token_ids = []
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -752,6 +785,7 @@ class RBLNOptimumScheduler(Scheduler):
         )
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.spec_token_ids = []
         request.num_preemptions += 1
         # The preempted request restarts from prefill, so it releases its
         # cache slot id now and gets a fresh one at re-admission.
