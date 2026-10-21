@@ -411,13 +411,15 @@ WARM_UP_CONFIGS: list[dict[str, Any]] = [
         "all_random": False,
         "temperature": 0.0,
     },
-    {
-        "name": "random",
-        "no_penalties": True,
-        "all_greedy": False,
-        "all_random": True,
-        "temperature": 0.5,
-    },
+    # FIXME: Restore after checking repeated mega-cache lookups: the temporary
+    # TOP_P_CLAMP fallback can make random and topp produce the same graph.
+    # {
+    #     "name": "random",
+    #     "no_penalties": True,
+    #     "all_greedy": False,
+    #     "all_random": True,
+    #     "temperature": 0.5,
+    # },
     {
         "name": "topp",
         "no_penalties": True,
