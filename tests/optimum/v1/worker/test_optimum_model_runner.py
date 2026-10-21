@@ -39,6 +39,7 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
 
 import vllm_rbln.v1.worker.optimum_model_runner as runner_module
+from vllm_rbln.model_executor.models.optimum.decoder_only import RBLNOptimumForCausalLM
 from vllm_rbln.model_executor.models.optimum.model_base import (
     RBLNOptimumMultimodalMixin,
 )
@@ -432,7 +433,9 @@ def test_update_states_request_unscheduled(model_runner):
     assert _is_req_scheduled(model_runner, new_req_id)
 
 
-def _decode_step(req_ids: list[str], cache_slot_ids: list[int], dummy_block=None):
+def _decode_step(
+    req_ids: list[str], cache_slot_ids: list[int], dummy_block=None, drafts=None
+):
     # Only the scheduler fields _prepare_decode reads.
     return SimpleNamespace(
         block_table_dict={
@@ -440,6 +443,10 @@ def _decode_step(req_ids: list[str], cache_slot_ids: list[int], dummy_block=None
         },
         cache_slot_id_dict=dict(zip(req_ids, cache_slot_ids)),
         dummy_block=dummy_block,
+        scheduled_spec_decode_tokens=drafts or {},
+        num_scheduled_tokens={
+            req_id: 1 + len((drafts or {}).get(req_id, [])) for req_id in req_ids
+        },
     )
 
 
@@ -547,6 +554,95 @@ def test_prepare_decode_pins_rows_the_model_names(model_runner):
     assert model_input.cache_slot_ids[3, 0] == 3
     assert model_input.cache_slot_ids[0, 0] == 0
     assert model_input.block_tables[3, 0] != model_input.block_tables[1, 0]
+
+
+@pytest.mark.parametrize("base_tokens", [1, 2])
+@pytest.mark.parametrize("second_drafts", [[], [21]])
+def test_prepare_speculative_decode(model_runner, base_tokens, second_drafts):
+    _two_running_requests(model_runner)
+    model_runner.num_spec_tokens = 3
+    model_runner.model.use_multiple_decoder = True
+    model_runner.model.decoder_batch_sizes = (1, 2, 10)
+    second_row = model_runner.input_batch.req_id_to_index["r1"]
+    model_runner.input_batch.num_computed_tokens_cpu[second_row] = 4
+    model_runner.input_batch.token_ids_cpu[second_row, 4:6] = [33, 34]
+    drafts = {"r0": [11, 12, 13]}
+    if second_drafts:
+        drafts["r1"] = second_drafts
+    output = _decode_step(["r0", "r1"], [0, 1], dummy_block=7, drafts=drafts)
+    output.num_scheduled_tokens["r1"] = base_tokens + len(second_drafts)
+
+    inputs = model_runner._prepare_decode(output)
+
+    assert inputs.input_tokens.shape == (model_runner.model.decoder_batch_size, 4)
+    assert inputs.input_tokens[0].tolist() == [1, 11, 12, 13]
+    expected = [33, 34][:base_tokens] + second_drafts
+    assert inputs.input_tokens[1].tolist() == expected + [0] * (4 - len(expected))
+    assert inputs.input_positions[:2].tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert inputs.input_positions[2:].tolist() == [[0, 1, 2, 3]] * 8
+    assert inputs.block_tables.shape == (model_runner.model.decoder_batch_size, 1)
+    assert (inputs.block_tables[2:] == 7).all()
+    assert inputs.batch_rows == slice(0, 2)
+
+    ordinary = model_runner._prepare_decode(_decode_step(["r0", "r1"], [0, 1]))
+    assert ordinary.input_tokens.shape == (2, 1)
+
+
+@pytest.mark.parametrize("query_length", [1, 4])
+def test_causal_lm_selects_decoder_for_query_length(model_runner, query_length):
+    _two_running_requests(model_runner)
+    inputs = model_runner._prepare_decode(_decode_step(["r0", "r1"], [0, 1]))
+    inputs = runner_module.replace(
+        inputs,
+        input_tokens=inputs.input_tokens.expand(-1, query_length),
+        input_positions=inputs.input_positions.expand(-1, query_length),
+    )
+    calls = []
+
+    def decoder(**kwargs):
+        calls.append(("ordinary", kwargs))
+        return SimpleNamespace(logits="ordinary logits")
+
+    def multi_token_decoder(**kwargs):
+        calls.append(("multi", kwargs))
+        return SimpleNamespace(logits="multi logits")
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            decoders={inputs.padded_batch_size: decoder},
+            decoder=decoder,
+            multi_token_decoder=multi_token_decoder,
+        )
+    )
+    result = RBLNOptimumForCausalLM.forward(model, inputs)
+    expected = "multi" if query_length > 1 else "ordinary"
+    assert result == f"{expected} logits"
+    assert calls[0][0] == expected
+    assert calls[0][1]["input_ids"] is inputs.input_tokens
+    assert calls[0][1]["block_tables"] is inputs.block_tables
+
+
+def test_execute_model_preserves_speculative_query_logits(model_runner):
+    _two_running_requests(model_runner)
+    model_runner.num_spec_tokens = 3
+
+    def forward(inputs):
+        return torch.arange(inputs.padded_batch_size * 4).view(-1, 4, 1)
+
+    model_runner.model.forward = forward
+    output = _decode_scheduler_output(["r0", "r1"], [0, 1])
+    output.scheduled_spec_decode_tokens = {"r0": [11, 12, 13], "r1": [21]}
+    output.num_scheduled_tokens = {"r0": 4, "r1": 2}
+    output.total_num_scheduled_tokens = 6
+
+    model_runner.execute_model(output)
+
+    assert model_runner.execute_model_state.logits.tolist() == [
+        [[0], [1], [2], [3]],
+        [[4], [5], [6], [7]],
+    ]
+    with pytest.raises(NotImplementedError, match="Rejection sampling"):
+        model_runner.sample_tokens(None)
 
 
 def test_execute_model_keeps_the_running_rows_of_the_padded_decode_batch(

@@ -472,7 +472,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 return self._pool(
                     hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
                 )
-            # [batch_size, 1, vocab_size] -> [batch_size, vocab_size]
+            # Ordinary decode: [B, 1, vocab] -> [B, vocab].
+            # Speculative verification: [B, K+1, vocab] -> [B, K+1, vocab].
             hidden_states = hidden_states.squeeze(1)
             logits = self.model.compute_logits(hidden_states, None)
 
@@ -749,13 +750,25 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         req_ids = self.input_batch.req_ids
         num_reqs = len(req_ids)
-        tokens: list[int] = []
+        use_spec_decode = bool(scheduler_output.scheduled_spec_decode_tokens)
+        query_length = self.num_spec_tokens + 1 if use_spec_decode else 1
+        tokens: list[list[int]] = []
         positions: list[int] = []
         block_tables_list = []
         for req_id in req_ids:
             req_index = self.input_batch.req_id_to_index[req_id]
             position = int(self.input_batch.num_computed_tokens_cpu[req_index])
-            tokens.append(int(self.input_batch.token_ids_cpu[req_index][position]))
+            draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+            num_base_tokens = scheduler_output.num_scheduled_tokens[req_id] - len(
+                draft_tokens
+            )
+            assert 0 < num_base_tokens <= query_length
+            request_tokens = self.input_batch.token_ids_cpu[
+                req_index, position : position + num_base_tokens
+            ].tolist()
+            request_tokens.extend(draft_tokens)
+            assert len(request_tokens) <= query_length
+            tokens.append(request_tokens + [0] * (query_length - len(request_tokens)))
             positions.append(position)
             if self.enable_prefix_caching:
                 block_tables_list.append(scheduler_output.block_table_dict[req_id])
@@ -771,12 +784,22 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             dtype=torch.int16,
         )
 
-        padded_batch_size, rows = self.model.decode_layout(cache_slot_ids, block_tables)
+        if use_spec_decode:
+            # The multi-token decoder is compiled only at the full request batch size.
+            padded_batch_size = self.model.decoder_batch_size
+            rows = slice(0, num_reqs)
+        else:
+            padded_batch_size, rows = self.model.decode_layout(
+                cache_slot_ids, block_tables
+            )
 
-        input_tokens = torch.zeros(padded_batch_size, 1, dtype=torch.int64)
-        input_tokens[rows, 0] = torch.tensor(tokens, dtype=torch.int64)
-        input_positions = torch.zeros(padded_batch_size, 1, dtype=torch.int32)
-        input_positions[rows, 0] = torch.tensor(positions, dtype=torch.int32)
+        input_tokens = torch.zeros(padded_batch_size, query_length, dtype=torch.int64)
+        input_tokens[rows] = torch.tensor(tokens, dtype=torch.int64)
+        offsets = torch.arange(query_length, dtype=torch.int32)
+        input_positions = offsets.expand(padded_batch_size, -1).clone()
+        input_positions[rows] = (
+            torch.tensor(positions, dtype=torch.int32).unsqueeze(1) + offsets
+        )
 
         num_blocks = block_tables.shape[1]
         if padded_batch_size > num_reqs:
@@ -807,12 +830,16 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         mrope_positions = None
         per_request = [
-            self._mrope_positions(self.requests[req_id], position, position + 1)
+            self._mrope_positions(
+                self.requests[req_id], position, position + query_length
+            )
             for req_id, position in zip(req_ids, positions)
         ]
         if per_request[0] is not None:
-            mrope_positions = torch.zeros(3, padded_batch_size, 1, dtype=torch.int64)
-            mrope_positions[:, rows] = torch.cat(per_request, dim=1).unsqueeze(-1)
+            mrope_positions = torch.zeros(
+                3, padded_batch_size, query_length, dtype=torch.int64
+            )
+            mrope_positions[:, rows] = torch.stack(per_request, dim=1)
 
         return ModelInputForRBLN(
             input_tokens=input_tokens,
@@ -1597,6 +1624,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # kv_connector_output = self.kv_connector_output
         # self.kv_connector_output = None
         assert self.execute_model_state is not None
+        if self.execute_model_state.scheduler_output.scheduled_spec_decode_tokens:
+            raise NotImplementedError(
+                "Rejection sampling is not connected on the optimum model path yet."
+            )
 
         # Unpack ephemeral state.
         (

@@ -52,8 +52,17 @@ class RBLNOptimumForCausalLM(
                 block_tables=model_input.block_tables,
             ).logits
 
-        self.model.decoder = self.model.decoders[model_input.padded_batch_size]
-        return self.model.decoder(
+        if model_input.input_tokens.shape[1] > 1:
+            decoder = self.model.multi_token_decoder
+            if decoder is None:
+                raise RuntimeError(
+                    "The compiled model has no multi_token_decoder. "
+                    "Recompile with num_speculative_tokens enabled."
+                )
+        else:
+            decoder = self.model.decoders[model_input.padded_batch_size]
+            self.model.decoder = decoder
+        return decoder(
             input_ids=model_input.input_tokens,
             cache_position=model_input.input_positions,
             block_tables=model_input.block_tables,
