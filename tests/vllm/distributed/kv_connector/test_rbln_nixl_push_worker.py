@@ -1336,7 +1336,6 @@ class TestStreamedEngineHandleWrite:
     def test_a_handover_pairs_the_window_group_from_its_end(self):
         # Once the window fits one block, the producer's window group leads
         # with a null block while the consumer registers only the live one.
-        # Pairing from the front wrote the null block into the consumer's window.
         sent = []
         for window_group in ([7], [0, 7]):
             worker = self._worker()
@@ -1353,7 +1352,17 @@ class TestStreamedEngineHandleWrite:
         worker._valid_tokens = {"r0": 3 * 16 + 8}
         meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], [6, 8]), 0)
 
-        with pytest.raises(AssertionError, match="pairs block lists"):
+        with pytest.raises(RuntimeError, match="pairs block lists"):
+            worker._xfer_blocks_for_req("r0", meta)
+
+    def test_a_handover_into_a_window_group_with_no_registered_block_is_refused(
+        self,
+    ):
+        worker = self._worker()
+        worker._valid_tokens = {"r0": 3 * 16 + 8}
+        meta = self._offer(worker, ([0, 1, 2, 3], [7]), ([4, 5], []), 0)
+
+        with pytest.raises(RuntimeError, match="pairs block lists"):
             worker._xfer_blocks_for_req("r0", meta)
 
     def test_a_hybrid_whose_window_comes_first_counts_the_other_group(self):

@@ -17,7 +17,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Container, Sequence
+from collections.abc import Container
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -1005,13 +1005,6 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
 
         self._submit_writes(req_id, engine_id, notif_id, writes, streamed)
 
-    @staticmethod
-    def _paired_tails(
-        local: Sequence[int], remote: Sequence[int]
-    ) -> tuple[Sequence[int], Sequence[int]]:
-        n = min(len(local), len(remote))
-        return local[len(local) - n :], remote[len(remote) - n :]
-
     def _xfer_batch_over_engine_handle(
         self,
         req_id: str,
@@ -1086,29 +1079,24 @@ class RblnNixlPushConnectorWorker(RblnNixlWorkerBase, NixlPushConnectorWorker):
                 "two block lists count different things."
             )
         local_block_ids, remote_block_ids, span, pieces = window
-        # Align the groups the way upstream aligns them before it reads them:
-        # a streamed batch empties the window's group on our side while the
-        # consumer keeps the block it registered for it, and the two lists
-        # have to name the same descriptors.
-        # The handover may hold more window blocks than the consumer registered
-        # (a leading null block once the window fits one block), and it must
-        # still fill every block the consumer did register.
-        assert offered_tokens or all(
+        if not offered_tokens and not all(
             len(loc) >= len(rem) and (len(rem) or not len(loc))
             for loc, rem in zip(local_block_ids, remote_block_ids)
-        ), (
-            f"RBLN NIXL push: the handover of request {req_id} pairs block "
-            f"lists of lengths {[len(g) for g in local_block_ids]} against "
-            f"{[len(g) for g in remote_block_ids]}."
-        )
-        # The consumer registered the SUFFIX of each group, so the lists pair
-        # from the end, as `_trim_to_consumer_blocks` does on the other route.
-        pairs = [
-            self._paired_tails(loc, rem)
-            for loc, rem in zip(local_block_ids, remote_block_ids)
-        ]
-        local_block_ids = tuple(loc for loc, _ in pairs)
-        remote_block_ids = tuple(rem for _, rem in pairs)
+        ):
+            raise RuntimeError(
+                f"RBLN NIXL push: the handover of request {req_id} pairs block "
+                f"lists of lengths {[len(g) for g in local_block_ids]} against "
+                f"{[len(g) for g in remote_block_ids]}."
+            )
+        # The consumer registers the suffix of each group, so the lists pair from
+        # the end: a streamed batch empties the window group on our side, and a
+        # handover may carry a leading null block the consumer never registered.
+        paired_local, paired_remote = [], []
+        for loc, rem in zip(local_block_ids, remote_block_ids):
+            n = min(len(loc), len(rem))
+            paired_local.append(loc[len(loc) - n :])
+            paired_remote.append(rem[len(rem) - n :])
+        local_block_ids, remote_block_ids = tuple(paired_local), tuple(paired_remote)
         notif_id = self._with_coverage(
             self._xfer_notif_id(
                 engine_id, meta.remote.request_id, remote_info.remote_tp_size
