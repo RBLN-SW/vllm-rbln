@@ -33,6 +33,7 @@ _RBLN_GENERATION_MODELS: dict[str, tuple[str, str]] = {
     "OPTForCausalLM": ("opt", "RBLNOPTForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "RBLNQwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": ("qwen3_moe", "RBLNQwen3MoeForCausalLM"),
+    "SmolLM3ForCausalLM": ("smollm3", "RBLNSmolLM3ForCausalLM"),
     "GptOssForCausalLM": ("gpt-oss", "RBLNGptOssForCausalLM"),
     # Qwen3-Reranker is served by score() but reads its score off two vocabulary
     # logits, so it runs the generation graph -- as upstream vLLM does, resolving
