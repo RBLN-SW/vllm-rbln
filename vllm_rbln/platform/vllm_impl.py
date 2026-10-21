@@ -75,6 +75,28 @@ def _validate(vllm_config: "VllmConfig") -> None:
     if vllm_config.lora_config is not None:
         raise ValueError("LoRA is not supported on RBLN.")
 
+    if model_config.uses_mrope:
+        # The RBLN RoPE override covers `RotaryEmbedding` and takes
+        # `[batch, seq]` positions; `MRotaryEmbedding` is a sibling class with
+        # no RBLN forward, and its native one reads a 2-D tensor as `[3, N]`.
+        raise ValueError(
+            "M-RoPE models (e.g. the Qwen2-VL family) are not supported on the "
+            "RBLN vLLM path yet. Use the optimum path."
+        )
+
+    text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+    if (
+        getattr(text_config, "sparse_attention_config", None)
+        and model_config.dtype != torch.bfloat16
+    ):
+        # The MSA indexer kernel is instantiated in one dtype for the index
+        # queries, keys and key cache, and it is validated in bf16 (and KV8)
+        # only; the model's index-key cache is bf16 for that reason.
+        raise ValueError(
+            "MiniMax-M3 sparse attention (MSA) is supported in bfloat16 only on "
+            f"RBLN; got dtype={model_config.dtype}. Pass --dtype bfloat16."
+        )
+
     if rbln_config.compile_dtype:
         from vllm_rbln.compilation import check_dtype_option_supported
 

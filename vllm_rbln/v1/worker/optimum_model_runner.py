@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
 import logging
 import time
 from collections.abc import Sequence
@@ -19,7 +18,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, Union, cast
 
 import numpy as np
-import rebel
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -94,10 +92,15 @@ from vllm_rbln.utils.optimum.bucket import select_bucket_size
 from vllm_rbln.utils.optimum.predicates import is_qwen3_embedding, is_qwen3_reranker
 from vllm_rbln.utils.optimum.registry import get_rbln_model_info
 from vllm_rbln.v1.core.optimum_scheduler import RBLNSchedulerOutput
+from vllm_rbln.v1.metrics.performance import (
+    PerformanceContext,
+    Phase,
+    get_performance_context,
+    metrics_enabled,
+)
 from vllm_rbln.v1.sample import WARM_UP_CONFIGS, RBLNRejectionSampler, RBLNSampler
 from vllm_rbln.v1.sample.ops.top_k_top_p import TOP_P_CLAMP
 from vllm_rbln.v1.sample.rbln_logits_processor import build_rbln_logitsprocs
-from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.optimum_input_batch import RBLNInputBatch
 
 if TYPE_CHECKING:
@@ -308,9 +311,7 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 "VLLM_COMPUTE_NANS_IN_LOGITS is not supported on the optimum "
                 "model path."
             )
-        if envs.VLLM_RBLN_METRICS:
-            self.model_performance_tracker = PerformanceTracker("MODEL")
-            self.sampler_performance_tracker = PerformanceTracker("SAMPLER")
+        self._metrics_ctx: PerformanceContext | None = None
 
         # Encoder output of every multimodal item by mm_hash, filled by
         # _execute_mm_encoder (or the EC connector) and read by
@@ -403,6 +404,10 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
         self._draft_token_ids = None
         self._draft_token_req_ids = None
+        metrics = None
+        if metrics_enabled():
+            metrics = get_performance_context(self)
+            metrics.start_pass()
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("rbln_model_runner: preprocess"):
             # with self.synchronize_input_prep():
@@ -421,6 +426,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                             0,
                             len(new_req.prompt_token_ids),
                         )
+                    if metrics is not None:
+                        metrics.end_pass()
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
             if not num_scheduled_tokens:
@@ -433,6 +440,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 if getattr(self.model, "attention_manager", None):
                     self.model.attention_manager.clear()
                 # Return empty ModelRunnerOutput if there's no work to do.
+                if metrics is not None:
+                    metrics.end_pass()
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             model_input, num_scheduled_tokens_np = self._prepare_inputs(
@@ -449,34 +458,27 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 )
 
         with record_function_or_nullcontext("rbln_model_runner: forward"):
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
-            model_start_time = time.perf_counter()
-            with capture_ctx as model_reports:
-                hidden_states = self.model(model_input)
+            if metrics is not None:
+                metrics.mark_phase(
+                    Phase.PREFILL if model_input.is_prompt else Phase.DECODE
+                )
+                model_start_time = time.perf_counter()
+            hidden_states = self.model(model_input)
+            if metrics is not None:
+                metrics.add_graph_time(time.perf_counter() - model_start_time)
             if not model_input.is_prompt:
                 # The decode graph returns every row of the padded batch;
                 # keep the running requests' rows in running order.
                 hidden_states = hidden_states[model_input.batch_rows]
-            if envs.VLLM_RBLN_METRICS and self.model_performance_tracker is not None:
-                collect_metrics(
-                    self.model_performance_tracker,
-                    model_input.is_prompt,
-                    start_time=model_start_time,
-                    end_time=time.perf_counter(),
-                    reports=model_reports,
-                    token_count=0,
-                    # the performance of sampler doesn't depend on token count
-                )
 
         with record_function_or_nullcontext("rbln_model_runner: postprocess"):
             if self.is_pooling_model:
-                return self._pool(
+                output = self._pool(
                     hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
                 )
+                if metrics is not None:
+                    metrics.end_pass()
+                return output
             # Ordinary decode: [B, 1, vocab] -> [B, vocab].
             # Speculative verification: [B, K+1, vocab] -> [B, K+1, vocab].
             hidden_states = hidden_states.squeeze(1)
@@ -1665,27 +1667,17 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
 
         with record_function_or_nullcontext("rbln_model_runner: sample"):
-            sampler_start_time = time.perf_counter()
-            if hasattr(rebel, "capture_reports"):
-                capture_ctx = rebel.capture_reports()
-            else:
-                # use a dummy context manager that does nothing
-                capture_ctx = contextlib.nullcontext()
-            with capture_ctx as sampler_reports:
-                sampler_output = self._sample(logits, spec_decode_metadata, is_prompt)
-            if envs.VLLM_RBLN_METRICS and self.sampler_performance_tracker is not None:
-                collect_metrics(
-                    self.sampler_performance_tracker,
-                    is_prompt,
-                    start_time=sampler_start_time,
-                    end_time=time.perf_counter(),
-                    reports=sampler_reports,
-                    token_count=0,
-                    # the performance of sampler doesn't depend on token count
-                )
+            metrics = self._metrics_ctx
+            if metrics is not None:
+                sampler_start_time = time.perf_counter()
+            sampler_output = self._sample(logits, spec_decode_metadata, is_prompt)
+            if metrics is not None:
+                metrics.add_graph_time(time.perf_counter() - sampler_start_time)
         self.input_batch.prev_sampled_token_ids = None
 
         with record_function_or_nullcontext("rbln_model_runner: bookkeep"):
+            if metrics is not None:
+                bookkeeping_start_time = time.perf_counter()
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -1699,6 +1691,9 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 use_padding,
                 spec_decode_metadata=spec_decode_metadata,
             )
+
+            if metrics is not None:
+                metrics.add_graph_time(time.perf_counter() - bookkeeping_start_time)
 
         if self.speculative_config is not None:
             with record_function_or_nullcontext("rbln_model_runner: draft"):
@@ -1722,6 +1717,8 @@ class RBLNOptimumModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             )
         # FIXME: enable async scheduling
         assert not self.use_async_scheduling
+        if metrics is not None:
+            metrics.end_pass()
         return output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

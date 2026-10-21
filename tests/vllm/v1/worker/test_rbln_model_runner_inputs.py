@@ -21,6 +21,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.config import ModelConfig
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalFieldConfig,
+    MultiModalKwargsItem,
+    PlaceholderRange,
+)
 from vllm.v1.outputs import SamplerOutput
 
 import vllm_rbln.v1.worker.rbln_model_runner as mr
@@ -32,6 +39,201 @@ from tests.vllm.v1.worker.utils import (
 )
 
 pytestmark = pytest.mark.maybe_use_device
+
+
+class _InGraphMergeModel(torch.nn.Module):
+    merges_mm_embeds_in_graph = True
+
+
+class TestResolveMultiModalSupport:
+    @staticmethod
+    def _multimodal(monkeypatch, value: bool) -> None:
+        monkeypatch.setattr(
+            ModelConfig, "supports_multimodal_inputs", property(lambda self: value)
+        )
+
+    def test_a_text_model_stays_off_the_path(self, make_model_runner, monkeypatch):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, False)
+        runner.model = _InGraphMergeModel()
+
+        assert runner._resolve_mm_support() is False
+
+    def test_a_model_that_merges_in_graph_opts_in(self, make_model_runner, monkeypatch):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, True)
+        runner.model = _InGraphMergeModel()
+
+        assert runner._resolve_mm_support() is True
+
+    def test_any_other_multimodal_model_is_refused(
+        self, make_model_runner, monkeypatch
+    ):
+        runner = make_model_runner()
+        self._multimodal(monkeypatch, True)
+        runner.model = SimpleNamespace(embed_multimodal=lambda **kw: ())
+
+        with pytest.raises(ValueError, match="SupportsRBLNMultiModal"):
+            runner._resolve_mm_support()
+
+
+class TestGatherMultimodalEmbeddings:
+    def test_scheduled_images_are_encoded_and_cached_by_hash(
+        self, make_model_runner, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner()
+        step = schedule_new("images")
+        pixels = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+        elems = MultiModalFieldConfig.batched("image").build_elems(
+            "pixel_values", pixels
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem({"pixel_values": elem}),
+                modality="image",
+                identifier=f"image-{i}",
+                mm_position=PlaceholderRange(offset=i, length=1),
+            )
+            for i, elem in enumerate(elems)
+        ]
+        step.scheduled_encoder_inputs = {"images": [1, 0]}
+        runner._update_states(step)
+        calls = []
+
+        def embed_multimodal(*, pixel_values):
+            calls.append(pixel_values.clone())
+            return tuple(pixel_values + 10)
+
+        runner.model = SimpleNamespace(embed_multimodal=embed_multimodal)
+        runner._execute_mm_encoder(step)
+
+        assert len(calls) == 1
+        torch.testing.assert_close(calls[0], pixels.flip(0))
+        torch.testing.assert_close(runner.encoder_cache["image-0"], pixels[0] + 10)
+        torch.testing.assert_close(runner.encoder_cache["image-1"], pixels[1] + 10)
+
+    @pytest.mark.parametrize(
+        "computed, values",
+        [(0, [0, 0, 11]), (3, [0, 22, 33]), (6, [0, 0, 0])],
+    )
+    def test_chunk_boundaries_preserve_text_holes_and_request_order(
+        self, make_model_runner, monkeypatch, computed, values
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+        runner = make_model_runner()
+        step = schedule_new(
+            "image",
+            "text",
+            prompt_token_ids=[[1] * 12, [1] * 12],
+            num_computed_tokens=[computed, 0],
+            num_scheduled_tokens=[3, 3],
+        )
+        step.scheduled_new_reqs[0].mm_features = [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="image-hash",
+                mm_position=PlaceholderRange(
+                    offset=2,
+                    length=5,
+                    is_embed=torch.tensor([True, False, True, True, False]),
+                ),
+            )
+        ]
+        runner._update_states(step)
+        hidden = runner.model_config.get_hidden_size()
+        runner.encoder_cache["image-hash"] = (
+            torch.tensor([11.0, 22.0, 33.0]).unsqueeze(1).expand(-1, hidden)
+        )
+
+        embeds, mask = runner._gather_mm_embeddings(step, num_tokens=6)
+
+        expected = torch.tensor(values + [0, 0, 0], dtype=runner.dtype)
+        torch.testing.assert_close(embeds, expected[:, None].expand(-1, hidden))
+        torch.testing.assert_close(mask[:, 0], (expected != 0).to(runner.dtype))
+
+
+class TestWarmupMultimodalEncoder:
+    @staticmethod
+    def _fake_processor(monkeypatch, pixels, *, image_limit=1):
+        """Stand in for the registry's processor: one dummy image of `pixels`."""
+        elems = MultiModalFieldConfig.batched("image").build_elems(
+            "pixel_values", pixels
+        )
+        dummy_calls = []
+
+        def get_dummy_mm_inputs(mm_counts, *, scheduler_config=None):
+            dummy_calls.append(dict(mm_counts))
+            return {
+                "mm_kwargs": {
+                    "image": [MultiModalKwargsItem({"pixel_values": elems[0]})]
+                }
+            }
+
+        processor = SimpleNamespace(
+            info=SimpleNamespace(allowed_mm_limits={"image": image_limit, "video": 1}),
+            get_dummy_mm_inputs=get_dummy_mm_inputs,
+        )
+        monkeypatch.setattr(
+            mr.MULTIMODAL_REGISTRY, "create_processor", lambda model_config: processor
+        )
+        return dummy_calls
+
+    def test_encodes_the_processors_dummy_image_once(
+        self, make_model_runner, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mr, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+        )
+        runner = make_model_runner()
+        runner.supports_mm_inputs = True
+        pixels = torch.tensor([[[1.0, 2.0]]])
+        dummy_calls = self._fake_processor(monkeypatch, pixels)
+        encoded = []
+
+        def embed_multimodal(*, pixel_values):
+            encoded.append(pixel_values.clone())
+            return (pixel_values[0],)
+
+        runner.model = SimpleNamespace(embed_multimodal=embed_multimodal)
+
+        runner._warmup_mm_encoder()
+
+        # One image, the processor's own dummy, through the serving path.
+        assert dummy_calls == [{"image": 1}]
+        assert len(encoded) == 1
+        torch.testing.assert_close(encoded[0], pixels)
+
+    @pytest.mark.parametrize(
+        "reason", ["text_only_model", "other_pp_rank", "no_image_limit"]
+    )
+    def test_skips_when_no_image_can_reach_the_encoder(
+        self, make_model_runner, monkeypatch, reason
+    ):
+        monkeypatch.setattr(
+            mr,
+            "get_pp_group",
+            lambda: SimpleNamespace(is_first_rank=reason != "other_pp_rank"),
+        )
+        runner = make_model_runner()
+        runner.supports_mm_inputs = reason != "text_only_model"
+        self._fake_processor(
+            monkeypatch,
+            torch.ones(1, 1, 2),
+            image_limit=0 if reason == "no_image_limit" else 1,
+        )
+
+        def embed_multimodal(**kwargs):
+            raise AssertionError("nothing should be encoded")
+
+        runner.model = SimpleNamespace(embed_multimodal=embed_multimodal)
+
+        runner._warmup_mm_encoder()
 
 
 def _decode_ready(
