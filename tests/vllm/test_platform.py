@@ -460,6 +460,28 @@ class TestRejectedConfigs:
         with pytest.raises(ValueError, match="LoRA"):
             reconfigure(lambda config: setattr(config, "lora_config", object()))
 
+    def test_msa_models_need_bfloat16(self, reconfigure):
+        def msa(dtype):
+            def mutate(config):
+                config.model_config.hf_text_config.sparse_attention_config = {
+                    "sparse_attention_freq": [0, 1]
+                }
+                config.model_config.dtype = dtype
+
+            return mutate
+
+        for dtype in (torch.float16, torch.float32):
+            with pytest.raises(ValueError, match="bfloat16 only"):
+                reconfigure(msa(dtype))
+        reconfigure(msa(torch.bfloat16))
+
+    def test_mrope_models_are_rejected(self, reconfigure, monkeypatch):
+        from vllm.config import ModelConfig
+
+        monkeypatch.setattr(ModelConfig, "uses_mrope", property(lambda self: True))
+        with pytest.raises(ValueError, match="M-RoPE"):
+            reconfigure(lambda config: None)
+
     def test_chunked_prefill_off(self, reconfigure):
         with pytest.raises(ValueError, match="chunked prefill"):
             reconfigure(
